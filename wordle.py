@@ -336,14 +336,12 @@ class GameState:
         self.solutions = [Solution(all_answers)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
-        self.answer_word = None
         self.volume = 10
 
     def reset_all(self):
         self.solutions = [Solution(self.all_answers)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
-        self.answer_word = None
 
     @property
     def single(self):
@@ -431,9 +429,9 @@ def cmd_guess(gs):
             print(f'  {n} words before guess')
             print_guesses(soln)
 
-        if gs.answer_word:
+        if soln.answer_word:
             response = calculate_response(
-                try_word, gs.answer_word
+                try_word, soln.answer_word
             )
             print(f'  -> {try_word}  ', end='')
             print_colored_pattern(response)
@@ -634,11 +632,11 @@ def cmd_test(gs):
         assert len(word) == 5
 
         # Show pattern if answer is set
-        if gs.answer_word:
+        if soln.answer_word:
             resp = calculate_response(
-                word, gs.answer_word
+                word, soln.answer_word
             )
-            print(f'\n  vs {gs.answer_word.upper()}: ',
+            print(f'\n  vs {soln.answer_word.upper()}: ',
                   end='')
             print_colored_pattern(resp)
             print('  ', end='')
@@ -736,26 +734,41 @@ def cmd_reset(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_answer(gs):
-    if gs.answer_word:
-        print(f"Answer: {gs.answer_word.upper()}. "
-              "Clear? (y/n) ", end="")
-        if input().strip().lower() == 'y':
-            gs.answer_word = None
-            print("Simulation off.")
-        else:
-            print("New word (or blank): ", end="")
-            new = input().strip().lower()
-            if new and len(new) == 5:
-                gs.answer_word = new
-                print(f"Answer: {new.upper()}")
+    result = pick_one_or_all(gs, "Answer. ")
+    if result is None:
+        return
+    key, val = result
+
+    if key == 'all':
+        local_solns = list(enumerate(gs.solutions))
     else:
-        print("Answer word? ", end="")
-        new = input().strip().lower()
-        if len(new) != 5:
-            print_error("Must be 5 letters.")
+        local_solns = [(key, val)]
+
+    for i, soln in local_solns:
+        if not gs.single:
+            print(f'  Solution {i + 1}: ', end='')
+
+        if soln.answer_word:
+            print(f"{soln.answer_word.upper()}. "
+                  "Clear? (y/n) ", end="")
+            ans = input().strip().lower()
+            if ans == 'y':
+                soln.answer_word = None
+                print("  Simulation off.")
+            else:
+                print("  New word (or blank): ", end="")
+                new = input().strip().lower()
+                if new and len(new) == 5:
+                    soln.answer_word = new
+                    print(f"  Answer: {new.upper()}")
         else:
-            gs.answer_word = new
-            print(f"Simulation on: {new.upper()}")
+            print("Answer word? ", end="")
+            new = input().strip().lower()
+            if len(new) != 5:
+                print_error("Must be 5 letters.")
+            else:
+                soln.answer_word = new
+                print(f"  Simulation on: {new.upper()}")
 
 
 # ---------------------------------------------------------------------------
@@ -816,8 +829,14 @@ def cmd_volume(gs):
 
 def cmd_help(gs):
     hard = gs.input_set.name
-    sim = (gs.answer_word.upper()
-           if gs.answer_word else "off")
+    if gs.single:
+        aw = gs.solutions[0].answer_word
+        sim = aw.upper() if aw else "off"
+    else:
+        sim_count = sum(
+            1 for s in gs.solutions if s.answer_word
+        )
+        sim = f"{sim_count}/{len(gs.solutions)} set"
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
@@ -857,11 +876,12 @@ COMMANDS = {
 def print_status(gs):
     """Print current game status."""
     print(f'\n{"=" * DISPLAY_WIDTH}')
-    if gs.answer_word:
-        with colored_text("yellow"):
-            print(f"Sim: {gs.answer_word.upper()}")
     if gs.single:
-        words = gs.solutions[0].current_words
+        soln = gs.solutions[0]
+        if soln.answer_word:
+            with colored_text("yellow"):
+                print(f"Sim: {soln.answer_word.upper()}")
+        words = soln.current_words
         n = len(words)
         if n == 0:
             with colored_text("red"):
@@ -883,7 +903,12 @@ def print_status(gs):
                 print('1 remaining', end='')
                 print_success(f'  {words[0]}')
             else:
-                print(f'{len(words):,} remaining')
+                print(f'{len(words):,} remaining', end='')
+                if soln.answer_word:
+                    with colored_text("yellow"):
+                        print(f'  sim:{soln.answer_word}',
+                              end='')
+                print()
 
 
 def main():

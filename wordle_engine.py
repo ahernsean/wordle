@@ -258,7 +258,8 @@ def score_word(word, remaining_words, method=ScoringMethod.UNWEIGHTED_AVG,
 class Solution:
     """
     Tracks the state of a single Wordle game: remaining candidate
-    answers, guess history, and cached scores.
+    answers, guess history, cached scores, and (optionally) a known
+    answer word for simulation mode.
     """
 
     def __init__(self, answer_words):
@@ -271,6 +272,7 @@ class Solution:
         self.scores = []
         self.scores_method = None
         self.scores_updated = False
+        self.answer_word = None
 
     def apply_guess(self, try_word, response):
         """Apply a guess and its response, filtering the word list."""
