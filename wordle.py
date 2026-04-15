@@ -237,6 +237,26 @@ class ProgressTracker:
 # Display helpers
 # ---------------------------------------------------------------------------
 
+# Module-level display context. Command handlers call
+# set_display_context(soln) before any display output.
+# Display functions use it to mark answer-set words with *.
+_display_answer_set = set()
+
+
+def set_display_context(soln):
+    """Set the answer set used by display functions."""
+    global _display_answer_set
+    if soln is not None:
+        _display_answer_set = soln.answer_set
+    else:
+        _display_answer_set = set()
+
+
+def _mark(word):
+    """Return '*' if word is in the current answer set, ' ' otherwise."""
+    return '*' if word in _display_answer_set else ' '
+
+
 def format_columns(strings, width=DISPLAY_WIDTH,
                    gap="  ", prefix="    "):
     """Format strings into auto-computed columns."""
@@ -256,12 +276,17 @@ def format_columns(strings, width=DISPLAY_WIDTH,
 
 
 def print_scored_list(pairs, method=None, limit=20):
-    """Print ranked (word, score) pairs in columns."""
+    """Print ranked (word, score) pairs in columns.
+    Words in the answer set are marked with *.
+    """
     def fmt(s):
         if method:
             return method.format_score(s)
         return f'{s:0.4f}'
-    items = [f'{w}: {fmt(s)}' for w, s in pairs[:limit]]
+    items = [
+        f'{w}{_mark(w)}: {fmt(s)}'
+        for w, s in pairs[:limit]
+    ]
     if len(pairs) > limit:
         items.append('...')
     if items:
@@ -269,8 +294,10 @@ def print_scored_list(pairs, method=None, limit=20):
 
 
 def print_word_list(words, limit=20):
-    """Print plain words in columns."""
-    items = list(words[:limit])
+    """Print plain words in columns.
+    Words in the answer set are marked with *.
+    """
+    items = [f'{w}{_mark(w)}' for w in words[:limit]]
     if len(words) > limit:
         items.append(f'... ({len(words)} total)')
     if items:
@@ -479,6 +506,8 @@ def cmd_solve(gs):
         else:
             soln = val
 
+    set_display_context(soln)
+
     # Input word set
     iset = gs.input_set
     if not gs.single:
@@ -566,6 +595,106 @@ def cmd_solve(gs):
 
 
 # ---------------------------------------------------------------------------
+# Command: Grid (entropy vs max group size)
+# ---------------------------------------------------------------------------
+
+def cmd_grid(gs):
+    if gs.single:
+        soln = gs.solutions[0]
+    else:
+        result = pick_one_or_all(gs, "Grid. ")
+        if result is None:
+            return
+        key, val = result
+        if key == 'all':
+            soln = Solution.join(gs.solutions)
+        else:
+            soln = val
+
+    set_display_context(soln)
+
+    # Input word set
+    iset = gs.input_set
+    if not gs.single:
+        print('Input words? '
+              '(h)ard, (a)ll, (s)olved? ', end='')
+        ch = input().strip().lower()
+        if ch == 'h':
+            iset = InputSet.CURRENT_WORDLIST
+        elif ch == 'a':
+            iset = InputSet.ALL_GUESSES
+        elif ch == 's':
+            iset = InputSet.SOLVED_WORDS
+        else:
+            print_error("Invalid choice.")
+            return
+    else:
+        is_hard = (iset == InputSet.CURRENT_WORDLIST)
+        label = ("current words" if is_hard
+                 else "all guesses")
+        print(f'Input: {label}')
+
+    if iset == InputSet.CURRENT_WORDLIST:
+        wordlist = soln.current_words
+    elif iset == InputSet.SOLVED_WORDS:
+        wordlist = [
+            s.current_words[0] for s in gs.solutions
+            if len(s.current_words) == 1
+        ]
+        if not wordlist:
+            print_error("No solutions found yet!")
+            return
+    else:
+        wordlist = gs.all_guesses
+
+    methods = [ScoringMethod.ENTROPY_GAIN,
+               ScoringMethod.MINIMAX]
+
+    n_in = len(wordlist)
+    n_rem = len(soln.current_words)
+    print(f"\nScoring {n_in:,} guesses vs "
+          f"{n_rem:,} words.")
+    print("Grid: Entropy vs Max Group Size")
+
+    tracker = ProgressTracker(n_in)
+    results = soln.compute_scores_multi(
+        wordlist, methods,
+        progress_callback=tracker.update
+    )
+    tracker.finish()
+
+    # Bucket by max group size
+    from collections import defaultdict as dd
+    buckets = dd(list)
+    for word, scores in results:
+        mx = int(scores[ScoringMethod.MINIMAX])
+        ent = scores[ScoringMethod.ENTROPY_GAIN]
+        buckets[mx].append((word, ent))
+
+    # Sort each bucket by entropy (best first)
+    for mx in buckets:
+        buckets[mx].sort(key=lambda x: -x[1])
+
+    # Show the best 5 buckets (lowest max group)
+    sorted_keys = sorted(buckets.keys())[:5]
+    ent_method = ScoringMethod.ENTROPY_GAIN
+    per_bucket = 10
+
+    print(f"\n(* = in answer set)")
+    for mx in sorted_keys:
+        entries = buckets[mx][:per_bucket]
+        print(f"\n  Max group {mx}:"
+              f"  ({len(buckets[mx])} words)")
+        items = [
+            f'{w}{_mark(w)}: {ent_method.format_score(e)}'
+            for w, e in entries
+        ]
+        if len(buckets[mx]) > per_bucket:
+            items.append('...')
+        print('\n'.join(format_columns(items)))
+
+
+# ---------------------------------------------------------------------------
 # Command: Display
 # ---------------------------------------------------------------------------
 
@@ -575,6 +704,7 @@ def cmd_display(gs):
         return
     _, soln = result
 
+    set_display_context(soln)
     n = len(soln.current_words)
     print(f"\n{n:,} words remaining:")
     if soln.scores_updated:
@@ -840,6 +970,7 @@ def cmd_help(gs):
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
+  b = Grid (entropy vs max group)
   d = Display remaining words
   t = Test a word (all methods)
   i = Include letters (filter)
@@ -860,6 +991,7 @@ def cmd_help(gs):
 COMMANDS = {
     'g': cmd_guess,
     's': cmd_solve,
+    'b': cmd_grid,
     'd': cmd_display,
     't': cmd_test,
     'i': cmd_include,
@@ -921,7 +1053,7 @@ def main():
 
     while True:
         print_status(gs)
-        print(f"\nCommand (gsdtixrawhv?)? ",
+        print(f"\nCommand (gsbdtixrawhv?)? ",
               end="")
         cmd = input().strip()
         if not cmd:
