@@ -18,20 +18,23 @@ class ScoringMethod(Enum):
     WEIGHTED_AVG = auto()     # sum(n_i^2) / N
     ENTROPY_GAIN = auto()     # Shannon entropy (bits of info gained)
     MINIMAX = auto()          # max(n_i)
+    PROB_FINISH = auto()      # P(next guess solves it)
 
     @property
     def label(self):
         labels = {
             ScoringMethod.UNWEIGHTED_AVG: "Unweighted avg group size",
             ScoringMethod.WEIGHTED_AVG:   "Weighted avg remaining",
-            ScoringMethod.ENTROPY_GAIN:        "Entropy gain (bits)",
+            ScoringMethod.ENTROPY_GAIN:   "Entropy gain (bits)",
             ScoringMethod.MINIMAX:        "Worst-case group size",
+            ScoringMethod.PROB_FINISH:    "P(finish next turn)",
         }
         return labels[self]
 
     @property
     def higher_is_better(self):
-        return self == ScoringMethod.ENTROPY_GAIN
+        return self in (ScoringMethod.ENTROPY_GAIN,
+                        ScoringMethod.PROB_FINISH)
 
     def sort_key(self):
         """Return a sort key function: best scores first."""
@@ -43,6 +46,8 @@ class ScoringMethod(Enum):
         """Format a score value for display."""
         if self == ScoringMethod.MINIMAX:
             return str(int(value))
+        if self == ScoringMethod.PROB_FINISH:
+            return f'{value:.1%}'
         return f'{value:0.4f}'
 
 
@@ -212,6 +217,8 @@ def score_groups(groups, method=ScoringMethod.UNWEIGHTED_AVG):
     - WEIGHTED_AVG: sum(n_i^2)/N. Lower is better.
     - ENTROPY_GAIN: Shannon entropy in bits. Higher is better.
     - MINIMAX: max(n_i). Lower is better.
+    - PROB_FINISH: fraction of remaining words in size-1
+      groups (game ends next turn). Higher is better.
     """
     if not groups:
         if method.higher_is_better:
@@ -239,7 +246,16 @@ def score_groups(groups, method=ScoringMethod.UNWEIGHTED_AVG):
     elif method == ScoringMethod.MINIMAX:
         return max(sizes)
 
+    elif method == ScoringMethod.PROB_FINISH:
+        singles = sum(1 for s in sizes if s == 1)
+        return singles / n
+
     raise ValueError(f"Unknown scoring method: {method}")
+
+
+def score_groups_multi(groups, methods):
+    """Score a word's group partition under multiple methods at once."""
+    return {m: score_groups(groups, m) for m in methods}
 
 
 def score_word(word, remaining_words, method=ScoringMethod.UNWEIGHTED_AVG,
@@ -249,6 +265,18 @@ def score_word(word, remaining_words, method=ScoringMethod.UNWEIGHTED_AVG,
         progress_callback()
     groups = calculate_group_counts(word, remaining_words)
     return score_groups(groups, method)
+
+
+def score_word_multi(word, remaining_words, methods,
+                     progress_callback=None):
+    """
+    Score a single candidate guess under multiple methods.
+    Computes group counts once, then scores with each method.
+    """
+    if progress_callback:
+        progress_callback()
+    groups = calculate_group_counts(word, remaining_words)
+    return score_groups_multi(groups, methods)
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +296,19 @@ class Solution:
 
     def reset(self):
         self.current_words = self.all_answers[:]
+        self._answer_set = None
         self.guesses = []
         self.scores = []
         self.scores_method = None
         self.scores_updated = False
         self.answer_word = None
+
+    @property
+    def answer_set(self):
+        """Cached set of current_words for O(1) membership tests."""
+        if self._answer_set is None:
+            self._answer_set = set(self.current_words)
+        return self._answer_set
 
     def apply_guess(self, try_word, response):
         """Apply a guess and its response, filtering the word list."""
@@ -280,6 +316,7 @@ class Solution:
         self.current_words = apply_guess(
             self.current_words, try_word, response
         )
+        self._answer_set = None
         self.scores_updated = False
 
     def include_letters(self, letters):
@@ -288,6 +325,7 @@ class Solution:
             self.current_words = [
                 w for w in self.current_words if letter in w
             ]
+        self._answer_set = None
         self.scores_updated = False
 
     def exclude_letters(self, letters):
@@ -296,6 +334,7 @@ class Solution:
             self.current_words = [
                 w for w in self.current_words if letter not in w
             ]
+        self._answer_set = None
         self.scores_updated = False
 
     @staticmethod
@@ -332,4 +371,25 @@ class Solution:
         self.scores = results
         self.scores_method = method
         self.scores_updated = True
+        return results
+
+    def compute_scores_multi(self, input_wordlist, methods,
+                             progress_callback=None):
+        """
+        Score every word under multiple methods in a single pass.
+        Computes group counts once per word, then scores with each
+        method. Returns a list of (word, {method: score}) tuples,
+        sorted by the first method in the list.
+        """
+        results = []
+        for word in input_wordlist:
+            scores = score_word_multi(
+                word, self.current_words, methods,
+                progress_callback
+            )
+            results.append((word, scores))
+        primary = methods[0]
+        results.sort(key=lambda x: primary.sort_key()(
+            (x[0], x[1][primary])
+        ))
         return results
