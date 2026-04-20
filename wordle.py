@@ -19,6 +19,7 @@ from wordle_engine import (
     Solution, ScoringMethod, InputSet,
     load_word_list, calculate_response,
     calculate_group_counts, score_groups,
+    max_entropy,
 )
 
 # ---------------------------------------------------------------------------
@@ -239,22 +240,34 @@ class ProgressTracker:
 
 # Module-level display context. Command handlers call
 # set_display_context(soln) before any display output.
-# Display functions use it to mark answer-set words with *.
+# Display functions use it to mark answer-set words with *
+# and max-entropy scores with =.
 _display_answer_set = set()
+_display_max_ent = 0.0
 
 
 def set_display_context(soln):
-    """Set the answer set used by display functions."""
-    global _display_answer_set
+    """Set the display context from a solution."""
+    global _display_answer_set, _display_max_ent
     if soln is not None:
         _display_answer_set = soln.answer_set
+        _display_max_ent = max_entropy(
+            len(soln.current_words)
+        )
     else:
         _display_answer_set = set()
+        _display_max_ent = 0.0
 
 
 def _mark(word):
     """Return '*' if word is in the current answer set, ' ' otherwise."""
     return '*' if word in _display_answer_set else ' '
+
+
+def _is_max_ent(score):
+    """True if score equals the theoretical max entropy."""
+    return (_display_max_ent > 0
+            and abs(score - _display_max_ent) < 1e-9)
 
 
 def format_columns(strings, width=DISPLAY_WIDTH,
@@ -278,11 +291,17 @@ def format_columns(strings, width=DISPLAY_WIDTH,
 def print_scored_list(pairs, method=None, limit=20):
     """Print ranked (word, score) pairs in columns.
     Words in the answer set are marked with *.
+    Max-entropy scores are marked with =.
     """
     def fmt(s):
         if method:
-            return method.format_score(s)
-        return f'{s:0.4f}'
+            fs = method.format_score(s)
+        else:
+            fs = f'{s:0.4f}'
+        if (method == ScoringMethod.ENTROPY_GAIN
+                and _is_max_ent(s)):
+            fs += '='
+        return fs
     items = [
         f'{w}{_mark(w)}: {fmt(s)}'
         for w, s in pairs[:limit]
@@ -360,13 +379,15 @@ class GameState:
         self.all_guesses = all_guesses
         self.n_answers = len(all_answers)
         self.n_guesses = len(all_guesses)
-        self.solutions = [Solution(all_answers)]
+        self.solutions = [Solution(all_answers,
+                                   all_guesses)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
         self.volume = 10
 
     def reset_all(self):
-        self.solutions = [Solution(self.all_answers)]
+        self.solutions = [Solution(self.all_answers,
+                                   self.all_guesses)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
 
@@ -479,6 +500,11 @@ def cmd_guess(gs):
 
         soln.apply_guess(try_word, response)
         cw = soln.current_words
+        if soln.fallback_active:
+            with colored_text("yellow"):
+                print(f'\n  Answer list exhausted. '
+                      f'Fell back to full guess '
+                      f'vocabulary.')
         print(f'  {len(cw)} words remaining', end='')
         if len(cw) == 0:
             print_error(": No words remaining!")
@@ -569,6 +595,9 @@ def cmd_solve(gs):
             soln.scores_updated = True
             print(f"\nCached ({gs.n_guesses} words, "
                   f"{method.label}).")
+            if method == ScoringMethod.ENTROPY_GAIN:
+                print(f"(= = max entropy "
+                      f"{_display_max_ent:.4f})")
             print("Best guesses:")
             print_scored_list(soln.scores, method)
             return
@@ -590,6 +619,9 @@ def cmd_solve(gs):
                    mname)
 
     print(f"\n{method.label}:")
+    if method == ScoringMethod.ENTROPY_GAIN:
+        print(f"(= = max entropy "
+              f"{_display_max_ent:.4f})")
     print("Best guesses:")
     print_scored_list(results, method)
 
@@ -679,14 +711,22 @@ def cmd_grid(gs):
     sorted_keys = sorted(buckets.keys())[:5]
     ent_method = ScoringMethod.ENTROPY_GAIN
     per_bucket = 10
+    me = _display_max_ent
 
-    print(f"\n(* = in answer set)")
+    def ent_fmt(e):
+        s = ent_method.format_score(e)
+        if _is_max_ent(e):
+            s += '='
+        return s
+
+    print(f"\n(* = in answer set, "
+          f"= = max entropy {me:.4f})")
     for mx in sorted_keys:
         entries = buckets[mx][:per_bucket]
         print(f"\n  Max group {mx}:"
               f"  ({len(buckets[mx])} words)")
         items = [
-            f'{w}{_mark(w)}: {ent_method.format_score(e)}'
+            f'{w}{_mark(w)}: {ent_fmt(e)}'
             for w, e in entries
         ]
         if len(buckets[mx]) > per_bucket:
@@ -756,6 +796,7 @@ def cmd_test(gs):
         return
     _, soln = result
 
+    set_display_context(soln)
     print("Word to test? ", end="")
     try:
         word = input().strip().lower()
@@ -803,10 +844,19 @@ def cmd_test(gs):
             word, soln.current_words
         )
         n = len(soln.current_words)
-        print(f'\n  {word.upper()} vs {n} words:')
+        in_answers = _mark(word).strip()
+        label = f'{word.upper()}'
+        if in_answers:
+            label += ' (in answer set)'
+        print(f'\n  {label} vs {n} words:')
         for m in ScoringMethod:
             s = score_groups(groups, m)
-            print(f'    {m.label}: {m.format_score(s)}')
+            extra = ''
+            if (m == ScoringMethod.ENTROPY_GAIN
+                    and _is_max_ent(s)):
+                extra = ' = max'
+            print(f'    {m.label}: '
+                  f'{m.format_score(s)}{extra}')
         print(f'    Groups: {len(groups)}')
     except Exception as e:
         print_error(f"Error: {e}")
@@ -912,7 +962,8 @@ def cmd_wordcount(gs):
         if wc < 1:
             raise ValueError
         gs.solutions = [
-            Solution(gs.all_answers) for _ in range(wc)
+            Solution(gs.all_answers, gs.all_guesses)
+            for _ in range(wc)
         ]
         if wc > 1:
             print("How many per row? ", end="")
@@ -1013,6 +1064,9 @@ def print_status(gs):
         if soln.answer_word:
             with colored_text("yellow"):
                 print(f"Sim: {soln.answer_word.upper()}")
+        if soln.fallback_active:
+            with colored_text("yellow"):
+                print("(using full guess vocabulary)")
         words = soln.current_words
         n = len(words)
         if n == 0:
@@ -1036,6 +1090,9 @@ def print_status(gs):
                 print_success(f'  {words[0]}')
             else:
                 print(f'{len(words):,} remaining', end='')
+                if soln.fallback_active:
+                    with colored_text("yellow"):
+                        print(' [fallback]', end='')
                 if soln.answer_word:
                     with colored_text("yellow"):
                         print(f'  sim:{soln.answer_word}',
