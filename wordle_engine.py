@@ -279,6 +279,16 @@ def score_word_multi(word, remaining_words, methods,
     return score_groups_multi(groups, methods)
 
 
+def max_entropy(n):
+    """Theoretical maximum entropy for n remaining words: log2(n).
+    A guess achieves this only if it perfectly partitions all
+    n words into n singleton groups.
+    """
+    if n <= 1:
+        return 0.0
+    return math.log2(n)
+
+
 # ---------------------------------------------------------------------------
 # Solution class
 # ---------------------------------------------------------------------------
@@ -288,10 +298,14 @@ class Solution:
     Tracks the state of a single Wordle game: remaining candidate
     answers, guess history, cached scores, and (optionally) a known
     answer word for simulation mode.
+
+    If all_guesses is provided, falling back to it when the answer
+    list is exhausted (word not in answer list).
     """
 
-    def __init__(self, answer_words):
+    def __init__(self, answer_words, all_guesses=None):
         self.all_answers = answer_words
+        self.all_guesses = all_guesses
         self.reset()
 
     def reset(self):
@@ -302,6 +316,7 @@ class Solution:
         self.scores_method = None
         self.scores_updated = False
         self.answer_word = None
+        self.fallback_active = False
 
     @property
     def answer_set(self):
@@ -311,13 +326,34 @@ class Solution:
         return self._answer_set
 
     def apply_guess(self, try_word, response):
-        """Apply a guess and its response, filtering the word list."""
+        """
+        Apply a guess and its response, filtering the word list.
+
+        If the result is empty and all_guesses is available, replays
+        all guesses against the full guess vocabulary as a fallback.
+        Returns the number of remaining words (caller should check
+        for fallback_active).
+        """
         self.guesses.append([try_word, list(response)])
         self.current_words = apply_guess(
             self.current_words, try_word, response
         )
         self._answer_set = None
         self.scores_updated = False
+
+        # Fallback: replay all guesses against full vocabulary
+        if (len(self.current_words) == 0
+                and self.all_guesses
+                and not self.fallback_active):
+            words = self.all_guesses[:]
+            for gw, gr in self.guesses:
+                words = apply_guess(words, gw, gr)
+            if words:
+                self.current_words = words
+                self._answer_set = None
+                self.fallback_active = True
+
+        return len(self.current_words)
 
     def include_letters(self, letters):
         """Keep only words containing all specified letters."""
@@ -346,7 +382,8 @@ class Solution:
         """
         if not solutions:
             return None
-        out = Solution(solutions[0].all_answers)
+        out = Solution(solutions[0].all_answers,
+                       solutions[0].all_guesses)
         combined = set()
         for soln in solutions:
             if len(soln.current_words) > 1:
