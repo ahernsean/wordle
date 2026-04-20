@@ -204,6 +204,18 @@ class ProgressTracker:
         print('  ', end='', flush=True)
         self.chars_printed = 2
 
+    @staticmethod
+    def _fmt_eta(td):
+        """Format a timedelta compactly: 2m30s, 45s, etc."""
+        secs = int(td.total_seconds())
+        if secs < 60:
+            return f'{secs}s'
+        mins = secs // 60
+        secs = secs % 60
+        if secs == 0:
+            return f'{mins}m'
+        return f'{mins}m{secs:02d}s'
+
     def update(self):
         self.count += 1
         pct = (self.count * 100) // self.total
@@ -212,7 +224,13 @@ class ProgressTracker:
             return
         # New percentage point reached
         if pct >= self.next_milestone:
-            label = f'{self.next_milestone}%'
+            elapsed = datetime.now() - self.start_time
+            if 0 < pct < 100:
+                remaining = elapsed * (100 - pct) / pct
+                eta = self._fmt_eta(remaining)
+                label = f'{self.next_milestone}%~{eta} '
+            else:
+                label = f'{self.next_milestone}%'
             print(label, end='', flush=True)
             self.chars_printed += len(label)
             self.next_milestone += 25
@@ -735,6 +753,86 @@ def cmd_grid(gs):
 
 
 # ---------------------------------------------------------------------------
+# Command: Lookahead (two-step entropy)
+# ---------------------------------------------------------------------------
+
+LOOKAHEAD_N = 10
+
+def cmd_lookahead(gs):
+    if gs.single:
+        soln = gs.solutions[0]
+    else:
+        result = pick_one_or_all(gs, "Lookahead. ")
+        if result is None:
+            return
+        key, val = result
+        if key == 'all':
+            soln = Solution.join(gs.solutions)
+        else:
+            soln = val
+
+    set_display_context(soln)
+
+    # Need a prior entropy solve
+    if (not soln.scores_updated
+            or soln.scores_method
+            != ScoringMethod.ENTROPY_GAIN):
+        print_error(
+            "Run entropy solve (s) first."
+        )
+        return
+
+    n_rem = len(soln.current_words)
+    if n_rem <= 2:
+        print("Two or fewer words remain, "
+              "lookahead not needed.")
+        return
+
+    top_n = soln.scores[:LOOKAHEAD_N]
+    print(f"\nTwo-step lookahead on top "
+          f"{len(top_n)} words vs "
+          f"{n_rem:,} remaining.")
+    print("(hard mode for second step)")
+
+    # Phase 1 computes groups (fast), then
+    # total_callback gives us the work count
+    # for the progress tracker.
+    tracker = [None]  # mutable container
+
+    def on_total(total):
+        print(f"  Second-step evaluations: "
+              f"{total:,}")
+        tracker[0] = ProgressTracker(max(total, 1))
+
+    def on_tick():
+        if tracker[0]:
+            tracker[0].update()
+
+    results = soln.compute_lookahead(
+        top_n,
+        total_callback=on_total,
+        progress_callback=on_tick,
+    )
+
+    if tracker[0]:
+        tracker[0].finish()
+
+    me = _display_max_ent
+    print(f"\nTwo-step entropy lookahead:")
+    print(f"  {'Word':<7} {'Step1':>7}  "
+          f"{'Step2':>7}  {'Total':>7}")
+    print(f"  {'----':<7} {'-----':>7}  "
+          f"{'-----':>7}  {'-----':>7}")
+    for word, s1, s2, combined in results:
+        m = _mark(word)
+        me_flag = '=' if _is_max_ent(s1) else ' '
+        print(f"  {word}{m} "
+              f"{s1:7.4f}{me_flag} "
+              f"{s2:7.4f}  "
+              f"{combined:7.4f}")
+
+
+# ---------------------------------------------------------------------------
 # Command: Display
 # ---------------------------------------------------------------------------
 
@@ -1022,6 +1120,7 @@ def cmd_help(gs):
   g = Guess a word
   s = Solve (find best guess)
   b = Grid (entropy vs max group)
+  l = Lookahead (two-step entropy)
   d = Display remaining words
   t = Test a word (all methods)
   i = Include letters (filter)
@@ -1043,6 +1142,7 @@ COMMANDS = {
     'g': cmd_guess,
     's': cmd_solve,
     'b': cmd_grid,
+    'l': cmd_lookahead,
     'd': cmd_display,
     't': cmd_test,
     'i': cmd_include,
@@ -1110,7 +1210,7 @@ def main():
 
     while True:
         print_status(gs)
-        print(f"\nCommand (gsbdtixrawhv?)? ",
+        print(f"\nCommand (gsbldtixrawhv?)? ",
               end="")
         cmd = input().strip()
         if not cmd:
