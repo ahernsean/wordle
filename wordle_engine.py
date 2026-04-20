@@ -432,14 +432,18 @@ class Solution:
         return results
 
     def compute_lookahead(self, top_words,
+                          second_step_words=None,
                           total_callback=None,
                           progress_callback=None):
         """
         Two-step entropy lookahead on (word, first_entropy) pairs.
 
         For each candidate first guess, computes the weighted average
-        of the best second-step entropy across all response groups,
-        using hard mode (candidates = subgroup words).
+        of the best second-step entropy across all response groups.
+
+        second_step_words: word list to search for best second guess.
+            If None, uses hard mode (subgroup words only).
+            If provided, searches that list against each subgroup.
 
         total_callback(n): called once with total work units.
         progress_callback(): called per work unit.
@@ -449,6 +453,7 @@ class Solution:
         """
         method = ScoringMethod.ENTROPY_GAIN
         n = len(self.current_words)
+        full_mode = second_step_words is not None
 
         # Phase 1: compute groups, count work
         word_data = []
@@ -457,12 +462,18 @@ class Solution:
             groups = calculate_group_counts(
                 word, self.current_words
             )
-            # Work = candidates to evaluate in groups > 2
-            # (size-1 and size-2 groups are short-circuited)
-            work = sum(
-                count for count in groups.values()
+            # Count non-trivial groups (size > 2)
+            big_groups = sum(
+                1 for count in groups.values()
                 if count > 2
             )
+            if full_mode:
+                work = big_groups * len(second_step_words)
+            else:
+                work = sum(
+                    count for count in groups.values()
+                    if count > 2
+                )
             total_work += work
             word_data.append((word, first_ent, groups))
 
@@ -490,9 +501,11 @@ class Solution:
                     self.current_words, word, response
                 )
 
-                # Hard mode: search within subgroup
+                # Search for best second guess
+                candidates = (second_step_words
+                              if full_mode else subgroup)
                 best = 0.0
-                for candidate in subgroup:
+                for candidate in candidates:
                     if progress_callback:
                         progress_callback()
                     s = score_word(

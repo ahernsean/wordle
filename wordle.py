@@ -756,7 +756,7 @@ def cmd_grid(gs):
 # Command: Lookahead (two-step entropy)
 # ---------------------------------------------------------------------------
 
-LOOKAHEAD_N = 10
+LOOKAHEAD_N = 20
 
 def cmd_lookahead(gs):
     if gs.single:
@@ -788,11 +788,37 @@ def cmd_lookahead(gs):
               "lookahead not needed.")
         return
 
-    top_n = soln.scores[:LOOKAHEAD_N]
+    # Prompt for N
+    print(f"How many top words? "
+          f"({LOOKAHEAD_N}) ", end="")
+    n_input = input().strip()
+    if n_input:
+        try:
+            count = int(n_input)
+            if count < 1:
+                raise ValueError
+        except ValueError:
+            print_error("Invalid number.")
+            return
+    else:
+        count = LOOKAHEAD_N
+
+    top_n = soln.scores[:count]
+
+    # Determine second-step word list from mode
+    is_hard = (gs.input_set
+               == InputSet.CURRENT_WORDLIST)
+    if is_hard:
+        second_step = None
+        mode_label = "hard mode"
+    else:
+        second_step = gs.all_guesses
+        mode_label = "all guesses"
+
     print(f"\nTwo-step lookahead on top "
           f"{len(top_n)} words vs "
           f"{n_rem:,} remaining.")
-    print("(hard mode for second step)")
+    print(f"({mode_label} for second step)")
 
     # Phase 1 computes groups (fast), then
     # total_callback gives us the work count
@@ -810,6 +836,7 @@ def cmd_lookahead(gs):
 
     results = soln.compute_lookahead(
         top_n,
+        second_step_words=second_step,
         total_callback=on_total,
         progress_callback=on_tick,
     )
@@ -817,7 +844,6 @@ def cmd_lookahead(gs):
     if tracker[0]:
         tracker[0].finish()
 
-    me = _display_max_ent
     print(f"\nTwo-step entropy lookahead:")
     print(f"  {'Word':<7} {'Step1':>7}  "
           f"{'Step2':>7}  {'Total':>7}")
