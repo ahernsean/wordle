@@ -191,39 +191,88 @@ def parse_response(response_str):
 class ProgressTracker:
     """Width-aware progress for narrow screens.
 
-    Prints dots and percentage labels at 25%
-    milestones, wrapping to fit DISPLAY_WIDTH.
+    Prints dots for each percentage point,
+    milestone labels at 25% intervals, and
+    inline ETA every ETA_INTERVAL seconds.
     """
+
+    ETA_INTERVAL = 10  # seconds between ETA reports
 
     def __init__(self, total):
         self.count = 0
         self.total = total
         self.start_time = datetime.now()
+        self.last_eta = self.start_time
         self.chars_printed = 0
         self.next_milestone = 25
         print('  ', end='', flush=True)
         self.chars_printed = 2
+
+    @staticmethod
+    def _fmt_eta(td):
+        """Format a timedelta compactly."""
+        secs = int(td.total_seconds())
+        if secs < 60:
+            return f'{secs}s'
+        mins = secs // 60
+        secs = secs % 60
+        if secs == 0:
+            return f'{mins}m'
+        return f'{mins}m{secs:02d}s'
+
+    def _maybe_wrap(self, extra=0):
+        """Wrap to next line if near screen edge."""
+        if (self.chars_printed + extra
+                >= DISPLAY_WIDTH - 6):
+            print('\n  ', end='', flush=True)
+            self.chars_printed = 2
 
     def update(self):
         self.count += 1
         pct = (self.count * 100) // self.total
         prev = ((self.count - 1) * 100) // self.total
         if pct <= prev:
+            # Between percentage points: only check
+            # time-based ETA
+            now = datetime.now()
+            if ((now - self.last_eta).total_seconds()
+                    >= self.ETA_INTERVAL):
+                self.last_eta = now
+                frac = self.count / self.total
+                if 0 < frac < 1:
+                    elapsed = now - self.start_time
+                    remaining = (elapsed
+                                 * (1 - frac) / frac)
+                    label = f'~{self._fmt_eta(remaining)} '
+                    self._maybe_wrap(len(label))
+                    print(label, end='', flush=True)
+                    self.chars_printed += len(label)
             return
         # New percentage point reached
         if pct >= self.next_milestone:
             label = f'{self.next_milestone}%'
+            self._maybe_wrap(len(label))
             print(label, end='', flush=True)
             self.chars_printed += len(label)
             self.next_milestone += 25
         else:
             print('.', end='', flush=True)
             self.chars_printed += 1
-        # Wrap before screen edge, but not after 100%
-        if (self.chars_printed >= DISPLAY_WIDTH - 6
-                and pct < 100):
-            print('\n  ', end='', flush=True)
-            self.chars_printed = 2
+        # Time-based ETA at percentage boundaries
+        now = datetime.now()
+        if ((now - self.last_eta).total_seconds()
+                >= self.ETA_INTERVAL):
+            self.last_eta = now
+            frac = self.count / self.total
+            if 0 < frac < 1:
+                elapsed = now - self.start_time
+                remaining = (elapsed
+                             * (1 - frac) / frac)
+                label = f'~{self._fmt_eta(remaining)} '
+                print(label, end='', flush=True)
+                self.chars_printed += len(label)
+        # Wrap check
+        self._maybe_wrap()
 
     def finish(self):
         if self.next_milestone <= 100:
@@ -735,6 +784,115 @@ def cmd_grid(gs):
 
 
 # ---------------------------------------------------------------------------
+# Command: Lookahead (two-step entropy)
+# ---------------------------------------------------------------------------
+
+LOOKAHEAD_N = 20
+
+def cmd_lookahead(gs):
+    if gs.single:
+        soln = gs.solutions[0]
+    else:
+        result = pick_one_or_all(gs, "Lookahead. ")
+        if result is None:
+            return
+        key, val = result
+        if key == 'all':
+            soln = Solution.join(gs.solutions)
+        else:
+            soln = val
+
+    set_display_context(soln)
+
+    # Need a prior entropy solve
+    if (not soln.scores_updated
+            or soln.scores_method
+            != ScoringMethod.ENTROPY_GAIN):
+        print_error(
+            "Run entropy solve (s) first."
+        )
+        return
+
+    n_rem = len(soln.current_words)
+    if n_rem <= 2:
+        print("Two or fewer words remain, "
+              "lookahead not needed.")
+        return
+
+    # Prompt for N
+    print(f"How many top words? "
+          f"({LOOKAHEAD_N}) ", end="")
+    n_input = input().strip()
+    if n_input:
+        try:
+            count = int(n_input)
+            if count < 1:
+                raise ValueError
+        except ValueError:
+            print_error("Invalid number.")
+            return
+    else:
+        count = LOOKAHEAD_N
+
+    top_n = soln.scores[:count]
+
+    # Determine second-step word list from mode
+    is_hard = (gs.input_set
+               == InputSet.CURRENT_WORDLIST)
+    if is_hard:
+        second_step = None
+        mode_label = "hard mode"
+    else:
+        step2_count = max(count * count, 100)
+        second_step = [
+            w for w, s in soln.scores[:step2_count]
+        ]
+        mode_label = f"top {len(second_step)} guesses"
+
+    print(f"\nTwo-step lookahead on top "
+          f"{len(top_n)} words vs "
+          f"{n_rem:,} remaining.")
+    print(f"({mode_label} for second step)")
+
+    # Phase 1 computes groups (fast), then
+    # total_callback gives us the work count
+    # for the progress tracker.
+    tracker = [None]  # mutable container
+
+    def on_total(total):
+        print(f"  Second-step evaluations: "
+              f"{total:,}")
+        tracker[0] = ProgressTracker(max(total, 1))
+
+    def on_tick():
+        if tracker[0]:
+            tracker[0].update()
+
+    results = soln.compute_lookahead(
+        top_n,
+        second_step_words=second_step,
+        total_callback=on_total,
+        progress_callback=on_tick,
+    )
+
+    if tracker[0]:
+        tracker[0].finish()
+
+    print(f"\nTwo-step entropy lookahead:")
+    print(f"  {'Word':<7} {'Step1':>7}  "
+          f"{'Step2':>7}  {'Total':>7}")
+    print(f"  {'----':<7} {'-----':>7}  "
+          f"{'-----':>7}  {'-----':>7}")
+    for word, s1, s2, combined in results:
+        m = _mark(word)
+        me_flag = '=' if _is_max_ent(s1) else ' '
+        print(f"  {word}{m} "
+              f"{s1:7.4f}{me_flag} "
+              f"{s2:7.4f}  "
+              f"{combined:7.4f}")
+
+
+# ---------------------------------------------------------------------------
 # Command: Display
 # ---------------------------------------------------------------------------
 
@@ -1022,6 +1180,7 @@ def cmd_help(gs):
   g = Guess a word
   s = Solve (find best guess)
   b = Grid (entropy vs max group)
+  l = Lookahead (two-step entropy)
   d = Display remaining words
   t = Test a word (all methods)
   i = Include letters (filter)
@@ -1043,6 +1202,7 @@ COMMANDS = {
     'g': cmd_guess,
     's': cmd_solve,
     'b': cmd_grid,
+    'l': cmd_lookahead,
     'd': cmd_display,
     't': cmd_test,
     'i': cmd_include,
@@ -1110,7 +1270,7 @@ def main():
 
     while True:
         print_status(gs)
-        print(f"\nCommand (gsbdtixrawhv?)? ",
+        print(f"\nCommand (gsbldtixrawhv?)? ",
               end="")
         cmd = input().strip()
         if not cmd:

@@ -430,3 +430,95 @@ class Solution:
             (x[0], x[1][primary])
         ))
         return results
+
+    def compute_lookahead(self, top_words,
+                          second_step_words=None,
+                          total_callback=None,
+                          progress_callback=None):
+        """
+        Two-step entropy lookahead on (word, first_entropy) pairs.
+
+        For each candidate first guess, computes the weighted average
+        of the best second-step entropy across all response groups.
+
+        second_step_words: word list to search for best second guess.
+            If None, uses hard mode (subgroup words only).
+            If provided, searches that list against each subgroup.
+
+        total_callback(n): called once with total work units.
+        progress_callback(): called per work unit.
+
+        Returns sorted list of (word, step1, step2, combined)
+        tuples, best combined score first.
+        """
+        method = ScoringMethod.ENTROPY_GAIN
+        n = len(self.current_words)
+        full_mode = second_step_words is not None
+
+        # Phase 1: compute groups, count work
+        word_data = []
+        total_work = 0
+        for word, first_ent in top_words:
+            groups = calculate_group_counts(
+                word, self.current_words
+            )
+            # Count non-trivial groups (size > 2)
+            big_groups = sum(
+                1 for count in groups.values()
+                if count > 2
+            )
+            if full_mode:
+                work = big_groups * len(second_step_words)
+            else:
+                work = sum(
+                    count for count in groups.values()
+                    if count > 2
+                )
+            total_work += work
+            word_data.append((word, first_ent, groups))
+
+        if total_callback:
+            total_callback(total_work)
+
+        # Phase 2: second-step evaluation
+        results = []
+        for word, first_ent, groups in word_data:
+            weighted_second = 0.0
+
+            for pattern, count in groups.items():
+                if count <= 1:
+                    # Solved: no second guess needed
+                    continue
+
+                if count == 2:
+                    # Either word perfectly splits the pair
+                    weighted_second += (2 / n) * 1.0
+                    continue
+
+                # Get subgroup
+                response = pattern.split(",")
+                subgroup = apply_guess(
+                    self.current_words, word, response
+                )
+
+                # Search for best second guess
+                candidates = (second_step_words
+                              if full_mode else subgroup)
+                best = 0.0
+                for candidate in candidates:
+                    if progress_callback:
+                        progress_callback()
+                    s = score_word(
+                        candidate, subgroup, method
+                    )
+                    best = max(best, s)
+
+                weighted_second += (count / n) * best
+
+            combined = first_ent + weighted_second
+            results.append(
+                (word, first_ent, weighted_second, combined)
+            )
+
+        results.sort(key=lambda x: -x[3])
+        return results
