@@ -16,7 +16,7 @@ import sound
 
 import wordle_engine
 from wordle_engine import (
-    Solution, ScoringMethod, InputSet,
+    Solution, ScoringMethod, InputSet, ResponseCache,
     load_word_list, calculate_response,
     calculate_group_counts, score_groups,
     max_entropy,
@@ -428,15 +428,18 @@ class GameState:
         self.all_guesses = all_guesses
         self.n_answers = len(all_answers)
         self.n_guesses = len(all_guesses)
+        self.cache = ResponseCache(all_answers)
         self.solutions = [Solution(all_answers,
-                                   all_guesses)]
+                                   all_guesses,
+                                   self.cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
         self.volume = 10
 
     def reset_all(self):
         self.solutions = [Solution(self.all_answers,
-                                   self.all_guesses)]
+                                   self.all_guesses,
+                                   self.cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
 
@@ -834,55 +837,100 @@ def cmd_lookahead(gs):
     else:
         count = LOOKAHEAD_N
 
+    # Prompt for depth
+    print(f"Lookahead depth? (2) ", end="")
+    d_input = input().strip()
+    if d_input:
+        try:
+            depth = int(d_input)
+            if depth < 2:
+                raise ValueError
+        except ValueError:
+            print_error("Invalid depth.")
+            return
+    else:
+        depth = 2
+
     top_n = soln.scores[:count]
 
     # Determine second-step word list from mode
     is_hard = (gs.input_set
                == InputSet.CURRENT_WORDLIST)
     if is_hard:
-        second_step = None
+        global_candidates = None
         mode_label = "hard mode"
     else:
         step2_count = max(count * count, 100)
-        second_step = [
+        global_candidates = [
             w for w, s in soln.scores[:step2_count]
         ]
-        mode_label = f"top {len(second_step)} guesses"
+        mode_label = f"top {len(global_candidates)} guesses"
 
-    print(f"\nTwo-step lookahead on top "
+    print(f"\n{depth}-step lookahead on top "
           f"{len(top_n)} words vs "
           f"{n_rem:,} remaining.")
-    print(f"({mode_label} for second step)")
+    print(f"({mode_label} for deeper steps)")
 
-    # Phase 1 computes groups (fast), then
-    # total_callback gives us the work count
-    # for the progress tracker.
-    tracker = [None]  # mutable container
+    if depth == 2:
+        # Use the fast two-step path
+        tracker = [None]
 
-    def on_total(total):
-        print(f"  Second-step evaluations: "
-              f"{total:,}")
-        tracker[0] = ProgressTracker(max(total, 1))
+        def on_total(total):
+            print(f"  Evaluations: {total:,}")
+            tracker[0] = ProgressTracker(
+                max(total, 1)
+            )
 
-    def on_tick():
+        def on_tick():
+            if tracker[0]:
+                tracker[0].update()
+
+        results = soln.compute_lookahead(
+            top_n,
+            second_step_words=global_candidates,
+            total_callback=on_total,
+            progress_callback=on_tick,
+        )
+
         if tracker[0]:
-            tracker[0].update()
+            tracker[0].finish()
+        status = 'complete'
 
-    results = soln.compute_lookahead(
-        top_n,
-        second_step_words=second_step,
-        total_callback=on_total,
-        progress_callback=on_tick,
-    )
+    else:
+        # Deep lookahead with pruning
+        budget = 300  # 5 minutes
+        print(f"  Time budget: {budget}s")
+        print(f"  Pruning to top {LOOKAHEAD_N}")
 
-    if tracker[0]:
-        tracker[0].finish()
+        def on_progress(idx, total, word, score):
+            pct = (idx + 1) * 100 // total
+            if score is not None:
+                print(f"  {idx+1}/{total} "
+                      f"{word}{_mark(word)}"
+                      f" {score:.4f}",
+                      flush=True)
+            else:
+                print(f"  {idx+1}/{total} "
+                      f"{word}{_mark(word)}"
+                      f" (pruned)",
+                      flush=True)
 
-    print(f"\nTwo-step entropy lookahead:")
+        results, status = soln.compute_deep_lookahead(
+            top_n,
+            global_candidates=global_candidates,
+            max_depth=depth - 1,
+            time_budget=budget,
+            top_k=LOOKAHEAD_N,
+            progress_callback=on_progress,
+        )
+
+    label = f"{depth}-step"
+    print(f"\n{label} entropy lookahead "
+          f"({status}):")
     print(f"  {'Word':<7} {'Step1':>7}  "
-          f"{'Step2':>7}  {'Total':>7}")
+          f"{'Deeper':>7}  {'Total':>7}")
     print(f"  {'----':<7} {'-----':>7}  "
-          f"{'-----':>7}  {'-----':>7}")
+          f"{'------':>7}  {'-----':>7}")
     for word, s1, s2, combined in results:
         m = _mark(word)
         me_flag = '=' if _is_max_ent(s1) else ' '
@@ -1120,7 +1168,8 @@ def cmd_wordcount(gs):
         if wc < 1:
             raise ValueError
         gs.solutions = [
-            Solution(gs.all_answers, gs.all_guesses)
+            Solution(gs.all_answers, gs.all_guesses,
+                     gs.cache)
             for _ in range(wc)
         ]
         if wc > 1:
@@ -1180,7 +1229,7 @@ def cmd_help(gs):
   g = Guess a word
   s = Solve (find best guess)
   b = Grid (entropy vs max group)
-  l = Lookahead (two-step entropy)
+  l = Lookahead (multi-step entropy)
   d = Display remaining words
   t = Test a word (all methods)
   i = Include letters (filter)

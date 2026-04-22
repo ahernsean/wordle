@@ -5,6 +5,7 @@ No UI dependencies. All display/interaction is handled by the caller.
 """
 
 import math
+import time
 from collections import defaultdict
 from enum import Enum, auto
 
@@ -618,3 +619,246 @@ class Solution:
 
         results.sort(key=lambda x: -x[3])
         return results
+
+    def compute_deep_lookahead(self, top_words,
+                               global_candidates=None,
+                               max_depth=3,
+                               time_budget=300,
+                               top_k=20,
+                               progress_callback=None):
+        """
+        Adaptive-depth entropy lookahead with pruning.
+
+        Recursively evaluates up to max_depth levels,
+        using branch-and-bound pruning: for a subgroup of
+        size k, the max remaining contribution is log2(k).
+
+        global_candidates: top-N² words from step-1 solve.
+            At each level, candidates = union of subgroup
+            + global_candidates.
+            If None, hard mode (subgroup only).
+        max_depth: max levels beyond step 1 (default 3).
+        time_budget: seconds before stopping (default 300).
+        top_k: keep this many best results (default 20).
+        progress_callback: called per first-guess word
+            completed, with (index, total, word, score).
+
+        Returns sorted list of (word, step1, deeper,
+        combined) tuples, best combined score first.
+        Also returns a status string ('complete' or
+        'timeout after N of M').
+        """
+        cache = self.cache
+        n = len(self.current_words)
+        deadline = time.time() + time_budget
+        global_set = (set(global_candidates)
+                      if global_candidates else set())
+
+        # Pruning threshold: 20th best score found.
+        # Starts at 0 (no pruning until we have top_k).
+        results = []
+        prune_threshold = 0.0
+
+        def _update_threshold():
+            nonlocal prune_threshold
+            if len(results) >= top_k:
+                results.sort(key=lambda x: -x[3])
+                prune_threshold = results[top_k - 1][3]
+
+        def _best_from_subgroup(subgroup, depth):
+            """Return the best total weighted entropy
+            achievable from this subgroup over `depth`
+            remaining levels."""
+            k = len(subgroup)
+            if k <= 1:
+                return 0.0
+            if k == 2:
+                return 1.0
+            if depth <= 0:
+                return 0.0
+
+            # Build candidate list: subgroup + globals
+            sg_set = set(subgroup)
+            candidates = list(subgroup)
+            for w in global_set:
+                if w not in sg_set:
+                    candidates.append(w)
+
+            best_total = 0.0
+            for candidate in candidates:
+                # Get this candidate's partition
+                if cache:
+                    groups = cache.group_words(
+                        candidate, subgroup
+                    )
+                else:
+                    gc = calculate_group_counts(
+                        candidate, subgroup
+                    )
+                    groups = {}
+                    for pat, cnt in gc.items():
+                        resp = pat.split(",")
+                        sub = apply_guess(
+                            subgroup, candidate, resp
+                        )
+                        groups[pat] = sub
+
+                # Entropy at this level
+                sizes = [len(ws) for ws in
+                         groups.values()]
+                ent = 0.0
+                for s in sizes:
+                    p = s / k
+                    if p > 0:
+                        ent -= p * math.log2(p)
+
+                # Upper bound: ent + sum of log2
+                # bounds on children
+                if depth > 1:
+                    upper = ent
+                    for ws in groups.values():
+                        m = len(ws)
+                        if m > 1:
+                            upper += (m / k) * math.log2(m)
+                    if upper <= best_total:
+                        continue  # prune candidate
+
+                # Recurse into children
+                recursive = 0.0
+                for pat, sub_sub in groups.items():
+                    m = len(sub_sub)
+                    if m <= 1:
+                        continue
+                    if m == 2:
+                        recursive += (2 / k) * 1.0
+                        continue
+                    sub_score = _best_from_subgroup(
+                        sub_sub, depth - 1
+                    )
+                    recursive += (m / k) * sub_score
+
+                total = ent + recursive
+                best_total = max(best_total, total)
+
+            return best_total
+
+        # Main loop over first-guess candidates
+        total_words = len(top_words)
+        completed = 0
+        timed_out = False
+
+        for idx, (word, first_ent) in enumerate(
+                top_words):
+            # Time check
+            if time.time() > deadline:
+                timed_out = True
+                break
+
+            # Get step-1 groups
+            if cache:
+                grouped = cache.group_words(
+                    word, self.current_words
+                )
+            else:
+                gc = calculate_group_counts(
+                    word, self.current_words
+                )
+                grouped = {}
+                for pat, cnt in gc.items():
+                    resp = pat.split(",")
+                    sub = apply_guess(
+                        self.current_words, word, resp
+                    )
+                    grouped[pat] = sub
+
+            # Upper bound for this word
+            upper = first_ent
+            for ws in grouped.values():
+                m = len(ws)
+                if m > 1:
+                    upper += (m / n) * math.log2(m)
+
+            if (len(results) >= top_k
+                    and upper <= prune_threshold):
+                completed += 1
+                if progress_callback:
+                    progress_callback(
+                        idx, total_words, word, None
+                    )
+                continue  # prune entire word
+
+            # Evaluate each group
+            weighted_deeper = 0.0
+            # Track partial upper bound for mid-word
+            # pruning: replace remaining groups' actual
+            # scores with log2 bounds
+            remaining_upper = upper - first_ent
+            actual_so_far = 0.0
+            pruned_mid = False
+
+            # Sort groups largest first (evaluate the
+            # most informative groups first for better
+            # pruning)
+            sorted_groups = sorted(
+                grouped.items(),
+                key=lambda x: -len(x[1])
+            )
+
+            for pat, subgroup in sorted_groups:
+                count = len(subgroup)
+                if count <= 1:
+                    continue
+
+                # Remove this group's upper bound
+                # contribution
+                if count > 1:
+                    remaining_upper -= (
+                        (count / n) * math.log2(count)
+                    )
+
+                if count == 2:
+                    contrib = (2 / n) * 1.0
+                    actual_so_far += contrib
+                    weighted_deeper += contrib
+                else:
+                    sub_score = _best_from_subgroup(
+                        subgroup, max_depth
+                    )
+                    contrib = (count / n) * sub_score
+                    actual_so_far += contrib
+                    weighted_deeper += contrib
+
+                # Mid-word prune check
+                refined = (first_ent + actual_so_far
+                           + remaining_upper)
+                if (len(results) >= top_k
+                        and refined <= prune_threshold):
+                    pruned_mid = True
+                    break
+
+            if not pruned_mid:
+                combined = first_ent + weighted_deeper
+                results.append(
+                    (word, first_ent,
+                     weighted_deeper, combined)
+                )
+                _update_threshold()
+
+            completed += 1
+            if progress_callback:
+                score = (None if pruned_mid
+                         else first_ent + weighted_deeper)
+                progress_callback(
+                    idx, total_words, word, score
+                )
+
+        results.sort(key=lambda x: -x[3])
+        results = results[:top_k]
+
+        if timed_out:
+            status = (f'timeout after {completed}'
+                      f' of {total_words}')
+        else:
+            status = 'complete'
+
+        return results, status
