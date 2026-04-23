@@ -5,6 +5,7 @@ No UI dependencies. All display/interaction is handled by the caller.
 """
 
 import math
+import time
 from collections import defaultdict
 from enum import Enum, auto
 
@@ -100,6 +101,27 @@ def calculate_response(test_word, answer_word):
             response.append("gray")
 
     return response
+
+
+_RESPONSE_VALUES = {'gray': 0, 'yellow': 1, 'green': 2}
+_RESPONSE_NAMES = {0: 'gray', 1: 'yellow', 2: 'green'}
+
+
+def _encode_response(response):
+    """Encode a response list as an integer 0-242 (base 3)."""
+    code = 0
+    for r in response:
+        code = code * 3 + _RESPONSE_VALUES[r]
+    return code
+
+
+def _decode_response(code):
+    """Decode an integer 0-242 back to a response list."""
+    result = []
+    for _ in range(5):
+        result.append(_RESPONSE_NAMES[code % 3])
+        code //= 3
+    return result[::-1]
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +228,64 @@ def calculate_group_counts(test_word, words):
 
 
 # ---------------------------------------------------------------------------
+# Response cache
+# ---------------------------------------------------------------------------
+
+class ResponseCache:
+    """Lazily caches word-to-pattern mappings for each guess word.
+
+    For each guess word G, stores a dict mapping every answer word
+    to its encoded response pattern (int 0-242). This is built
+    once per guess word on first access, then all subsequent
+    scoring against any subset is just dict lookups and counting.
+    """
+
+    def __init__(self, answer_words):
+        self.answer_words = answer_words
+        self._cache = {}   # guess → {answer → pattern_int}
+
+    def _ensure(self, guess):
+        """Build the mapping for guess if not cached."""
+        if guess not in self._cache:
+            mapping = {}
+            for answer in self.answer_words:
+                resp = calculate_response(guess, answer)
+                mapping[answer] = _encode_response(resp)
+            self._cache[guess] = mapping
+
+    def group_counts(self, guess, subset):
+        """Return {pattern_int: count} for guess vs subset."""
+        self._ensure(guess)
+        mapping = self._cache[guess]
+        counts = defaultdict(int)
+        for word in subset:
+            if word in mapping:
+                counts[mapping[word]] += 1
+            else:
+                # Uncached word (e.g. fallback mode)
+                resp = calculate_response(guess, word)
+                counts[_encode_response(resp)] += 1
+        return counts
+
+    def group_words(self, guess, subset):
+        """Return {pattern_int: [words]} for guess vs subset."""
+        self._ensure(guess)
+        mapping = self._cache[guess]
+        groups = defaultdict(list)
+        for word in subset:
+            if word in mapping:
+                groups[mapping[word]].append(word)
+            else:
+                resp = calculate_response(guess, word)
+                groups[_encode_response(resp)].append(word)
+        return groups
+
+    def is_cached(self, guess):
+        """Check if a guess word is already cached."""
+        return guess in self._cache
+
+
+# ---------------------------------------------------------------------------
 # Scoring functions
 # ---------------------------------------------------------------------------
 
@@ -259,23 +339,29 @@ def score_groups_multi(groups, methods):
 
 
 def score_word(word, remaining_words, method=ScoringMethod.UNWEIGHTED_AVG,
-               progress_callback=None):
+               progress_callback=None, cache=None):
     """Score a single candidate guess against the remaining answer words."""
     if progress_callback:
         progress_callback()
-    groups = calculate_group_counts(word, remaining_words)
+    if cache:
+        groups = cache.group_counts(word, remaining_words)
+    else:
+        groups = calculate_group_counts(word, remaining_words)
     return score_groups(groups, method)
 
 
 def score_word_multi(word, remaining_words, methods,
-                     progress_callback=None):
+                     progress_callback=None, cache=None):
     """
     Score a single candidate guess under multiple methods.
     Computes group counts once, then scores with each method.
     """
     if progress_callback:
         progress_callback()
-    groups = calculate_group_counts(word, remaining_words)
+    if cache:
+        groups = cache.group_counts(word, remaining_words)
+    else:
+        groups = calculate_group_counts(word, remaining_words)
     return score_groups_multi(groups, methods)
 
 
@@ -303,9 +389,11 @@ class Solution:
     list is exhausted (word not in answer list).
     """
 
-    def __init__(self, answer_words, all_guesses=None):
+    def __init__(self, answer_words, all_guesses=None,
+                 cache=None):
         self.all_answers = answer_words
         self.all_guesses = all_guesses
+        self.cache = cache
         self.reset()
 
     def reset(self):
@@ -382,8 +470,10 @@ class Solution:
         """
         if not solutions:
             return None
-        out = Solution(solutions[0].all_answers,
-                       solutions[0].all_guesses)
+        first = solutions[0]
+        out = Solution(first.all_answers,
+                       first.all_guesses,
+                       first.cache)
         combined = set()
         for soln in solutions:
             if len(soln.current_words) > 1:
@@ -401,7 +491,8 @@ class Solution:
         results = []
         for word in input_wordlist:
             s = score_word(
-                word, self.current_words, method, progress_callback
+                word, self.current_words, method,
+                progress_callback, cache=self.cache
             )
             results.append((word, s))
         results.sort(key=method.sort_key())
@@ -422,7 +513,7 @@ class Solution:
         for word in input_wordlist:
             scores = score_word_multi(
                 word, self.current_words, methods,
-                progress_callback
+                progress_callback, cache=self.cache
             )
             results.append((word, scores))
         primary = methods[0]
@@ -454,54 +545,59 @@ class Solution:
         method = ScoringMethod.ENTROPY_GAIN
         n = len(self.current_words)
         full_mode = second_step_words is not None
+        cache = self.cache
 
-        # Phase 1: compute groups, count work
+        # Phase 1: compute group partitions, count work
         word_data = []
         total_work = 0
         for word, first_ent in top_words:
-            groups = calculate_group_counts(
-                word, self.current_words
-            )
-            # Count non-trivial groups (size > 2)
+            if cache:
+                grouped = cache.group_words(
+                    word, self.current_words
+                )
+            else:
+                groups = calculate_group_counts(
+                    word, self.current_words
+                )
+                grouped = {}
+                for pattern, cnt in groups.items():
+                    resp = pattern.split(",")
+                    sub = apply_guess(
+                        self.current_words, word, resp
+                    )
+                    grouped[pattern] = sub
+
             big_groups = sum(
-                1 for count in groups.values()
-                if count > 2
+                1 for ws in grouped.values()
+                if len(ws) > 2
             )
             if full_mode:
                 work = big_groups * len(second_step_words)
             else:
                 work = sum(
-                    count for count in groups.values()
-                    if count > 2
+                    len(ws) for ws in grouped.values()
+                    if len(ws) > 2
                 )
             total_work += work
-            word_data.append((word, first_ent, groups))
+            word_data.append((word, first_ent, grouped))
 
         if total_callback:
             total_callback(total_work)
 
         # Phase 2: second-step evaluation
         results = []
-        for word, first_ent, groups in word_data:
+        for word, first_ent, grouped in word_data:
             weighted_second = 0.0
 
-            for pattern, count in groups.items():
+            for pattern, subgroup in grouped.items():
+                count = len(subgroup)
                 if count <= 1:
-                    # Solved: no second guess needed
                     continue
 
                 if count == 2:
-                    # Either word perfectly splits the pair
                     weighted_second += (2 / n) * 1.0
                     continue
 
-                # Get subgroup
-                response = pattern.split(",")
-                subgroup = apply_guess(
-                    self.current_words, word, response
-                )
-
-                # Search for best second guess
                 candidates = (second_step_words
                               if full_mode else subgroup)
                 best = 0.0
@@ -509,7 +605,8 @@ class Solution:
                     if progress_callback:
                         progress_callback()
                     s = score_word(
-                        candidate, subgroup, method
+                        candidate, subgroup, method,
+                        cache=cache
                     )
                     best = max(best, s)
 
@@ -522,3 +619,246 @@ class Solution:
 
         results.sort(key=lambda x: -x[3])
         return results
+
+    def compute_deep_lookahead(self, top_words,
+                               global_candidates=None,
+                               max_depth=3,
+                               time_budget=300,
+                               top_k=20,
+                               progress_callback=None):
+        """
+        Adaptive-depth entropy lookahead with pruning.
+
+        Recursively evaluates up to max_depth levels,
+        using branch-and-bound pruning: for a subgroup of
+        size k, the max remaining contribution is log2(k).
+
+        global_candidates: top-N² words from step-1 solve.
+            At each level, candidates = union of subgroup
+            + global_candidates.
+            If None, hard mode (subgroup only).
+        max_depth: max levels beyond step 1 (default 3).
+        time_budget: seconds before stopping (default 300).
+        top_k: keep this many best results (default 20).
+        progress_callback: called per first-guess word
+            completed, with (index, total, word, score).
+
+        Returns sorted list of (word, step1, deeper,
+        combined) tuples, best combined score first.
+        Also returns a status string ('complete' or
+        'timeout after N of M').
+        """
+        cache = self.cache
+        n = len(self.current_words)
+        deadline = time.time() + time_budget
+        global_set = (set(global_candidates)
+                      if global_candidates else set())
+
+        # Pruning threshold: 20th best score found.
+        # Starts at 0 (no pruning until we have top_k).
+        results = []
+        prune_threshold = 0.0
+
+        def _update_threshold():
+            nonlocal prune_threshold
+            if len(results) >= top_k:
+                results.sort(key=lambda x: -x[3])
+                prune_threshold = results[top_k - 1][3]
+
+        def _best_from_subgroup(subgroup, depth):
+            """Return the best total weighted entropy
+            achievable from this subgroup over `depth`
+            remaining levels."""
+            k = len(subgroup)
+            if k <= 1:
+                return 0.0
+            if k == 2:
+                return 1.0
+            if depth <= 0:
+                return 0.0
+
+            # Build candidate list: subgroup + globals
+            sg_set = set(subgroup)
+            candidates = list(subgroup)
+            for w in global_set:
+                if w not in sg_set:
+                    candidates.append(w)
+
+            best_total = 0.0
+            for candidate in candidates:
+                # Get this candidate's partition
+                if cache:
+                    groups = cache.group_words(
+                        candidate, subgroup
+                    )
+                else:
+                    gc = calculate_group_counts(
+                        candidate, subgroup
+                    )
+                    groups = {}
+                    for pat, cnt in gc.items():
+                        resp = pat.split(",")
+                        sub = apply_guess(
+                            subgroup, candidate, resp
+                        )
+                        groups[pat] = sub
+
+                # Entropy at this level
+                sizes = [len(ws) for ws in
+                         groups.values()]
+                ent = 0.0
+                for s in sizes:
+                    p = s / k
+                    if p > 0:
+                        ent -= p * math.log2(p)
+
+                # Upper bound: ent + sum of log2
+                # bounds on children
+                if depth > 1:
+                    upper = ent
+                    for ws in groups.values():
+                        m = len(ws)
+                        if m > 1:
+                            upper += (m / k) * math.log2(m)
+                    if upper <= best_total:
+                        continue  # prune candidate
+
+                # Recurse into children
+                recursive = 0.0
+                for pat, sub_sub in groups.items():
+                    m = len(sub_sub)
+                    if m <= 1:
+                        continue
+                    if m == 2:
+                        recursive += (2 / k) * 1.0
+                        continue
+                    sub_score = _best_from_subgroup(
+                        sub_sub, depth - 1
+                    )
+                    recursive += (m / k) * sub_score
+
+                total = ent + recursive
+                best_total = max(best_total, total)
+
+            return best_total
+
+        # Main loop over first-guess candidates
+        total_words = len(top_words)
+        completed = 0
+        timed_out = False
+
+        for idx, (word, first_ent) in enumerate(
+                top_words):
+            # Time check
+            if time.time() > deadline:
+                timed_out = True
+                break
+
+            # Get step-1 groups
+            if cache:
+                grouped = cache.group_words(
+                    word, self.current_words
+                )
+            else:
+                gc = calculate_group_counts(
+                    word, self.current_words
+                )
+                grouped = {}
+                for pat, cnt in gc.items():
+                    resp = pat.split(",")
+                    sub = apply_guess(
+                        self.current_words, word, resp
+                    )
+                    grouped[pat] = sub
+
+            # Upper bound for this word
+            upper = first_ent
+            for ws in grouped.values():
+                m = len(ws)
+                if m > 1:
+                    upper += (m / n) * math.log2(m)
+
+            if (len(results) >= top_k
+                    and upper <= prune_threshold):
+                completed += 1
+                if progress_callback:
+                    progress_callback(
+                        idx, total_words, word, None
+                    )
+                continue  # prune entire word
+
+            # Evaluate each group
+            weighted_deeper = 0.0
+            # Track partial upper bound for mid-word
+            # pruning: replace remaining groups' actual
+            # scores with log2 bounds
+            remaining_upper = upper - first_ent
+            actual_so_far = 0.0
+            pruned_mid = False
+
+            # Sort groups largest first (evaluate the
+            # most informative groups first for better
+            # pruning)
+            sorted_groups = sorted(
+                grouped.items(),
+                key=lambda x: -len(x[1])
+            )
+
+            for pat, subgroup in sorted_groups:
+                count = len(subgroup)
+                if count <= 1:
+                    continue
+
+                # Remove this group's upper bound
+                # contribution
+                if count > 1:
+                    remaining_upper -= (
+                        (count / n) * math.log2(count)
+                    )
+
+                if count == 2:
+                    contrib = (2 / n) * 1.0
+                    actual_so_far += contrib
+                    weighted_deeper += contrib
+                else:
+                    sub_score = _best_from_subgroup(
+                        subgroup, max_depth
+                    )
+                    contrib = (count / n) * sub_score
+                    actual_so_far += contrib
+                    weighted_deeper += contrib
+
+                # Mid-word prune check
+                refined = (first_ent + actual_so_far
+                           + remaining_upper)
+                if (len(results) >= top_k
+                        and refined <= prune_threshold):
+                    pruned_mid = True
+                    break
+
+            if not pruned_mid:
+                combined = first_ent + weighted_deeper
+                results.append(
+                    (word, first_ent,
+                     weighted_deeper, combined)
+                )
+                _update_threshold()
+
+            completed += 1
+            if progress_callback:
+                score = (None if pruned_mid
+                         else first_ent + weighted_deeper)
+                progress_callback(
+                    idx, total_words, word, score
+                )
+
+        results.sort(key=lambda x: -x[3])
+        results = results[:top_k]
+
+        if timed_out:
+            status = (f'timeout after {completed}'
+                      f' of {total_words}')
+        else:
+            status = 'complete'
+
+        return results, status
