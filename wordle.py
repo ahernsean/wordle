@@ -243,7 +243,7 @@ class ProgressTracker:
                     elapsed = now - self.start_time
                     remaining = (elapsed
                                  * (1 - frac) / frac)
-                    label = f'~{self._fmt_eta(remaining)} '
+                    label = f'~{self._fmt_eta(remaining)}'
                     self._maybe_wrap(len(label))
                     print(label, end='', flush=True)
                     self.chars_printed += len(label)
@@ -268,7 +268,7 @@ class ProgressTracker:
                 elapsed = now - self.start_time
                 remaining = (elapsed
                              * (1 - frac) / frac)
-                label = f'~{self._fmt_eta(remaining)} '
+                label = f'~{self._fmt_eta(remaining)}'
                 print(label, end='', flush=True)
                 self.chars_printed += len(label)
         # Wrap check
