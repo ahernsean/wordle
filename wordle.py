@@ -1,5 +1,5 @@
 """
-wordle.py - Interactive Wordle solver (Pythonista for iOS).
+wordle.py - Interactive Wordle solver (Pythonista on iOS, Linux-friendly).
 
 Supports single-game and multi-game (quordle, etc.) modes.
 When running a single game, redundant prompts are skipped
@@ -7,12 +7,21 @@ for a streamlined experience.
 """
 
 import os
+import sys
 import pickle
+import shutil
 from datetime import datetime
 import contextlib
 
-import console
-import sound
+try:
+    import console  # Pythonista
+except ImportError:
+    console = None
+
+try:
+    import sound  # Pythonista
+except ImportError:
+    sound = None
 
 import wordle_engine
 from wordle_engine import (
@@ -32,50 +41,94 @@ ENGINE_PATH = wordle_engine.__file__
 
 
 # ---------------------------------------------------------------------------
-# Console helpers (Pythonista-specific)
+# Platform helpers
 # ---------------------------------------------------------------------------
 
-console.set_color()
-sound.set_volume(1)
+IS_PYTHONISTA = console is not None
+IS_LINUX = sys.platform.startswith("linux")
+SUPPORTS_COLOR = (
+    IS_PYTHONISTA
+    or (
+        IS_LINUX
+        and sys.stdout.isatty()
+        and "NO_COLOR" not in os.environ
+        and os.environ.get("TERM") != "dumb"
+    )
+)
+
+ANSI_COLORS = {
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+}
+ANSI_RESET = "\033[0m"
+
+if sound is not None:
+    sound.set_volume(1)
+if console is not None:
+    console.set_color()
+
+
+def play_effect(name, *_args, **_kwargs):
+    if sound is not None:
+        sound.play_effect(name, *_args, **_kwargs)
+
+
+def set_volume(level):
+    if sound is not None:
+        sound.set_volume(level)
+
+
+def reset_color():
+    if IS_PYTHONISTA and console is not None:
+        console.set_color()
+    elif SUPPORTS_COLOR:
+        print(ANSI_RESET, end="")
 
 
 def get_display_width():
     """
     Auto-detect console width in characters.
-
-    Uses console.get_size() for the view width in
-    points, then tries common monospace fonts to find
-    which one divides the width into a clean integer
-    column count.
     """
+    if IS_PYTHONISTA and console is not None:
+        """
+        Uses console.get_size() for the view width in
+        points, then tries common monospace fonts to find
+        which one divides the width into a clean integer
+        column count.
+        """
+        try:
+            import ui
+            w_points, _ = console.get_size()
+            candidates = [
+                ('Menlo', 12), ('Menlo', 14),
+                ('DejaVuSansMono', 16),
+                ('Courier', 12), ('Courier', 14),
+            ]
+            best_cols = None
+            best_err = 999
+            for name, size in candidates:
+                try:
+                    cw, _ = ui.measure_string(
+                        'M', font=(name, size)
+                    )
+                    cols = w_points / cw
+                    err = abs(cols - round(cols))
+                    if err < best_err:
+                        best_err = err
+                        best_cols = int(cols)
+                except Exception:
+                    continue
+            if best_cols and best_cols >= 20:
+                return best_cols
+        except Exception:
+            pass
+        return 42  # safe iPhone fallback
+
     try:
-        import ui
-        w_points, _ = console.get_size()
-        # Try common Pythonista monospace fonts/sizes
-        candidates = [
-            ('Menlo', 12), ('Menlo', 14),
-            ('DejaVuSansMono', 16),
-            ('Courier', 12), ('Courier', 14),
-        ]
-        best_cols = None
-        best_err = 999
-        for name, size in candidates:
-            try:
-                cw, _ = ui.measure_string(
-                    'M', font=(name, size)
-                )
-                cols = w_points / cw
-                err = abs(cols - round(cols))
-                if err < best_err:
-                    best_err = err
-                    best_cols = int(cols)
-            except Exception:
-                continue
-        if best_cols and best_cols >= 20:
-            return best_cols
+        return shutil.get_terminal_size(fallback=(80, 24)).columns
     except Exception:
-        pass
-    return 42  # safe iPhone fallback
+        return 80
 
 
 DISPLAY_WIDTH = get_display_width()
@@ -84,25 +137,28 @@ print(f'Display width: {DISPLAY_WIDTH} columns')
 
 @contextlib.contextmanager
 def colored_text(color):
-    colors = {
+    pythonista_colors = {
         "red":    (1, 0, 0),
         "green":  (0, 0.6, 0),
         "yellow": (0.6, 0.6, 0),
     }
-    if isinstance(color, list):
-        console.set_color(*color)
-    elif color in colors:
-        console.set_color(*colors[color])
-    else:
-        console.set_color()
+    if IS_PYTHONISTA and console is not None:
+        if isinstance(color, list):
+            console.set_color(*color)
+        elif color in pythonista_colors:
+            console.set_color(*pythonista_colors[color])
+        else:
+            reset_color()
+    elif SUPPORTS_COLOR and color in ANSI_COLORS:
+        print(ANSI_COLORS[color], end="")
     try:
         yield
     finally:
-        console.set_color()
+        reset_color()
 
 
 def print_error(msg):
-    sound.play_effect("Error")
+    play_effect("Error")
     with colored_text("red"):
         print(msg)
 
@@ -374,7 +430,7 @@ def print_word_list(words, limit=20):
 
 def print_guesses(soln):
     """Print guess history with colored output."""
-    console.set_color()
+    reset_color()
     if not soln.guesses:
         return
     print("  Prior guesses:")
@@ -384,7 +440,7 @@ def print_guesses(soln):
         print('  ', end='')
         print_colored_word(word, response)
         print()
-    console.set_color()
+    reset_color()
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +575,7 @@ def cmd_guess(gs):
                 f'  Already solved: '
                 f'{soln.current_words[0]}'
             )
-            sound.play_effect("Jump", 1, 0.3)
+            play_effect("Jump", 1, 0.3)
             continue
         elif len(soln.current_words) == 0:
             print_error("  No remaining words!")
@@ -561,7 +617,7 @@ def cmd_guess(gs):
         if len(cw) == 0:
             print_error(": No words remaining!")
         elif len(cw) == 1:
-            sound.play_effect("Coin_1")
+            play_effect("Coin_1")
             print_success(f': {cw[0]}')
         else:
             print()
@@ -1205,8 +1261,11 @@ def cmd_volume(gs):
           end="")
     try:
         gs.volume = int(input().strip())
-        sound.set_volume(gs.volume / 10)
-        print(f"  Volume: {gs.volume}")
+        set_volume(gs.volume / 10)
+        if sound is None:
+            print(f"  Volume stored as {gs.volume} (no sound on this platform)")
+        else:
+            print(f"  Volume: {gs.volume}")
     except (ValueError, TypeError):
         print_error("Invalid volume.")
 
@@ -1321,7 +1380,17 @@ def main():
         print_status(gs)
         print(f"\nCommand (gsbldtixrawhv?)? ",
               end="")
-        cmd = input().strip()
+        try:
+            cmd = input().strip()
+        except EOFError:
+            print()
+            print("Exiting.")
+            break
+        except KeyboardInterrupt:
+            print()
+            print("Interrupted.")
+            break
+
         if not cmd:
             continue
         handler = COMMANDS.get(cmd[0])
