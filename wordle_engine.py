@@ -285,6 +285,106 @@ class ResponseCache:
         return guess in self._cache
 
 
+class AdaptivePartitionAdapter:
+    """Thin adaptive-search wrapper around ResponseCache.
+
+    Provides machine-stable partition payloads keyed by pattern id,
+    where each child subgroup is represented as a bitset over the
+    global answer-word index space.
+    """
+
+    def __init__(self, answer_words, response_cache):
+        self.answer_words = answer_words
+        self.response_cache = response_cache
+        self._word_to_index = {
+            word: idx for idx, word in enumerate(answer_words)
+        }
+        self._subset_word_cache = {}      # subset_bits -> [words]
+        self._partition_cache = {}        # (guess, subset_bits) -> payload
+
+    def bits_to_words(self, subset_bits):
+        """Convert subset bitset to list of words (memoized)."""
+        cached = self._subset_word_cache.get(subset_bits)
+        if cached is not None:
+            return cached
+
+        words = []
+        bits = subset_bits
+        while bits:
+            low_bit = bits & -bits
+            idx = low_bit.bit_length() - 1
+            words.append(self.answer_words[idx])
+            bits ^= low_bit
+
+        self._subset_word_cache[subset_bits] = words
+        return words
+
+    def words_to_bits(self, words):
+        """Convert words iterable to subset bitset."""
+        bits = 0
+        for word in words:
+            idx = self._word_to_index.get(word)
+            if idx is not None:
+                bits |= (1 << idx)
+        return bits
+
+    def partition(self, guess_word, subset_bits):
+        """Return adaptive partition payload for (guess, subset_bits).
+
+        Stable machine format:
+        {
+            "pattern_to_subset_bits": {pattern_id: child_subset_bits},
+            "pattern_counts": {pattern_id: child_count},
+            "pattern_weights": {pattern_id: child_count / parent_count},
+            "immediate_entropy": float,
+            "total_count": int,
+        }
+        """
+        cache_key = (guess_word, subset_bits)
+        cached = self._partition_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        subset_words = self.bits_to_words(subset_bits)
+        groups = self.response_cache.group_words(
+            guess_word, subset_words
+        )
+
+        pattern_to_subset_bits = {}
+        pattern_counts = {}
+        total_count = len(subset_words)
+
+        for pattern_id in sorted(groups):
+            child_words = groups[pattern_id]
+            child_bits = self.words_to_bits(child_words)
+            pattern_to_subset_bits[pattern_id] = child_bits
+            pattern_counts[pattern_id] = len(child_words)
+
+        if total_count == 0:
+            pattern_weights = {
+                pattern_id: 0.0 for pattern_id in pattern_counts
+            }
+        else:
+            pattern_weights = {
+                pattern_id: pattern_counts[pattern_id] / total_count
+                for pattern_id in pattern_counts
+            }
+
+        immediate_entropy = score_groups(
+            pattern_counts, ScoringMethod.ENTROPY_GAIN
+        )
+
+        payload = {
+            "pattern_to_subset_bits": pattern_to_subset_bits,
+            "pattern_counts": pattern_counts,
+            "pattern_weights": pattern_weights,
+            "immediate_entropy": immediate_entropy,
+            "total_count": total_count,
+        }
+        self._partition_cache[cache_key] = payload
+        return payload
+
+
 # ---------------------------------------------------------------------------
 # Scoring functions
 # ---------------------------------------------------------------------------
@@ -653,6 +753,17 @@ class Solution:
         deadline = time.time() + time_budget
         global_set = (set(global_candidates)
                       if global_candidates else set())
+        adaptive_partitions = None
+        if cache:
+            adaptive_partitions = AdaptivePartitionAdapter(
+                self.all_answers, cache
+            )
+
+        full_bits = 0
+        if adaptive_partitions:
+            full_bits = adaptive_partitions.words_to_bits(
+                self.current_words
+            )
 
         # Pruning threshold: 20th best score found.
         # Starts at 0 (no pruning until we have top_k).
@@ -687,10 +798,20 @@ class Solution:
             best_total = 0.0
             for candidate in candidates:
                 # Get this candidate's partition
-                if cache:
-                    groups = cache.group_words(
-                        candidate, subgroup
+                if adaptive_partitions:
+                    subgroup_bits = adaptive_partitions.words_to_bits(
+                        subgroup
                     )
+                    partition_data = adaptive_partitions.partition(
+                        candidate, subgroup_bits
+                    )
+                    groups = {
+                        pattern_id: adaptive_partitions.bits_to_words(
+                            child_bits
+                        )
+                        for pattern_id, child_bits in
+                        partition_data["pattern_to_subset_bits"].items()
+                    }
                 else:
                     gc = calculate_group_counts(
                         candidate, subgroup
@@ -755,10 +876,17 @@ class Solution:
                 break
 
             # Get step-1 groups
-            if cache:
-                grouped = cache.group_words(
-                    word, self.current_words
+            if adaptive_partitions:
+                partition_data = adaptive_partitions.partition(
+                    word, full_bits
                 )
+                grouped = {
+                    pattern_id: adaptive_partitions.bits_to_words(
+                        child_bits
+                    )
+                    for pattern_id, child_bits in
+                    partition_data["pattern_to_subset_bits"].items()
+                }
             else:
                 gc = calculate_group_counts(
                     word, self.current_words
