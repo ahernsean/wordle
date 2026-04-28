@@ -9,6 +9,8 @@ import time
 from collections import defaultdict
 from enum import Enum, auto
 
+from adaptive_cache_sqlite import AdaptiveCacheSQLite
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -390,10 +392,11 @@ class Solution:
     """
 
     def __init__(self, answer_words, all_guesses=None,
-                 cache=None):
+                 cache=None, adaptive_cache=None):
         self.all_answers = answer_words
         self.all_guesses = all_guesses
         self.cache = cache
+        self.adaptive_cache = adaptive_cache
         self.reset()
 
     def reset(self):
@@ -473,7 +476,8 @@ class Solution:
         first = solutions[0]
         out = Solution(first.all_answers,
                        first.all_guesses,
-                       first.cache)
+                       first.cache,
+                       first.adaptive_cache)
         combined = set()
         for soln in solutions:
             if len(soln.current_words) > 1:
@@ -625,6 +629,7 @@ class Solution:
                                max_depth=3,
                                time_budget=300,
                                top_k=20,
+                               persistence_policy='entropy_deep_v1',
                                progress_callback=None):
         """
         Adaptive-depth entropy lookahead with pruning.
@@ -649,6 +654,7 @@ class Solution:
         'timeout after N of M').
         """
         cache = self.cache
+        state_cache = self.adaptive_cache
         n = len(self.current_words)
         deadline = time.time() + time_budget
         global_set = (set(global_candidates)
@@ -676,6 +682,17 @@ class Solution:
                 return 1.0
             if depth <= 0:
                 return 0.0
+
+            subset_blob = None
+            if state_cache:
+                subset_blob = AdaptiveCacheSQLite.encode_subset(
+                    subgroup
+                )
+                cached_state = state_cache.read_state(
+                    subset_blob, depth, persistence_policy
+                )
+                if cached_state and cached_state.is_exact:
+                    return cached_state.lower_bound
 
             # Build candidate list: subgroup + globals
             sg_set = set(subgroup)
@@ -739,6 +756,16 @@ class Solution:
 
                 total = ent + recursive
                 best_total = max(best_total, total)
+
+            if state_cache:
+                state_cache.write_state(
+                    subset_blob,
+                    depth,
+                    persistence_policy,
+                    lower_bound=best_total,
+                    upper_bound=best_total,
+                    is_exact=True,
+                )
 
             return best_total
 
