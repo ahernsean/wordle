@@ -625,7 +625,8 @@ class Solution:
                                max_depth=3,
                                time_budget=300,
                                top_k=20,
-                               progress_callback=None):
+                               progress_callback=None,
+                               status_callback=None):
         """
         Adaptive-depth entropy lookahead with pruning.
 
@@ -642,6 +643,17 @@ class Solution:
         top_k: keep this many best results (default 20).
         progress_callback: called per first-guess word
             completed, with (index, total, word, score).
+            Preserved for backward compatibility.
+        status_callback(info): optional adaptive status
+            callback. Receives a stable dict payload:
+            {
+              'elapsed', 'time_budget',
+              'frontier_size', 'queued_items',
+              'activated_root_words',
+              'top_rows', 'prune_cutoff'
+            }
+            where top_rows is a list of
+            (word, lower_bound, upper_bound, exact_flag).
 
         Returns sorted list of (word, step1, deeper,
         combined) tuples, best combined score first.
@@ -653,6 +665,7 @@ class Solution:
         deadline = time.time() + time_budget
         global_set = (set(global_candidates)
                       if global_candidates else set())
+        start_time = time.time()
 
         # Pruning threshold: 20th best score found.
         # Starts at 0 (no pruning until we have top_k).
@@ -664,6 +677,36 @@ class Solution:
             if len(results) >= top_k:
                 results.sort(key=lambda x: -x[3])
                 prune_threshold = results[top_k - 1][3]
+
+        def _status_rows(extra_row=None):
+            rows = [
+                (w, c, c, True)
+                for (w, _s1, _sd, c) in
+                sorted(results, key=lambda x: -x[3])[:top_k]
+            ]
+            if extra_row is not None:
+                rows.append(extra_row)
+            rows.sort(key=lambda x: -x[1])
+            return rows[:top_k]
+
+        def _emit_status(frontier_size=0,
+                         queued_items=0,
+                         activated_root_words=0,
+                         extra_row=None):
+            if not status_callback:
+                return
+            info = {
+                'elapsed': time.time() - start_time,
+                'time_budget': time_budget,
+                'frontier_size': int(frontier_size),
+                'queued_items': int(queued_items),
+                'activated_root_words': int(
+                    activated_root_words
+                ),
+                'top_rows': _status_rows(extra_row),
+                'prune_cutoff': prune_threshold,
+            }
+            status_callback(info)
 
         def _best_from_subgroup(subgroup, depth):
             """Return the best total weighted entropy
@@ -749,6 +792,11 @@ class Solution:
 
         for idx, (word, first_ent) in enumerate(
                 top_words):
+            _emit_status(
+                frontier_size=0,
+                queued_items=total_words - idx,
+                activated_root_words=completed,
+            )
             # Time check
             if time.time() > deadline:
                 timed_out = True
@@ -781,6 +829,12 @@ class Solution:
             if (len(results) >= top_k
                     and upper <= prune_threshold):
                 completed += 1
+                _emit_status(
+                    frontier_size=0,
+                    queued_items=total_words - completed,
+                    activated_root_words=completed,
+                    extra_row=(word, 0.0, upper, False),
+                )
                 if progress_callback:
                     progress_callback(
                         idx, total_words, word, None
@@ -804,7 +858,9 @@ class Solution:
                 key=lambda x: -len(x[1])
             )
 
-            for pat, subgroup in sorted_groups:
+            total_groups = len(sorted_groups)
+            for group_idx, (pat, subgroup) in enumerate(
+                    sorted_groups):
                 count = len(subgroup)
                 if count <= 1:
                     continue
@@ -828,6 +884,22 @@ class Solution:
                     actual_so_far += contrib
                     weighted_deeper += contrib
 
+                _emit_status(
+                    frontier_size=max(
+                        total_groups - (group_idx + 1),
+                        0,
+                    ),
+                    queued_items=total_words - idx,
+                    activated_root_words=completed,
+                    extra_row=(
+                        word,
+                        first_ent + actual_so_far,
+                        first_ent + actual_so_far
+                        + remaining_upper,
+                        False,
+                    ),
+                )
+
                 # Mid-word prune check
                 refined = (first_ent + actual_so_far
                            + remaining_upper)
@@ -845,6 +917,11 @@ class Solution:
                 _update_threshold()
 
             completed += 1
+            _emit_status(
+                frontier_size=0,
+                queued_items=total_words - completed,
+                activated_root_words=completed,
+            )
             if progress_callback:
                 score = (None if pruned_mid
                          else first_ent + weighted_deeper)
