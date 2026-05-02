@@ -1102,40 +1102,35 @@ def cmd_lookahead(gs):
             )
             results, status = adaptive_results, adaptive_status
         else:
+            def on_status(snapshot):
+                status_lines[0] += 1
+                if status_lines[0] % 25 == 0:
+                    print(format_status(snapshot), flush=True)
+
             start = time.perf_counter()
-            results, status = soln.compute_adaptive_lookahead(
-                top_n,
-                global_candidates=global_candidates,
-                max_depth=depth - 1,
-                time_budget=budget,
-                top_k=LOOKAHEAD_N,
-                progress_callback=on_progress,
-            ) if algo_mode == 'adaptive' else soln.compute_deep_lookahead(
-                top_n,
-                global_candidates=global_candidates,
-                max_depth=depth - 1,
-                time_budget=budget,
-                top_k=LOOKAHEAD_N,
-                progress_callback=on_progress,
+            results, status = (
+                soln.compute_adaptive_lookahead(
+                    top_n,
+                    global_candidates=global_candidates,
+                    max_depth=depth - 1,
+                    time_budget=budget,
+                    top_k=LOOKAHEAD_N,
+                    progress_callback=on_progress,
+                    status_callback=on_status,
+                ) if algo_mode == 'adaptive'
+                else soln.compute_deep_lookahead(
+                    top_n,
+                    global_candidates=global_candidates,
+                    max_depth=depth - 1,
+                    time_budget=budget,
+                    top_k=LOOKAHEAD_N,
+                    progress_callback=on_progress,
+                    status_callback=on_status,
+                )
             )
             elapsed = time.perf_counter() - start
             print(f"  Engine '{algo_mode}' elapsed: "
                   f"{elapsed:.2f}s")
-        def on_status(snapshot):
-            status_lines[0] += 1
-            if status_lines[0] % 25 == 0:
-                print(format_status(snapshot), flush=True)
-
-        results, status = soln.compute_deep_lookahead(
-            top_n,
-            global_candidates=global_candidates,
-            max_depth=depth - 1,
-            time_budget=budget,
-            top_k=LOOKAHEAD_N,
-            progress_callback=on_progress,
-            status_callback=on_status,
-        )
-
     label = f"{depth}-step"
     print(f"\n{label} entropy lookahead "
           f"({status}):")
