@@ -1036,9 +1036,35 @@ def cmd_lookahead(gs):
             print_error("Invalid algorithm choice.")
             return
         algo_mode = LOOKAHEAD_ALGORITHMS[algo_key]
+        status_lines = [0]
+
+        def format_status(snapshot):
+            elapsed = int(snapshot['elapsed'])
+            budget_s = int(snapshot['time_budget'])
+            frontier = snapshot['frontier_size']
+            queued = snapshot['queued_items']
+            activated = snapshot['activated_root_words']
+            cutoff = snapshot['prune_cutoff']
+            rows = snapshot['top_rows'][:3]
+
+            head = (
+                f"  t={elapsed}s/{budget_s}s "
+                f"active={activated} "
+                f"frontier={frontier} "
+                f"queued={queued} "
+                f"C_N={cutoff:.4f}"
+            )
+            tail = []
+            for w, lo, hi, exact in rows:
+                flag = "=" if exact else "~"
+                tail.append(
+                    f"{w}{_mark(w)} {lo:.4f}-{hi:.4f}{flag}"
+                )
+            if tail:
+                return head + " | " + " | ".join(tail)
+            return head
 
         def on_progress(idx, total, word, score):
-            pct = (idx + 1) * 100 // total
             if score is not None:
                 print(f"  {idx+1}/{total} "
                       f"{word}{_mark(word)}"
@@ -1095,6 +1121,20 @@ def cmd_lookahead(gs):
             elapsed = time.perf_counter() - start
             print(f"  Engine '{algo_mode}' elapsed: "
                   f"{elapsed:.2f}s")
+        def on_status(snapshot):
+            status_lines[0] += 1
+            if status_lines[0] % 25 == 0:
+                print(format_status(snapshot), flush=True)
+
+        results, status = soln.compute_deep_lookahead(
+            top_n,
+            global_candidates=global_candidates,
+            max_depth=depth - 1,
+            time_budget=budget,
+            top_k=LOOKAHEAD_N,
+            progress_callback=on_progress,
+            status_callback=on_status,
+        )
 
     label = f"{depth}-step"
     print(f"\n{label} entropy lookahead "
