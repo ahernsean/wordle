@@ -10,6 +10,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from adaptive_cache_sqlite import AdaptiveCacheSQLite
+from adaptive_frontier import AdaptiveFrontier, WorkItemType
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -284,6 +288,105 @@ class ResponseCache:
         """Check if a guess word is already cached."""
         return guess in self._cache
 
+
+class AdaptivePartitionAdapter:
+    """Thin adaptive-search wrapper around ResponseCache.
+
+    Provides machine-stable partition payloads keyed by pattern id,
+    where each child subgroup is represented as a bitset over the
+    global answer-word index space.
+    """
+
+    def __init__(self, answer_words, response_cache):
+        self.answer_words = answer_words
+        self.response_cache = response_cache
+        self._word_to_index = {
+            word: idx for idx, word in enumerate(answer_words)
+        }
+        self._subset_word_cache = {}      # subset_bits -> [words]
+        self._partition_cache = {}        # (guess, subset_bits) -> payload
+
+    def bits_to_words(self, subset_bits):
+        """Convert subset bitset to list of words (memoized)."""
+        cached = self._subset_word_cache.get(subset_bits)
+        if cached is not None:
+            return cached
+
+        words = []
+        bits = subset_bits
+        while bits:
+            low_bit = bits & -bits
+            idx = low_bit.bit_length() - 1
+            words.append(self.answer_words[idx])
+            bits ^= low_bit
+
+        self._subset_word_cache[subset_bits] = words
+        return words
+
+    def words_to_bits(self, words):
+        """Convert words iterable to subset bitset."""
+        bits = 0
+        for word in words:
+            idx = self._word_to_index.get(word)
+            if idx is not None:
+                bits |= (1 << idx)
+        return bits
+
+    def partition(self, guess_word, subset_bits):
+        """Return adaptive partition payload for (guess, subset_bits).
+
+        Stable machine format:
+        {
+            "pattern_to_subset_bits": {pattern_id: child_subset_bits},
+            "pattern_counts": {pattern_id: child_count},
+            "pattern_weights": {pattern_id: child_count / parent_count},
+            "immediate_entropy": float,
+            "total_count": int,
+        }
+        """
+        cache_key = (guess_word, subset_bits)
+        cached = self._partition_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        subset_words = self.bits_to_words(subset_bits)
+        groups = self.response_cache.group_words(
+            guess_word, subset_words
+        )
+
+        pattern_to_subset_bits = {}
+        pattern_counts = {}
+        total_count = len(subset_words)
+
+        for pattern_id in sorted(groups):
+            child_words = groups[pattern_id]
+            child_bits = self.words_to_bits(child_words)
+            pattern_to_subset_bits[pattern_id] = child_bits
+            pattern_counts[pattern_id] = len(child_words)
+
+        if total_count == 0:
+            pattern_weights = {
+                pattern_id: 0.0 for pattern_id in pattern_counts
+            }
+        else:
+            pattern_weights = {
+                pattern_id: pattern_counts[pattern_id] / total_count
+                for pattern_id in pattern_counts
+            }
+
+        immediate_entropy = score_groups(
+            pattern_counts, ScoringMethod.ENTROPY_GAIN
+        )
+
+        payload = {
+            "pattern_to_subset_bits": pattern_to_subset_bits,
+            "pattern_counts": pattern_counts,
+            "pattern_weights": pattern_weights,
+            "immediate_entropy": immediate_entropy,
+            "total_count": total_count,
+        }
+        self._partition_cache[cache_key] = payload
+        return payload
 
 
 
@@ -637,8 +740,15 @@ class Solution:
                                    max_depth=3,
                                    time_budget=300,
                                    top_k=20,
-                                   progress_callback=None,
-                                   status_callback=None):
+                                   progress_callback=None):
+    def compute_deep_lookahead(self, top_words,
+                               global_candidates=None,
+                               max_depth=3,
+                               time_budget=300,
+                               top_k=20,
+                               persistence_policy='entropy_deep_v1',
+                               progress_callback=None,
+                               status_callback=None):
         """
         Adaptive-depth entropy lookahead with pruning.
 
@@ -679,6 +789,18 @@ class Solution:
         start_time = time.time()
         global_set = (set(global_candidates)
                       if global_candidates else set())
+        start_time = time.time()
+        adaptive_partitions = None
+        if cache:
+            adaptive_partitions = AdaptivePartitionAdapter(
+                self.all_answers, cache
+            )
+
+        full_bits = 0
+        if adaptive_partitions:
+            full_bits = adaptive_partitions.words_to_bits(
+                self.current_words
+            )
         answer_to_index = {
             word: idx for idx, word in enumerate(self.all_answers)
         }
@@ -745,6 +867,11 @@ class Solution:
             }
             status_callback(info)
 
+        def _best_from_subgroup(subgroup, depth):
+            """Return the best total weighted entropy
+            achievable from this subgroup over `depth`
+            remaining levels."""
+            k = len(subgroup)
         def _partition_to_bits(candidate, subgroup_bits):
             subgroup_words = bits_to_words(subgroup_bits)
             if cache:
@@ -778,6 +905,20 @@ class Solution:
                 state_cache[key] = 0.0
                 return 0.0
 
+            subset_blob = None
+            if state_cache:
+                subset_blob = AdaptiveCacheSQLite.encode_subset(
+                    subgroup
+                )
+                cached_state = state_cache.read_state(
+                    subset_blob, depth, persistence_policy
+                )
+                if cached_state and cached_state.is_exact:
+                    return cached_state.lower_bound
+
+            # Build candidate list: subgroup + globals
+            sg_set = set(subgroup)
+            candidates = list(subgroup)
             subgroup_words = bits_to_words(subgroup_bits)
             sg_set = set(subgroup_words)
             candidates = list(subgroup_words)
@@ -787,6 +928,36 @@ class Solution:
 
             best_total = 0.0
             for candidate in candidates:
+                # Get this candidate's partition
+                if adaptive_partitions:
+                    subgroup_bits = adaptive_partitions.words_to_bits(
+                        subgroup
+                    )
+                    partition_data = adaptive_partitions.partition(
+                        candidate, subgroup_bits
+                    )
+                    groups = {
+                        pattern_id: adaptive_partitions.bits_to_words(
+                            child_bits
+                        )
+                        for pattern_id, child_bits in
+                        partition_data["pattern_to_subset_bits"].items()
+                    }
+                else:
+                    gc = calculate_group_counts(
+                        candidate, subgroup
+                    )
+                    groups = {}
+                    for pat, cnt in gc.items():
+                        resp = pat.split(",")
+                        sub = apply_guess(
+                            subgroup, candidate, resp
+                        )
+                        groups[pat] = sub
+
+                # Entropy at this level
+                sizes = [len(ws) for ws in
+                         groups.values()]
                 groups = _partition_to_bits(candidate, subgroup_bits)
 
                 sizes = [bits.bit_count() for bits in groups.values()]
@@ -821,6 +992,16 @@ class Solution:
                 total = ent + recursive
                 best_total = max(best_total, total)
 
+            if state_cache:
+                state_cache.write_state(
+                    subset_blob,
+                    depth,
+                    persistence_policy,
+                    lower_bound=best_total,
+                    upper_bound=best_total,
+                    is_exact=True,
+                )
+
             state_cache[key] = best_total
             return best_total
 
@@ -831,10 +1012,52 @@ class Solution:
         current_bits = words_to_bits(self.current_words)
 
         for idx, (word, first_ent) in enumerate(top_words):
+        prepared = {}
+        generations = {}
+
+        for idx, (word, first_ent) in enumerate(
+                top_words):
+            if cache:
+                grouped = cache.group_words(
+                    word, self.current_words
+        current_bits = words_to_bits(self.current_words)
+
+        for idx, (word, first_ent) in enumerate(top_words):
+            _emit_status(
+                frontier_size=0,
+                queued_items=total_words - idx,
+                activated_root_words=completed,
+            )
+            # Time check
             if time.time() > deadline:
                 timed_out = True
                 break
 
+            grouped_bits = _partition_to_bits(word, current_bits)
+
+            # Get step-1 groups
+            if adaptive_partitions:
+                partition_data = adaptive_partitions.partition(
+                    word, full_bits
+                )
+                grouped = {
+                    pattern_id: adaptive_partitions.bits_to_words(
+                        child_bits
+                    )
+                    for pattern_id, child_bits in
+                    partition_data["pattern_to_subset_bits"].items()
+                }
+            else:
+                gc = calculate_group_counts(
+                    word, self.current_words
+                )
+                grouped = {}
+                for pat, cnt in gc.items():
+                    resp = pat.split(",")
+                    sub = apply_guess(
+                        self.current_words, word, resp
+                    )
+                    grouped[pat] = sub
             grouped_bits = _partition_to_bits(word, current_bits)
 
             upper = first_ent
@@ -843,6 +1066,43 @@ class Solution:
                 if m > 1:
                     upper += (m / n) * math.log2(m)
 
+            key = (idx, word)
+            prepared[key] = (word, first_ent, grouped)
+            generations[key] = 0
+
+        frontier = AdaptiveFrontier(
+            get_generation=lambda key: generations[key],
+            get_cutoff=(lambda:
+                        prune_threshold
+                        if len(results) >= top_k
+                        else float('-inf'))
+        )
+
+        for key, (word, first_ent, grouped) in prepared.items():
+            upper = first_ent
+            for bits in grouped_bits.values():
+                m = bits.bit_count()
+                if m > 1:
+                    upper += (m / n) * math.log2(m)
+            frontier.enqueue(
+                WorkItemType.ACTIVATE_TOP_WORD,
+                key,
+                upper,
+                generations[key],
+                upper
+            )
+
+        while True:
+            # Time check
+            if time.time() > deadline:
+                timed_out = True
+                break
+
+            item = frontier.pop()
+            if item is None:
+                break
+            idx, word = item.item_key
+            _, first_ent, grouped = prepared[item.item_key]
             if (len(results) >= top_k
                     and upper <= prune_threshold):
                 completed += 1
@@ -866,6 +1126,10 @@ class Solution:
                 key=lambda x: -x[1].bit_count()
             )
 
+            total_groups = len(sorted_groups)
+            for group_idx, (pat, subgroup) in enumerate(
+                    sorted_groups):
+                count = len(subgroup)
             for _pat, subgroup_bits in sorted_groups:
                 count = subgroup_bits.bit_count()
                 if count <= 1:
@@ -885,7 +1149,25 @@ class Solution:
                     actual_so_far += contrib
                     weighted_deeper += contrib
 
-                refined = first_ent + actual_so_far + remaining_upper
+                _emit_status(
+                    frontier_size=max(
+                        total_groups - (group_idx + 1),
+                        0,
+                    ),
+                    queued_items=total_words - idx,
+                    activated_root_words=completed,
+                    extra_row=(
+                        word,
+                        first_ent + actual_so_far,
+                        first_ent + actual_so_far
+                        + remaining_upper,
+                        False,
+                    ),
+                )
+
+                # Mid-word prune check
+                refined = (first_ent + actual_so_far
+                           + remaining_upper)
                 if (len(results) >= top_k
                         and refined <= prune_threshold):
                     pruned_mid = True
@@ -910,12 +1192,17 @@ class Solution:
 
         results.sort(key=lambda x: -x[3])
         results = results[:top_k]
+        sched_counts = frontier.counters()
 
         if timed_out:
             status = (f'timeout after {completed}'
-                      f' of {total_words}')
+                      f' of {total_words}; '
+                      f'stale={sched_counts["skipped_stale"]}, '
+                      f'pruned={sched_counts["skipped_pruned"]}')
         else:
-            status = 'complete'
+            status = (f'complete; '
+                      f'stale={sched_counts["skipped_stale"]}, '
+                      f'pruned={sched_counts["skipped_pruned"]}')
 
         return results, status
 
