@@ -399,6 +399,40 @@ class StateKey:
     policy: str
 
 
+@dataclass
+class ChildEdge:
+    parent_guess_id: int
+    child_state_key: StateKey
+    path_weight: float
+
+
+@dataclass
+class CandidateRecord:
+    guess_id: int
+    immediate_entropy: float
+    lower_bound: float
+    upper_bound: float
+    is_exact: bool
+    children: list[ChildEdge]
+    dirty_flags: set[str]
+
+
+@dataclass
+class StateNode:
+    subset_bits: int
+    remaining_depth: int
+    policy: str
+    lower_bound: float
+    upper_bound: float
+    best_guess_id: int | None
+    is_exact: bool
+    candidate_records: dict[int, CandidateRecord]
+    dependents: set[tuple[StateKey, int]]
+    retained_local_ranking: list[int]
+    dirty_flags: set[str]
+    generation: int
+
+
 class AdaptiveFrontierSearch:
     """Stateful adaptive lookahead runner extracted from Solution."""
 
@@ -427,6 +461,12 @@ class AdaptiveFrontierSearch:
         self.global_set = set(global_candidates) if global_candidates else set()
         self.answer_to_index = {w: i for i, w in enumerate(solution.all_answers)}
         self.index_to_answer = list(solution.all_answers)
+        universe = list(solution.all_answers)
+        if solution.all_guesses:
+            for word in solution.all_guesses:
+                if word not in self.answer_to_index:
+                    universe.append(word)
+        self.guess_to_id = {w: i for i, w in enumerate(universe)}
         self.policy = 'global' if self.global_set else 'hard'
         self.memo = {}
 
@@ -437,6 +477,7 @@ class AdaptiveFrontierSearch:
         self.generations = {}
         self.frontier = None
         self.intern_table = {}
+        self.state_intern = {}
         self.pending = set()
         self.dirty = set()
         self.completed = 0
@@ -475,8 +516,64 @@ class AdaptiveFrontierSearch:
             for pat, words in grouped.items()
         }
 
+    def get_or_create_state(self, subset_bits, remaining_depth, policy):
+        key = StateKey(subset_bits, remaining_depth, policy)
+        existing = self.state_intern.get(key)
+        if existing is not None:
+            return key, existing
+
+        n = subset_bits.bit_count()
+        if n <= 1 or remaining_depth <= 0:
+            lower = upper = 0.0
+            is_exact = True
+        elif n == 2 and remaining_depth >= 1:
+            lower = upper = 1.0
+            is_exact = True
+        else:
+            lower = 0.0
+            upper = remaining_depth * math.log2(n)
+            is_exact = False
+
+        node = StateNode(
+            subset_bits=subset_bits,
+            remaining_depth=remaining_depth,
+            policy=policy,
+            lower_bound=lower,
+            upper_bound=upper,
+            best_guess_id=None,
+            is_exact=is_exact,
+            candidate_records={},
+            dependents=set(),
+            retained_local_ranking=[],
+            dirty_flags=set(),
+            generation=0,
+        )
+        self.state_intern[key] = node
+        return key, node
+
+    def build_child_edges(self, parent_state_key, parent_guess_id, grouped):
+        parent_size = parent_state_key.subset_bits.bit_count()
+        edges = []
+        for _pat, child_subset_bits in grouped.items():
+            child_key, child_state = self.get_or_create_state(
+                child_subset_bits,
+                parent_state_key.remaining_depth - 1,
+                parent_state_key.policy,
+            )
+            weight = 0.0
+            if parent_size > 0:
+                weight = child_subset_bits.bit_count() / parent_size
+            edges.append(ChildEdge(parent_guess_id, child_key, weight))
+            child_state.dependents.add((parent_state_key, parent_guess_id))
+        return edges
+
     def _init_root_candidates(self):
         self.root_subset_bits = self.words_to_bits(self.solution.current_words)
+        self.get_or_create_state(
+            self.root_subset_bits,
+            self.max_depth,
+            self.policy,
+        )
         for idx, (word, first_ent) in enumerate(self.top_words):
             grouped = self.partition_to_bits(word, self.root_subset_bits)
             upper = first_ent + sum(
@@ -530,6 +627,9 @@ class AdaptiveFrontierSearch:
 
     def best_from_subgroup(self, subgroup_bits, depth):
         key = StateKey(subgroup_bits, depth, self.policy)
+        state_key, state_node = self.get_or_create_state(
+            subgroup_bits, depth, self.policy
+        )
         if key in self.memo:
             return self.memo[key]
         k = subgroup_bits.bit_count()
@@ -556,23 +656,42 @@ class AdaptiveFrontierSearch:
 
         best_total = 0.0
         for candidate in candidates:
+            guess_id = self.guess_to_id.get(candidate, -1)
             groups = self.partition_to_bits(candidate, subgroup_bits)
+            edges = self.build_child_edges(state_key, guess_id, groups)
             ent = 0.0
-            for child_bits in groups.values():
-                s = child_bits.bit_count()
+            for edge in edges:
+                s = edge.child_state_key.subset_bits.bit_count()
                 if s:
-                    p = s / k
+                    p = edge.path_weight
                     ent -= p * math.log2(p)
             recursive = 0.0
-            for child_bits in groups.values():
-                m = child_bits.bit_count()
+            for edge in edges:
+                m = edge.child_state_key.subset_bits.bit_count()
                 if m <= 1:
                     continue
                 if m == 2:
                     recursive += (2 / k)
                 else:
-                    recursive += (m / k) * self.best_from_subgroup(child_bits, depth - 1)
-            best_total = max(best_total, ent + recursive)
+                    recursive += edge.path_weight * self.best_from_subgroup(
+                        edge.child_state_key.subset_bits,
+                        edge.child_state_key.remaining_depth,
+                    )
+            total = ent + recursive
+            is_exact = all(
+                self.state_intern[edge.child_state_key].is_exact
+                for edge in edges
+            )
+            state_node.candidate_records[guess_id] = CandidateRecord(
+                guess_id=guess_id,
+                immediate_entropy=ent,
+                lower_bound=total,
+                upper_bound=total,
+                is_exact=is_exact,
+                children=edges,
+                dirty_flags=set(),
+            )
+            best_total = max(best_total, total)
 
         if self.persistence:
             self.persistence.write_state(
@@ -584,6 +703,9 @@ class AdaptiveFrontierSearch:
                 is_exact=True,
             )
         self.memo[key] = best_total
+        state_node.lower_bound = best_total
+        state_node.upper_bound = best_total
+        state_node.is_exact = True
         return best_total
 
     def _process_work_item(self, item):
