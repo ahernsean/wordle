@@ -740,6 +740,9 @@ class Solution:
                                    max_depth=3,
                                    time_budget=300,
                                    top_k=20,
+                                   persistence_policy='entropy_deep_v1',
+                                   progress_callback=None,
+                                   status_callback=None):
                                    progress_callback=None):
     def compute_deep_lookahead(self, top_words,
                                global_candidates=None,
@@ -824,6 +827,7 @@ class Solution:
                 bits ^= lsb
             return words
 
+        state_memo = {}
         state_cache = {}
 
         # Pruning threshold: 20th best score found.
@@ -891,6 +895,25 @@ class Solution:
 
         def _best_from_subgroup_bits(subgroup_bits, depth):
             key = StateKey(subgroup_bits, depth, policy)
+            if key in state_memo:
+                return state_memo[key]
+
+            k = subgroup_bits.bit_count()
+            if k <= 1:
+                state_memo[key] = 0.0
+                return 0.0
+            if k == 2:
+                state_memo[key] = 1.0
+                return 1.0
+            if depth <= 0:
+                state_memo[key] = 0.0
+                return 0.0
+
+            subgroup_words = bits_to_words(subgroup_bits)
+            subset_blob = None
+            if state_cache:
+                subset_blob = AdaptiveCacheSQLite.encode_subset(
+                    subgroup_words
             if key in state_cache:
                 return state_cache[key]
 
@@ -929,6 +952,9 @@ class Solution:
             best_total = 0.0
             for candidate in candidates:
                 # Get this candidate's partition
+                groups = _partition_to_bits(
+                    candidate, subgroup_bits
+                )
                 if adaptive_partitions:
                     subgroup_bits = adaptive_partitions.words_to_bits(
                         subgroup
@@ -1002,6 +1028,7 @@ class Solution:
                     is_exact=True,
                 )
 
+            state_memo[key] = best_total
             state_cache[key] = best_total
             return best_total
 
@@ -1067,6 +1094,19 @@ class Solution:
                     upper += (m / n) * math.log2(m)
 
             key = (idx, word)
+            prepared[key] = (word, first_ent, grouped_bits)
+            generations[key] = 0
+
+        frontier = AdaptiveFrontier(
+            get_generation=lambda key: generations[key],
+            get_cutoff=(lambda:
+                        prune_threshold
+                        if len(results) >= top_k
+                        else float('-inf'))
+        )
+
+        for key, (word, first_ent, grouped) in prepared.items():
+            grouped_bits = grouped
             prepared[key] = (word, first_ent, grouped)
             generations[key] = 0
 
@@ -1102,6 +1142,7 @@ class Solution:
             if item is None:
                 break
             idx, word = item.item_key
+            upper = item.upper_bound
             _, first_ent, grouped = prepared[item.item_key]
             if (len(results) >= top_k
                     and upper <= prune_threshold):
@@ -1122,11 +1163,14 @@ class Solution:
             pruned_mid = False
 
             sorted_groups = sorted(
+                grouped.items(),
                 grouped_bits.items(),
                 key=lambda x: -x[1].bit_count()
             )
 
             total_groups = len(sorted_groups)
+            for group_idx, (_pat, subgroup_bits) in enumerate(
+                    sorted_groups):
             for group_idx, (pat, subgroup) in enumerate(
                     sorted_groups):
                 count = len(subgroup)
