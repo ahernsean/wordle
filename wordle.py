@@ -852,7 +852,6 @@ LOOKAHEAD_N = 20
 LOOKAHEAD_ALGORITHMS = {
     'l': 'legacy',
     'a': 'adaptive',
-    'p': 'parity',
 }
 
 
@@ -1028,7 +1027,7 @@ def cmd_lookahead(gs):
         print(f"  Time budget: {budget}s")
         print(f"  Pruning to top {LOOKAHEAD_N}")
         print("Algorithm? "
-              "(l=legacy, a=adaptive, p=parity) "
+              "(l=legacy, a=adaptive) "
               "[l] ", end="")
         algo_input = input().strip().lower()
         algo_key = algo_input[0] if algo_input else 'l'
@@ -1076,66 +1075,34 @@ def cmd_lookahead(gs):
                       f" (pruned)",
                       flush=True)
 
-        if algo_mode == 'parity':
-            t0 = time.perf_counter()
-            legacy_results, legacy_status = (
-                _run_lookahead_engine(
-                    soln, 'legacy', top_n,
-                    global_candidates, depth,
-                    budget, LOOKAHEAD_N
-                )
-            )
-            t1 = time.perf_counter()
-            adaptive_results, adaptive_status = (
-                _run_lookahead_engine(
-                    soln, 'adaptive', top_n,
-                    global_candidates, depth,
-                    budget, LOOKAHEAD_N
-                )
-            )
-            t2 = time.perf_counter()
-            _parity_metrics(
-                legacy_results, adaptive_results,
-                legacy_status, adaptive_status,
-                t1 - t0, t2 - t1,
-                len(top_n), depth, budget
-            )
-            results, status = adaptive_results, adaptive_status
-        else:
-            start = time.perf_counter()
-            results, status = soln.compute_adaptive_lookahead(
-                top_n,
-                global_candidates=global_candidates,
-                max_depth=depth - 1,
-                time_budget=budget,
-                top_k=LOOKAHEAD_N,
-                progress_callback=on_progress,
-            ) if algo_mode == 'adaptive' else soln.compute_deep_lookahead(
-                top_n,
-                global_candidates=global_candidates,
-                max_depth=depth - 1,
-                time_budget=budget,
-                top_k=LOOKAHEAD_N,
-                progress_callback=on_progress,
-            )
-            elapsed = time.perf_counter() - start
-            print(f"  Engine '{algo_mode}' elapsed: "
-                  f"{elapsed:.2f}s")
         def on_status(snapshot):
             status_lines[0] += 1
-            if status_lines[0] % 25 == 0:
-                print(format_status(snapshot), flush=True)
+            print(format_status(snapshot), flush=True)
 
-        results, status = soln.compute_deep_lookahead(
-            top_n,
-            global_candidates=global_candidates,
-            max_depth=depth - 1,
-            time_budget=budget,
-            top_k=LOOKAHEAD_N,
-            progress_callback=on_progress,
-            status_callback=on_status,
+        start = time.perf_counter()
+        results, status = (
+            soln.compute_adaptive_lookahead(
+                top_n,
+                global_candidates=global_candidates,
+                max_depth=depth - 1,
+                time_budget=budget,
+                top_k=LOOKAHEAD_N,
+                progress_callback=on_progress,
+                status_callback=on_status,
+            ) if algo_mode == 'adaptive'
+            else soln.compute_deep_lookahead(
+                top_n,
+                global_candidates=global_candidates,
+                max_depth=depth - 1,
+                time_budget=budget,
+                top_k=LOOKAHEAD_N,
+                progress_callback=on_progress,
+                status_callback=on_status,
+            )
         )
-
+        elapsed = time.perf_counter() - start
+        print(f"  Engine '{algo_mode}' elapsed: "
+              f"{elapsed:.2f}s")
     label = f"{depth}-step"
     print(f"\n{label} entropy lookahead "
           f"({status}):")
