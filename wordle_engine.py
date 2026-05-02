@@ -398,6 +398,251 @@ class StateKey:
     remaining_depth: int
     policy: str
 
+
+class AdaptiveFrontierSearch:
+    """Stateful adaptive lookahead runner extracted from Solution."""
+
+    def __init__(self, solution, top_words,
+                 global_candidates=None,
+                 max_depth=3,
+                 time_budget=300,
+                 top_k=20,
+                 persistence_policy='entropy_deep_v1',
+                 progress_callback=None,
+                 status_callback=None):
+        self.solution = solution
+        self.top_words = top_words
+        self.global_candidates = global_candidates
+        self.max_depth = max_depth
+        self.time_budget = time_budget
+        self.top_k = top_k
+        self.persistence_policy = persistence_policy
+        self.progress_callback = progress_callback
+        self.status_callback = status_callback
+
+        self.cache = solution.cache
+        self.persistence = solution.adaptive_cache
+        self.n = len(solution.current_words)
+        self.deadline = time.time() + time_budget
+        self.global_set = set(global_candidates) if global_candidates else set()
+        self.answer_to_index = {w: i for i, w in enumerate(solution.all_answers)}
+        self.index_to_answer = list(solution.all_answers)
+        self.policy = 'global' if self.global_set else 'hard'
+        self.memo = {}
+
+        self.root_subset_bits = 0
+        self.results = []
+        self.prune_threshold = 0.0
+        self.prepared = {}
+        self.generations = {}
+        self.frontier = None
+        self.intern_table = {}
+        self.pending = set()
+        self.dirty = set()
+        self.completed = 0
+        self.timed_out = False
+        self.total_words = len(top_words)
+        self.activated_root_words = 0
+
+    def words_to_bits(self, words):
+        bits = 0
+        for word in words:
+            idx = self.answer_to_index.get(word)
+            if idx is not None:
+                bits |= (1 << idx)
+        return bits
+
+    def bits_to_words(self, bits):
+        words = []
+        while bits:
+            lsb = bits & -bits
+            idx = lsb.bit_length() - 1
+            words.append(self.index_to_answer[idx])
+            bits ^= lsb
+        return words
+
+    def partition_to_bits(self, candidate, subgroup_bits):
+        subgroup_words = self.bits_to_words(subgroup_bits)
+        if self.cache:
+            grouped = self.cache.group_words(candidate, subgroup_words)
+        else:
+            grouped = defaultdict(list)
+            for answer in subgroup_words:
+                pat = _encode_response(calculate_response(candidate, answer))
+                grouped[pat].append(answer)
+        return {
+            pat: self.words_to_bits(words)
+            for pat, words in grouped.items()
+        }
+
+    def _init_root_candidates(self):
+        self.root_subset_bits = self.words_to_bits(self.solution.current_words)
+        for idx, (word, first_ent) in enumerate(self.top_words):
+            grouped = self.partition_to_bits(word, self.root_subset_bits)
+            upper = first_ent + sum(
+                (bits.bit_count() / self.n) * math.log2(bits.bit_count())
+                for bits in grouped.values()
+                if bits.bit_count() > 1
+            )
+            key = (idx, word)
+            self.prepared[key] = (word, first_ent, grouped, upper)
+            self.generations[key] = 0
+            self.intern_table[key] = StateKey(self.root_subset_bits,
+                                              self.max_depth,
+                                              self.policy)
+
+    def _enqueue_initial_activation(self):
+        def cutoff():
+            return (self.prune_threshold if len(self.results) >= self.top_k
+                    else float('-inf'))
+
+        self.frontier = AdaptiveFrontier(
+            get_generation=lambda k: self.generations[k],
+            get_cutoff=cutoff,
+        )
+        for key, (_w, _f, _g, upper) in self.prepared.items():
+            self.frontier.enqueue(
+                WorkItemType.ACTIVATE_TOP_WORD,
+                key,
+                upper,
+                0,
+                upper,
+            )
+            self.pending.add(key)
+
+    def _emit_status(self):
+        if not self.status_callback:
+            return
+        top_rows = [
+            (word, combined, combined, True)
+            for word, _s1, _s2, combined in self.results[:self.top_k]
+        ]
+        info = {
+            'elapsed': self.time_budget - max(0.0, self.deadline - time.time()),
+            'time_budget': self.time_budget,
+            'frontier_size': len(self.frontier) if self.frontier else 0,
+            'queued_items': len(self.pending),
+            'activated_root_words': self.activated_root_words,
+            'top_rows': top_rows,
+            'prune_cutoff': self.prune_threshold,
+        }
+        self.status_callback(info)
+
+    def best_from_subgroup(self, subgroup_bits, depth):
+        key = StateKey(subgroup_bits, depth, self.policy)
+        if key in self.memo:
+            return self.memo[key]
+        k = subgroup_bits.bit_count()
+        if k <= 1 or depth <= 0:
+            self.memo[key] = 0.0
+            return 0.0
+        if k == 2:
+            self.memo[key] = 1.0
+            return 1.0
+
+        subgroup_words = self.bits_to_words(subgroup_bits)
+        subset_blob = AdaptiveCacheSQLite.encode_subset(subgroup_words)
+        if self.persistence:
+            cached = self.persistence.read_state(subset_blob, depth, self.policy)
+            if cached and cached.is_exact:
+                self.memo[key] = cached.lower_bound
+                return cached.lower_bound
+
+        candidates = list(subgroup_words)
+        sg_set = set(subgroup_words)
+        for word in self.global_set:
+            if word not in sg_set:
+                candidates.append(word)
+
+        best_total = 0.0
+        for candidate in candidates:
+            groups = self.partition_to_bits(candidate, subgroup_bits)
+            ent = 0.0
+            for child_bits in groups.values():
+                s = child_bits.bit_count()
+                if s:
+                    p = s / k
+                    ent -= p * math.log2(p)
+            recursive = 0.0
+            for child_bits in groups.values():
+                m = child_bits.bit_count()
+                if m <= 1:
+                    continue
+                if m == 2:
+                    recursive += (2 / k)
+                else:
+                    recursive += (m / k) * self.best_from_subgroup(child_bits, depth - 1)
+            best_total = max(best_total, ent + recursive)
+
+        if self.persistence:
+            self.persistence.write_state(
+                subset_blob,
+                depth,
+                self.persistence_policy,
+                lower_bound=best_total,
+                upper_bound=best_total,
+                is_exact=True,
+            )
+        self.memo[key] = best_total
+        return best_total
+
+    def _process_work_item(self, item):
+        idx, word = item.item_key
+        self.pending.discard(item.item_key)
+        self.dirty.add(item.item_key)
+        _word, first_ent, grouped, upper = self.prepared[item.item_key]
+
+        if len(self.results) >= self.top_k and upper <= self.prune_threshold:
+            self.completed += 1
+            if self.progress_callback:
+                self.progress_callback(idx, self.total_words, word, None)
+            return
+
+        weighted_deeper = 0.0
+        for _pat, subgroup_bits in sorted(grouped.items(), key=lambda x: -x[1].bit_count()):
+            count = subgroup_bits.bit_count()
+            if count <= 1:
+                continue
+            if count == 2:
+                weighted_deeper += (2 / self.n)
+            else:
+                weighted_deeper += (count / self.n) * self.best_from_subgroup(
+                    subgroup_bits, self.max_depth
+                )
+
+        combined = first_ent + weighted_deeper
+        self.results.append((word, first_ent, weighted_deeper, combined))
+        self.results.sort(key=lambda x: -x[3])
+        if len(self.results) > self.top_k:
+            self.results = self.results[:self.top_k]
+        if len(self.results) >= self.top_k:
+            self.prune_threshold = self.results[self.top_k - 1][3]
+        self.completed += 1
+        self.activated_root_words += 1
+        if self.progress_callback:
+            self.progress_callback(idx, self.total_words, word, combined)
+
+    def run(self):
+        self._init_root_candidates()
+        self._enqueue_initial_activation()
+
+        while True:
+            if time.time() > self.deadline:
+                self.timed_out = True
+                break
+            item = self.frontier.pop()
+            if item is None:
+                break
+            self._process_work_item(item)
+            self._emit_status()
+
+        status = (
+            f'timeout after {self.completed} of {self.total_words}'
+            if self.timed_out else
+            'complete'
+        )
+        return self.results, status
+
 # ---------------------------------------------------------------------------
 # Scoring functions
 # ---------------------------------------------------------------------------
@@ -776,180 +1021,18 @@ class Solution:
         Also returns a status string ('complete' or
         'timeout after N of M').
         """
-        cache = self.cache
-        persistence = self.adaptive_cache
-        n = len(self.current_words)
-        deadline = time.time() + time_budget
-        global_set = set(global_candidates) if global_candidates else set()
-        answer_to_index = {w: i for i, w in enumerate(self.all_answers)}
-        index_to_answer = list(self.all_answers)
-        policy = 'global' if global_set else 'hard'
-        memo = {}
-
-        def words_to_bits(words):
-            bits = 0
-            for word in words:
-                idx = answer_to_index.get(word)
-                if idx is not None:
-                    bits |= (1 << idx)
-            return bits
-
-        def bits_to_words(bits):
-            words = []
-            while bits:
-                lsb = bits & -bits
-                idx = lsb.bit_length() - 1
-                words.append(index_to_answer[idx])
-                bits ^= lsb
-            return words
-
-        def partition_to_bits(candidate, subgroup_bits):
-            subgroup_words = bits_to_words(subgroup_bits)
-            if cache:
-                grouped = cache.group_words(candidate, subgroup_words)
-            else:
-                grouped = defaultdict(list)
-                for answer in subgroup_words:
-                    pat = _encode_response(calculate_response(candidate, answer))
-                    grouped[pat].append(answer)
-            return {pat: words_to_bits(words) for pat, words in grouped.items()}
-
-        def best_from_subgroup(subgroup_bits, depth):
-            key = StateKey(subgroup_bits, depth, policy)
-            if key in memo:
-                return memo[key]
-            k = subgroup_bits.bit_count()
-            if k <= 1 or depth <= 0:
-                memo[key] = 0.0
-                return 0.0
-            if k == 2:
-                memo[key] = 1.0
-                return 1.0
-
-            subgroup_words = bits_to_words(subgroup_bits)
-            subset_blob = AdaptiveCacheSQLite.encode_subset(subgroup_words)
-            if persistence:
-                cached = persistence.read_state(subset_blob, depth, policy)
-                if cached and cached.is_exact:
-                    memo[key] = cached.lower_bound
-                    return cached.lower_bound
-
-            candidates = list(subgroup_words)
-            sg_set = set(subgroup_words)
-            for word in global_set:
-                if word not in sg_set:
-                    candidates.append(word)
-
-            best_total = 0.0
-            for candidate in candidates:
-                groups = partition_to_bits(candidate, subgroup_bits)
-                ent = 0.0
-                for child_bits in groups.values():
-                    s = child_bits.bit_count()
-                    if s:
-                        p = s / k
-                        ent -= p * math.log2(p)
-                recursive = 0.0
-                for child_bits in groups.values():
-                    m = child_bits.bit_count()
-                    if m <= 1:
-                        continue
-                    if m == 2:
-                        recursive += (2 / k)
-                    else:
-                        recursive += (m / k) * best_from_subgroup(child_bits, depth - 1)
-                best_total = max(best_total, ent + recursive)
-
-            if persistence:
-                persistence.write_state(
-                    subset_blob,
-                    depth,
-                    persistence_policy,
-                    lower_bound=best_total,
-                    upper_bound=best_total,
-                    is_exact=True,
-                )
-            memo[key] = best_total
-            return best_total
-
-        results = []
-        prune_threshold = 0.0
-        current_bits = words_to_bits(self.current_words)
-        prepared = {}
-        generations = {}
-
-        for idx, (word, first_ent) in enumerate(top_words):
-            grouped = partition_to_bits(word, current_bits)
-            upper = first_ent + sum(
-                (bits.bit_count() / n) * math.log2(bits.bit_count())
-                for bits in grouped.values()
-                if bits.bit_count() > 1
-            )
-            key = (idx, word)
-            prepared[key] = (word, first_ent, grouped, upper)
-            generations[key] = 0
-
-        def cutoff():
-            return prune_threshold if len(results) >= top_k else float('-inf')
-
-        frontier = AdaptiveFrontier(
-            get_generation=lambda k: generations[k],
-            get_cutoff=cutoff,
+        runner = AdaptiveFrontierSearch(
+            solution=self,
+            top_words=top_words,
+            global_candidates=global_candidates,
+            max_depth=max_depth,
+            time_budget=time_budget,
+            top_k=top_k,
+            persistence_policy=persistence_policy,
+            progress_callback=progress_callback,
+            status_callback=status_callback,
         )
-
-        for key, (_w, _f, _g, upper) in prepared.items():
-            frontier.enqueue(WorkItemType.ACTIVATE_TOP_WORD, key, upper, 0, upper)
-
-        completed = 0
-        timed_out = False
-        total_words = len(top_words)
-        while True:
-            if time.time() > deadline:
-                timed_out = True
-                break
-            item = frontier.pop()
-            if item is None:
-                break
-            idx, word = item.item_key
-            _word, first_ent, grouped, upper = prepared[item.item_key]
-
-            if len(results) >= top_k and upper <= prune_threshold:
-                completed += 1
-                if progress_callback:
-                    progress_callback(idx, total_words, word, None)
-                continue
-
-            weighted_deeper = 0.0
-            for _pat, subgroup_bits in sorted(
-                grouped.items(), key=lambda x: -x[1].bit_count()
-            ):
-                count = subgroup_bits.bit_count()
-                if count <= 1:
-                    continue
-                if count == 2:
-                    weighted_deeper += (2 / n)
-                else:
-                    weighted_deeper += (count / n) * best_from_subgroup(
-                        subgroup_bits, max_depth
-                    )
-
-            combined = first_ent + weighted_deeper
-            results.append((word, first_ent, weighted_deeper, combined))
-            results.sort(key=lambda x: -x[3])
-            if len(results) > top_k:
-                results = results[:top_k]
-            if len(results) >= top_k:
-                prune_threshold = results[top_k - 1][3]
-            completed += 1
-            if progress_callback:
-                progress_callback(idx, total_words, word, combined)
-
-        status = (
-            f'timeout after {completed} of {total_words}'
-            if timed_out else
-            'complete'
-        )
-        return results, status
+        return runner.run()
 
     def compute_deep_lookahead(self, *args, **kwargs):
         """
