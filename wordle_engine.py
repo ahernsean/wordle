@@ -743,6 +743,15 @@ class Solution:
                                    persistence_policy='entropy_deep_v1',
                                    progress_callback=None,
                                    status_callback=None):
+                                   progress_callback=None):
+    def compute_deep_lookahead(self, top_words,
+                               global_candidates=None,
+                               max_depth=3,
+                               time_budget=300,
+                               top_k=20,
+                               persistence_policy='entropy_deep_v1',
+                               progress_callback=None,
+                               status_callback=None):
         """
         Adaptive-depth entropy lookahead with pruning.
 
@@ -819,6 +828,7 @@ class Solution:
             return words
 
         state_memo = {}
+        state_cache = {}
 
         # Pruning threshold: 20th best score found.
         # Starts at 0 (no pruning until we have top_k).
@@ -904,6 +914,24 @@ class Solution:
             if state_cache:
                 subset_blob = AdaptiveCacheSQLite.encode_subset(
                     subgroup_words
+            if key in state_cache:
+                return state_cache[key]
+
+            k = subgroup_bits.bit_count()
+            if k <= 1:
+                state_cache[key] = 0.0
+                return 0.0
+            if k == 2:
+                state_cache[key] = 1.0
+                return 1.0
+            if depth <= 0:
+                state_cache[key] = 0.0
+                return 0.0
+
+            subset_blob = None
+            if state_cache:
+                subset_blob = AdaptiveCacheSQLite.encode_subset(
+                    subgroup
                 )
                 cached_state = state_cache.read_state(
                     subset_blob, depth, persistence_policy
@@ -912,6 +940,9 @@ class Solution:
                     return cached_state.lower_bound
 
             # Build candidate list: subgroup + globals
+            sg_set = set(subgroup)
+            candidates = list(subgroup)
+            subgroup_words = bits_to_words(subgroup_bits)
             sg_set = set(subgroup_words)
             candidates = list(subgroup_words)
             for w in global_set:
@@ -924,6 +955,37 @@ class Solution:
                 groups = _partition_to_bits(
                     candidate, subgroup_bits
                 )
+                if adaptive_partitions:
+                    subgroup_bits = adaptive_partitions.words_to_bits(
+                        subgroup
+                    )
+                    partition_data = adaptive_partitions.partition(
+                        candidate, subgroup_bits
+                    )
+                    groups = {
+                        pattern_id: adaptive_partitions.bits_to_words(
+                            child_bits
+                        )
+                        for pattern_id, child_bits in
+                        partition_data["pattern_to_subset_bits"].items()
+                    }
+                else:
+                    gc = calculate_group_counts(
+                        candidate, subgroup
+                    )
+                    groups = {}
+                    for pat, cnt in gc.items():
+                        resp = pat.split(",")
+                        sub = apply_guess(
+                            subgroup, candidate, resp
+                        )
+                        groups[pat] = sub
+
+                # Entropy at this level
+                sizes = [len(ws) for ws in
+                         groups.values()]
+                groups = _partition_to_bits(candidate, subgroup_bits)
+
                 sizes = [bits.bit_count() for bits in groups.values()]
                 ent = 0.0
                 for s in sizes:
@@ -967,6 +1029,7 @@ class Solution:
                 )
 
             state_memo[key] = best_total
+            state_cache[key] = best_total
             return best_total
 
         # Main loop over first-guess candidates
@@ -974,8 +1037,17 @@ class Solution:
         completed = 0
         timed_out = False
         current_bits = words_to_bits(self.current_words)
+
+        for idx, (word, first_ent) in enumerate(top_words):
         prepared = {}
         generations = {}
+
+        for idx, (word, first_ent) in enumerate(
+                top_words):
+            if cache:
+                grouped = cache.group_words(
+                    word, self.current_words
+        current_bits = words_to_bits(self.current_words)
 
         for idx, (word, first_ent) in enumerate(top_words):
             _emit_status(
@@ -1035,6 +1107,18 @@ class Solution:
 
         for key, (word, first_ent, grouped) in prepared.items():
             grouped_bits = grouped
+            prepared[key] = (word, first_ent, grouped)
+            generations[key] = 0
+
+        frontier = AdaptiveFrontier(
+            get_generation=lambda key: generations[key],
+            get_cutoff=(lambda:
+                        prune_threshold
+                        if len(results) >= top_k
+                        else float('-inf'))
+        )
+
+        for key, (word, first_ent, grouped) in prepared.items():
             upper = first_ent
             for bits in grouped_bits.values():
                 m = bits.bit_count()
@@ -1080,12 +1164,17 @@ class Solution:
 
             sorted_groups = sorted(
                 grouped.items(),
+                grouped_bits.items(),
                 key=lambda x: -x[1].bit_count()
             )
 
             total_groups = len(sorted_groups)
             for group_idx, (_pat, subgroup_bits) in enumerate(
                     sorted_groups):
+            for group_idx, (pat, subgroup) in enumerate(
+                    sorted_groups):
+                count = len(subgroup)
+            for _pat, subgroup_bits in sorted_groups:
                 count = subgroup_bits.bit_count()
                 if count <= 1:
                     continue
