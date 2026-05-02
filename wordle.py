@@ -10,6 +10,7 @@ import os
 import sys
 import pickle
 import shutil
+import time
 from datetime import datetime
 import contextlib
 
@@ -848,6 +849,75 @@ def cmd_grid(gs):
 
 LOOKAHEAD_N = 20
 
+LOOKAHEAD_ALGORITHMS = {
+    'l': 'legacy',
+    'a': 'adaptive',
+    'p': 'parity',
+}
+
+
+def _run_lookahead_engine(soln, algorithm, top_n,
+                          global_candidates, depth,
+                          budget, top_k):
+    if algorithm == 'legacy':
+        return soln.compute_deep_lookahead(
+            top_n,
+            global_candidates=global_candidates,
+            max_depth=depth - 1,
+            time_budget=budget,
+            top_k=top_k,
+        )
+    return soln.compute_adaptive_lookahead(
+        top_n,
+        global_candidates=global_candidates,
+        max_depth=depth - 1,
+        time_budget=budget,
+        top_k=top_k,
+    )
+
+
+def _parity_metrics(legacy_results, adaptive_results,
+                    legacy_status, adaptive_status,
+                    legacy_elapsed, adaptive_elapsed,
+                    seed_count, depth, budget):
+    legacy_map = {
+        word: (s1, s2, total)
+        for word, s1, s2, total in legacy_results
+    }
+    adaptive_map = {
+        word: (s1, s2, total)
+        for word, s1, s2, total in adaptive_results
+    }
+    overlap = sorted(
+        set(legacy_map.keys()) & set(adaptive_map.keys())
+    )
+
+    if overlap:
+        max_total_delta = max(
+            abs(legacy_map[w][2] - adaptive_map[w][2])
+            for w in overlap
+        )
+    else:
+        max_total_delta = float('nan')
+
+    print("\nParity metrics "
+          "(same seed inputs/depth/time budget):")
+    print(f"  seed inputs: {seed_count}")
+    print(f"  depth: {depth}")
+    print(f"  budget: {budget}s")
+    print(f"  legacy:   {legacy_status}, "
+          f"{len(legacy_results)} rows, "
+          f"{legacy_elapsed:.2f}s")
+    print(f"  adaptive: {adaptive_status}, "
+          f"{len(adaptive_results)} rows, "
+          f"{adaptive_elapsed:.2f}s")
+    print(f"  overlap words: {len(overlap)}")
+    if overlap:
+        print(f"  max |total delta| on overlap: "
+              f"{max_total_delta:.6f}")
+    else:
+        print("  max |total delta| on overlap: n/a")
+
 def cmd_lookahead(gs):
     if gs.single:
         soln = gs.solutions[0]
@@ -953,10 +1023,19 @@ def cmd_lookahead(gs):
         status = 'complete'
 
     else:
-        # Deep lookahead with pruning
+        # Adaptive-depth lookahead with pruning
         budget = 300  # 5 minutes
         print(f"  Time budget: {budget}s")
         print(f"  Pruning to top {LOOKAHEAD_N}")
+        print("Algorithm? "
+              "(l=legacy, a=adaptive, p=parity) "
+              "[l] ", end="")
+        algo_input = input().strip().lower()
+        algo_key = algo_input[0] if algo_input else 'l'
+        if algo_key not in LOOKAHEAD_ALGORITHMS:
+            print_error("Invalid algorithm choice.")
+            return
+        algo_mode = LOOKAHEAD_ALGORITHMS[algo_key]
         status_lines = [0]
 
         def format_status(snapshot):
@@ -997,6 +1076,51 @@ def cmd_lookahead(gs):
                       f" (pruned)",
                       flush=True)
 
+        if algo_mode == 'parity':
+            t0 = time.perf_counter()
+            legacy_results, legacy_status = (
+                _run_lookahead_engine(
+                    soln, 'legacy', top_n,
+                    global_candidates, depth,
+                    budget, LOOKAHEAD_N
+                )
+            )
+            t1 = time.perf_counter()
+            adaptive_results, adaptive_status = (
+                _run_lookahead_engine(
+                    soln, 'adaptive', top_n,
+                    global_candidates, depth,
+                    budget, LOOKAHEAD_N
+                )
+            )
+            t2 = time.perf_counter()
+            _parity_metrics(
+                legacy_results, adaptive_results,
+                legacy_status, adaptive_status,
+                t1 - t0, t2 - t1,
+                len(top_n), depth, budget
+            )
+            results, status = adaptive_results, adaptive_status
+        else:
+            start = time.perf_counter()
+            results, status = soln.compute_adaptive_lookahead(
+                top_n,
+                global_candidates=global_candidates,
+                max_depth=depth - 1,
+                time_budget=budget,
+                top_k=LOOKAHEAD_N,
+                progress_callback=on_progress,
+            ) if algo_mode == 'adaptive' else soln.compute_deep_lookahead(
+                top_n,
+                global_candidates=global_candidates,
+                max_depth=depth - 1,
+                time_budget=budget,
+                top_k=LOOKAHEAD_N,
+                progress_callback=on_progress,
+            )
+            elapsed = time.perf_counter() - start
+            print(f"  Engine '{algo_mode}' elapsed: "
+                  f"{elapsed:.2f}s")
         def on_status(snapshot):
             status_lines[0] += 1
             if status_lines[0] % 25 == 0:

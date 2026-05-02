@@ -735,6 +735,12 @@ class Solution:
         results.sort(key=lambda x: -x[3])
         return results
 
+    def compute_adaptive_lookahead(self, top_words,
+                                   global_candidates=None,
+                                   max_depth=3,
+                                   time_budget=300,
+                                   top_k=20,
+                                   progress_callback=None):
     def compute_deep_lookahead(self, top_words,
                                global_candidates=None,
                                max_depth=3,
@@ -1193,3 +1199,13 @@ class Solution:
                       f'pruned={sched_counts["skipped_pruned"]}')
 
         return results, status
+
+    def compute_deep_lookahead(self, *args, **kwargs):
+        """
+        Deprecated compatibility shim.
+
+        Use compute_adaptive_lookahead(...) instead.
+        """
+        return self.compute_adaptive_lookahead(
+            *args, **kwargs
+        )
