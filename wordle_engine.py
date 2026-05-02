@@ -9,6 +9,8 @@ import time
 from collections import defaultdict
 from enum import Enum, auto
 
+from adaptive_frontier import AdaptiveFrontier, WorkItemType
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -746,15 +748,11 @@ class Solution:
         total_words = len(top_words)
         completed = 0
         timed_out = False
+        prepared = {}
+        generations = {}
 
         for idx, (word, first_ent) in enumerate(
                 top_words):
-            # Time check
-            if time.time() > deadline:
-                timed_out = True
-                break
-
-            # Get step-1 groups
             if cache:
                 grouped = cache.group_words(
                     word, self.current_words
@@ -771,21 +769,49 @@ class Solution:
                     )
                     grouped[pat] = sub
 
-            # Upper bound for this word
             upper = first_ent
             for ws in grouped.values():
                 m = len(ws)
                 if m > 1:
                     upper += (m / n) * math.log2(m)
 
-            if (len(results) >= top_k
-                    and upper <= prune_threshold):
-                completed += 1
-                if progress_callback:
-                    progress_callback(
-                        idx, total_words, word, None
-                    )
-                continue  # prune entire word
+            key = (idx, word)
+            prepared[key] = (word, first_ent, grouped)
+            generations[key] = 0
+
+        frontier = AdaptiveFrontier(
+            get_generation=lambda key: generations[key],
+            get_cutoff=(lambda:
+                        prune_threshold
+                        if len(results) >= top_k
+                        else float('-inf'))
+        )
+
+        for key, (word, first_ent, grouped) in prepared.items():
+            upper = first_ent
+            for ws in grouped.values():
+                m = len(ws)
+                if m > 1:
+                    upper += (m / n) * math.log2(m)
+            frontier.enqueue(
+                WorkItemType.ACTIVATE_TOP_WORD,
+                key,
+                upper,
+                generations[key],
+                upper
+            )
+
+        while True:
+            # Time check
+            if time.time() > deadline:
+                timed_out = True
+                break
+
+            item = frontier.pop()
+            if item is None:
+                break
+            idx, word = item.item_key
+            _, first_ent, grouped = prepared[item.item_key]
 
             # Evaluate each group
             weighted_deeper = 0.0
@@ -854,11 +880,16 @@ class Solution:
 
         results.sort(key=lambda x: -x[3])
         results = results[:top_k]
+        sched_counts = frontier.counters()
 
         if timed_out:
             status = (f'timeout after {completed}'
-                      f' of {total_words}')
+                      f' of {total_words}; '
+                      f'stale={sched_counts["skipped_stale"]}, '
+                      f'pruned={sched_counts["skipped_pruned"]}')
         else:
-            status = 'complete'
+            status = (f'complete; '
+                      f'stale={sched_counts["skipped_stale"]}, '
+                      f'pruned={sched_counts["skipped_pruned"]}')
 
         return results, status
