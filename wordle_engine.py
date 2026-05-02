@@ -7,6 +7,7 @@ No UI dependencies. All display/interaction is handled by the caller.
 import math
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum, auto
 
 
@@ -284,6 +285,16 @@ class ResponseCache:
         """Check if a guess word is already cached."""
         return guess in self._cache
 
+
+
+
+@dataclass(frozen=True)
+class StateKey:
+    """Canonical key for adaptive lookahead subproblems."""
+
+    subset_bits: int
+    remaining_depth: int
+    policy: str
 
 # ---------------------------------------------------------------------------
 # Scoring functions
@@ -653,6 +664,30 @@ class Solution:
         deadline = time.time() + time_budget
         global_set = (set(global_candidates)
                       if global_candidates else set())
+        answer_to_index = {
+            word: idx for idx, word in enumerate(self.all_answers)
+        }
+        index_to_answer = list(self.all_answers)
+        policy = ('global' if global_set else 'hard')
+
+        def words_to_bits(words):
+            bits = 0
+            for word in words:
+                idx = answer_to_index.get(word)
+                if idx is not None:
+                    bits |= (1 << idx)
+            return bits
+
+        def bits_to_words(bits):
+            words = []
+            while bits:
+                lsb = bits & -bits
+                idx = lsb.bit_length() - 1
+                words.append(index_to_answer[idx])
+                bits ^= lsb
+            return words
+
+        state_cache = {}
 
         # Pruning threshold: 20th best score found.
         # Starts at 0 (no pruning until we have top_k).
@@ -665,116 +700,101 @@ class Solution:
                 results.sort(key=lambda x: -x[3])
                 prune_threshold = results[top_k - 1][3]
 
-        def _best_from_subgroup(subgroup, depth):
-            """Return the best total weighted entropy
-            achievable from this subgroup over `depth`
-            remaining levels."""
-            k = len(subgroup)
+        def _partition_to_bits(candidate, subgroup_bits):
+            subgroup_words = bits_to_words(subgroup_bits)
+            if cache:
+                grouped = cache.group_words(candidate, subgroup_words)
+            else:
+                grouped = defaultdict(list)
+                for answer in subgroup_words:
+                    pat_code = _encode_response(
+                        calculate_response(candidate, answer)
+                    )
+                    grouped[pat_code].append(answer)
+
+            group_bits = {}
+            for pattern, words in grouped.items():
+                group_bits[pattern] = words_to_bits(words)
+            return group_bits
+
+        def _best_from_subgroup_bits(subgroup_bits, depth):
+            key = StateKey(subgroup_bits, depth, policy)
+            if key in state_cache:
+                return state_cache[key]
+
+            k = subgroup_bits.bit_count()
             if k <= 1:
+                state_cache[key] = 0.0
                 return 0.0
             if k == 2:
+                state_cache[key] = 1.0
                 return 1.0
             if depth <= 0:
+                state_cache[key] = 0.0
                 return 0.0
 
-            # Build candidate list: subgroup + globals
-            sg_set = set(subgroup)
-            candidates = list(subgroup)
+            subgroup_words = bits_to_words(subgroup_bits)
+            sg_set = set(subgroup_words)
+            candidates = list(subgroup_words)
             for w in global_set:
                 if w not in sg_set:
                     candidates.append(w)
 
             best_total = 0.0
             for candidate in candidates:
-                # Get this candidate's partition
-                if cache:
-                    groups = cache.group_words(
-                        candidate, subgroup
-                    )
-                else:
-                    gc = calculate_group_counts(
-                        candidate, subgroup
-                    )
-                    groups = {}
-                    for pat, cnt in gc.items():
-                        resp = pat.split(",")
-                        sub = apply_guess(
-                            subgroup, candidate, resp
-                        )
-                        groups[pat] = sub
+                groups = _partition_to_bits(candidate, subgroup_bits)
 
-                # Entropy at this level
-                sizes = [len(ws) for ws in
-                         groups.values()]
+                sizes = [bits.bit_count() for bits in groups.values()]
                 ent = 0.0
                 for s in sizes:
                     p = s / k
                     if p > 0:
                         ent -= p * math.log2(p)
 
-                # Upper bound: ent + sum of log2
-                # bounds on children
                 if depth > 1:
                     upper = ent
-                    for ws in groups.values():
-                        m = len(ws)
+                    for bits in groups.values():
+                        m = bits.bit_count()
                         if m > 1:
                             upper += (m / k) * math.log2(m)
                     if upper <= best_total:
-                        continue  # prune candidate
+                        continue
 
-                # Recurse into children
                 recursive = 0.0
-                for pat, sub_sub in groups.items():
-                    m = len(sub_sub)
+                for child_bits in groups.values():
+                    m = child_bits.bit_count()
                     if m <= 1:
                         continue
                     if m == 2:
                         recursive += (2 / k) * 1.0
                         continue
-                    sub_score = _best_from_subgroup(
-                        sub_sub, depth - 1
+                    sub_score = _best_from_subgroup_bits(
+                        child_bits, depth - 1
                     )
                     recursive += (m / k) * sub_score
 
                 total = ent + recursive
                 best_total = max(best_total, total)
 
+            state_cache[key] = best_total
             return best_total
 
         # Main loop over first-guess candidates
         total_words = len(top_words)
         completed = 0
         timed_out = False
+        current_bits = words_to_bits(self.current_words)
 
-        for idx, (word, first_ent) in enumerate(
-                top_words):
-            # Time check
+        for idx, (word, first_ent) in enumerate(top_words):
             if time.time() > deadline:
                 timed_out = True
                 break
 
-            # Get step-1 groups
-            if cache:
-                grouped = cache.group_words(
-                    word, self.current_words
-                )
-            else:
-                gc = calculate_group_counts(
-                    word, self.current_words
-                )
-                grouped = {}
-                for pat, cnt in gc.items():
-                    resp = pat.split(",")
-                    sub = apply_guess(
-                        self.current_words, word, resp
-                    )
-                    grouped[pat] = sub
+            grouped_bits = _partition_to_bits(word, current_bits)
 
-            # Upper bound for this word
             upper = first_ent
-            for ws in grouped.values():
-                m = len(ws)
+            for bits in grouped_bits.values():
+                m = bits.bit_count()
                 if m > 1:
                     upper += (m / n) * math.log2(m)
 
@@ -782,55 +802,39 @@ class Solution:
                     and upper <= prune_threshold):
                 completed += 1
                 if progress_callback:
-                    progress_callback(
-                        idx, total_words, word, None
-                    )
-                continue  # prune entire word
+                    progress_callback(idx, total_words, word, None)
+                continue
 
-            # Evaluate each group
             weighted_deeper = 0.0
-            # Track partial upper bound for mid-word
-            # pruning: replace remaining groups' actual
-            # scores with log2 bounds
             remaining_upper = upper - first_ent
             actual_so_far = 0.0
             pruned_mid = False
 
-            # Sort groups largest first (evaluate the
-            # most informative groups first for better
-            # pruning)
             sorted_groups = sorted(
-                grouped.items(),
-                key=lambda x: -len(x[1])
+                grouped_bits.items(),
+                key=lambda x: -x[1].bit_count()
             )
 
-            for pat, subgroup in sorted_groups:
-                count = len(subgroup)
+            for _pat, subgroup_bits in sorted_groups:
+                count = subgroup_bits.bit_count()
                 if count <= 1:
                     continue
 
-                # Remove this group's upper bound
-                # contribution
-                if count > 1:
-                    remaining_upper -= (
-                        (count / n) * math.log2(count)
-                    )
+                remaining_upper -= ((count / n) * math.log2(count))
 
                 if count == 2:
                     contrib = (2 / n) * 1.0
                     actual_so_far += contrib
                     weighted_deeper += contrib
                 else:
-                    sub_score = _best_from_subgroup(
-                        subgroup, max_depth
+                    sub_score = _best_from_subgroup_bits(
+                        subgroup_bits, max_depth
                     )
                     contrib = (count / n) * sub_score
                     actual_so_far += contrib
                     weighted_deeper += contrib
 
-                # Mid-word prune check
-                refined = (first_ent + actual_so_far
-                           + remaining_upper)
+                refined = first_ent + actual_so_far + remaining_upper
                 if (len(results) >= top_k
                         and refined <= prune_threshold):
                     pruned_mid = True
@@ -838,19 +842,15 @@ class Solution:
 
             if not pruned_mid:
                 combined = first_ent + weighted_deeper
-                results.append(
-                    (word, first_ent,
-                     weighted_deeper, combined)
-                )
+                results.append((word, first_ent,
+                                weighted_deeper, combined))
                 _update_threshold()
 
             completed += 1
             if progress_callback:
                 score = (None if pruned_mid
                          else first_ent + weighted_deeper)
-                progress_callback(
-                    idx, total_words, word, score
-                )
+                progress_callback(idx, total_words, word, score)
 
         results.sort(key=lambda x: -x[3])
         results = results[:top_k]
