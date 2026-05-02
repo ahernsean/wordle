@@ -786,6 +786,7 @@ class Solution:
         state_cache = self.adaptive_cache
         n = len(self.current_words)
         deadline = time.time() + time_budget
+        start_time = time.time()
         global_set = (set(global_candidates)
                       if global_candidates else set())
         start_time = time.time()
@@ -1008,6 +1009,9 @@ class Solution:
         total_words = len(top_words)
         completed = 0
         timed_out = False
+        current_bits = words_to_bits(self.current_words)
+
+        for idx, (word, first_ent) in enumerate(top_words):
         prepared = {}
         generations = {}
 
@@ -1028,6 +1032,8 @@ class Solution:
             if time.time() > deadline:
                 timed_out = True
                 break
+
+            grouped_bits = _partition_to_bits(word, current_bits)
 
             # Get step-1 groups
             if adaptive_partitions:
@@ -1074,8 +1080,8 @@ class Solution:
 
         for key, (word, first_ent, grouped) in prepared.items():
             upper = first_ent
-            for ws in grouped.values():
-                m = len(ws)
+            for bits in grouped_bits.values():
+                m = bits.bit_count()
                 if m > 1:
                     upper += (m / n) * math.log2(m)
             frontier.enqueue(
