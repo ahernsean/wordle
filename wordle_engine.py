@@ -10,6 +10,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from adaptive_frontier import AdaptiveFrontier, WorkItemType
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -971,6 +973,14 @@ class Solution:
         total_words = len(top_words)
         completed = 0
         timed_out = False
+        prepared = {}
+        generations = {}
+
+        for idx, (word, first_ent) in enumerate(
+                top_words):
+            if cache:
+                grouped = cache.group_words(
+                    word, self.current_words
         current_bits = words_to_bits(self.current_words)
 
         for idx, (word, first_ent) in enumerate(top_words):
@@ -1015,6 +1025,43 @@ class Solution:
                 if m > 1:
                     upper += (m / n) * math.log2(m)
 
+            key = (idx, word)
+            prepared[key] = (word, first_ent, grouped)
+            generations[key] = 0
+
+        frontier = AdaptiveFrontier(
+            get_generation=lambda key: generations[key],
+            get_cutoff=(lambda:
+                        prune_threshold
+                        if len(results) >= top_k
+                        else float('-inf'))
+        )
+
+        for key, (word, first_ent, grouped) in prepared.items():
+            upper = first_ent
+            for ws in grouped.values():
+                m = len(ws)
+                if m > 1:
+                    upper += (m / n) * math.log2(m)
+            frontier.enqueue(
+                WorkItemType.ACTIVATE_TOP_WORD,
+                key,
+                upper,
+                generations[key],
+                upper
+            )
+
+        while True:
+            # Time check
+            if time.time() > deadline:
+                timed_out = True
+                break
+
+            item = frontier.pop()
+            if item is None:
+                break
+            idx, word = item.item_key
+            _, first_ent, grouped = prepared[item.item_key]
             if (len(results) >= top_k
                     and upper <= prune_threshold):
                 completed += 1
@@ -1104,11 +1151,16 @@ class Solution:
 
         results.sort(key=lambda x: -x[3])
         results = results[:top_k]
+        sched_counts = frontier.counters()
 
         if timed_out:
             status = (f'timeout after {completed}'
-                      f' of {total_words}')
+                      f' of {total_words}; '
+                      f'stale={sched_counts["skipped_stale"]}, '
+                      f'pruned={sched_counts["skipped_pruned"]}')
         else:
-            status = 'complete'
+            status = (f'complete; '
+                      f'stale={sched_counts["skipped_stale"]}, '
+                      f'pruned={sched_counts["skipped_pruned"]}')
 
         return results, status
