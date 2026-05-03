@@ -25,6 +25,7 @@ except ImportError:
     sound = None
 
 import wordle_engine
+from adaptive_cache_sqlite import AdaptiveCacheSQLite
 from wordle_engine import (
     Solution, ScoringMethod, InputSet, ResponseCache,
     load_word_list, calculate_response,
@@ -486,9 +487,16 @@ class GameState:
         self.n_answers = len(all_answers)
         self.n_guesses = len(all_guesses)
         self.cache = ResponseCache(all_answers)
+        self.adaptive_cache_path = os.path.abspath("adaptive_cache.sqlite3")
+        self.adaptive_cache = AdaptiveCacheSQLite(
+            self.adaptive_cache_path,
+            all_answers,
+        )
+        print(f"Adaptive cache DB: {self.adaptive_cache_path}")
         self.solutions = [Solution(all_answers,
                                    all_guesses,
-                                   self.cache)]
+                                   self.cache,
+                                   self.adaptive_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
         self.volume = 10
@@ -496,7 +504,8 @@ class GameState:
     def reset_all(self):
         self.solutions = [Solution(self.all_answers,
                                    self.all_guesses,
-                                   self.cache)]
+                                   self.cache,
+                                   self.adaptive_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
 
@@ -867,14 +876,23 @@ def cmd_lookahead(gs):
 
     set_display_context(soln)
 
-    # Need a prior entropy solve
+    # Auto-compute entropy ranking inputs if missing/stale.
     if (not soln.scores_updated
             or soln.scores_method
             != ScoringMethod.ENTROPY_GAIN):
-        print_error(
-            "Run entropy solve (s) first."
+        print("No cached entropy solve found; "
+              "computing now for lookahead...")
+        is_hard = (gs.input_set
+                   == InputSet.CURRENT_WORDLIST)
+        rank_words = (soln.current_words if is_hard
+                      else gs.all_guesses)
+        tracker = ProgressTracker(len(rank_words))
+        soln.compute_scores(
+            rank_words,
+            ScoringMethod.ENTROPY_GAIN,
+            progress_callback=tracker.update,
         )
-        return
+        tracker.finish()
 
     n_rem = len(soln.current_words)
     if n_rem <= 2:
@@ -931,40 +949,15 @@ def cmd_lookahead(gs):
           f"{n_rem:,} remaining.")
     print(f"({mode_label} for deeper steps)")
 
-    if depth == 2:
-        # Use the fast two-step path
-        tracker = [None]
+    # Adaptive-depth lookahead with pruning
+    budget = 300  # 5 minutes
+    print(f"  Time budget: {budget}s")
+    print(f"  Pruning to top {LOOKAHEAD_N}")
+    algo_mode = LOOKAHEAD_ALGORITHMS['a']
+    status_lines = [0]
 
-        def on_total(total):
-            print(f"  Evaluations: {total:,}")
-            tracker[0] = ProgressTracker(
-                max(total, 1)
-            )
-
-        def on_tick():
-            if tracker[0]:
-                tracker[0].update()
-
-        results = soln.compute_lookahead(
-            top_n,
-            second_step_words=global_candidates,
-            total_callback=on_total,
-            progress_callback=on_tick,
-        )
-
-        if tracker[0]:
-            tracker[0].finish()
-        status = 'complete'
-
-    else:
-        # Adaptive-depth lookahead with pruning
-        budget = 300  # 5 minutes
-        print(f"  Time budget: {budget}s")
-        print(f"  Pruning to top {LOOKAHEAD_N}")
-        algo_mode = LOOKAHEAD_ALGORITHMS['a']
-        status_lines = [0]
-
-        def format_status(snapshot):
+    def format_status(snapshot):
+            # Human-readable multiline status block.
             elapsed = int(snapshot['elapsed'])
             budget_s = int(snapshot['time_budget'])
             frontier = snapshot['frontier_size']
@@ -973,24 +966,25 @@ def cmd_lookahead(gs):
             cutoff = snapshot['prune_cutoff']
             rows = snapshot['top_rows'][:3]
 
-            head = (
-                f"  t={elapsed}s/{budget_s}s "
-                f"active={activated} "
-                f"frontier={frontier} "
-                f"queued={queued} "
-                f"C_N={cutoff:.4f}"
-            )
-            tail = []
+            lines = [
+                "",
+                "  --- Adaptive status ---",
+                f"  elapsed/budget: {elapsed}s / {budget_s}s",
+                f"  activated words: {activated}",
+                f"  frontier size: {frontier}",
+                f"  queued work items: {queued}",
+                f"  Top-N cutoff lower bound (C_N): {cutoff:.4f}",
+                "  exact? symbols: '=' means lower == upper, '~' means open interval",
+                "  contenders: word      lower    upper   exact?    gap",
+            ]
             for w, lo, hi, exact in rows:
                 flag = "=" if exact else "~"
-                tail.append(
-                    f"{w}{_mark(w)} {lo:.4f}-{hi:.4f}{flag}"
+                lines.append(
+                    f"    {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
                 )
-            if tail:
-                return head + " | " + " | ".join(tail)
-            return head
+            return "\n".join(lines)
 
-        def on_progress(idx, total, word, score):
+    def on_progress(idx, total, word, score):
             if score is not None:
                 print(f"  {idx+1}/{total} "
                       f"{word}{_mark(word)}"
@@ -1002,24 +996,24 @@ def cmd_lookahead(gs):
                       f" (pruned)",
                       flush=True)
 
-        def on_status(snapshot):
-            status_lines[0] += 1
-            if status_lines[0] % 25 == 0:
-                print(format_status(snapshot), flush=True)
+    def on_status(snapshot):
+        status_lines[0] += 1
+        if status_lines[0] % 25 == 0:
+            print(format_status(snapshot), flush=True)
 
-        start = time.perf_counter()
-        results, status = soln.compute_adaptive_lookahead(
-            top_n,
-            global_candidates=global_candidates,
-            max_depth=depth - 1,
-            time_budget=budget,
-            top_k=LOOKAHEAD_N,
-            progress_callback=on_progress,
-            status_callback=on_status,
-        )
-        elapsed = time.perf_counter() - start
-        print(f"  Engine '{algo_mode}' elapsed: "
-              f"{elapsed:.2f}s")
+    start = time.perf_counter()
+    results, status = soln.compute_adaptive_lookahead(
+        top_n,
+        global_candidates=global_candidates,
+        max_depth=depth - 1,
+        time_budget=budget,
+        top_k=LOOKAHEAD_N,
+        progress_callback=on_progress,
+        status_callback=on_status,
+    )
+    elapsed = time.perf_counter() - start
+    print(f"  Engine '{algo_mode}' elapsed: "
+          f"{elapsed:.2f}s")
     label = f"{depth}-step"
     print(f"\n{label} entropy lookahead "
           f"({status}):")
@@ -1265,7 +1259,7 @@ def cmd_wordcount(gs):
             raise ValueError
         gs.solutions = [
             Solution(gs.all_answers, gs.all_guesses,
-                     gs.cache)
+                     gs.cache, gs.adaptive_cache)
             for _ in range(wc)
         ]
         if wc > 1:
@@ -1337,9 +1331,28 @@ def cmd_help(gs):
   a = Answer for simulation ({sim})
   w = Game count (quordle, etc.)
   h = Hard mode ({hard})
+  c = Cache info (adaptive sqlite)
   v = Volume ({gs.volume})
   ? = This help
 """)
+
+
+def cmd_cacheinfo(gs):
+    db_path = gs.adaptive_cache_path
+    conn = gs.adaptive_cache._conn
+    row = conn.execute(
+        "SELECT COUNT(*) AS c, MAX(updated_at) AS m FROM adaptive_state"
+    ).fetchone()
+    rows = row["c"] if row else 0
+    mtime = row["m"] if row and row["m"] else None
+    if mtime:
+        ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
+    else:
+        ts = "n/a"
+    print("\nAdaptive cache diagnostics:")
+    print(f"  db path: {db_path}")
+    print(f"  row count: {rows}")
+    print(f"  last write: {ts}")
 
 
 # ---------------------------------------------------------------------------
@@ -1359,6 +1372,7 @@ COMMANDS = {
     'a': cmd_answer,
     'w': cmd_wordcount,
     'h': cmd_hardmode,
+    'c': cmd_cacheinfo,
     'v': cmd_volume,
     '?': cmd_help,
 }
