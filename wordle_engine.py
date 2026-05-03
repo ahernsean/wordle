@@ -468,6 +468,7 @@ class AdaptiveFrontierSearch:
                     universe.append(word)
         self.guess_to_id = {w: i for i, w in enumerate(universe)}
         self.policy = 'global' if self.global_set else 'hard'
+        self.persistence_key = self.policy
         self.memo = {}
 
         self.root_subset_bits = 0
@@ -484,6 +485,8 @@ class AdaptiveFrontierSearch:
         self.timed_out = False
         self.total_words = len(top_words)
         self.activated_root_words = 0
+        self.root_candidate_records = {}
+        self.id_to_guess = {i: w for w, i in self.guess_to_id.items()}
 
     def words_to_bits(self, words):
         bits = 0
@@ -611,9 +614,15 @@ class AdaptiveFrontierSearch:
         if not self.status_callback:
             return
         top_rows = [
-            (word, combined, combined, True)
-            for word, _s1, _s2, combined in self.results[:self.top_k]
+            (
+                self.id_to_guess.get(guess_id, str(guess_id)),
+                rec.lower_bound,
+                rec.upper_bound,
+                rec.is_exact,
+            )
+            for guess_id, rec in self.root_candidate_records.items()
         ]
+        top_rows.sort(key=lambda row: (-row[1], row[0]))
         info = {
             'elapsed': self.time_budget - max(0.0, self.deadline - time.time()),
             'time_budget': self.time_budget,
@@ -643,7 +652,7 @@ class AdaptiveFrontierSearch:
         subgroup_words = self.bits_to_words(subgroup_bits)
         subset_blob = AdaptiveCacheSQLite.encode_subset(subgroup_words)
         if self.persistence:
-            cached = self.persistence.read_state(subset_blob, depth, self.policy)
+            cached = self.persistence.read_state(subset_blob, depth, self.persistence_key)
             if cached and cached.is_exact:
                 self.memo[key] = cached.lower_bound
                 return cached.lower_bound
@@ -697,7 +706,7 @@ class AdaptiveFrontierSearch:
             self.persistence.write_state(
                 subset_blob,
                 depth,
-                self.persistence_policy,
+                self.persistence_key,
                 lower_bound=best_total,
                 upper_bound=best_total,
                 is_exact=True,
@@ -708,41 +717,87 @@ class AdaptiveFrontierSearch:
         state_node.is_exact = True
         return best_total
 
-    def _process_work_item(self, item):
+    def _recompute_candidate_bounds(self, candidate):
+        lower = candidate.immediate_entropy
+        upper = candidate.immediate_entropy
+        is_exact = True
+        for edge in candidate.children:
+            child = self.state_intern[edge.child_state_key]
+            lower += edge.path_weight * child.lower_bound
+            upper += edge.path_weight * child.upper_bound
+            is_exact = is_exact and child.is_exact
+        candidate.lower_bound = lower
+        candidate.upper_bound = upper
+        candidate.is_exact = is_exact
+
+    def _enqueue_refine_child(self, parent_state_key, parent_guess_id, edge, parent_upper):
+        child_item_key = ('child', parent_state_key, parent_guess_id, edge.child_state_key)
+        if child_item_key not in self.generations:
+            self.generations[child_item_key] = 0
+        self.frontier.enqueue(
+            WorkItemType.REFINE_CHILD,
+            child_item_key,
+            edge.path_weight * parent_upper,
+            self.generations[child_item_key],
+            parent_upper,
+        )
+        self.pending.add(child_item_key)
+
+    def _handle_activate_top_word(self, item):
         idx, word = item.item_key
         self.pending.discard(item.item_key)
-        self.dirty.add(item.item_key)
         _word, first_ent, grouped, upper = self.prepared[item.item_key]
-
-        if len(self.results) >= self.top_k and upper <= self.prune_threshold:
-            self.completed += 1
-            if self.progress_callback:
-                self.progress_callback(idx, self.total_words, word, None)
-            return
-
-        weighted_deeper = 0.0
-        for _pat, subgroup_bits in sorted(grouped.items(), key=lambda x: -x[1].bit_count()):
-            count = subgroup_bits.bit_count()
-            if count <= 1:
-                continue
-            if count == 2:
-                weighted_deeper += (2 / self.n)
-            else:
-                weighted_deeper += (count / self.n) * self.best_from_subgroup(
-                    subgroup_bits, self.max_depth
-                )
-
-        combined = first_ent + weighted_deeper
-        self.results.append((word, first_ent, weighted_deeper, combined))
-        self.results.sort(key=lambda x: -x[3])
-        if len(self.results) > self.top_k:
-            self.results = self.results[:self.top_k]
-        if len(self.results) >= self.top_k:
-            self.prune_threshold = self.results[self.top_k - 1][3]
+        root_key = StateKey(self.root_subset_bits, self.max_depth, self.policy)
+        root_node = self.state_intern[root_key]
+        guess_id = self.guess_to_id[word]
+        edges = self.build_child_edges(root_key, guess_id, grouped)
+        record = CandidateRecord(
+            guess_id=guess_id,
+            immediate_entropy=first_ent,
+            lower_bound=first_ent,
+            upper_bound=first_ent,
+            is_exact=False,
+            children=edges,
+            dirty_flags=set(),
+        )
+        self._recompute_candidate_bounds(record)
+        root_node.candidate_records[guess_id] = record
+        self.root_candidate_records[guess_id] = record
+        for edge in edges:
+            child = self.state_intern[edge.child_state_key]
+            if not child.is_exact:
+                self._enqueue_refine_child(root_key, guess_id, edge, record.upper_bound)
         self.completed += 1
         self.activated_root_words += 1
         if self.progress_callback:
-            self.progress_callback(idx, self.total_words, word, combined)
+            self.progress_callback(idx, self.total_words, word, record.lower_bound)
+
+    def _handle_refine_child(self, item):
+        self.pending.discard(item.item_key)
+        _kind, _parent_key, _guess_id, child_state_key = item.item_key
+        child = self.state_intern[child_state_key]
+        if child.is_exact:
+            return
+        old_lower = child.lower_bound
+        old_upper = child.upper_bound
+        exact_value = self.best_from_subgroup(
+            child.subset_bits, child.remaining_depth
+        )
+        child.lower_bound = max(child.lower_bound, exact_value)
+        child.upper_bound = min(child.upper_bound, exact_value)
+        child.is_exact = abs(child.upper_bound - child.lower_bound) < 1e-12
+        if child.lower_bound != old_lower or child.upper_bound != old_upper:
+            for parent_state_key, parent_guess_id in child.dependents:
+                parent_state = self.state_intern[parent_state_key]
+                parent_record = parent_state.candidate_records.get(parent_guess_id)
+                if parent_record:
+                    self._recompute_candidate_bounds(parent_record)
+
+    def _process_work_item(self, item):
+        if item.item_type == WorkItemType.ACTIVATE_TOP_WORD:
+            self._handle_activate_top_word(item)
+        elif item.item_type == WorkItemType.REFINE_CHILD:
+            self._handle_refine_child(item)
 
     def run(self):
         self._init_root_candidates()
@@ -756,7 +811,22 @@ class AdaptiveFrontierSearch:
             if item is None:
                 break
             self._process_work_item(item)
+            ranked = sorted(
+                self.root_candidate_records.values(),
+                key=lambda rec: -rec.lower_bound
+            )
+            if len(ranked) >= self.top_k:
+                self.prune_threshold = ranked[self.top_k - 1].lower_bound
             self._emit_status()
+
+        self.results = []
+        for guess_id, rec in self.root_candidate_records.items():
+            word = self.id_to_guess.get(guess_id, str(guess_id))
+            deeper = max(0.0, rec.lower_bound - rec.immediate_entropy)
+            self.results.append((word, rec.immediate_entropy, deeper, rec.lower_bound))
+        self.results.sort(key=lambda row: -row[3])
+        if len(self.results) > self.top_k:
+            self.results = self.results[:self.top_k]
 
         status = (
             f'timeout after {self.completed} of {self.total_words}'
