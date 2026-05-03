@@ -794,9 +794,9 @@ class AdaptiveFrontierSearch:
                     self._recompute_candidate_bounds(parent_record)
 
     def _process_work_item(self, item):
-        if item.kind == WorkItemType.ACTIVATE_TOP_WORD:
+        if item.item_type == WorkItemType.ACTIVATE_TOP_WORD:
             self._handle_activate_top_word(item)
-        elif item.kind == WorkItemType.REFINE_CHILD:
+        elif item.item_type == WorkItemType.REFINE_CHILD:
             self._handle_refine_child(item)
 
     def run(self):

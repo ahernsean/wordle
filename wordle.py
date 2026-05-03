@@ -849,29 +849,7 @@ def cmd_grid(gs):
 
 LOOKAHEAD_N = 20
 
-LOOKAHEAD_ALGORITHMS = {
-    'a': 'adaptive',
-}
-
-
-def _run_lookahead_engine(soln, algorithm, top_n,
-                          global_candidates, depth,
-                          budget, top_k):
-    if algorithm == 'legacy':
-        return soln.compute_deep_lookahead(
-            top_n,
-            global_candidates=global_candidates,
-            max_depth=depth - 1,
-            time_budget=budget,
-            top_k=top_k,
-        )
-    return soln.compute_adaptive_lookahead(
-        top_n,
-        global_candidates=global_candidates,
-        max_depth=depth - 1,
-        time_budget=budget,
-        top_k=top_k,
-    )
+LOOKAHEAD_ALGORITHMS = {'a': 'adaptive'}
 
 
 def cmd_lookahead(gs):
@@ -983,13 +961,7 @@ def cmd_lookahead(gs):
         budget = 300  # 5 minutes
         print(f"  Time budget: {budget}s")
         print(f"  Pruning to top {LOOKAHEAD_N}")
-        print("Algorithm? (a=adaptive) [a] ", end="")
-        algo_input = input().strip().lower()
-        algo_key = algo_input[0] if algo_input else 'a'
-        if algo_key not in LOOKAHEAD_ALGORITHMS:
-            print_error("Invalid algorithm choice.")
-            return
-        algo_mode = LOOKAHEAD_ALGORITHMS[algo_key]
+        algo_mode = LOOKAHEAD_ALGORITHMS['a']
         status_lines = [0]
 
         def format_status(snapshot):
