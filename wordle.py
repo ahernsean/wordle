@@ -954,8 +954,6 @@ def cmd_lookahead(gs):
     print(f"  Time budget: {budget}s")
     print(f"  Pruning to top {LOOKAHEAD_N}")
     algo_mode = LOOKAHEAD_ALGORITHMS['a']
-    status_lines = [0]
-
     def format_status(snapshot):
             # Human-readable multiline status block.
             elapsed = int(snapshot['elapsed'])
@@ -964,7 +962,7 @@ def cmd_lookahead(gs):
             queued = snapshot['queued_items']
             activated = snapshot['activated_root_words']
             cutoff = snapshot['prune_cutoff']
-            rows = snapshot['top_rows'][:3]
+            rows = snapshot['top_rows'][:5]
 
             lines = [
                 "",
@@ -982,6 +980,12 @@ def cmd_lookahead(gs):
                 lines.append(
                     f"    {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
                 )
+            if rows:
+                best_now = ", ".join(
+                    f"{w}{_mark(w)} ({lo:.4f})"
+                    for w, lo, _hi, _exact in rows
+                )
+                lines.append(f"  best guesses if halted now: {best_now}")
             return "\n".join(lines)
 
     def on_progress(idx, total, word, score):
@@ -997,9 +1001,7 @@ def cmd_lookahead(gs):
                       flush=True)
 
     def on_status(snapshot):
-        status_lines[0] += 1
-        if status_lines[0] % 25 == 0:
-            print(format_status(snapshot), flush=True)
+        print(format_status(snapshot), flush=True)
 
     start = time.perf_counter()
     results, status = soln.compute_adaptive_lookahead(

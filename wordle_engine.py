@@ -487,6 +487,8 @@ class AdaptiveFrontierSearch:
         self.activated_root_words = 0
         self.root_candidate_records = {}
         self.id_to_guess = {i: w for w, i in self.guess_to_id.items()}
+        self.status_interval_s = 10.0
+        self._last_status_emit = 0.0
 
     def words_to_bits(self, words):
         bits = 0
@@ -610,8 +612,12 @@ class AdaptiveFrontierSearch:
             )
             self.pending.add(key)
 
-    def _emit_status(self):
+    def _emit_status(self, force=False):
         if not self.status_callback:
+            return
+        now = time.time()
+        if (not force and self._last_status_emit
+                and (now - self._last_status_emit) < self.status_interval_s):
             return
         top_rows = [
             (
@@ -624,7 +630,7 @@ class AdaptiveFrontierSearch:
         ]
         top_rows.sort(key=lambda row: (-row[1], row[0]))
         info = {
-            'elapsed': self.time_budget - max(0.0, self.deadline - time.time()),
+            'elapsed': self.time_budget - max(0.0, self.deadline - now),
             'time_budget': self.time_budget,
             'frontier_size': len(self.frontier) if self.frontier else 0,
             'queued_items': len(self.pending),
@@ -633,6 +639,7 @@ class AdaptiveFrontierSearch:
             'prune_cutoff': self.prune_threshold,
         }
         self.status_callback(info)
+        self._last_status_emit = now
 
     def best_from_subgroup(self, subgroup_bits, depth):
         key = StateKey(subgroup_bits, depth, self.policy)
@@ -665,6 +672,7 @@ class AdaptiveFrontierSearch:
 
         best_total = 0.0
         for candidate in candidates:
+            self._emit_status()
             guess_id = self.guess_to_id.get(candidate, -1)
             groups = self.partition_to_bits(candidate, subgroup_bits)
             edges = self.build_child_edges(state_key, guess_id, groups)
