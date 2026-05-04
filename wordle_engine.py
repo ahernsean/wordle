@@ -688,6 +688,7 @@ class AdaptiveFrontierSearch:
             'frontier_size': len(self.frontier) if self.frontier else 0,
             'queued_items': len(self.pending),
             'activated_root_words': self.activated_root_words,
+            'eligible_root_words': len(self.prepared),
             'top_rows': top_rows,
             'prune_cutoff': self.prune_threshold,
         }
@@ -695,6 +696,8 @@ class AdaptiveFrontierSearch:
         self._last_status_emit = now
 
     def best_from_subgroup(self, subgroup_bits, depth):
+        if time.time() > self.deadline:
+            raise TimeoutError("adaptive lookahead time budget exceeded")
         key = StateKey(subgroup_bits, depth, self.policy)
         state_key, state_node = self.get_or_create_state(
             subgroup_bits, depth, self.policy
@@ -726,6 +729,8 @@ class AdaptiveFrontierSearch:
         best_total = 0.0
         best_word = None
         for candidate in candidates:
+            if time.time() > self.deadline:
+                raise TimeoutError("adaptive lookahead time budget exceeded")
             self._emit_status()
             guess_id = self.guess_to_id.get(candidate, -1)
             groups = self.partition_to_bits(candidate, subgroup_bits)
@@ -744,6 +749,8 @@ class AdaptiveFrontierSearch:
                 if m == 2:
                     recursive += (2 / k)
                 else:
+                    if time.time() > self.deadline:
+                        raise TimeoutError("adaptive lookahead time budget exceeded")
                     recursive += edge.path_weight * self.best_from_subgroup(
                         edge.child_state_key.subset_bits,
                         edge.child_state_key.remaining_depth,
@@ -845,9 +852,13 @@ class AdaptiveFrontierSearch:
             return
         old_lower = child.lower_bound
         old_upper = child.upper_bound
-        exact_value = self.best_from_subgroup(
-            child.subset_bits, child.remaining_depth
-        )
+        try:
+            exact_value = self.best_from_subgroup(
+                child.subset_bits, child.remaining_depth
+            )
+        except TimeoutError:
+            self.timed_out = True
+            return
         child.lower_bound = max(child.lower_bound, exact_value)
         child.upper_bound = min(child.upper_bound, exact_value)
         child.is_exact = abs(child.upper_bound - child.lower_bound) < 1e-12
@@ -876,6 +887,8 @@ class AdaptiveFrontierSearch:
             if item is None:
                 break
             self._process_work_item(item)
+            if self.timed_out:
+                break
             self._maybe_expand_roots()
             ranked = sorted(
                 self.root_candidate_records.values(),

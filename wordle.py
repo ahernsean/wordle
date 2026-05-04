@@ -956,25 +956,24 @@ def cmd_lookahead(gs):
             frontier = snapshot['frontier_size']
             queued = snapshot['queued_items']
             activated = snapshot['activated_root_words']
-            total_roots = len(top_n)
+            total_roots = snapshot.get('eligible_root_words', len(top_n))
             cutoff = snapshot['prune_cutoff']
             rows = snapshot['top_rows'][:5]
 
             lines = [
                 "",
-                "  --- Adaptive status ---",
                 f"  elapsed/budget: {elapsed}s / {budget_s}s",
                 f"  activated root words: {activated}/{total_roots}",
                 f"  frontier heap entries: {frontier}",
                 f"  pending item keys: {queued}",
                 f"  Top-N cutoff lower bound (C_N): {cutoff:.4f}",
                 "  exact? symbols: '=' means lower == upper, '~' means open interval",
-                "  contenders:   word      lower    upper   exact?    gap",
+                "  contenders:            word      lower    upper   exact?    gap",
             ]
             for w, lo, hi, exact in rows:
                 flag = "=" if exact else "~"
                 lines.append(
-                    f"      {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
+                    f"              {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
                 )
             if rows:
                 lines.append("  best guesses if halted now:")
