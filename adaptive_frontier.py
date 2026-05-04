@@ -103,9 +103,18 @@ class AdaptiveFrontier:
 
     def pop(self) -> Optional[WorkItem]:
         """Pop next valid item; skip stale/pruned; requeue dirty items."""
+        return self.pop_prefer_type(None)
+
+    def pop_prefer_type(self, preferred_type: Optional[WorkItemType]) -> Optional[WorkItem]:
+        """Pop next valid item, optionally preferring a specific item type."""
+        deferred: List[_HeapEntry] = []
         while self._heap:
             entry = heapq.heappop(self._heap)
             item = entry.item
+
+            if preferred_type is not None and item.item_type != preferred_type:
+                deferred.append(entry)
+                continue
 
             current_gen = self._get_generation(item.item_key)
             if item.generation != current_gen:
@@ -137,8 +146,12 @@ class AdaptiveFrontier:
                 continue
 
             self.popped_valid += 1
+            for d in deferred:
+                heapq.heappush(self._heap, d)
             return item
 
+        for d in deferred:
+            heapq.heappush(self._heap, d)
         return None
 
     def counters(self) -> Dict[str, int]:

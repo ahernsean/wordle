@@ -5,6 +5,7 @@ No UI dependencies. All display/interaction is handled by the caller.
 """
 
 import math
+import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -437,6 +438,7 @@ class AdaptiveFrontierSearch:
     """Stateful adaptive lookahead runner extracted from Solution."""
 
     def __init__(self, solution, top_words,
+                 root_expansion_words=None,
                  global_candidates=None,
                  max_depth=3,
                  time_budget=300,
@@ -446,9 +448,15 @@ class AdaptiveFrontierSearch:
                  status_callback=None):
         self.solution = solution
         self.top_words = top_words
+        self.root_expansion_words = (
+            root_expansion_words
+            if root_expansion_words is not None
+            else top_words
+        )
         self.global_candidates = global_candidates
         self.max_depth = max_depth
         self.time_budget = time_budget
+        self.start_time = time.time()
         self.top_k = top_k
         self.persistence_policy = persistence_policy
         self.progress_callback = progress_callback
@@ -486,7 +494,27 @@ class AdaptiveFrontierSearch:
         self.total_words = len(top_words)
         self.activated_root_words = 0
         self.root_candidate_records = {}
+        self.dormant_root_keys = []
+        self.exploration_rate = 0.04
+        self.expansion_batch_size = 3
+        self.max_exploration_rate = 0.25
+        self.stagnation_threshold = 3
+        self.stagnant_status_intervals = 0
+        self._last_top_signature = None
         self.id_to_guess = {i: w for w, i in self.guess_to_id.items()}
+        self.status_interval_s = 10.0
+        self._last_status_emit = 0.0
+        self.mode_weights = {
+            'exploit_cutoff': 0.34,
+            'exploit_upside': 0.23,
+            'explore_new_roots': 0.15,
+            'anti_starvation': 0.10,
+            'cache_harvest': 0.10,
+            'stagnation_escape': 0.05,
+            'endgame': 0.03,
+        }
+        self.mode_counts = {k: 0 for k in self.mode_weights}
+        self._last_item_type = None
 
     def words_to_bits(self, words):
         bits = 0
@@ -507,6 +535,15 @@ class AdaptiveFrontierSearch:
 
     def partition_to_bits(self, candidate, subgroup_bits):
         subgroup_words = self.bits_to_words(subgroup_bits)
+        subset_blob = AdaptiveCacheSQLite.encode_subset(subgroup_words)
+        if self.persistence:
+            cached = self.persistence.read_partition(
+                subset_blob,
+                candidate,
+                self.persistence_key,
+            )
+            if cached is not None:
+                return {int(pat): bits for pat, bits in cached.items()}
         if self.cache:
             grouped = self.cache.group_words(candidate, subgroup_words)
         else:
@@ -514,10 +551,18 @@ class AdaptiveFrontierSearch:
             for answer in subgroup_words:
                 pat = _encode_response(calculate_response(candidate, answer))
                 grouped[pat].append(answer)
-        return {
+        payload = {
             pat: self.words_to_bits(words)
             for pat, words in grouped.items()
         }
+        if self.persistence:
+            self.persistence.write_partition(
+                subset_blob,
+                candidate,
+                self.persistence_key,
+                {str(pat): bits for pat, bits in payload.items()},
+            )
+        return payload
 
     def get_or_create_state(self, subset_bits, remaining_depth, policy):
         key = StateKey(subset_bits, remaining_depth, policy)
@@ -577,7 +622,8 @@ class AdaptiveFrontierSearch:
             self.max_depth,
             self.policy,
         )
-        for idx, (word, first_ent) in enumerate(self.top_words):
+        for idx, (word, first_ent) in enumerate(
+                self.root_expansion_words):
             grouped = self.partition_to_bits(word, self.root_subset_bits)
             upper = first_ent + sum(
                 (bits.bit_count() / self.n) * math.log2(bits.bit_count())
@@ -590,6 +636,8 @@ class AdaptiveFrontierSearch:
             self.intern_table[key] = StateKey(self.root_subset_bits,
                                               self.max_depth,
                                               self.policy)
+            if idx >= len(self.top_words):
+                self.dormant_root_keys.append(key)
 
     def _enqueue_initial_activation(self):
         def cutoff():
@@ -601,6 +649,8 @@ class AdaptiveFrontierSearch:
             get_cutoff=cutoff,
         )
         for key, (_w, _f, _g, upper) in self.prepared.items():
+            if key in self.dormant_root_keys:
+                continue
             self.frontier.enqueue(
                 WorkItemType.ACTIVATE_TOP_WORD,
                 key,
@@ -610,8 +660,98 @@ class AdaptiveFrontierSearch:
             )
             self.pending.add(key)
 
-    def _emit_status(self):
+    def _maybe_expand_roots(self):
+        if not self.dormant_root_keys:
+            return
+        if random.random() >= self.current_exploration_rate():
+            return
+        random.shuffle(self.dormant_root_keys)
+        batch_size = self.expansion_batch_size
+        if self.current_scheduler_mode() == 'stagnation-escape':
+            batch_size = min(5, batch_size + 2)
+        batch = min(batch_size,
+                    len(self.dormant_root_keys))
+        for _ in range(batch):
+            key = self.dormant_root_keys.pop()
+            _w, _f, _g, upper = self.prepared[key]
+            self.frontier.enqueue(
+                WorkItemType.ACTIVATE_TOP_WORD,
+                key,
+                upper,
+                self.generations[key],
+                upper,
+            )
+            self.pending.add(key)
+
+    def current_exploration_rate(self):
+        mode = self.current_scheduler_mode()
+        if mode == 'endgame-stabilize':
+            return max(0.01, self.exploration_rate * 0.5)
+        if self.stagnant_status_intervals < self.stagnation_threshold:
+            return self.exploration_rate
+        bonus_steps = self.stagnant_status_intervals - self.stagnation_threshold + 1
+        boosted = self.exploration_rate + (0.03 * bonus_steps)
+        return min(self.max_exploration_rate, boosted)
+
+    def current_scheduler_mode(self):
+        elapsed = time.time() - self.start_time
+        budget = max(self.time_budget, 1e-9)
+        if elapsed / budget >= 0.8:
+            return 'endgame-stabilize'
+        if self.stagnant_status_intervals >= self.stagnation_threshold:
+            return 'stagnation-escape'
+        return 'normal'
+
+    def effective_mode_weights(self):
+        weights = dict(self.mode_weights)
+        phase = self.current_scheduler_mode()
+        if phase == 'stagnation-escape':
+            weights['stagnation_escape'] += 0.10
+            weights['explore_new_roots'] += 0.08
+            weights['exploit_cutoff'] -= 0.08
+            weights['cache_harvest'] -= 0.04
+        elif phase == 'endgame-stabilize':
+            weights['endgame'] += 0.20
+            weights['exploit_cutoff'] += 0.10
+            weights['explore_new_roots'] -= 0.10
+            weights['stagnation_escape'] -= 0.08
+        # normalize and guard
+        for k, v in list(weights.items()):
+            weights[k] = max(0.0, v)
+        s = sum(weights.values()) or 1.0
+        for k in weights:
+            weights[k] /= s
+        return weights
+
+    def choose_scheduler_mode(self):
+        weights = self.effective_mode_weights()
+        modes = list(weights.keys())
+        probs = [weights[m] for m in modes]
+        chosen = random.choices(modes, probs, k=1)[0]
+        self.mode_counts[chosen] += 1
+        return chosen
+
+    def pop_work_for_mode(self, mode):
+        if mode in ('exploit_cutoff', 'cache_harvest', 'endgame'):
+            return self.frontier.pop_prefer_type(WorkItemType.REFINE_CHILD) or self.frontier.pop()
+        if mode in ('exploit_upside', 'explore_new_roots'):
+            return self.frontier.pop_prefer_type(WorkItemType.ACTIVATE_TOP_WORD) or self.frontier.pop()
+        if mode == 'anti_starvation':
+            preferred = WorkItemType.REFINE_CHILD
+            if self._last_item_type == WorkItemType.REFINE_CHILD:
+                preferred = WorkItemType.ACTIVATE_TOP_WORD
+            return self.frontier.pop_prefer_type(preferred) or self.frontier.pop()
+        if mode == 'stagnation_escape':
+            self._maybe_expand_roots()
+            return self.frontier.pop_prefer_type(WorkItemType.ACTIVATE_TOP_WORD) or self.frontier.pop()
+        return self.frontier.pop()
+
+    def _emit_status(self, force=False):
         if not self.status_callback:
+            return
+        now = time.time()
+        if (not force and self._last_status_emit
+                and (now - self._last_status_emit) < self.status_interval_s):
             return
         top_rows = [
             (
@@ -623,18 +763,33 @@ class AdaptiveFrontierSearch:
             for guess_id, rec in self.root_candidate_records.items()
         ]
         top_rows.sort(key=lambda row: (-row[1], row[0]))
+        top_signature = tuple((w, round(lo, 4)) for w, lo, _hi, _exact in top_rows[:5])
+        if top_signature == self._last_top_signature:
+            self.stagnant_status_intervals += 1
+        else:
+            self.stagnant_status_intervals = 0
+            self._last_top_signature = top_signature
         info = {
-            'elapsed': self.time_budget - max(0.0, self.deadline - time.time()),
+            'elapsed': now - self.start_time,
             'time_budget': self.time_budget,
             'frontier_size': len(self.frontier) if self.frontier else 0,
             'queued_items': len(self.pending),
             'activated_root_words': self.activated_root_words,
+            'eligible_root_words': len(self.prepared),
             'top_rows': top_rows,
             'prune_cutoff': self.prune_threshold,
+            'stagnant_intervals': self.stagnant_status_intervals,
+            'exploration_rate': self.current_exploration_rate(),
+            'scheduler_mode': self.current_scheduler_mode(),
+            'mode_counts': dict(self.mode_counts),
+            'mode_weights': self.effective_mode_weights(),
         }
         self.status_callback(info)
+        self._last_status_emit = now
 
     def best_from_subgroup(self, subgroup_bits, depth):
+        if time.time() > self.deadline:
+            raise TimeoutError("adaptive lookahead time budget exceeded")
         key = StateKey(subgroup_bits, depth, self.policy)
         state_key, state_node = self.get_or_create_state(
             subgroup_bits, depth, self.policy
@@ -664,7 +819,11 @@ class AdaptiveFrontierSearch:
                 candidates.append(word)
 
         best_total = 0.0
+        best_word = None
         for candidate in candidates:
+            if time.time() > self.deadline:
+                raise TimeoutError("adaptive lookahead time budget exceeded")
+            self._emit_status()
             guess_id = self.guess_to_id.get(candidate, -1)
             groups = self.partition_to_bits(candidate, subgroup_bits)
             edges = self.build_child_edges(state_key, guess_id, groups)
@@ -682,6 +841,8 @@ class AdaptiveFrontierSearch:
                 if m == 2:
                     recursive += (2 / k)
                 else:
+                    if time.time() > self.deadline:
+                        raise TimeoutError("adaptive lookahead time budget exceeded")
                     recursive += edge.path_weight * self.best_from_subgroup(
                         edge.child_state_key.subset_bits,
                         edge.child_state_key.remaining_depth,
@@ -700,7 +861,9 @@ class AdaptiveFrontierSearch:
                 children=edges,
                 dirty_flags=set(),
             )
-            best_total = max(best_total, total)
+            if best_word is None or total > best_total:
+                best_total = total
+                best_word = candidate
 
         if self.persistence:
             self.persistence.write_state(
@@ -709,6 +872,7 @@ class AdaptiveFrontierSearch:
                 self.persistence_key,
                 lower_bound=best_total,
                 upper_bound=best_total,
+                best_guess_id=best_word,
                 is_exact=True,
             )
         self.memo[key] = best_total
@@ -780,9 +944,13 @@ class AdaptiveFrontierSearch:
             return
         old_lower = child.lower_bound
         old_upper = child.upper_bound
-        exact_value = self.best_from_subgroup(
-            child.subset_bits, child.remaining_depth
-        )
+        try:
+            exact_value = self.best_from_subgroup(
+                child.subset_bits, child.remaining_depth
+            )
+        except TimeoutError:
+            self.timed_out = True
+            return
         child.lower_bound = max(child.lower_bound, exact_value)
         child.upper_bound = min(child.upper_bound, exact_value)
         child.is_exact = abs(child.upper_bound - child.lower_bound) < 1e-12
@@ -807,10 +975,16 @@ class AdaptiveFrontierSearch:
             if time.time() > self.deadline:
                 self.timed_out = True
                 break
-            item = self.frontier.pop()
+            chosen_mode = self.choose_scheduler_mode()
+            if chosen_mode in ('explore_new_roots', 'stagnation_escape'):
+                self._maybe_expand_roots()
+            item = self.pop_work_for_mode(chosen_mode)
             if item is None:
                 break
             self._process_work_item(item)
+            self._last_item_type = item.item_type
+            if self.timed_out:
+                break
             ranked = sorted(
                 self.root_candidate_records.values(),
                 key=lambda rec: -rec.lower_bound
@@ -818,6 +992,11 @@ class AdaptiveFrontierSearch:
             if len(ranked) >= self.top_k:
                 self.prune_threshold = ranked[self.top_k - 1].lower_bound
             self._emit_status()
+
+        # Always emit one final snapshot at completion/timeout so the
+        # caller sees end-state bounds even if interval throttling would
+        # otherwise suppress it.
+        self._emit_status(force=True)
 
         self.results = []
         for guess_id, rec in self.root_candidate_records.items():
@@ -1173,6 +1352,7 @@ class Solution:
         return results
 
     def compute_adaptive_lookahead(self, top_words,
+                                   root_expansion_words=None,
                                    global_candidates=None,
                                    max_depth=3,
                                    time_budget=300,
@@ -1187,6 +1367,9 @@ class Solution:
         using branch-and-bound pruning: for a subgroup of
         size k, the max remaining contribution is log2(k).
 
+        root_expansion_words: optional broader pool of
+            root candidates eligible for stochastic activation
+            beyond initial top_words.
         global_candidates: top-N² words from step-1 solve.
             At each level, candidates = union of subgroup
             + global_candidates.
@@ -1216,6 +1399,7 @@ class Solution:
         runner = AdaptiveFrontierSearch(
             solution=self,
             top_words=top_words,
+            root_expansion_words=root_expansion_words,
             global_candidates=global_candidates,
             max_depth=max_depth,
             time_budget=time_budget,

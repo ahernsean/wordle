@@ -95,6 +95,32 @@ class AdaptiveCacheSQLite:
             ON adaptive_state(universe_id, policy, remaining_depth)
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS adaptive_partition (
+                subset_blob BLOB NOT NULL,
+                guess_word TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                universe_id TEXT NOT NULL,
+                partition_blob BLOB NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (
+                    subset_blob,
+                    guess_word,
+                    policy,
+                    universe_id
+                ),
+                FOREIGN KEY (universe_id)
+                    REFERENCES universe_metadata(universe_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_adaptive_partition_lookup
+            ON adaptive_partition(universe_id, policy, guess_word)
+            """
+        )
 
     def _compute_universe_hash(self):
         payload = {
@@ -139,8 +165,47 @@ class AdaptiveCacheSQLite:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
-
         return universe_id
+
+    def read_partition(self, subset_blob, guess_word, policy):
+        row = self._conn.execute(
+            """
+            SELECT partition_blob
+            FROM adaptive_partition
+            WHERE subset_blob = ?
+              AND guess_word = ?
+              AND policy = ?
+              AND universe_id = ?
+            """,
+            (subset_blob, guess_word, policy, self.universe_id),
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["partition_blob"])
+
+    def write_partition(self, subset_blob, guess_word, policy, payload):
+        now = int(time.time())
+        serialized = json.dumps(payload, separators=(",", ":"))
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO adaptive_partition (
+                subset_blob,
+                guess_word,
+                policy,
+                universe_id,
+                partition_blob,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                subset_blob,
+                guess_word,
+                policy,
+                self.universe_id,
+                serialized,
+                now,
+            ),
+        )
 
     @staticmethod
     def encode_subset(words):

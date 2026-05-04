@@ -915,19 +915,10 @@ def cmd_lookahead(gs):
     else:
         count = LOOKAHEAD_N
 
-    # Prompt for depth
-    print(f"Lookahead depth? (2) ", end="")
-    d_input = input().strip()
-    if d_input:
-        try:
-            depth = int(d_input)
-            if depth < 2:
-                raise ValueError
-        except ValueError:
-            print_error("Invalid depth.")
-            return
-    else:
-        depth = 2
+    # Adaptive interface is budget-driven (no fixed user depth prompt).
+    # Keep an internal recursion safety horizon to avoid Python recursion
+    # overflow on very large remaining sets while still allowing deep search.
+    depth = min(n_rem, 24)
 
     top_n = soln.scores[:count]
 
@@ -944,7 +935,7 @@ def cmd_lookahead(gs):
         ]
         mode_label = f"top {len(global_candidates)} guesses"
 
-    print(f"\n{depth}-step lookahead on top "
+    print(f"\nAdaptive lookahead (budget-driven depth) on top "
           f"{len(top_n)} words vs "
           f"{n_rem:,} remaining.")
     print(f"({mode_label} for deeper steps)")
@@ -954,8 +945,6 @@ def cmd_lookahead(gs):
     print(f"  Time budget: {budget}s")
     print(f"  Pruning to top {LOOKAHEAD_N}")
     algo_mode = LOOKAHEAD_ALGORITHMS['a']
-    status_lines = [0]
-
     def format_status(snapshot):
             # Human-readable multiline status block.
             elapsed = int(snapshot['elapsed'])
@@ -963,52 +952,60 @@ def cmd_lookahead(gs):
             frontier = snapshot['frontier_size']
             queued = snapshot['queued_items']
             activated = snapshot['activated_root_words']
+            total_roots = snapshot.get('eligible_root_words', len(top_n))
             cutoff = snapshot['prune_cutoff']
-            rows = snapshot['top_rows'][:3]
+            rows = snapshot['top_rows'][:5]
+            mode = snapshot.get('scheduler_mode', 'normal')
+            stagnant_intervals = snapshot.get('stagnant_intervals', 0)
+            exploration_rate = snapshot.get('exploration_rate', 0.0)
+            mode_counts = snapshot.get('mode_counts', {})
+            mode_weights = snapshot.get('mode_weights', {})
 
             lines = [
                 "",
-                "  --- Adaptive status ---",
                 f"  elapsed/budget: {elapsed}s / {budget_s}s",
-                f"  activated words: {activated}",
-                f"  frontier size: {frontier}",
-                f"  queued work items: {queued}",
+                f"  activated root words: {activated}/{total_roots}",
+                f"  frontier heap entries: {frontier}",
+                f"  pending item keys: {queued}",
                 f"  Top-N cutoff lower bound (C_N): {cutoff:.4f}",
+                f"  scheduler mode: {mode}",
+                f"  stagnation intervals: {stagnant_intervals}",
+                f"  root exploration rate: {exploration_rate:.2%}",
+                "  scheduler weights: " + ", ".join(
+                    f"{k}={mode_weights[k]:.2f}" for k in sorted(mode_weights)
+                ) if mode_weights else "  scheduler weights: (n/a)",
+                "  scheduler counts: " + ", ".join(
+                    f"{k}={mode_counts[k]}" for k in sorted(mode_counts)
+                ) if mode_counts else "  scheduler counts: (n/a)",
                 "  exact? symbols: '=' means lower == upper, '~' means open interval",
-                "  contenders: word      lower    upper   exact?    gap",
+                "  contenders:            word      lower    upper   exact?    gap",
             ]
             for w, lo, hi, exact in rows:
                 flag = "=" if exact else "~"
                 lines.append(
-                    f"    {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
+                    f"              {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
                 )
+            if rows:
+                lines.append("  best guesses if halted now:")
+                lines.append("    rank  word      lower")
+                for idx, (w, lo, _hi, _exact) in enumerate(rows, start=1):
+                    lines.append(
+                        f"    {idx:>4}  {w}{_mark(w):<2}  {lo:7.4f}"
+                    )
             return "\n".join(lines)
 
-    def on_progress(idx, total, word, score):
-            if score is not None:
-                print(f"  {idx+1}/{total} "
-                      f"{word}{_mark(word)}"
-                      f" {score:.4f}",
-                      flush=True)
-            else:
-                print(f"  {idx+1}/{total} "
-                      f"{word}{_mark(word)}"
-                      f" (pruned)",
-                      flush=True)
-
     def on_status(snapshot):
-        status_lines[0] += 1
-        if status_lines[0] % 25 == 0:
-            print(format_status(snapshot), flush=True)
+        print(format_status(snapshot), flush=True)
 
     start = time.perf_counter()
     results, status = soln.compute_adaptive_lookahead(
         top_n,
+        root_expansion_words=soln.scores[:max(count * 3, 150)],
         global_candidates=global_candidates,
         max_depth=depth - 1,
         time_budget=budget,
         top_k=LOOKAHEAD_N,
-        progress_callback=on_progress,
+        progress_callback=None,
         status_callback=on_status,
     )
     elapsed = time.perf_counter() - start
