@@ -916,9 +916,9 @@ def cmd_lookahead(gs):
         count = LOOKAHEAD_N
 
     # Adaptive interface is budget-driven (no fixed user depth prompt).
-    # Use a large internal horizon and let scheduling + time budget decide
-    # how deep to explore in practice.
-    depth = n_rem
+    # Keep an internal recursion safety horizon to avoid Python recursion
+    # overflow on very large remaining sets while still allowing deep search.
+    depth = min(n_rem, 24)
 
     top_n = soln.scores[:count]
 
@@ -958,6 +958,8 @@ def cmd_lookahead(gs):
             mode = snapshot.get('scheduler_mode', 'normal')
             stagnant_intervals = snapshot.get('stagnant_intervals', 0)
             exploration_rate = snapshot.get('exploration_rate', 0.0)
+            mode_counts = snapshot.get('mode_counts', {})
+            mode_weights = snapshot.get('mode_weights', {})
 
             lines = [
                 "",
@@ -969,6 +971,12 @@ def cmd_lookahead(gs):
                 f"  scheduler mode: {mode}",
                 f"  stagnation intervals: {stagnant_intervals}",
                 f"  root exploration rate: {exploration_rate:.2%}",
+                "  scheduler weights: " + ", ".join(
+                    f"{k}={mode_weights[k]:.2f}" for k in sorted(mode_weights)
+                ) if mode_weights else "  scheduler weights: (n/a)",
+                "  scheduler counts: " + ", ".join(
+                    f"{k}={mode_counts[k]}" for k in sorted(mode_counts)
+                ) if mode_counts else "  scheduler counts: (n/a)",
                 "  exact? symbols: '=' means lower == upper, '~' means open interval",
                 "  contenders:            word      lower    upper   exact?    gap",
             ]

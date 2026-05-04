@@ -504,6 +504,17 @@ class AdaptiveFrontierSearch:
         self.id_to_guess = {i: w for w, i in self.guess_to_id.items()}
         self.status_interval_s = 10.0
         self._last_status_emit = 0.0
+        self.mode_weights = {
+            'exploit_cutoff': 0.34,
+            'exploit_upside': 0.23,
+            'explore_new_roots': 0.15,
+            'anti_starvation': 0.10,
+            'cache_harvest': 0.10,
+            'stagnation_escape': 0.05,
+            'endgame': 0.03,
+        }
+        self.mode_counts = {k: 0 for k in self.mode_weights}
+        self._last_item_type = None
 
     def words_to_bits(self, words):
         bits = 0
@@ -691,6 +702,50 @@ class AdaptiveFrontierSearch:
             return 'stagnation-escape'
         return 'normal'
 
+    def effective_mode_weights(self):
+        weights = dict(self.mode_weights)
+        phase = self.current_scheduler_mode()
+        if phase == 'stagnation-escape':
+            weights['stagnation_escape'] += 0.10
+            weights['explore_new_roots'] += 0.08
+            weights['exploit_cutoff'] -= 0.08
+            weights['cache_harvest'] -= 0.04
+        elif phase == 'endgame-stabilize':
+            weights['endgame'] += 0.20
+            weights['exploit_cutoff'] += 0.10
+            weights['explore_new_roots'] -= 0.10
+            weights['stagnation_escape'] -= 0.08
+        # normalize and guard
+        for k, v in list(weights.items()):
+            weights[k] = max(0.0, v)
+        s = sum(weights.values()) or 1.0
+        for k in weights:
+            weights[k] /= s
+        return weights
+
+    def choose_scheduler_mode(self):
+        weights = self.effective_mode_weights()
+        modes = list(weights.keys())
+        probs = [weights[m] for m in modes]
+        chosen = random.choices(modes, probs, k=1)[0]
+        self.mode_counts[chosen] += 1
+        return chosen
+
+    def pop_work_for_mode(self, mode):
+        if mode in ('exploit_cutoff', 'cache_harvest', 'endgame'):
+            return self.frontier.pop_prefer_type(WorkItemType.REFINE_CHILD) or self.frontier.pop()
+        if mode in ('exploit_upside', 'explore_new_roots'):
+            return self.frontier.pop_prefer_type(WorkItemType.ACTIVATE_TOP_WORD) or self.frontier.pop()
+        if mode == 'anti_starvation':
+            preferred = WorkItemType.REFINE_CHILD
+            if self._last_item_type == WorkItemType.REFINE_CHILD:
+                preferred = WorkItemType.ACTIVATE_TOP_WORD
+            return self.frontier.pop_prefer_type(preferred) or self.frontier.pop()
+        if mode == 'stagnation_escape':
+            self._maybe_expand_roots()
+            return self.frontier.pop_prefer_type(WorkItemType.ACTIVATE_TOP_WORD) or self.frontier.pop()
+        return self.frontier.pop()
+
     def _emit_status(self, force=False):
         if not self.status_callback:
             return
@@ -726,6 +781,8 @@ class AdaptiveFrontierSearch:
             'stagnant_intervals': self.stagnant_status_intervals,
             'exploration_rate': self.current_exploration_rate(),
             'scheduler_mode': self.current_scheduler_mode(),
+            'mode_counts': dict(self.mode_counts),
+            'mode_weights': self.effective_mode_weights(),
         }
         self.status_callback(info)
         self._last_status_emit = now
@@ -918,13 +975,16 @@ class AdaptiveFrontierSearch:
             if time.time() > self.deadline:
                 self.timed_out = True
                 break
-            item = self.frontier.pop()
+            chosen_mode = self.choose_scheduler_mode()
+            if chosen_mode in ('explore_new_roots', 'stagnation_escape'):
+                self._maybe_expand_roots()
+            item = self.pop_work_for_mode(chosen_mode)
             if item is None:
                 break
             self._process_work_item(item)
+            self._last_item_type = item.item_type
             if self.timed_out:
                 break
-            self._maybe_expand_roots()
             ranked = sorted(
                 self.root_candidate_records.values(),
                 key=lambda rec: -rec.lower_bound
