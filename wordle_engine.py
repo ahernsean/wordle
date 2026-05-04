@@ -520,6 +520,15 @@ class AdaptiveFrontierSearch:
 
     def partition_to_bits(self, candidate, subgroup_bits):
         subgroup_words = self.bits_to_words(subgroup_bits)
+        subset_blob = AdaptiveCacheSQLite.encode_subset(subgroup_words)
+        if self.persistence:
+            cached = self.persistence.read_partition(
+                subset_blob,
+                candidate,
+                self.persistence_key,
+            )
+            if cached is not None:
+                return {int(pat): bits for pat, bits in cached.items()}
         if self.cache:
             grouped = self.cache.group_words(candidate, subgroup_words)
         else:
@@ -527,10 +536,18 @@ class AdaptiveFrontierSearch:
             for answer in subgroup_words:
                 pat = _encode_response(calculate_response(candidate, answer))
                 grouped[pat].append(answer)
-        return {
+        payload = {
             pat: self.words_to_bits(words)
             for pat, words in grouped.items()
         }
+        if self.persistence:
+            self.persistence.write_partition(
+                subset_blob,
+                candidate,
+                self.persistence_key,
+                {str(pat): bits for pat, bits in payload.items()},
+            )
+        return payload
 
     def get_or_create_state(self, subset_bits, remaining_depth, policy):
         key = StateKey(subset_bits, remaining_depth, policy)
@@ -707,6 +724,7 @@ class AdaptiveFrontierSearch:
                 candidates.append(word)
 
         best_total = 0.0
+        best_word = None
         for candidate in candidates:
             self._emit_status()
             guess_id = self.guess_to_id.get(candidate, -1)
@@ -744,7 +762,9 @@ class AdaptiveFrontierSearch:
                 children=edges,
                 dirty_flags=set(),
             )
-            best_total = max(best_total, total)
+            if best_word is None or total > best_total:
+                best_total = total
+                best_word = candidate
 
         if self.persistence:
             self.persistence.write_state(
@@ -753,6 +773,7 @@ class AdaptiveFrontierSearch:
                 self.persistence_key,
                 lower_bound=best_total,
                 upper_bound=best_total,
+                best_guess_id=best_word,
                 is_exact=True,
             )
         self.memo[key] = best_total
