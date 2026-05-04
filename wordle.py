@@ -915,17 +915,12 @@ def cmd_lookahead(gs):
     else:
         count = LOOKAHEAD_N
 
-    # Prompt for depth
-    print(f"Lookahead depth? (2) ", end="")
-    d_input = input().strip()
-    if d_input:
-        try:
-            depth = int(d_input)
-            if depth < 2:
-                raise ValueError
-        except ValueError:
-            print_error("Invalid depth.")
-            return
+    # Adaptive interface chooses depth automatically.
+    # Depth here means total steps (step1 + deeper lookahead).
+    if n_rem <= 20:
+        depth = 4
+    elif n_rem <= 100:
+        depth = 3
     else:
         depth = 2
 
