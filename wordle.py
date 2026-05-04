@@ -974,19 +974,20 @@ def cmd_lookahead(gs):
                 f"  pending item keys: {queued}",
                 f"  Top-N cutoff lower bound (C_N): {cutoff:.4f}",
                 "  exact? symbols: '=' means lower == upper, '~' means open interval",
-                "  contenders: word      lower    upper   exact?    gap",
+                "  contenders:   word      lower    upper   exact?    gap",
             ]
             for w, lo, hi, exact in rows:
                 flag = "=" if exact else "~"
                 lines.append(
-                    f"    {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
+                    f"      {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
                 )
             if rows:
-                best_now = ", ".join(
-                    f"{w}{_mark(w)} ({lo:.4f})"
-                    for w, lo, _hi, _exact in rows
-                )
-                lines.append(f"  best guesses if halted now: {best_now}")
+                lines.append("  best guesses if halted now:")
+                lines.append("    rank  word      lower")
+                for idx, (w, lo, _hi, _exact) in enumerate(rows, start=1):
+                    lines.append(
+                        f"    {idx:>4}  {w}{_mark(w):<2}  {lo:7.4f}"
+                    )
             return "\n".join(lines)
 
     def on_status(snapshot):
@@ -995,6 +996,7 @@ def cmd_lookahead(gs):
     start = time.perf_counter()
     results, status = soln.compute_adaptive_lookahead(
         top_n,
+        root_expansion_words=soln.scores[:max(count * 3, 150)],
         global_candidates=global_candidates,
         max_depth=depth - 1,
         time_budget=budget,

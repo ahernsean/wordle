@@ -5,6 +5,7 @@ No UI dependencies. All display/interaction is handled by the caller.
 """
 
 import math
+import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -437,6 +438,7 @@ class AdaptiveFrontierSearch:
     """Stateful adaptive lookahead runner extracted from Solution."""
 
     def __init__(self, solution, top_words,
+                 root_expansion_words=None,
                  global_candidates=None,
                  max_depth=3,
                  time_budget=300,
@@ -446,6 +448,11 @@ class AdaptiveFrontierSearch:
                  status_callback=None):
         self.solution = solution
         self.top_words = top_words
+        self.root_expansion_words = (
+            root_expansion_words
+            if root_expansion_words is not None
+            else top_words
+        )
         self.global_candidates = global_candidates
         self.max_depth = max_depth
         self.time_budget = time_budget
@@ -487,6 +494,9 @@ class AdaptiveFrontierSearch:
         self.total_words = len(top_words)
         self.activated_root_words = 0
         self.root_candidate_records = {}
+        self.dormant_root_keys = []
+        self.exploration_rate = 0.04
+        self.expansion_batch_size = 3
         self.id_to_guess = {i: w for w, i in self.guess_to_id.items()}
         self.status_interval_s = 10.0
         self._last_status_emit = 0.0
@@ -580,7 +590,8 @@ class AdaptiveFrontierSearch:
             self.max_depth,
             self.policy,
         )
-        for idx, (word, first_ent) in enumerate(self.top_words):
+        for idx, (word, first_ent) in enumerate(
+                self.root_expansion_words):
             grouped = self.partition_to_bits(word, self.root_subset_bits)
             upper = first_ent + sum(
                 (bits.bit_count() / self.n) * math.log2(bits.bit_count())
@@ -593,6 +604,8 @@ class AdaptiveFrontierSearch:
             self.intern_table[key] = StateKey(self.root_subset_bits,
                                               self.max_depth,
                                               self.policy)
+            if idx >= len(self.top_words):
+                self.dormant_root_keys.append(key)
 
     def _enqueue_initial_activation(self):
         def cutoff():
@@ -604,11 +617,33 @@ class AdaptiveFrontierSearch:
             get_cutoff=cutoff,
         )
         for key, (_w, _f, _g, upper) in self.prepared.items():
+            if key in self.dormant_root_keys:
+                continue
             self.frontier.enqueue(
                 WorkItemType.ACTIVATE_TOP_WORD,
                 key,
                 upper,
                 0,
+                upper,
+            )
+            self.pending.add(key)
+
+    def _maybe_expand_roots(self):
+        if not self.dormant_root_keys:
+            return
+        if random.random() >= self.exploration_rate:
+            return
+        random.shuffle(self.dormant_root_keys)
+        batch = min(self.expansion_batch_size,
+                    len(self.dormant_root_keys))
+        for _ in range(batch):
+            key = self.dormant_root_keys.pop()
+            _w, _f, _g, upper = self.prepared[key]
+            self.frontier.enqueue(
+                WorkItemType.ACTIVATE_TOP_WORD,
+                key,
+                upper,
+                self.generations[key],
                 upper,
             )
             self.pending.add(key)
@@ -820,6 +855,7 @@ class AdaptiveFrontierSearch:
             if item is None:
                 break
             self._process_work_item(item)
+            self._maybe_expand_roots()
             ranked = sorted(
                 self.root_candidate_records.values(),
                 key=lambda rec: -rec.lower_bound
@@ -1187,6 +1223,7 @@ class Solution:
         return results
 
     def compute_adaptive_lookahead(self, top_words,
+                                   root_expansion_words=None,
                                    global_candidates=None,
                                    max_depth=3,
                                    time_budget=300,
@@ -1201,6 +1238,9 @@ class Solution:
         using branch-and-bound pruning: for a subgroup of
         size k, the max remaining contribution is log2(k).
 
+        root_expansion_words: optional broader pool of
+            root candidates eligible for stochastic activation
+            beyond initial top_words.
         global_candidates: top-N² words from step-1 solve.
             At each level, candidates = union of subgroup
             + global_candidates.
@@ -1230,6 +1270,7 @@ class Solution:
         runner = AdaptiveFrontierSearch(
             solution=self,
             top_words=top_words,
+            root_expansion_words=root_expansion_words,
             global_candidates=global_candidates,
             max_depth=max_depth,
             time_budget=time_budget,
