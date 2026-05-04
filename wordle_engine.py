@@ -497,6 +497,10 @@ class AdaptiveFrontierSearch:
         self.dormant_root_keys = []
         self.exploration_rate = 0.04
         self.expansion_batch_size = 3
+        self.max_exploration_rate = 0.25
+        self.stagnation_threshold = 3
+        self.stagnant_status_intervals = 0
+        self._last_top_signature = None
         self.id_to_guess = {i: w for w, i in self.guess_to_id.items()}
         self.status_interval_s = 10.0
         self._last_status_emit = 0.0
@@ -648,7 +652,7 @@ class AdaptiveFrontierSearch:
     def _maybe_expand_roots(self):
         if not self.dormant_root_keys:
             return
-        if random.random() >= self.exploration_rate:
+        if random.random() >= self.current_exploration_rate():
             return
         random.shuffle(self.dormant_root_keys)
         batch = min(self.expansion_batch_size,
@@ -664,6 +668,13 @@ class AdaptiveFrontierSearch:
                 upper,
             )
             self.pending.add(key)
+
+    def current_exploration_rate(self):
+        if self.stagnant_status_intervals < self.stagnation_threshold:
+            return self.exploration_rate
+        bonus_steps = self.stagnant_status_intervals - self.stagnation_threshold + 1
+        boosted = self.exploration_rate + (0.03 * bonus_steps)
+        return min(self.max_exploration_rate, boosted)
 
     def _emit_status(self, force=False):
         if not self.status_callback:
@@ -682,6 +693,12 @@ class AdaptiveFrontierSearch:
             for guess_id, rec in self.root_candidate_records.items()
         ]
         top_rows.sort(key=lambda row: (-row[1], row[0]))
+        top_signature = tuple((w, round(lo, 4)) for w, lo, _hi, _exact in top_rows[:5])
+        if top_signature == self._last_top_signature:
+            self.stagnant_status_intervals += 1
+        else:
+            self.stagnant_status_intervals = 0
+            self._last_top_signature = top_signature
         info = {
             'elapsed': now - self.start_time,
             'time_budget': self.time_budget,
@@ -691,6 +708,13 @@ class AdaptiveFrontierSearch:
             'eligible_root_words': len(self.prepared),
             'top_rows': top_rows,
             'prune_cutoff': self.prune_threshold,
+            'stagnant_intervals': self.stagnant_status_intervals,
+            'exploration_rate': self.current_exploration_rate(),
+            'scheduler_mode': (
+                'stagnation-escape'
+                if self.stagnant_status_intervals >= self.stagnation_threshold
+                else 'normal'
+            ),
         }
         self.status_callback(info)
         self._last_status_emit = now

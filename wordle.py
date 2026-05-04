@@ -959,6 +959,9 @@ def cmd_lookahead(gs):
             total_roots = snapshot.get('eligible_root_words', len(top_n))
             cutoff = snapshot['prune_cutoff']
             rows = snapshot['top_rows'][:5]
+            mode = snapshot.get('scheduler_mode', 'normal')
+            stagnant_intervals = snapshot.get('stagnant_intervals', 0)
+            exploration_rate = snapshot.get('exploration_rate', 0.0)
 
             lines = [
                 "",
@@ -967,6 +970,9 @@ def cmd_lookahead(gs):
                 f"  frontier heap entries: {frontier}",
                 f"  pending item keys: {queued}",
                 f"  Top-N cutoff lower bound (C_N): {cutoff:.4f}",
+                f"  scheduler mode: {mode}",
+                f"  stagnation intervals: {stagnant_intervals}",
+                f"  root exploration rate: {exploration_rate:.2%}",
                 "  exact? symbols: '=' means lower == upper, '~' means open interval",
                 "  contenders:            word      lower    upper   exact?    gap",
             ]
