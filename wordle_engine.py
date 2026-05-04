@@ -449,6 +449,7 @@ class AdaptiveFrontierSearch:
         self.global_candidates = global_candidates
         self.max_depth = max_depth
         self.time_budget = time_budget
+        self.start_time = time.time()
         self.top_k = top_k
         self.persistence_policy = persistence_policy
         self.progress_callback = progress_callback
@@ -630,7 +631,7 @@ class AdaptiveFrontierSearch:
         ]
         top_rows.sort(key=lambda row: (-row[1], row[0]))
         info = {
-            'elapsed': self.time_budget - max(0.0, self.deadline - now),
+            'elapsed': now - self.start_time,
             'time_budget': self.time_budget,
             'frontier_size': len(self.frontier) if self.frontier else 0,
             'queued_items': len(self.pending),

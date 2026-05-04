@@ -961,6 +961,7 @@ def cmd_lookahead(gs):
             frontier = snapshot['frontier_size']
             queued = snapshot['queued_items']
             activated = snapshot['activated_root_words']
+            total_roots = len(top_n)
             cutoff = snapshot['prune_cutoff']
             rows = snapshot['top_rows'][:5]
 
@@ -968,9 +969,9 @@ def cmd_lookahead(gs):
                 "",
                 "  --- Adaptive status ---",
                 f"  elapsed/budget: {elapsed}s / {budget_s}s",
-                f"  activated words: {activated}",
-                f"  frontier size: {frontier}",
-                f"  queued work items: {queued}",
+                f"  activated root words: {activated}/{total_roots}",
+                f"  frontier heap entries: {frontier}",
+                f"  pending item keys: {queued}",
                 f"  Top-N cutoff lower bound (C_N): {cutoff:.4f}",
                 "  exact? symbols: '=' means lower == upper, '~' means open interval",
                 "  contenders: word      lower    upper   exact?    gap",
@@ -988,18 +989,6 @@ def cmd_lookahead(gs):
                 lines.append(f"  best guesses if halted now: {best_now}")
             return "\n".join(lines)
 
-    def on_progress(idx, total, word, score):
-            if score is not None:
-                print(f"  {idx+1}/{total} "
-                      f"{word}{_mark(word)}"
-                      f" {score:.4f}",
-                      flush=True)
-            else:
-                print(f"  {idx+1}/{total} "
-                      f"{word}{_mark(word)}"
-                      f" (pruned)",
-                      flush=True)
-
     def on_status(snapshot):
         print(format_status(snapshot), flush=True)
 
@@ -1010,7 +999,7 @@ def cmd_lookahead(gs):
         max_depth=depth - 1,
         time_budget=budget,
         top_k=LOOKAHEAD_N,
-        progress_callback=on_progress,
+        progress_callback=None,
         status_callback=on_status,
     )
     elapsed = time.perf_counter() - start
