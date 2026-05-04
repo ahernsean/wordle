@@ -827,6 +827,11 @@ class AdaptiveFrontierSearch:
                 self.prune_threshold = ranked[self.top_k - 1].lower_bound
             self._emit_status()
 
+        # Always emit one final snapshot at completion/timeout so the
+        # caller sees end-state bounds even if interval throttling would
+        # otherwise suppress it.
+        self._emit_status(force=True)
+
         self.results = []
         for guess_id, rec in self.root_candidate_records.items():
             word = self.id_to_guess.get(guess_id, str(guess_id))
