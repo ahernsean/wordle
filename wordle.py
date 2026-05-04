@@ -915,14 +915,10 @@ def cmd_lookahead(gs):
     else:
         count = LOOKAHEAD_N
 
-    # Adaptive interface chooses depth automatically.
-    # Depth here means total steps (step1 + deeper lookahead).
-    if n_rem <= 20:
-        depth = 4
-    elif n_rem <= 100:
-        depth = 3
-    else:
-        depth = 2
+    # Adaptive interface is budget-driven (no fixed user depth prompt).
+    # Use a large internal horizon and let scheduling + time budget decide
+    # how deep to explore in practice.
+    depth = n_rem
 
     top_n = soln.scores[:count]
 
@@ -939,7 +935,7 @@ def cmd_lookahead(gs):
         ]
         mode_label = f"top {len(global_candidates)} guesses"
 
-    print(f"\n{depth}-step lookahead on top "
+    print(f"\nAdaptive lookahead (budget-driven depth) on top "
           f"{len(top_n)} words vs "
           f"{n_rem:,} remaining.")
     print(f"({mode_label} for deeper steps)")

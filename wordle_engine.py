@@ -655,7 +655,10 @@ class AdaptiveFrontierSearch:
         if random.random() >= self.current_exploration_rate():
             return
         random.shuffle(self.dormant_root_keys)
-        batch = min(self.expansion_batch_size,
+        batch_size = self.expansion_batch_size
+        if self.current_scheduler_mode() == 'stagnation-escape':
+            batch_size = min(5, batch_size + 2)
+        batch = min(batch_size,
                     len(self.dormant_root_keys))
         for _ in range(batch):
             key = self.dormant_root_keys.pop()
@@ -670,11 +673,23 @@ class AdaptiveFrontierSearch:
             self.pending.add(key)
 
     def current_exploration_rate(self):
+        mode = self.current_scheduler_mode()
+        if mode == 'endgame-stabilize':
+            return max(0.01, self.exploration_rate * 0.5)
         if self.stagnant_status_intervals < self.stagnation_threshold:
             return self.exploration_rate
         bonus_steps = self.stagnant_status_intervals - self.stagnation_threshold + 1
         boosted = self.exploration_rate + (0.03 * bonus_steps)
         return min(self.max_exploration_rate, boosted)
+
+    def current_scheduler_mode(self):
+        elapsed = time.time() - self.start_time
+        budget = max(self.time_budget, 1e-9)
+        if elapsed / budget >= 0.8:
+            return 'endgame-stabilize'
+        if self.stagnant_status_intervals >= self.stagnation_threshold:
+            return 'stagnation-escape'
+        return 'normal'
 
     def _emit_status(self, force=False):
         if not self.status_callback:
@@ -710,11 +725,7 @@ class AdaptiveFrontierSearch:
             'prune_cutoff': self.prune_threshold,
             'stagnant_intervals': self.stagnant_status_intervals,
             'exploration_rate': self.current_exploration_rate(),
-            'scheduler_mode': (
-                'stagnation-escape'
-                if self.stagnant_status_intervals >= self.stagnation_threshold
-                else 'normal'
-            ),
+            'scheduler_mode': self.current_scheduler_mode(),
         }
         self.status_callback(info)
         self._last_status_emit = now
