@@ -978,7 +978,7 @@ def cmd_lookahead(gs):
                     f"{k}={mode_counts[k]}" for k in sorted(mode_counts)
                 ) if mode_counts else "  scheduler counts: (n/a)",
                 "  exact? symbols: '=' means lower == upper, '~' means open interval",
-                "  contenders:            word      lower    upper   exact?    gap",
+                "  contenders: word      lower    upper   exact?    gap",
             ]
             for w, lo, hi, exact in rows:
                 flag = "=" if exact else "~"
