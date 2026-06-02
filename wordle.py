@@ -225,7 +225,11 @@ def get_display_width():
             best_font = None
             for fname, fsize in candidates:
                 try:
-                    cw, _ = ui.measure_string('M', font=(fname, fsize))
+                    # Measure 20 chars to get advance width, not single-glyph
+                    # bounding box. Single-char measurement clips the right
+                    # bearing, underestimating the true character cell width.
+                    tw, _ = ui.measure_string('M' * 20, font=(fname, fsize))
+                    cw = tw / 20
                     cols = w_points / cw
                     err = abs(cols - round(cols))
                     if err < best_err:
@@ -237,7 +241,7 @@ def get_display_width():
 
             if best_cols and best_cols >= 20:
                 dbg(f'best font: {best_font[0]} {best_font[1]}pt '
-                    f'cw={best_font[2]:.3f}pt err={best_err:.4f} -> {best_cols} cols')
+                    f'adv={best_font[2]:.3f}pt err={best_err:.4f} -> {best_cols} cols')
                 return best_cols
         except Exception as e:
             print(f'[width] exception in detection: {e}')
