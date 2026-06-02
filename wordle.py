@@ -1517,8 +1517,8 @@ def main():
 
     gs = GameState(all_answers, all_guesses)
 
+    print_status(gs)
     while True:
-        print_status(gs)
         print(f"\nCommand (gsbldtixurаwhc?)? ", end="")
         try:
             cmd = input().strip()
@@ -1532,6 +1532,7 @@ def main():
             break
 
         if not cmd:
+            print_status(gs)
             continue
         handler = COMMANDS.get(cmd[0])
         if handler:
@@ -1542,6 +1543,7 @@ def main():
                 raise
         else:
             print_error(f"Unknown: {cmd}")
+        print_status(gs)
 
 
 if __name__ == '__main__':
