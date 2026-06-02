@@ -72,8 +72,63 @@ def reset_color():
         print(ANSI_RESET, end="")
 
 
+def _find_console_view_width():
+    """Walk Pythonista's view hierarchy to find the console OMTextView width."""
+    try:
+        from objc_util import ObjCClass
+
+        def _classname(view):
+            try:
+                return view._get_objc_classname().decode('utf-8', errors='ignore')
+            except Exception:
+                return ''
+
+        def _walk(view, depth=0):
+            if depth > 10:
+                return None
+            name = _classname(view)
+            if 'OMTextView' in name:
+                sv_name = _classname(view.superview()) if view.superview() else ''
+                if 'Editor' not in sv_name:
+                    return view
+            try:
+                for sv in view.subviews():
+                    hit = _walk(sv, depth + 1)
+                    if hit is not None:
+                        return hit
+            except Exception:
+                pass
+            return None
+
+        app = ObjCClass('UIApplication').sharedApplication()
+        win = app.keyWindow()
+        root = win.rootViewController().view()
+        cv = _walk(root)
+        if cv is not None:
+            w = cv.frame().size.width
+            if w > 10:
+                return w
+    except Exception:
+        pass
+    return None
+
+
+def _key_window_width():
+    """Return the key window width in points (correct for iPad windowed mode)."""
+    try:
+        from objc_util import ObjCClass
+        app = ObjCClass('UIApplication').sharedApplication()
+        win = app.keyWindow()
+        w = win.frame().size.width
+        if w > 10:
+            return w - 16  # subtract ~8pt padding per side
+    except Exception:
+        pass
+    return None
+
+
 def get_display_width():
-    """Auto-detect console width in characters."""
+    """Return console width in characters. Safe to call repeatedly."""
     # Explicit override always wins.
     env = os.environ.get('COLUMNS', '').strip()
     if env:
@@ -83,25 +138,23 @@ def get_display_width():
             pass
 
     if IS_PYTHONISTA and console is not None:
-        # shutil.get_terminal_size() returns the logical default (~80) in
-        # Pythonista, not the physical display width. Use pixel-based
-        # measurement instead, with several fallback layers.
+        # shutil.get_terminal_size() returns the logical default (~80), not
+        # the physical display width. Use pixel-based measurement instead,
+        # with several fallback layers in decreasing accuracy.
         try:
             import ui
 
             w_points = None
 
-            # Layer 1: console.get_size() — available in some Pythonista
-            # versions; returns the actual console view width in points.
+            # Layer 1: console.get_size() — available in newer Pythonista;
+            # returns the actual console view width in points.
             try:
                 w_points, _ = console.get_size()
             except AttributeError:
                 pass
 
-            # Layer 2: os.get_terminal_size() on each standard fd. Unlike
-            # shutil, this does NOT fabricate an 80-column fallback — it
-            # raises OSError if the fd isn't a real pty.  Succeeds on some
-            # Pythonista configurations.
+            # Layer 2: os.get_terminal_size() on each fd. Unlike shutil, this
+            # raises OSError rather than fabricating 80; a success is real.
             if w_points is None:
                 for fd in range(3):
                     try:
@@ -111,12 +164,21 @@ def get_display_width():
                     except OSError:
                         continue
 
-            # Layer 3: pixel math against screen width.
-            # ui.get_screen_size() returns the full physical screen — correct
-            # for iPhone (console fills the screen) but wrong for iPad in
-            # windowed/split-screen mode where the console is a fraction of
-            # the screen.  Cap at 720pt (~100 cols at Menlo 12) to prevent
-            # wildly large values on iPad.
+            # Layer 3: Walk the ObjC view hierarchy to find the OMTextView
+            # (the console text view). Its frame gives the exact width — works
+            # for both iPhone and iPad in any window configuration.
+            if w_points is None:
+                w_points = _find_console_view_width()
+
+            # Layer 4: Key window frame. On iPad in windowed/split mode the
+            # window is smaller than the screen; this is much more accurate
+            # than ui.get_screen_size() in that scenario.
+            if w_points is None:
+                w_points = _key_window_width()
+
+            # Layer 5: Screen size with a cap. ui.get_screen_size() returns
+            # the full physical screen which is wrong for iPad windowed mode.
+            # 720pt ≈ 100 cols at Menlo 12 prevents absurd values.
             if w_points is None:
                 sw, _ = ui.get_screen_size()
                 w_points = min(sw - 16, 720)
@@ -298,7 +360,7 @@ class ProgressTracker:
 
     def _emit(self, token):
         """Print token; pad with dots and wrap if it would overflow the margin."""
-        margin = DISPLAY_WIDTH - 2
+        margin = get_display_width() - 2
         if self.chars_printed + len(token) > margin:
             pad = margin - self.chars_printed
             if pad > 0:
@@ -372,11 +434,13 @@ def _is_max_ent(score):
             and abs(score - _display_max_ent) < 1e-9)
 
 
-def format_columns(strings, width=DISPLAY_WIDTH,
+def format_columns(strings, width=None,
                    gap="  ", prefix="    "):
     """Format strings into auto-computed columns."""
     if not strings:
         return []
+    if width is None:
+        width = get_display_width()
     max_len = max(len(s) for s in strings)
     cols = max(1, (width - len(prefix)) // (max_len + len(gap)))
     rows = max(1, -(-len(strings) // cols))  # ceiling
@@ -1403,7 +1467,7 @@ COMMANDS = {
 
 def print_status(gs):
     """Print current game status."""
-    print(f'\n{"=" * DISPLAY_WIDTH}')
+    print(f'\n{"=" * get_display_width()}')
     if gs.single:
         soln = gs.solutions[0]
         if soln.answer_word:
