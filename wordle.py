@@ -80,19 +80,14 @@ def get_display_width():
         # Use pixel-based measurement instead.
         try:
             import ui
-            # Try console.get_size() first (available in some versions)
+            # Try console.get_size() first (available in some versions).
+            # Fall back to screen width minus ~16pt horizontal padding.
             w_points = None
             try:
                 w_points, _ = console.get_size()
-                print(f'  [width] console.get_size(): {w_points:.1f}pt')
             except AttributeError:
-                print('  [width] console.get_size() not available')
-
-            if w_points is None:
-                # Fall back to screen width (console fills most of it)
                 sw, _ = ui.get_screen_size()
-                w_points = sw
-                print(f'  [width] ui.get_screen_size(): {sw:.1f}pt')
+                w_points = sw - 16  # subtract ~8pt padding per side
 
             candidates = [
                 ('Menlo', 11), ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
@@ -106,22 +101,17 @@ def get_display_width():
                     cw, _ = ui.measure_string('M', font=(name, size))
                     cols = w_points / cw
                     err = abs(cols - round(cols))
-                    print(f'  [width] {name} {size}pt: '
-                          f'cw={cw:.2f} -> {cols:.1f} cols '
-                          f'(err={err:.3f})')
                     if err < best_err:
                         best_err = err
                         best_cols = int(cols)
-                except Exception as e:
-                    print(f'  [width] {name} {size}pt: failed ({e})')
+                except Exception:
+                    continue
 
             if best_cols and best_cols >= 20:
-                print(f'  [width] selected: {best_cols} cols')
                 return best_cols
-        except Exception as e:
-            print(f'  [width] pixel detection failed: {e}')
+        except Exception:
+            pass
 
-        print('  [width] using fallback: 42')
         return 42
 
     try:
