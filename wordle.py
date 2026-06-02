@@ -76,12 +76,24 @@ def get_display_width():
     """Auto-detect console width in characters."""
     if IS_PYTHONISTA and console is not None:
         # shutil.get_terminal_size() returns the logical terminal width
-        # (typically 80) in Pythonista, not the physical display width.
+        # (~80) in Pythonista, not the physical display width.
         # Use pixel-based measurement instead.
         try:
             import ui
-            w_points, _ = console.get_size()
-            print(f'  [width] console pixel width: {w_points:.1f}pt')
+            # Try console.get_size() first (available in some versions)
+            w_points = None
+            try:
+                w_points, _ = console.get_size()
+                print(f'  [width] console.get_size(): {w_points:.1f}pt')
+            except AttributeError:
+                print('  [width] console.get_size() not available')
+
+            if w_points is None:
+                # Fall back to screen width (console fills most of it)
+                sw, _ = ui.get_screen_size()
+                w_points = sw
+                print(f'  [width] ui.get_screen_size(): {sw:.1f}pt')
+
             candidates = [
                 ('Menlo', 11), ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
                 ('DejaVuSansMono', 14), ('DejaVuSansMono', 16),
@@ -94,24 +106,26 @@ def get_display_width():
                     cw, _ = ui.measure_string('M', font=(name, size))
                     cols = w_points / cw
                     err = abs(cols - round(cols))
-                    print(f'  [width] {name} {size}pt: cw={cw:.2f} '
-                          f'-> {cols:.1f} cols (err={err:.3f})')
+                    print(f'  [width] {name} {size}pt: '
+                          f'cw={cw:.2f} -> {cols:.1f} cols '
+                          f'(err={err:.3f})')
                     if err < best_err:
                         best_err = err
                         best_cols = int(cols)
                 except Exception as e:
                     print(f'  [width] {name} {size}pt: failed ({e})')
+
             if best_cols and best_cols >= 20:
                 print(f'  [width] selected: {best_cols} cols')
                 return best_cols
         except Exception as e:
             print(f'  [width] pixel detection failed: {e}')
+
         print('  [width] using fallback: 42')
         return 42
 
     try:
-        cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-        return cols
+        return shutil.get_terminal_size(fallback=(80, 24)).columns
     except Exception:
         return 80
 
