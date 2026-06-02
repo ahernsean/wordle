@@ -141,38 +141,52 @@ def get_display_width():
                             pass
                         return None
 
+                    # Collect ALL OMTextViews so we can pick the right one
+                    all_views = []
+                    def _walk_all(v, depth=0):
+                        if depth > 12:
+                            return
+                        if 'OMTextView' in _cls(v):
+                            sv = v.superview()
+                            all_views.append((v, _cls(v), _cls(sv) if sv else ''))
+                        try:
+                            for sv in v.subviews():
+                                _walk_all(sv, depth + 1)
+                        except Exception:
+                            pass
+
                     app = ObjCClass('UIApplication').sharedApplication()
                     win = app.keyWindow()
+                    kw = win.frame().size.width
+                    dbg(f'L3 keyWindow.frame.width={kw:.1f}pt')
                     root = win.rootViewController().view()
-                    cv = _walk(root)
-                    if cv is not None:
-                        w = cv.frame().size.width
-                        sv_cls = _cls(cv.superview()) if cv.superview() else 'none'
-                        dbg(f'L3 OMTextView found: frame.width={w:.1f}pt '
-                            f'class={_cls(cv)} superview={sv_cls}')
-                        # Also report font and text container info
-                        try:
-                            font = cv.font()
-                            fn = str(font.familyName())
-                            fs = float(font.pointSize())
-                            dbg(f'L3   font: {fn} {fs:.1f}pt')
-                        except Exception as e:
-                            dbg(f'L3   font: error {e}')
-                        try:
-                            pad = float(cv.textContainer().lineFragmentPadding())
-                            dbg(f'L3   lineFragmentPadding: {pad:.1f}pt (total {2*pad:.1f}pt)')
-                        except Exception as e:
-                            dbg(f'L3   lineFragmentPadding: error {e}')
-                        try:
-                            ins = cv.textContainerInset()
-                            dbg(f'L3   textContainerInset: {ins}')
-                        except Exception as e:
-                            dbg(f'L3   textContainerInset: error {e}')
-                        if w > 10:
-                            w_points = w
-                            layer = 'OMTextView.frame'
+                    _walk_all(root)
+                    dbg(f'L3 found {len(all_views)} OMTextView(s):')
+                    for i, (v, vcls, svcls) in enumerate(all_views):
+                        fw = v.frame().size.width
+                        fh = v.frame().size.height
+                        dbg(f'L3   [{i}] w={fw:.0f}pt h={fh:.0f}pt '
+                            f'sv={svcls}')
+
+                    # Pick: prefer the narrowest view whose width < keyWindow width,
+                    # falling back to the first found.
+                    cv = None
+                    if all_views:
+                        candidates_v = [(v, v.frame().size.width)
+                                        for v, _, _ in all_views
+                                        if v.frame().size.width < kw * 0.95]
+                        if candidates_v:
+                            cv, w = min(candidates_v, key=lambda x: x[1])
+                            dbg(f'L3 chose narrowest sub-window view: {w:.0f}pt')
+                        else:
+                            cv, _, _ = all_views[0]
+                            w = cv.frame().size.width
+                            dbg(f'L3 chose first view (fallback): {w:.0f}pt')
+                    if cv is not None and w > 10:
+                        w_points = w
+                        layer = 'OMTextView.frame'
                     else:
-                        dbg('L3 OMTextView: not found in hierarchy')
+                        dbg('L3 OMTextView: no usable view found')
                 except Exception as e:
                     dbg(f'L3 OMTextView walk: exception {e}')
 
