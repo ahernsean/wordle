@@ -74,20 +74,52 @@ def reset_color():
 
 def get_display_width():
     """Auto-detect console width in characters."""
+    # Explicit override always wins.
+    env = os.environ.get('COLUMNS', '').strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+
     if IS_PYTHONISTA and console is not None:
-        # shutil.get_terminal_size() returns the logical terminal width
-        # (~80) in Pythonista, not the physical display width.
-        # Use pixel-based measurement instead.
+        # shutil.get_terminal_size() returns the logical default (~80) in
+        # Pythonista, not the physical display width. Use pixel-based
+        # measurement instead, with several fallback layers.
         try:
             import ui
-            # Try console.get_size() first (available in some versions).
-            # Fall back to screen width minus ~16pt horizontal padding.
+
             w_points = None
+
+            # Layer 1: console.get_size() — available in some Pythonista
+            # versions; returns the actual console view width in points.
             try:
                 w_points, _ = console.get_size()
             except AttributeError:
+                pass
+
+            # Layer 2: os.get_terminal_size() on each standard fd. Unlike
+            # shutil, this does NOT fabricate an 80-column fallback — it
+            # raises OSError if the fd isn't a real pty.  Succeeds on some
+            # Pythonista configurations.
+            if w_points is None:
+                for fd in range(3):
+                    try:
+                        sz = os.get_terminal_size(fd)
+                        if sz.columns > 10:
+                            return sz.columns
+                    except OSError:
+                        continue
+
+            # Layer 3: pixel math against screen width.
+            # ui.get_screen_size() returns the full physical screen — correct
+            # for iPhone (console fills the screen) but wrong for iPad in
+            # windowed/split-screen mode where the console is a fraction of
+            # the screen.  Cap at 720pt (~100 cols at Menlo 12) to prevent
+            # wildly large values on iPad.
+            if w_points is None:
                 sw, _ = ui.get_screen_size()
-                w_points = sw - 16  # subtract ~8pt padding per side
+                w_points = min(sw - 16, 720)
 
             candidates = [
                 ('Menlo', 11), ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
