@@ -74,45 +74,46 @@ def reset_color():
 
 def get_display_width():
     """Auto-detect console width in characters."""
-    # Try standard terminal size first — works even in Pythonista if
-    # the console supports TIOCGWINSZ (os.get_terminal_size).
-    try:
-        cols = shutil.get_terminal_size(fallback=(0, 24)).columns
-        if cols >= 20:
-            return cols
-    except Exception:
-        pass
-
     if IS_PYTHONISTA and console is not None:
+        # shutil.get_terminal_size() returns the logical terminal width
+        # (typically 80) in Pythonista, not the physical display width.
+        # Use pixel-based measurement instead.
         try:
             import ui
             w_points, _ = console.get_size()
+            print(f'  [width] console pixel width: {w_points:.1f}pt')
             candidates = [
-                ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
-                ('DejaVuSansMono', 16),
+                ('Menlo', 11), ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
+                ('DejaVuSansMono', 14), ('DejaVuSansMono', 16),
                 ('Courier', 12), ('Courier', 14),
             ]
             best_cols = None
             best_err = 999
             for name, size in candidates:
                 try:
-                    cw, _ = ui.measure_string(
-                        'M', font=(name, size)
-                    )
+                    cw, _ = ui.measure_string('M', font=(name, size))
                     cols = w_points / cw
                     err = abs(cols - round(cols))
+                    print(f'  [width] {name} {size}pt: cw={cw:.2f} '
+                          f'-> {cols:.1f} cols (err={err:.3f})')
                     if err < best_err:
                         best_err = err
                         best_cols = int(cols)
-                except Exception:
-                    continue
+                except Exception as e:
+                    print(f'  [width] {name} {size}pt: failed ({e})')
             if best_cols and best_cols >= 20:
+                print(f'  [width] selected: {best_cols} cols')
                 return best_cols
-        except Exception:
-            pass
-        return 80  # better iPad fallback than the old 42-col iPhone minimum
+        except Exception as e:
+            print(f'  [width] pixel detection failed: {e}')
+        print('  [width] using fallback: 42')
+        return 42
 
-    return 80
+    try:
+        cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        return cols
+    except Exception:
+        return 80
 
 
 DISPLAY_WIDTH = get_display_width()
