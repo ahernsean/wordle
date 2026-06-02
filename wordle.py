@@ -74,12 +74,21 @@ def reset_color():
 
 def get_display_width():
     """Auto-detect console width in characters."""
+    # Try standard terminal size first — works even in Pythonista if
+    # the console supports TIOCGWINSZ (os.get_terminal_size).
+    try:
+        cols = shutil.get_terminal_size(fallback=(0, 24)).columns
+        if cols >= 20:
+            return cols
+    except Exception:
+        pass
+
     if IS_PYTHONISTA and console is not None:
         try:
             import ui
             w_points, _ = console.get_size()
             candidates = [
-                ('Menlo', 12), ('Menlo', 14),
+                ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
                 ('DejaVuSansMono', 16),
                 ('Courier', 12), ('Courier', 14),
             ]
@@ -101,12 +110,9 @@ def get_display_width():
                 return best_cols
         except Exception:
             pass
-        return 42  # safe iPhone fallback
+        return 80  # better iPad fallback than the old 42-col iPhone minimum
 
-    try:
-        return shutil.get_terminal_size(fallback=(80, 24)).columns
-    except Exception:
-        return 80
+    return 80
 
 
 DISPLAY_WIDTH = get_display_width()
@@ -254,10 +260,17 @@ class ProgressTracker:
         return f'{mins}m{secs:02d}s'
 
     def _emit(self, token):
-        """Print a token and wrap the line if now at or past the margin."""
+        """Print token; pad with dots and wrap if it would overflow the margin."""
+        margin = DISPLAY_WIDTH - 6
+        if self.chars_printed + len(token) > margin:
+            pad = margin - self.chars_printed
+            if pad > 0:
+                print('.' * pad, end='', flush=True)
+            print('\n  ', end='', flush=True)
+            self.chars_printed = 2
         print(token, end='', flush=True)
         self.chars_printed += len(token)
-        if self.chars_printed >= DISPLAY_WIDTH - 6:
+        if self.chars_printed >= margin:
             print('\n  ', end='', flush=True)
             self.chars_printed = 2
 
