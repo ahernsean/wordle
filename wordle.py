@@ -72,61 +72,6 @@ def reset_color():
         print(ANSI_RESET, end="")
 
 
-def _find_console_view_width():
-    """Walk Pythonista's view hierarchy to find the console OMTextView width."""
-    try:
-        from objc_util import ObjCClass
-
-        def _classname(view):
-            try:
-                return view._get_objc_classname().decode('utf-8', errors='ignore')
-            except Exception:
-                return ''
-
-        def _walk(view, depth=0):
-            if depth > 10:
-                return None
-            name = _classname(view)
-            if 'OMTextView' in name:
-                sv_name = _classname(view.superview()) if view.superview() else ''
-                if 'Editor' not in sv_name:
-                    return view
-            try:
-                for sv in view.subviews():
-                    hit = _walk(sv, depth + 1)
-                    if hit is not None:
-                        return hit
-            except Exception:
-                pass
-            return None
-
-        app = ObjCClass('UIApplication').sharedApplication()
-        win = app.keyWindow()
-        root = win.rootViewController().view()
-        cv = _walk(root)
-        if cv is not None:
-            w = cv.frame().size.width
-            if w > 10:
-                return w
-    except Exception:
-        pass
-    return None
-
-
-def _key_window_width():
-    """Return the key window width in points (correct for iPad windowed mode)."""
-    try:
-        from objc_util import ObjCClass
-        app = ObjCClass('UIApplication').sharedApplication()
-        win = app.keyWindow()
-        w = win.frame().size.width
-        if w > 10:
-            return w - 16  # subtract ~8pt padding per side
-    except Exception:
-        pass
-    return None
-
-
 def get_display_width():
     """Return console width in characters. Safe to call repeatedly."""
     # Explicit override always wins.
@@ -138,51 +83,124 @@ def get_display_width():
             pass
 
     if IS_PYTHONISTA and console is not None:
-        # shutil.get_terminal_size() returns the logical default (~80), not
-        # the physical display width. Use pixel-based measurement instead,
-        # with several fallback layers in decreasing accuracy.
         try:
             import ui
 
+            dbg = lambda msg: print(f'[width] {msg}')
             w_points = None
+            layer = None
 
-            # Layer 1: console.get_size() — available in newer Pythonista;
-            # returns the actual console view width in points.
+            # Layer 1: console.get_size()
             try:
                 w_points, _ = console.get_size()
+                layer = 'console.get_size()'
+                dbg(f'L1 console.get_size(): {w_points:.1f}pt')
             except AttributeError:
-                pass
+                dbg('L1 console.get_size(): AttributeError')
+            except Exception as e:
+                dbg(f'L1 console.get_size(): {e}')
 
-            # Layer 2: os.get_terminal_size() on each fd. Unlike shutil, this
-            # raises OSError rather than fabricating 80; a success is real.
+            # Layer 2: os.get_terminal_size() on each fd
             if w_points is None:
                 for fd in range(3):
                     try:
                         sz = os.get_terminal_size(fd)
                         if sz.columns > 10:
+                            dbg(f'L2 os.get_terminal_size({fd}): {sz.columns} cols')
                             return sz.columns
-                    except OSError:
-                        continue
+                        else:
+                            dbg(f'L2 os.get_terminal_size({fd}): {sz.columns} (ignored)')
+                    except OSError as e:
+                        dbg(f'L2 os.get_terminal_size({fd}): OSError {e}')
 
-            # Layer 3: Walk the ObjC view hierarchy to find the OMTextView
-            # (the console text view). Its frame gives the exact width — works
-            # for both iPhone and iPad in any window configuration.
+            # Layer 3: Walk ObjC view hierarchy to find OMTextView
             if w_points is None:
-                w_points = _find_console_view_width()
+                try:
+                    from objc_util import ObjCClass
 
-            # Layer 4: Key window frame. On iPad in windowed/split mode the
-            # window is smaller than the screen; this is much more accurate
-            # than ui.get_screen_size() in that scenario.
+                    def _cls(v):
+                        try:
+                            return v._get_objc_classname().decode('utf-8', errors='ignore')
+                        except Exception:
+                            return ''
+
+                    def _walk(v, depth=0):
+                        if depth > 10:
+                            return None
+                        if 'OMTextView' in _cls(v):
+                            sv = v.superview()
+                            sv_name = _cls(sv) if sv else ''
+                            if 'Editor' not in sv_name:
+                                return v
+                        try:
+                            for sv in v.subviews():
+                                hit = _walk(sv, depth + 1)
+                                if hit is not None:
+                                    return hit
+                        except Exception:
+                            pass
+                        return None
+
+                    app = ObjCClass('UIApplication').sharedApplication()
+                    win = app.keyWindow()
+                    root = win.rootViewController().view()
+                    cv = _walk(root)
+                    if cv is not None:
+                        w = cv.frame().size.width
+                        sv_cls = _cls(cv.superview()) if cv.superview() else 'none'
+                        dbg(f'L3 OMTextView found: frame.width={w:.1f}pt '
+                            f'class={_cls(cv)} superview={sv_cls}')
+                        # Also report font and text container info
+                        try:
+                            font = cv.font()
+                            fn = str(font.familyName())
+                            fs = float(font.pointSize())
+                            dbg(f'L3   font: {fn} {fs:.1f}pt')
+                        except Exception as e:
+                            dbg(f'L3   font: error {e}')
+                        try:
+                            pad = float(cv.textContainer().lineFragmentPadding())
+                            dbg(f'L3   lineFragmentPadding: {pad:.1f}pt (total {2*pad:.1f}pt)')
+                        except Exception as e:
+                            dbg(f'L3   lineFragmentPadding: error {e}')
+                        try:
+                            ins = cv.textContainerInset()
+                            dbg(f'L3   textContainerInset: {ins}')
+                        except Exception as e:
+                            dbg(f'L3   textContainerInset: error {e}')
+                        if w > 10:
+                            w_points = w
+                            layer = 'OMTextView.frame'
+                    else:
+                        dbg('L3 OMTextView: not found in hierarchy')
+                except Exception as e:
+                    dbg(f'L3 OMTextView walk: exception {e}')
+
+            # Layer 4: Key window frame
             if w_points is None:
-                w_points = _key_window_width()
+                try:
+                    from objc_util import ObjCClass
+                    app = ObjCClass('UIApplication').sharedApplication()
+                    win = app.keyWindow()
+                    w = win.frame().size.width
+                    dbg(f'L4 keyWindow.frame.width={w:.1f}pt -> using {w-16:.1f}pt')
+                    if w > 10:
+                        w_points = w - 16
+                        layer = 'keyWindow'
+                except Exception as e:
+                    dbg(f'L4 keyWindow: {e}')
 
-            # Layer 5: Screen size with a cap. ui.get_screen_size() returns
-            # the full physical screen which is wrong for iPad windowed mode.
-            # 720pt ≈ 100 cols at Menlo 12 prevents absurd values.
+            # Layer 5: Screen size with cap
             if w_points is None:
-                sw, _ = ui.get_screen_size()
-                w_points = min(sw - 16, 720)
+                sw, sh = ui.get_screen_size()
+                capped = min(sw - 16, 720)
+                dbg(f'L5 screen={sw:.1f}x{sh:.1f}pt -> capped to {capped:.1f}pt')
+                w_points = capped
+                layer = 'screen(capped)'
 
+            dbg(f'w_points={w_points:.1f}pt via {layer}')
+
+            # Font candidate search
             candidates = [
                 ('Menlo', 11), ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
                 ('DejaVuSansMono', 14), ('DejaVuSansMono', 16),
@@ -190,21 +208,25 @@ def get_display_width():
             ]
             best_cols = None
             best_err = 999
-            for name, size in candidates:
+            best_font = None
+            for fname, fsize in candidates:
                 try:
-                    cw, _ = ui.measure_string('M', font=(name, size))
+                    cw, _ = ui.measure_string('M', font=(fname, fsize))
                     cols = w_points / cw
                     err = abs(cols - round(cols))
                     if err < best_err:
                         best_err = err
                         best_cols = int(cols)
+                        best_font = (fname, fsize, cw)
                 except Exception:
                     continue
 
             if best_cols and best_cols >= 20:
+                dbg(f'best font: {best_font[0]} {best_font[1]}pt '
+                    f'cw={best_font[2]:.3f}pt err={best_err:.4f} -> {best_cols} cols')
                 return best_cols
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'[width] exception in detection: {e}')
 
         return 42
 
