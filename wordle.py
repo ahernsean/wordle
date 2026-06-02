@@ -1097,27 +1097,29 @@ def cmd_test(gs):
                 print(f'    Step 2: {s2:.4f}')
                 print(f'    Total:  {combined:.4f}')
 
-        # Top subgroups
-        if soln.cache:
-            grouped_words = soln.cache.group_words(word, soln.current_words)
-        else:
-            grouped_words = defaultdict(list)
-            for answer in soln.current_words:
-                from wordle_engine import _encode_response
-                pat = _encode_response(calculate_response(word, answer))
-                grouped_words[pat].append(answer)
-
-        sorted_groups = sorted(
-            grouped_words.items(), key=lambda x: -len(x[1])
-        )
-        print(f'\n  Top subgroups:')
-        for pat, subgroup in sorted_groups[:5]:
-            pattern_str = format_response(decode_response(pat))
-            cnt = len(subgroup)
-            preview = ' '.join(w.upper() for w in subgroup[:6])
-            if cnt > 6:
-                preview += f' ... ({cnt} total)'
-            print(f'    {pattern_str}: {preview}')
+        # Group size distribution
+        sorted_groups = sorted(groups.items(), key=lambda x: -x[1])
+        b = [0, 0, 0, 0, 0]
+        for _, cnt in sorted_groups:
+            if cnt == 1:
+                b[0] += 1
+            elif cnt <= 4:
+                b[1] += 1
+            elif cnt <= 9:
+                b[2] += 1
+            elif cnt <= 49:
+                b[3] += 1
+            else:
+                b[4] += 1
+        labels = ['1', '2-4', '5-9', '10-49', '50+']
+        dist_str = '  '.join(f'{lbl}:{n}' for lbl, n in zip(labels, b) if n)
+        print(f'\n  Subgroup sizes: {dist_str}')
+        items = [
+            f'{format_response(decode_response(pat))}:{cnt}'
+            for pat, cnt in sorted_groups[:40]
+        ]
+        if items:
+            print('\n'.join(format_columns(items)))
 
     except AssertionError:
         print_error("Word must be 5 letters.")
