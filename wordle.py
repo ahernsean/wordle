@@ -253,10 +253,11 @@ class ProgressTracker:
             return f'{mins}m'
         return f'{mins}m{secs:02d}s'
 
-    def _maybe_wrap(self, extra=0):
-        """Wrap to next line if near screen edge."""
-        if (self.chars_printed + extra
-                >= DISPLAY_WIDTH - 6):
+    def _emit(self, token):
+        """Print a token and wrap the line if now at or past the margin."""
+        print(token, end='', flush=True)
+        self.chars_printed += len(token)
+        if self.chars_printed >= DISPLAY_WIDTH - 6:
             print('\n  ', end='', flush=True)
             self.chars_printed = 2
 
@@ -264,30 +265,12 @@ class ProgressTracker:
         self.count += 1
         pct = (self.count * 100) // self.total
         prev = ((self.count - 1) * 100) // self.total
-        if pct <= prev:
-            now = datetime.now()
-            if ((now - self.last_eta).total_seconds()
-                    >= self.ETA_INTERVAL):
-                self.last_eta = now
-                frac = self.count / self.total
-                if 0 < frac < 1:
-                    elapsed = now - self.start_time
-                    remaining = (elapsed
-                                 * (1 - frac) / frac)
-                    label = self._fmt_eta(remaining)
-                    self._maybe_wrap(len(label))
-                    print(label, end='', flush=True)
-                    self.chars_printed += len(label)
-            return
-        if pct >= self.next_milestone:
-            label = f'{self.next_milestone}%'
-            self._maybe_wrap(len(label))
-            print(label, end='', flush=True)
-            self.chars_printed += len(label)
-            self.next_milestone += 25
-        else:
-            print('.', end='', flush=True)
-            self.chars_printed += 1
+        if pct > prev:
+            if pct >= self.next_milestone:
+                self._emit(f'{self.next_milestone}%')
+                self.next_milestone += 25
+            else:
+                self._emit('.')
         now = datetime.now()
         if ((now - self.last_eta).total_seconds()
                 >= self.ETA_INTERVAL):
@@ -295,13 +278,8 @@ class ProgressTracker:
             frac = self.count / self.total
             if 0 < frac < 1:
                 elapsed = now - self.start_time
-                remaining = (elapsed
-                             * (1 - frac) / frac)
-                label = self._fmt_eta(remaining)
-                self._maybe_wrap(len(label))
-                print(label, end='', flush=True)
-                self.chars_printed += len(label)
-        self._maybe_wrap()
+                remaining = elapsed * (1 - frac) / frac
+                self._emit(self._fmt_eta(remaining))
 
     def finish(self):
         if self.next_milestone <= 100:
