@@ -815,9 +815,7 @@ def cmd_grid(gs):
     for mx in mx_groups:
         mx_groups[mx].sort(key=lambda x: -x[1])
 
-    ENT_NEIGHBOR_THRESH = 0.10  # bits
     NEIGHBORS_PER_LEVEL = 4
-    me = _display_max_ent
 
     def ent_fmt(e):
         s = ScoringMethod.ENTROPY_GAIN.format_score(e)
@@ -825,19 +823,15 @@ def cmd_grid(gs):
             s += '='
         return s
 
-    print(f"\n(* = in answer set, = = max entropy {me:.4f})")
-    print("(showing Pareto frontier + near neighbors per group size)")
+    print(f"\n(* = in answer set)")
+    print("(showing Pareto frontier + top words per group size)")
 
     any_shown = False
     for mx in sorted(frontier_mxs):
         entries = mx_groups[mx]
         if not entries:
             continue
-        best_ent = entries[0][1]
-        to_show = [
-            (w, e) for w, e in entries
-            if best_ent - e <= ENT_NEIGHBOR_THRESH
-        ][:NEIGHBORS_PER_LEVEL]
+        to_show = entries[:NEIGHBORS_PER_LEVEL]
         any_shown = True
         print(f"\n  Max group {mx}  "
               f"({len(entries)} words at this level)")
