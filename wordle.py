@@ -266,7 +266,7 @@ class ProgressTracker:
 
     def _emit(self, token):
         """Print token; pad with dots and wrap if it would overflow the margin."""
-        margin = DISPLAY_WIDTH - 6
+        margin = DISPLAY_WIDTH - 2
         if self.chars_printed + len(token) > margin:
             pad = margin - self.chars_printed
             if pad > 0:
