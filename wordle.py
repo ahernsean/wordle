@@ -36,6 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
+BUILD = "b5"
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +88,10 @@ def get_display_width():
             import ui
 
             dbg = lambda msg: print(f'[width] {msg}')
+            dbg(f'build={BUILD}')
             w_points = None
             layer = None
+            content_view_used = False
 
             # Layer 1: console.get_size()
             try:
@@ -168,23 +171,42 @@ def get_display_width():
                         dbg(f'L3   [{i}] w={fw:.0f}pt h={fh:.0f}pt '
                             f'sv={svcls}')
 
-                    # Pick: prefer the narrowest view whose width < keyWindow width,
-                    # falling back to the first found.
+                    # Pick: prefer OMTextViews whose superview is plain UIView.
+                    # In Pythonista the console pane's OMTextView has UIView as
+                    # its direct superview; editor panes use OMTextEditorView.
+                    # Among UIView-superview candidates take the tallest (full
+                    # console height > any toolbar widget).
+                    # Fall back to narrowest sub-window view, then first found.
                     cv = None
+                    w = 0
                     if all_views:
-                        candidates_v = [(v, v.frame().size.width)
-                                        for v, _, _ in all_views
-                                        if v.frame().size.width < kw * 0.95]
-                        if candidates_v:
-                            cv, w = min(candidates_v, key=lambda x: x[1])
-                            dbg(f'L3 chose narrowest sub-window view: {w:.0f}pt')
+                        console_cands = [
+                            (v, v.frame().size.width, v.frame().size.height)
+                            for v, _, svcls in all_views
+                            if svcls == 'UIView'
+                        ]
+                        if console_cands:
+                            cv, w, h = max(console_cands, key=lambda x: x[2])
+                            dbg(f'L3 chose UIView-sv view: '
+                                f'w={w:.0f}pt h={h:.0f}pt')
                         else:
-                            cv, _, _ = all_views[0]
-                            w = cv.frame().size.width
-                            dbg(f'L3 chose first view (fallback): {w:.0f}pt')
-                    # Inspect subviews of chosen view to find real text area
-                    # (UITextView internal _UITextContainerView gives true width,
-                    # excluding lineFragmentPadding + textContainerInset)
+                            sub_cands = [(v, v.frame().size.width)
+                                         for v, _, _ in all_views
+                                         if v.frame().size.width < kw * 0.95]
+                            if sub_cands:
+                                cv, w = min(sub_cands, key=lambda x: x[1])
+                                dbg(f'L3 chose narrowest sub-window (fallback): '
+                                    f'{w:.0f}pt')
+                            else:
+                                cv, _, _ = all_views[0]
+                                w = cv.frame().size.width
+                                dbg(f'L3 chose first view (final fallback): '
+                                    f'{w:.0f}pt')
+
+                    # Inspect direct subviews of the chosen view to find the
+                    # true text area width. OMTextContentView (or similar) sits
+                    # inside OMTextView and its frame excludes the padding that
+                    # the outer frame includes.
                     if cv is not None:
                         try:
                             for sv in cv.subviews():
@@ -193,10 +215,10 @@ def get_display_width():
                                 sw2 = sf.size.width
                                 dbg(f'L3   subview: {sn} w={sw2:.0f}pt '
                                     f'h={sf.size.height:.0f}pt')
-                                if 'TextContainer' in sn and sw2 > 10:
-                                    dbg(f'L3   -> using TextContainer width '
-                                        f'{sw2:.0f}pt')
+                                if ('TextContent' in sn) and 10 < sw2 < w * 0.99:
+                                    dbg(f'L3   -> using {sn} width {sw2:.0f}pt')
                                     w = sw2
+                                    content_view_used = True
                         except Exception as e:
                             dbg(f'L3   subviews: error {e}')
 
@@ -252,7 +274,10 @@ def get_display_width():
                     err = abs(cols - round(cols))
                     if err < best_err:
                         best_err = err
-                        best_cols = int(cols)
+                        # Use round() when we have the true text area width
+                        # from OMTextContentView; int() (truncation) when using
+                        # the raw frame which may include unreadable padding.
+                        best_cols = round(cols) if content_view_used else int(cols)
                         best_font = (fname, fsize, cw)
                 except Exception:
                     continue
