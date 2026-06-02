@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b5"
+BUILD = "b6"
 
 
 # ---------------------------------------------------------------------------
@@ -203,24 +203,60 @@ def get_display_width():
                                 dbg(f'L3 chose first view (final fallback): '
                                     f'{w:.0f}pt')
 
-                    # Inspect direct subviews of the chosen view to find the
-                    # true text area width. OMTextContentView (or similar) sits
-                    # inside OMTextView and its frame excludes the padding that
-                    # the outer frame includes.
+                    # Try to get the true text area width, which is smaller than
+                    # the OMTextView frame due to internal padding (UITextView
+                    # lineFragmentPadding + textContainerInset). Attempt several
+                    # ObjC routes; fall back to subtracting the iOS default 10pt.
                     if cv is not None:
+
+                        # Route A: textStorage → NSLayoutManager → NSTextContainer
                         try:
-                            for sv in cv.subviews():
-                                sn = _cls(sv)
-                                sf = sv.frame()
-                                sw2 = sf.size.width
-                                dbg(f'L3   subview: {sn} w={sw2:.0f}pt '
-                                    f'h={sf.size.height:.0f}pt')
-                                if ('TextContent' in sn) and 10 < sw2 < w * 0.99:
-                                    dbg(f'L3   -> using {sn} width {sw2:.0f}pt')
-                                    w = sw2
-                                    content_view_used = True
+                            ts = cv.textStorage()
+                            lm = ts.layoutManagers().firstObject()
+                            tc = lm.textContainers().firstObject()
+                            tc_w = tc.size().width
+                            dbg(f'L3   textContainer.size.width={tc_w:.1f}pt')
+                            if 10 < tc_w < w * 0.99:
+                                w = tc_w
+                                content_view_used = True
+                                dbg(f'L3   -> using textContainer width')
                         except Exception as e:
-                            dbg(f'L3   subviews: error {e}')
+                            dbg(f'L3   textStorage chain: {e}')
+
+                        # Route B: UIScrollView adjustedContentInset
+                        if not content_view_used:
+                            try:
+                                ins = cv.adjustedContentInset()
+                                horiz = ins.left + ins.right
+                                dbg(f'L3   adjustedContentInset: '
+                                    f'left={ins.left:.1f} right={ins.right:.1f}')
+                                if horiz > 0.5:
+                                    w -= horiz
+                                    content_view_used = True
+                                    dbg(f'L3   -> subtracted {horiz:.1f}pt '
+                                        f'→ {w:.1f}pt')
+                            except Exception as e:
+                                dbg(f'L3   adjustedContentInset: {e}')
+
+                        # Route C: direct subview with narrower width
+                        if not content_view_used:
+                            try:
+                                for sv in cv.subviews():
+                                    sn = _cls(sv)
+                                    sw2 = sv.frame().size.width
+                                    if 'TextContent' in sn and 10 < sw2 < w * 0.99:
+                                        dbg(f'L3   subview {sn} w={sw2:.0f}pt '
+                                            f'→ using it')
+                                        w = sw2
+                                        content_view_used = True
+                            except Exception as e:
+                                dbg(f'L3   subviews: {e}')
+
+                        # Fallback: subtract default lineFragmentPadding (5pt/side)
+                        if not content_view_used:
+                            w -= 10
+                            dbg(f'L3   fallback -10pt (lineFragmentPadding) '
+                                f'→ {w:.0f}pt')
 
                     if cv is not None and w > 10:
                         w_points = w
