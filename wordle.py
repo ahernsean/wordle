@@ -182,6 +182,24 @@ def get_display_width():
                             cv, _, _ = all_views[0]
                             w = cv.frame().size.width
                             dbg(f'L3 chose first view (fallback): {w:.0f}pt')
+                    # Inspect subviews of chosen view to find real text area
+                    # (UITextView internal _UITextContainerView gives true width,
+                    # excluding lineFragmentPadding + textContainerInset)
+                    if cv is not None:
+                        try:
+                            for sv in cv.subviews():
+                                sn = _cls(sv)
+                                sf = sv.frame()
+                                sw2 = sf.size.width
+                                dbg(f'L3   subview: {sn} w={sw2:.0f}pt '
+                                    f'h={sf.size.height:.0f}pt')
+                                if 'TextContainer' in sn and sw2 > 10:
+                                    dbg(f'L3   -> using TextContainer width '
+                                        f'{sw2:.0f}pt')
+                                    w = sw2
+                        except Exception as e:
+                            dbg(f'L3   subviews: error {e}')
+
                     if cv is not None and w > 10:
                         w_points = w
                         layer = 'OMTextView.frame'
