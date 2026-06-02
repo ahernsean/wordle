@@ -1593,6 +1593,7 @@ def print_status(gs):
 
 
 def main():
+    print(f"wordle.py {BUILD}")
     all_answers = load_word_list(ANSWER_FILE)
     all_guesses = load_word_list(GUESS_FILE)
     print(f"Loaded {len(all_answers):,} answers, "
