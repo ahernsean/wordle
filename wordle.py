@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b8"
+BUILD = "b9"
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +73,25 @@ def reset_color():
         print(ANSI_RESET, end="")
 
 
-def get_display_width():
-    """Return console width in characters. Safe to call repeatedly."""
+_width_cache: list = [None, 0.0]  # [cols, timestamp]
+
+def get_display_width() -> int:
+    """Return console width in characters.
+
+    Caches the result for 0.5 s so the ObjC view-hierarchy walk only
+    runs once per command, not once per column-layout call.
+    """
+    now = time.monotonic()
+    if _width_cache[0] is not None and now - _width_cache[1] < 0.5:
+        return _width_cache[0]
+    cols = _detect_display_width()
+    _width_cache[0] = cols
+    _width_cache[1] = now
+    return cols
+
+
+def _detect_display_width() -> int:
+    """Detect console width (slow path — called at most every 0.5 s)."""
     # Explicit override always wins.
     env = os.environ.get('COLUMNS', '').strip()
     if env:
@@ -87,8 +104,7 @@ def get_display_width():
         try:
             import ui
 
-            dbg = lambda msg: print(f'[width] {msg}')
-            dbg(f'build={BUILD}')
+            dbg = lambda msg: None
             w_points = None
             layer = None
             content_view_used = False
@@ -252,11 +268,11 @@ def get_display_width():
                             except Exception as e:
                                 dbg(f'L3   subviews: {e}')
 
-                        # Fallback: subtract default lineFragmentPadding (5pt/side)
+                        # Fallback: subtract UITextView default padding
+                        # (lineFragmentPadding 5pt/side + rounding margin).
+                        # c=14 is empirically correct for both iPhone and iPad.
                         if not content_view_used:
-                            w -= 13
-                            dbg(f'L3   fallback -13pt (lineFragmentPadding) '
-                                f'→ {w:.0f}pt')
+                            w -= 14
 
                     if cv is not None and w > 10:
                         w_points = w
@@ -312,9 +328,6 @@ def get_display_width():
     except Exception:
         return 80
 
-
-DISPLAY_WIDTH = get_display_width()
-print(f'Display width: {DISPLAY_WIDTH} columns')
 
 
 @contextlib.contextmanager
