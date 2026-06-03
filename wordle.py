@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b7"
+BUILD = "b8"
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +254,8 @@ def get_display_width():
 
                         # Fallback: subtract default lineFragmentPadding (5pt/side)
                         if not content_view_used:
-                            w -= 10
-                            dbg(f'L3   fallback -10pt (lineFragmentPadding) '
+                            w -= 13
+                            dbg(f'L3   fallback -13pt (lineFragmentPadding) '
                                 f'→ {w:.0f}pt')
 
                     if cv is not None and w > 10:
@@ -290,38 +290,18 @@ def get_display_width():
 
             dbg(f'w_points={w_points:.1f}pt via {layer}')
 
-            # Font candidate search
-            candidates = [
-                ('Menlo', 11), ('Menlo', 12), ('Menlo', 13), ('Menlo', 14),
-                ('DejaVuSansMono', 14), ('DejaVuSansMono', 16),
-                ('Courier', 12), ('Courier', 14),
-            ]
-            best_cols = None
-            best_err = 999
-            best_font = None
-            for fname, fsize in candidates:
-                try:
-                    # Measure 20 chars to get advance width, not single-glyph
-                    # bounding box. Single-char measurement clips the right
-                    # bearing, underestimating the true character cell width.
-                    tw, _ = ui.measure_string('M' * 20, font=(fname, fsize))
-                    cw = tw / 20
-                    cols = w_points / cw
-                    err = abs(cols - round(cols))
-                    if err < best_err:
-                        best_err = err
-                        # Use round() when we have the true text area width
-                        # from OMTextContentView; int() (truncation) when using
-                        # the raw frame which may include unreadable padding.
-                        best_cols = round(cols) if content_view_used else int(cols)
-                        best_font = (fname, fsize, cw)
-                except Exception:
-                    continue
-
-            if best_cols and best_cols >= 20:
-                dbg(f'best font: {best_font[0]} {best_font[1]}pt '
-                    f'adv={best_font[2]:.3f}pt err={best_err:.4f} -> {best_cols} cols')
-                return best_cols
+            # Pythonista's console uses Menlo 14pt. Measure it directly
+            # instead of a best-fit search, which is unreliable when the
+            # inset correction doesn't land on a near-integer multiple.
+            try:
+                tw, _ = ui.measure_string('M' * 20, font=('Menlo', 14))
+                adv = tw / 20
+                cols = int(w_points / adv)
+                if cols >= 20:
+                    dbg(f'Menlo 14pt adv={adv:.3f}pt -> {cols} cols')
+                    return cols
+            except Exception as e:
+                dbg(f'font: {e}')
         except Exception as e:
             print(f'[width] exception in detection: {e}')
 
