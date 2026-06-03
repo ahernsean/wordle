@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b6"
+BUILD = "b7"
 
 
 # ---------------------------------------------------------------------------
@@ -602,10 +602,10 @@ def print_word_list(words, limit=20):
     Words in the answer set are marked with *.
     """
     items = [f'{w}{_mark(w)}' for w in words[:limit]]
-    if len(words) > limit:
-        items.append(f'... ({len(words)} total)')
     if items:
         print('\n'.join(format_columns(items)))
+    if len(words) > limit:
+        print(f'    ... ({len(words)} total)')
 
 
 def print_guesses(soln):
