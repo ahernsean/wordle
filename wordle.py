@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b9"
+BUILD = "b10"
 
 
 # ---------------------------------------------------------------------------
@@ -73,21 +73,18 @@ def reset_color():
         print(ANSI_RESET, end="")
 
 
-_width_cache: list = [None, 0.0]  # [cols, timestamp]
+_width_cache: list = [None]  # [cols] — refreshed once per REPL cycle
 
 def get_display_width() -> int:
-    """Return console width in characters.
+    """Return cached display width. Never re-detects on its own."""
+    if _width_cache[0] is None:
+        _width_cache[0] = _detect_display_width()
+    return _width_cache[0]
 
-    Caches the result for 0.5 s so the ObjC view-hierarchy walk only
-    runs once per command, not once per column-layout call.
-    """
-    now = time.monotonic()
-    if _width_cache[0] is not None and now - _width_cache[1] < 0.5:
-        return _width_cache[0]
-    cols = _detect_display_width()
-    _width_cache[0] = cols
-    _width_cache[1] = now
-    return cols
+
+def refresh_display_width() -> None:
+    """Re-detect display width. Called once before each prompt."""
+    _width_cache[0] = _detect_display_width()
 
 
 def _detect_display_width() -> int:
@@ -1579,6 +1576,7 @@ COMMANDS = {
 
 def print_status(gs):
     """Print current game status."""
+    refresh_display_width()
     print(f'\n{"=" * get_display_width()}')
     if gs.single:
         soln = gs.solutions[0]
