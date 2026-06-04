@@ -1068,21 +1068,6 @@ def cmd_lookahead(gs):
 
     set_display_context(soln)
 
-    # Auto-compute entropy ranking if not already done
-    if (not soln.scores_updated
-            or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
-        print("Computing entropy ranking for lookahead...")
-        rank_words = (soln.current_words
-                      if gs.input_set == InputSet.CURRENT_WORDLIST
-                      else gs.all_guesses)
-        tracker = ProgressTracker(len(rank_words))
-        soln.compute_scores(
-            rank_words,
-            ScoringMethod.ENTROPY_GAIN,
-            progress_callback=tracker.update,
-        )
-        tracker.finish()
-
     n_rem = len(soln.current_words)
     if n_rem <= 2:
         print("Two or fewer words remain, "
@@ -1101,6 +1086,21 @@ def cmd_lookahead(gs):
             return
     else:
         count = LOOKAHEAD_N
+
+    # Auto-compute entropy ranking if not already done
+    if (not soln.scores_updated
+            or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
+        print("Computing entropy ranking for lookahead...")
+        rank_words = (soln.current_words
+                      if gs.input_set == InputSet.CURRENT_WORDLIST
+                      else gs.all_guesses)
+        tracker = ProgressTracker(len(rank_words))
+        soln.compute_scores(
+            rank_words,
+            ScoringMethod.ENTROPY_GAIN,
+            progress_callback=tracker.update,
+        )
+        tracker.finish()
 
     top_n = soln.scores[:count]
 
