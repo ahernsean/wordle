@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b15"
+BUILD = "b16"
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +89,7 @@ def refresh_display_width() -> None:
 
 
 def _detect_display_width() -> int:
-    """Detect console width (slow path — called at most every 0.5 s)."""
-    # Explicit override always wins.
+    """Detect console width; called at most once per REPL cycle."""
     env = os.environ.get('COLUMNS', '').strip()
     if env:
         try:
@@ -101,36 +100,25 @@ def _detect_display_width() -> int:
     if IS_PYTHONISTA and console is not None:
         try:
             import ui
-
-            dbg = lambda msg: None
             w_points = None
-            layer = None
-            content_view_used = False
 
-            # Layer 1: console.get_size()
+            # L1: console.get_size()
             try:
                 w_points, _ = console.get_size()
-                layer = 'console.get_size()'
-                dbg(f'L1 console.get_size(): {w_points:.1f}pt')
-            except AttributeError:
-                dbg('L1 console.get_size(): AttributeError')
-            except Exception as e:
-                dbg(f'L1 console.get_size(): {e}')
+            except Exception:
+                pass
 
-            # Layer 2: os.get_terminal_size() on each fd
+            # L2: os.get_terminal_size() on each fd
             if w_points is None:
                 for fd in range(3):
                     try:
                         sz = os.get_terminal_size(fd)
                         if sz.columns > 10:
-                            dbg(f'L2 os.get_terminal_size({fd}): {sz.columns} cols')
                             return sz.columns
-                        else:
-                            dbg(f'L2 os.get_terminal_size({fd}): {sz.columns} (ignored)')
-                    except OSError as e:
-                        dbg(f'L2 os.get_terminal_size({fd}): OSError {e}')
+                    except OSError:
+                        pass
 
-            # Layer 3: Walk ObjC view hierarchy to find OMTextView
+            # L3: Walk ObjC view hierarchy to find OMTextView
             if w_points is None:
                 try:
                     from objc_util import ObjCClass
@@ -141,31 +129,13 @@ def _detect_display_width() -> int:
                         except Exception:
                             return ''
 
-                    def _walk(v, depth=0):
-                        if depth > 10:
-                            return None
-                        if 'OMTextView' in _cls(v):
-                            sv = v.superview()
-                            sv_name = _cls(sv) if sv else ''
-                            if 'Editor' not in sv_name:
-                                return v
-                        try:
-                            for sv in v.subviews():
-                                hit = _walk(sv, depth + 1)
-                                if hit is not None:
-                                    return hit
-                        except Exception:
-                            pass
-                        return None
-
-                    # Collect ALL OMTextViews so we can pick the right one
                     all_views = []
                     def _walk_all(v, depth=0):
                         if depth > 12:
                             return
                         if 'OMTextView' in _cls(v):
                             sv = v.superview()
-                            all_views.append((v, _cls(v), _cls(sv) if sv else ''))
+                            all_views.append((v, _cls(sv) if sv else ''))
                         try:
                             for sv in v.subviews():
                                 _walk_all(sv, depth + 1)
@@ -175,149 +145,88 @@ def _detect_display_width() -> int:
                     app = ObjCClass('UIApplication').sharedApplication()
                     win = app.keyWindow()
                     kw = win.frame().size.width
-                    dbg(f'L3 keyWindow.frame.width={kw:.1f}pt')
-                    root = win.rootViewController().view()
-                    _walk_all(root)
-                    dbg(f'L3 found {len(all_views)} OMTextView(s):')
-                    for i, (v, vcls, svcls) in enumerate(all_views):
-                        fw = v.frame().size.width
-                        fh = v.frame().size.height
-                        dbg(f'L3   [{i}] w={fw:.0f}pt h={fh:.0f}pt '
-                            f'sv={svcls}')
+                    _walk_all(win.rootViewController().view())
 
-                    # Pick: prefer OMTextViews whose superview is plain UIView.
-                    # In Pythonista the console pane's OMTextView has UIView as
-                    # its direct superview; editor panes use OMTextEditorView.
-                    # Among UIView-superview candidates take the tallest (full
-                    # console height > any toolbar widget).
+                    # Prefer the OMTextView whose superview is plain UIView
+                    # (the console pane); among those take the tallest.
                     # Fall back to narrowest sub-window view, then first found.
                     cv = None
                     w = 0
                     if all_views:
                         console_cands = [
                             (v, v.frame().size.width, v.frame().size.height)
-                            for v, _, svcls in all_views
-                            if svcls == 'UIView'
+                            for v, svcls in all_views if svcls == 'UIView'
                         ]
                         if console_cands:
-                            cv, w, h = max(console_cands, key=lambda x: x[2])
-                            dbg(f'L3 chose UIView-sv view: '
-                                f'w={w:.0f}pt h={h:.0f}pt')
+                            cv, w, _ = max(console_cands, key=lambda x: x[2])
                         else:
-                            sub_cands = [(v, v.frame().size.width)
-                                         for v, _, _ in all_views
-                                         if v.frame().size.width < kw * 0.95]
+                            sub_cands = [
+                                (v, v.frame().size.width)
+                                for v, _ in all_views
+                                if v.frame().size.width < kw * 0.95
+                            ]
                             if sub_cands:
                                 cv, w = min(sub_cands, key=lambda x: x[1])
-                                dbg(f'L3 chose narrowest sub-window (fallback): '
-                                    f'{w:.0f}pt')
                             else:
-                                cv, _, _ = all_views[0]
+                                cv, _ = all_views[0]
                                 w = cv.frame().size.width
-                                dbg(f'L3 chose first view (final fallback): '
-                                    f'{w:.0f}pt')
 
-                    # Try to get the true text area width, which is smaller than
-                    # the OMTextView frame due to internal padding (UITextView
-                    # lineFragmentPadding + textContainerInset). Attempt several
-                    # ObjC routes; fall back to subtracting the iOS default 10pt.
+                    # Subtract internal UITextView padding.
+                    # Routes A and B attempt ObjC reads; c=14 is the
+                    # empirically correct fallback for iPhone and iPad.
                     if cv is not None:
-
-                        # Route A: textStorage → NSLayoutManager → NSTextContainer
-                        try:
-                            ts = cv.textStorage()
-                            lm = ts.layoutManagers().firstObject()
-                            tc = lm.textContainers().firstObject()
-                            tc_w = tc.size().width
-                            dbg(f'L3   textContainer.size.width={tc_w:.1f}pt')
+                        adjusted = False
+                        try:  # Route A: textStorage → NSLayoutManager → NSTextContainer
+                            tc_w = (cv.textStorage().layoutManagers()
+                                    .firstObject().textContainers()
+                                    .firstObject().size().width)
                             if 10 < tc_w < w * 0.99:
                                 w = tc_w
-                                content_view_used = True
-                                dbg(f'L3   -> using textContainer width')
-                        except Exception as e:
-                            dbg(f'L3   textStorage chain: {e}')
-
-                        # Route B: UIScrollView adjustedContentInset
-                        if not content_view_used:
-                            try:
+                                adjusted = True
+                        except Exception:
+                            pass
+                        if not adjusted:
+                            try:  # Route B: adjustedContentInset
                                 ins = cv.adjustedContentInset()
                                 horiz = ins.left + ins.right
-                                dbg(f'L3   adjustedContentInset: '
-                                    f'left={ins.left:.1f} right={ins.right:.1f}')
                                 if horiz > 0.5:
                                     w -= horiz
-                                    content_view_used = True
-                                    dbg(f'L3   -> subtracted {horiz:.1f}pt '
-                                        f'→ {w:.1f}pt')
-                            except Exception as e:
-                                dbg(f'L3   adjustedContentInset: {e}')
-
-                        # Route C: direct subview with narrower width
-                        if not content_view_used:
-                            try:
-                                for sv in cv.subviews():
-                                    sn = _cls(sv)
-                                    sw2 = sv.frame().size.width
-                                    if 'TextContent' in sn and 10 < sw2 < w * 0.99:
-                                        dbg(f'L3   subview {sn} w={sw2:.0f}pt '
-                                            f'→ using it')
-                                        w = sw2
-                                        content_view_used = True
-                            except Exception as e:
-                                dbg(f'L3   subviews: {e}')
-
-                        # Fallback: subtract UITextView default padding
-                        # (lineFragmentPadding 5pt/side + rounding margin).
-                        # c=14 is empirically correct for both iPhone and iPad.
-                        if not content_view_used:
+                                    adjusted = True
+                            except Exception:
+                                pass
+                        if not adjusted:
                             w -= 14
 
                     if cv is not None and w > 10:
                         w_points = w
-                        layer = 'OMTextView.frame'
-                    else:
-                        dbg('L3 OMTextView: no usable view found')
-                except Exception as e:
-                    dbg(f'L3 OMTextView walk: exception {e}')
+                except Exception:
+                    pass
 
-            # Layer 4: Key window frame
+            # L4: Key window frame
             if w_points is None:
                 try:
                     from objc_util import ObjCClass
-                    app = ObjCClass('UIApplication').sharedApplication()
-                    win = app.keyWindow()
+                    win = ObjCClass('UIApplication').sharedApplication().keyWindow()
                     w = win.frame().size.width
-                    dbg(f'L4 keyWindow.frame.width={w:.1f}pt -> using {w-16:.1f}pt')
                     if w > 10:
                         w_points = w - 16
-                        layer = 'keyWindow'
-                except Exception as e:
-                    dbg(f'L4 keyWindow: {e}')
+                except Exception:
+                    pass
 
-            # Layer 5: Screen size with cap
+            # L5: Screen size with cap
             if w_points is None:
-                sw, sh = ui.get_screen_size()
-                capped = min(sw - 16, 720)
-                dbg(f'L5 screen={sw:.1f}x{sh:.1f}pt -> capped to {capped:.1f}pt')
-                w_points = capped
-                layer = 'screen(capped)'
+                sw, _ = ui.get_screen_size()
+                w_points = min(sw - 16, 720)
 
-            dbg(f'w_points={w_points:.1f}pt via {layer}')
-
-            # Pythonista's console uses Menlo 14pt. Measure it directly
-            # instead of a best-fit search, which is unreliable when the
-            # inset correction doesn't land on a near-integer multiple.
             try:
                 tw, _ = ui.measure_string('M' * 20, font=('Menlo', 14))
-                adv = tw / 20
-                cols = int(w_points / adv)
+                cols = int(w_points / (tw / 20))
                 if cols >= 20:
-                    dbg(f'Menlo 14pt adv={adv:.3f}pt -> {cols} cols')
                     return cols
-            except Exception as e:
-                dbg(f'font: {e}')
-        except Exception as e:
-            print(f'[width] exception in detection: {e}')
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         return 42
 
