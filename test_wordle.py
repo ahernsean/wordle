@@ -36,34 +36,39 @@ def make_solution(db_path=None):
 class TestCalculateResponse(unittest.TestCase):
 
     def test_all_green(self):
-        self.assertEqual(calculate_response("crane", "crane"), [2, 2, 2, 2, 2])
+        self.assertEqual(calculate_response("crane", "crane"),
+                         ["green", "green", "green", "green", "green"])
 
     def test_all_gray(self):
         # logic / bumpy share no letters
-        self.assertEqual(calculate_response("logic", "bumpy"), [0, 0, 0, 0, 0])
+        self.assertEqual(calculate_response("logic", "bumpy"),
+                         ["gray", "gray", "gray", "gray", "gray"])
 
     def test_all_yellow(self):
         # RATES vs STARE: every letter present, none in correct position
-        # R(0)->pos2, A(1)->pos3, T(2)->pos4, E(3)->pos1, S(4)->pos0
-        self.assertEqual(calculate_response("rates", "stare"), [1, 1, 1, 1, 1])
+        self.assertEqual(calculate_response("rates", "stare"),
+                         ["yellow", "yellow", "yellow", "yellow", "yellow"])
 
     def test_mixed(self):
-        # CRANE vs SLANT: A and N green, C R E gray
-        self.assertEqual(calculate_response("crane", "slant"), [0, 0, 2, 2, 0])
+        # CRANE vs SLANT: A(2) and N(3) green, C R E gray
+        self.assertEqual(calculate_response("crane", "slant"),
+                         ["gray", "gray", "green", "green", "gray"])
 
     def test_yellow_and_green(self):
         # CRANE vs TRACE: C yellow, R green, A green, N gray, E green
-        self.assertEqual(calculate_response("crane", "trace"), [1, 2, 2, 0, 2])
+        self.assertEqual(calculate_response("crane", "trace"),
+                         ["yellow", "green", "green", "gray", "green"])
 
     def test_duplicate_letter_in_guess(self):
-        # STEEL vs SLATE: only one E in SLATE
-        # S(0)green, T(1)yellow, E(2)green, E(3)gray(E consumed), L(4)yellow
-        self.assertEqual(calculate_response("steel", "slate"), [2, 1, 2, 0, 1])
+        # STEEL vs SLATE: only one E in SLATE (pos 4)
+        # S(0)green, T(1)yellow, E(2)yellow, E(3)gray(E consumed), L(4)yellow
+        self.assertEqual(calculate_response("steel", "slate"),
+                         ["green", "yellow", "yellow", "gray", "yellow"])
 
     def test_symmetric_known_pair(self):
-        # Verify both orderings are distinct
-        r1 = calculate_response("heart", "earth")
-        r2 = calculate_response("earth", "heart")
+        # crane vs trace and trace vs crane differ (C/T swap yellow vs gray)
+        r1 = calculate_response("crane", "trace")
+        r2 = calculate_response("trace", "crane")
         self.assertNotEqual(r1, r2)
 
 
