@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b25"
+BUILD = "b26"
 
 
 # ---------------------------------------------------------------------------
@@ -542,16 +542,16 @@ class GameState:
         self.n_answers = len(all_answers)
         self.n_guesses = len(all_guesses)
         self.cache = ResponseCache(all_answers)
-        self.lookahead_cache_path = os.path.abspath("wordle_cache.sqlite3")
-        self.lookahead_cache = ScoreCache(
-            self.lookahead_cache_path,
+        self.score_cache_path = os.path.abspath("wordle_cache.sqlite3")
+        self.score_cache = ScoreCache(
+            self.score_cache_path,
             all_answers,
         )
-        print(f"Score cache: {self.lookahead_cache_path}")
+        print(f"Score cache: {self.score_cache_path}")
         self.solutions = [Solution(all_answers,
                                    all_guesses,
                                    self.cache,
-                                   self.lookahead_cache)]
+                                   self.score_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
 
@@ -559,7 +559,7 @@ class GameState:
         self.solutions = [Solution(self.all_answers,
                                    self.all_guesses,
                                    self.cache,
-                                   self.lookahead_cache)]
+                                   self.score_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
 
@@ -1003,9 +1003,9 @@ def cmd_lookahead(gs):
             cnt = len(subgroup)
             if cnt <= 2:
                 continue
-            if soln.lookahead_cache:
+            if soln.score_cache:
                 blob = ScoreCache.encode_subset(subgroup)
-                if soln.lookahead_cache.read(blob, policy) is not None:
+                if soln.score_cache.read(blob, policy) is not None:
                     continue
             total_work += (len(second_step_words)
                            if second_step_words else cnt)
@@ -1140,7 +1140,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
 
     # For step-2 SQLite caching, hard mode can't be keyed by subgroup blob alone
     # because cands2 depends on the specific (word, pattern) constraint set.
-    lc = soln.lookahead_cache
+    lc = soln.score_cache
     policy = None if hard_mode else ('full' if step2_pool is not None else 'hard')
 
     step2 = 0.0
@@ -1588,7 +1588,7 @@ def cmd_wordcount(gs):
             raise ValueError
         gs.solutions = [
             Solution(gs.all_answers, gs.all_guesses,
-                     gs.cache, gs.lookahead_cache)
+                     gs.cache, gs.score_cache)
             for _ in range(wc)
         ]
         if wc > 1:
@@ -1626,14 +1626,14 @@ def cmd_hardmode(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_cacheinfo(gs):
-    lc = gs.lookahead_cache
+    lc = gs.score_cache
     la_rows, ws_rows, mtime = lc.stats()
     if mtime:
         ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
     else:
         ts = "n/a"
     print("\nScore cache:")
-    print(f"  db path:       {gs.lookahead_cache_path}")
+    print(f"  db path:       {gs.score_cache_path}")
     print(f"  subgroup rows: {la_rows:,}")
     print(f"  word scores:   {ws_rows:,}")
     print(f"  last write:    {ts}")

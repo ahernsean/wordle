@@ -381,11 +381,11 @@ class Solution:
     """
 
     def __init__(self, answer_words, all_guesses=None,
-                 cache=None, lookahead_cache=None):
+                 cache=None, score_cache=None):
         self.all_answers = answer_words
         self.all_guesses = all_guesses
         self.cache = cache
-        self.lookahead_cache = lookahead_cache
+        self.score_cache = score_cache
         self.reset()
 
     def reset(self):
@@ -408,28 +408,28 @@ class Solution:
         self.scores_updated = False
 
     def _is_full_game(self):
-        return len(self.current_words) == len(self.all_answers)
+        return len(self.guesses) == 0
 
     def _ensure_scores_loaded(self, method):
         """Transparently load full-game scores from SQLite into word_scores."""
-        if not self.lookahead_cache or not self._is_full_game():
+        if not self.score_cache or not self._is_full_game():
             return
         if method in self._db_loaded_methods:
             return
         self._db_loaded_methods.add(method)
-        cached = self.lookahead_cache.read_scores(method.name.lower())
+        cached = self.score_cache.read_scores(method.name.lower())
         if cached:
             for w, s in cached:
                 self.word_scores.setdefault(w, {})[method] = s
 
     def _persist_scores(self, method):
         """Transparently write full-game scores from word_scores to SQLite."""
-        if not self.lookahead_cache or not self._is_full_game():
+        if not self.score_cache or not self._is_full_game():
             return
         scores = [(w, s[method]) for w, s in self.word_scores.items()
                   if method in s]
         if scores:
-            self.lookahead_cache.write_scores(scores, method.name.lower())
+            self.score_cache.write_scores(scores, method.name.lower())
 
     @property
     def answer_set(self):
@@ -527,7 +527,7 @@ class Solution:
         out = Solution(first.all_answers,
                        first.all_guesses,
                        first.cache,
-                       first.lookahead_cache)
+                       first.score_cache)
         combined = set()
         for soln in solutions:
             if len(soln.current_words) > 1:
@@ -634,7 +634,7 @@ class Solution:
         n = len(self.current_words)
         full_mode = second_step_words is not None
         cache = self.cache
-        lc = self.lookahead_cache
+        lc = self.score_cache
         policy = 'full' if full_mode else 'hard'
 
         # Phase 1: compute group partitions, count work units
