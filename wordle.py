@@ -37,7 +37,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b19"
+BUILD = "b20"
 
 
 # ---------------------------------------------------------------------------
@@ -1260,12 +1260,41 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
         for w in words
     ]
 
-    cw = max(6, max(len(w) for w in words))
     lw = 9  # "Entropy 1" = 9, "10-49:" = 6
 
+    # Build all data rows up front so we can measure max column width
+    totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
+    data_rows = [
+        ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
+        ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
+        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
+        ('Entropy 1', [s['step1']       for s in all_stats], '{:.4f}', True),
+    ]
+    if n > 2:
+        data_rows += [
+            ('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}', True),
+            ('+ ent. 3', [s['step3'] for s in all_stats], '{:.4f}', True),
+            ('Total ent', totals,                          '{:.4f}', True),
+        ]
+
+    bucket_labels = ['1:', '2-4:', '5-9:', '10-49:', '50+:']
+    bucket_higher = [True, False, False, False, False]
+    bucket_rows = []
+    for bi, (lbl, hb) in enumerate(zip(bucket_labels, bucket_higher)):
+        vals = [s['buckets'][bi] for s in all_stats]
+        if any(vals):
+            bucket_rows.append((lbl, vals, '{:d}', hb))
+
+    # Column width: wide enough for word names AND every formatted value.
+    # Using a consistent format per row means right-justifying to cw
+    # automatically aligns decimal points within each row.
+    cw = max(len(w) for w in words)
+    for _, values, fmt, _ in data_rows + bucket_rows:
+        for v in values:
+            cw = max(cw, len(fmt.format(v)))
+
     def print_row(label, values, fmt, higher_better=True):
-        formatted = [fmt.format(v) for v in values]
-        padded    = [s.rjust(cw) for s in formatted]
+        padded = [fmt.format(v).rjust(cw) for v in values]
         best = max(values) if higher_better else min(values)
         all_tied = all(v == best for v in values)
         print(f'  {label:<{lw}} ', end='')
@@ -1279,32 +1308,16 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
                 print(p, end='')
         print()
 
-    # Header: word count, then word names aligned with data columns
     print(f'\n  {n:,} words:')
-    print(f'  {"":>{lw}} ' +
-          '  '.join(w.upper().rjust(cw) for w in words))
+    print(f'  {"":>{lw}} ' + '  '.join(w.upper().rjust(cw) for w in words))
 
-    # Single-step metrics
-    print_row('Wt avg',    [s['wt_avg']     for s in all_stats], '{:.2f}', False)
-    print_row('Max grp',   [s['max_grp']    for s in all_stats], '{:d}',   False)
-    print_row('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}')
+    for label, values, fmt, hb in data_rows:
+        print_row(label, values, fmt, hb)
 
-    # Multi-step entropy (chain rule decomposition)
-    print_row('Entropy 1', [s['step1'] for s in all_stats], '{:.4f}')
-    if n > 2:
-        print_row('+ ent. 2',  [s['step2'] for s in all_stats], '{:.4f}')
-        print_row('+ ent. 3',  [s['step3'] for s in all_stats], '{:.4f}')
-        totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
-        print_row('Total ent', totals, '{:.4f}')
-
-    # Bucket distribution
-    print()
-    bucket_labels = ['1:', '2-4:', '5-9:', '10-49:', '50+:']
-    bucket_higher = [True, False, False, False, False]
-    for bi, (lbl, hb) in enumerate(zip(bucket_labels, bucket_higher)):
-        vals = [s['buckets'][bi] for s in all_stats]
-        if any(vals):
-            print_row(lbl, vals, '{:d}', higher_better=hb)
+    if bucket_rows:
+        print()
+        for label, values, fmt, hb in bucket_rows:
+            print_row(label, values, fmt, hb)
 
 
 def cmd_test(gs, inline=''):
