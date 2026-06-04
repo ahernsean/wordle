@@ -8,9 +8,9 @@ for a streamlined experience.
 
 import os
 import sys
-import pickle
 import shutil
 import time
+from collections import defaultdict
 from datetime import datetime
 import contextlib
 
@@ -19,18 +19,14 @@ try:
 except ImportError:
     console = None
 
-try:
-    import sound  # Pythonista
-except ImportError:
-    sound = None
-
 import wordle_engine
-from adaptive_cache_sqlite import AdaptiveCacheSQLite
+from cache_sqlite import ScoreCache
 from wordle_engine import (
     Solution, ScoringMethod, InputSet, ResponseCache,
     load_word_list, calculate_response,
     calculate_group_counts, score_groups,
-    max_entropy,
+    decode_response, max_entropy,
+    answer_to_restriction,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,6 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
+BUILD = "b26"
 
 
 # ---------------------------------------------------------------------------
@@ -64,21 +61,10 @@ ANSI_COLORS = {
     "yellow": "\033[33m",
 }
 ANSI_RESET = "\033[0m"
+ANSI_BOLD  = "\033[1m" if SUPPORTS_COLOR else ""
 
-if sound is not None:
-    sound.set_volume(1)
 if console is not None:
     console.set_color()
-
-
-def play_effect(name, *_args, **_kwargs):
-    if sound is not None:
-        sound.play_effect(name, *_args, **_kwargs)
-
-
-def set_volume(level):
-    if sound is not None:
-        sound.set_volume(level)
 
 
 def reset_color():
@@ -88,53 +74,167 @@ def reset_color():
         print(ANSI_RESET, end="")
 
 
-def get_display_width():
-    """
-    Auto-detect console width in characters.
-    """
+_width_cache: list = [None]  # [cols] — refreshed once per REPL cycle
+
+def get_display_width() -> int:
+    """Return cached display width. Never re-detects on its own."""
+    if _width_cache[0] is None:
+        _width_cache[0] = _detect_display_width()
+    return _width_cache[0]
+
+
+def refresh_display_width() -> None:
+    """Re-detect display width. Called once before each prompt."""
+    _width_cache[0] = _detect_display_width()
+
+
+def _detect_display_width() -> int:
+    """Detect console width; called at most once per REPL cycle."""
+    env = os.environ.get('COLUMNS', '').strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+
     if IS_PYTHONISTA and console is not None:
-        """
-        Uses console.get_size() for the view width in
-        points, then tries common monospace fonts to find
-        which one divides the width into a clean integer
-        column count.
-        """
         try:
             import ui
-            w_points, _ = console.get_size()
-            candidates = [
-                ('Menlo', 12), ('Menlo', 14),
-                ('DejaVuSansMono', 16),
-                ('Courier', 12), ('Courier', 14),
-            ]
-            best_cols = None
-            best_err = 999
-            for name, size in candidates:
+            w_points = None
+
+            # L1: console.get_size()
+            try:
+                w_points, _ = console.get_size()
+            except Exception:
+                pass
+
+            # L2: os.get_terminal_size() on each fd
+            if w_points is None:
+                for fd in range(3):
+                    try:
+                        sz = os.get_terminal_size(fd)
+                        if sz.columns > 10:
+                            return sz.columns
+                    except OSError:
+                        pass
+
+            # L3: Walk ObjC view hierarchy to find OMTextView
+            if w_points is None:
                 try:
-                    cw, _ = ui.measure_string(
-                        'M', font=(name, size)
-                    )
-                    cols = w_points / cw
-                    err = abs(cols - round(cols))
-                    if err < best_err:
-                        best_err = err
-                        best_cols = int(cols)
+                    from objc_util import ObjCClass
+
+                    def _cls(v):
+                        try:
+                            return v._get_objc_classname().decode('utf-8', errors='ignore')
+                        except Exception:
+                            return ''
+
+                    all_views = []
+                    def _walk_all(v, depth=0):
+                        if depth > 12:
+                            return
+                        if 'OMTextView' in _cls(v):
+                            sv = v.superview()
+                            all_views.append((v, _cls(sv) if sv else ''))
+                        try:
+                            for sv in v.subviews():
+                                _walk_all(sv, depth + 1)
+                        except Exception:
+                            pass
+
+                    app = ObjCClass('UIApplication').sharedApplication()
+                    win = app.keyWindow()
+                    kw = win.frame().size.width
+                    _walk_all(win.rootViewController().view())
+
+                    # Prefer the OMTextView whose superview is plain UIView
+                    # (the console pane); among those take the tallest.
+                    # Fall back to narrowest sub-window view, then first found.
+                    cv = None
+                    w = 0
+                    if all_views:
+                        console_cands = [
+                            (v, v.frame().size.width, v.frame().size.height)
+                            for v, svcls in all_views if svcls == 'UIView'
+                        ]
+                        if console_cands:
+                            cv, w, _ = max(console_cands, key=lambda x: x[2])
+                        else:
+                            sub_cands = [
+                                (v, v.frame().size.width)
+                                for v, _ in all_views
+                                if v.frame().size.width < kw * 0.95
+                            ]
+                            if sub_cands:
+                                cv, w = min(sub_cands, key=lambda x: x[1])
+                            else:
+                                cv, _ = all_views[0]
+                                w = cv.frame().size.width
+
+                    # Subtract internal UITextView padding.
+                    # Routes A and B attempt ObjC reads; c=14 is the
+                    # empirically correct fallback for iPhone and iPad.
+                    if cv is not None:
+                        adjusted = False
+                        try:  # Route A: textStorage → NSLayoutManager → NSTextContainer
+                            tc_w = (cv.textStorage().layoutManagers()
+                                    .firstObject().textContainers()
+                                    .firstObject().size().width)
+                            if 10 < tc_w < w * 0.99:
+                                w = tc_w
+                                adjusted = True
+                        except Exception:
+                            pass
+                        if not adjusted:
+                            try:  # Route B: adjustedContentInset
+                                ins = cv.adjustedContentInset()
+                                horiz = ins.left + ins.right
+                                if horiz > 0.5:
+                                    w -= horiz
+                                    adjusted = True
+                            except Exception:
+                                pass
+                        if not adjusted:
+                            w -= 14
+
+                    if cv is not None and w > 10:
+                        w_points = w
                 except Exception:
-                    continue
-            if best_cols and best_cols >= 20:
-                return best_cols
+                    pass
+
+            # L4: Key window frame
+            if w_points is None:
+                try:
+                    from objc_util import ObjCClass
+                    win = ObjCClass('UIApplication').sharedApplication().keyWindow()
+                    w = win.frame().size.width
+                    if w > 10:
+                        w_points = w - 16
+                except Exception:
+                    pass
+
+            # L5: Screen size with cap
+            if w_points is None:
+                sw, _ = ui.get_screen_size()
+                w_points = min(sw - 16, 720)
+
+            try:
+                tw, _ = ui.measure_string('M' * 20, font=('Menlo', 14))
+                cols = int(w_points / (tw / 20))
+                if cols >= 20:
+                    return cols
+            except Exception:
+                pass
         except Exception:
             pass
-        return 42  # safe iPhone fallback
+
+        return 42
 
     try:
         return shutil.get_terminal_size(fallback=(80, 24)).columns
     except Exception:
         return 80
 
-
-DISPLAY_WIDTH = get_display_width()
-print(f'Display width: {DISPLAY_WIDTH} columns')
 
 
 @contextlib.contextmanager
@@ -160,7 +260,6 @@ def colored_text(color):
 
 
 def print_error(msg):
-    play_effect("Error")
     with colored_text("red"):
         print(msg)
 
@@ -258,7 +357,7 @@ class ProgressTracker:
 
     def __init__(self, total):
         self.count = 0
-        self.total = total
+        self.total = max(total, 1)
         self.start_time = datetime.now()
         self.last_eta = self.start_time
         self.chars_printed = 0
@@ -278,10 +377,18 @@ class ProgressTracker:
             return f'{mins}m'
         return f'{mins}m{secs:02d}s'
 
-    def _maybe_wrap(self, extra=0):
-        """Wrap to next line if near screen edge."""
-        if (self.chars_printed + extra
-                >= DISPLAY_WIDTH - 6):
+    def _emit(self, token):
+        """Print token; pad with dots and wrap if it would overflow the margin."""
+        margin = get_display_width() - 2
+        if self.chars_printed + len(token) > margin:
+            pad = margin - self.chars_printed
+            if pad > 0:
+                print('.' * pad, end='', flush=True)
+            print('\n  ', end='', flush=True)
+            self.chars_printed = 2
+        print(token, end='', flush=True)
+        self.chars_printed += len(token)
+        if self.chars_printed >= margin:
             print('\n  ', end='', flush=True)
             self.chars_printed = 2
 
@@ -289,34 +396,12 @@ class ProgressTracker:
         self.count += 1
         pct = (self.count * 100) // self.total
         prev = ((self.count - 1) * 100) // self.total
-        if pct <= prev:
-            # Between percentage points: only check
-            # time-based ETA
-            now = datetime.now()
-            if ((now - self.last_eta).total_seconds()
-                    >= self.ETA_INTERVAL):
-                self.last_eta = now
-                frac = self.count / self.total
-                if 0 < frac < 1:
-                    elapsed = now - self.start_time
-                    remaining = (elapsed
-                                 * (1 - frac) / frac)
-                    label = f'~{self._fmt_eta(remaining)}'
-                    self._maybe_wrap(len(label))
-                    print(label, end='', flush=True)
-                    self.chars_printed += len(label)
-            return
-        # New percentage point reached
-        if pct >= self.next_milestone:
-            label = f'{self.next_milestone}%'
-            self._maybe_wrap(len(label))
-            print(label, end='', flush=True)
-            self.chars_printed += len(label)
-            self.next_milestone += 25
-        else:
-            print('.', end='', flush=True)
-            self.chars_printed += 1
-        # Time-based ETA at percentage boundaries
+        if pct > prev:
+            if pct >= self.next_milestone:
+                self._emit(f'{self.next_milestone}%')
+                self.next_milestone += 25
+            else:
+                self._emit('.')
         now = datetime.now()
         if ((now - self.last_eta).total_seconds()
                 >= self.ETA_INTERVAL):
@@ -324,13 +409,8 @@ class ProgressTracker:
             frac = self.count / self.total
             if 0 < frac < 1:
                 elapsed = now - self.start_time
-                remaining = (elapsed
-                             * (1 - frac) / frac)
-                label = f'~{self._fmt_eta(remaining)}'
-                print(label, end='', flush=True)
-                self.chars_printed += len(label)
-        # Wrap check
-        self._maybe_wrap()
+                remaining = elapsed * (1 - frac) / frac
+                self._emit(self._fmt_eta(remaining))
 
     def finish(self):
         if self.next_milestone <= 100:
@@ -345,10 +425,6 @@ class ProgressTracker:
 # Display helpers
 # ---------------------------------------------------------------------------
 
-# Module-level display context. Command handlers call
-# set_display_context(soln) before any display output.
-# Display functions use it to mark answer-set words with *
-# and max-entropy scores with =.
 _display_answer_set = set()
 _display_max_ent = 0.0
 
@@ -377,11 +453,13 @@ def _is_max_ent(score):
             and abs(score - _display_max_ent) < 1e-9)
 
 
-def format_columns(strings, width=DISPLAY_WIDTH,
+def format_columns(strings, width=None,
                    gap="  ", prefix="    "):
     """Format strings into auto-computed columns."""
     if not strings:
         return []
+    if width is None:
+        width = get_display_width()
     max_len = max(len(s) for s in strings)
     cols = max(1, (width - len(prefix)) // (max_len + len(gap)))
     rows = max(1, -(-len(strings) // cols))  # ceiling
@@ -424,10 +502,10 @@ def print_word_list(words, limit=20):
     Words in the answer set are marked with *.
     """
     items = [f'{w}{_mark(w)}' for w in words[:limit]]
-    if len(words) > limit:
-        items.append(f'... ({len(words)} total)')
     if items:
         print('\n'.join(format_columns(items)))
+    if len(words) > limit:
+        print(f'    ... ({len(words)} total)')
 
 
 def print_guesses(soln):
@@ -449,29 +527,6 @@ def print_guesses(soln):
 # Pickle cache
 # ---------------------------------------------------------------------------
 
-def _cache_path(prefix, n, method_name=None):
-    if method_name:
-        return f"{prefix}-{n}-{method_name}.p"
-    return f"{prefix}-{n}.p"
-
-
-def load_cache(prefix, n, method_name=None):
-    filepath = _cache_path(prefix, n, method_name)
-    try:
-        cache_mtime = os.path.getmtime(filepath)
-        engine_mtime = os.path.getmtime(ENGINE_PATH)
-        if cache_mtime < engine_mtime:
-            return None
-        with open(filepath, "rb") as f:
-            return pickle.load(f)
-    except (FileNotFoundError, OSError):
-        return None
-
-
-def save_cache(data, prefix, n, method_name=None):
-    with open(_cache_path(prefix, n, method_name),
-              "wb") as f:
-        pickle.dump(data, f)
 
 
 # ---------------------------------------------------------------------------
@@ -487,25 +542,24 @@ class GameState:
         self.n_answers = len(all_answers)
         self.n_guesses = len(all_guesses)
         self.cache = ResponseCache(all_answers)
-        self.adaptive_cache_path = os.path.abspath("adaptive_cache.sqlite3")
-        self.adaptive_cache = AdaptiveCacheSQLite(
-            self.adaptive_cache_path,
+        self.score_cache_path = os.path.abspath("wordle_cache.sqlite3")
+        self.score_cache = ScoreCache(
+            self.score_cache_path,
             all_answers,
         )
-        print(f"Adaptive cache DB: {self.adaptive_cache_path}")
+        print(f"Score cache: {self.score_cache_path}")
         self.solutions = [Solution(all_answers,
                                    all_guesses,
                                    self.cache,
-                                   self.adaptive_cache)]
+                                   self.score_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
-        self.volume = 10
 
     def reset_all(self):
         self.solutions = [Solution(self.all_answers,
                                    self.all_guesses,
                                    self.cache,
-                                   self.adaptive_cache)]
+                                   self.score_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
 
@@ -585,7 +639,6 @@ def cmd_guess(gs):
                 f'  Already solved: '
                 f'{soln.current_words[0]}'
             )
-            play_effect("Jump", 1, 0.3)
             continue
         elif len(soln.current_words) == 0:
             print_error("  No remaining words!")
@@ -627,7 +680,6 @@ def cmd_guess(gs):
         if len(cw) == 0:
             print_error(": No words remaining!")
         elif len(cw) == 1:
-            play_effect("Coin_1")
             print_success(f': {cw[0]}')
         else:
             print()
@@ -636,6 +688,20 @@ def cmd_guess(gs):
 # ---------------------------------------------------------------------------
 # Command: Solve
 # ---------------------------------------------------------------------------
+
+def _input_wordlist(gs, soln, iset):
+    """Resolve InputSet to the appropriate word list."""
+    if iset == InputSet.HARD_MODE:
+        return soln.hard_mode_words(gs.all_guesses)
+    if iset == InputSet.CURRENT_WORDLIST:
+        return soln.current_words
+    if iset == InputSet.SOLVED_WORDS:
+        return [
+            s.current_words[0] for s in gs.solutions
+            if len(s.current_words) == 1
+        ]
+    return gs.all_guesses
+
 
 def cmd_solve(gs):
     if gs.single:
@@ -652,14 +718,13 @@ def cmd_solve(gs):
 
     set_display_context(soln)
 
-    # Input word set
     iset = gs.input_set
     if not gs.single:
         print('Input words? '
-              '(h)ard, (a)ll, (s)olved? ', end='')
+              '(h)ard mode, (a)ll, (s)olved? ', end='')
         ch = input().strip().lower()
         if ch == 'h':
-            iset = InputSet.CURRENT_WORDLIST
+            iset = InputSet.HARD_MODE
         elif ch == 'a':
             iset = InputSet.ALL_GUESSES
         elif ch == 's':
@@ -668,25 +733,18 @@ def cmd_solve(gs):
             print_error("Invalid choice.")
             return
     else:
-        is_hard = (iset == InputSet.CURRENT_WORDLIST)
-        label = ("current words" if is_hard
-                 else "all guesses")
-        print(f'Input: {label}')
+        labels = {
+            InputSet.ALL_GUESSES:     "all guesses",
+            InputSet.HARD_MODE:       "hard mode",
+            InputSet.CURRENT_WORDLIST: "answers only",
+        }
+        print(f'Input: {labels.get(iset, iset.name)}')
 
-    if iset == InputSet.CURRENT_WORDLIST:
-        wordlist = soln.current_words
-    elif iset == InputSet.SOLVED_WORDS:
-        wordlist = [
-            s.current_words[0] for s in gs.solutions
-            if len(s.current_words) == 1
-        ]
-        if not wordlist:
-            print_error("No solutions found yet!")
-            return
-    else:
-        wordlist = gs.all_guesses
+    wordlist = _input_wordlist(gs, soln, iset)
+    if not wordlist:
+        print_error("No words in input set!")
+        return
 
-    # Scoring method
     methods = list(ScoringMethod)
     print("\nScoring method:")
     for i, m in enumerate(methods):
@@ -699,31 +757,18 @@ def cmd_solve(gs):
         print_error("Invalid choice.")
         return
 
-    is_full = (len(soln.current_words) == gs.n_answers
-               and iset == InputSet.ALL_GUESSES)
-    mname = method.name.lower()
-
-    # Try cache
-    if is_full:
-        cached = load_cache("weights", gs.n_guesses, mname)
-        if cached:
-            soln.scores = sorted(cached,
-                                 key=method.sort_key())
-            soln.scores_method = method
-            soln.scores_updated = True
-            print(f"\nCached ({gs.n_guesses} words, "
-                  f"{method.label}).")
-            if method == ScoringMethod.ENTROPY_GAIN:
-                print(f"(= = max entropy "
-                      f"{_display_max_ent:.4f})")
-            print("Best guesses:")
-            print_scored_list(soln.scores, method)
-            return
+    # Fast path: already computed this session
+    if soln.scores_updated and soln.scores_method == method:
+        print(f"\n{method.label} (cached):")
+        if method == ScoringMethod.ENTROPY_GAIN:
+            print(f"(= = max entropy {_display_max_ent:.4f})")
+        print("Best guesses:")
+        print_scored_list(soln.scores, method)
+        return
 
     n_in = len(wordlist)
     n_rem = len(soln.current_words)
-    print(f"\nScoring {n_in:,} guesses vs "
-          f"{n_rem:,} words.")
+    print(f"\nScoring {n_in:,} guesses vs {n_rem:,} words.")
     print(f"Method: {method.label}")
 
     tracker = ProgressTracker(n_in)
@@ -732,21 +777,40 @@ def cmd_solve(gs):
     )
     tracker.finish()
 
-    if is_full:
-        save_cache(results, "weights", gs.n_guesses,
-                   mname)
-
     print(f"\n{method.label}:")
     if method == ScoringMethod.ENTROPY_GAIN:
-        print(f"(= = max entropy "
-              f"{_display_max_ent:.4f})")
+        print(f"(= = max entropy {_display_max_ent:.4f})")
     print("Best guesses:")
     print_scored_list(results, method)
 
 
 # ---------------------------------------------------------------------------
-# Command: Grid (entropy vs max group size)
+# Command: Grid (entropy vs max group size, Pareto-filtered)
 # ---------------------------------------------------------------------------
+
+def _compute_pareto(word_ent_mx):
+    """
+    Return the Pareto frontier: words where no other word has both
+    strictly higher entropy AND strictly smaller max group size.
+
+    Returns list of (word, ent, mx) in ascending mx order,
+    only including mx levels that are not dominated.
+    """
+    from collections import defaultdict as _dd
+    mx_best = {}  # mx -> best entropy at that level
+    for word, ent, mx in word_ent_mx:
+        if mx not in mx_best or ent > mx_best[mx]:
+            mx_best[mx] = ent
+
+    frontier_mxs = []
+    running_max = -1.0
+    for mx in sorted(mx_best):
+        if mx_best[mx] > running_max:
+            frontier_mxs.append(mx)
+            running_max = mx_best[mx]
+
+    return set(frontier_mxs)
+
 
 def cmd_grid(gs):
     if gs.single:
@@ -763,14 +827,13 @@ def cmd_grid(gs):
 
     set_display_context(soln)
 
-    # Input word set
     iset = gs.input_set
     if not gs.single:
         print('Input words? '
-              '(h)ard, (a)ll, (s)olved? ', end='')
+              '(h)ard mode, (a)ll, (s)olved? ', end='')
         ch = input().strip().lower()
         if ch == 'h':
-            iset = InputSet.CURRENT_WORDLIST
+            iset = InputSet.HARD_MODE
         elif ch == 'a':
             iset = InputSet.ALL_GUESSES
         elif ch == 's':
@@ -779,32 +842,24 @@ def cmd_grid(gs):
             print_error("Invalid choice.")
             return
     else:
-        is_hard = (iset == InputSet.CURRENT_WORDLIST)
-        label = ("current words" if is_hard
-                 else "all guesses")
-        print(f'Input: {label}')
+        labels = {
+            InputSet.ALL_GUESSES:     "all guesses",
+            InputSet.HARD_MODE:       "hard mode",
+            InputSet.CURRENT_WORDLIST: "answers only",
+        }
+        print(f'Input: {labels.get(iset, iset.name)}')
 
-    if iset == InputSet.CURRENT_WORDLIST:
-        wordlist = soln.current_words
-    elif iset == InputSet.SOLVED_WORDS:
-        wordlist = [
-            s.current_words[0] for s in gs.solutions
-            if len(s.current_words) == 1
-        ]
-        if not wordlist:
-            print_error("No solutions found yet!")
-            return
-    else:
-        wordlist = gs.all_guesses
+    wordlist = _input_wordlist(gs, soln, iset)
+    if not wordlist:
+        print_error("No words in input set!")
+        return
 
-    methods = [ScoringMethod.ENTROPY_GAIN,
-               ScoringMethod.MINIMAX]
-
+    methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX]
     n_in = len(wordlist)
     n_rem = len(soln.current_words)
     print(f"\nScoring {n_in:,} guesses vs "
           f"{n_rem:,} words.")
-    print("Grid: Entropy vs Max Group Size")
+    print("Board: Entropy vs Max Group Size (Pareto view)")
 
     tracker = ProgressTracker(n_in)
     results = soln.compute_scores_multi(
@@ -813,43 +868,51 @@ def cmd_grid(gs):
     )
     tracker.finish()
 
-    # Bucket by max group size
-    from collections import defaultdict as dd
-    buckets = dd(list)
-    for word, scores in results:
-        mx = int(scores[ScoringMethod.MINIMAX])
-        ent = scores[ScoringMethod.ENTROPY_GAIN]
-        buckets[mx].append((word, ent))
+    # Build flat list for Pareto analysis
+    word_ent_mx = [
+        (word, scores[ScoringMethod.ENTROPY_GAIN],
+         int(scores[ScoringMethod.MINIMAX]))
+        for word, scores in results
+    ]
 
-    # Sort each bucket by entropy (best first)
-    for mx in buckets:
-        buckets[mx].sort(key=lambda x: -x[1])
+    frontier_mxs = _compute_pareto(word_ent_mx)
 
-    # Show the best 5 buckets (lowest max group)
-    sorted_keys = sorted(buckets.keys())[:5]
-    ent_method = ScoringMethod.ENTROPY_GAIN
-    per_bucket = 10
-    me = _display_max_ent
+    # Group by mx, sorted by entropy descending within each group
+    from collections import defaultdict as _dd
+    mx_groups = _dd(list)
+    for word, ent, mx in word_ent_mx:
+        mx_groups[mx].append((word, ent))
+    for mx in mx_groups:
+        mx_groups[mx].sort(key=lambda x: -x[1])
+
+    NEIGHBORS_PER_LEVEL = 4
 
     def ent_fmt(e):
-        s = ent_method.format_score(e)
+        s = ScoringMethod.ENTROPY_GAIN.format_score(e)
         if _is_max_ent(e):
             s += '='
         return s
 
-    print(f"\n(* = in answer set, "
-          f"= = max entropy {me:.4f})")
-    for mx in sorted_keys:
-        entries = buckets[mx][:per_bucket]
-        print(f"\n  Max group {mx}:"
-              f"  ({len(buckets[mx])} words)")
+    print(f"\n(* = in answer set)")
+    print("(showing Pareto frontier + top words per group size)")
+
+    any_shown = False
+    for mx in sorted(frontier_mxs):
+        entries = mx_groups[mx]
+        if not entries:
+            continue
+        to_show = entries[:NEIGHBORS_PER_LEVEL]
+        any_shown = True
+        print(f"\n  Max group {mx}  "
+              f"({len(entries)} words at this level)")
         items = [
             f'{w}{_mark(w)}: {ent_fmt(e)}'
-            for w, e in entries
+            for w, e in to_show
         ]
-        if len(buckets[mx]) > per_bucket:
-            items.append('...')
         print('\n'.join(format_columns(items)))
+
+    if not any_shown:
+        print("  (no words to display)")
 
 
 # ---------------------------------------------------------------------------
@@ -857,8 +920,6 @@ def cmd_grid(gs):
 # ---------------------------------------------------------------------------
 
 LOOKAHEAD_N = 20
-
-LOOKAHEAD_ALGORITHMS = {'a': 'adaptive'}
 
 
 def cmd_lookahead(gs):
@@ -876,33 +937,13 @@ def cmd_lookahead(gs):
 
     set_display_context(soln)
 
-    # Auto-compute entropy ranking inputs if missing/stale.
-    if (not soln.scores_updated
-            or soln.scores_method
-            != ScoringMethod.ENTROPY_GAIN):
-        print("No cached entropy solve found; "
-              "computing now for lookahead...")
-        is_hard = (gs.input_set
-                   == InputSet.CURRENT_WORDLIST)
-        rank_words = (soln.current_words if is_hard
-                      else gs.all_guesses)
-        tracker = ProgressTracker(len(rank_words))
-        soln.compute_scores(
-            rank_words,
-            ScoringMethod.ENTROPY_GAIN,
-            progress_callback=tracker.update,
-        )
-        tracker.finish()
-
     n_rem = len(soln.current_words)
     if n_rem <= 2:
         print("Two or fewer words remain, "
               "lookahead not needed.")
         return
 
-    # Prompt for N
-    print(f"How many top words? "
-          f"({LOOKAHEAD_N}) ", end="")
+    print(f"How many top words? ({LOOKAHEAD_N}) ", end="")
     n_input = input().strip()
     if n_input:
         try:
@@ -915,109 +956,77 @@ def cmd_lookahead(gs):
     else:
         count = LOOKAHEAD_N
 
-    # Adaptive interface is budget-driven (no fixed user depth prompt).
-    # Keep an internal recursion safety horizon to avoid Python recursion
-    # overflow on very large remaining sets while still allowing deep search.
-    depth = min(n_rem, 24)
+    # Compute entropy ranking if needed (transparently loads/saves SQLite)
+    if (not soln.scores_updated
+            or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
+        print("Computing entropy ranking for lookahead...")
+        rank_words = (soln.current_words
+                      if gs.input_set == InputSet.CURRENT_WORDLIST
+                      else gs.all_guesses)
+        tracker = ProgressTracker(len(rank_words))
+        soln.compute_scores(
+            rank_words,
+            ScoringMethod.ENTROPY_GAIN,
+            progress_callback=tracker.update,
+        )
+        tracker.finish()
 
     top_n = soln.scores[:count]
 
-    # Determine second-step word list from mode
-    is_hard = (gs.input_set
-               == InputSet.CURRENT_WORDLIST)
-    if is_hard:
-        global_candidates = None
-        mode_label = "hard mode"
+    # Answers-only mode: restrict step-2 candidates to the subgroup
+    is_answers_only = (gs.input_set == InputSet.CURRENT_WORDLIST)
+    if is_answers_only:
+        second_step_words = None
+        mode_label = "answers only (subgroup)"
     else:
         step2_count = max(count * count, 100)
-        global_candidates = [
-            w for w, s in soln.scores[:step2_count]
-        ]
-        mode_label = f"top {len(global_candidates)} guesses"
+        second_step_words = [w for w, _s in soln.scores[:step2_count]]
+        mode_label = f"top {len(second_step_words)} guesses"
 
-    print(f"\nAdaptive lookahead (budget-driven depth) on top "
-          f"{len(top_n)} words vs "
-          f"{n_rem:,} remaining.")
-    print(f"({mode_label} for deeper steps)")
+    print(f"\nTwo-step lookahead on top {len(top_n)} words "
+          f"vs {n_rem:,} remaining.")
+    print(f"  Second step: {mode_label}")
 
-    # Adaptive-depth lookahead with pruning
-    budget = 300  # 5 minutes
-    print(f"  Time budget: {budget}s")
-    print(f"  Pruning to top {LOOKAHEAD_N}")
-    algo_mode = LOOKAHEAD_ALGORITHMS['a']
-    def format_status(snapshot):
-            # Human-readable multiline status block.
-            elapsed = int(snapshot['elapsed'])
-            budget_s = int(snapshot['time_budget'])
-            frontier = snapshot['frontier_size']
-            queued = snapshot['queued_items']
-            activated = snapshot['activated_root_words']
-            total_roots = snapshot.get('eligible_root_words', len(top_n))
-            cutoff = snapshot['prune_cutoff']
-            rows = snapshot['top_rows'][:5]
-            mode = snapshot.get('scheduler_mode', 'normal')
-            stagnant_intervals = snapshot.get('stagnant_intervals', 0)
-            exploration_rate = snapshot.get('exploration_rate', 0.0)
-            mode_counts = snapshot.get('mode_counts', {})
-            mode_weights = snapshot.get('mode_weights', {})
+    # Count work for progress tracker (skipping cache hits)
+    total_work = 0
+    for word, first_ent in top_n:
+        if soln.cache:
+            grouped = soln.cache.group_words(word, soln.current_words)
+        else:
+            grouped = defaultdict(list)
+            for answer in soln.current_words:
+                from wordle_engine import _encode_response
+                pat = _encode_response(calculate_response(word, answer))
+                grouped[pat].append(answer)
+        policy = 'full' if second_step_words else 'hard'
+        for subgroup in grouped.values():
+            cnt = len(subgroup)
+            if cnt <= 2:
+                continue
+            if soln.score_cache:
+                blob = ScoreCache.encode_subset(subgroup)
+                if soln.score_cache.read(blob, policy) is not None:
+                    continue
+            total_work += (len(second_step_words)
+                           if second_step_words else cnt)
 
-            lines = [
-                "",
-                f"  elapsed/budget: {elapsed}s / {budget_s}s",
-                f"  activated root words: {activated}/{total_roots}",
-                f"  frontier heap entries: {frontier}",
-                f"  pending item keys: {queued}",
-                f"  Top-N cutoff lower bound (C_N): {cutoff:.4f}",
-                f"  scheduler mode: {mode}",
-                f"  stagnation intervals: {stagnant_intervals}",
-                f"  root exploration rate: {exploration_rate:.2%}",
-                "  scheduler weights: " + ", ".join(
-                    f"{k}={mode_weights[k]:.2f}" for k in sorted(mode_weights)
-                ) if mode_weights else "  scheduler weights: (n/a)",
-                "  scheduler counts: " + ", ".join(
-                    f"{k}={mode_counts[k]}" for k in sorted(mode_counts)
-                ) if mode_counts else "  scheduler counts: (n/a)",
-                "  exact? symbols: '=' means lower == upper, '~' means open interval",
-                "  contenders: word      lower    upper   exact?    gap",
-            ]
-            for w, lo, hi, exact in rows:
-                flag = "=" if exact else "~"
-                lines.append(
-                    f"              {w}{_mark(w):<2}  {lo:7.4f}  {hi:7.4f}     {flag}    {hi-lo:7.4f}"
-                )
-            if rows:
-                lines.append("  best guesses if halted now:")
-                lines.append("    rank  word      lower")
-                for idx, (w, lo, _hi, _exact) in enumerate(rows, start=1):
-                    lines.append(
-                        f"    {idx:>4}  {w}{_mark(w):<2}  {lo:7.4f}"
-                    )
-            return "\n".join(lines)
-
-    def on_status(snapshot):
-        print(format_status(snapshot), flush=True)
+    tracker = ProgressTracker(max(total_work, 1))
 
     start = time.perf_counter()
-    results, status = soln.compute_adaptive_lookahead(
+    results = soln.compute_lookahead(
         top_n,
-        root_expansion_words=soln.scores[:max(count * 3, 150)],
-        global_candidates=global_candidates,
-        max_depth=depth - 1,
-        time_budget=budget,
-        top_k=LOOKAHEAD_N,
-        progress_callback=None,
-        status_callback=on_status,
+        second_step_words=second_step_words,
+        progress_callback=tracker.update,
     )
+    tracker.finish()
     elapsed = time.perf_counter() - start
-    print(f"  Engine '{algo_mode}' elapsed: "
-          f"{elapsed:.2f}s")
-    label = f"{depth}-step"
-    print(f"\n{label} entropy lookahead "
-          f"({status}):")
+    print(f"  Elapsed: {elapsed:.1f}s")
+
+    print(f"\nTwo-step entropy lookahead:")
     print(f"  {'Word':<7} {'Step1':>7}  "
-          f"{'Deeper':>7}  {'Total':>7}")
+          f"{'Step2':>7}  {'Total':>7}")
     print(f"  {'----':<7} {'-----':>7}  "
-          f"{'------':>7}  {'-----':>7}")
+          f"{'-----':>7}  {'-----':>7}")
     for word, s1, s2, combined in results:
         m = _mark(word)
         me_flag = '=' if _is_max_ent(s1) else ' '
@@ -1083,23 +1092,266 @@ def _explain_conflict(pos, guess_word, recorded, hypothetical):
     return f"{letter}: expected {rec}, got {hyp}"
 
 
-def cmd_test(gs):
+def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
+                     all_guesses=None):
+    """
+    Compute 3-step expected entropy and group stats for a single word.
+    Returns a dict with keys: step1, step2, step3, max_grp, max_grp2,
+    wt_avg, prob_finish, buckets.
+
+    step2_pool: candidate pool for step 2. If None and not hard_mode,
+        uses only the subgroup (answers-only mode).
+    hard_mode: if True, compute valid step-2 candidates per subgroup
+        by applying the step-1 response constraints to all_guesses.
+    Step 3 always uses subgroup candidates — sub-subgroups are tiny.
+    """
+    cache = soln.cache
+    remaining = soln.current_words
+    n = len(remaining)
+
+    if cache:
+        s1_groups = cache.group_words(word, remaining)
+    else:
+        s1_groups = defaultdict(list)
+        for answer in remaining:
+            pat = tuple(calculate_response(word, answer))
+            s1_groups[pat].append(answer)
+
+    group_counts = {p: len(g) for p, g in s1_groups.items()}
+    step1     = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
+    wt_avg    = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
+    max_grp   = int(score_groups(group_counts, ScoringMethod.MINIMAX))
+    prob_fin  = score_groups(group_counts, ScoringMethod.PROB_FINISH)
+
+    buckets = [0, 0, 0, 0, 0]
+    for g in s1_groups.values():
+        k = len(g)
+        if k == 1:    buckets[0] += 1
+        elif k <= 4:  buckets[1] += 1
+        elif k <= 9:  buckets[2] += 1
+        elif k <= 49: buckets[3] += 1
+        else:         buckets[4] += 1
+
+    # Write level-1 scores into the in-memory per-word cache
+    soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
+    soln.word_scores[word][ScoringMethod.MINIMAX]     = float(max_grp)
+    soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
+    soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
+
+    # For step-2 SQLite caching, hard mode can't be keyed by subgroup blob alone
+    # because cands2 depends on the specific (word, pattern) constraint set.
+    lc = soln.score_cache
+    policy = None if hard_mode else ('full' if step2_pool is not None else 'hard')
+
+    step2 = 0.0
+    step3 = 0.0
+
+    t0 = time.time()
+    _prog = {'on': False, 'step3': False}
+
+    for pat, subgroup in s1_groups.items():
+        k = len(subgroup)
+        if k <= 1:
+            continue
+
+        if hard_mode and all_guesses:
+            resp = decode_response(pat)
+            cands2 = answer_to_restriction(word, resp).apply(all_guesses)
+        elif step2_pool is not None:
+            cands2 = step2_pool
+        else:
+            cands2 = subgroup
+
+        # Check SQLite subgroup cache (shares entries with compute_lookahead)
+        blob = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
+        cache_hit = lc.read(blob, policy) if blob else None
+
+        if cache_hit is not None:
+            best2_word, best2_ent = cache_hit
+            # One group computation to get sub-subgroups for step 3
+            if cache:
+                best2_grps = cache.group_words(best2_word, subgroup)
+            else:
+                best2_grps = defaultdict(list)
+                for ans in subgroup:
+                    p2 = tuple(calculate_response(best2_word, ans))
+                    best2_grps[p2].append(ans)
+        else:
+            # Announce progress only if we've been computing more than 5 seconds
+            if not _prog['on'] and time.time() - t0 > 5:
+                suffix = '2, 3' if _prog['step3'] else '2'
+                print(f'  Computing entropy...{suffix}', end='', flush=True)
+                _prog['on'] = True
+
+            best2_ent = 0.0
+            best2_word = None
+            best2_grps = None
+            for c2 in cands2:
+                if cache:
+                    sg = cache.group_words(c2, subgroup)
+                else:
+                    sg = defaultdict(list)
+                    for ans in subgroup:
+                        p2 = tuple(calculate_response(c2, ans))
+                        sg[p2].append(ans)
+                ent = score_groups(
+                    {p: len(g) for p, g in sg.items()},
+                    ScoringMethod.ENTROPY_GAIN,
+                )
+                if ent > best2_ent:
+                    best2_ent = ent
+                    best2_word = c2
+                    best2_grps = sg
+
+            if blob and best2_word:
+                lc.write(blob, policy, best2_word, best2_ent)
+
+        step2 += (k / n) * best2_ent
+
+        if best2_grps:
+            if not _prog['step3']:
+                _prog['step3'] = True
+                if _prog['on']:
+                    print(', 3', end='', flush=True)
+            for sub_sub in best2_grps.values():
+                kk = len(sub_sub)
+                if kk <= 1:
+                    continue
+                best3_ent = 0.0
+                for c3 in sub_sub:
+                    if cache:
+                        ssc = cache.group_counts(c3, sub_sub)
+                    else:
+                        ssc = calculate_group_counts(c3, sub_sub)
+                    ent = score_groups(ssc, ScoringMethod.ENTROPY_GAIN)
+                    if ent > best3_ent:
+                        best3_ent = ent
+                step3 += (kk / n) * best3_ent
+
+    if _prog['on']:
+        print()  # finish the "Computing entropy..." line
+
+    return {
+        'step1': step1, 'step2': step2, 'step3': step3,
+        'max_grp': max_grp,
+        'wt_avg': wt_avg, 'prob_finish': prob_fin,
+        'buckets': buckets,
+    }
+
+
+def _compare_words(words, soln, step2_pool=None, hard_mode=False,
+                   all_guesses=None):
+    """Compare 2–4 words side by side."""
+    n = len(soln.current_words)
+
+    print(f'\n  Computing {", ".join(w.upper() for w in words)}...', flush=True)
+    all_stats = []
+    for i, w in enumerate(words):
+        if len(words) > 1:
+            print(f'  [{i + 1}/{len(words)}] {w.upper()}', flush=True)
+        all_stats.append(_multistep_stats(w, soln, step2_pool, hard_mode, all_guesses))
+
+    lw = 9  # "Entropy 1" = 9, "10-49:" = 6
+
+    # Build all data rows up front so we can measure max column width
+    totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
+    data_rows = [
+        ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
+        ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
+        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
+        ('Entropy 1', [s['step1']       for s in all_stats], '{:.4f}', True),
+    ]
+    if n > 2:
+        data_rows += [
+            ('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}', True),
+            ('+ ent. 3', [s['step3'] for s in all_stats], '{:.4f}', True),
+            ('Total ent', totals,                          '{:.4f}', True),
+        ]
+
+    bucket_labels = ['1:', '2-4:', '5-9:', '10-49:', '50+:']
+    bucket_higher = [True, False, False, False, False]
+    bucket_rows = []
+    for bi, (lbl, hb) in enumerate(zip(bucket_labels, bucket_higher)):
+        vals = [s['buckets'][bi] for s in all_stats]
+        if any(vals):
+            bucket_rows.append((lbl, vals, '{:d}', hb))
+
+    # Column width: wide enough for word names AND every formatted value.
+    # Using a consistent format per row means right-justifying to cw
+    # automatically aligns decimal points within each row.
+    cw = max(len(w) for w in words)
+    for _, values, fmt, _ in data_rows + bucket_rows:
+        for v in values:
+            cw = max(cw, len(fmt.format(v)))
+
+    def print_row(label, values, fmt, higher_better=True):
+        padded = [fmt.format(v).rjust(cw) for v in values]
+        best = max(values) if higher_better else min(values)
+        all_tied = all(v == best for v in values)
+        print(f'  {label:<{lw}} ', end='')
+        for i, (p, v) in enumerate(zip(padded, values)):
+            if i:
+                print('  ', end='')
+            if not all_tied and v == best:
+                with colored_text('green'):
+                    print(p, end='')
+            else:
+                print(p, end='')
+        print()
+
+    print(f'\n  {n:,} words:')
+    print(f'  {"":>{lw}} ' + '  '.join(w.upper().rjust(cw) for w in words))
+
+    for label, values, fmt, hb in data_rows:
+        print_row(label, values, fmt, hb)
+
+    if bucket_rows:
+        print()
+        for label, values, fmt, hb in bucket_rows:
+            print_row(label, values, fmt, hb)
+
+
+def cmd_test(gs, inline=''):
     result = pick_one(gs, "Test. ")
     if result is None:
         return
     _, soln = result
 
     set_display_context(soln)
-    print("Word to test? ", end="")
+    if inline:
+        line = inline
+    else:
+        print("Word(s) to test? ", end="")
+        line = input().strip()
+
+    # Derive step-2 pool and hard-mode flag from current input-set setting
+    iset = gs.input_set
+    if iset == InputSet.HARD_MODE:
+        step2_pool = None
+        hard_mode  = True
+    elif iset == InputSet.CURRENT_WORDLIST:
+        step2_pool = None
+        hard_mode  = False
+    else:  # ALL_GUESSES — cap at 200 top-entropy words; searching all 12k is ~65x slower
+        hard_mode  = False
+        if (soln.scores_updated
+                and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
+            step2_pool = [w for w, _ in soln.scores[:200]]
+        else:
+            step2_pool = soln.all_answers
+
+    words = line.lower().split()
     try:
-        word = input().strip().lower()
-        assert len(word) == 5
+        if 2 <= len(words) <= 4:
+            assert all(len(w) == 5 for w in words)
+            _compare_words(words, soln, step2_pool, hard_mode, gs.all_guesses)
+            return
+        assert len(words) == 1 and len(words[0]) == 5
+        word = words[0]
 
         # Show pattern if answer is set
         if soln.answer_word:
-            resp = calculate_response(
-                word, soln.answer_word
-            )
+            resp = calculate_response(word, soln.answer_word)
             print(f'\n  vs {soln.answer_word.upper()}: ',
                   end='')
             print_colored_pattern(resp)
@@ -1133,9 +1385,10 @@ def cmd_test(gs):
                 print('  Not a valid candidate.')
 
         # Scores
-        groups = calculate_group_counts(
-            word, soln.current_words
-        )
+        if soln.cache:
+            groups = soln.cache.group_counts(word, soln.current_words)
+        else:
+            groups = calculate_group_counts(word, soln.current_words)
         n = len(soln.current_words)
         in_answers = _mark(word).strip()
         label = f'{word.upper()}'
@@ -1151,8 +1404,60 @@ def cmd_test(gs):
             print(f'    {m.label}: '
                   f'{m.format_score(s)}{extra}')
         print(f'    Groups: {len(groups)}')
+
+        # Multi-step lookahead for this word
+        if n > 2:
+            st = _multistep_stats(word, soln, step2_pool, hard_mode,
+                                  gs.all_guesses)
+            mode = ('hard mode' if hard_mode
+                    else (f'top {len(step2_pool)}' if step2_pool else 'answers only'))
+            print(f'\n  Multi-step lookahead ({mode}):')
+            total = st['step1'] + st['step2'] + st['step3']
+            _rows = [
+                ('Entropy 1:', st['step1']),
+                ('+ ent. 2:',  st['step2']),
+                ('+ ent. 3:',  st['step3']),
+                ('Total:',     total),
+            ]
+            _lw = max(len(r[0]) for r in _rows)
+            _vw = max(len(f'{v:.4f}') for _, v in _rows)
+            for lbl, val in _rows:
+                print(f'    {lbl:<{_lw}}  {val:>{_vw}.4f}')
+
+        # Group size distribution
+        sorted_groups = sorted(groups.items(), key=lambda x: -x[1])
+        b = [0, 0, 0, 0, 0]
+        for _, cnt in sorted_groups:
+            if cnt == 1:
+                b[0] += 1
+            elif cnt <= 4:
+                b[1] += 1
+            elif cnt <= 9:
+                b[2] += 1
+            elif cnt <= 49:
+                b[3] += 1
+            else:
+                b[4] += 1
+        labels = ['1', '2-4', '5-9', '10-49', '50+']
+        pairs = [f'{lbl}:{n}' for lbl, n in zip(labels, b) if n]
+        prefix = '  Subgroup sizes: '
+        width = get_display_width()
+        print()
+        cur = prefix
+        for i, pair in enumerate(pairs):
+            sep = '  ' if cur != prefix else ''
+            if len(cur) + len(sep) + len(pair) <= width:
+                cur += sep + pair
+            else:
+                print(cur)
+                cur = '    ' + pair
+        print(cur)
+
+    except AssertionError:
+        print_error("Word must be 5 letters.")
     except Exception as e:
         print_error(f"Error: {e}")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1505,33 @@ def cmd_reset(gs):
         else:
             val.reset()
             print(f"Solution {key + 1} reset.")
+
+
+# ---------------------------------------------------------------------------
+# Command: Undo
+# ---------------------------------------------------------------------------
+
+def cmd_undo(gs):
+    if gs.single:
+        soln = gs.solutions[0]
+    else:
+        result = pick_one(gs, "Undo. ")
+        if result is None:
+            return
+        _, soln = result
+
+    if not soln.guesses:
+        print("  Nothing to undo.")
+        return
+
+    last_word, last_resp = soln.guesses[-1]
+    if soln.undo_guess():
+        n = len(soln.current_words)
+        print(f"  Undid: {last_word.upper()} "
+              f"({format_response(last_resp)})")
+        print(f"  {n:,} words remaining.")
+    else:
+        print("  Nothing to undo.")
 
 
 # ---------------------------------------------------------------------------
@@ -1256,7 +1588,7 @@ def cmd_wordcount(gs):
             raise ValueError
         gs.solutions = [
             Solution(gs.all_answers, gs.all_guesses,
-                     gs.cache, gs.adaptive_cache)
+                     gs.cache, gs.score_cache)
             for _ in range(wc)
         ]
         if wc > 1:
@@ -1275,30 +1607,36 @@ def cmd_wordcount(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_hardmode(gs):
-    if gs.input_set == InputSet.ALL_GUESSES:
-        gs.input_set = InputSet.CURRENT_WORDLIST
-        print("  Hard mode on")
+    cycle = {
+        InputSet.ALL_GUESSES:      InputSet.HARD_MODE,
+        InputSet.HARD_MODE:        InputSet.CURRENT_WORDLIST,
+        InputSet.CURRENT_WORDLIST: InputSet.ALL_GUESSES,
+    }
+    labels = {
+        InputSet.ALL_GUESSES:      "all guesses (normal)",
+        InputSet.HARD_MODE:        "hard mode (satisfies constraints)",
+        InputSet.CURRENT_WORDLIST: "answers only (strictest)",
+    }
+    gs.input_set = cycle.get(gs.input_set, InputSet.ALL_GUESSES)
+    print(f"  Input set: {labels[gs.input_set]}")
+
+
+# ---------------------------------------------------------------------------
+# Command: Cache info
+# ---------------------------------------------------------------------------
+
+def cmd_cacheinfo(gs):
+    lc = gs.score_cache
+    la_rows, ws_rows, mtime = lc.stats()
+    if mtime:
+        ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
     else:
-        gs.input_set = InputSet.ALL_GUESSES
-        print("  Hard mode off")
-
-
-# ---------------------------------------------------------------------------
-# Command: Volume
-# ---------------------------------------------------------------------------
-
-def cmd_volume(gs):
-    print(f"Volume (0-10, now {gs.volume})? ",
-          end="")
-    try:
-        gs.volume = int(input().strip())
-        set_volume(gs.volume / 10)
-        if sound is None:
-            print(f"  Volume stored as {gs.volume} (no sound on this platform)")
-        else:
-            print(f"  Volume: {gs.volume}")
-    except (ValueError, TypeError):
-        print_error("Invalid volume.")
+        ts = "n/a"
+    print("\nScore cache:")
+    print(f"  db path:       {gs.score_cache_path}")
+    print(f"  subgroup rows: {la_rows:,}")
+    print(f"  word scores:   {ws_rows:,}")
+    print(f"  last write:    {ts}")
 
 
 # ---------------------------------------------------------------------------
@@ -1306,50 +1644,39 @@ def cmd_volume(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_help(gs):
-    hard = gs.input_set.name
+    iset_labels = {
+        InputSet.ALL_GUESSES:      "all guesses",
+        InputSet.HARD_MODE:        "hard mode",
+        InputSet.CURRENT_WORDLIST: "answers only",
+    }
+    iset = iset_labels.get(gs.input_set, gs.input_set.name)
     if gs.single:
         aw = gs.solutions[0].answer_word
         sim = aw.upper() if aw else "off"
+        nguesses = len(gs.solutions[0].guesses)
     else:
         sim_count = sum(
             1 for s in gs.solutions if s.answer_word
         )
         sim = f"{sim_count}/{len(gs.solutions)} set"
+        nguesses = "?"
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
-  b = Grid (entropy vs max group)
-  l = Lookahead (multi-step entropy)
+  b = Board (Pareto entropy vs max group)
+  l = Lookahead (two-step entropy)
   d = Display remaining words
-  t = Test a word (all methods)
+  t = Test a word (all methods + lookahead)
   i = Include letters (filter)
   x = eXclude letters (filter)
+  u = Undo last guess  ({nguesses} guesses so far)
   r = Reset
   a = Answer for simulation ({sim})
   w = Game count (quordle, etc.)
-  h = Hard mode ({hard})
-  c = Cache info (adaptive sqlite)
-  v = Volume ({gs.volume})
+  h = Input set: {iset}
+  c = Cache info
   ? = This help
 """)
-
-
-def cmd_cacheinfo(gs):
-    db_path = gs.adaptive_cache_path
-    conn = gs.adaptive_cache._conn
-    row = conn.execute(
-        "SELECT COUNT(*) AS c, MAX(updated_at) AS m FROM adaptive_state"
-    ).fetchone()
-    rows = row["c"] if row else 0
-    mtime = row["m"] if row and row["m"] else None
-    if mtime:
-        ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
-    else:
-        ts = "n/a"
-    print("\nAdaptive cache diagnostics:")
-    print(f"  db path: {db_path}")
-    print(f"  row count: {rows}")
-    print(f"  last write: {ts}")
 
 
 # ---------------------------------------------------------------------------
@@ -1365,19 +1692,20 @@ COMMANDS = {
     't': cmd_test,
     'i': cmd_include,
     'x': cmd_exclude,
+    'u': cmd_undo,
     'r': cmd_reset,
     'a': cmd_answer,
     'w': cmd_wordcount,
     'h': cmd_hardmode,
     'c': cmd_cacheinfo,
-    'v': cmd_volume,
     '?': cmd_help,
 }
 
 
 def print_status(gs):
     """Print current game status."""
-    print(f'\n{"=" * DISPLAY_WIDTH}')
+    refresh_display_width()
+    print(f'\n{"=" * get_display_width()}')
     if gs.single:
         soln = gs.solutions[0]
         if soln.answer_word:
@@ -1420,6 +1748,7 @@ def print_status(gs):
 
 
 def main():
+    print(f"wordle.py {BUILD}")
     all_answers = load_word_list(ANSWER_FILE)
     all_guesses = load_word_list(GUESS_FILE)
     print(f"Loaded {len(all_answers):,} answers, "
@@ -1427,10 +1756,9 @@ def main():
 
     gs = GameState(all_answers, all_guesses)
 
+    print_status(gs)
     while True:
-        print_status(gs)
-        print(f"\nCommand (gsbldtixrawhv?)? ",
-              end="")
+        print(f"\nCommand (gsbldtixurаwhc?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:
@@ -1443,16 +1771,22 @@ def main():
             break
 
         if not cmd:
+            print_status(gs)
             continue
         handler = COMMANDS.get(cmd[0])
         if handler:
             try:
-                handler(gs)
+                inline = cmd[1:].strip()
+                if inline and handler is cmd_test:
+                    cmd_test(gs, inline)
+                else:
+                    handler(gs)
             except Exception as e:
                 print_error(f"Error: {e}")
                 raise
         else:
             print_error(f"Unknown: {cmd}")
+        print_status(gs)
 
 
 if __name__ == '__main__':

@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Wordle runtime files
+lookahead_cache.sqlite3
+lookahead_cache.sqlite3-shm
+lookahead_cache.sqlite3-wal
+weights-*.p

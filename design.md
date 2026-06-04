@@ -1,943 +1,384 @@
-# Wordle adaptive refinement frontier search design
+# Wordle Solver — Design Notes
 
-2026-04-27 @ 22:41:44 EDT
+## Overview
 
-## Problem statement
+An interactive Wordle assistant implemented in Python, designed to run in
+Pythonista on iOS (iPhone/iPad) and on standard Linux terminals. It helps
+with a live Wordle game by tracking remaining possible answers and
+recommending guesses, and also supports multi-board variants
+(Quordle, Dordle, etc.).
 
-Given a current set of possible Wordle answers, rank candidate guesses by expected information gain over multiple future guess levels, subject to a bounded computation budget.
+Three files hold essentially everything:
 
-The search must support the following behavior:
+| File | Role |
+|------|------|
+| `wordle_engine.py` | All algorithms. No I/O. |
+| `wordle.py` | REPL, display, command handlers. |
+| `adaptive_cache_sqlite.py` | SQLite-backed lookahead result cache. |
 
-- Return useful partially refined rankings when the time budget expires
-- Continue refining candidates incrementally rather than fully solving one candidate before touching others
-- At any time, provide current “best words” list as reflected by progressive refinement
-- Reuse durable knowledge across different Wordle problems
-- Avoid redundant recomputation of equivalent subgroup states
-- Preserve correctness of bound-based pruning while allowing controlled exploration
+---
 
-This design describes a frontier-based adaptive refinement search over Wordle answer subgroups.
+## Word Lists
 
-This is to be integrated into the existing Wordle framework in the GitHub repo. It runs on iOS/iPadOS Pythonista and Linux console. The primary goal is to make the most effective use the limited computation available on mobile devices in a fixed amount of time to give a list of good "next guess" words for solving a Wordle puzzle. This design goal motivates the remainder of the design, including caching previous results, persisting word and pattern relationships for use on subsequent runs for future puzzles, minimal iterative refinement to advance the search frontier.
+Two files at startup:
 
-## Goals
+- **`NYT_wordlist.txt`** — ~3,200 answer words (the set the NYT Wordle draws from).
+- **`wordle.txt`** — ~12,972 valid guess words (superset including answers).
 
-### Search goals
+Answers are the universe for "what is the answer?"; guesses are the
+universe for "what should I guess next?" The two are kept separate
+throughout. All scoring is done by partitioning the *answer set* into
+response groups; the guess being evaluated can come from either list.
 
-The search should:
+---
 
-- begin with 1-step entropy information
-- refine promising candidates incrementally
-- compare candidates using lower and upper bounds on achievable multi-step entropy
-- choose the next unit of work according to expected value to the global top-`N` result
-- retain enough local information to avoid repeating work unnecessarily
-- stop cleanly at any time and return the best current ranking with known bounds
+## Response Encoding
 
-### Persistent cache goals
+A response is a list of five colors: `'green'`, `'yellow'`, or `'gray'`.
 
-The persistent cache should store reusable facts about subgroup states that remain valid across different Wordle problems.
+```
+calculate_response(guess, answer) -> ['green', 'gray', 'yellow', ...]
+```
 
-The persistent cache should:
+Two-pass algorithm handles duplicate letters correctly:
+- Pass 1: mark greens and consume those answer positions.
+- Pass 2: mark yellows (present but wrong position) and grays.
 
-- be keyed by subgroup state, remaining depth, and candidate policy
-- store summary knowledge only
-- support incremental updates
-- be safe under interruption
-- avoid storing run-specific frontier state
+For computation, responses are encoded as integers 0–242 (base 3,
+gray=0 / yellow=1 / green=2, most-significant digit first). All
+internal group-counting uses these ints as dict keys. `decode_response`
+reverses the encoding for display.
 
-### Runtime cache goals
+---
 
-The per-problem runtime cache should optimize one active solve.
+## Group Analysis and Scoring
 
-The runtime cache should:
+The core operation: partition the remaining answer words by what response
+they would give to a candidate guess. Each partition bucket is a
+*response group*. The guess that creates the most informative partition is
+the best guess.
 
-- intern subgroup states to eliminate redundant computation
-- retain local rankings and frontier information needed for fast context switching
-- support shared subproblems through a DAG structure
-- remain correctness-independent if later bounded or evicted
-- optimize compute time first; memory-management policy is secondary
+Four scoring methods:
 
-## Assumptions
+| Method | Formula | Direction |
+|--------|---------|-----------|
+| `WEIGHTED_AVG` | Σ(nᵢ²) / N | lower is better |
+| `ENTROPY_GAIN` | −Σ(pᵢ log₂ pᵢ) | higher is better |
+| `MINIMAX` | max(nᵢ) | lower is better |
+| `PROB_FINISH` | (# groups of size 1) / N | higher is better |
 
-The design assumes:
+`ENTROPY_GAIN` (Shannon entropy in bits) is the primary method used by
+lookahead and most automated ranking. `MINIMAX` is useful for worst-case
+risk analysis. `PROB_FINISH` is the probability that a single guess solves
+the puzzle outright.
 
-- there is a stable answer universe with stable ordering
-- the answer list is sorted alphabetically or otherwise loaded into a stable order
-- subgroup state is defined by the remaining possible answers only
-- candidate guesses may come from either the full guess list or the current survivor set, depending on policy
-- the answer set tends to shrink sharply after each informative guess, making local 1-step entropy solves much cheaper than the root-level solve
-- the main early bottleneck is computation time, not memory pressure
+`max_entropy(n)` returns log₂(n) — the theoretical ceiling for n remaining
+words. In practice, with only 243 possible responses (3⁵), no word can
+achieve this ceiling unless very few words remain.
 
-## Definitions
+---
 
-### Answer universe
+## ResponseCache (in-memory)
 
-Let `A` be the full set of allowed answer words.
+```python
+class ResponseCache:
+    def __init__(self, answer_words): ...
+    def group_counts(self, guess, subset) -> {pattern_int: count}
+    def group_words(self, guess, subset) -> {pattern_int: [words]}
+```
 
-Each answer word is assigned a stable integer index in `[0, |A|)`.
+For each guess word encountered, caches the full `{answer → pattern_int}`
+mapping across all answer words. Built lazily on first access. Subsequent
+calls against any subset of answers are then pure dict lookups —
+no `calculate_response` calls needed.
 
-### Candidate guess universe
+One `ResponseCache` instance is shared across all `Solution` objects for
+the session.
 
-Let `G` be the set of allowed guess words under the current semantic policy.
+---
 
-Typical policies include:
+## Solution Class
 
-- `ALL_GUESSES`: any allowed guess word may be used
-- `SURVIVORS_ONLY`: only words still present in the current survivor set may be used
+`Solution` tracks the state of a single board:
 
-### Survivor subgroup
+```python
+class Solution:
+    current_words   # remaining candidate answers
+    guesses         # [(word, response), ...]
+    word_scores     # {word: {ScoringMethod: score}} — per-word score cache
+    answer_word     # set in simulation mode; None otherwise
+    fallback_active # True if current_words came from full guess vocab
+```
 
-A survivor subgroup is a subset `S ⊆ A` of remaining possible answers.
+### Score Cache
 
-A subgroup is represented in memory as a Python `int` bitset over the answer universe:
+`word_scores` is a per-word, per-method cache. `compute_scores` and
+`compute_scores_multi` populate it incrementally — a word already scored
+under a method is not recomputed. This means the board command (which
+scores entropy + minimax together) and the solve command (entropy only)
+share computed entropy values with no redundant work.
 
-- bit `i` is set iff answer `A[i]` is still possible
+The cache is cleared whenever `current_words` changes: after `apply_guess`,
+`undo_guess`, `include_letters`, or `exclude_letters`.
 
-On disk, the subgroup bitset is stored as a SQLite `BLOB`.
+### Undo
 
-### Remaining depth
+`undo_guess()` pops the last entry from `self.guesses`, resets
+`current_words` to the full answer list, and replays all remaining guesses.
+Works in all modes (live game, simulation, multi-game).
+
+### Hard Mode Words
+
+`hard_mode_words(all_guesses)` filters the full 12K guess list to words
+consistent with all prior responses — green letters fixed in position,
+yellow letters present but not in that position. This is real Wordle hard
+mode: guesses must respect all revealed constraints, but are not limited
+to remaining answers.
+
+### Multi-Game Join
+
+`Solution.join(solutions)` merges the `current_words` from multiple
+active boards into a single Solution for computing a shared best guess
+(useful for Quordle-style play).
+
+### Fallback
+
+If `apply_guess` would leave `current_words` empty (the guessed word is not
+in the answer list and its response pattern matches nothing), the engine
+replays all guesses against the full 12K guess vocabulary. `fallback_active`
+is set to True; the UI displays a warning.
+
+---
+
+## Two-Step Entropy Lookahead
+
+```python
+soln.compute_lookahead(
+    top_words,           # [(word, first_entropy), ...]
+    second_step_words,   # None = hard mode; list = full mode
+    total_callback,      # called once with total work units
+    progress_callback,   # called per work unit
+) -> [(word, step1, step2, combined), ...]
+```
 
-For a subgroup state, `d` is the remaining number of future guess levels whose deeper entropy is still being evaluated from that state.
+**Algorithm:**
 
-### Wordle response partition
+For each candidate first guess:
+1. Partition `current_words` into response groups.
+2. For each group of size > 2, find the best second guess: the word in
+   `second_step_words` (or the subgroup itself in hard mode) that maximises
+   entropy against that subgroup.
+3. Compute the weighted average second-step entropy:
+   `step2 = Σ (|group| / N) × best_entropy(group)`
+4. `combined = step1 + step2`
+
+Groups of size 1 are already solved; groups of size 2 contribute exactly
+1.0 bit (any distinguishing word resolves them).
+
+**Hard mode vs full mode:**
+
+- **Hard mode** (`second_step_words=None`): the second guess must come from
+  the subgroup itself. Fast; realistic for hard-mode play.
+- **Full mode** (`second_step_words=[...]`): search a provided word list
+  (typically the top N² ranked guesses) for the best second step. Slower;
+  finds better second steps.
+
+The test command uses hard mode. The lookahead command uses full mode,
+searching the top N² candidates as second-step words.
+
+**SQLite subgroup cache:**
+
+Completed subgroup results are cached in `LookaheadCache` (see below).
+Before scanning candidates for a subgroup, the cache is checked. On a hit,
+the scan is skipped entirely. Cache hits are excluded from the work-unit
+count so the progress bar reflects only real computation.
+
+---
+
+## LookaheadCache (SQLite)
+
+Defined in `adaptive_cache_sqlite.py`.
+
+```python
+class LookaheadCache:
+    def read(self, subset_blob, policy) -> (best_word, best_entropy) | None
+    def write(self, subset_blob, policy, best_word, best_entropy)
+    def stats() -> (row_count, last_updated_ts)
+    @staticmethod
+    def encode_subset(words) -> bytes  # b"\0".join(sorted(words).encode())
+```
+
+**Schema:**
+
+```sql
+CREATE TABLE universe (
+    universe_id  TEXT PRIMARY KEY,  -- SHA-256 of sorted answer list
+    answer_hash  TEXT NOT NULL,
+    answer_count INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
+)
+
+CREATE TABLE lookahead_result (
+    subset_blob  BLOB    NOT NULL,  -- NUL-joined sorted subgroup words
+    policy       TEXT    NOT NULL,  -- 'hard' or 'full'
+    universe_id  TEXT    NOT NULL,
+    best_word    TEXT    NOT NULL,
+    best_entropy REAL    NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (subset_blob, policy, universe_id)
+)
+```
+
+`universe_id` is the SHA-256 of the newline-joined sorted answer list.
+Results from a different answer set are silently ignored via the universe
+join.
+
+The cache is **exact**: only completed subgroup scans are stored. No
+partial or approximate values are written. Because small subgroups (≤ ~20
+words) recur frequently across sessions regardless of which first guess
+produced them, the cache grows incrementally and makes repeated lookahead
+runs progressively faster.
+
+---
+
+## InputSet and Hard Mode Toggle
 
-For a candidate guess `g` and subgroup `S`, the Wordle response function partitions `S` into child subgroups `{S_i}` according to the response pattern produced by comparing `g` against each answer in `S`.
+The `InputSet` enum controls which words are eligible as guesses:
 
-Each child subgroup has probability weight:
+| Value | Candidate pool |
+|-------|---------------|
+| `ALL_GUESSES` | All ~12,972 words |
+| `HARD_MODE` | Words from all_guesses satisfying all revealed constraints |
+| `CURRENT_WORDLIST` | Remaining possible answers only (strictest) |
+| `SOLVED_WORDS` | Multi-game only: the solved answer from each board |
 
-`p_i = |S_i| / |S|`
+The `h` command cycles `ALL_GUESSES → HARD_MODE → CURRENT_WORDLIST → ALL_GUESSES`.
+The current setting applies to the `s`, `b`, and `l` commands.
 
-### Immediate entropy
+---
 
-For a candidate guess `g` evaluated on subgroup `S`, immediate entropy is:
+## Interactive Commands
 
-`H_immediate(g, S) = - Σ_i p_i log2(p_i)`
+The REPL loop reads a single character per command.
 
-where the sum is over the response partition children `{S_i}`.
+| Key | Command | Description |
+|-----|---------|-------------|
+| `g` | Guess | Enter a guess word and response pattern |
+| `s` | Solve | Score all candidates by chosen method |
+| `b` | Board | Pareto entropy vs max-group-size display |
+| `l` | Lookahead | Two-step entropy lookahead on top N words |
+| `d` | Display | Show remaining words (scored if available) |
+| `t` | Test | Analyse a specific word (all methods + lookahead) |
+| `i` | Include | Keep only words containing specified letters |
+| `x` | Exclude | Remove words containing specified letters |
+| `u` | Undo | Remove the last guess and restore prior word count |
+| `r` | Reset | Reset one or all boards |
+| `a` | Answer | Set a known answer for simulation mode |
+| `w` | Words | Set number of games (Quordle, Dordle, etc.) |
+| `h` | Hard mode | Cycle through input sets |
+| `c` | Cache info | Show SQLite cache statistics |
+| `?` | Help | Print command summary |
 
-### State value
+### Response entry format (`g`)
 
-The value of a subgroup state is the **deeper entropy still achievable from that state**, not including any immediate entropy already accounted for by a parent candidate.
+The response to a guess is entered as a 5-character string:
+`g` = green, `y` = yellow, any other character (including `-`, `0`, `_`,
+em-dash) = gray. The parser accepts punctuation liberally because mobile
+keyboards sometimes substitute punctuation for hyphens.
 
-For state `(S, d, policy)`, let:
+### Solve (`s`)
 
-- `L(S, d)` be a lower bound on deeper achievable entropy
-- `U(S, d)` be an upper bound on deeper achievable entropy
+Scores every word in the current input set against the remaining answers
+under one of the four methods. When run at the start of a full game
+(all answers remaining, all-guesses mode), results are saved to a `.p`
+pickle file and reloaded on subsequent runs if the engine has not changed.
 
-### Candidate value at a state
+### Board (`b`) — Pareto View
 
-For candidate guess `g` evaluated at subgroup state `(S, d)`, with partition children `{S_i}` and weights `{p_i}`:
+Scores all candidates simultaneously on entropy and max-group-size, then
+displays the **Pareto frontier**: the max-group-size levels where no other
+level has both higher entropy and lower max-group-size.
 
-`L_g(S, d) = H_immediate(g, S) + Σ_i p_i * L(S_i, d - 1)`
+**Algorithm:**
 
-`U_g(S, d) = H_immediate(g, S) + Σ_i p_i * U(S_i, d - 1)`
+1. For each unique max-group-size value, find the best entropy among all
+   words at that size.
+2. Sort sizes ascending. Walk the list keeping a running maximum entropy
+   seen so far. A size is on the frontier if and only if its best entropy
+   exceeds the running maximum.
+3. For each frontier size, show the top 4 words by entropy.
 
-The subgroup state's own bounds are the best candidate bounds currently known at that state:
+Words in the answer set are marked `*`. Each frontier level shows how many
+total words share that max-group-size.
 
-`L(S, d) = max_g L_g(S, d)` over candidates evaluated so far
+### Lookahead (`l`)
 
-`U(S, d) = max_g U_g(S, d)` over candidates evaluated so far
+Ranks the top N first guesses by combined two-step entropy. Prompts for N
+(default 20). Uses full mode: searches the top N² ranked words as
+second-step candidates.
 
-### Fresh-state initialization
+A progress bar reflects only uncached work. After computing, displays a
+table of `word / step1 / step2 / combined`.
 
-For a newly created subgroup state with subgroup size `n = |S|` and remaining depth `d`:
+### Test (`t`)
 
-- initial lower bound:
+Analyses a single word in detail:
+- If simulation mode is active, shows the response pattern against the
+  known answer.
+- Checks consistency with all prior guesses; explains each conflict.
+- Scores the word under all four methods and shows group count.
+- Runs a single-word two-step lookahead (hard mode): step1, step2, combined.
+- Shows the 5 largest response groups with up to 6 example words each.
 
-  `L(S, d) = 0`
+---
 
-- initial upper bound:
+## Pickle Cache
 
-  `U(S, d) = d * log2(n)`
+When `s` is run at game start on the full word list, results are saved to
+`weights-<n_guesses>-<method>.p`. On subsequent runs, the file is loaded if
+its mtime is newer than `wordle_engine.py`. This avoids the ~1-minute full
+scoring run each session.
 
-Special exact cases:
+---
 
-- if `n <= 1`, then `L = U = 0`
-- if `d <= 0`, then `L = U = 0`
-- if `n == 2` and `d >= 1`, then `L = U = 1.0`
+## Multi-Game Mode
 
-### Top-`N` viability rule
+`w` sets the number of simultaneous games (e.g. 4 for Quordle). Each game
+gets its own `Solution`. The `g` command can target one board or all boards
+at once. `s`, `b`, and `l` can operate on a single board or a joined view
+of all unsolved boards.
 
-A candidate or work item is globally non-viable when its upper bound falls below the current top-`N` cutoff.
+---
 
-Let `C_N` be the current `N`th-best lower bound among the top-level candidates.
+## Platform Notes
 
-Then a candidate or subtree is globally non-viable when:
+### Color Output
 
-`U < C_N`
+On Pythonista, `console.set_color(r, g, b)` is used. On Linux, ANSI escape
+codes are used when stdout is a TTY and `NO_COLOR` is not set.
 
-Child refinement should stop when no dependent parent candidate can remain top-`N` even if that child were further refined.
+### Display Width
 
-This is the governing pruning rule.
+`get_display_width()` tries the following in order:
 
-## High-level algorithm
+1. `shutil.get_terminal_size()` — queries the OS via `TIOCGWINSZ`. Works
+   in standard terminals and may work in Pythonista if the console exposes
+   terminal size.
+2. Pythonista pixel-based estimation: reads the console view width in
+   points via `console.get_size()`, then tries several monospace fonts via
+   `ui.measure_string('M', font=...)` and picks the one whose column count
+   is closest to an integer (i.e. most likely to match the actual console
+   font). Font candidates: Menlo 12/13/14, DejaVuSansMono 16, Courier 12/14.
+3. Falls back to 80 columns.
 
-The algorithm is a **frontier-based adaptive refinement search** over subgroup states.
+The detected width is printed at startup: `Display width: N columns`.
 
-### Root behavior
+### Progress Bar
 
-At the current Wordle problem root:
-
-1. compute 1-step entropy information for top-level candidates
-2. create work items that can activate dormant top-level candidates
-3. refine candidates incrementally under a bounded compute budget
-4. return the best current ranking using known lower and upper bounds
-
-### Search structure
-
-The runtime search is a DAG of interned subgroup states, not a duplicated tree.
-
-Equivalent subgroup states reached from different paths are represented once and shared.
-
-This eliminates redundant computation and allows refinement of one subgroup to benefit multiple parents.
-
-## Scheduler
-
-A single unified scheduler manages all work.
-
-There is no separate top-level scheduler and child scheduler.
-
-### Work-item kinds
-
-The scheduler supports at least:
-
-- `ACTIVATE_TOP_WORD`
-- `REFINE_CHILD`
-
-### Unified scheduling principle
-
-The scheduler should choose the next unit of work most likely to improve the current top-`N` answer quality.
-
-It is mostly greedy, with a small amount of stochastic exploration.
-
-### Exploration policy
-
-A small exploration rate is used, on the order of a few percent.
-
-When exploring stochastically, sampling is done from the full eligible set rather than only a narrow top band.
-
-The exact percentage is tunable.
-
-## `ACTIVATE_TOP_WORD`
-
-`ACTIVATE_TOP_WORD` performs the minimum useful work required to turn a dormant first word into a real contender.
-
-Given top-level guess `g` on current survivors `S_root`, activation does the following:
-
-1. compute or retrieve the step-1 partition of `S_root` under `g`
-2. compute `H_immediate(g, S_root)`
-3. create the top-level candidate record for `g`
-4. create or intern all immediate child states `(S_i, d - 1, policy)`
-5. compute candidate bounds:
-
-   `L_g = H_immediate(g, S_root)`
-
-   `U_g = H_immediate(g, S_root) + Σ_i p_i * U(S_i, d - 1)`
-
-6. enqueue downstream refinement work for unresolved nontrivial children
-7. stop
-
-Activation does not perform deeper recursive refinement beyond that first partition layer.
-
-### Trivial child handling during activation
-
-During activation:
-
-- if `|S_i| == 0` or `|S_i| == 1`, exact deeper value is `0`
-- if `|S_i| == 2` and remaining depth is at least `1`, exact deeper value is `1.0`
-- only unresolved nontrivial children generate downstream refinement work
-
-### Persistent-cache interaction during activation
-
-Persistent cache can initialize child states with any previously known:
-
-- lower bound
-- upper bound
-- best guess
-- exact/partial flag
-
-Persistent cache does not remove the need to compute the immediate step-1 partition of the current activated guess.
-
-## `REFINE_CHILD`
-
-`REFINE_CHILD` also performs the minimum useful step.
-
-It refines one child state only if that state is still worth work under the current bound-based top-`N` logic.
-
-### Bounds-gated refinement
-
-Before refinement:
-
-1. if the child state is already exact, stop
-2. if the child state is globally non-viable for all dependent parents, stop
-
-Only then does refinement proceed.
-
-### Refinement action
-
-If refinement is justified, `REFINE_CHILD` performs a **full local 1-step entropy solve** on the child subgroup.
-
-This local breadth-1 solve is a bound-tightening operation.
-
-It does the following:
-
-1. evaluate the full local 1-step entropy ranking for the child subgroup
-2. compute candidate-specific immediate entropies and child partitions
-3. create or intern descendant subgroup states
-4. tighten the child state's lower and upper bounds using the evaluated local candidates
-5. mark dependent parents dirty
-6. expose resulting descendant work to the scheduler according to global viability and priority
-7. stop
-
-`REFINE_CHILD` does not continue recursive descent within the same work item.
-
-### Why a full local 1-step solve is used
-
-Local child subgroups are much smaller than the root subgroup in typical use.
-
-Therefore, a full local breadth-1 entropy solve is usually an appropriate minimum useful step:
-
-- it is much cheaper than the root-level 1-step solve
-- it provides principled local information rather than a weak proxy
-- it improves bound quality substantially
-
-## Local ranking retention
-
-When a `REFINE_CHILD` operation computes a full local 1-step ranking at a state, the full local ranking is retained as state-local knowledge.
-
-This ranking is not discarded simply because some candidates are not locally top-ranked.
-
-### Local ranking is not local pruning
-
-Shallow local ranking alone does not justify pruning.
-
-A candidate that looks weak after one local breadth-1 pass may still become strong under deeper refinement.
-
-Therefore:
-
-- local rankings are retained
-- local rankings do not by themselves prune candidates
-- pruning is governed only by global bound viability
-
-### Retained ranking vs active frontier
-
-Retaining a full local ranking does not require enqueuing every descendant immediately.
-
-Instead:
-
-- the full local ranking remains attached to the state
-- the scheduler decides which resulting work items become active frontier items
-
-This preserves information while avoiding queue explosion.
-
-### Scheduler access to local ranking
-
-The scheduler should not be artificially deprived of local-ranking information.
-
-However, it also should not perform repeated full scans of local rankings merely to choose the next work item.
-
-Therefore, states should expose scheduler-ready work through an indexed or heap-friendly mechanism derived from the retained local ranking.
-
-## Runtime data structures
-
-The following data structures are expected.
-
-### `StateNode`
-
-A unique runtime state keyed by:
-
-- `subset_bits`
-- `remaining_depth`
-- `policy`
-
-Expected fields:
-
-- `subset_bits: int`
-- `remaining_depth: int`
-- `policy: enum`
-- `lower_bound: float`
-- `upper_bound: float`
-- `best_guess_id: int | None`
-- `is_exact: bool`
-- `candidate_records: mapping[guess_id -> CandidateRecord]`
-- `dependents: set[(parent_state_key, parent_guess_id)]`
-- `retained_local_ranking`: ranking or indexed structure derived from the latest local breadth-1 solve
-- dirty / status flags as needed
-
-### `CandidateRecord`
-
-A candidate guess evaluated at one state.
-
-Expected fields:
-
-- `guess_id: int`
-- `immediate_entropy: float`
-- `lower_bound: float`
-- `upper_bound: float`
-- `is_exact: bool`
-- `children: sequence[ChildEdge]`
-- dirty / status flags as needed
-
-### `ChildEdge`
-
-A weighted relation from one candidate record to one child state.
-
-Expected fields:
-
-- `parent_guess_id: int`
-- `child_state_key` or direct child state reference
-- `path_weight: float`
-
-Bound contribution is read from the child state itself rather than duplicated on the edge unless profiling later proves snapshots worthwhile.
-
-### Scheduler work items
-
-At minimum:
-
-#### `ACTIVATE_TOP_WORD`
-Expected fields:
-
-- `guess_id`
-- any precomputed root-level priority information needed by the scheduler
-
-#### `REFINE_CHILD`
-Expected fields:
-
-- `parent_state_key`
-- `parent_guess_id`
-- `child_state_key`
-- `path_weight`
-- any cached priority metadata needed by the scheduler
-
-## Runtime DAG and dependent propagation
-
-Because the runtime search is a DAG, one child state may have multiple parents.
-
-When a child state's bounds improve, dependent parent candidates should be marked dirty and recomputed lazily.
-
-This allows shared subgroup refinement to benefit all relevant parents.
-
-## Persistent cache
-
-### Purpose
-
-The persistent cache stores reusable facts about subgroup states that remain valid across different Wordle problems.
-
-### Storage technology
-
-Persistent cache uses SQLite.
-
-Reasons:
-
-- incremental updates
-- safer under interruption
-- easier inspection and maintenance
-- natural fit for keyed subgroup-state storage
-
-### Persistent key
-
-The persistent cache key is:
-
-- subgroup bitset
-- remaining depth
-- policy
-
-### Persistent value
-
-The persistent cache stores summary fields such as:
-
-- `lower_bound`
-- `upper_bound`
-- `best_guess_id`
-- `is_exact`
-
-Persisted `best_guess_id` is treated as a **strong hint**, not an absolute command, unless the cached state is exact.
-
-### SQLite representation
-
-A single table is sufficient.
-
-Representative fields:
-
-- `subset_blob` BLOB
-- `remaining_depth` INTEGER
-- `policy` INTEGER
-- `lower_bound` REAL
-- `upper_bound` REAL
-- `best_guess_id` INTEGER
-- `is_exact` INTEGER
-
-Primary key:
-
-- `(subset_blob, remaining_depth, policy)`
-
-## Runtime cache versus persistent cache
-
-### Runtime cache
-
-The runtime cache is per-problem and optimized for the current solve.
-
-It may hold:
-
-- interned states
-- retained local rankings
-- live frontier information
-- dependency links
-- scheduler acceleration structures
-
-### Persistent cache
-
-The persistent cache is cross-problem and stores only durable subgroup facts.
-
-It does not store the live frontier.
-
-## Memory management
-
-The design prioritizes compute-time reduction over aggressive memory optimization.
-
-Runtime memory eviction is not a primary design concern for the first implementation.
-
-If needed later, runtime memory management should be:
-
-- simple
-- tunable
-- correctness-independent
-
-A later bounded in-memory policy such as LRU is acceptable, but the core design should not depend on eviction. Remember, the key is to make best use of time-limited and Python-constrained computation on a mobile device. Memory is likely available. Heavyweight computation may not be.
-
-## Summary of core design choices
-
-- subgroup state is represented over the answer universe only
-- candidate guesses are governed separately by policy
-- the search uses a DAG of interned subgroup states
-- one unified scheduler manages mixed work-item types
-- activation and refinement both perform the minimum useful step
-- refinement uses full local 1-step entropy solves, gated by global bounds
-- local rankings are retained, but shallow local ranking alone never prunes
-- global pruning is governed by upper bounds versus the current top-`N` cutoff
-- persistent cache stores reusable subgroup summaries in SQLite
-- runtime cache stores richer per-problem frontier state
-
-
-## Integration with the existing framework
-
-This design is intended to be implemented **within the existing Python framework**, not as a greenfield rewrite.
-
-### Existing architectural split
-
-The current codebase already has a clear separation of responsibilities:
-
-#### `wordle_engine.py`
-
-This module owns:
-
-- scoring primitives
-- response computation
-- restriction application and survivor filtering
-- group partitioning
-- reusable `ResponseCache`
-- the `Solution` model
-- current lookahead algorithms:
-  - `compute_lookahead(...)`
-  - `compute_deep_lookahead(...)`
-
-This module should remain the home of the adaptive refinement frontier search implementation.
-
-#### `wordle.py`
-
-This module currently owns:
-
-- platform adaptation and terminal / Pythonista behavior
-- progress display and human-facing reporting
-- command parsing and dispatch
-- on-disk caching policy for current command outputs
-- high-level orchestration of solving workflows
-- interaction with `Solution`
-
-This module should continue to own command-line / Pythonista integration, user prompts, status display, and human-facing orchestration.
-
-It should **not** own engine persistence semantics or low-level cache management for the adaptive search.
-
-### Design requirement: preserve the framework split
-
-The adaptive refinement frontier search must fit into the current framework with minimal architectural disruption.
-
-The design should preserve the following principles:
-
-- no UI logic in `wordle_engine.py`
-- no core search logic in `wordle.py`
-- `Solution` remains the natural owner of problem-local search state
-- human-facing progress and status reporting remain callback-driven from engine to UI
-- persistent storage policy is orchestrated from the UI layer, while reusable cache data structures and search semantics remain engine-defined
-
-The design could evolve to use additional Python files in some situations:
-- It might make sense to have the persistent cache as a separate object, with SQLite interactions implemented behind an interface.
-- The scheduler might be complex enough to warrant a separate file.
-- The classes involved with frontier management might themselves be worth separating out into a file that the engine uses.
-
-These additional Python files are not mandated. They are offered as options for possibly cleaner design.
-
-## Existing engine structures that the design should reuse
-
-The current engine already provides several pieces that should be reused rather than replaced.
-
-### `Solution`
-
-`Solution` already owns:
-
-- `current_words`
-- guess history
-- cached score lists
-- answer-set helpers
-- application of guesses
-- score computation against current survivors
-
-The adaptive frontier search should extend `Solution` rather than bypass it.
-
-In particular, the new search should treat:
-
-- `Solution.current_words`
-
-as the root survivor subgroup for the current problem.
-
-### `ResponseCache`
-
-`ResponseCache` already lazily caches:
-
-- for each guess word
-- the encoded Wordle response against every answer word
-
-This cache is valuable and should remain central.
-
-It already makes repeated group partitioning much cheaper by replacing repeated response computation with table lookup.
-
-The adaptive search should continue using `ResponseCache` for:
-
-- immediate partition construction
-- local 1-step entropy solves
-- child subgroup generation
-
-But conversely, first-level entropy solves done by the adaptive algorithm ought to be cached in such a way that a later local 1-step solve can reuse immediately, saving computation.
-
-### Current lookahead APIs
-
-The existing engine already has two lookahead paths:
-
-- `compute_lookahead(...)` for depth 2
-- `compute_deep_lookahead(...)` for deeper depth with pruning and callbacks
-
-The adaptive frontier search should be introduced as an additional engine-level lookahead path, not as a replacement of the engine/UI split. If the adaptive frontier turns out to be a good algorithm, both the naive compute_lookahead() and the compute_deep_lookahead() paths might be deleted in the future. Both conceptually ought to be able to be replaced by the adaptive algorithm with custom schedulers.
-
-Recommended structure:
-
-- introduce an engine-side class such as `AdaptiveFrontierSearch`
-- keep `Solution` as the current puzzle-state holder
-- optionally expose a thin convenience method on `Solution` that constructs and runs `AdaptiveFrontierSearch`
-
-The existing `cmd_lookahead(...)` flow in `wordle.py` should become the natural entry point for invoking the new algorithm.
-
-## Existing UI structures that the design should reuse
-
-### Callback-based progress reporting
-
-The current deep-lookahead path already supports:
-
-- `progress_callback`
-- `status_callback`
-- periodic reporting via `report_interval`
-
-This is the correct integration seam.
-
-The adaptive frontier search should continue to report status through callbacks rather than printing directly.
-
-The engine should expose machine-readable snapshots.
-The UI layer should decide how to present them.
-
-### Existing command flow
-
-`cmd_lookahead(...)` in `wordle.py` already:
-
-- checks that entropy scores exist
-- chooses the candidate word source based on current mode
-- prompts for maximum depth
-- prints progress and results
-
-This command should be adapted rather than replaced.
-
-It should continue to:
-
-- gather user options
-- create progress/status callbacks
-- invoke the engine
-- format the final ranked results
-
-### Existing solve/scoring context
-
-The current code already distinguishes among:
-
-- all guesses
-- current word list
-- solved words
-
-The adaptive design's semantic policy should map cleanly onto existing concepts already present in the code:
-
-- `InputSet.ALL_GUESSES`
-- `InputSet.CURRENT_WORDLIST`
-
-and engine-side equivalents such as:
-
-- `ALL_GUESSES`
-- `SURVIVORS_ONLY`
-
-## Concrete adaptation requirements
-
-### 1. Add, do not replace
-
-The new algorithm should be added alongside the current scoring and lookahead code.
-
-The design should not assume a full rewrite of:
-
-- `Solution`
-- `ResponseCache`
-- command dispatch
-- progress reporting infrastructure
-
-### 2. Maintain callback-driven engine/UI separation
-
-The engine should expose:
-
-- search progress snapshots
-- candidate ranking updates
-- status summaries
-
-through callbacks or structured return values.
-
-The engine should not own terminal formatting, color, or display cadence decisions beyond report-interval triggering.
-
-### 3. Fit persistent caching into the engine subsystem
-
-The adaptive search introduces cache layers that are part of engine behavior, not user-facing command behavior.
-
-The new persistent subgroup-state cache should therefore be treated as an **engine-side persistence concern**.
-
-A clean model is:
-
-- engine defines subgroup-state cache semantics, keys, and stored values
-- engine owns the persistence adapter for SQLite subgroup-state storage
-- UI code remains unaware of low-level persistence details except for top-level configuration, if any
-
-This keeps cache management with the search subsystem that understands the meaning of the cached data.
-
-The existing pickle-based command-result caches in `wordle.py` are separate conveniences and should not be used as the model for adaptive-search persistence.
-
-### 4. Preserve current root-level workflow
-
-The existing workflow is:
-
-1. compute entropy scores
-2. select top words
-3. run lookahead
-
-The adaptive frontier search should preserve this workflow shape.
-
-It should still begin from the existing entropy solve and top-word selection process, because:
-
-- those scores already exist in the current framework
-- they determine the initial top-level activation candidates
-- they fit naturally with the current `cmd_lookahead(...)` experience
-
-### 5. Distinguish current command-result caches from subgroup-state caches
-
-The current pickle cache in `wordle.py` stores complete command-result tables keyed by file timestamps and score method.
-
-The adaptive design introduces a different kind of cache:
-
-- reusable subgroup-state summaries across problems
-
-These are distinct and should not be conflated.
-
-Therefore:
-
-- existing pickle caches may continue to exist for current score-table conveniences
-- the new SQLite cache serves a different purpose and should be documented separately
-- the design should make that distinction explicit
-
-## Expected implementation placement
-
-### Engine-side additions
-
-Expected new or expanded engine-side components include:
-
-- adaptive frontier search driver
-- runtime DAG state structures
-- state-node / candidate-record / child-edge logic
-- scheduler work-item logic
-- subgroup-state persistent-cache interface
-- integration hooks on `Solution`
-
-These belong in `wordle_engine.py` but could evolve into separate Python files if needed, as discussed above.
-
-### UI-side additions
-
-Expected UI-side changes include:
-
-- adapting `cmd_lookahead(...)` to invoke the adaptive frontier search path
-- presenting adaptive search progress snapshots periodically to keep the user informed
-- presenting final bounded results
-- configuring time budget, depth, and possibly exploration settings
-- managing the SQLite cache file location and lifecycle, if this remains a UI responsibility
-
-These belong in `wordle.py`.
-
-## Expected compatibility behavior
-
-The design should aim for compatibility with the current user workflow.
-
-A user who already understands the current flow should still be able to:
-
-- (optionally) run 1-step entropy solve
-- ask for multi-level lookahead
-- see progress
-- receive a ranked answer table
-
-The difference is that the deeper search implementation becomes adaptive and frontier-driven rather than sequentially deepening one candidate at a time.
-
-## Existing-code-informed constraints
-
-The following constraints arise directly from the structure of the current files.
-
-### Root candidate ranking may be reused, but must not be required
-
-The current `cmd_lookahead(...)` path depends on an existing entropy solve and uses `soln.scores[:count]`.
-
-The adaptive design should be able to **reuse** that existing root entropy information when it is present and compatible, because reusing prior work is a primary requirement.
-
-However, the adaptive search must not require a prior explicit `(s)olve` command.
-
-Root-level entropy scoring is an internal phase of the adaptive search and should be computed on demand when needed.
-
-### Response partition caching already exists
-
-Because `ResponseCache.group_words(...)` and `ResponseCache.group_counts(...)` already exist, the design should treat them as the first-line partitioning mechanism.
-
-This reduces implementation risk and aligns with the existing optimization strategy.
-
-### Progress reporting already has a machine/UI seam
-
-Because the deep lookahead path already uses `status_callback(info)` with structured dictionaries, the adaptive design should follow the same pattern for status snapshots.
-
-This keeps `wordle.py` in control of presentation while allowing richer adaptive-search instrumentation.
-
-### Full-result persistence already exists separately
-
-Because `wordle.py` already persists root score tables with pickle, the adaptive subgroup-state SQLite cache must be described and implemented as a separate cache layer with a different purpose.
-
-## Recommended adaptation to the design vocabulary
-
-Within this existing framework, the adaptive refinement frontier search should be framed as:
-
-- an engine-side search subsystem operating on a `Solution`
-- an engine-level replacement for the current deep recursive lookahead algorithm
-- invokable from the existing lookahead command path
-- built on top of existing `Solution` and `ResponseCache` infrastructure
-- integrated with the current callback/reporting structure
-- capable of reusing root entropy work whether it was computed by a prior command or by the adaptive search itself
-
-That framing is more accurate than describing it as a standalone solver or as a UI-driven workflow.
-
-
-## Reuse requirements
-
-Efficient reuse is a primary design goal.
-
-### Reuse within a single active Wordle problem
-
-While solving one current puzzle, the implementation should reuse as much work as possible, including:
-
-- root-level entropy computations
-- local 1-step entropy solves on subgroup states
-- subgroup partitions obtained through `ResponseCache`
-- retained local rankings
-- interned DAG subgroup states
-- partial bounds and best-known guesses
-- scheduler-ready frontier information
-
-A prior root entropy solve and a later adaptive search should share compatible data rather than recomputing it.
-
-### Reuse across different Wordle problems
-
-Across separate puzzles, the implementation should persist reusable subgroup-state knowledge, including summary information such as:
-
-- subgroup-state bounds
-- best known guess
-- exact/partial status
-
-The design should also allow future persistence of reusable subgroup partition knowledge if that proves worthwhile.
-
-The implementation should avoid conflating:
-
-- per-problem live frontier state
-- reusable subgroup-state summaries
-- command-result convenience caches
-
-## Replacement of the current deep lookahead
-
-The current deep recursive lookahead path is superseded by the adaptive refinement frontier search.
-
-The existing `compute_deep_lookahead(...)` algorithm may be deleted or retired once the adaptive search is implemented and validated.
-
-The depth-2 path may remain temporarily during transition if useful, but the intended long-term direction is one adaptive multi-level engine rather than parallel deep-lookahead systems.
-
-## Engine-side subsystem structure
-
-The preferred engine structure is:
-
-- `Solution` as the owner of the current puzzle state
-- `AdaptiveFrontierSearch` as the engine-side search subsystem
-- a separate engine-side persistence adapter for subgroup-state SQLite storage
-
-This means:
-
-- `Solution` should not absorb all scheduler, DAG, and persistence machinery directly
-- `AdaptiveFrontierSearch` should own runtime DAG state, scheduler logic, and refinement workflow
-- persistence should be separated from both UI code and the scheduler core
-
-## Persistence placement
-
-Low-level cache file management for adaptive-search persistence belongs with the persistence adapter in the engine subsystem, not in `wordle.py`.
-
-Reasoning:
-
-- the user-facing layer should not need to understand subgroup-state cache semantics
-- cache keys and values are defined by engine concepts
-- the persistence adapter is part of the search subsystem's infrastructure
-- keeping this logic out of `wordle.py` preserves the UI/engine separation
-
-`wordle.py` may still provide high-level configuration knobs if needed, but should not own the operational details of subgroup-state cache storage.
-
-## Scheduler implementation note
-
-Scheduler priority entries may become stale as bounds tighten and states are refined.
-
-Therefore the design should explicitly allow:
-
-- lazy invalidation
-- dirty flags
-- recomputation or validation when entries are popped from the heap
-
-The scheduler should not assume that all stored priorities remain exact over time.
-
-## Incremental implementation plan
-
-Implementation should proceed incrementally rather than in one large rewrite.
-
-A recommended sequence is:
-
-1. introduce the engine-side `AdaptiveFrontierSearch` class with no UI disruption
-2. make root entropy scoring an internal phase of adaptive search, while reusing existing compatible entropy results when present
-3. replace the current deep-lookahead command path with the new engine-side search
-4. preserve existing callback-based reporting and adapt it to richer adaptive-search snapshots
-5. add the persistent subgroup-state SQLite adapter
-6. add retained local rankings and scheduler acceleration structures
-7. tune exploration, pruning, and optional runtime memory controls after behavior is validated
-
-This sequence reduces risk and makes it easier to test correctness and performance step by step.
+`ProgressTracker` prints a width-aware progress indicator during long
+computations:
+- One `.` per percentage point completed.
+- `25%` / `50%` / `75%` / `100%` milestone labels.
+- An ETA label (e.g. `1m30s`) every 10 seconds.
+- Lines wrap at `DISPLAY_WIDTH - 6` columns. Before each wrap, the current
+  line is padded to the margin with dots so all rows are the same width.
