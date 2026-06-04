@@ -37,7 +37,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b20"
+BUILD = "b21"
 
 
 # ---------------------------------------------------------------------------
@@ -1255,10 +1255,12 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
     """Compare 2–4 words side by side."""
     n = len(soln.current_words)
 
-    all_stats = [
-        _multistep_stats(w, soln, step2_pool, hard_mode, all_guesses)
-        for w in words
-    ]
+    print(f'\n  Computing {", ".join(w.upper() for w in words)}...', flush=True)
+    all_stats = []
+    for i, w in enumerate(words):
+        if len(words) > 1:
+            print(f'  [{i + 1}/{len(words)}] {w.upper()}', flush=True)
+        all_stats.append(_multistep_stats(w, soln, step2_pool, hard_mode, all_guesses))
 
     lw = 9  # "Entropy 1" = 9, "10-49:" = 6
 
@@ -1341,13 +1343,13 @@ def cmd_test(gs, inline=''):
     elif iset == InputSet.CURRENT_WORDLIST:
         step2_pool = None
         hard_mode  = False
-    else:  # ALL_GUESSES
+    else:  # ALL_GUESSES — cap at 200 top-entropy words; searching all 12k is ~65x slower
         hard_mode  = False
         if (soln.scores_updated
                 and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
-            step2_pool = [w for w, _ in soln.scores]
+            step2_pool = [w for w, _ in soln.scores[:200]]
         else:
-            step2_pool = gs.all_guesses
+            step2_pool = soln.all_answers
 
     words = line.lower().split()
     try:
@@ -1419,7 +1421,7 @@ def cmd_test(gs, inline=''):
             st = _multistep_stats(word, soln, step2_pool, hard_mode,
                                   gs.all_guesses)
             mode = ('hard mode' if hard_mode
-                    else ('full' if step2_pool else 'answers only'))
+                    else (f'top {len(step2_pool)}' if step2_pool else 'answers only'))
             print(f'\n  Multi-step lookahead ({mode}):')
             print(f'    Entropy 1:  {st["step1"]:.4f}')
             print(f'    + ent. 2:   {st["step2"]:.4f}')
