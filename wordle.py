@@ -37,7 +37,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b22"
+BUILD = "b23"
 
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1028,8 @@ def cmd_lookahead(gs):
             progress_callback=tracker.update,
         )
         tracker.finish()
+        if is_full:
+            save_cache(soln.scores, "weights", gs.n_guesses, "entropy_gain")
 
     top_n = soln.scores[:count]
 
