@@ -37,7 +37,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b17"
+BUILD = "b18"
 
 
 # ---------------------------------------------------------------------------
@@ -1192,7 +1192,6 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
 
     step2 = 0.0
     step3 = 0.0
-    max_grp2 = 0
 
     for pat, subgroup in s1_groups.items():
         k = len(subgroup)
@@ -1228,8 +1227,6 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         step2 += (k / n) * best2_ent
 
         if best2_grps:
-            local_max2 = max(len(g) for g in best2_grps.values())
-            max_grp2 = max(max_grp2, local_max2)
             for sub_sub in best2_grps.values():
                 kk = len(sub_sub)
                 if kk <= 1:
@@ -1247,7 +1244,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
 
     return {
         'step1': step1, 'step2': step2, 'step3': step3,
-        'max_grp': max_grp, 'max_grp2': max_grp2,
+        'max_grp': max_grp,
         'wt_avg': wt_avg, 'prob_finish': prob_fin,
         'buckets': buckets,
     }
@@ -1257,8 +1254,6 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
                    all_guesses=None):
     """Compare 2–4 words side by side."""
     n = len(soln.current_words)
-    header = '  vs  '.join(w.upper() for w in words)
-    print(f'\n  {header}  ({n:,} words)')
 
     all_stats = [
         _multistep_stats(w, soln, step2_pool, hard_mode, all_guesses)
@@ -1266,7 +1261,7 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
     ]
 
     cw = max(6, max(len(w) for w in words))
-    lw = 7  # "Entropy" = 7, "10-49:" = 6
+    lw = 9  # "Entropy 1" = 9, "10-49:" = 6
 
     def print_row(label, values, fmt, higher_better=True):
         formatted = [fmt.format(v) for v in values]
@@ -1284,22 +1279,21 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
                 print(p, end='')
         print()
 
-    # Header row
+    # Header: word count, then word names aligned with data columns
+    print(f'\n  {n:,} words:')
     print(f'  {"":>{lw}} ' +
           '  '.join(w.upper().rjust(cw) for w in words))
 
     # Single-step metrics
-    print_row('Wt avg',  [s['wt_avg']    for s in all_stats], '{:.2f}', False)
-    print_row('Max G1',  [s['max_grp']   for s in all_stats], '{:d}',   False)
-    if n > 2:
-        print_row('Max G2', [s['max_grp2'] for s in all_stats], '{:d}', False)
-    print_row('Solve%',  [s['prob_finish'] for s in all_stats], '{:.1%}')
+    print_row('Wt avg',    [s['wt_avg']     for s in all_stats], '{:.2f}', False)
+    print_row('Max grp',   [s['max_grp']    for s in all_stats], '{:d}',   False)
+    print_row('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}')
 
     # Multi-step entropy (chain rule decomposition)
-    print_row('Entropy', [s['step1'] for s in all_stats], '{:.4f}')
+    print_row('Entropy 1', [s['step1'] for s in all_stats], '{:.4f}')
     if n > 2:
-        print_row('+H2',     [s['step2'] for s in all_stats], '{:.4f}')
-        print_row('+H3',     [s['step3'] for s in all_stats], '{:.4f}')
+        print_row('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}')
+        print_row('+ ent. 3', [s['step3'] for s in all_stats], '{:.4f}')
 
     # Bucket distribution
     print()
@@ -1412,11 +1406,11 @@ def cmd_test(gs, inline=''):
             mode = ('hard mode' if hard_mode
                     else ('full' if step2_pool else 'answers only'))
             print(f'\n  Multi-step lookahead ({mode}):')
-            print(f'    Entropy:  {st["step1"]:.4f}')
-            print(f'    +H2:      {st["step2"]:.4f}')
-            print(f'    +H3:      {st["step3"]:.4f}')
+            print(f'    Entropy 1:  {st["step1"]:.4f}')
+            print(f'    + ent. 2:   {st["step2"]:.4f}')
+            print(f'    + ent. 3:   {st["step3"]:.4f}')
             total = st["step1"] + st["step2"] + st["step3"]
-            print(f'    Total H:  {total:.4f}')
+            print(f'    Total:      {total:.4f}')
 
         # Group size distribution
         sorted_groups = sorted(groups.items(), key=lambda x: -x[1])
