@@ -27,6 +27,7 @@ from wordle_engine import (
     calculate_group_counts, score_groups,
     decode_response, max_entropy,
     answer_to_restriction,
+    min_expected_guesses,
 )
 
 # ---------------------------------------------------------------------------
@@ -1244,11 +1245,43 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     for m in _step1_methods:
         soln._persist_scores(m)
 
+    # ERD: exact expected guesses, answers-only candidates.
+    # Only computed mid-game (option C); root (full game) is too expensive
+    # for an interactive command and is left as None.
+    erd = None
+    if not soln._is_full_game():
+        erd_t0 = time.time()
+        erd_announced = False
+        deadline = erd_t0 + 30
+        erd_cost = 1.0
+        erd_ok = True
+        for subgroup in s1_groups.values():
+            k = len(subgroup)
+            if k == 0:
+                continue
+            if k == 1 and subgroup[0] == word:
+                continue  # all-green branch: already solved, 0 more guesses
+            if not erd_announced and time.time() - erd_t0 > 5:
+                print('  Computing ERD...', end='', flush=True)
+                erd_announced = True
+            sub_erd = min_expected_guesses(
+                subgroup, cache, soln.score_cache, deadline
+            )
+            if sub_erd is None:
+                erd_ok = False
+                break
+            erd_cost += (k / n) * sub_erd
+        if erd_announced:
+            print()
+        if erd_ok:
+            erd = erd_cost
+
     return {
         'step1': step1, 'step2': step2, 'step3': step3,
         'max_grp': max_grp,
         'wt_avg': wt_avg, 'prob_finish': prob_fin,
         'buckets': buckets,
+        'erd': erd,
     }
 
 
@@ -1289,23 +1322,34 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
         if any(vals):
             bucket_rows.append((lbl, vals, '{:d}', hb))
 
+    erd_vals = [s.get('erd') for s in all_stats]
+    if any(v is not None for v in erd_vals):
+        data_rows.append(('ERD', erd_vals, '{:.3f}', False))
+
     # Column width: wide enough for word names AND every formatted value.
     # Using a consistent format per row means right-justifying to cw
     # automatically aligns decimal points within each row.
     cw = max(len(w) for w in words)
     for _, values, fmt, _ in data_rows + bucket_rows:
         for v in values:
-            cw = max(cw, len(fmt.format(v)))
+            if v is not None:
+                cw = max(cw, len(fmt.format(v)))
 
     def print_row(label, values, fmt, higher_better=True):
-        padded = [fmt.format(v).rjust(cw) for v in values]
-        best = max(values) if higher_better else min(values)
-        all_tied = all(v == best for v in values)
+        padded = [('—'.rjust(cw) if v is None else fmt.format(v).rjust(cw))
+                  for v in values]
+        valid = [v for v in values if v is not None]
+        if len(valid) < 2 or all(v == valid[0] for v in valid):
+            all_tied = True
+            best = None
+        else:
+            best = max(valid) if higher_better else min(valid)
+            all_tied = False
         print(f'  {label:<{lw}} ', end='')
         for i, (p, v) in enumerate(zip(padded, values)):
             if i:
                 print('  ', end='')
-            if not all_tied and v == best:
+            if not all_tied and v is not None and v == best:
                 with colored_text('green'):
                     print(p, end='')
             else:
@@ -1436,6 +1480,8 @@ def cmd_test(gs, inline=''):
             _vw = max(len(f'{v:.4f}') for _, v in _rows)
             for lbl, val in _rows:
                 print(f'    {lbl:<{_lw}}  {val:>{_vw}.4f}')
+            if st.get('erd') is not None:
+                print(f'    ERD:{"":{_lw - 3}}  {st["erd"]:>{_vw}.3f} exp guesses')
 
         # Group size distribution
         sorted_groups = sorted(groups.items(), key=lambda x: -x[1])

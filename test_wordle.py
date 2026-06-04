@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
     calculate_response, score_groups, calculate_group_counts,
+    min_expected_guesses,
 )
 from cache_sqlite import ScoreCache
 from wordle import _multistep_stats
@@ -360,6 +362,59 @@ class TestTransparentPersistence(unittest.TestCase):
                 v2 = s2.word_scores[w][m]
                 self.assertAlmostEqual(v1, v2, places=10,
                                        msg=f"{m} score mismatch for {w}")
+
+
+# ---------------------------------------------------------------------------
+# min_expected_guesses
+# ---------------------------------------------------------------------------
+
+class TestMinExpectedGuesses(unittest.TestCase):
+
+    def setUp(self):
+        self.cache = ResponseCache(ANSWERS)
+
+    def test_singleton_returns_one(self):
+        for w in ANSWERS:
+            self.assertEqual(min_expected_guesses([w], self.cache, None), 1.0,
+                             msg=f"singleton {w}")
+
+    def test_any_pair_returns_one_point_five(self):
+        for i in range(len(ANSWERS)):
+            for j in range(i + 1, len(ANSWERS)):
+                pair = [ANSWERS[i], ANSWERS[j]]
+                self.assertAlmostEqual(
+                    min_expected_guesses(pair, self.cache, None), 1.5, places=10,
+                    msg=f"pair {pair}")
+
+    def test_result_written_to_sqlite(self):
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            subset = ANSWERS[:4]
+            result = min_expected_guesses(subset, self.cache, sc)
+            self.assertIsNotNone(result)
+            hit = sc.read(ScoreCache.encode_subset(subset), 'erd')
+            self.assertIsNotNone(hit)
+            self.assertAlmostEqual(hit[1], result, places=10)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_expired_deadline_returns_none(self):
+        already_past = time.time() - 1
+        result = min_expected_guesses(ANSWERS, self.cache, None,
+                                      deadline=already_past)
+        self.assertIsNone(result)
+
+    def test_result_is_at_least_one(self):
+        result = min_expected_guesses(ANSWERS[:5], self.cache, None)
+        self.assertIsNotNone(result)
+        self.assertGreaterEqual(result, 1.0)
+
+    def test_larger_set_costs_more_than_smaller(self):
+        cost3 = min_expected_guesses(ANSWERS[:3], self.cache, None)
+        cost5 = min_expected_guesses(ANSWERS[:5], self.cache, None)
+        self.assertLess(cost3, cost5)
 
 
 # ---------------------------------------------------------------------------
