@@ -393,6 +393,7 @@ class Solution:
         self._answer_set = None
         self.guesses = []
         self.word_scores = {}        # {word: {ScoringMethod: score}}
+        self._db_loaded_methods = set()
         self.scores = []             # last sorted (word, score) list
         self.scores_method = None
         self.scores_updated = False
@@ -401,9 +402,34 @@ class Solution:
 
     def _invalidate_scores(self):
         self.word_scores = {}
+        self._db_loaded_methods = set()
         self.scores = []
         self.scores_method = None
         self.scores_updated = False
+
+    def _is_full_game(self):
+        return len(self.current_words) == len(self.all_answers)
+
+    def _ensure_scores_loaded(self, method):
+        """Transparently load full-game scores from SQLite into word_scores."""
+        if not self.lookahead_cache or not self._is_full_game():
+            return
+        if method in self._db_loaded_methods:
+            return
+        self._db_loaded_methods.add(method)
+        cached = self.lookahead_cache.read_scores(method.name.lower())
+        if cached:
+            for w, s in cached:
+                self.word_scores.setdefault(w, {})[method] = s
+
+    def _persist_scores(self, method):
+        """Transparently write full-game scores from word_scores to SQLite."""
+        if not self.lookahead_cache or not self._is_full_game():
+            return
+        scores = [(w, s[method]) for w, s in self.word_scores.items()
+                  if method in s]
+        if scores:
+            self.lookahead_cache.write_scores(scores, method.name.lower())
 
     @property
     def answer_set(self):
@@ -516,8 +542,10 @@ class Solution:
         Score every word in input_wordlist against current_words.
 
         Uses per-word cache (word_scores) to skip words already scored
-        under this method. Returns a sorted list of (word, score) tuples.
+        under this method. Transparently loads from and saves to SQLite
+        for full-game state. Returns a sorted list of (word, score) tuples.
         """
+        self._ensure_scores_loaded(method)
         results = []
         for word in input_wordlist:
             cached = self.word_scores.get(word)
@@ -539,6 +567,7 @@ class Solution:
         self.scores = results
         self.scores_method = method
         self.scores_updated = True
+        self._persist_scores(method)
         return results
 
     def compute_scores_multi(self, input_wordlist, methods,
@@ -546,9 +575,12 @@ class Solution:
         """
         Score every word under multiple methods in a single pass.
         Computes group counts once per word for any missing methods.
+        Transparently loads from and saves to SQLite for full-game state.
         Returns a list of (word, {method: score}) tuples,
         sorted by the first method in the list.
         """
+        for method in methods:
+            self._ensure_scores_loaded(method)
         results = []
         for word in input_wordlist:
             cached = self.word_scores.get(word, {})
@@ -571,6 +603,8 @@ class Solution:
         results.sort(key=lambda x: primary.sort_key()(
             (x[0], x[1][primary])
         ))
+        for method in methods:
+            self._persist_scores(method)
         return results
 
     def compute_lookahead(self, top_words,

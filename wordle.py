@@ -20,7 +20,7 @@ except ImportError:
     console = None
 
 import wordle_engine
-from adaptive_cache_sqlite import LookaheadCache
+from cache_sqlite import ScoreCache
 from wordle_engine import (
     Solution, ScoringMethod, InputSet, ResponseCache,
     load_word_list, calculate_response,
@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b24"
+BUILD = "b25"
 
 
 # ---------------------------------------------------------------------------
@@ -542,12 +542,12 @@ class GameState:
         self.n_answers = len(all_answers)
         self.n_guesses = len(all_guesses)
         self.cache = ResponseCache(all_answers)
-        self.lookahead_cache_path = os.path.abspath("lookahead_cache.sqlite3")
-        self.lookahead_cache = LookaheadCache(
+        self.lookahead_cache_path = os.path.abspath("wordle_cache.sqlite3")
+        self.lookahead_cache = ScoreCache(
             self.lookahead_cache_path,
             all_answers,
         )
-        print(f"Lookahead cache: {self.lookahead_cache_path}")
+        print(f"Score cache: {self.lookahead_cache_path}")
         self.solutions = [Solution(all_answers,
                                    all_guesses,
                                    self.cache,
@@ -757,32 +757,18 @@ def cmd_solve(gs):
         print_error("Invalid choice.")
         return
 
-    is_full = (len(soln.current_words) == gs.n_answers
-               and iset == InputSet.ALL_GUESSES)
-    mname = method.name.lower()
-
-    if is_full:
-        cached = gs.lookahead_cache.read_scores(mname)
-        if cached:
-            results = sorted(cached, key=method.sort_key())
-            soln.scores = results
-            soln.scores_method = method
-            soln.scores_updated = True
-            for word, score in cached:
-                soln.word_scores.setdefault(word, {})[method] = score
-            print(f"\nCached ({gs.n_guesses} words, "
-                  f"{method.label}).")
-            if method == ScoringMethod.ENTROPY_GAIN:
-                print(f"(= = max entropy "
-                      f"{_display_max_ent:.4f})")
-            print("Best guesses:")
-            print_scored_list(soln.scores, method)
-            return
+    # Fast path: already computed this session
+    if soln.scores_updated and soln.scores_method == method:
+        print(f"\n{method.label} (cached):")
+        if method == ScoringMethod.ENTROPY_GAIN:
+            print(f"(= = max entropy {_display_max_ent:.4f})")
+        print("Best guesses:")
+        print_scored_list(soln.scores, method)
+        return
 
     n_in = len(wordlist)
     n_rem = len(soln.current_words)
-    print(f"\nScoring {n_in:,} guesses vs "
-          f"{n_rem:,} words.")
+    print(f"\nScoring {n_in:,} guesses vs {n_rem:,} words.")
     print(f"Method: {method.label}")
 
     tracker = ProgressTracker(n_in)
@@ -791,13 +777,9 @@ def cmd_solve(gs):
     )
     tracker.finish()
 
-    if is_full:
-        gs.lookahead_cache.write_scores(results, mname)
-
     print(f"\n{method.label}:")
     if method == ScoringMethod.ENTROPY_GAIN:
-        print(f"(= = max entropy "
-              f"{_display_max_ent:.4f})")
+        print(f"(= = max entropy {_display_max_ent:.4f})")
     print("Best guesses:")
     print_scored_list(results, method)
 
@@ -974,23 +956,7 @@ def cmd_lookahead(gs):
     else:
         count = LOOKAHEAD_N
 
-    # Try loading full-game entropy ranking from disk cache
-    is_full = (len(soln.current_words) == gs.n_answers
-               and gs.input_set != InputSet.CURRENT_WORDLIST)
-    if is_full and (not soln.scores_updated
-                    or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
-        cached = gs.lookahead_cache.read_scores("entropy_gain")
-        if cached:
-            soln.scores = sorted(cached,
-                                 key=ScoringMethod.ENTROPY_GAIN.sort_key())
-            soln.scores_method = ScoringMethod.ENTROPY_GAIN
-            soln.scores_updated = True
-            for word, score in cached:
-                soln.word_scores.setdefault(
-                    word, {})[ScoringMethod.ENTROPY_GAIN] = score
-            print(f"  (entropy loaded from cache, {gs.n_guesses} words)")
-
-    # Auto-compute entropy ranking if not already done
+    # Compute entropy ranking if needed (transparently loads/saves SQLite)
     if (not soln.scores_updated
             or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
         print("Computing entropy ranking for lookahead...")
@@ -1004,8 +970,6 @@ def cmd_lookahead(gs):
             progress_callback=tracker.update,
         )
         tracker.finish()
-        if is_full:
-            gs.lookahead_cache.write_scores(soln.scores, "entropy_gain")
 
     top_n = soln.scores[:count]
 
@@ -1040,7 +1004,7 @@ def cmd_lookahead(gs):
             if cnt <= 2:
                 continue
             if soln.lookahead_cache:
-                blob = LookaheadCache.encode_subset(subgroup)
+                blob = ScoreCache.encode_subset(subgroup)
                 if soln.lookahead_cache.read(blob, policy) is not None:
                     continue
             total_work += (len(second_step_words)
@@ -1168,6 +1132,17 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         elif k <= 49: buckets[3] += 1
         else:         buckets[4] += 1
 
+    # Write level-1 scores into the in-memory per-word cache
+    soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
+    soln.word_scores[word][ScoringMethod.MINIMAX]     = float(max_grp)
+    soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
+    soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
+
+    # For step-2 SQLite caching, hard mode can't be keyed by subgroup blob alone
+    # because cands2 depends on the specific (word, pattern) constraint set.
+    lc = soln.lookahead_cache
+    policy = None if hard_mode else ('full' if step2_pool is not None else 'hard')
+
     step2 = 0.0
     step3 = 0.0
 
@@ -1187,29 +1162,49 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         else:
             cands2 = subgroup
 
-        # Announce progress only if we've been computing more than 5 seconds
-        if not _prog['on'] and time.time() - t0 > 5:
-            suffix = '2, 3' if _prog['step3'] else '2'
-            print(f'  Computing entropy...{suffix}', end='', flush=True)
-            _prog['on'] = True
+        # Check SQLite subgroup cache (shares entries with compute_lookahead)
+        blob = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
+        cache_hit = lc.read(blob, policy) if blob else None
 
-        best2_ent = 0.0
-        best2_grps = None
-        for c2 in cands2:
+        if cache_hit is not None:
+            best2_word, best2_ent = cache_hit
+            # One group computation to get sub-subgroups for step 3
             if cache:
-                sg = cache.group_words(c2, subgroup)
+                best2_grps = cache.group_words(best2_word, subgroup)
             else:
-                sg = defaultdict(list)
+                best2_grps = defaultdict(list)
                 for ans in subgroup:
-                    p2 = tuple(calculate_response(c2, ans))
-                    sg[p2].append(ans)
-            ent = score_groups(
-                {p: len(g) for p, g in sg.items()},
-                ScoringMethod.ENTROPY_GAIN,
-            )
-            if ent > best2_ent:
-                best2_ent = ent
-                best2_grps = sg
+                    p2 = tuple(calculate_response(best2_word, ans))
+                    best2_grps[p2].append(ans)
+        else:
+            # Announce progress only if we've been computing more than 5 seconds
+            if not _prog['on'] and time.time() - t0 > 5:
+                suffix = '2, 3' if _prog['step3'] else '2'
+                print(f'  Computing entropy...{suffix}', end='', flush=True)
+                _prog['on'] = True
+
+            best2_ent = 0.0
+            best2_word = None
+            best2_grps = None
+            for c2 in cands2:
+                if cache:
+                    sg = cache.group_words(c2, subgroup)
+                else:
+                    sg = defaultdict(list)
+                    for ans in subgroup:
+                        p2 = tuple(calculate_response(c2, ans))
+                        sg[p2].append(ans)
+                ent = score_groups(
+                    {p: len(g) for p, g in sg.items()},
+                    ScoringMethod.ENTROPY_GAIN,
+                )
+                if ent > best2_ent:
+                    best2_ent = ent
+                    best2_word = c2
+                    best2_grps = sg
+
+            if blob and best2_word:
+                lc.write(blob, policy, best2_word, best2_ent)
 
         step2 += (k / n) * best2_ent
 
@@ -1632,15 +1627,16 @@ def cmd_hardmode(gs):
 
 def cmd_cacheinfo(gs):
     lc = gs.lookahead_cache
-    rows, mtime = lc.stats()
+    la_rows, ws_rows, mtime = lc.stats()
     if mtime:
         ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
     else:
         ts = "n/a"
-    print("\nLookahead cache:")
-    print(f"  db path:    {gs.lookahead_cache_path}")
-    print(f"  entries:    {rows:,}")
-    print(f"  last write: {ts}")
+    print("\nScore cache:")
+    print(f"  db path:       {gs.lookahead_cache_path}")
+    print(f"  subgroup rows: {la_rows:,}")
+    print(f"  word scores:   {ws_rows:,}")
+    print(f"  last write:    {ts}")
 
 
 # ---------------------------------------------------------------------------
