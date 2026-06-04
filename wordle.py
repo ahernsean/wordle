@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b12"
+BUILD = "b13"
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,7 @@ ANSI_COLORS = {
     "yellow": "\033[33m",
 }
 ANSI_RESET = "\033[0m"
+ANSI_BOLD  = "\033[1m" if SUPPORTS_COLOR else ""
 
 if console is not None:
     console.set_color()
@@ -1239,17 +1240,91 @@ def _explain_conflict(pos, guess_word, recorded, hypothetical):
     return f"{letter}: expected {rec}, got {hyp}"
 
 
-def cmd_test(gs):
+def _word_stats(word, soln):
+    """Return (entropy, max_grp, buckets, step1, step2, combined) for word."""
+    if soln.cache:
+        groups = soln.cache.group_counts(word, soln.current_words)
+    else:
+        groups = calculate_group_counts(word, soln.current_words)
+    entropy = score_groups(groups, ScoringMethod.ENTROPY_GAIN)
+    max_grp = int(score_groups(groups, ScoringMethod.MINIMAX))
+    buckets = [0, 0, 0, 0, 0]
+    for cnt in groups.values():
+        if cnt == 1: buckets[0] += 1
+        elif cnt <= 4: buckets[1] += 1
+        elif cnt <= 9: buckets[2] += 1
+        elif cnt <= 49: buckets[3] += 1
+        else: buckets[4] += 1
+    if len(soln.current_words) > 2:
+        la = soln.compute_lookahead([(word, entropy)])
+        if la:
+            _, s1, s2, combined = la[0]
+            return entropy, max_grp, buckets, s1, s2, combined
+    return entropy, max_grp, buckets, entropy, 0.0, entropy
+
+
+def _compare_words(word1, word2, soln):
+    n = len(soln.current_words)
+    print(f'\n  {word1.upper()} vs {word2.upper()}  ({n:,} words)')
+
+    stats1 = _word_stats(word1, soln)
+    stats2 = _word_stats(word2, soln)
+
+    e1, mg1, b1, s1_1, s2_1, c1 = stats1
+    e2, mg2, b2, s1_2, s2_2, c2 = stats2
+
+    cw = max(6, len(word1), len(word2))
+    lw = 8  # "Combined" is the longest label
+
+    def bold(s):
+        return f'{ANSI_BOLD}{s}{ANSI_RESET}' if ANSI_BOLD else s
+
+    def row(label, v1, v2, fmt, higher_better=True):
+        s1 = fmt.format(v1)
+        s2 = fmt.format(v2)
+        s1p = s1.rjust(cw)
+        s2p = s2.rjust(cw)
+        if v1 != v2:
+            if (v1 > v2) == higher_better:
+                s1p = bold(s1p)
+            else:
+                s2p = bold(s2p)
+        return f'  {label:<{lw}} {s1p}  {s2p}'
+
+    print(f'  {"":>{lw}} {word1.upper():>{cw}}  {word2.upper():>{cw}}')
+    print(row('Entropy', e1, e2, '{:.4f}'))
+    print(row('Max grp', mg1, mg2, '{:d}', higher_better=False))
+    if n > 2:
+        print(row('Combined', c1, c2, '{:.4f}'))
+    print()
+    bucket_labels = ['1:', '2-4:', '5-9:', '10-49:', '50+:']
+    bucket_higher = [True, False, False, False, False]
+    for lbl, v1, v2, hb in zip(bucket_labels, b1, b2, bucket_higher):
+        if v1 or v2:
+            print(row(lbl, v1, v2, '{:d}', higher_better=hb))
+
+
+def cmd_test(gs, inline=''):
     result = pick_one(gs, "Test. ")
     if result is None:
         return
     _, soln = result
 
     set_display_context(soln)
-    print("Word to test? ", end="")
+    if inline:
+        line = inline
+    else:
+        print("Word(s) to test? ", end="")
+        line = input().strip()
+
+    words = line.lower().split()
     try:
-        word = input().strip().lower()
-        assert len(word) == 5
+        if len(words) == 2:
+            assert len(words[0]) == 5 and len(words[1]) == 5
+            _compare_words(words[0], words[1], soln)
+            return
+        assert len(words) == 1 and len(words[0]) == 5
+        word = words[0]
 
         # Show pattern if answer is set
         if soln.answer_word:
@@ -1669,7 +1744,11 @@ def main():
         handler = COMMANDS.get(cmd[0])
         if handler:
             try:
-                handler(gs)
+                inline = cmd[1:].strip()
+                if inline and handler is cmd_test:
+                    cmd_test(gs, inline)
+                else:
+                    handler(gs)
             except Exception as e:
                 print_error(f"Error: {e}")
                 raise
