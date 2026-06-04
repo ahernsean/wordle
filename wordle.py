@@ -1004,8 +1004,8 @@ def cmd_lookahead(gs):
             if cnt <= 2:
                 continue
             if soln.score_cache:
-                blob = ScoreCache.encode_subset(subgroup)
-                if soln.score_cache.read(blob, policy) is not None:
+                subset_key = ScoreCache.encode_subset(subgroup)
+                if soln.score_cache.read(subset_key, policy) is not None:
                     continue
             total_work += (len(second_step_words)
                            if second_step_words else cnt)
@@ -1148,7 +1148,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         elif k <= 49: buckets[3] += 1
         else:         buckets[4] += 1
 
-    # For step-2 SQLite caching, hard mode can't be keyed by subgroup blob alone
+    # For step-2 SQLite caching, hard mode can't be keyed by subgroup key alone
     # because cands2 depends on the specific (word, pattern) constraint set.
     lc = soln.score_cache
     policy = None if hard_mode else ('full' if step2_pool is not None else 'hard')
@@ -1173,8 +1173,8 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
             cands2 = subgroup
 
         # Check SQLite subgroup cache (shares entries with compute_lookahead)
-        blob = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
-        cache_hit = lc.read(blob, policy) if blob else None
+        subset_key = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
+        cache_hit = lc.read(subset_key, policy) if subset_key else None
 
         if cache_hit is not None:
             best2_word, best2_ent = cache_hit
@@ -1213,8 +1213,8 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
                     best2_word = c2
                     best2_grps = sg
 
-            if blob and best2_word:
-                lc.write(blob, policy, best2_word, best2_ent)
+            if subset_key and best2_word:
+                lc.write(subset_key, policy, best2_word, best2_ent)
 
         step2 += (k / n) * best2_ent
 

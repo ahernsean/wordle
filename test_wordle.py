@@ -214,25 +214,25 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_subgroup_round_trip(self):
         sc = ScoreCache(self.db, ANSWERS)
-        blob = ScoreCache.encode_subset(["crane", "slate", "trace"])
-        sc.write(blob, "full", "heart", 2.5)
-        word, ent = sc.read(blob, "full")
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        word, ent = sc.read(subset_key, "full")
         self.assertEqual(word, "heart")
         self.assertAlmostEqual(ent, 2.5)
 
     def test_read_miss_returns_none(self):
         sc = ScoreCache(self.db, ANSWERS)
-        blob = ScoreCache.encode_subset(["crane", "slate"])
-        self.assertIsNone(sc.read(blob, "full"))
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        self.assertIsNone(sc.read(subset_key, "full"))
         self.assertIsNone(sc.read_scores("entropy_gain"))
 
     def test_policy_separation(self):
         sc = ScoreCache(self.db, ANSWERS)
-        blob = ScoreCache.encode_subset(["crane", "slate"])
-        sc.write(blob, "full", "heart", 2.5)
-        sc.write(blob, "hard", "earth", 1.8)
-        self.assertEqual(sc.read(blob, "full")[0], "heart")
-        self.assertEqual(sc.read(blob, "hard")[0], "earth")
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        sc.write(subset_key, "hard", "earth", 1.8)
+        self.assertEqual(sc.read(subset_key, "full")[0], "heart")
+        self.assertEqual(sc.read(subset_key, "hard")[0], "earth")
 
     def test_different_universe_no_cross_contamination(self):
         alt_answers = ["brain", "stove", "cloud"]
@@ -247,6 +247,48 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc.write_scores([("crane", 9.9)], "entropy_gain")
         result = dict(sc.read_scores("entropy_gain"))
         self.assertAlmostEqual(result["crane"], 9.9)
+
+    def test_encode_subset_is_compact(self):
+        # Key length = 5 * number of words, no separators
+        words = ["crane", "slate", "trace"]
+        key = ScoreCache.encode_subset(words)
+        self.assertEqual(len(key), 15)
+        self.assertNotIn(b"\x00", key)
+
+    def test_encode_subset_is_order_independent(self):
+        self.assertEqual(
+            ScoreCache.encode_subset(["slate", "crane"]),
+            ScoreCache.encode_subset(["crane", "slate"]),
+        )
+
+    def test_old_null_separated_entries_are_dropped(self):
+        # Simulate a row written with the old encoding (null-separated)
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lookahead_result (
+                subset_key BLOB NOT NULL, policy TEXT NOT NULL,
+                universe_id TEXT NOT NULL, best_word TEXT NOT NULL,
+                best_entropy REAL NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_key, policy, universe_id)
+            )
+        """)
+        old_key = b"crane\x00slate"
+        conn.execute(
+            "INSERT OR REPLACE INTO lookahead_result VALUES (?,?,?,?,?,?)",
+            (old_key, "full", "test_universe", "heart", 2.5, 0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening ScoreCache should delete the old-format row
+        ScoreCache(self.db, ANSWERS)
+        conn2 = _sqlite3.connect(self.db)
+        rows = conn2.execute(
+            "SELECT COUNT(*) FROM lookahead_result WHERE instr(subset_key, char(0)) > 0"
+        ).fetchone()[0]
+        conn2.close()
+        self.assertEqual(rows, 0)
 
 
 # ---------------------------------------------------------------------------

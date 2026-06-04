@@ -655,8 +655,8 @@ class Solution:
                 if cnt <= 2:
                     continue
                 if lc:
-                    blob = ScoreCache.encode_subset(subgroup)
-                    if lc.read(blob, policy) is not None:
+                    subset_key = ScoreCache.encode_subset(subgroup)
+                    if lc.read(subset_key, policy) is not None:
                         continue  # cache hit — no scan needed
                 work += (len(second_step_words)
                          if full_mode else len(subgroup))
@@ -683,14 +683,13 @@ class Solution:
                 # Check SQLite cache first
                 best = None
                 if lc:
-                    blob = ScoreCache.encode_subset(subgroup)
-                    hit = lc.read(blob, policy)
+                    subset_key = ScoreCache.encode_subset(subgroup)
+                    hit = lc.read(subset_key, policy)
                     if hit is not None:
                         _best_word, best = hit
 
                 if best is None:
-                    blob = (ScoreCache.encode_subset(subgroup)
-                            if lc else None)
+                    subset_key = ScoreCache.encode_subset(subgroup) if lc else None
                     candidates = (second_step_words
                                   if full_mode else subgroup)
                     best = 0.0
@@ -705,8 +704,8 @@ class Solution:
                         if s > best:
                             best = s
                             best_word = candidate
-                    if lc and best_word is not None and blob is not None:
-                        lc.write(blob, policy, best_word, best)
+                    if lc and best_word is not None and subset_key is not None:
+                        lc.write(subset_key, policy, best_word, best)
 
                 weighted_second += (cnt / n) * best
 
