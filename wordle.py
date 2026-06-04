@@ -37,7 +37,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b18"
+BUILD = "b19"
 
 
 # ---------------------------------------------------------------------------
@@ -1292,8 +1292,10 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
     # Multi-step entropy (chain rule decomposition)
     print_row('Entropy 1', [s['step1'] for s in all_stats], '{:.4f}')
     if n > 2:
-        print_row('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}')
-        print_row('+ ent. 3', [s['step3'] for s in all_stats], '{:.4f}')
+        print_row('+ ent. 2',  [s['step2'] for s in all_stats], '{:.4f}')
+        print_row('+ ent. 3',  [s['step3'] for s in all_stats], '{:.4f}')
+        totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
+        print_row('Total ent', totals, '{:.4f}')
 
     # Bucket distribution
     print()
