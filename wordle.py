@@ -27,6 +27,7 @@ from wordle_engine import (
     load_word_list, calculate_response,
     calculate_group_counts, score_groups,
     decode_response, max_entropy,
+    answer_to_restriction,
 )
 
 # ---------------------------------------------------------------------------
@@ -36,7 +37,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b16"
+BUILD = "b17"
 
 
 # ---------------------------------------------------------------------------
@@ -1149,12 +1150,18 @@ def _explain_conflict(pos, guess_word, recorded, hypothetical):
     return f"{letter}: expected {rec}, got {hyp}"
 
 
-def _multistep_stats(word, soln, second_step_words=None):
+def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
+                     all_guesses=None):
     """
     Compute 3-step expected entropy and group stats for a single word.
-    Returns (step1, step2, step3, max_grp, buckets).
-    second_step_words: candidate pool for step 2 (None = answers only, subgroup).
-    Step 3 always uses answers-only (subgroup) — sub-subgroups are tiny.
+    Returns a dict with keys: step1, step2, step3, max_grp, max_grp2,
+    wt_avg, prob_finish, buckets.
+
+    step2_pool: candidate pool for step 2. If None and not hard_mode,
+        uses only the subgroup (answers-only mode).
+    hard_mode: if True, compute valid step-2 candidates per subgroup
+        by applying the step-1 response constraints to all_guesses.
+    Step 3 always uses subgroup candidates — sub-subgroups are tiny.
     """
     cache = soln.cache
     remaining = soln.current_words
@@ -1168,11 +1175,12 @@ def _multistep_stats(word, soln, second_step_words=None):
             pat = tuple(calculate_response(word, answer))
             s1_groups[pat].append(answer)
 
-    step1 = score_groups(
-        {p: len(g) for p, g in s1_groups.items()},
-        ScoringMethod.ENTROPY_GAIN,
-    )
-    max_grp = max(len(g) for g in s1_groups.values())
+    group_counts = {p: len(g) for p, g in s1_groups.items()}
+    step1     = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
+    wt_avg    = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
+    max_grp   = int(score_groups(group_counts, ScoringMethod.MINIMAX))
+    prob_fin  = score_groups(group_counts, ScoringMethod.PROB_FINISH)
+
     buckets = [0, 0, 0, 0, 0]
     for g in s1_groups.values():
         k = len(g)
@@ -1184,13 +1192,21 @@ def _multistep_stats(word, soln, second_step_words=None):
 
     step2 = 0.0
     step3 = 0.0
+    max_grp2 = 0
 
-    for subgroup in s1_groups.values():
+    for pat, subgroup in s1_groups.items():
         k = len(subgroup)
         if k <= 1:
             continue
 
-        cands2 = second_step_words if second_step_words else subgroup
+        if hard_mode and all_guesses:
+            resp = decode_response(pat)
+            cands2 = answer_to_restriction(word, resp).apply(all_guesses)
+        elif step2_pool is not None:
+            cands2 = step2_pool
+        else:
+            cands2 = subgroup
+
         best2_ent = 0.0
         best2_grps = None
         for c2 in cands2:
@@ -1199,8 +1215,8 @@ def _multistep_stats(word, soln, second_step_words=None):
             else:
                 sg = defaultdict(list)
                 for ans in subgroup:
-                    pat = tuple(calculate_response(c2, ans))
-                    sg[pat].append(ans)
+                    p2 = tuple(calculate_response(c2, ans))
+                    sg[p2].append(ans)
             ent = score_groups(
                 {p: len(g) for p, g in sg.items()},
                 ScoringMethod.ENTROPY_GAIN,
@@ -1212,6 +1228,8 @@ def _multistep_stats(word, soln, second_step_words=None):
         step2 += (k / n) * best2_ent
 
         if best2_grps:
+            local_max2 = max(len(g) for g in best2_grps.values())
+            max_grp2 = max(max_grp2, local_max2)
             for sub_sub in best2_grps.values():
                 kk = len(sub_sub)
                 if kk <= 1:
@@ -1227,49 +1245,70 @@ def _multistep_stats(word, soln, second_step_words=None):
                         best3_ent = ent
                 step3 += (kk / n) * best3_ent
 
-    return step1, step2, step3, max_grp, buckets
+    return {
+        'step1': step1, 'step2': step2, 'step3': step3,
+        'max_grp': max_grp, 'max_grp2': max_grp2,
+        'wt_avg': wt_avg, 'prob_finish': prob_fin,
+        'buckets': buckets,
+    }
 
 
-def _compare_words(word1, word2, soln, second_step_words=None):
+def _compare_words(words, soln, step2_pool=None, hard_mode=False,
+                   all_guesses=None):
+    """Compare 2–4 words side by side."""
     n = len(soln.current_words)
-    print(f'\n  {word1.upper()} vs {word2.upper()}  ({n:,} words)')
+    header = '  vs  '.join(w.upper() for w in words)
+    print(f'\n  {header}  ({n:,} words)')
 
-    s1_1, s2_1, s3_1, mg1, b1 = _multistep_stats(word1, soln, second_step_words)
-    s1_2, s2_2, s3_2, mg2, b2 = _multistep_stats(word2, soln, second_step_words)
+    all_stats = [
+        _multistep_stats(w, soln, step2_pool, hard_mode, all_guesses)
+        for w in words
+    ]
 
-    cw = max(6, len(word1), len(word2))
-    lw = 7  # "Max grp" = 7, "10-49:" = 6, "Step 1" = 6
+    cw = max(6, max(len(w) for w in words))
+    lw = 7  # "Entropy" = 7, "10-49:" = 6
 
-    def print_row(label, v1, v2, fmt, higher_better=True):
-        s1 = fmt.format(v1)
-        s2 = fmt.format(v2)
-        s1p = s1.rjust(cw)
-        s2p = s2.rjust(cw)
+    def print_row(label, values, fmt, higher_better=True):
+        formatted = [fmt.format(v) for v in values]
+        padded    = [s.rjust(cw) for s in formatted]
+        best = max(values) if higher_better else min(values)
+        all_tied = all(v == best for v in values)
         print(f'  {label:<{lw}} ', end='')
-        if v1 != v2:
-            if (v1 > v2) == higher_better:
+        for i, (p, v) in enumerate(zip(padded, values)):
+            if i:
+                print('  ', end='')
+            if not all_tied and v == best:
                 with colored_text('green'):
-                    print(s1p, end='')
-                print(f'  {s2p}')
+                    print(p, end='')
             else:
-                print(f'{s1p}  ', end='')
-                with colored_text('green'):
-                    print(s2p)
-        else:
-            print(f'{s1p}  {s2p}')
+                print(p, end='')
+        print()
 
-    print(f'  {"":>{lw}} {word1.upper():>{cw}}  {word2.upper():>{cw}}')
-    print_row('Max grp', mg1, mg2, '{:d}', higher_better=False)
-    print_row('Step 1', s1_1, s1_2, '{:.4f}')
+    # Header row
+    print(f'  {"":>{lw}} ' +
+          '  '.join(w.upper().rjust(cw) for w in words))
+
+    # Single-step metrics
+    print_row('Wt avg',  [s['wt_avg']    for s in all_stats], '{:.2f}', False)
+    print_row('Max G1',  [s['max_grp']   for s in all_stats], '{:d}',   False)
     if n > 2:
-        print_row('Step 2', s2_1, s2_2, '{:.4f}')
-        print_row('Step 3', s3_1, s3_2, '{:.4f}')
+        print_row('Max G2', [s['max_grp2'] for s in all_stats], '{:d}', False)
+    print_row('Solve%',  [s['prob_finish'] for s in all_stats], '{:.1%}')
+
+    # Multi-step entropy (chain rule decomposition)
+    print_row('Entropy', [s['step1'] for s in all_stats], '{:.4f}')
+    if n > 2:
+        print_row('+H2',     [s['step2'] for s in all_stats], '{:.4f}')
+        print_row('+H3',     [s['step3'] for s in all_stats], '{:.4f}')
+
+    # Bucket distribution
     print()
     bucket_labels = ['1:', '2-4:', '5-9:', '10-49:', '50+:']
     bucket_higher = [True, False, False, False, False]
-    for lbl, v1, v2, hb in zip(bucket_labels, b1, b2, bucket_higher):
-        if v1 or v2:
-            print_row(lbl, v1, v2, '{:d}', higher_better=hb)
+    for bi, (lbl, hb) in enumerate(zip(bucket_labels, bucket_higher)):
+        vals = [s['buckets'][bi] for s in all_stats]
+        if any(vals):
+            print_row(lbl, vals, '{:d}', higher_better=hb)
 
 
 def cmd_test(gs, inline=''):
@@ -1285,19 +1324,27 @@ def cmd_test(gs, inline=''):
         print("Word(s) to test? ", end="")
         line = input().strip()
 
-    # Derive second-step candidate pool based on mode setting
-    if (gs.input_set != InputSet.CURRENT_WORDLIST
-            and soln.scores_updated
-            and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
-        second_step_words = [w for w, _ in soln.scores[:100]]
-    else:
-        second_step_words = None
+    # Derive step-2 pool and hard-mode flag from current input-set setting
+    iset = gs.input_set
+    if iset == InputSet.HARD_MODE:
+        step2_pool = None
+        hard_mode  = True
+    elif iset == InputSet.CURRENT_WORDLIST:
+        step2_pool = None
+        hard_mode  = False
+    else:  # ALL_GUESSES
+        hard_mode  = False
+        if (soln.scores_updated
+                and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
+            step2_pool = [w for w, _ in soln.scores]
+        else:
+            step2_pool = gs.all_guesses
 
     words = line.lower().split()
     try:
-        if len(words) == 2:
-            assert len(words[0]) == 5 and len(words[1]) == 5
-            _compare_words(words[0], words[1], soln, second_step_words)
+        if 2 <= len(words) <= 4:
+            assert all(len(w) == 5 for w in words)
+            _compare_words(words, soln, step2_pool, hard_mode, gs.all_guesses)
             return
         assert len(words) == 1 and len(words[0]) == 5
         word = words[0]
@@ -1360,14 +1407,16 @@ def cmd_test(gs, inline=''):
 
         # Multi-step lookahead for this word
         if n > 2:
-            s1, s2, s3, _, _ = _multistep_stats(
-                word, soln, second_step_words)
-            mode = 'full' if second_step_words else 'answers only'
+            st = _multistep_stats(word, soln, step2_pool, hard_mode,
+                                  gs.all_guesses)
+            mode = ('hard mode' if hard_mode
+                    else ('full' if step2_pool else 'answers only'))
             print(f'\n  Multi-step lookahead ({mode}):')
-            print(f'    Step 1: {s1:.4f}')
-            print(f'    Step 2: {s2:.4f}')
-            print(f'    Step 3: {s3:.4f}')
-            print(f'    Total:  {s1+s2+s3:.4f}')
+            print(f'    Entropy:  {st["step1"]:.4f}')
+            print(f'    +H2:      {st["step2"]:.4f}')
+            print(f'    +H3:      {st["step3"]:.4f}')
+            total = st["step1"] + st["step2"] + st["step3"]
+            print(f'    Total H:  {total:.4f}')
 
         # Group size distribution
         sorted_groups = sorted(groups.items(), key=lambda x: -x[1])
