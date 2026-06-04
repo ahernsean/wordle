@@ -1109,6 +1109,11 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     remaining = soln.current_words
     n = len(remaining)
 
+    _step1_methods = (ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX,
+                      ScoringMethod.WEIGHTED_AVG, ScoringMethod.PROB_FINISH)
+    for m in _step1_methods:
+        soln._ensure_scores_loaded(m)
+
     if cache:
         s1_groups = cache.group_words(word, remaining)
     else:
@@ -1117,11 +1122,22 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
             pat = tuple(calculate_response(word, answer))
             s1_groups[pat].append(answer)
 
-    group_counts = {p: len(g) for p, g in s1_groups.items()}
-    step1     = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
-    wt_avg    = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
-    max_grp   = int(score_groups(group_counts, ScoringMethod.MINIMAX))
-    prob_fin  = score_groups(group_counts, ScoringMethod.PROB_FINISH)
+    _cached = soln.word_scores.get(word, {})
+    if all(m in _cached for m in _step1_methods):
+        step1    = _cached[ScoringMethod.ENTROPY_GAIN]
+        max_grp  = int(_cached[ScoringMethod.MINIMAX])
+        wt_avg   = _cached[ScoringMethod.WEIGHTED_AVG]
+        prob_fin = _cached[ScoringMethod.PROB_FINISH]
+    else:
+        group_counts = {p: len(g) for p, g in s1_groups.items()}
+        step1    = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
+        wt_avg   = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
+        max_grp  = int(score_groups(group_counts, ScoringMethod.MINIMAX))
+        prob_fin = score_groups(group_counts, ScoringMethod.PROB_FINISH)
+        soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
+        soln.word_scores[word][ScoringMethod.MINIMAX]      = float(max_grp)
+        soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
+        soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
 
     buckets = [0, 0, 0, 0, 0]
     for g in s1_groups.values():
@@ -1131,12 +1147,6 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         elif k <= 9:  buckets[2] += 1
         elif k <= 49: buckets[3] += 1
         else:         buckets[4] += 1
-
-    # Write level-1 scores into the in-memory per-word cache
-    soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
-    soln.word_scores[word][ScoringMethod.MINIMAX]     = float(max_grp)
-    soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
-    soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
 
     # For step-2 SQLite caching, hard mode can't be keyed by subgroup blob alone
     # because cands2 depends on the specific (word, pattern) constraint set.
@@ -1230,6 +1240,9 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
 
     if _prog['on']:
         print()  # finish the "Computing entropy..." line
+
+    for m in _step1_methods:
+        soln._persist_scores(m)
 
     return {
         'step1': step1, 'step2': step2, 'step3': step3,

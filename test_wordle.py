@@ -15,6 +15,7 @@ from wordle_engine import (
     calculate_response, score_groups, calculate_group_counts,
 )
 from cache_sqlite import ScoreCache
+from wordle import _multistep_stats
 
 
 # Small deterministic word sets used across all tests.
@@ -317,6 +318,58 @@ class TestTransparentPersistence(unittest.TestCase):
                 v2 = s2.word_scores[w][m]
                 self.assertAlmostEqual(v1, v2, places=10,
                                        msg=f"{m} score mismatch for {w}")
+
+
+# ---------------------------------------------------------------------------
+# _multistep_stats participates in the transparent cache
+# ---------------------------------------------------------------------------
+
+class TestMultistepStatsCache(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_step1_scores_persisted_to_sqlite(self):
+        soln = make_solution(db_path=self.db)
+        _multistep_stats("crane", soln)
+        sc = ScoreCache(self.db, ANSWERS)
+        rows = sc.read_scores("entropy_gain")
+        self.assertIsNotNone(rows)
+        self.assertIn("crane", dict(rows))
+
+    def test_step1_scores_loaded_from_sqlite_on_second_session(self):
+        soln1 = make_solution(db_path=self.db)
+        stats1 = _multistep_stats("crane", soln1)
+
+        soln2 = make_solution(db_path=self.db)
+        stats2 = _multistep_stats("crane", soln2)
+        self.assertAlmostEqual(stats1['step1'], stats2['step1'], places=10)
+
+    def test_step1_scores_reused_from_word_scores(self):
+        # Pre-populate word_scores via compute_scores; _multistep_stats
+        # should not overwrite with a different value.
+        soln = make_solution(db_path=self.db)
+        soln.compute_scores(GUESSES, ScoringMethod.ENTROPY_GAIN)
+        cached_entropy = soln.word_scores["crane"][ScoringMethod.ENTROPY_GAIN]
+
+        stats = _multistep_stats("crane", soln)
+        self.assertAlmostEqual(stats['step1'], cached_entropy, places=10)
+
+    def test_mid_game_scores_not_persisted(self):
+        soln = make_solution(db_path=self.db)
+        pattern = calculate_response("crane", "slate")
+        soln.apply_guess("crane", pattern)
+        self.assertFalse(soln._is_full_game())
+
+        _multistep_stats("slate", soln)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        self.assertIsNone(sc.read_scores("entropy_gain"))
 
 
 if __name__ == "__main__":
