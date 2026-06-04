@@ -37,7 +37,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b21"
+BUILD = "b22"
 
 
 # ---------------------------------------------------------------------------
@@ -1193,6 +1193,9 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     step2 = 0.0
     step3 = 0.0
 
+    t0 = time.time()
+    _prog = {'on': False, 'step3': False}
+
     for pat, subgroup in s1_groups.items():
         k = len(subgroup)
         if k <= 1:
@@ -1205,6 +1208,12 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
             cands2 = step2_pool
         else:
             cands2 = subgroup
+
+        # Announce progress only if we've been computing more than 5 seconds
+        if not _prog['on'] and time.time() - t0 > 5:
+            suffix = '2, 3' if _prog['step3'] else '2'
+            print(f'  Computing entropy...{suffix}', end='', flush=True)
+            _prog['on'] = True
 
         best2_ent = 0.0
         best2_grps = None
@@ -1227,6 +1236,10 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         step2 += (k / n) * best2_ent
 
         if best2_grps:
+            if not _prog['step3']:
+                _prog['step3'] = True
+                if _prog['on']:
+                    print(', 3', end='', flush=True)
             for sub_sub in best2_grps.values():
                 kk = len(sub_sub)
                 if kk <= 1:
@@ -1241,6 +1254,9 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
                     if ent > best3_ent:
                         best3_ent = ent
                 step3 += (kk / n) * best3_ent
+
+    if _prog['on']:
+        print()  # finish the "Computing entropy..." line
 
     return {
         'step1': step1, 'step2': step2, 'step3': step3,
@@ -1423,11 +1439,17 @@ def cmd_test(gs, inline=''):
             mode = ('hard mode' if hard_mode
                     else (f'top {len(step2_pool)}' if step2_pool else 'answers only'))
             print(f'\n  Multi-step lookahead ({mode}):')
-            print(f'    Entropy 1:  {st["step1"]:.4f}')
-            print(f'    + ent. 2:   {st["step2"]:.4f}')
-            print(f'    + ent. 3:   {st["step3"]:.4f}')
-            total = st["step1"] + st["step2"] + st["step3"]
-            print(f'    Total:      {total:.4f}')
+            total = st['step1'] + st['step2'] + st['step3']
+            _rows = [
+                ('Entropy 1:', st['step1']),
+                ('+ ent. 2:',  st['step2']),
+                ('+ ent. 3:',  st['step3']),
+                ('Total:',     total),
+            ]
+            _lw = max(len(r[0]) for r in _rows)
+            _vw = max(len(f'{v:.4f}') for _, v in _rows)
+            for lbl, val in _rows:
+                print(f'    {lbl:<{_lw}}  {val:>{_vw}.4f}')
 
         # Group size distribution
         sorted_groups = sorted(groups.items(), key=lambda x: -x[1])
