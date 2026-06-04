@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b11"
+BUILD = "b12"
 
 
 # ---------------------------------------------------------------------------
@@ -1346,17 +1346,6 @@ def cmd_test(gs):
                 print(cur)
                 cur = '    ' + pair
         print(cur)
-        display_n = min(40, len(sorted_groups))
-        if len(sorted_groups) > display_n:
-            print(f'\n  Top {display_n} of {len(sorted_groups)} patterns by group size:')
-        else:
-            print(f'\n  {display_n} pattern{"s" if display_n != 1 else ""} by group size:')
-        items = [
-            f'{format_response(decode_response(pat))}:{cnt}'
-            for pat, cnt in sorted_groups[:40]
-        ]
-        if items:
-            print('\n'.join(format_columns(items)))
 
     except AssertionError:
         print_error("Word must be 5 letters.")
