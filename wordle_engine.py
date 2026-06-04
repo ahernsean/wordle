@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from enum import Enum, auto
 
-from adaptive_cache_sqlite import LookaheadCache
+from cache_sqlite import ScoreCache
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +655,7 @@ class Solution:
                 if cnt <= 2:
                     continue
                 if lc:
-                    blob = LookaheadCache.encode_subset(subgroup)
+                    blob = ScoreCache.encode_subset(subgroup)
                     if lc.read(blob, policy) is not None:
                         continue  # cache hit — no scan needed
                 work += (len(second_step_words)
@@ -683,13 +683,13 @@ class Solution:
                 # Check SQLite cache first
                 best = None
                 if lc:
-                    blob = LookaheadCache.encode_subset(subgroup)
+                    blob = ScoreCache.encode_subset(subgroup)
                     hit = lc.read(blob, policy)
                     if hit is not None:
                         _best_word, best = hit
 
                 if best is None:
-                    blob = (LookaheadCache.encode_subset(subgroup)
+                    blob = (ScoreCache.encode_subset(subgroup)
                             if lc else None)
                     candidates = (second_step_words
                                   if full_mode else subgroup)
