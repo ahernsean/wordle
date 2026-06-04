@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b10"
+BUILD = "b11"
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1087,22 @@ def cmd_lookahead(gs):
     else:
         count = LOOKAHEAD_N
 
+    # Try loading full-game entropy ranking from disk cache
+    is_full = (len(soln.current_words) == gs.n_answers
+               and gs.input_set != InputSet.CURRENT_WORDLIST)
+    if is_full and (not soln.scores_updated
+                    or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
+        cached = load_cache("weights", gs.n_guesses, "entropy_gain")
+        if cached:
+            soln.scores = sorted(cached,
+                                 key=ScoringMethod.ENTROPY_GAIN.sort_key())
+            soln.scores_method = ScoringMethod.ENTROPY_GAIN
+            soln.scores_updated = True
+            for word, score in cached:
+                soln.word_scores.setdefault(
+                    word, {})[ScoringMethod.ENTROPY_GAIN] = score
+            print(f"  (entropy loaded from cache, {gs.n_guesses} words)")
+
     # Auto-compute entropy ranking if not already done
     if (not soln.scores_updated
             or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
@@ -1317,8 +1333,24 @@ def cmd_test(gs):
             else:
                 b[4] += 1
         labels = ['1', '2-4', '5-9', '10-49', '50+']
-        dist_str = '  '.join(f'{lbl}:{n}' for lbl, n in zip(labels, b) if n)
-        print(f'\n  Subgroup sizes: {dist_str}')
+        pairs = [f'{lbl}:{n}' for lbl, n in zip(labels, b) if n]
+        prefix = '  Subgroup sizes: '
+        width = get_display_width()
+        print()
+        cur = prefix
+        for i, pair in enumerate(pairs):
+            sep = '  ' if cur != prefix else ''
+            if len(cur) + len(sep) + len(pair) <= width:
+                cur += sep + pair
+            else:
+                print(cur)
+                cur = '    ' + pair
+        print(cur)
+        display_n = min(40, len(sorted_groups))
+        if len(sorted_groups) > display_n:
+            print(f'\n  Top {display_n} of {len(sorted_groups)} patterns by group size:')
+        else:
+            print(f'\n  {display_n} pattern{"s" if display_n != 1 else ""} by group size:')
         items = [
             f'{format_response(decode_response(pat))}:{cnt}'
             for pat, cnt in sorted_groups[:40]
