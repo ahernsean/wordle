@@ -36,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b14"
+BUILD = "b15"
 
 
 # ---------------------------------------------------------------------------
@@ -1121,11 +1121,11 @@ def cmd_lookahead(gs):
 
     top_n = soln.scores[:count]
 
-    # Full mode: search top N² words as second-step candidates
-    is_hard = (gs.input_set == InputSet.CURRENT_WORDLIST)
-    if is_hard:
+    # Answers-only mode: restrict step-2 candidates to the subgroup
+    is_answers_only = (gs.input_set == InputSet.CURRENT_WORDLIST)
+    if is_answers_only:
         second_step_words = None
-        mode_label = "hard mode (subgroup only)"
+        mode_label = "answers only (subgroup)"
     else:
         step2_count = max(count * count, 100)
         second_step_words = [w for w, _s in soln.scores[:step2_count]]
@@ -1244,8 +1244,8 @@ def _multistep_stats(word, soln, second_step_words=None):
     """
     Compute 3-step expected entropy and group stats for a single word.
     Returns (step1, step2, step3, max_grp, buckets).
-    second_step_words: candidate pool for step 2 (None = hard mode, subgroup only).
-    Step 3 always uses hard mode (subgroup only) — sub-subgroups are tiny.
+    second_step_words: candidate pool for step 2 (None = answers only, subgroup).
+    Step 3 always uses answers-only (subgroup) — sub-subgroups are tiny.
     """
     cache = soln.cache
     remaining = soln.current_words
@@ -1453,8 +1453,8 @@ def cmd_test(gs, inline=''):
         if n > 2:
             s1, s2, s3, _, _ = _multistep_stats(
                 word, soln, second_step_words)
-            mode = 'full' if second_step_words else 'hard'
-            print(f'\n  Multi-step lookahead ({mode} mode):')
+            mode = 'full' if second_step_words else 'answers only'
+            print(f'\n  Multi-step lookahead ({mode}):')
             print(f'    Step 1: {s1:.4f}')
             print(f'    Step 2: {s2:.4f}')
             print(f'    Step 3: {s3:.4f}')
