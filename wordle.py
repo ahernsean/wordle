@@ -8,7 +8,6 @@ for a streamlined experience.
 
 import os
 import sys
-import pickle
 import shutil
 import time
 from collections import defaultdict
@@ -37,7 +36,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b23"
+BUILD = "b24"
 
 
 # ---------------------------------------------------------------------------
@@ -528,29 +527,6 @@ def print_guesses(soln):
 # Pickle cache
 # ---------------------------------------------------------------------------
 
-def _cache_path(prefix, n, method_name=None):
-    if method_name:
-        return f"{prefix}-{n}-{method_name}.p"
-    return f"{prefix}-{n}.p"
-
-
-def load_cache(prefix, n, method_name=None):
-    filepath = _cache_path(prefix, n, method_name)
-    try:
-        cache_mtime = os.path.getmtime(filepath)
-        engine_mtime = os.path.getmtime(ENGINE_PATH)
-        if cache_mtime < engine_mtime:
-            return None
-        with open(filepath, "rb") as f:
-            return pickle.load(f)
-    except (FileNotFoundError, OSError):
-        return None
-
-
-def save_cache(data, prefix, n, method_name=None):
-    with open(_cache_path(prefix, n, method_name),
-              "wb") as f:
-        pickle.dump(data, f)
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +762,7 @@ def cmd_solve(gs):
     mname = method.name.lower()
 
     if is_full:
-        cached = load_cache("weights", gs.n_guesses, mname)
+        cached = gs.lookahead_cache.read_scores(mname)
         if cached:
             results = sorted(cached, key=method.sort_key())
             soln.scores = results
@@ -816,7 +792,7 @@ def cmd_solve(gs):
     tracker.finish()
 
     if is_full:
-        save_cache(results, "weights", gs.n_guesses, mname)
+        gs.lookahead_cache.write_scores(results, mname)
 
     print(f"\n{method.label}:")
     if method == ScoringMethod.ENTROPY_GAIN:
@@ -1003,7 +979,7 @@ def cmd_lookahead(gs):
                and gs.input_set != InputSet.CURRENT_WORDLIST)
     if is_full and (not soln.scores_updated
                     or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
-        cached = load_cache("weights", gs.n_guesses, "entropy_gain")
+        cached = gs.lookahead_cache.read_scores("entropy_gain")
         if cached:
             soln.scores = sorted(cached,
                                  key=ScoringMethod.ENTROPY_GAIN.sort_key())
@@ -1029,7 +1005,7 @@ def cmd_lookahead(gs):
         )
         tracker.finish()
         if is_full:
-            save_cache(soln.scores, "weights", gs.n_guesses, "entropy_gain")
+            gs.lookahead_cache.write_scores(soln.scores, "entropy_gain")
 
     top_n = soln.scores[:count]
 

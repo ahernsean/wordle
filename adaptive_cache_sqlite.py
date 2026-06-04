@@ -52,6 +52,16 @@ class LookaheadCache:
             CREATE INDEX IF NOT EXISTS idx_lookahead
             ON lookahead_result(universe_id, policy)
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS word_scores (
+                word         TEXT    NOT NULL,
+                method       TEXT    NOT NULL,
+                score        REAL    NOT NULL,
+                universe_id  TEXT    NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                PRIMARY KEY (word, method, universe_id)
+            )
+        """)
 
     def _ensure_universe(self):
         canonical = "\n".join(self.answer_words)
@@ -93,6 +103,31 @@ class LookaheadCache:
             VALUES (?, ?, ?, ?, ?, ?)
         """, (subset_blob, policy, self.universe_id,
               best_word, best_entropy, now))
+
+    def read_scores(self, method):
+        """Return list of (word, score) for this method/universe, or None if empty."""
+        rows = self._conn.execute("""
+            SELECT word, score FROM word_scores
+            WHERE method = ? AND universe_id = ?
+        """, (method, self.universe_id)).fetchall()
+        if not rows:
+            return None
+        return [(r["word"], r["score"]) for r in rows]
+
+    def write_scores(self, scores, method):
+        """Store list of (word, score) tuples for this method/universe."""
+        now = int(time.time())
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.executemany("""
+                INSERT OR REPLACE INTO word_scores
+                    (word, method, score, universe_id, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, [(w, method, s, self.universe_id, now) for w, s in scores])
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def stats(self):
         """Return (row_count, last_updated_ts) for display."""
