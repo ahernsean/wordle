@@ -9,6 +9,7 @@ for a streamlined experience.
 import os
 import sys
 import shutil
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -37,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b31"
+BUILD = "b32"
 
 
 # ---------------------------------------------------------------------------
@@ -1806,6 +1807,78 @@ def print_status(gs):
                 print()
 
 
+# ---------------------------------------------------------------------------
+# ERD background warmer
+# ---------------------------------------------------------------------------
+
+_WARM_MAX_SUBGROUP = 50  # subgroups larger than this are skipped during warmup
+
+
+class ERDWarmer(threading.Thread):
+    """Daemon thread: fills the ERD cache proactively for the current position.
+
+    Runs while the main thread blocks on input(), giving background ERD
+    computation at zero latency cost to the user.  Uses its own ScoreCache
+    connection so it does not contend with the main thread's connection.
+    Stop is signalled via an Event; the thread checks it between subgroups.
+    """
+
+    def __init__(self, current_words, all_answers, score_cache_path, response_cache):
+        super().__init__(daemon=True, name='ERDWarmer')
+        self._words = list(current_words)        # snapshot
+        self._all_answers = all_answers
+        self._cache_path = score_cache_path
+        self._rcache = response_cache
+        self._cancel = threading.Event()
+
+    def stop(self):
+        self._cancel.set()
+
+    def run(self):
+        if len(self._words) <= 2:
+            return  # nothing useful; base cases need no cache
+        score_cache = ScoreCache(self._cache_path, self._all_answers)
+        try:
+            self._warm(score_cache)
+        finally:
+            score_cache.close()
+
+    def _warm(self, score_cache):
+        # Collect every unique subgroup produced by each candidate word.
+        seen = set()
+        work = []  # (size, word_list)
+        for word in self._words:
+            if self._cancel.is_set():
+                return
+            if self._rcache:
+                groups = self._rcache.group_words(word, self._words)
+            else:
+                groups = {}
+            for sg in groups.values():
+                k = len(sg)
+                if k <= 1 or k > _WARM_MAX_SUBGROUP:
+                    continue
+                key = ScoreCache.encode_subset(sg)
+                if key not in seen:
+                    seen.add(key)
+                    work.append((k, list(sg)))
+
+        # Smallest subgroups first: fastest to compute, most reuse as
+        # sub-subgroups of larger ones computed later.
+        work.sort()
+
+        for _size, sg in work:
+            if self._cancel.is_set():
+                return
+            sk = ScoreCache.encode_subset(sg)
+            if score_cache.read(sk, 'erd') is not None:
+                continue  # already in cache
+            # Short deadline so an unexpectedly expensive subgroup doesn't
+            # block the cancel signal for long.
+            deadline = time.time() + 5.0
+            min_expected_guesses(sg, self._rcache, score_cache, deadline)
+
+
 def main():
     print(f"wordle.py {BUILD}")
     all_answers = load_word_list(ANSWER_FILE)
@@ -1816,18 +1889,42 @@ def main():
     gs = GameState(all_answers, all_guesses)
 
     print_status(gs)
+    _warmer = None
     while True:
+        # Start a fresh warmer for the current game position.  It runs
+        # while input() blocks and is stopped as soon as the user types.
+        if _warmer is not None:
+            _warmer.stop()
+            _warmer = None
+        if gs.single and not gs.solutions[0]._is_full_game():
+            soln0 = gs.solutions[0]
+            _warmer = ERDWarmer(
+                soln0.current_words,
+                gs.all_answers,
+                gs.score_cache_path,
+                gs.cache,
+            )
+            _warmer.start()
+
         print(f"\nCommand (gsbldtixurаwhc?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:
+            if _warmer is not None:
+                _warmer.stop()
             print()
             print("Exiting.")
             break
         except KeyboardInterrupt:
+            if _warmer is not None:
+                _warmer.stop()
             print()
             print("Interrupted.")
             break
+
+        if _warmer is not None:
+            _warmer.stop()
+            _warmer = None
 
         if not cmd:
             print_status(gs)
