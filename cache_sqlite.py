@@ -43,13 +43,13 @@ class ScoreCache:
         """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS lookahead_result (
-                subset_blob  BLOB NOT NULL,
+                subset_key   BLOB NOT NULL,
                 policy       TEXT NOT NULL,
                 universe_id  TEXT NOT NULL,
                 best_word    TEXT NOT NULL,
                 best_entropy REAL NOT NULL,
                 updated_at   INTEGER NOT NULL,
-                PRIMARY KEY (subset_blob, policy, universe_id)
+                PRIMARY KEY (subset_key, policy, universe_id)
             )
         """)
         self._conn.execute("""
@@ -66,6 +66,11 @@ class ScoreCache:
                 PRIMARY KEY (word, method, universe_id)
             )
         """)
+        # Drop any rows written with the old null-separated encoding.
+        # All valid 5-letter words are ASCII, so a null byte identifies old format.
+        self._conn.execute(
+            "DELETE FROM lookahead_result WHERE instr(subset_key, char(0)) > 0"
+        )
 
     def _ensure_universe(self):
         canonical = "\n".join(self.answer_words)
@@ -87,29 +92,33 @@ class ScoreCache:
 
     @staticmethod
     def encode_subset(words):
-        """Encode a word list as a deterministic blob key."""
-        return "\0".join(sorted(words)).encode("utf-8")
+        """Canonical key for a set of words: sorted, concatenated, no separator.
 
-    def read(self, subset_blob, policy):
+        All Wordle words are exactly 5 ASCII characters, so a key of length 5N
+        encodes exactly N words recoverable by slicing at fixed 5-byte offsets.
+        """
+        return "".join(sorted(words)).encode("utf-8")
+
+    def read(self, subset_key, policy):
         """Return (best_word, best_entropy) or None on cache miss."""
         row = self._conn.execute("""
             SELECT best_word, best_entropy
             FROM lookahead_result
-            WHERE subset_blob = ? AND policy = ? AND universe_id = ?
-        """, (subset_blob, policy, self.universe_id)).fetchone()
+            WHERE subset_key = ? AND policy = ? AND universe_id = ?
+        """, (subset_key, policy, self.universe_id)).fetchone()
         if row is None:
             return None
         return row["best_word"], row["best_entropy"]
 
-    def write(self, subset_blob, policy, best_word, best_entropy):
+    def write(self, subset_key, policy, best_word, best_entropy):
         """Store a completed subgroup result."""
         now = int(time.time())
         self._conn.execute("""
             INSERT OR REPLACE INTO lookahead_result
-                (subset_blob, policy, universe_id,
+                (subset_key, policy, universe_id,
                  best_word, best_entropy, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (subset_blob, policy, self.universe_id,
+        """, (subset_key, policy, self.universe_id,
               best_word, best_entropy, now))
 
     # ------------------------------------------------------------------

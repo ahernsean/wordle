@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,8 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
     calculate_response, score_groups, calculate_group_counts,
+    min_expected_guesses,
 )
 from cache_sqlite import ScoreCache
+from wordle import _multistep_stats, _erd_solve_scores
 
 
 # Small deterministic word sets used across all tests.
@@ -213,25 +216,25 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_subgroup_round_trip(self):
         sc = ScoreCache(self.db, ANSWERS)
-        blob = ScoreCache.encode_subset(["crane", "slate", "trace"])
-        sc.write(blob, "full", "heart", 2.5)
-        word, ent = sc.read(blob, "full")
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        word, ent = sc.read(subset_key, "full")
         self.assertEqual(word, "heart")
         self.assertAlmostEqual(ent, 2.5)
 
     def test_read_miss_returns_none(self):
         sc = ScoreCache(self.db, ANSWERS)
-        blob = ScoreCache.encode_subset(["crane", "slate"])
-        self.assertIsNone(sc.read(blob, "full"))
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        self.assertIsNone(sc.read(subset_key, "full"))
         self.assertIsNone(sc.read_scores("entropy_gain"))
 
     def test_policy_separation(self):
         sc = ScoreCache(self.db, ANSWERS)
-        blob = ScoreCache.encode_subset(["crane", "slate"])
-        sc.write(blob, "full", "heart", 2.5)
-        sc.write(blob, "hard", "earth", 1.8)
-        self.assertEqual(sc.read(blob, "full")[0], "heart")
-        self.assertEqual(sc.read(blob, "hard")[0], "earth")
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        sc.write(subset_key, "hard", "earth", 1.8)
+        self.assertEqual(sc.read(subset_key, "full")[0], "heart")
+        self.assertEqual(sc.read(subset_key, "hard")[0], "earth")
 
     def test_different_universe_no_cross_contamination(self):
         alt_answers = ["brain", "stove", "cloud"]
@@ -246,6 +249,48 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc.write_scores([("crane", 9.9)], "entropy_gain")
         result = dict(sc.read_scores("entropy_gain"))
         self.assertAlmostEqual(result["crane"], 9.9)
+
+    def test_encode_subset_is_compact(self):
+        # Key length = 5 * number of words, no separators
+        words = ["crane", "slate", "trace"]
+        key = ScoreCache.encode_subset(words)
+        self.assertEqual(len(key), 15)
+        self.assertNotIn(b"\x00", key)
+
+    def test_encode_subset_is_order_independent(self):
+        self.assertEqual(
+            ScoreCache.encode_subset(["slate", "crane"]),
+            ScoreCache.encode_subset(["crane", "slate"]),
+        )
+
+    def test_old_null_separated_entries_are_dropped(self):
+        # Simulate a row written with the old encoding (null-separated)
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lookahead_result (
+                subset_key BLOB NOT NULL, policy TEXT NOT NULL,
+                universe_id TEXT NOT NULL, best_word TEXT NOT NULL,
+                best_entropy REAL NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_key, policy, universe_id)
+            )
+        """)
+        old_key = b"crane\x00slate"
+        conn.execute(
+            "INSERT OR REPLACE INTO lookahead_result VALUES (?,?,?,?,?,?)",
+            (old_key, "full", "test_universe", "heart", 2.5, 0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening ScoreCache should delete the old-format row
+        ScoreCache(self.db, ANSWERS)
+        conn2 = _sqlite3.connect(self.db)
+        rows = conn2.execute(
+            "SELECT COUNT(*) FROM lookahead_result WHERE instr(subset_key, char(0)) > 0"
+        ).fetchone()[0]
+        conn2.close()
+        self.assertEqual(rows, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +362,195 @@ class TestTransparentPersistence(unittest.TestCase):
                 v2 = s2.word_scores[w][m]
                 self.assertAlmostEqual(v1, v2, places=10,
                                        msg=f"{m} score mismatch for {w}")
+
+
+# ---------------------------------------------------------------------------
+# min_expected_guesses
+# ---------------------------------------------------------------------------
+
+class TestMinExpectedGuesses(unittest.TestCase):
+
+    def setUp(self):
+        self.cache = ResponseCache(ANSWERS)
+
+    def test_singleton_returns_one(self):
+        for w in ANSWERS:
+            self.assertEqual(min_expected_guesses([w], self.cache, None), 1.0,
+                             msg=f"singleton {w}")
+
+    def test_any_pair_returns_one_point_five(self):
+        for i in range(len(ANSWERS)):
+            for j in range(i + 1, len(ANSWERS)):
+                pair = [ANSWERS[i], ANSWERS[j]]
+                self.assertAlmostEqual(
+                    min_expected_guesses(pair, self.cache, None), 1.5, places=10,
+                    msg=f"pair {pair}")
+
+    def test_result_written_to_sqlite(self):
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            subset = ANSWERS[:4]
+            result = min_expected_guesses(subset, self.cache, sc)
+            self.assertIsNotNone(result)
+            hit = sc.read(ScoreCache.encode_subset(subset), 'erd')
+            self.assertIsNotNone(hit)
+            self.assertAlmostEqual(hit[1], result, places=10)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_expired_deadline_returns_none(self):
+        already_past = time.time() - 1
+        result = min_expected_guesses(ANSWERS, self.cache, None,
+                                      deadline=already_past)
+        self.assertIsNone(result)
+
+    def test_result_is_at_least_one(self):
+        result = min_expected_guesses(ANSWERS[:5], self.cache, None)
+        self.assertIsNotNone(result)
+        self.assertGreaterEqual(result, 1.0)
+
+    def test_larger_set_costs_more_than_smaller(self):
+        cost3 = min_expected_guesses(ANSWERS[:3], self.cache, None)
+        cost5 = min_expected_guesses(ANSWERS[:5], self.cache, None)
+        self.assertLess(cost3, cost5)
+
+
+# ---------------------------------------------------------------------------
+# _erd_solve_scores
+# ---------------------------------------------------------------------------
+
+class TestERDSolveScores(unittest.TestCase):
+    """
+    Tests for _erd_solve_scores, with focus on the singleton subgroup
+    edge case: min_expected_guesses never writes n==1 results to cache
+    (it returns 1.0 as a base case), so _erd_solve_scores must handle
+    them inline rather than via a cache read.
+    """
+
+    def _soln_with_words(self, words, sc):
+        import types
+        cache = ResponseCache(words)
+        return types.SimpleNamespace(
+            current_words=list(words),
+            score_cache=sc,
+            cache=cache,
+        ), cache
+
+    def test_singleton_subgroups_do_not_cause_none(self):
+        """
+        Every pair produces non-all-green singletons (k=1, sg[0]!=word).
+        After min_expected_guesses populates the root, _erd_solve_scores
+        must succeed — not return None — despite singletons being absent
+        from the cache.
+        """
+        words = ANSWERS[:2]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            erd = min_expected_guesses(words, cache, sc)
+            self.assertAlmostEqual(erd, 1.5)
+            # Singletons are NOT in cache — confirm that
+            for w in words:
+                hit = sc.read(ScoreCache.encode_subset([w]), 'erd')
+                self.assertIsNone(hit, f"singleton {w} should not be cached")
+            # _erd_solve_scores must still work
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores, "must not fail on singleton subgroups")
+            self.assertEqual(len(scores), len(words))
+
+    def test_all_candidates_return_correct_cost_for_pair(self):
+        """For any 2-word set both candidates cost exactly 1.5."""
+        words = ANSWERS[:2]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            min_expected_guesses(words, cache, sc)
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores)
+            for word, cost in scores:
+                self.assertAlmostEqual(cost, 1.5, places=10,
+                                       msg=f"cost for {word}")
+
+    def test_results_sorted_ascending(self):
+        """Scores are returned lowest-first (best play first)."""
+        words = ANSWERS[:5]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            min_expected_guesses(words, cache, sc)
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores)
+            costs = [c for _, c in scores]
+            self.assertEqual(costs, sorted(costs))
+
+    def test_best_word_matches_root_cache(self):
+        """The top-ranked word must match what min_expected_guesses chose."""
+        words = ANSWERS[:5]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            min_expected_guesses(words, cache, sc)
+            root_hit = sc.read(ScoreCache.encode_subset(words), 'erd')
+            self.assertIsNotNone(root_hit)
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores)
+            best_word, best_cost = scores[0]
+            self.assertEqual(best_word, root_hit[0])
+            self.assertAlmostEqual(best_cost, root_hit[1], places=10)
+
+
+# ---------------------------------------------------------------------------
+# _multistep_stats participates in the transparent cache
+# ---------------------------------------------------------------------------
+
+class TestMultistepStatsCache(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_step1_scores_persisted_to_sqlite(self):
+        soln = make_solution(db_path=self.db)
+        _multistep_stats("crane", soln)
+        sc = ScoreCache(self.db, ANSWERS)
+        rows = sc.read_scores("entropy_gain")
+        self.assertIsNotNone(rows)
+        self.assertIn("crane", dict(rows))
+
+    def test_step1_scores_loaded_from_sqlite_on_second_session(self):
+        soln1 = make_solution(db_path=self.db)
+        stats1 = _multistep_stats("crane", soln1)
+
+        soln2 = make_solution(db_path=self.db)
+        stats2 = _multistep_stats("crane", soln2)
+        self.assertAlmostEqual(stats1['step1'], stats2['step1'], places=10)
+
+    def test_step1_scores_reused_from_word_scores(self):
+        # Pre-populate word_scores via compute_scores; _multistep_stats
+        # should not overwrite with a different value.
+        soln = make_solution(db_path=self.db)
+        soln.compute_scores(GUESSES, ScoringMethod.ENTROPY_GAIN)
+        cached_entropy = soln.word_scores["crane"][ScoringMethod.ENTROPY_GAIN]
+
+        stats = _multistep_stats("crane", soln)
+        self.assertAlmostEqual(stats['step1'], cached_entropy, places=10)
+
+    def test_mid_game_scores_not_persisted(self):
+        soln = make_solution(db_path=self.db)
+        pattern = calculate_response("crane", "slate")
+        soln.apply_guess("crane", pattern)
+        self.assertFalse(soln._is_full_game())
+
+        _multistep_stats("slate", soln)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        self.assertIsNone(sc.read_scores("entropy_gain"))
 
 
 if __name__ == "__main__":

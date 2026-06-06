@@ -655,8 +655,8 @@ class Solution:
                 if cnt <= 2:
                     continue
                 if lc:
-                    blob = ScoreCache.encode_subset(subgroup)
-                    if lc.read(blob, policy) is not None:
+                    subset_key = ScoreCache.encode_subset(subgroup)
+                    if lc.read(subset_key, policy) is not None:
                         continue  # cache hit — no scan needed
                 work += (len(second_step_words)
                          if full_mode else len(subgroup))
@@ -683,14 +683,13 @@ class Solution:
                 # Check SQLite cache first
                 best = None
                 if lc:
-                    blob = ScoreCache.encode_subset(subgroup)
-                    hit = lc.read(blob, policy)
+                    subset_key = ScoreCache.encode_subset(subgroup)
+                    hit = lc.read(subset_key, policy)
                     if hit is not None:
                         _best_word, best = hit
 
                 if best is None:
-                    blob = (ScoreCache.encode_subset(subgroup)
-                            if lc else None)
+                    subset_key = ScoreCache.encode_subset(subgroup) if lc else None
                     candidates = (second_step_words
                                   if full_mode else subgroup)
                     best = 0.0
@@ -705,8 +704,8 @@ class Solution:
                         if s > best:
                             best = s
                             best_word = candidate
-                    if lc and best_word is not None and blob is not None:
-                        lc.write(blob, policy, best_word, best)
+                    if lc and best_word is not None and subset_key is not None:
+                        lc.write(subset_key, policy, best_word, best)
 
                 weighted_second += (cnt / n) * best
 
@@ -715,3 +714,73 @@ class Solution:
 
         results.sort(key=lambda x: -x[3])
         return results
+
+
+def min_expected_guesses(remaining, cache, score_cache,
+                          deadline=None, progress_fn=None):
+    """
+    Exact expected guesses to solve remaining words, playing optimally.
+
+    Uses words in `remaining` as candidates (answers-only). Memoizes
+    completed subgroups in score_cache with policy='erd'.
+
+    Returns None if deadline is exceeded mid-computation; partial
+    results already written to score_cache are kept and valid.
+    """
+    n = len(remaining)
+    if n == 1:
+        return 1.0
+
+    subset_key = ScoreCache.encode_subset(remaining)
+    if score_cache:
+        hit = score_cache.read(subset_key, 'erd')
+        if hit is not None:
+            return hit[1]
+
+    if deadline is not None and time.time() > deadline:
+        return None
+    if progress_fn is not None:
+        progress_fn()
+
+    best_erd = float('inf')
+    best_word = None
+
+    for guess in remaining:
+        if cache:
+            groups = cache.group_words(guess, remaining)
+        else:
+            groups = defaultdict(list)
+            for answer in remaining:
+                pat = _encode_response(calculate_response(guess, answer))
+                groups[pat].append(answer)
+
+        cost = 1.0
+        timed_out = False
+        for subgroup in groups.values():
+            k = len(subgroup)
+            if k == 0:
+                continue
+            # When guess is the answer, the all-green response produces a
+            # singleton {guess}. We've already solved it with this guess —
+            # 0 additional guesses needed for that branch.
+            if k == 1 and subgroup[0] == guess:
+                continue
+            sub_erd = min_expected_guesses(
+                subgroup, cache, score_cache, deadline, progress_fn
+            )
+            if sub_erd is None:
+                timed_out = True
+                break
+            cost += (k / n) * sub_erd
+
+        if timed_out:
+            return None
+
+        if cost < best_erd:
+            best_erd = cost
+            best_word = guess
+
+    if score_cache and best_word is not None:
+        score_cache.write(subset_key, 'erd', best_word, best_erd)
+
+    return best_erd

@@ -9,6 +9,7 @@ for a streamlined experience.
 import os
 import sys
 import shutil
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -27,6 +28,7 @@ from wordle_engine import (
     calculate_group_counts, score_groups,
     decode_response, max_entropy,
     answer_to_restriction,
+    min_expected_guesses,
 )
 
 # ---------------------------------------------------------------------------
@@ -36,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b26"
+BUILD = "b41"
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +556,7 @@ class GameState:
                                    self.score_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
+        self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
 
     def reset_all(self):
         self.solutions = [Solution(self.all_answers,
@@ -703,6 +706,41 @@ def _input_wordlist(gs, soln, iset):
     return gs.all_guesses
 
 
+def _erd_solve_scores(soln):
+    """
+    Rank all current_words candidates by ERD using only cached values.
+    Returns sorted (word, erd_cost) list, lowest first, or None if any
+    subgroup is missing from the cache.
+    """
+    n = len(soln.current_words)
+    sc = soln.score_cache
+    cache = soln.cache
+    results = []
+    for word in soln.current_words:
+        groups = cache.group_words(word, soln.current_words) if cache else {}
+        cost = 1.0
+        ok = True
+        for sg in groups.values():
+            k = len(sg)
+            if k == 0:
+                continue
+            if k == 1 and sg[0] == word:
+                continue  # all-green branch: solved, 0 extra guesses
+            if k == 1:
+                cost += 1.0 / n  # base case: one word left = 1 more guess
+                continue
+            hit = sc.read(ScoreCache.encode_subset(sg), 'erd')
+            if hit is None:
+                ok = False
+                break
+            cost += (k / n) * hit[1]
+        if not ok:
+            return None
+        results.append((word, cost))
+    results.sort(key=lambda x: x[1])
+    return results
+
+
 def cmd_solve(gs):
     if gs.single:
         soln = gs.solutions[0]
@@ -717,6 +755,56 @@ def cmd_solve(gs):
             soln = val
 
     set_display_context(soln)
+
+    # ERD option: available only when the full tree for this position is cached.
+    erd_root = None
+    if not soln._is_full_game():
+        root_key = ScoreCache.encode_subset(soln.current_words)
+        erd_root = soln.score_cache.read(root_key, 'erd')
+
+    methods = list(ScoringMethod)
+    erd_idx = len(methods) + 1
+    print("\nScoring method:")
+    for i, m in enumerate(methods):
+        arrow = "^" if m.higher_is_better else "v"
+        print(f"  {i + 1}. {m.label} ({arrow})")
+    if erd_root is not None:
+        print(f"  {erd_idx}. ERD: expected remaining depth (v) [{erd_root[1]:.3f}]")
+    else:
+        done, total = gs.last_erd_progress
+        if total == 0:
+            prog = 'not ready'
+        elif done < total:
+            prog = f'{done}/{total} subgroups'
+        else:
+            prog = 'finishing root...'
+        print(f"  {erd_idx}. ERD: expected remaining depth  ({prog})")
+    print(f"Choose (1-{erd_idx})? ", end='')
+    try:
+        raw = int(input().strip())
+    except ValueError:
+        print_error("Invalid choice.")
+        return
+
+    # ERD branch: no input wordlist needed, candidates are always current_words.
+    if raw == erd_idx:
+        if erd_root is None:
+            print_error("ERD tree not ready yet. Wait for the [ERD ready] notification.")
+            return
+        scores = _erd_solve_scores(soln)
+        if scores is None:
+            print_error("ERD cache incomplete — some subgroups missing.")
+            return
+        print("\nERD:")
+        print("Best guesses:")
+        print_scored_list(scores, method=None)
+        return
+
+    try:
+        method = methods[raw - 1]
+    except IndexError:
+        print_error("Invalid choice.")
+        return
 
     iset = gs.input_set
     if not gs.single:
@@ -743,18 +831,6 @@ def cmd_solve(gs):
     wordlist = _input_wordlist(gs, soln, iset)
     if not wordlist:
         print_error("No words in input set!")
-        return
-
-    methods = list(ScoringMethod)
-    print("\nScoring method:")
-    for i, m in enumerate(methods):
-        arrow = "^" if m.higher_is_better else "v"
-        print(f"  {i + 1}. {m.label} ({arrow})")
-    print(f"Choose (1-{len(methods)})? ", end='')
-    try:
-        method = methods[int(input().strip()) - 1]
-    except (ValueError, IndexError):
-        print_error("Invalid choice.")
         return
 
     # Fast path: already computed this session
@@ -1004,8 +1080,8 @@ def cmd_lookahead(gs):
             if cnt <= 2:
                 continue
             if soln.score_cache:
-                blob = ScoreCache.encode_subset(subgroup)
-                if soln.score_cache.read(blob, policy) is not None:
+                subset_key = ScoreCache.encode_subset(subgroup)
+                if soln.score_cache.read(subset_key, policy) is not None:
                     continue
             total_work += (len(second_step_words)
                            if second_step_words else cnt)
@@ -1109,6 +1185,11 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     remaining = soln.current_words
     n = len(remaining)
 
+    _step1_methods = (ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX,
+                      ScoringMethod.WEIGHTED_AVG, ScoringMethod.PROB_FINISH)
+    for m in _step1_methods:
+        soln._ensure_scores_loaded(m)
+
     if cache:
         s1_groups = cache.group_words(word, remaining)
     else:
@@ -1117,11 +1198,22 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
             pat = tuple(calculate_response(word, answer))
             s1_groups[pat].append(answer)
 
-    group_counts = {p: len(g) for p, g in s1_groups.items()}
-    step1     = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
-    wt_avg    = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
-    max_grp   = int(score_groups(group_counts, ScoringMethod.MINIMAX))
-    prob_fin  = score_groups(group_counts, ScoringMethod.PROB_FINISH)
+    _cached = soln.word_scores.get(word, {})
+    if all(m in _cached for m in _step1_methods):
+        step1    = _cached[ScoringMethod.ENTROPY_GAIN]
+        max_grp  = int(_cached[ScoringMethod.MINIMAX])
+        wt_avg   = _cached[ScoringMethod.WEIGHTED_AVG]
+        prob_fin = _cached[ScoringMethod.PROB_FINISH]
+    else:
+        group_counts = {p: len(g) for p, g in s1_groups.items()}
+        step1    = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
+        wt_avg   = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
+        max_grp  = int(score_groups(group_counts, ScoringMethod.MINIMAX))
+        prob_fin = score_groups(group_counts, ScoringMethod.PROB_FINISH)
+        soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
+        soln.word_scores[word][ScoringMethod.MINIMAX]      = float(max_grp)
+        soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
+        soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
 
     buckets = [0, 0, 0, 0, 0]
     for g in s1_groups.values():
@@ -1132,13 +1224,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         elif k <= 49: buckets[3] += 1
         else:         buckets[4] += 1
 
-    # Write level-1 scores into the in-memory per-word cache
-    soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
-    soln.word_scores[word][ScoringMethod.MINIMAX]     = float(max_grp)
-    soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
-    soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
-
-    # For step-2 SQLite caching, hard mode can't be keyed by subgroup blob alone
+    # For step-2 SQLite caching, hard mode can't be keyed by subgroup key alone
     # because cands2 depends on the specific (word, pattern) constraint set.
     lc = soln.score_cache
     policy = None if hard_mode else ('full' if step2_pool is not None else 'hard')
@@ -1163,8 +1249,8 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
             cands2 = subgroup
 
         # Check SQLite subgroup cache (shares entries with compute_lookahead)
-        blob = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
-        cache_hit = lc.read(blob, policy) if blob else None
+        subset_key = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
+        cache_hit = lc.read(subset_key, policy) if subset_key else None
 
         if cache_hit is not None:
             best2_word, best2_ent = cache_hit
@@ -1203,8 +1289,8 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
                     best2_word = c2
                     best2_grps = sg
 
-            if blob and best2_word:
-                lc.write(blob, policy, best2_word, best2_ent)
+            if subset_key and best2_word:
+                lc.write(subset_key, policy, best2_word, best2_ent)
 
         step2 += (k / n) * best2_ent
 
@@ -1231,11 +1317,46 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     if _prog['on']:
         print()  # finish the "Computing entropy..." line
 
+    for m in _step1_methods:
+        soln._persist_scores(m)
+
+    # ERD: exact expected guesses, answers-only candidates.
+    # Only computed mid-game (option C); root (full game) is too expensive
+    # for an interactive command and is left as None.
+    erd = None
+    if not soln._is_full_game():
+        erd_t0 = time.time()
+        erd_announced = False
+        deadline = erd_t0 + 30
+        erd_cost = 1.0
+        erd_ok = True
+        for subgroup in s1_groups.values():
+            k = len(subgroup)
+            if k == 0:
+                continue
+            if k == 1 and subgroup[0] == word:
+                continue  # all-green branch: already solved, 0 more guesses
+            if not erd_announced and time.time() - erd_t0 > 5:
+                print('  Computing ERD...', end='', flush=True)
+                erd_announced = True
+            sub_erd = min_expected_guesses(
+                subgroup, cache, soln.score_cache, deadline
+            )
+            if sub_erd is None:
+                erd_ok = False
+                break
+            erd_cost += (k / n) * sub_erd
+        if erd_announced:
+            print()
+        if erd_ok:
+            erd = erd_cost
+
     return {
         'step1': step1, 'step2': step2, 'step3': step3,
         'max_grp': max_grp,
         'wt_avg': wt_avg, 'prob_finish': prob_fin,
         'buckets': buckets,
+        'erd': erd,
     }
 
 
@@ -1255,12 +1376,15 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
 
     # Build all data rows up front so we can measure max column width
     totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
+    erd_vals = [s.get('erd') for s in all_stats]
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
         ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
         ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
-        ('Entropy 1', [s['step1']       for s in all_stats], '{:.4f}', True),
     ]
+    if any(v is not None for v in erd_vals):
+        data_rows.append(('ERD', erd_vals, '{:.3f}', False))
+    data_rows.append(('Entropy 1', [s['step1'] for s in all_stats], '{:.4f}', True))
     if n > 2:
         data_rows += [
             ('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}', True),
@@ -1282,17 +1406,24 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
     cw = max(len(w) for w in words)
     for _, values, fmt, _ in data_rows + bucket_rows:
         for v in values:
-            cw = max(cw, len(fmt.format(v)))
+            if v is not None:
+                cw = max(cw, len(fmt.format(v)))
 
     def print_row(label, values, fmt, higher_better=True):
-        padded = [fmt.format(v).rjust(cw) for v in values]
-        best = max(values) if higher_better else min(values)
-        all_tied = all(v == best for v in values)
+        padded = [('—'.rjust(cw) if v is None else fmt.format(v).rjust(cw))
+                  for v in values]
+        valid = [v for v in values if v is not None]
+        if len(valid) < 2 or all(v == valid[0] for v in valid):
+            all_tied = True
+            best = None
+        else:
+            best = max(valid) if higher_better else min(valid)
+            all_tied = False
         print(f'  {label:<{lw}} ', end='')
         for i, (p, v) in enumerate(zip(padded, values)):
             if i:
                 print('  ', end='')
-            if not all_tied and v == best:
+            if not all_tied and v is not None and v == best:
                 with colored_text('green'):
                     print(p, end='')
             else:
@@ -1413,16 +1544,21 @@ def cmd_test(gs, inline=''):
                     else (f'top {len(step2_pool)}' if step2_pool else 'answers only'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
-            _rows = [
-                ('Entropy 1:', st['step1']),
-                ('+ ent. 2:',  st['step2']),
-                ('+ ent. 3:',  st['step3']),
-                ('Total:',     total),
+            erd   = st.get('erd')
+            chain_vals = [st['step1'], st['step2'], st['step3'], total]
+            _vw = max(len(f'{v:.4f}') for v in chain_vals)
+            _rows = []
+            if erd is not None:
+                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp remaining depth'))
+            _rows += [
+                ('Entropy 1:', f'{st["step1"]:>{_vw}.4f}'),
+                ('+ ent. 2:',  f'{st["step2"]:>{_vw}.4f}'),
+                ('+ ent. 3:',  f'{st["step3"]:>{_vw}.4f}'),
+                ('Total:',     f'{total:>{_vw}.4f}'),
             ]
-            _lw = max(len(r[0]) for r in _rows)
-            _vw = max(len(f'{v:.4f}') for _, v in _rows)
+            _lw = max(len(lbl) for lbl, _ in _rows)
             for lbl, val in _rows:
-                print(f'    {lbl:<{_lw}}  {val:>{_vw}.4f}')
+                print(f'    {lbl:<{_lw}}  {val}')
 
         # Group size distribution
         sorted_groups = sorted(groups.items(), key=lambda x: -x[1])
@@ -1722,7 +1858,13 @@ def print_status(gs):
         elif n == 1:
             print_success(f"Solved: {words[0]}")
         else:
-            print(f"{n:,} words remaining")
+            erd_tag = ''
+            if not soln._is_full_game():
+                sk = ScoreCache.encode_subset(words)
+                hit = soln.score_cache.read(sk, 'erd')
+                if hit is not None:
+                    erd_tag = f'  [ERD: {hit[1]:.3f}]'
+            print(f"{n:,} words remaining{erd_tag}")
     else:
         n = len(gs.solutions)
         print(f'{n} wordlists')
@@ -1747,6 +1889,98 @@ def print_status(gs):
                 print()
 
 
+# ---------------------------------------------------------------------------
+# ERD background warmer
+# ---------------------------------------------------------------------------
+
+_WARM_MAX_SUBGROUP = 50  # subgroups larger than this are skipped during warmup
+
+
+class ERDWarmer(threading.Thread):
+    """Daemon thread: fills the ERD cache proactively for the current position.
+
+    Runs while the main thread blocks on input(), giving background ERD
+    computation at zero latency cost to the user.  Uses its own ScoreCache
+    connection so it does not contend with the main thread's connection.
+    Stop is signalled via an Event; the thread checks it between subgroups.
+    """
+
+    def __init__(self, current_words, all_answers, score_cache_path, response_cache):
+        super().__init__(daemon=True, name='ERDWarmer')
+        self._words = list(current_words)        # snapshot
+        self._all_answers = all_answers
+        self._cache_path = score_cache_path
+        self._rcache = response_cache
+        self._cancel = threading.Event()
+        self.subgroups_done = 0   # incremented after each subgroup is cached
+        self.subgroups_total = 0  # set after collection; 0 means still collecting
+
+    def stop(self):
+        self._cancel.set()
+
+    def run(self):
+        if len(self._words) <= 2:
+            return  # nothing useful; base cases need no cache
+        score_cache = ScoreCache(self._cache_path, self._all_answers)
+        try:
+            self._warm(score_cache)
+        finally:
+            score_cache.close()
+
+    def _warm(self, score_cache):
+        # Collect every unique subgroup produced by each candidate word.
+        seen = set()
+        work = []  # (size, word_list)
+        for word in self._words:
+            if self._cancel.is_set():
+                return
+            if self._rcache:
+                groups = self._rcache.group_words(word, self._words)
+            else:
+                groups = {}
+            for sg in groups.values():
+                k = len(sg)
+                if k <= 1 or k > _WARM_MAX_SUBGROUP:
+                    continue
+                key = ScoreCache.encode_subset(sg)
+                if key not in seen:
+                    seen.add(key)
+                    work.append((k, list(sg)))
+
+        # Smallest subgroups first: fastest to compute, most reuse as
+        # sub-subgroups of larger ones computed later.
+        work.sort()
+        self.subgroups_total = len(work)  # now bounded; 0 = still collecting
+
+        for _size, sg in work:
+            if self._cancel.is_set():
+                return
+            sk = ScoreCache.encode_subset(sg)
+            if score_cache.read(sk, 'erd') is not None:
+                self.subgroups_done += 1
+                continue  # already in cache
+            # Short deadline so an unexpectedly expensive subgroup doesn't
+            # block the cancel signal for long.
+            deadline = time.time() + 5.0
+            min_expected_guesses(sg, self._rcache, score_cache, deadline)
+            self.subgroups_done += 1
+
+        # All subgroups done. Now compute the root (current position).
+        # If all first-level subgroups were cached above, this reads from
+        # cache and finishes in O(n) SQLite reads — fast.
+        if self._cancel.is_set():
+            return
+        root_key = ScoreCache.encode_subset(self._words)
+        if score_cache.read(root_key, 'erd') is None:
+            deadline = time.time() + 30.0
+            result = min_expected_guesses(
+                self._words, self._rcache, score_cache, deadline
+            )
+            if result is not None:
+                print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
+                      flush=True)
+
+
 def main():
     print(f"wordle.py {BUILD}")
     all_answers = load_word_list(ANSWER_FILE)
@@ -1757,18 +1991,43 @@ def main():
     gs = GameState(all_answers, all_guesses)
 
     print_status(gs)
+    _warmer = None
     while True:
+        # Start a fresh warmer for the current game position.  It runs
+        # while input() blocks and is stopped as soon as the user types.
+        if _warmer is not None:
+            _warmer.stop()
+            _warmer = None
+        if gs.single and not gs.solutions[0]._is_full_game():
+            soln0 = gs.solutions[0]
+            _warmer = ERDWarmer(
+                soln0.current_words,
+                gs.all_answers,
+                gs.score_cache_path,
+                gs.cache,
+            )
+            _warmer.start()
+
         print(f"\nCommand (gsbldtixurаwhc?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:
+            if _warmer is not None:
+                _warmer.stop()
             print()
             print("Exiting.")
             break
         except KeyboardInterrupt:
+            if _warmer is not None:
+                _warmer.stop()
             print()
             print("Interrupted.")
             break
+
+        if _warmer is not None:
+            gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
+            _warmer.stop()
+            _warmer = None
 
         if not cmd:
             print_status(gs)
