@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b39"
+BUILD = "b40"
 
 
 # ---------------------------------------------------------------------------
@@ -769,8 +769,7 @@ def cmd_solve(gs):
         arrow = "^" if m.higher_is_better else "v"
         print(f"  {i + 1}. {m.label} ({arrow})")
     if erd_root is not None:
-        print(f"  {erd_idx}. ERD: expected remaining depth (v)"
-              f"  [{erd_root[1]:.3f} from here]")
+        print(f"  {erd_idx}. ERD: expected remaining depth (v) [{erd_root[1]:.3f}]")
     else:
         done, total = gs.last_erd_progress
         if total == 0:
