@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b40"
+BUILD = "b41"
 
 
 # ---------------------------------------------------------------------------
@@ -795,8 +795,7 @@ def cmd_solve(gs):
         if scores is None:
             print_error("ERD cache incomplete — some subgroups missing.")
             return
-        print(f"\nERD (expected remaining depth, lower = better):")
-        print(f"Optimal: {erd_root[1]:.4f}  best word: {erd_root[0].upper()}")
+        print("\nERD:")
         print("Best guesses:")
         print_scored_list(scores, method=None)
         return
