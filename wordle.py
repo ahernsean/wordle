@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b35"
+BUILD = "b36"
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +705,38 @@ def _input_wordlist(gs, soln, iset):
     return gs.all_guesses
 
 
+def _erd_solve_scores(soln):
+    """
+    Rank all current_words candidates by ERD using only cached values.
+    Returns sorted (word, erd_cost) list, lowest first, or None if any
+    subgroup is missing from the cache.
+    """
+    n = len(soln.current_words)
+    sc = soln.score_cache
+    cache = soln.cache
+    results = []
+    for word in soln.current_words:
+        groups = cache.group_words(word, soln.current_words) if cache else {}
+        cost = 1.0
+        ok = True
+        for sg in groups.values():
+            k = len(sg)
+            if k == 0:
+                continue
+            if k == 1 and sg[0] == word:
+                continue  # all-green branch: solved, 0 extra guesses
+            hit = sc.read(ScoreCache.encode_subset(sg), 'erd')
+            if hit is None:
+                ok = False
+                break
+            cost += (k / n) * hit[1]
+        if not ok:
+            return None
+        results.append((word, cost))
+    results.sort(key=lambda x: x[1])
+    return results
+
+
 def cmd_solve(gs):
     if gs.single:
         soln = gs.solutions[0]
@@ -719,6 +751,47 @@ def cmd_solve(gs):
             soln = val
 
     set_display_context(soln)
+
+    # ERD option: available only when the full tree for this position is cached.
+    erd_root = None
+    if not soln._is_full_game():
+        root_key = ScoreCache.encode_subset(soln.current_words)
+        erd_root = soln.score_cache.read(root_key, 'erd')
+
+    methods = list(ScoringMethod)
+    erd_idx = len(methods) + 1
+    print("\nScoring method:")
+    for i, m in enumerate(methods):
+        arrow = "^" if m.higher_is_better else "v"
+        print(f"  {i + 1}. {m.label} ({arrow})")
+    if erd_root is not None:
+        print(f"  {erd_idx}. ERD: exact expected guesses (v)"
+              f"  [{erd_root[1]:.3f} optimal from here]")
+    n_opts = erd_idx if erd_root else len(methods)
+    print(f"Choose (1-{n_opts})? ", end='')
+    try:
+        raw = int(input().strip())
+    except ValueError:
+        print_error("Invalid choice.")
+        return
+
+    # ERD branch: no input wordlist needed, candidates are always current_words.
+    if erd_root is not None and raw == erd_idx:
+        scores = _erd_solve_scores(soln)
+        if scores is None:
+            print_error("ERD cache incomplete — some subgroups missing.")
+            return
+        print(f"\nERD (exact expected guesses, lower = better):")
+        print(f"Optimal: {erd_root[1]:.4f}  best word: {erd_root[0].upper()}")
+        print("Best guesses:")
+        print_scored_list(scores, method=None)
+        return
+
+    try:
+        method = methods[raw - 1]
+    except IndexError:
+        print_error("Invalid choice.")
+        return
 
     iset = gs.input_set
     if not gs.single:
@@ -745,18 +818,6 @@ def cmd_solve(gs):
     wordlist = _input_wordlist(gs, soln, iset)
     if not wordlist:
         print_error("No words in input set!")
-        return
-
-    methods = list(ScoringMethod)
-    print("\nScoring method:")
-    for i, m in enumerate(methods):
-        arrow = "^" if m.higher_is_better else "v"
-        print(f"  {i + 1}. {m.label} ({arrow})")
-    print(f"Choose (1-{len(methods)})? ", end='')
-    try:
-        method = methods[int(input().strip()) - 1]
-    except (ValueError, IndexError):
-        print_error("Invalid choice.")
         return
 
     # Fast path: already computed this session
