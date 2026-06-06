@@ -717,12 +717,13 @@ class Solution:
 
 
 def min_expected_guesses(remaining, cache, score_cache,
-                          deadline=None, progress_fn=None):
+                          deadline=None, progress_fn=None, guesses=None):
     """
     Exact expected guesses to solve remaining words, playing optimally.
 
-    Uses words in `remaining` as candidates (answers-only). Memoizes
-    completed subgroups in score_cache with policy='erd'.
+    guesses: vocabulary of allowed guess words. None means answers-only
+             (restrict guesses to `remaining`). Pass the full word list for
+             all-guesses mode. Cached under policy 'erd_all' vs 'erd_answers'.
 
     Returns None if deadline is exceeded mid-computation; partial
     results already written to score_cache are kept and valid.
@@ -731,9 +732,12 @@ def min_expected_guesses(remaining, cache, score_cache,
     if n == 1:
         return 1.0
 
+    policy = 'erd_all' if guesses is not None else 'erd_answers'
+    guess_list = guesses if guesses is not None else remaining
+
     subset_key = ScoreCache.encode_subset(remaining)
     if score_cache:
-        hit = score_cache.read(subset_key, 'erd')
+        hit = score_cache.read(subset_key, policy)
         if hit is not None:
             return hit[1]
 
@@ -745,8 +749,11 @@ def min_expected_guesses(remaining, cache, score_cache,
     best_erd = float('inf')
     best_word = None
 
-    for guess in remaining:
-        if cache:
+    for guess in guess_list:
+        # Use the response cache for answer-vocabulary words (pre-built
+        # mappings). For non-answer guess words, compute groups inline to
+        # avoid polluting the response cache with 12 000 full-vocab mappings.
+        if cache and guess in cache.answer_words:
             groups = cache.group_words(guess, remaining)
         else:
             groups = defaultdict(list)
@@ -756,6 +763,7 @@ def min_expected_guesses(remaining, cache, score_cache,
 
         cost = 1.0
         timed_out = False
+        skip_guess = False
         for subgroup in groups.values():
             k = len(subgroup)
             if k == 0:
@@ -765,14 +773,22 @@ def min_expected_guesses(remaining, cache, score_cache,
             # 0 additional guesses needed for that branch.
             if k == 1 and subgroup[0] == guess:
                 continue
+            if k >= n:
+                # All remaining words gave the same response — this guess
+                # provides zero information and cannot make progress.
+                # Skip it to prevent infinite recursion.
+                skip_guess = True
+                break
             sub_erd = min_expected_guesses(
-                subgroup, cache, score_cache, deadline, progress_fn
+                subgroup, cache, score_cache, deadline, progress_fn, guesses
             )
             if sub_erd is None:
                 timed_out = True
                 break
             cost += (k / n) * sub_erd
 
+        if skip_guess:
+            continue
         if timed_out:
             return None
 
@@ -781,6 +797,6 @@ def min_expected_guesses(remaining, cache, score_cache,
             best_word = guess
 
     if score_cache and best_word is not None:
-        score_cache.write(subset_key, 'erd', best_word, best_erd)
+        score_cache.write(subset_key, policy, best_word, best_erd)
 
     return best_erd

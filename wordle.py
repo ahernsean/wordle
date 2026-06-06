@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b41"
+BUILD = "b42"
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +729,7 @@ def _erd_solve_scores(soln):
             if k == 1:
                 cost += 1.0 / n  # base case: one word left = 1 more guess
                 continue
-            hit = sc.read(ScoreCache.encode_subset(sg), 'erd')
+            hit = sc.read(ScoreCache.encode_subset(sg), 'erd_all')
             if hit is None:
                 ok = False
                 break
@@ -760,7 +760,7 @@ def cmd_solve(gs):
     erd_root = None
     if not soln._is_full_game():
         root_key = ScoreCache.encode_subset(soln.current_words)
-        erd_root = soln.score_cache.read(root_key, 'erd')
+        erd_root = soln.score_cache.read(root_key, 'erd_all')
 
     methods = list(ScoringMethod)
     erd_idx = len(methods) + 1
@@ -1861,7 +1861,7 @@ def print_status(gs):
             erd_tag = ''
             if not soln._is_full_game():
                 sk = ScoreCache.encode_subset(words)
-                hit = soln.score_cache.read(sk, 'erd')
+                hit = soln.score_cache.read(sk, 'erd_all')
                 if hit is not None:
                     erd_tag = f'  [ERD: {hit[1]:.3f}]'
             print(f"{n:,} words remaining{erd_tag}")
@@ -1905,10 +1905,12 @@ class ERDWarmer(threading.Thread):
     Stop is signalled via an Event; the thread checks it between subgroups.
     """
 
-    def __init__(self, current_words, all_answers, score_cache_path, response_cache):
+    def __init__(self, current_words, all_answers, all_guesses,
+                 score_cache_path, response_cache):
         super().__init__(daemon=True, name='ERDWarmer')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
+        self._all_guesses = all_guesses
         self._cache_path = score_cache_path
         self._rcache = response_cache
         self._cancel = threading.Event()
@@ -1956,13 +1958,14 @@ class ERDWarmer(threading.Thread):
             if self._cancel.is_set():
                 return
             sk = ScoreCache.encode_subset(sg)
-            if score_cache.read(sk, 'erd') is not None:
+            if score_cache.read(sk, 'erd_all') is not None:
                 self.subgroups_done += 1
                 continue  # already in cache
             # Short deadline so an unexpectedly expensive subgroup doesn't
             # block the cancel signal for long.
             deadline = time.time() + 5.0
-            min_expected_guesses(sg, self._rcache, score_cache, deadline)
+            min_expected_guesses(sg, self._rcache, score_cache, deadline,
+                                 guesses=self._all_guesses)
             self.subgroups_done += 1
 
         # All subgroups done. Now compute the root (current position).
@@ -1971,10 +1974,11 @@ class ERDWarmer(threading.Thread):
         if self._cancel.is_set():
             return
         root_key = ScoreCache.encode_subset(self._words)
-        if score_cache.read(root_key, 'erd') is None:
+        if score_cache.read(root_key, 'erd_all') is None:
             deadline = time.time() + 30.0
             result = min_expected_guesses(
-                self._words, self._rcache, score_cache, deadline
+                self._words, self._rcache, score_cache, deadline,
+                guesses=self._all_guesses,
             )
             if result is not None:
                 print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
@@ -2003,6 +2007,7 @@ def main():
             _warmer = ERDWarmer(
                 soln0.current_words,
                 gs.all_answers,
+                gs.all_guesses,
                 gs.score_cache_path,
                 gs.cache,
             )

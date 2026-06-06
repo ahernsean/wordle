@@ -394,7 +394,7 @@ class TestMinExpectedGuesses(unittest.TestCase):
             subset = ANSWERS[:4]
             result = min_expected_guesses(subset, self.cache, sc)
             self.assertIsNotNone(result)
-            hit = sc.read(ScoreCache.encode_subset(subset), 'erd')
+            hit = sc.read(ScoreCache.encode_subset(subset), 'erd_answers')
             self.assertIsNotNone(hit)
             self.assertAlmostEqual(hit[1], result, places=10)
         finally:
@@ -449,11 +449,11 @@ class TestERDSolveScores(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
             soln, cache = self._soln_with_words(words, sc)
-            erd = min_expected_guesses(words, cache, sc)
+            erd = min_expected_guesses(words, cache, sc, guesses=words)
             self.assertAlmostEqual(erd, 1.5)
             # Singletons are NOT in cache — confirm that
             for w in words:
-                hit = sc.read(ScoreCache.encode_subset([w]), 'erd')
+                hit = sc.read(ScoreCache.encode_subset([w]), 'erd_all')
                 self.assertIsNone(hit, f"singleton {w} should not be cached")
             # _erd_solve_scores must still work
             scores = _erd_solve_scores(soln)
@@ -466,7 +466,7 @@ class TestERDSolveScores(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
             soln, cache = self._soln_with_words(words, sc)
-            min_expected_guesses(words, cache, sc)
+            min_expected_guesses(words, cache, sc, guesses=words)
             scores = _erd_solve_scores(soln)
             self.assertIsNotNone(scores)
             for word, cost in scores:
@@ -479,7 +479,7 @@ class TestERDSolveScores(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
             soln, cache = self._soln_with_words(words, sc)
-            min_expected_guesses(words, cache, sc)
+            min_expected_guesses(words, cache, sc, guesses=words)
             scores = _erd_solve_scores(soln)
             self.assertIsNotNone(scores)
             costs = [c for _, c in scores]
@@ -491,8 +491,8 @@ class TestERDSolveScores(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
             soln, cache = self._soln_with_words(words, sc)
-            min_expected_guesses(words, cache, sc)
-            root_hit = sc.read(ScoreCache.encode_subset(words), 'erd')
+            min_expected_guesses(words, cache, sc, guesses=words)
+            root_hit = sc.read(ScoreCache.encode_subset(words), 'erd_all')
             self.assertIsNotNone(root_hit)
             scores = _erd_solve_scores(soln)
             self.assertIsNotNone(scores)
