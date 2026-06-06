@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b48"
+BUILD = "b49"
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +557,8 @@ class GameState:
         self.columns = 1
         self.input_set = InputSet.ANY_WORD
         self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
-        self.hard_erd_cache = None        # MemoryScoreCache from last hard-mode warmer
-        self.hard_erd_cache_words = None  # frozenset of words the cache was built for
+        self.constrained_erd_cache = None        # MemoryScoreCache from last hard-mode warmer
+        self.constrained_erd_cache_words = None  # frozenset of words the cache was built for
 
     def reset_all(self):
         self.solutions = [Solution(self.all_answers,
@@ -696,8 +696,8 @@ def cmd_guess(gs):
 
 def _input_wordlist(gs, soln, iset):
     """Resolve InputSet to the appropriate word list."""
-    if iset == InputSet.HARD_MODE:
-        return soln.hard_mode_words(gs.all_words)
+    if iset == InputSet.CONSTRAINT_COMPLIANT:
+        return soln.constraint_compliant_words(gs.all_words)
     if iset == InputSet.POSSIBLE_ANSWERS:
         return soln.current_words
     if iset == InputSet.SOLVED_WORDS:
@@ -712,11 +712,11 @@ def _erd_cache_and_policy(gs, soln):
     """Return (score_cache, policy) appropriate for the current input mode.
 
     ANY_WORD      → SQLite,            'erd_all'
-    HARD_MODE        → MemoryScoreCache,  'erd_hard'
+    CONSTRAINT_COMPLIANT        → MemoryScoreCache,  'erd_constrained'
     POSSIBLE_ANSWERS → SQLite,            'erd_answers'
     """
-    if gs.input_set == InputSet.HARD_MODE:
-        return gs.hard_erd_cache, 'erd_hard'
+    if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
+        return gs.constrained_erd_cache, 'erd_constrained'
     elif gs.input_set == InputSet.POSSIBLE_ANSWERS:
         return soln.score_cache, 'erd_answers'
     else:
@@ -730,7 +730,7 @@ def _erd_solve_scores(soln, score_cache=None, policy='erd_all'):
     subgroup is missing from the cache.
 
     score_cache: cache to read from; defaults to soln.score_cache (SQLite).
-    policy: cache policy key ('erd_all' or 'erd_hard').
+    policy: cache policy key ('erd_all' or 'erd_constrained').
     """
     n = len(soln.current_words)
     sc = score_cache if score_cache is not None else soln.score_cache
@@ -834,7 +834,7 @@ def cmd_solve(gs):
               '(h)ard mode, (a)ll, (s)olved? ', end='')
         ch = input().strip().lower()
         if ch == 'h':
-            iset = InputSet.HARD_MODE
+            iset = InputSet.CONSTRAINT_COMPLIANT
         elif ch == 'a':
             iset = InputSet.ANY_WORD
         elif ch == 's':
@@ -845,7 +845,7 @@ def cmd_solve(gs):
     else:
         labels = {
             InputSet.ANY_WORD:     "any word",
-            InputSet.HARD_MODE:       "hard mode",
+            InputSet.CONSTRAINT_COMPLIANT:       "hard mode",
             InputSet.POSSIBLE_ANSWERS: "possible answers",
         }
         print(f'Candidates: {labels.get(iset, iset.name)}')
@@ -931,7 +931,7 @@ def cmd_grid(gs):
               '(h)ard mode, (a)ll, (s)olved? ', end='')
         ch = input().strip().lower()
         if ch == 'h':
-            iset = InputSet.HARD_MODE
+            iset = InputSet.CONSTRAINT_COMPLIANT
         elif ch == 'a':
             iset = InputSet.ANY_WORD
         elif ch == 's':
@@ -942,7 +942,7 @@ def cmd_grid(gs):
     else:
         labels = {
             InputSet.ANY_WORD:     "any word",
-            InputSet.HARD_MODE:       "hard mode",
+            InputSet.CONSTRAINT_COMPLIANT:       "hard mode",
             InputSet.POSSIBLE_ANSWERS: "possible answers",
         }
         print(f'Candidates: {labels.get(iset, iset.name)}')
@@ -1190,16 +1190,16 @@ def _explain_conflict(pos, guess_word, recorded, hypothetical):
     return f"{letter}: expected {rec}, got {hyp}"
 
 
-def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
+def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
                      all_words=None):
     """
     Compute 3-step expected entropy and group stats for a single word.
     Returns a dict with keys: step1, step2, step3, max_grp, max_grp2,
     wt_avg, prob_finish, buckets.
 
-    step2_pool: candidate pool for step 2. If None and not hard_mode,
+    step2_pool: candidate pool for step 2. If None and not constraint_compliant,
         uses only the subgroup (answers-only mode).
-    hard_mode: if True, compute valid step-2 candidates per subgroup
+    constraint_compliant: if True, compute valid step-2 candidates per subgroup
         by applying the step-1 response constraints to all_words.
     Step 3 always uses subgroup candidates — sub-subgroups are tiny.
     """
@@ -1249,7 +1249,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     # For step-2 SQLite caching, hard mode can't be keyed by subgroup key alone
     # because cands2 depends on the specific (word, pattern) constraint set.
     lc = soln.score_cache
-    policy = None if hard_mode else ('full' if step2_pool is not None else 'hard')
+    policy = None if constraint_compliant else ('full' if step2_pool is not None else 'hard')
 
     step2 = 0.0
     step3 = 0.0
@@ -1262,7 +1262,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         if k <= 1:
             continue
 
-        if hard_mode and all_words:
+        if constraint_compliant and all_words:
             resp = decode_response(pat)
             cands2 = answer_to_restriction(word, resp).apply(all_words)
         elif step2_pool is not None:
@@ -1382,7 +1382,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     }
 
 
-def _compare_words(words, soln, step2_pool=None, hard_mode=False,
+def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
                    all_words=None):
     """Compare 2–4 words side by side."""
     n = len(soln.current_words)
@@ -1392,7 +1392,7 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
     for i, w in enumerate(words):
         if len(words) > 1:
             print(f'  [{i + 1}/{len(words)}] {w.upper()}', flush=True)
-        all_stats.append(_multistep_stats(w, soln, step2_pool, hard_mode, all_words))
+        all_stats.append(_multistep_stats(w, soln, step2_pool, constraint_compliant, all_words))
 
     lw = 9  # "Entropy 1" = 9, "10-49:" = 6
 
@@ -1479,14 +1479,14 @@ def cmd_test(gs, inline=''):
 
     # Derive step-2 pool and hard-mode flag from current input-set setting
     iset = gs.input_set
-    if iset == InputSet.HARD_MODE:
+    if iset == InputSet.CONSTRAINT_COMPLIANT:
         step2_pool = None
-        hard_mode  = True
+        constraint_compliant  = True
     elif iset == InputSet.POSSIBLE_ANSWERS:
         step2_pool = None
-        hard_mode  = False
+        constraint_compliant  = False
     else:  # ANY_WORD — cap at 200 top-entropy words; searching all 12k is ~65x slower
-        hard_mode  = False
+        constraint_compliant  = False
         if (soln.scores_updated
                 and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
             step2_pool = [w for w, _ in soln.scores[:200]]
@@ -1497,7 +1497,7 @@ def cmd_test(gs, inline=''):
     try:
         if 2 <= len(words) <= 4:
             assert all(len(w) == 5 for w in words)
-            _compare_words(words, soln, step2_pool, hard_mode, gs.all_words)
+            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words)
             return
         assert len(words) == 1 and len(words[0]) == 5
         word = words[0]
@@ -1560,9 +1560,9 @@ def cmd_test(gs, inline=''):
 
         # Multi-step lookahead for this word
         if n > 2:
-            st = _multistep_stats(word, soln, step2_pool, hard_mode,
+            st = _multistep_stats(word, soln, step2_pool, constraint_compliant,
                                   gs.all_words)
-            mode = ('hard mode' if hard_mode
+            mode = ('hard mode' if constraint_compliant
                     else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
@@ -1767,7 +1767,7 @@ def cmd_wordcount(gs):
 def cmd_candidates(gs):
     options = [
         (InputSet.ANY_WORD,      "any word"),
-        (InputSet.HARD_MODE,        "hard mode (must use revealed info)"),
+        (InputSet.CONSTRAINT_COMPLIANT,        "hard mode (must use revealed info)"),
         (InputSet.POSSIBLE_ANSWERS, "possible answers"),
     ]
     current_label = next(label for iset, label in options
@@ -1791,7 +1791,7 @@ def cmd_candidates(gs):
 def cmd_help(gs):
     cand_labels = {
         InputSet.ANY_WORD:     "all words",
-        InputSet.HARD_MODE:       "hard mode",
+        InputSet.CONSTRAINT_COMPLIANT:       "hard mode",
         InputSet.POSSIBLE_ANSWERS: "possible answers",
     }
     cand = cand_labels.get(gs.input_set, gs.input_set.name)
@@ -1918,12 +1918,12 @@ class ERDWarmer(threading.Thread):
 
     persist=True  (ANY_WORD / POSSIBLE_ANSWERS): uses a private SQLite
                   ScoreCache connection; results survive across sessions.
-    persist=False (HARD_MODE): uses a MemoryScoreCache; results are transient
+    persist=False (CONSTRAINT_COMPLIANT): uses a MemoryScoreCache; results are transient
                   because the eligible guess set is path-dependent.
                   Caller may pass seed_mem_cache to pre-populate sub-results
                   from a prior run at the same position.
 
-    policy must be passed explicitly: 'erd_all', 'erd_answers', or 'erd_hard'.
+    policy must be passed explicitly: 'erd_all', 'erd_answers', or 'erd_constrained'.
     """
 
     def __init__(self, current_words, all_answers, effective_guesses,
@@ -2037,14 +2037,14 @@ def main():
             _warmer = None
         if gs.single and not gs.solutions[0]._is_full_game():
             soln0 = gs.solutions[0]
-            if gs.input_set == InputSet.HARD_MODE:
-                effective_guesses = soln0.hard_mode_words(gs.all_words)
-                policy = 'erd_hard'
+            if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
+                effective_guesses = soln0.constraint_compliant_words(gs.all_words)
+                policy = 'erd_constrained'
                 persist = False
                 # Reuse sub-results if position is unchanged since last run.
                 cur_frozen = frozenset(soln0.current_words)
-                seed_cache = (gs.hard_erd_cache
-                              if gs.hard_erd_cache_words == cur_frozen
+                seed_cache = (gs.constrained_erd_cache
+                              if gs.constrained_erd_cache_words == cur_frozen
                               else None)
             elif gs.input_set == InputSet.POSSIBLE_ANSWERS:
                 effective_guesses = soln0.current_words
@@ -2087,8 +2087,8 @@ def main():
         if _warmer is not None:
             gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
             if _warmer.mem_cache is not None:
-                gs.hard_erd_cache = _warmer.mem_cache
-                gs.hard_erd_cache_words = frozenset(_warmer._words)
+                gs.constrained_erd_cache = _warmer.mem_cache
+                gs.constrained_erd_cache_words = frozenset(_warmer._words)
             _warmer.stop()
             _warmer = None
 

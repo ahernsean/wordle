@@ -54,7 +54,7 @@ class ScoringMethod(Enum):
 
 class InputSet(Enum):
     ANY_WORD = auto()
-    HARD_MODE = auto()         # real Wordle hard mode: satisfies all constraints
+    CONSTRAINT_COMPLIANT = auto()  # Wordle hard mode: next guess must satisfy all constraints
     POSSIBLE_ANSWERS = auto()  # restrict to remaining possible answers (strictest)
     SOLVED_WORDS = auto()
 
@@ -485,7 +485,7 @@ class Solution:
             self._answer_set = None
         return True
 
-    def hard_mode_words(self, all_words):
+    def constraint_compliant_words(self, all_words):
         """
         Return words from all_words consistent with all prior responses.
         This is real Wordle hard mode: must satisfy green/yellow constraints
