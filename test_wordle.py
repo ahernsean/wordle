@@ -17,7 +17,7 @@ from wordle_engine import (
     min_expected_guesses,
 )
 from cache_sqlite import ScoreCache
-from wordle import _multistep_stats
+from wordle import _multistep_stats, _erd_solve_scores
 
 
 # Small deterministic word sets used across all tests.
@@ -415,6 +415,90 @@ class TestMinExpectedGuesses(unittest.TestCase):
         cost3 = min_expected_guesses(ANSWERS[:3], self.cache, None)
         cost5 = min_expected_guesses(ANSWERS[:5], self.cache, None)
         self.assertLess(cost3, cost5)
+
+
+# ---------------------------------------------------------------------------
+# _erd_solve_scores
+# ---------------------------------------------------------------------------
+
+class TestERDSolveScores(unittest.TestCase):
+    """
+    Tests for _erd_solve_scores, with focus on the singleton subgroup
+    edge case: min_expected_guesses never writes n==1 results to cache
+    (it returns 1.0 as a base case), so _erd_solve_scores must handle
+    them inline rather than via a cache read.
+    """
+
+    def _soln_with_words(self, words, sc):
+        import types
+        cache = ResponseCache(words)
+        return types.SimpleNamespace(
+            current_words=list(words),
+            score_cache=sc,
+            cache=cache,
+        ), cache
+
+    def test_singleton_subgroups_do_not_cause_none(self):
+        """
+        Every pair produces non-all-green singletons (k=1, sg[0]!=word).
+        After min_expected_guesses populates the root, _erd_solve_scores
+        must succeed — not return None — despite singletons being absent
+        from the cache.
+        """
+        words = ANSWERS[:2]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            erd = min_expected_guesses(words, cache, sc)
+            self.assertAlmostEqual(erd, 1.5)
+            # Singletons are NOT in cache — confirm that
+            for w in words:
+                hit = sc.read(ScoreCache.encode_subset([w]), 'erd')
+                self.assertIsNone(hit, f"singleton {w} should not be cached")
+            # _erd_solve_scores must still work
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores, "must not fail on singleton subgroups")
+            self.assertEqual(len(scores), len(words))
+
+    def test_all_candidates_return_correct_cost_for_pair(self):
+        """For any 2-word set both candidates cost exactly 1.5."""
+        words = ANSWERS[:2]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            min_expected_guesses(words, cache, sc)
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores)
+            for word, cost in scores:
+                self.assertAlmostEqual(cost, 1.5, places=10,
+                                       msg=f"cost for {word}")
+
+    def test_results_sorted_ascending(self):
+        """Scores are returned lowest-first (best play first)."""
+        words = ANSWERS[:5]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            min_expected_guesses(words, cache, sc)
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores)
+            costs = [c for _, c in scores]
+            self.assertEqual(costs, sorted(costs))
+
+    def test_best_word_matches_root_cache(self):
+        """The top-ranked word must match what min_expected_guesses chose."""
+        words = ANSWERS[:5]
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
+            soln, cache = self._soln_with_words(words, sc)
+            min_expected_guesses(words, cache, sc)
+            root_hit = sc.read(ScoreCache.encode_subset(words), 'erd')
+            self.assertIsNotNone(root_hit)
+            scores = _erd_solve_scores(soln)
+            self.assertIsNotNone(scores)
+            best_word, best_cost = scores[0]
+            self.assertEqual(best_word, root_hit[0])
+            self.assertAlmostEqual(best_cost, root_hit[1], places=10)
 
 
 # ---------------------------------------------------------------------------
