@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b46"
+BUILD = "b47"
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +844,7 @@ def cmd_solve(gs):
             return
     else:
         labels = {
-            InputSet.ALL_GUESSES:     "all words",
+            InputSet.ALL_GUESSES:     "any word",
             InputSet.HARD_MODE:       "hard mode",
             InputSet.POSSIBLE_ANSWERS: "possible answers",
         }
@@ -941,7 +941,7 @@ def cmd_grid(gs):
             return
     else:
         labels = {
-            InputSet.ALL_GUESSES:     "all words",
+            InputSet.ALL_GUESSES:     "any word",
             InputSet.HARD_MODE:       "hard mode",
             InputSet.POSSIBLE_ANSWERS: "possible answers",
         }
@@ -1766,14 +1766,15 @@ def cmd_wordcount(gs):
 
 def cmd_candidates(gs):
     options = [
-        (InputSet.ALL_GUESSES,     "all words"),
-        (InputSet.HARD_MODE,       "hard mode (must use revealed info)"),
+        (InputSet.ALL_GUESSES,      "any word"),
+        (InputSet.HARD_MODE,        "hard mode (must use revealed info)"),
         (InputSet.POSSIBLE_ANSWERS, "possible answers"),
     ]
-    print("\nCandidates mode:")
-    for i, (iset, label) in enumerate(options, 1):
-        marker = "→" if iset == gs.input_set else " "
-        print(f"  {marker}{i}. {label}")
+    current_label = next(label for iset, label in options
+                         if iset == gs.input_set)
+    print(f"\nCandidates mode (current: {current_label}):")
+    for i, (_, label) in enumerate(options, 1):
+        print(f"  {i}. {label}")
     print("Choose (1-3)? ", end="")
     try:
         raw = int(input().strip())
