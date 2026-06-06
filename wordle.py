@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b37"
+BUILD = "b38"
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +556,7 @@ class GameState:
                                    self.score_cache)]
         self.columns = 1
         self.input_set = InputSet.ALL_GUESSES
+        self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
 
     def reset_all(self):
         self.solutions = [Solution(self.all_answers,
@@ -768,7 +769,14 @@ def cmd_solve(gs):
         print(f"  {erd_idx}. ERD: expected remaining depth (v)"
               f"  [{erd_root[1]:.3f} from here]")
     else:
-        print(f"  {erd_idx}. ERD: expected remaining depth  (not ready)")
+        done, total = gs.last_erd_progress
+        if total == 0:
+            prog = 'not ready'
+        elif done < total:
+            prog = f'{done}/{total} subgroups'
+        else:
+            prog = 'finishing root...'
+        print(f"  {erd_idx}. ERD: expected remaining depth  ({prog})")
     print(f"Choose (1-{erd_idx})? ", end='')
     try:
         raw = int(input().strip())
@@ -1903,6 +1911,8 @@ class ERDWarmer(threading.Thread):
         self._cache_path = score_cache_path
         self._rcache = response_cache
         self._cancel = threading.Event()
+        self.subgroups_done = 0   # incremented after each subgroup is cached
+        self.subgroups_total = 0  # set after collection; 0 means still collecting
 
     def stop(self):
         self._cancel.set()
@@ -1939,17 +1949,20 @@ class ERDWarmer(threading.Thread):
         # Smallest subgroups first: fastest to compute, most reuse as
         # sub-subgroups of larger ones computed later.
         work.sort()
+        self.subgroups_total = len(work)  # now bounded; 0 = still collecting
 
         for _size, sg in work:
             if self._cancel.is_set():
                 return
             sk = ScoreCache.encode_subset(sg)
             if score_cache.read(sk, 'erd') is not None:
+                self.subgroups_done += 1
                 continue  # already in cache
             # Short deadline so an unexpectedly expensive subgroup doesn't
             # block the cancel signal for long.
             deadline = time.time() + 5.0
             min_expected_guesses(sg, self._rcache, score_cache, deadline)
+            self.subgroups_done += 1
 
         # All subgroups done. Now compute the root (current position).
         # If all first-level subgroups were cached above, this reads from
@@ -2011,6 +2024,7 @@ def main():
             break
 
         if _warmer is not None:
+            gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
             _warmer.stop()
             _warmer = None
 
