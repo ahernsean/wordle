@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b38"
+BUILD = "b39"
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +726,9 @@ def _erd_solve_scores(soln):
                 continue
             if k == 1 and sg[0] == word:
                 continue  # all-green branch: solved, 0 extra guesses
+            if k == 1:
+                cost += 1.0 / n  # base case: one word left = 1 more guess
+                continue
             hit = sc.read(ScoreCache.encode_subset(sg), 'erd')
             if hit is None:
                 ok = False
