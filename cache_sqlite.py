@@ -76,6 +76,12 @@ class ScoreCache:
         self._conn.execute(
             "DELETE FROM lookahead_result WHERE policy = 'erd'"
         )
+        # Drop rows written under 'erd_hard' (renamed to 'erd_constrained').
+        # Constraint-compliant mode is now always transient (MemoryScoreCache),
+        # so persisted entries are useless regardless of age.
+        self._conn.execute(
+            "DELETE FROM lookahead_result WHERE policy = 'erd_hard'"
+        )
 
     def _ensure_universe(self):
         canonical = "\n".join(self.answer_words)
