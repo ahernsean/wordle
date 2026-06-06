@@ -71,6 +71,11 @@ class ScoreCache:
         self._conn.execute(
             "DELETE FROM lookahead_result WHERE instr(subset_key, char(0)) > 0"
         )
+        # Drop rows written under the old 'erd' policy (renamed to 'erd_answers'
+        # and then superseded by 'erd_all').  One-time cleanup; harmless if already done.
+        self._conn.execute(
+            "DELETE FROM lookahead_result WHERE policy = 'erd'"
+        )
 
     def _ensure_universe(self):
         canonical = "\n".join(self.answer_words)
@@ -160,3 +165,27 @@ class ScoreCache:
             SELECT COUNT(*) AS c FROM word_scores WHERE universe_id = ?
         """, (self.universe_id,)).fetchone()
         return la["c"] or 0, ws["c"] or 0, la["m"]
+
+
+class MemoryScoreCache:
+    """Transient in-memory ERD cache for path-dependent computations (hard mode).
+
+    Implements the same read/write/encode_subset interface as ScoreCache so it
+    can be passed directly to min_expected_guesses.  Results are never persisted.
+    """
+
+    def __init__(self):
+        self._data = {}  # (subset_key_bytes, policy) -> (best_word, best_score)
+
+    def read(self, subset_key, policy):
+        return self._data.get((subset_key, policy))
+
+    def write(self, subset_key, policy, best_word, best_entropy):
+        self._data[(subset_key, policy)] = (best_word, best_entropy)
+
+    def close(self):
+        pass
+
+    @staticmethod
+    def encode_subset(words):
+        return ScoreCache.encode_subset(words)
