@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b44"
+BUILD = "b45"
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +698,7 @@ def _input_wordlist(gs, soln, iset):
     """Resolve InputSet to the appropriate word list."""
     if iset == InputSet.HARD_MODE:
         return soln.hard_mode_words(gs.all_guesses)
-    if iset == InputSet.CURRENT_WORDLIST:
+    if iset == InputSet.POSSIBLE_ANSWERS:
         return soln.current_words
     if iset == InputSet.SOLVED_WORDS:
         return [
@@ -713,11 +713,11 @@ def _erd_cache_and_policy(gs, soln):
 
     ALL_GUESSES      → SQLite,            'erd_all'
     HARD_MODE        → MemoryScoreCache,  'erd_hard'
-    CURRENT_WORDLIST → SQLite,            'erd_answers'
+    POSSIBLE_ANSWERS → SQLite,            'erd_answers'
     """
     if gs.input_set == InputSet.HARD_MODE:
         return gs.hard_erd_cache, 'erd_hard'
-    elif gs.input_set == InputSet.CURRENT_WORDLIST:
+    elif gs.input_set == InputSet.POSSIBLE_ANSWERS:
         return soln.score_cache, 'erd_answers'
     else:
         return soln.score_cache, 'erd_all'
@@ -844,11 +844,11 @@ def cmd_solve(gs):
             return
     else:
         labels = {
-            InputSet.ALL_GUESSES:     "all guesses",
+            InputSet.ALL_GUESSES:     "all words",
             InputSet.HARD_MODE:       "hard mode",
-            InputSet.CURRENT_WORDLIST: "answers only",
+            InputSet.POSSIBLE_ANSWERS: "possible answers",
         }
-        print(f'Input: {labels.get(iset, iset.name)}')
+        print(f'Candidates: {labels.get(iset, iset.name)}')
 
     wordlist = _input_wordlist(gs, soln, iset)
     if not wordlist:
@@ -941,11 +941,11 @@ def cmd_grid(gs):
             return
     else:
         labels = {
-            InputSet.ALL_GUESSES:     "all guesses",
+            InputSet.ALL_GUESSES:     "all words",
             InputSet.HARD_MODE:       "hard mode",
-            InputSet.CURRENT_WORDLIST: "answers only",
+            InputSet.POSSIBLE_ANSWERS: "possible answers",
         }
-        print(f'Input: {labels.get(iset, iset.name)}')
+        print(f'Candidates: {labels.get(iset, iset.name)}')
 
     wordlist = _input_wordlist(gs, soln, iset)
     if not wordlist:
@@ -1059,7 +1059,7 @@ def cmd_lookahead(gs):
             or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
         print("Computing entropy ranking for lookahead...")
         rank_words = (soln.current_words
-                      if gs.input_set == InputSet.CURRENT_WORDLIST
+                      if gs.input_set == InputSet.POSSIBLE_ANSWERS
                       else gs.all_guesses)
         tracker = ProgressTracker(len(rank_words))
         soln.compute_scores(
@@ -1072,10 +1072,10 @@ def cmd_lookahead(gs):
     top_n = soln.scores[:count]
 
     # Answers-only mode: restrict step-2 candidates to the subgroup
-    is_answers_only = (gs.input_set == InputSet.CURRENT_WORDLIST)
+    is_answers_only = (gs.input_set == InputSet.POSSIBLE_ANSWERS)
     if is_answers_only:
         second_step_words = None
-        mode_label = "answers only (subgroup)"
+        mode_label = "possible answers (subgroup)"
     else:
         step2_count = max(count * count, 100)
         second_step_words = [w for w, _s in soln.scores[:step2_count]]
@@ -1482,7 +1482,7 @@ def cmd_test(gs, inline=''):
     if iset == InputSet.HARD_MODE:
         step2_pool = None
         hard_mode  = True
-    elif iset == InputSet.CURRENT_WORDLIST:
+    elif iset == InputSet.POSSIBLE_ANSWERS:
         step2_pool = None
         hard_mode  = False
     else:  # ALL_GUESSES — cap at 200 top-entropy words; searching all 12k is ~65x slower
@@ -1563,7 +1563,7 @@ def cmd_test(gs, inline=''):
             st = _multistep_stats(word, soln, step2_pool, hard_mode,
                                   gs.all_guesses)
             mode = ('hard mode' if hard_mode
-                    else (f'top {len(step2_pool)}' if step2_pool else 'answers only'))
+                    else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
             erd   = st.get('erd')
@@ -1764,37 +1764,23 @@ def cmd_wordcount(gs):
 # Command: Hard mode toggle
 # ---------------------------------------------------------------------------
 
-def cmd_hardmode(gs):
-    cycle = {
-        InputSet.ALL_GUESSES:      InputSet.HARD_MODE,
-        InputSet.HARD_MODE:        InputSet.CURRENT_WORDLIST,
-        InputSet.CURRENT_WORDLIST: InputSet.ALL_GUESSES,
-    }
-    labels = {
-        InputSet.ALL_GUESSES:      "all guesses (normal)",
-        InputSet.HARD_MODE:        "hard mode (satisfies constraints)",
-        InputSet.CURRENT_WORDLIST: "answers only (strictest)",
-    }
-    gs.input_set = cycle.get(gs.input_set, InputSet.ALL_GUESSES)
-    print(f"  Input set: {labels[gs.input_set]}")
-
-
-# ---------------------------------------------------------------------------
-# Command: Cache info
-# ---------------------------------------------------------------------------
-
-def cmd_cacheinfo(gs):
-    lc = gs.score_cache
-    la_rows, ws_rows, mtime = lc.stats()
-    if mtime:
-        ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
-    else:
-        ts = "n/a"
-    print("\nScore cache:")
-    print(f"  db path:       {gs.score_cache_path}")
-    print(f"  subgroup rows: {la_rows:,}")
-    print(f"  word scores:   {ws_rows:,}")
-    print(f"  last write:    {ts}")
+def cmd_candidates(gs):
+    options = [
+        (InputSet.ALL_GUESSES,     "all words"),
+        (InputSet.HARD_MODE,       "hard mode (must use revealed info)"),
+        (InputSet.POSSIBLE_ANSWERS, "possible answers"),
+    ]
+    print("\nCandidates mode:")
+    for i, (iset, label) in enumerate(options, 1):
+        marker = "*" if iset == gs.input_set else " "
+        print(f"  {marker}{i}. {label}")
+    print("Choose (1-3)? ", end="")
+    try:
+        raw = int(input().strip())
+        gs.input_set = options[raw - 1][0]
+        print(f"  Candidates: {options[raw - 1][1]}")
+    except (ValueError, IndexError):
+        print_error("Invalid choice.")
 
 
 # ---------------------------------------------------------------------------
@@ -1802,12 +1788,12 @@ def cmd_cacheinfo(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_help(gs):
-    iset_labels = {
-        InputSet.ALL_GUESSES:      "all guesses",
-        InputSet.HARD_MODE:        "hard mode",
-        InputSet.CURRENT_WORDLIST: "answers only",
+    cand_labels = {
+        InputSet.ALL_GUESSES:     "all words",
+        InputSet.HARD_MODE:       "hard mode",
+        InputSet.POSSIBLE_ANSWERS: "possible answers",
     }
-    iset = iset_labels.get(gs.input_set, gs.input_set.name)
+    cand = cand_labels.get(gs.input_set, gs.input_set.name)
     if gs.single:
         aw = gs.solutions[0].answer_word
         sim = aw.upper() if aw else "off"
@@ -1818,6 +1804,9 @@ def cmd_help(gs):
         )
         sim = f"{sim_count}/{len(gs.solutions)} set"
         nguesses = "?"
+    lc = gs.score_cache
+    la_rows, ws_rows, mtime = lc.stats()
+    cache_ts = (datetime.utcfromtimestamp(mtime).isoformat() + "Z") if mtime else "n/a"
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
@@ -1831,9 +1820,11 @@ def cmd_help(gs):
   r = Reset
   a = Answer for simulation ({sim})
   w = Game count (quordle, etc.)
-  h = Input set: {iset}
-  c = Cache info
+  c = Candidates: {cand}
   ? = This help
+
+  Cache: {gs.score_cache_path}
+    {la_rows:,} subgroup rows, {ws_rows:,} word scores, last write {cache_ts}
 """)
 
 
@@ -1854,8 +1845,7 @@ COMMANDS = {
     'r': cmd_reset,
     'a': cmd_answer,
     'w': cmd_wordcount,
-    'h': cmd_hardmode,
-    'c': cmd_cacheinfo,
+    'c': cmd_candidates,
     '?': cmd_help,
 }
 
@@ -1925,7 +1915,7 @@ class ERDWarmer(threading.Thread):
     Runs while the main thread blocks on input(), giving background ERD
     computation at zero latency cost to the user.
 
-    persist=True  (ALL_GUESSES / CURRENT_WORDLIST): uses a private SQLite
+    persist=True  (ALL_GUESSES / POSSIBLE_ANSWERS): uses a private SQLite
                   ScoreCache connection; results survive across sessions.
     persist=False (HARD_MODE): uses a MemoryScoreCache; results are transient
                   because the eligible guess set is path-dependent.
@@ -2055,7 +2045,7 @@ def main():
                 seed_cache = (gs.hard_erd_cache
                               if gs.hard_erd_cache_words == cur_frozen
                               else None)
-            elif gs.input_set == InputSet.CURRENT_WORDLIST:
+            elif gs.input_set == InputSet.POSSIBLE_ANSWERS:
                 effective_guesses = soln0.current_words
                 policy = 'erd_answers'
                 persist = True
@@ -2077,7 +2067,7 @@ def main():
             )
             _warmer.start()
 
-        print(f"\nCommand (gsbldtixurаwhc?)? ", end="")
+        print(f"\nCommand (gsbldtixurawc?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:

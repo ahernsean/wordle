@@ -54,8 +54,8 @@ class ScoringMethod(Enum):
 
 class InputSet(Enum):
     ALL_GUESSES = auto()
-    HARD_MODE = auto()        # real Wordle hard mode: satisfies all constraints
-    CURRENT_WORDLIST = auto() # restrict to remaining possible answers (strictest)
+    HARD_MODE = auto()         # real Wordle hard mode: satisfies all constraints
+    POSSIBLE_ANSWERS = auto()  # restrict to remaining possible answers (strictest)
     SOLVED_WORDS = auto()
 
 
