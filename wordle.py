@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b36"
+BUILD = "b37"
 
 
 # ---------------------------------------------------------------------------
@@ -765,10 +765,11 @@ def cmd_solve(gs):
         arrow = "^" if m.higher_is_better else "v"
         print(f"  {i + 1}. {m.label} ({arrow})")
     if erd_root is not None:
-        print(f"  {erd_idx}. ERD: exact expected guesses (v)"
-              f"  [{erd_root[1]:.3f} optimal from here]")
-    n_opts = erd_idx if erd_root else len(methods)
-    print(f"Choose (1-{n_opts})? ", end='')
+        print(f"  {erd_idx}. ERD: expected remaining depth (v)"
+              f"  [{erd_root[1]:.3f} from here]")
+    else:
+        print(f"  {erd_idx}. ERD: expected remaining depth  (not ready)")
+    print(f"Choose (1-{erd_idx})? ", end='')
     try:
         raw = int(input().strip())
     except ValueError:
@@ -776,12 +777,15 @@ def cmd_solve(gs):
         return
 
     # ERD branch: no input wordlist needed, candidates are always current_words.
-    if erd_root is not None and raw == erd_idx:
+    if raw == erd_idx:
+        if erd_root is None:
+            print_error("ERD tree not ready yet. Wait for the [ERD ready] notification.")
+            return
         scores = _erd_solve_scores(soln)
         if scores is None:
             print_error("ERD cache incomplete — some subgroups missing.")
             return
-        print(f"\nERD (exact expected guesses, lower = better):")
+        print(f"\nERD (expected remaining depth, lower = better):")
         print(f"Optimal: {erd_root[1]:.4f}  best word: {erd_root[0].upper()}")
         print("Best guesses:")
         print_scored_list(scores, method=None)
@@ -1536,7 +1540,7 @@ def cmd_test(gs, inline=''):
             _vw = max(len(f'{v:.4f}') for v in chain_vals)
             _rows = []
             if erd is not None:
-                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp guesses'))
+                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp remaining depth'))
             _rows += [
                 ('Entropy 1:', f'{st["step1"]:>{_vw}.4f}'),
                 ('+ ent. 2:',  f'{st["step2"]:>{_vw}.4f}'),
@@ -1959,7 +1963,7 @@ class ERDWarmer(threading.Thread):
                 self._words, self._rcache, score_cache, deadline
             )
             if result is not None:
-                print(f'\n  [ERD ready: {result:.3f} expected guesses]',
+                print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
                       flush=True)
 
 
