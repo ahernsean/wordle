@@ -6,3 +6,7 @@ __pycache__/
 wordle_cache.sqlite3
 wordle_cache.sqlite3-shm
 wordle_cache.sqlite3-wal
+lookahead_cache.sqlite3
+lookahead_cache.sqlite3-shm
+lookahead_cache.sqlite3-wal
+*.p
