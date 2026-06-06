@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b43"
+BUILD = "b44"
 
 
 # ---------------------------------------------------------------------------
@@ -708,6 +708,21 @@ def _input_wordlist(gs, soln, iset):
     return gs.all_guesses
 
 
+def _erd_cache_and_policy(gs, soln):
+    """Return (score_cache, policy) appropriate for the current input mode.
+
+    ALL_GUESSES      → SQLite,            'erd_all'
+    HARD_MODE        → MemoryScoreCache,  'erd_hard'
+    CURRENT_WORDLIST → SQLite,            'erd_answers'
+    """
+    if gs.input_set == InputSet.HARD_MODE:
+        return gs.hard_erd_cache, 'erd_hard'
+    elif gs.input_set == InputSet.CURRENT_WORDLIST:
+        return soln.score_cache, 'erd_answers'
+    else:
+        return soln.score_cache, 'erd_all'
+
+
 def _erd_solve_scores(soln, score_cache=None, policy='erd_all'):
     """
     Rank all current_words candidates by ERD using only cached values.
@@ -762,20 +777,12 @@ def cmd_solve(gs):
     set_display_context(soln)
 
     # ERD option: available when the full tree for this position is cached
-    # (SQLite for all-guesses mode; in-memory for hard mode).
+    # for the current input mode.
     erd_root = None
-    erd_sc = None
-    erd_policy = 'erd_all'
-    if not soln._is_full_game():
+    erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+    if not soln._is_full_game() and erd_sc is not None:
         root_key = ScoreCache.encode_subset(soln.current_words)
-        erd_root = soln.score_cache.read(root_key, 'erd_all')
-        if erd_root is not None:
-            erd_sc = soln.score_cache
-        elif gs.hard_erd_cache is not None:
-            erd_root = gs.hard_erd_cache.read(root_key, 'erd_hard')
-            if erd_root is not None:
-                erd_sc = gs.hard_erd_cache
-                erd_policy = 'erd_hard'
+        erd_root = erd_sc.read(root_key, erd_policy)
 
     methods = list(ScoringMethod)
     erd_idx = len(methods) + 1
@@ -1875,12 +1882,11 @@ def print_status(gs):
         else:
             erd_tag = ''
             if not soln._is_full_game():
-                sk = ScoreCache.encode_subset(words)
-                hit = soln.score_cache.read(sk, 'erd_all')
-                if hit is None and gs.hard_erd_cache is not None:
-                    hit = gs.hard_erd_cache.read(sk, 'erd_hard')
-                if hit is not None:
-                    erd_tag = f'  [ERD: {hit[1]:.3f}]'
+                erd_sc, erd_pol = _erd_cache_and_policy(gs, soln)
+                if erd_sc is not None:
+                    hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
+                    if hit is not None:
+                        erd_tag = f'  [ERD: {hit[1]:.3f}]'
             print(f"{n:,} words remaining{erd_tag}")
     else:
         n = len(gs.solutions)
@@ -1919,23 +1925,26 @@ class ERDWarmer(threading.Thread):
     Runs while the main thread blocks on input(), giving background ERD
     computation at zero latency cost to the user.
 
-    persist=True  (all-guesses mode): uses a private SQLite ScoreCache connection;
-                  results survive across sessions under policy 'erd_all'.
-    persist=False (hard mode): uses a MemoryScoreCache; results are transient
-                  (path-dependent eligible guesses make cross-session caching
-                  useless).  policy='erd_hard'.  Caller may pass seed_mem_cache
-                  to pre-populate sub-results from a prior run at the same position.
+    persist=True  (ALL_GUESSES / CURRENT_WORDLIST): uses a private SQLite
+                  ScoreCache connection; results survive across sessions.
+    persist=False (HARD_MODE): uses a MemoryScoreCache; results are transient
+                  because the eligible guess set is path-dependent.
+                  Caller may pass seed_mem_cache to pre-populate sub-results
+                  from a prior run at the same position.
+
+    policy must be passed explicitly: 'erd_all', 'erd_answers', or 'erd_hard'.
     """
 
     def __init__(self, current_words, all_answers, effective_guesses,
                  score_cache_path, response_cache,
-                 persist=True, seed_mem_cache=None):
+                 policy='erd_all', persist=True, seed_mem_cache=None):
         super().__init__(daemon=True, name='ERDWarmer')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
         self._effective_guesses = effective_guesses
         self._cache_path = score_cache_path
         self._rcache = response_cache
+        self._policy = policy
         self._persist = persist
         self._seed_mem_cache = seed_mem_cache
         self._cancel = threading.Event()
@@ -1961,7 +1970,7 @@ class ERDWarmer(threading.Thread):
                 score_cache.close()
 
     def _warm(self, score_cache):
-        policy = 'erd_all' if self._persist else 'erd_hard'
+        policy = self._policy
 
         # Collect every unique subgroup produced by each candidate word.
         seen = set()
@@ -2039,14 +2048,21 @@ def main():
             soln0 = gs.solutions[0]
             if gs.input_set == InputSet.HARD_MODE:
                 effective_guesses = soln0.hard_mode_words(gs.all_guesses)
+                policy = 'erd_hard'
                 persist = False
                 # Reuse sub-results if position is unchanged since last run.
                 cur_frozen = frozenset(soln0.current_words)
                 seed_cache = (gs.hard_erd_cache
                               if gs.hard_erd_cache_words == cur_frozen
                               else None)
-            else:
+            elif gs.input_set == InputSet.CURRENT_WORDLIST:
+                effective_guesses = soln0.current_words
+                policy = 'erd_answers'
+                persist = True
+                seed_cache = None
+            else:  # ALL_GUESSES
                 effective_guesses = gs.all_guesses
+                policy = 'erd_all'
                 persist = True
                 seed_cache = None
             _warmer = ERDWarmer(
@@ -2055,6 +2071,7 @@ def main():
                 effective_guesses,
                 gs.score_cache_path,
                 gs.cache,
+                policy=policy,
                 persist=persist,
                 seed_mem_cache=seed_cache,
             )
