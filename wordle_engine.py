@@ -53,7 +53,7 @@ class ScoringMethod(Enum):
 
 
 class InputSet(Enum):
-    ALL_GUESSES = auto()
+    ANY_WORD = auto()
     HARD_MODE = auto()         # real Wordle hard mode: satisfies all constraints
     POSSIBLE_ANSWERS = auto()  # restrict to remaining possible answers (strictest)
     SOLVED_WORDS = auto()
@@ -376,14 +376,14 @@ class Solution:
     answers, guess history, cached scores, and (optionally) a known
     answer word for simulation mode.
 
-    If all_guesses is provided, falls back to it when the answer
+    If all_words is provided, falls back to it when the answer
     list is exhausted (word not in answer list).
     """
 
-    def __init__(self, answer_words, all_guesses=None,
+    def __init__(self, answer_words, all_words=None,
                  cache=None, score_cache=None):
         self.all_answers = answer_words
-        self.all_guesses = all_guesses
+        self.all_words = all_words
         self.cache = cache
         self.score_cache = score_cache
         self.reset()
@@ -442,7 +442,7 @@ class Solution:
         """
         Apply a guess and its response, filtering the word list.
 
-        If the result is empty and all_guesses is available, replays
+        If the result is empty and all_words is available, replays
         all guesses against the full guess vocabulary as a fallback.
         Returns the number of remaining words (caller should check
         for fallback_active).
@@ -456,9 +456,9 @@ class Solution:
 
         # Fallback: replay all guesses against full vocabulary
         if (len(self.current_words) == 0
-                and self.all_guesses
+                and self.all_words
                 and not self.fallback_active):
-            words = self.all_guesses[:]
+            words = self.all_words[:]
             for gw, gr in self.guesses:
                 words = apply_guess(words, gw, gr)
             if words:
@@ -485,13 +485,13 @@ class Solution:
             self._answer_set = None
         return True
 
-    def hard_mode_words(self, all_guesses):
+    def hard_mode_words(self, all_words):
         """
-        Return words from all_guesses consistent with all prior responses.
+        Return words from all_words consistent with all prior responses.
         This is real Wordle hard mode: must satisfy green/yellow constraints
         but is not restricted to remaining answers.
         """
-        words = list(all_guesses)
+        words = list(all_words)
         for gw, gr in self.guesses:
             words = apply_guess(words, gw, gr)
         return words
@@ -525,7 +525,7 @@ class Solution:
             return None
         first = solutions[0]
         out = Solution(first.all_answers,
-                       first.all_guesses,
+                       first.all_words,
                        first.cache,
                        first.score_cache)
         combined = set()
