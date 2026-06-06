@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b33"
+BUILD = "b34"
 
 
 # ---------------------------------------------------------------------------
@@ -1307,10 +1307,10 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
         ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
         ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
-        ('Entropy 1', [s['step1']       for s in all_stats], '{:.4f}', True),
     ]
     if any(v is not None for v in erd_vals):
         data_rows.append(('ERD', erd_vals, '{:.3f}', False))
+    data_rows.append(('Entropy 1', [s['step1'] for s in all_stats], '{:.4f}', True))
     if n > 2:
         data_rows += [
             ('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}', True),
@@ -1473,13 +1473,14 @@ def cmd_test(gs, inline=''):
             erd   = st.get('erd')
             chain_vals = [st['step1'], st['step2'], st['step3'], total]
             _vw = max(len(f'{v:.4f}') for v in chain_vals)
-            _rows = [('Entropy 1:', f'{st["step1"]:>{_vw}.4f}')]
+            _rows = []
             if erd is not None:
                 _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp guesses'))
             _rows += [
-                ('+ ent. 2:', f'{st["step2"]:>{_vw}.4f}'),
-                ('+ ent. 3:', f'{st["step3"]:>{_vw}.4f}'),
-                ('Total:',    f'{total:>{_vw}.4f}'),
+                ('Entropy 1:', f'{st["step1"]:>{_vw}.4f}'),
+                ('+ ent. 2:',  f'{st["step2"]:>{_vw}.4f}'),
+                ('+ ent. 3:',  f'{st["step3"]:>{_vw}.4f}'),
+                ('Total:',     f'{total:>{_vw}.4f}'),
             ]
             _lw = max(len(lbl) for lbl, _ in _rows)
             for lbl, val in _rows:
