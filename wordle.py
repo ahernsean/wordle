@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b34"
+BUILD = "b35"
 
 
 # ---------------------------------------------------------------------------
@@ -1885,6 +1885,21 @@ class ERDWarmer(threading.Thread):
             # block the cancel signal for long.
             deadline = time.time() + 5.0
             min_expected_guesses(sg, self._rcache, score_cache, deadline)
+
+        # All subgroups done. Now compute the root (current position).
+        # If all first-level subgroups were cached above, this reads from
+        # cache and finishes in O(n) SQLite reads — fast.
+        if self._cancel.is_set():
+            return
+        root_key = ScoreCache.encode_subset(self._words)
+        if score_cache.read(root_key, 'erd') is None:
+            deadline = time.time() + 30.0
+            result = min_expected_guesses(
+                self._words, self._rcache, score_cache, deadline
+            )
+            if result is not None:
+                print(f'\n  [ERD ready: {result:.3f} expected guesses]',
+                      flush=True)
 
 
 def main():
