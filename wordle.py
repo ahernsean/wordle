@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b32"
+BUILD = "b33"
 
 
 # ---------------------------------------------------------------------------
@@ -1302,12 +1302,15 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
 
     # Build all data rows up front so we can measure max column width
     totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
+    erd_vals = [s.get('erd') for s in all_stats]
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
         ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
         ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
         ('Entropy 1', [s['step1']       for s in all_stats], '{:.4f}', True),
     ]
+    if any(v is not None for v in erd_vals):
+        data_rows.append(('ERD', erd_vals, '{:.3f}', False))
     if n > 2:
         data_rows += [
             ('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}', True),
@@ -1322,10 +1325,6 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
         vals = [s['buckets'][bi] for s in all_stats]
         if any(vals):
             bucket_rows.append((lbl, vals, '{:d}', hb))
-
-    erd_vals = [s.get('erd') for s in all_stats]
-    if any(v is not None for v in erd_vals):
-        data_rows.append(('ERD', erd_vals, '{:.3f}', False))
 
     # Column width: wide enough for word names AND every formatted value.
     # Using a consistent format per row means right-justifying to cw
@@ -1471,18 +1470,20 @@ def cmd_test(gs, inline=''):
                     else (f'top {len(step2_pool)}' if step2_pool else 'answers only'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
-            _rows = [
-                ('Entropy 1:', st['step1']),
-                ('+ ent. 2:',  st['step2']),
-                ('+ ent. 3:',  st['step3']),
-                ('Total:',     total),
+            erd   = st.get('erd')
+            chain_vals = [st['step1'], st['step2'], st['step3'], total]
+            _vw = max(len(f'{v:.4f}') for v in chain_vals)
+            _rows = [('Entropy 1:', f'{st["step1"]:>{_vw}.4f}')]
+            if erd is not None:
+                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp guesses'))
+            _rows += [
+                ('+ ent. 2:', f'{st["step2"]:>{_vw}.4f}'),
+                ('+ ent. 3:', f'{st["step3"]:>{_vw}.4f}'),
+                ('Total:',    f'{total:>{_vw}.4f}'),
             ]
-            _lw = max(len(r[0]) for r in _rows)
-            _vw = max(len(f'{v:.4f}') for _, v in _rows)
+            _lw = max(len(lbl) for lbl, _ in _rows)
             for lbl, val in _rows:
-                print(f'    {lbl:<{_lw}}  {val:>{_vw}.4f}')
-            if st.get('erd') is not None:
-                print(f'    ERD:{"":{_lw - 3}}  {st["erd"]:>{_vw}.3f} exp guesses')
+                print(f'    {lbl:<{_lw}}  {val}')
 
         # Group size distribution
         sorted_groups = sorted(groups.items(), key=lambda x: -x[1])
@@ -1782,7 +1783,13 @@ def print_status(gs):
         elif n == 1:
             print_success(f"Solved: {words[0]}")
         else:
-            print(f"{n:,} words remaining")
+            erd_tag = ''
+            if not soln._is_full_game():
+                sk = ScoreCache.encode_subset(words)
+                hit = soln.score_cache.read(sk, 'erd')
+                if hit is not None:
+                    erd_tag = f'  [ERD: {hit[1]:.3f}]'
+            print(f"{n:,} words remaining{erd_tag}")
     else:
         n = len(gs.solutions)
         print(f'{n} wordlists')
