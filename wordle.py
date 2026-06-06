@@ -38,7 +38,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 GUESS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b45"
+BUILD = "b46"
 
 
 # ---------------------------------------------------------------------------
@@ -1071,9 +1071,9 @@ def cmd_lookahead(gs):
 
     top_n = soln.scores[:count]
 
-    # Answers-only mode: restrict step-2 candidates to the subgroup
-    is_answers_only = (gs.input_set == InputSet.POSSIBLE_ANSWERS)
-    if is_answers_only:
+    # Possible-answers mode: restrict step-2 candidates to the subgroup
+    is_possible_answers = (gs.input_set == InputSet.POSSIBLE_ANSWERS)
+    if is_possible_answers:
         second_step_words = None
         mode_label = "possible answers (subgroup)"
     else:
@@ -1772,7 +1772,7 @@ def cmd_candidates(gs):
     ]
     print("\nCandidates mode:")
     for i, (iset, label) in enumerate(options, 1):
-        marker = "*" if iset == gs.input_set else " "
+        marker = "→" if iset == gs.input_set else " "
         print(f"  {marker}{i}. {label}")
     print("Choose (1-3)? ", end="")
     try:
