@@ -283,7 +283,11 @@ class TestScoreCacheSQLite(unittest.TestCase):
         )
 
     def test_old_null_separated_entries_are_dropped(self):
-        # Simulate a row written with the old encoding (null-separated)
+        # Simulate a row written under BOTH legacy forms at once: the old
+        # null-separated subset-key encoding, and the pre-rename
+        # lookahead_result/best_word/best_entropy table+column names —
+        # genuinely ancient data would carry both, since the encoding
+        # predates the table/column rename.
         import sqlite3 as _sqlite3
         conn = _sqlite3.connect(self.db)
         conn.execute("""
@@ -302,14 +306,46 @@ class TestScoreCacheSQLite(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        # Opening ScoreCache should delete the old-format row
+        # Opening ScoreCache should rename the table/columns to
+        # subgroup_pick/picked_word/picked_score AND delete the old-format row
         ScoreCache(self.db, ANSWERS)
         conn2 = _sqlite3.connect(self.db)
         rows = conn2.execute(
-            "SELECT COUNT(*) FROM lookahead_result WHERE instr(subset_key, char(0)) > 0"
+            "SELECT COUNT(*) FROM subgroup_pick WHERE instr(subset_key, char(0)) > 0"
         ).fetchone()[0]
         conn2.close()
         self.assertEqual(rows, 0)
+
+    def test_old_lookahead_result_table_is_renamed(self):
+        # Simulate a row persisted under the pre-rename table/column names,
+        # WITHOUT the legacy key encoding — i.e. data written between the
+        # subset-key-encoding migration and this table/column rename. Built
+        # entirely without a ScoreCache so subgroup_pick doesn't exist yet —
+        # otherwise the rename-in-place path wouldn't trigger.
+        import hashlib as _hashlib
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lookahead_result (
+                subset_key BLOB NOT NULL, policy TEXT NOT NULL,
+                universe_id TEXT NOT NULL, best_word TEXT NOT NULL,
+                best_entropy REAL NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_key, policy, universe_id)
+            )
+        """)
+        universe_id = _hashlib.sha256("\n".join(ANSWERS).encode()).hexdigest()
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        conn.execute(
+            "INSERT OR REPLACE INTO lookahead_result VALUES (?,?,?,?,?,?)",
+            (subset_key, "hard", universe_id, "heart", 2.5, 0),
+        )
+        conn.commit()
+        conn.close()
+
+        sc = ScoreCache(self.db, ANSWERS)
+        hit = sc.read(subset_key, "hard")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit, ("heart", 2.5))
 
     def test_old_minimax_method_key_is_migrated(self):
         # Simulate rows persisted under the pre-rename method key.
@@ -548,10 +584,10 @@ class TestComputeLookaheadCache(unittest.TestCase):
             subset_key = ScoreCache.encode_subset(subgroup)
             hit = sc.read(subset_key, "hard")
             self.assertIsNotNone(hit)
-            best_word, _best_entropy = hit
+            picked_word, _picked_score = hit
 
             # Every method besides the ranking criterion (entropy, already
-            # captured in lookahead_result) should be persisted too — they
+            # captured in subgroup_pick) should be persisted too — they
             # all come from the same group-count partition, so there's no
             # principled reason to single any of them out.
             for method in ScoringMethod:
@@ -562,8 +598,8 @@ class TestComputeLookaheadCache(unittest.TestCase):
                     cached,
                     f"{method.name}'s score for the cached winner should be "
                     f"persisted alongside its entropy, at near-zero extra cost")
-                cached_value = dict(cached)[best_word]
-                expected_value = score_word(best_word, subgroup, method, cache=s.cache)
+                cached_value = dict(cached)[picked_word]
+                expected_value = score_word(picked_word, subgroup, method, cache=s.cache)
                 self.assertEqual(cached_value, expected_value)
 
 
