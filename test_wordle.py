@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
     calculate_response, score_groups, calculate_group_counts, score_word,
-    min_expected_guesses, ERD_ALL,
+    min_expected_guesses, ERD_ALL, cache_all_scores,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -556,6 +556,49 @@ class TestResponseCachePersistence(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# cache_all_scores — comprehensive per-word persistence from one partition
+# ---------------------------------------------------------------------------
+
+class TestCacheAllScores(unittest.TestCase):
+    """cache_all_scores is the single place that knows the full ScoringMethod
+    roster, so algorithms (compute_lookahead, min_expected_guesses, ...) that
+    merely want to remember a word's standing for a subgroup don't have to —
+    they delegate "comprehensively" to this helper instead of enumerating
+    ScoringMethod themselves. Adding a new ScoringMethod only changes this
+    one function; no algorithm using it needs to change.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_every_scoring_method_persisted_from_single_partition(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        cache = ResponseCache(ANSWERS, score_cache=sc)
+        subgroup = ANSWERS[:6]
+        subset_key = ScoreCache.encode_subset(subgroup)
+
+        cache_all_scores("heart", subgroup, sc, subset_key, cache=cache)
+
+        for method in ScoringMethod:
+            cached = sc.read_scores(subset_key, method.name.lower())
+            self.assertIsNotNone(
+                cached, f"{method.name} should be persisted by cache_all_scores")
+            expected = score_word("heart", subgroup, method, cache=cache)
+            self.assertEqual(dict(cached)["heart"], expected)
+
+    def test_no_op_without_score_cache(self):
+        cache = ResponseCache(ANSWERS)
+        # Must not raise when there's nothing to persist to.
+        cache_all_scores("heart", ANSWERS[:6], None,
+                         ScoreCache.encode_subset(ANSWERS[:6]), cache=cache)
+
+
+# ---------------------------------------------------------------------------
 # compute_lookahead — winner's max-group-size persisted alongside entropy
 # ---------------------------------------------------------------------------
 
@@ -637,6 +680,31 @@ class TestMinExpectedGuesses(unittest.TestCase):
             hit = sc.read(ScoreCache.encode_subset(subset), 'erd_answers')
             self.assertIsNotNone(hit)
             self.assertAlmostEqual(hit[1], result, places=10)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_winner_scores_cached_for_every_method(self):
+        """The ERD winner's standing under every ScoringMethod should be
+        persisted too — same comprehensive treatment as a lookahead winner,
+        via the same cache_all_scores helper, at near-zero extra cost since
+        the partition is already in hand for the winning guess.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            subset = ANSWERS[:4]
+            result = min_expected_guesses(subset, self.cache, sc)
+            self.assertIsNotNone(result)
+            picked_word, _picked_score = sc.read(ScoreCache.encode_subset(subset), 'erd_answers')
+
+            subset_key = ScoreCache.encode_subset(subset)
+            for method in ScoringMethod:
+                cached = sc.read_scores(subset_key, method.name.lower())
+                self.assertIsNotNone(
+                    cached, f"{method.name} should be persisted for the ERD winner")
+                expected = score_word(picked_word, subset, method, cache=self.cache)
+                self.assertEqual(dict(cached)[picked_word], expected)
         finally:
             os.unlink(tmp.name)
 

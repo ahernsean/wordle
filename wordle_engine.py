@@ -396,6 +396,26 @@ def score_word_multi(word, remaining_words, methods,
     return score_groups_multi(groups, methods)
 
 
+def cache_all_scores(word, subgroup, score_cache, subset_key, cache=None):
+    """Derive and persist every ScoringMethod's view of `word` against `subgroup`.
+
+    score_groups' methods all read off the same group-count partition, so
+    once that partition is in hand for one method, the rest are nearly free
+    to derive — persisting only the method an algorithm happened to be
+    ranking by would be an arbitrary cutoff.
+
+    This is the ONE place that enumerates ScoringMethod for caching purposes.
+    Callers (compute_lookahead, min_expected_guesses, ...) just say "this
+    word, for this subgroup, is worth remembering comprehensively" — they
+    don't need to know what the full roster is, or to change when it grows.
+    """
+    if not score_cache:
+        return
+    for method, value in score_word_multi(word, subgroup, list(ScoringMethod),
+                                           cache=cache).items():
+        score_cache.write_scores(subset_key, [(word, value)], method.name.lower())
+
+
 def max_entropy(n):
     """Theoretical maximum entropy for n remaining words: log2(n)."""
     if n <= 1:
@@ -750,18 +770,8 @@ class Solution:
                             best_word = candidate
                     if lc and best_word is not None and subset_key is not None:
                         lc.write(subset_key, policy, best_word, best)
-                        # The other scoring methods come from the very same
-                        # group-count partition score_word_multi just shares
-                        # across all of them — so persisting only the ranking
-                        # criterion (entropy) here would be an arbitrary cutoff.
-                        # Cache every method's view of this winner while it's
-                        # nearly free to compute.
-                        other_methods = [m for m in ScoringMethod if m != method]
-                        other_scores = score_word_multi(best_word, subgroup,
-                                                         other_methods, cache=cache)
-                        for m, s in other_scores.items():
-                            lc.write_scores(subset_key, [(best_word, s)],
-                                            m.name.lower())
+                        cache_all_scores(best_word, subgroup, lc, subset_key,
+                                         cache=cache)
 
                 weighted_second += (cnt / n) * best
 
@@ -869,5 +879,6 @@ def min_expected_guesses(remaining, cache, score_cache,
 
     if score_cache and best_word is not None:
         score_cache.write(subset_key, policy, best_word, best_erd)
+        cache_all_scores(best_word, remaining, score_cache, subset_key, cache=cache)
 
     return best_erd
