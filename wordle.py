@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b54"
+BUILD = "b55"
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +756,25 @@ _ERD_MODE_CONFIG = {
 def _erd_mode_config(gs):
     """ERD config for the current input mode; any other mode behaves as ANY_WORD."""
     return _ERD_MODE_CONFIG.get(gs.input_set, _ERD_MODE_CONFIG[InputSet.ANY_WORD])
+
+
+def _warmer_branch_key(gs, soln, effective_guesses):
+    """Identifies the (position, guess-vocabulary) a warmer is working on.
+
+    Two snapshots compare equal exactly when a running warmer is still doing
+    useful work for the branch the user is now looking at — i.e. when it is
+    safe to just let it keep going rather than tearing it down and starting
+    an identical one from scratch (which would race the old one to compute
+    and announce the very same root result).
+
+    current_words alone is not enough in CONSTRAINT_COMPLIANT mode: the
+    eligible-guess vocabulary is path-dependent, so the same remaining-word
+    set can arise from genuinely different guess histories (e.g. via undo)
+    with different effective_guesses — hence the vocabulary fingerprint.
+    """
+    vocab_fp = (MemoryScoreCache.fingerprint_vocabulary(effective_guesses)
+                if gs.input_set == InputSet.CONSTRAINT_COMPLIANT else None)
+    return (tuple(sorted(soln.current_words)), gs.input_set, vocab_fp)
 
 
 def _erd_cache_and_policy(gs, soln):
@@ -2150,7 +2169,7 @@ class ERDWarmer(threading.Thread):
                 guesses=self._effective_guesses,
                 policy=policy,
             )
-            if result is not None:
+            if result is not None and not self._cancel.is_set():
                 print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
                       flush=True)
 
@@ -2166,38 +2185,52 @@ def main():
 
     print_status(gs)
     _warmer = None
+    _warmer_key = None
     while True:
-        # Start a fresh warmer for the current game position.  It runs
-        # while input() blocks and is stopped as soon as the user types.
-        if _warmer is not None:
-            _warmer.stop()
-            _warmer = None
+        # Keep a warmer running for the current game position across REPL
+        # turns — tearing it down and rebuilding it on every keystroke (even
+        # when the branch hasn't changed) starves it of the very thing that
+        # makes it useful: minutes of uninterrupted background time to build
+        # out the ERD cache.  It also raced a fresh warmer against the old
+        # one's still-finishing root computation, producing duplicate
+        # "[ERD ready]" announcements for the same value.  Replace it only
+        # when the branch actually changes (or the game ends); otherwise let
+        # it keep going while input() blocks.
         if gs.single and not gs.solutions[0]._is_full_game():
             soln0 = gs.solutions[0]
             cfg = _erd_mode_config(gs)
             effective_guesses = cfg.guesses_fn(gs, soln0)
-            seed_cache = None
-            if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
-                # Hard-mode ERD results are valid only for the exact eligible-
-                # guess vocabulary that produced them.  Scope the long-lived
-                # cache to that vocabulary's fingerprint: entries from other
-                # vocabularies become invisible (no false hits across undo /
-                # reset / replay), while a recurring vocabulary's entries
-                # become reusable again automatically — no eviction needed.
-                gs.constrained_erd_cache.set_scope(
-                    MemoryScoreCache.fingerprint_vocabulary(effective_guesses))
-                seed_cache = gs.constrained_erd_cache
-            _warmer = ERDWarmer(
-                soln0.current_words,
-                gs.all_answers,
-                effective_guesses,
-                gs.score_cache_path,
-                gs.cache,
-                policy=cfg.policy,
-                persist=cfg.persist,
-                seed_mem_cache=seed_cache,
-            )
-            _warmer.start()
+            branch_key = _warmer_branch_key(gs, soln0, effective_guesses)
+            if _warmer is None or not _warmer.is_alive() or branch_key != _warmer_key:
+                if _warmer is not None:
+                    _warmer.stop()
+                seed_cache = None
+                if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
+                    # Hard-mode ERD results are valid only for the exact
+                    # eligible-guess vocabulary that produced them.  Scope the
+                    # long-lived cache to that vocabulary's fingerprint:
+                    # entries from other vocabularies become invisible (no
+                    # false hits across undo / reset / replay), while a
+                    # recurring vocabulary's entries become reusable again
+                    # automatically — no eviction needed.
+                    gs.constrained_erd_cache.set_scope(branch_key[2])
+                    seed_cache = gs.constrained_erd_cache
+                _warmer = ERDWarmer(
+                    soln0.current_words,
+                    gs.all_answers,
+                    effective_guesses,
+                    gs.score_cache_path,
+                    gs.cache,
+                    policy=cfg.policy,
+                    persist=cfg.persist,
+                    seed_mem_cache=seed_cache,
+                )
+                _warmer.start()
+                _warmer_key = branch_key
+        elif _warmer is not None:
+            _warmer.stop()
+            _warmer = None
+            _warmer_key = None
 
         print(f"\nCommand (gsbldtixurawc?)? ", end="")
         try:
@@ -2217,8 +2250,6 @@ def main():
 
         if _warmer is not None:
             gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
-            _warmer.stop()
-            _warmer = None
 
         if not cmd:
             print_status(gs)

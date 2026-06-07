@@ -1091,6 +1091,40 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
             calls.count(len(group_b)), 1,
             "the warmer must retry a timed-out subgroup rather than abandon it")
 
+    def test_no_ready_message_when_superseded_mid_root_computation(self):
+        """If stop() fires while the (slow, uninterruptible) root computation
+        is in flight, the warmer must not announce a result on the way out —
+        a superseded warmer racing a fresh one to print the same value is
+        exactly what produces duplicate "[ERD ready]" lines at the prompt."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+
+        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
+
+        def cancel_during_root(remaining, cache, sc, deadline=None,
+                                progress_fn=None, guesses=None, policy=None):
+            warmer.stop()  # e.g. the user moved on; a fresh warmer supersedes this one
+            return 1.8
+
+        printed = []
+        with mock.patch('wordle.min_expected_guesses', side_effect=cancel_during_root), \
+             mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
+            warmer._warm(score_cache)
+
+        self.assertFalse(
+            any('ERD ready' in str(a) for a in printed),
+            "a superseded warmer must not print a stale [ERD ready] announcement")
+
     def test_smaller_subgroups_are_attempted_before_larger_ones(self):
         """Smallest-first ordering: cheap, widely-reused subgroups get cached
         first, so their results are available when larger subgroups recurse
