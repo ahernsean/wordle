@@ -33,8 +33,8 @@ GUESSES = ANSWERS + ["brain", "stove", "cloud", "piano", "train"]
 
 
 def make_solution(db_path=None):
-    cache = ResponseCache(ANSWERS)
     sc = ScoreCache(db_path, ANSWERS) if db_path else None
+    cache = ResponseCache(ANSWERS, score_cache=sc)
     return Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
 
 
@@ -311,6 +311,29 @@ class TestScoreCacheSQLite(unittest.TestCase):
         conn2.close()
         self.assertEqual(rows, 0)
 
+    def test_decomposition_round_trip(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        patterns = bytes(range(len(ANSWERS)))
+        sc.write_decomposition("crane", patterns)
+        self.assertEqual(sc.read_decomposition("crane"), patterns)
+
+    def test_decomposition_read_miss_returns_none(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        self.assertIsNone(sc.read_decomposition("crane"))
+
+    def test_decomposition_different_universe_no_cross_contamination(self):
+        alt_answers = ["brain", "stove", "cloud"]
+        sc1 = ScoreCache(self.db, ANSWERS)
+        sc2 = ScoreCache(self.db, alt_answers)
+        sc1.write_decomposition("crane", bytes(range(len(ANSWERS))))
+        self.assertIsNone(sc2.read_decomposition("crane"))
+
+    def test_decomposition_overwrite_replaces_value(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        sc.write_decomposition("crane", bytes([1] * len(ANSWERS)))
+        sc.write_decomposition("crane", bytes([2] * len(ANSWERS)))
+        self.assertEqual(sc.read_decomposition("crane"), bytes([2] * len(ANSWERS)))
+
 
 # ---------------------------------------------------------------------------
 # Transparent SQLite persistence across sessions
@@ -419,6 +442,51 @@ class TestTransparentPersistence(unittest.TestCase):
                 v2 = s2.word_scores[w][m]
                 self.assertAlmostEqual(v1, v2, places=10,
                                        msg=f"{m} score mismatch for {w}")
+
+
+# ---------------------------------------------------------------------------
+# ResponseCache decomposition persistence
+# ---------------------------------------------------------------------------
+
+class TestResponseCachePersistence(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_decomposition_persisted_on_first_build(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        cache = ResponseCache(ANSWERS, score_cache=sc)
+        cache._ensure("crane")
+        self.assertIsNotNone(sc.read_decomposition("crane"))
+
+    def test_decomposition_reused_without_recomputing(self):
+        sc1 = ScoreCache(self.db, ANSWERS)
+        cache1 = ResponseCache(ANSWERS, score_cache=sc1)
+        cache1._ensure("crane")
+        expected = dict(cache1._cache["crane"])
+
+        sc2 = ScoreCache(self.db, ANSWERS)
+        cache2 = ResponseCache(ANSWERS, score_cache=sc2)
+        with mock.patch('wordle_engine.calculate_response') as fake_calc:
+            cache2._ensure("crane")
+            fake_calc.assert_not_called()
+        self.assertEqual(dict(cache2._cache["crane"]), expected)
+
+    def test_decomposition_reload_matches_freshly_computed(self):
+        sc1 = ScoreCache(self.db, ANSWERS)
+        cache1 = ResponseCache(ANSWERS, score_cache=sc1)
+        cache1._ensure("crane")
+        expected = dict(cache1._cache["crane"])
+
+        sc2 = ScoreCache(self.db, ANSWERS)
+        cache2 = ResponseCache(ANSWERS, score_cache=sc2)
+        cache2._ensure("crane")
+        self.assertEqual(dict(cache2._cache["crane"]), expected)
 
 
 # ---------------------------------------------------------------------------

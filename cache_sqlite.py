@@ -42,6 +42,15 @@ class ScoreCache:
             )
         """)
         self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS response_decomposition (
+                guess        TEXT    NOT NULL,
+                universe_id  TEXT    NOT NULL,
+                patterns     BLOB    NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                PRIMARY KEY (guess, universe_id)
+            )
+        """)
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS lookahead_result (
                 subset_key   BLOB NOT NULL,
                 policy       TEXT NOT NULL,
@@ -151,6 +160,34 @@ class ScoreCache:
               best_word, best_entropy, now))
 
     # ------------------------------------------------------------------
+    # Response decomposition cache (guess -> per-answer pattern bytes)
+    # ------------------------------------------------------------------
+
+    def read_decomposition(self, guess):
+        """Return the cached pattern-byte blob for guess, or None on a miss.
+
+        The blob holds one byte per answer word, in the same order as the
+        answer list this cache was opened with — so the caller can zip it
+        back against that list to recover the {answer: pattern} mapping.
+        """
+        row = self._conn.execute("""
+            SELECT patterns FROM response_decomposition
+            WHERE guess = ? AND universe_id = ?
+        """, (guess, self.universe_id)).fetchone()
+        if row is None:
+            return None
+        return row["patterns"]
+
+    def write_decomposition(self, guess, patterns):
+        """Store the pattern-byte blob (one byte per answer, canonical order)."""
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT OR REPLACE INTO response_decomposition
+                (guess, universe_id, patterns, updated_at)
+            VALUES (?, ?, ?, ?)
+        """, (guess, self.universe_id, patterns, now))
+
+    # ------------------------------------------------------------------
     # Word score cache (level 1, all ScoringMethods)
     # ------------------------------------------------------------------
 
@@ -188,7 +225,7 @@ class ScoreCache:
             raise
 
     def stats(self):
-        """Return (lookahead_rows, word_score_rows, last_updated_ts)."""
+        """Return (lookahead_rows, word_score_rows, decomposition_rows, last_updated_ts)."""
         la = self._conn.execute("""
             SELECT COUNT(*) AS c, MAX(updated_at) AS m
             FROM lookahead_result WHERE universe_id = ?
@@ -196,7 +233,10 @@ class ScoreCache:
         ws = self._conn.execute("""
             SELECT COUNT(*) AS c FROM word_scores WHERE universe_id = ?
         """, (self.universe_id,)).fetchone()
-        return la["c"] or 0, ws["c"] or 0, la["m"]
+        rd = self._conn.execute("""
+            SELECT COUNT(*) AS c FROM response_decomposition WHERE universe_id = ?
+        """, (self.universe_id,)).fetchone()
+        return la["c"] or 0, ws["c"] or 0, rd["c"] or 0, la["m"]
 
 
 class MemoryScoreCache:

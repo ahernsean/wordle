@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b58"
+BUILD = "b59"
 
 
 # ---------------------------------------------------------------------------
@@ -542,12 +542,12 @@ class GameState:
     def __init__(self, all_answers, all_words):
         self.all_answers = all_answers
         self.all_words = all_words
-        self.cache = ResponseCache(all_answers)
         self.score_cache_path = os.path.abspath("wordle_cache.sqlite3")
         self.score_cache = ScoreCache(
             self.score_cache_path,
             all_answers,
         )
+        self.cache = ResponseCache(all_answers, self.score_cache)
         print(f"Score cache: {self.score_cache_path}")
         # Long-lived: hard-mode ERD results are namespaced internally by a
         # fingerprint of the eligible-guess vocabulary (see set_scope), so
@@ -1923,7 +1923,7 @@ def cmd_help(gs):
         sim = f"{sim_count}/{len(gs.solutions)} set"
         nguesses = "?"
     lc = gs.score_cache
-    la_rows, ws_rows, mtime = lc.stats()
+    la_rows, ws_rows, rd_rows, mtime = lc.stats()
     cache_ts = (datetime.utcfromtimestamp(mtime).isoformat() + "Z") if mtime else "n/a"
     print(f"""
   g = Guess a word
@@ -1942,7 +1942,7 @@ def cmd_help(gs):
   ? = This help
 
   Cache: {gs.score_cache_path}
-    {la_rows:,} subgroup rows, {ws_rows:,} word scores, last write {cache_ts}
+    {la_rows:,} subgroup rows, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
 """)
 
 

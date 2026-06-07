@@ -252,18 +252,43 @@ class ResponseCache:
     scoring against any subset is just dict lookups and counting.
     """
 
-    def __init__(self, answer_words):
+    def __init__(self, answer_words, score_cache=None):
         self.answer_words = answer_words
+        self.score_cache = score_cache
         self._cache = {}   # guess → {answer → pattern_int}
 
     def _ensure(self, guess):
-        """Build the mapping for guess if not cached."""
-        if guess not in self._cache:
+        """Build the mapping for guess if not cached, persisting/reloading via SQLite.
+
+        The decomposition (guess -> {answer: pattern}) is the same for every
+        position in every session against this answer universe, so it is
+        cached to disk as a compact byte blob — one byte per answer word, in
+        canonical (self.answer_words) order — keyed only by guess+universe.
+        """
+        if guess in self._cache:
+            return
+        mapping = self._load_decomposition(guess)
+        if mapping is None:
             mapping = {}
             for answer in self.answer_words:
                 resp = calculate_response(guess, answer)
                 mapping[answer] = _encode_response(resp)
-            self._cache[guess] = mapping
+            self._store_decomposition(guess, mapping)
+        self._cache[guess] = mapping
+
+    def _load_decomposition(self, guess):
+        if not self.score_cache:
+            return None
+        blob = self.score_cache.read_decomposition(guess)
+        if blob is None:
+            return None
+        return {answer: blob[i] for i, answer in enumerate(self.answer_words)}
+
+    def _store_decomposition(self, guess, mapping):
+        if not self.score_cache:
+            return
+        blob = bytes(mapping[answer] for answer in self.answer_words)
+        self.score_cache.write_decomposition(guess, blob)
 
     def group_counts(self, guess, subset):
         """Return {pattern_int: count} for guess vs subset."""
