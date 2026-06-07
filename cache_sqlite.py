@@ -56,14 +56,24 @@ class ScoreCache:
             CREATE INDEX IF NOT EXISTS idx_lookahead
             ON lookahead_result(universe_id, policy)
         """)
+        # word_scores used to be keyed only by (word, method, universe_id) —
+        # i.e. scoped to the whole answer set, so it could only ever cache
+        # the very first guess of a game. Replace it with a subset-scoped
+        # table (mirroring lookahead_result) so any remaining-word position
+        # that recurs gets its scores cached, not just the opening one.
+        old_cols = {row["name"] for row in
+                    self._conn.execute("PRAGMA table_info(word_scores)")}
+        if old_cols and "subset_hash" not in old_cols:
+            self._conn.execute("DROP TABLE word_scores")
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS word_scores (
+                subset_hash  TEXT    NOT NULL,
                 word         TEXT    NOT NULL,
                 method       TEXT    NOT NULL,
                 score        REAL    NOT NULL,
                 universe_id  TEXT    NOT NULL,
                 updated_at   INTEGER NOT NULL,
-                PRIMARY KEY (word, method, universe_id)
+                PRIMARY KEY (subset_hash, method, universe_id, word)
             )
         """)
         # All valid 5-letter words are ASCII, so a null byte identifies the
@@ -144,26 +154,34 @@ class ScoreCache:
     # Word score cache (level 1, all ScoringMethods)
     # ------------------------------------------------------------------
 
-    def read_scores(self, method):
-        """Return list of (word, score) for this method/universe, or None if empty."""
+    @staticmethod
+    def _subset_hash(subset_key):
+        """Compact, fixed-size key for a (potentially large) subset blob."""
+        return hashlib.sha256(subset_key).hexdigest()
+
+    def read_scores(self, subset_key, method):
+        """Return list of (word, score) for this subset/method/universe, or None if empty."""
+        subset_hash = self._subset_hash(subset_key)
         rows = self._conn.execute("""
             SELECT word, score FROM word_scores
-            WHERE method = ? AND universe_id = ?
-        """, (method, self.universe_id)).fetchall()
+            WHERE subset_hash = ? AND method = ? AND universe_id = ?
+        """, (subset_hash, method, self.universe_id)).fetchall()
         if not rows:
             return None
         return [(r["word"], r["score"]) for r in rows]
 
-    def write_scores(self, scores, method):
-        """Store list of (word, score) tuples for this method/universe."""
+    def write_scores(self, subset_key, scores, method):
+        """Store list of (word, score) tuples for this subset/method/universe."""
+        subset_hash = self._subset_hash(subset_key)
         now = int(time.time())
         self._conn.execute("BEGIN")
         try:
             self._conn.executemany("""
                 INSERT OR REPLACE INTO word_scores
-                    (word, method, score, universe_id, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, [(w, method, s, self.universe_id, now) for w, s in scores])
+                    (subset_hash, word, method, score, universe_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, [(subset_hash, w, method, s, self.universe_id, now)
+                  for w, s in scores])
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")

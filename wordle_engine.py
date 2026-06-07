@@ -423,25 +423,32 @@ class Solution:
         return len(self.guesses) == 0
 
     def _ensure_scores_loaded(self, method):
-        """Transparently load full-game scores from SQLite into word_scores."""
-        if not self.score_cache or not self._is_full_game():
+        """Transparently load this position's scores from SQLite into word_scores.
+
+        Cached entries are scoped to the current remaining-word subset (not
+        just the full answer set), so any position that recurs — not only
+        the opening guess — benefits from the cache.
+        """
+        if not self.score_cache:
             return
         if method in self._db_loaded_methods:
             return
         self._db_loaded_methods.add(method)
-        cached = self.score_cache.read_scores(method.name.lower())
+        subset_key = ScoreCache.encode_subset(self.current_words)
+        cached = self.score_cache.read_scores(subset_key, method.name.lower())
         if cached:
             for w, s in cached:
                 self.word_scores.setdefault(w, {})[method] = s
 
     def _persist_scores(self, method):
-        """Transparently write full-game scores from word_scores to SQLite."""
-        if not self.score_cache or not self._is_full_game():
+        """Transparently write this position's scores from word_scores to SQLite."""
+        if not self.score_cache:
             return
         scores = [(w, s[method]) for w, s in self.word_scores.items()
                   if method in s]
         if scores:
-            self.score_cache.write_scores(scores, method.name.lower())
+            subset_key = ScoreCache.encode_subset(self.current_words)
+            self.score_cache.write_scores(subset_key, scores, method.name.lower())
 
     @property
     def answer_set(self):

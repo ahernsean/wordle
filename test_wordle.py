@@ -215,10 +215,21 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_word_scores_round_trip(self):
         sc = ScoreCache(self.db, ANSWERS)
-        sc.write_scores([("crane", 3.14159), ("slate", 2.71828)], "entropy_gain")
-        result = dict(sc.read_scores("entropy_gain"))
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write_scores(subset_key, [("crane", 3.14159), ("slate", 2.71828)],
+                        "entropy_gain")
+        result = dict(sc.read_scores(subset_key, "entropy_gain"))
         self.assertAlmostEqual(result["crane"], 3.14159)
         self.assertAlmostEqual(result["slate"], 2.71828)
+
+    def test_word_scores_are_subset_scoped(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key1 = ScoreCache.encode_subset(["crane", "slate"])
+        key2 = ScoreCache.encode_subset(["heart", "earth"])
+        sc.write_scores(key1, [("brain", 1.0)], "entropy_gain")
+        self.assertIsNone(sc.read_scores(key2, "entropy_gain"),
+                          "scores cached for one remaining-word subset must "
+                          "not leak into a lookup for a different subset")
 
     def test_subgroup_round_trip(self):
         sc = ScoreCache(self.db, ANSWERS)
@@ -232,7 +243,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc = ScoreCache(self.db, ANSWERS)
         subset_key = ScoreCache.encode_subset(["crane", "slate"])
         self.assertIsNone(sc.read(subset_key, "full"))
-        self.assertIsNone(sc.read_scores("entropy_gain"))
+        self.assertIsNone(sc.read_scores(subset_key, "entropy_gain"))
 
     def test_policy_separation(self):
         sc = ScoreCache(self.db, ANSWERS)
@@ -246,14 +257,16 @@ class TestScoreCacheSQLite(unittest.TestCase):
         alt_answers = ["brain", "stove", "cloud"]
         sc1 = ScoreCache(self.db, ANSWERS)
         sc2 = ScoreCache(self.db, alt_answers)
-        sc1.write_scores([("crane", 3.14)], "entropy_gain")
-        self.assertIsNone(sc2.read_scores("entropy_gain"))
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc1.write_scores(subset_key, [("crane", 3.14)], "entropy_gain")
+        self.assertIsNone(sc2.read_scores(subset_key, "entropy_gain"))
 
     def test_overwrite_replaces_value(self):
         sc = ScoreCache(self.db, ANSWERS)
-        sc.write_scores([("crane", 1.0)], "entropy_gain")
-        sc.write_scores([("crane", 9.9)], "entropy_gain")
-        result = dict(sc.read_scores("entropy_gain"))
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write_scores(subset_key, [("crane", 1.0)], "entropy_gain")
+        sc.write_scores(subset_key, [("crane", 9.9)], "entropy_gain")
+        result = dict(sc.read_scores(subset_key, "entropy_gain"))
         self.assertAlmostEqual(result["crane"], 9.9)
 
     def test_encode_subset_is_compact(self):
@@ -342,7 +355,7 @@ class TestTransparentPersistence(unittest.TestCase):
         # and _db_loaded_methods should contain ENTROPY_GAIN
         self.assertIn(ScoringMethod.ENTROPY_GAIN, s2._db_loaded_methods)
 
-    def test_mid_game_not_persisted(self):
+    def test_mid_game_scores_persisted_subset_scoped(self):
         s = make_solution(db_path=self.db)
         pattern = calculate_response("crane", "slate")
         s.apply_guess("crane", pattern)
@@ -350,9 +363,47 @@ class TestTransparentPersistence(unittest.TestCase):
 
         s.compute_scores(s.current_words, ScoringMethod.ENTROPY_GAIN)
 
-        # Nothing should have been written to DB
+        # Scores for this position are written, keyed by its remaining-word subset.
         sc = ScoreCache(self.db, ANSWERS)
-        self.assertIsNone(sc.read_scores("entropy_gain"))
+        subset_key = ScoreCache.encode_subset(s.current_words)
+        cached = sc.read_scores(subset_key, "entropy_gain")
+        self.assertIsNotNone(cached)
+        self.assertIn(s.current_words[0], dict(cached))
+
+    def test_mid_game_scores_reloaded_for_same_position(self):
+        pattern = calculate_response("crane", "slate")
+
+        s1 = make_solution(db_path=self.db)
+        s1.apply_guess("crane", pattern)
+        s1.compute_scores(s1.current_words, ScoringMethod.ENTROPY_GAIN)
+        scores1 = dict(s1.scores)
+
+        s2 = make_solution(db_path=self.db)
+        s2.apply_guess("crane", pattern)
+        s2.compute_scores(s2.current_words, ScoringMethod.ENTROPY_GAIN)
+        scores2 = dict(s2.scores)
+
+        for w in s1.current_words:
+            self.assertAlmostEqual(scores1[w], scores2[w], places=10)
+        self.assertIn(ScoringMethod.ENTROPY_GAIN, s2._db_loaded_methods)
+
+    def test_different_positions_use_different_cache_entries(self):
+        s1 = make_solution(db_path=self.db)
+        pattern1 = calculate_response("crane", "slate")
+        s1.apply_guess("crane", pattern1)
+        s1.compute_scores(s1.current_words, ScoringMethod.ENTROPY_GAIN)
+
+        s2 = make_solution(db_path=self.db)
+        pattern2 = calculate_response("heart", "earth")
+        s2.apply_guess("heart", pattern2)
+        self.assertNotEqual(sorted(s1.current_words), sorted(s2.current_words))
+
+        sc = ScoreCache(self.db, ANSWERS)
+        s2_key = ScoreCache.encode_subset(s2.current_words)
+        self.assertIsNone(
+            sc.read_scores(s2_key, "entropy_gain"),
+            "a different remaining-word set must not see another position's "
+            "cached scores")
 
     def test_multi_method_persist_and_reload(self):
         methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX]
@@ -525,7 +576,8 @@ class TestMultistepStatsCache(unittest.TestCase):
         soln = make_solution(db_path=self.db)
         _multistep_stats("crane", soln)
         sc = ScoreCache(self.db, ANSWERS)
-        rows = sc.read_scores("entropy_gain")
+        subset_key = ScoreCache.encode_subset(soln.current_words)
+        rows = sc.read_scores(subset_key, "entropy_gain")
         self.assertIsNotNone(rows)
         self.assertIn("crane", dict(rows))
 
@@ -547,7 +599,7 @@ class TestMultistepStatsCache(unittest.TestCase):
         stats = _multistep_stats("crane", soln)
         self.assertAlmostEqual(stats['step1'], cached_entropy, places=10)
 
-    def test_mid_game_scores_not_persisted(self):
+    def test_mid_game_scores_persisted_subset_scoped(self):
         soln = make_solution(db_path=self.db)
         pattern = calculate_response("crane", "slate")
         soln.apply_guess("crane", pattern)
@@ -556,7 +608,10 @@ class TestMultistepStatsCache(unittest.TestCase):
         _multistep_stats("slate", soln)
 
         sc = ScoreCache(self.db, ANSWERS)
-        self.assertIsNone(sc.read_scores("entropy_gain"))
+        subset_key = ScoreCache.encode_subset(soln.current_words)
+        cached = sc.read_scores(subset_key, "entropy_gain")
+        self.assertIsNotNone(cached)
+        self.assertIn("slate", dict(cached))
 
 
 # ---------------------------------------------------------------------------
