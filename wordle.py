@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b53"
+BUILD = "b54"
 
 
 # ---------------------------------------------------------------------------
@@ -2003,9 +2003,6 @@ def print_status(gs):
 # ERD background warmer
 # ---------------------------------------------------------------------------
 
-_WARM_MAX_SUBGROUP = 50  # subgroups larger than this are skipped during warmup
-
-
 class ERDWarmer(threading.Thread):
     """Daemon thread: fills the ERD cache proactively for the current position.
 
@@ -2057,53 +2054,94 @@ class ERDWarmer(threading.Thread):
             if self._persist:
                 score_cache.close()
 
-    def _warm(self, score_cache):
-        policy = self._policy
+    def _collect_subgroups(self):
+        """Every unique subgroup any candidate word can produce, smallest first.
 
-        # Collect every unique subgroup produced by each candidate word.
+        No size cap: the goal is to fill out the ERD cache for this branch as
+        completely as time allows.  Smallest-first ordering means the cheap,
+        widely-shared subgroups land in the cache first, so by the time the
+        warmer reaches the large ones their sub-results are already cached —
+        a "too big" subgroup on one pass can become a quick cache-assisted
+        computation on the next.
+        """
         seen = set()
         work = []  # (size, word_list)
         for word in self._words:
             if self._cancel.is_set():
-                return
+                return []
             if self._rcache:
                 groups = self._rcache.group_words(word, self._words)
             else:
                 groups = {}
             for sg in groups.values():
                 k = len(sg)
-                if k <= 1 or k > _WARM_MAX_SUBGROUP:
+                if k <= 1:
                     continue
                 key = ScoreCache.encode_subset(sg)
                 if key not in seen:
                     seen.add(key)
                     work.append((k, list(sg)))
-
-        # Smallest subgroups first: fastest to compute, most reuse as
-        # sub-subgroups of larger ones computed later.
         work.sort()
-        self.subgroups_total = len(work)  # now bounded; 0 = still collecting
+        return work
 
-        for _size, sg in work:
+    def _attempt_pass(self, items, score_cache, policy, per_item_deadline):
+        """Try to cache each item; return (still-uncached items, made progress?).
+
+        A per-item deadline is a "this packet is too big for now, move on"
+        signal — not a reason to give up on the item permanently or to stop
+        the thread.  Anything that times out is retried on a later pass with
+        a larger budget, once cheaper neighbors have had a chance to populate
+        the cache underneath it.
+        """
+        still_uncached = []
+        progressed = False
+        for size, sg in items:
             if self._cancel.is_set():
-                return
+                return still_uncached, progressed
             sk = ScoreCache.encode_subset(sg)
             if score_cache.read(sk, policy) is not None:
                 self.subgroups_done += 1
-                continue  # already in cache
-            # Short deadline so an unexpectedly expensive subgroup doesn't
-            # block the cancel signal for long.
-            deadline = time.time() + 5.0
-            min_expected_guesses(sg, self._rcache, score_cache, deadline,
-                                 guesses=self._effective_guesses,
-                                 policy=policy)
-            self.subgroups_done += 1
+                progressed = True
+                continue
+            deadline = time.time() + per_item_deadline
+            result = min_expected_guesses(sg, self._rcache, score_cache, deadline,
+                                           guesses=self._effective_guesses,
+                                           policy=policy)
+            if result is None:
+                still_uncached.append((size, sg))
+            else:
+                self.subgroups_done += 1
+                progressed = True
+        return still_uncached, progressed
 
-        # All subgroups done. Now compute the root (current position).
-        # If all first-level subgroups were cached above, this reads from
-        # cache and finishes in O(n) cache reads — fast.
+    def _warm(self, score_cache):
+        policy = self._policy
+
+        work = self._collect_subgroups()
+        self.subgroups_total = len(work)
         if self._cancel.is_set():
             return
+
+        # Keep retrying whatever is left, with a growing per-item budget,
+        # for as long as each round makes progress.  A round that caches
+        # nothing new means the stragglers are genuinely too expensive right
+        # now — stop rather than spin; the position itself is attempted next
+        # regardless, and a future warmer run (e.g. after the user's next
+        # guess narrows the branch) will revisit anything still missing.
+        pending = work
+        per_item_deadline = 5.0
+        while pending and not self._cancel.is_set():
+            pending, progressed = self._attempt_pass(pending, score_cache, policy,
+                                                       per_item_deadline)
+            if not progressed:
+                break
+            per_item_deadline *= 4
+
+        if self._cancel.is_set():
+            return
+
+        # The current position itself.  If its subgroups are cached above,
+        # this reads from cache and finishes in O(n) cache reads — fast.
         root_key = ScoreCache.encode_subset(self._words)
         if score_cache.read(root_key, policy) is None:
             deadline = time.time() + 30.0
