@@ -1409,35 +1409,37 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     for m in _step1_methods:
         soln._persist_scores(m)
 
-    # ERD: exact expected guesses for the current candidates mode.
-    # Only computed mid-game; root (full game) is too expensive for an
-    # interactive command and is left as None.
+    # ERD: exact expected guesses for the current candidates mode, surfaced
+    # purely from cache — never computed here. Exact ERD search over a large
+    # guess vocabulary is combinatorially expensive (a single subgroup can
+    # take tens of seconds), and that cost belongs solely to the background
+    # ERDWarmer, which uses its own short deadlines to detect when it has
+    # bitten off more than it can chew. The foreground must never block on
+    # it: each subgroup is an instant cache read, exactly mirroring how
+    # print_status's ERD tag already works. A miss means "not cached yet" —
+    # reported as unavailable (None) — not a cue to compute it live. As the
+    # warmer keeps populating the cache in the background, more of these
+    # lookups become hits for free.
     erd = None
     if not soln._is_full_game():
         if constraint_compliant:
-            # Hard-mode guess vocabulary is path-dependent (it depends on the
-            # exact constraints accumulated so far), so its ERD values must
-            # never be written into the persisted, cross-game SQLite cache.
-            # erd_cache (when supplied) is the long-lived, vocabulary-scoped
-            # MemoryScoreCache shared with the warmer for this position —
-            # reusing it lets try-mode and the warmer trade sub-results for
-            # free. A throwaway cache is the fallback for callers that don't
-            # have one (e.g. tests), keeping memoization local in that case.
-            erd_guesses = (soln.constraint_compliant_words(all_words)
-                           if all_words else None)
+            # Hard-mode ERD values are path-dependent (the eligible guess
+            # vocabulary depends on the exact constraints accumulated so
+            # far) and must never reach the persisted, cross-game SQLite
+            # cache. erd_cache (when supplied) is the long-lived,
+            # vocabulary-scoped MemoryScoreCache shared with the warmer for
+            # this position — surfacing from it lets try-mode see whatever
+            # the warmer has already found. A throwaway empty cache is the
+            # fallback for callers that don't have one (e.g. tests), which
+            # simply means nothing is surfaceable yet.
             erd_policy = ERD_CONSTRAINED
             erd_score_cache = erd_cache if erd_cache is not None else MemoryScoreCache()
         elif all_words:
-            erd_guesses = all_words
             erd_policy = ERD_ALL
             erd_score_cache = soln.score_cache
         else:
-            erd_guesses = None
             erd_policy = ERD_ANSWERS
             erd_score_cache = soln.score_cache
-        erd_t0 = time.time()
-        erd_announced = False
-        deadline = erd_t0 + 30
         erd_cost = 1.0
         erd_ok = True
         for subgroup in s1_groups.values():
@@ -1446,19 +1448,15 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
                 continue
             if k == 1 and subgroup[0] == word:
                 continue  # all-green branch: already solved, 0 more guesses
-            if not erd_announced and time.time() - erd_t0 > 5:
-                print('  Computing ERD...', end='', flush=True)
-                erd_announced = True
-            sub_erd = min_expected_guesses(
-                subgroup, cache, erd_score_cache, deadline,
-                guesses=erd_guesses, policy=erd_policy,
-            )
+            if k == 1:
+                sub_erd = 1.0  # singleton: exactly one more guess, always cached-equivalent
+            else:
+                hit = erd_score_cache.read(ScoreCache.encode_subset(subgroup), erd_policy)
+                sub_erd = hit[1] if hit is not None else None
             if sub_erd is None:
                 erd_ok = False
                 break
             erd_cost += (k / n) * sub_erd
-        if erd_announced:
-            print()
         if erd_ok:
             erd = erd_cost
 

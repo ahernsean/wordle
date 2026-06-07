@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -650,9 +651,13 @@ class TestERDPolicyParameter(unittest.TestCase):
 
 class TestMultistepStatsERDPolicy(unittest.TestCase):
     """
-    When all_words is provided, _multistep_stats should cache subgroup ERDs
-    under 'erd_all'.  Currently the guesses= arg is omitted so results land
-    under 'erd_answers' regardless of mode.
+    _multistep_stats surfaces ERD purely by reading the cache namespace that
+    matches the current mode — 'erd_all' for any-word, 'erd_answers' for the
+    default (possible-answers) mode, 'erd_constrained' (a transient/supplied
+    MemoryScoreCache, never SQLite) for hard mode. It must read from the
+    *correct* namespace for the mode in play, ignoring values cached under
+    any other policy — a cross-policy hit would surface a number computed
+    against the wrong guess vocabulary.
     """
 
     def setUp(self):
@@ -684,36 +689,46 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
                 return ScoreCache.encode_subset(sg)
         return None
 
-    def test_all_words_mode_caches_under_erd_all(self):
+    def test_all_words_mode_surfaces_from_erd_all_not_erd_answers(self):
         """
-        After _multistep_stats("heart", soln, all_words=GUESSES), at least one
-        subgroup ERD must be stored under 'erd_all', not 'erd_answers'.
-        ('heart' vs the 6-word remaining set creates a 2-word subgroup.)
-        """
-        soln = self._mid_game_soln()
-        key = self._find_subgroup_key("heart", soln.current_words)
-        self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
-
-        _multistep_stats("heart", soln, all_words=GUESSES)
-
-        sc = ScoreCache(self.db, ANSWERS)
-        self.assertIsNotNone(sc.read(key, 'erd_all'),
-                             "ERD subgroups must be cached under 'erd_all' in any-word mode")
-
-    def test_default_mode_caches_under_erd_answers(self):
-        """
-        Without all_words, _multistep_stats uses 'erd_answers' — this is the
-        existing correct behaviour for POSSIBLE_ANSWERS / default mode.
+        In any-word mode (all_words supplied), _multistep_stats must read the
+        subgroup ERD from 'erd_all' — and ignore a value parked under
+        'erd_answers' for the same subgroup, which was computed against a
+        different (answers-only) guess vocabulary and would be the wrong number.
         """
         soln = self._mid_game_soln()
         key = self._find_subgroup_key("heart", soln.current_words)
         self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
 
-        _multistep_stats("heart", soln)  # all_words=None
+        sc = ScoreCache(self.db, ANSWERS)
+        sc.write(key, 'erd_answers', 'wrong-vocab-value', 9.0)
+        sc.write(key, 'erd_all', 'crane', 1.5)
+
+        st = _multistep_stats("heart", soln, all_words=GUESSES)
+        self.assertIsNotNone(st['erd'],
+                             "a cached 'erd_all' value must be surfaced")
+        self.assertNotAlmostEqual(st['erd'], 1.0 + 9.0 * (2 / len(soln.current_words)),
+                                  msg="must not surface the 'erd_answers' value")
+
+    def test_default_mode_surfaces_from_erd_answers_not_erd_all(self):
+        """
+        Without all_words, _multistep_stats must read 'erd_answers' — and
+        ignore a value parked under 'erd_all' for the same subgroup, which
+        was computed against the full guess vocabulary and would be wrong here.
+        """
+        soln = self._mid_game_soln()
+        key = self._find_subgroup_key("heart", soln.current_words)
+        self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
 
         sc = ScoreCache(self.db, ANSWERS)
-        self.assertIsNotNone(sc.read(key, 'erd_answers'),
-                             "ERD subgroups must be cached under 'erd_answers' in default mode")
+        sc.write(key, 'erd_all', 'wrong-vocab-value', 9.0)
+        sc.write(key, 'erd_answers', 'crane', 1.5)
+
+        st = _multistep_stats("heart", soln)  # all_words=None
+        self.assertIsNotNone(st['erd'],
+                             "a cached 'erd_answers' value must be surfaced")
+        self.assertNotAlmostEqual(st['erd'], 1.0 + 9.0 * (2 / len(soln.current_words)),
+                                  msg="must not surface the 'erd_all' value")
 
     def test_constraint_compliant_mode_does_not_fall_through_to_erd_all(self):
         """
@@ -737,6 +752,112 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
         self.assertIsNone(sc.read(key, 'erd_constrained'),
                           "hard-mode ERD values are path-dependent and must never "
                           "be persisted to the cross-game SQLite cache")
+
+
+# ---------------------------------------------------------------------------
+# _multistep_stats ERD must never block the interactive (main) thread.
+#
+# Exact ERD computation (min_expected_guesses) over a large guess vocabulary
+# is combinatorially expensive — a single subgroup can take tens of seconds.
+# That cost belongs solely to the background ERDWarmer, which uses its own
+# short deadlines to detect when it has bitten off more than it can chew.
+# The foreground must instead simply *surface* whatever the warmer has
+# already cached: an instant, recursion-free cache read per subgroup. If a
+# subgroup isn't cached yet, ERD is reported as unavailable (None) rather
+# than computed live — exactly mirroring how print_status's ERD tag already
+# works. As the warmer (running continuously in the background) populates
+# more of the cache over time, more subgroups become surfaceable for free.
+# ---------------------------------------------------------------------------
+
+class TestMultistepStatsERDNonBlocking(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, 'test.sqlite3')
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _mid_game_soln(self):
+        soln = make_solution(db_path=self.db)
+        pattern = calculate_response("piano", "slate")
+        soln.apply_guess("piano", pattern)
+        self.assertFalse(soln._is_full_game())
+        return soln
+
+    def _subgroup(self, word, remaining):
+        """Return the first subgroup of size >= 2 that 'word' produces."""
+        groups = ResponseCache(ANSWERS).group_words(word, remaining)
+        for sg in groups.values():
+            if len(sg) >= 2:
+                return list(sg)
+        return None
+
+    def _refuse_to_compute(self):
+        """Patch min_expected_guesses to fail the test if _multistep_stats
+        ever calls it — the foreground must be a pure cache surface."""
+        return mock.patch(
+            'wordle.min_expected_guesses',
+            side_effect=AssertionError(
+                "_multistep_stats must never invoke min_expected_guesses — "
+                "ERD computation belongs to the background warmer only"))
+
+    def test_uncached_subgroup_yields_none_without_computing(self):
+        """A cache miss must surface as 'not yet available' (None), not
+        trigger a live computation that could block for tens of seconds."""
+        soln = self._mid_game_soln()
+        sg = self._subgroup("heart", soln.current_words)
+        self.assertIsNotNone(sg, "setup must produce a subgroup with k>=2")
+
+        with self._refuse_to_compute():
+            st = _multistep_stats("heart", soln, all_words=GUESSES)
+
+        self.assertIsNone(st['erd'],
+                          "ERD must be None when a subgroup isn't cached yet")
+
+    def test_cached_subgroup_is_surfaced_instantly(self):
+        """A pre-cached subgroup ERD must be read straight from the cache —
+        contributing to the displayed ERD without any fresh computation."""
+        soln = self._mid_game_soln()
+        sg = self._subgroup("heart", soln.current_words)
+        self.assertIsNotNone(sg)
+        n = len(soln.current_words)
+        key = ScoreCache.encode_subset(sg)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        sc.write(key, 'erd_all', 'crane', 1.5)
+
+        with self._refuse_to_compute():
+            st = _multistep_stats("heart", soln, all_words=GUESSES)
+
+        self.assertIsNotNone(st['erd'],
+                             "a fully-cached subgroup tree must surface a value")
+        # erd = 1.0 + sum over non-trivial subgroups of (k/n) * cached_value;
+        # the cached subgroup contributes exactly (len(sg)/n) * 1.5.
+        self.assertGreaterEqual(st['erd'], 1.0 + (len(sg) / n) * 1.5 - 1e-9)
+
+    def test_constraint_compliant_uses_supplied_cache_only(self):
+        """Hard mode must surface from the caller-supplied erd_cache (the
+        long-lived MemoryScoreCache shared with the warmer) without ever
+        computing — same non-blocking contract as any-word mode."""
+        soln = self._mid_game_soln()
+        sg = self._subgroup("heart", soln.current_words)
+        self.assertIsNotNone(sg)
+        n = len(soln.current_words)
+        key = ScoreCache.encode_subset(sg)
+
+        mc = MemoryScoreCache()
+        eligible = soln.constraint_compliant_words(GUESSES)
+        mc.set_scope(MemoryScoreCache.fingerprint_vocabulary(eligible))
+        mc.write(key, 'erd_constrained', 'crane', 1.5)
+
+        with self._refuse_to_compute():
+            st = _multistep_stats("heart", soln, constraint_compliant=True,
+                                  all_words=GUESSES, erd_cache=mc)
+
+        self.assertIsNotNone(st['erd'],
+                             "a fully-cached subgroup tree must surface a value")
+        self.assertGreaterEqual(st['erd'], 1.0 + (len(sg) / n) * 1.5 - 1e-9)
 
 
 # ---------------------------------------------------------------------------
