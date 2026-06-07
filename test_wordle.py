@@ -110,9 +110,9 @@ class TestScoreGroups(unittest.TestCase):
         self.assertAlmostEqual(
             score_groups(groups, ScoringMethod.ENTROPY_GAIN), expected)
 
-    def test_minimax(self):
+    def test_max_group_size(self):
         groups = {0: 5, 1: 3, 2: 7, 3: 2}
-        self.assertEqual(score_groups(groups, ScoringMethod.MINIMAX), 7)
+        self.assertEqual(score_groups(groups, ScoringMethod.MAX_GROUP_SIZE), 7)
 
     def test_weighted_avg(self):
         # sum(k^2) / N where N = sum(k)
@@ -146,7 +146,7 @@ class TestSolutionScoreCache(unittest.TestCase):
             self.assertIn(ScoringMethod.ENTROPY_GAIN, self.soln.word_scores[w])
 
     def test_compute_scores_multi_populates_both_methods(self):
-        methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX]
+        methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE]
         self.soln.compute_scores_multi(GUESSES, methods)
         for w in GUESSES:
             for m in methods:
@@ -193,8 +193,8 @@ class TestSolutionScoreCache(unittest.TestCase):
         scores = [s for _, s in self.soln.scores]
         self.assertEqual(scores, sorted(scores, reverse=True))
 
-    def test_scores_sorted_minimax_ascending(self):
-        self.soln.compute_scores(GUESSES, ScoringMethod.MINIMAX)
+    def test_scores_sorted_max_group_size_ascending(self):
+        self.soln.compute_scores(GUESSES, ScoringMethod.MAX_GROUP_SIZE)
         scores = [s for _, s in self.soln.scores]
         self.assertEqual(scores, sorted(scores))
 
@@ -310,6 +310,36 @@ class TestScoreCacheSQLite(unittest.TestCase):
         ).fetchone()[0]
         conn2.close()
         self.assertEqual(rows, 0)
+
+    def test_old_minimax_method_key_is_migrated(self):
+        # Simulate rows persisted under the pre-rename method key.
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS word_scores (
+                subset_hash TEXT NOT NULL, word TEXT NOT NULL,
+                method TEXT NOT NULL, score REAL NOT NULL,
+                universe_id TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_hash, method, universe_id, word)
+            )
+        """)
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        subset_hash = ScoreCache._subset_hash(subset_key)
+        universe_id = ScoreCache(self.db, ANSWERS).universe_id
+        conn.execute(
+            "INSERT OR REPLACE INTO word_scores VALUES (?,?,?,?,?,?)",
+            (subset_hash, "crane", "minimax", 4.0, universe_id, 0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Re-opening ScoreCache should migrate the old method key forward —
+        # the data must remain reachable under its new name.
+        sc = ScoreCache(self.db, ANSWERS)
+        self.assertIsNone(sc.read_scores(subset_key, "minimax"))
+        migrated = sc.read_scores(subset_key, "max_group_size")
+        self.assertIsNotNone(migrated)
+        self.assertEqual(dict(migrated)["crane"], 4.0)
 
     def test_decomposition_round_trip(self):
         sc = ScoreCache(self.db, ANSWERS)
@@ -429,7 +459,7 @@ class TestTransparentPersistence(unittest.TestCase):
             "cached scores")
 
     def test_multi_method_persist_and_reload(self):
-        methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX]
+        methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE]
         s1 = make_solution(db_path=self.db)
         s1.compute_scores_multi(GUESSES, methods)
 
@@ -503,7 +533,7 @@ class TestComputeLookaheadCache(unittest.TestCase):
     def tearDown(self):
         os.unlink(self.db)
 
-    def test_winner_max_group_size_persisted_alongside_entropy(self):
+    def test_winners_other_scores_persisted_alongside_ranking_score(self):
         s = make_solution(db_path=self.db)
         first_ent = score_word("piano", s.current_words, ScoringMethod.ENTROPY_GAIN,
                                cache=s.cache)
@@ -520,15 +550,22 @@ class TestComputeLookaheadCache(unittest.TestCase):
             self.assertIsNotNone(hit)
             best_word, _best_entropy = hit
 
-            minimax_scores = sc.read_scores(subset_key, "minimax")
-            self.assertIsNotNone(
-                minimax_scores,
-                "max-group-size for the cached winner should be persisted "
-                "alongside its entropy, at the same cost as computing it")
-            cached_max_grp = dict(minimax_scores)[best_word]
-            expected_max_grp = score_word(best_word, subgroup,
-                                           ScoringMethod.MINIMAX, cache=s.cache)
-            self.assertEqual(cached_max_grp, expected_max_grp)
+            # Every method besides the ranking criterion (entropy, already
+            # captured in lookahead_result) should be persisted too — they
+            # all come from the same group-count partition, so there's no
+            # principled reason to single any of them out.
+            for method in ScoringMethod:
+                if method == ScoringMethod.ENTROPY_GAIN:
+                    continue
+                cached = sc.read_scores(subset_key, method.name.lower())
+                self.assertIsNotNone(
+                    cached,
+                    f"{method.name}'s score for the cached winner should be "
+                    f"persisted alongside its entropy, at near-zero extra cost")
+                cached_value = dict(cached)[best_word]
+                expected_value = score_word(best_word, subgroup, method, cache=s.cache)
+                self.assertEqual(cached_value, expected_value)
+
 
 
 # ---------------------------------------------------------------------------

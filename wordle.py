@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b60"
+BUILD = "b61"
 
 
 # ---------------------------------------------------------------------------
@@ -1032,7 +1032,7 @@ def cmd_grid(gs):
         print_error("No words in input set!")
         return
 
-    methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX]
+    methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE]
     n_in = len(wordlist)
     n_rem = len(soln.current_words)
     print(f"\nScoring {n_in:,} guesses vs "
@@ -1049,7 +1049,7 @@ def cmd_grid(gs):
     # Build flat list for Pareto analysis
     word_ent_mx = [
         (word, scores[ScoringMethod.ENTROPY_GAIN],
-         int(scores[ScoringMethod.MINIMAX]))
+         int(scores[ScoringMethod.MAX_GROUP_SIZE]))
         for word, scores in results
     ]
 
@@ -1294,7 +1294,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     remaining = soln.current_words
     n = len(remaining)
 
-    _step1_methods = (ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX,
+    _step1_methods = (ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE,
                       ScoringMethod.WEIGHTED_AVG, ScoringMethod.PROB_FINISH)
     for m in _step1_methods:
         soln._ensure_scores_loaded(m)
@@ -1310,17 +1310,17 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     _cached = soln.word_scores.get(word, {})
     if all(m in _cached for m in _step1_methods):
         step1    = _cached[ScoringMethod.ENTROPY_GAIN]
-        max_grp  = int(_cached[ScoringMethod.MINIMAX])
+        max_grp  = int(_cached[ScoringMethod.MAX_GROUP_SIZE])
         wt_avg   = _cached[ScoringMethod.WEIGHTED_AVG]
         prob_fin = _cached[ScoringMethod.PROB_FINISH]
     else:
         group_counts = {p: len(g) for p, g in s1_groups.items()}
         step1    = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
         wt_avg   = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
-        max_grp  = int(score_groups(group_counts, ScoringMethod.MINIMAX))
+        max_grp  = int(score_groups(group_counts, ScoringMethod.MAX_GROUP_SIZE))
         prob_fin = score_groups(group_counts, ScoringMethod.PROB_FINISH)
         soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
-        soln.word_scores[word][ScoringMethod.MINIMAX]      = float(max_grp)
+        soln.word_scores[word][ScoringMethod.MAX_GROUP_SIZE]      = float(max_grp)
         soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
         soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
 
@@ -1942,7 +1942,7 @@ def cmd_help(gs):
   ? = This help
 
   Cache: {gs.score_cache_path}
-    {la_rows:,} subgroup best-guesses, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
+    {la_rows:,} subgroup picks, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
 """)
 
 

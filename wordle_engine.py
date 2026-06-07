@@ -19,7 +19,7 @@ from cache_sqlite import ScoreCache
 class ScoringMethod(Enum):
     WEIGHTED_AVG = auto()     # sum(n_i^2) / N  — lower is better
     ENTROPY_GAIN = auto()     # Shannon entropy (bits of info gained)
-    MINIMAX = auto()          # max(n_i)
+    MAX_GROUP_SIZE = auto()   # max(n_i)
     PROB_FINISH = auto()      # P(next guess solves it)
 
     @property
@@ -27,7 +27,7 @@ class ScoringMethod(Enum):
         labels = {
             ScoringMethod.WEIGHTED_AVG:   "Weighted avg remaining",
             ScoringMethod.ENTROPY_GAIN:   "Entropy gain (bits)",
-            ScoringMethod.MINIMAX:        "Worst-case group size",
+            ScoringMethod.MAX_GROUP_SIZE:        "Worst-case group size",
             ScoringMethod.PROB_FINISH:    "P(finish next turn)",
         }
         return labels[self]
@@ -45,7 +45,7 @@ class ScoringMethod(Enum):
 
     def format_score(self, value):
         """Format a score value for display."""
-        if self == ScoringMethod.MINIMAX:
+        if self == ScoringMethod.MAX_GROUP_SIZE:
             return str(int(value))
         if self == ScoringMethod.PROB_FINISH:
             return f'{value:.1%}'
@@ -331,7 +331,7 @@ def score_groups(groups, method=ScoringMethod.ENTROPY_GAIN):
 
     - WEIGHTED_AVG: sum(n_i^2)/N. Lower is better.
     - ENTROPY_GAIN: Shannon entropy in bits. Higher is better.
-    - MINIMAX: max(n_i). Lower is better.
+    - MAX_GROUP_SIZE: max(n_i). Lower is better.
     - PROB_FINISH: fraction of remaining words in size-1
       groups (game ends next turn). Higher is better.
     """
@@ -354,7 +354,7 @@ def score_groups(groups, method=ScoringMethod.ENTROPY_GAIN):
                 entropy -= p * math.log2(p)
         return entropy
 
-    elif method == ScoringMethod.MINIMAX:
+    elif method == ScoringMethod.MAX_GROUP_SIZE:
         return max(sizes)
 
     elif method == ScoringMethod.PROB_FINISH:
@@ -750,15 +750,18 @@ class Solution:
                             best_word = candidate
                     if lc and best_word is not None and subset_key is not None:
                         lc.write(subset_key, policy, best_word, best)
-                        # The winner's worst-case group size is just as useful
-                        # to have on hand later (e.g. for board displays) as
-                        # its entropy, and costs only one more pass over the
-                        # partition we already built to find it — so persist
-                        # it too, via the existing per-word score cache.
-                        max_grp = score_word(best_word, subgroup,
-                                             ScoringMethod.MINIMAX, cache=cache)
-                        lc.write_scores(subset_key, [(best_word, max_grp)],
-                                        ScoringMethod.MINIMAX.name.lower())
+                        # The other scoring methods come from the very same
+                        # group-count partition score_word_multi just shares
+                        # across all of them — so persisting only the ranking
+                        # criterion (entropy) here would be an arbitrary cutoff.
+                        # Cache every method's view of this winner while it's
+                        # nearly free to compute.
+                        other_methods = [m for m in ScoringMethod if m != method]
+                        other_scores = score_word_multi(best_word, subgroup,
+                                                         other_methods, cache=cache)
+                        for m, s in other_scores.items():
+                            lc.write_scores(subset_key, [(best_word, s)],
+                                            m.name.lower())
 
                 weighted_second += (cnt / n) * best
 

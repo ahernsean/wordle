@@ -85,6 +85,21 @@ class ScoreCache:
                 PRIMARY KEY (subset_hash, method, universe_id, word)
             )
         """)
+        # ScoringMethod.MINIMAX (named for the optimization strategy applied
+        # to the metric) was renamed to MAX_GROUP_SIZE (named for the metric
+        # itself, consistent with ENTROPY_GAIN/WEIGHTED_AVG/PROB_FINISH) —
+        # carry forward any rows persisted under the old method key. Checked
+        # via existence-first LIMIT 1 (see _purge_legacy_rows) so a table with
+        # no such rows — the steady state once this has run once — costs only
+        # a single indexed-or-not probe, not a full scan, on every connection.
+        stale_method = self._conn.execute(
+            "SELECT 1 FROM word_scores WHERE method = 'minimax' LIMIT 1"
+        ).fetchone()
+        if stale_method is not None:
+            self._conn.execute("""
+                UPDATE word_scores SET method = 'max_group_size'
+                WHERE method = 'minimax'
+            """)
         # All valid 5-letter words are ASCII, so a null byte identifies the
         # old null-separated subset-key encoding.
         self._purge_legacy_rows("instr(subset_key, char(0)) > 0", ())
