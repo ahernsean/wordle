@@ -549,23 +549,34 @@ class GameState:
             all_answers,
         )
         print(f"Score cache: {self.score_cache_path}")
-        self.solutions = [Solution(all_answers,
-                                   all_words,
-                                   self.cache,
-                                   self.score_cache)]
-        self.columns = 1
-        self.input_set = InputSet.ANY_WORD
-        self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
-        self.constrained_erd_cache = None        # MemoryScoreCache from last hard-mode warmer
-        self.constrained_erd_cache_words = None  # frozenset of words the cache was built for
+        self._start_new_game()
 
     def reset_all(self):
+        """Abandon the current game(s) and start fresh — same word lists,
+        same persistent caches, but every other piece of per-game state
+        (solutions, mode, ERD progress/cache) goes back to its initial value.
+
+        Centralized here and in __init__ so a freshly-started game and a
+        reset game can never drift out of sync: any new per-game field only
+        needs to be added in _start_new_game to be reset correctly too.
+        """
+        self._start_new_game()
+
+    def _start_new_game(self):
         self.solutions = [Solution(self.all_answers,
                                    self.all_words,
                                    self.cache,
                                    self.score_cache)]
         self.columns = 1
         self.input_set = InputSet.ANY_WORD
+        self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
+        # Hard-mode ERD results are path-dependent — they're only valid for
+        # the exact constraint history that produced them, which a reset
+        # always discards (even when replaying toward the same answer with
+        # different guesses). Drop them so a stale cache can't be reused
+        # under a now-mismatched set of eligible guesses.
+        self.constrained_erd_cache = None        # MemoryScoreCache from last hard-mode warmer
+        self.constrained_erd_cache_words = None  # frozenset of words the cache was built for
 
     @property
     def single(self):
