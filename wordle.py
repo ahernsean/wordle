@@ -723,21 +723,32 @@ def _erd_cache_and_policy(gs, soln):
         return soln.score_cache, 'erd_all'
 
 
-def _erd_solve_scores(soln, score_cache=None, policy='erd_all'):
+def _erd_solve_scores(soln, score_cache=None, policy='erd_all', guesses=None):
     """
-    Rank all current_words candidates by ERD using only cached values.
+    Rank candidates by ERD using only cached subgroup values.
     Returns sorted (word, erd_cost) list, lowest first, or None if any
-    subgroup is missing from the cache.
+    subgroup for any candidate is missing from the cache.
 
     score_cache: cache to read from; defaults to soln.score_cache (SQLite).
-    policy: cache policy key ('erd_all' or 'erd_constrained').
+    policy:      cache key ('erd_all', 'erd_answers', 'erd_constrained').
+    guesses:     candidate words to rank.  Defaults to soln.current_words
+                 (answer words only).  Pass the full word list to include
+                 non-answer candidates in any-word mode.
     """
+    from wordle_engine import _encode_response
     n = len(soln.current_words)
     sc = score_cache if score_cache is not None else soln.score_cache
     cache = soln.cache
+    candidates = guesses if guesses is not None else soln.current_words
     results = []
-    for word in soln.current_words:
-        groups = cache.group_words(word, soln.current_words) if cache else {}
+    for word in candidates:
+        if cache and word in cache.answer_words:
+            groups = cache.group_words(word, soln.current_words)
+        else:
+            groups = defaultdict(list)
+            for answer in soln.current_words:
+                pat = _encode_response(calculate_response(word, answer))
+                groups[pat].append(answer)
         cost = 1.0
         ok = True
         for sg in groups.values():
