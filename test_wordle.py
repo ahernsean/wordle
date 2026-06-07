@@ -553,5 +553,231 @@ class TestMultistepStatsCache(unittest.TestCase):
         self.assertIsNone(sc.read_scores("entropy_gain"))
 
 
+# ---------------------------------------------------------------------------
+# Bug: min_expected_guesses derives policy from guesses-is-not-None, ignoring
+# the caller's intended policy.  The fix adds an explicit policy= parameter.
+# ---------------------------------------------------------------------------
+
+class TestERDPolicyParameter(unittest.TestCase):
+    """
+    min_expected_guesses must accept and honour an explicit policy= argument
+    so callers can separate 'erd_answers', 'erd_all', 'erd_constrained' in
+    the cache independently of whether a guesses list is supplied.
+
+    All tests in this class currently fail because no policy= parameter exists.
+    """
+
+    def setUp(self):
+        self.cache = ResponseCache(ANSWERS)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, 'test.sqlite3')
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _sc(self):
+        return ScoreCache(self.db, ANSWERS)
+
+    def test_explicit_policy_stored_not_derived(self):
+        """Passing policy='erd_answers' with guesses= stores under 'erd_answers', not 'erd_all'."""
+        sc = self._sc()
+        subset = ANSWERS[:4]
+        key = ScoreCache.encode_subset(subset)
+
+        min_expected_guesses(subset, self.cache, sc,
+                             guesses=subset, policy='erd_answers')
+
+        self.assertIsNotNone(sc.read(key, 'erd_answers'),
+                             "result must be stored under the explicit policy")
+        self.assertIsNone(sc.read(key, 'erd_all'),
+                          "result must NOT be stored under the derived policy")
+
+    def test_possible_answers_warmer_readable_by_solve(self):
+        """
+        Results written with policy='erd_answers' (POSSIBLE_ANSWERS warmer) are
+        readable by _erd_solve_scores under policy='erd_answers'.
+
+        With the bug, the warmer calls min_expected_guesses(guesses=words) which
+        stores under 'erd_all'; _erd_solve_scores looks under 'erd_answers' → miss.
+        """
+        words = ANSWERS[:5]
+        sc = self._sc()
+        import types
+        soln = types.SimpleNamespace(
+            current_words=list(words),
+            score_cache=sc,
+            cache=ResponseCache(words),
+        )
+
+        # Simulate POSSIBLE_ANSWERS warmer: guesses=current_words, policy='erd_answers'
+        min_expected_guesses(words, soln.cache, sc,
+                             guesses=words, policy='erd_answers')
+
+        scores = _erd_solve_scores(soln, score_cache=sc, policy='erd_answers')
+        self.assertIsNotNone(scores,
+                             "POSSIBLE_ANSWERS ERD must be readable after warmer completes")
+
+    def test_erd_all_and_erd_answers_do_not_share_cache_slots(self):
+        """
+        erd_answers and erd_all are stored under separate cache slots.
+        Writing one does not contaminate the other.
+        """
+        subset = ANSWERS[:5]
+        sc = self._sc()
+        key = ScoreCache.encode_subset(subset)
+
+        # Write only erd_answers (no guesses=)
+        min_expected_guesses(subset, self.cache, sc, policy='erd_answers')
+        self.assertIsNotNone(sc.read(key, 'erd_answers'),
+                             "erd_answers must be stored after first call")
+        self.assertIsNone(sc.read(key, 'erd_all'),
+                          "erd_all must be untouched after erd_answers-only call")
+
+        # Now write erd_all (guesses=GUESSES, different vocabulary)
+        min_expected_guesses(subset, self.cache, sc,
+                             guesses=GUESSES, policy='erd_all')
+        self.assertIsNotNone(sc.read(key, 'erd_all'),
+                             "erd_all must be stored after second call")
+        self.assertIsNotNone(sc.read(key, 'erd_answers'),
+                             "erd_answers must still be present — independent slot")
+
+
+# ---------------------------------------------------------------------------
+# Bug: _multistep_stats calls min_expected_guesses without guesses=, so it
+# always uses policy='erd_answers' regardless of all_words mode.
+# After the fix it passes guesses=all_words and policy='erd_all'.
+# ---------------------------------------------------------------------------
+
+class TestMultistepStatsERDPolicy(unittest.TestCase):
+    """
+    When all_words is provided, _multistep_stats should cache subgroup ERDs
+    under 'erd_all'.  Currently the guesses= arg is omitted so results land
+    under 'erd_answers' regardless of mode.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, 'test.sqlite3')
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _mid_game_soln(self):
+        """Apply 'piano' → leaves 6 words including subgroup-producing 'heart'."""
+        soln = make_solution(db_path=self.db)
+        # 'piano' shares no a/e/i/o/u overlap with crane/rates/tales/trace/earth;
+        # guessing it against 'slate' leaves: slate, trace, stale, least, heart, share.
+        pattern = calculate_response("piano", "slate")
+        soln.apply_guess("piano", pattern)
+        self.assertFalse(soln._is_full_game())
+        self.assertGreaterEqual(len(soln.current_words), 3,
+                                "setup must leave 3+ words for non-trivial subgroups")
+        return soln
+
+    def _find_subgroup_key(self, word, remaining):
+        """Return ScoreCache key for the first subgroup of size >= 2."""
+        groups = ResponseCache(ANSWERS).group_words(word, remaining)
+        for sg in groups.values():
+            if len(sg) >= 2:
+                return ScoreCache.encode_subset(sg)
+        return None
+
+    def test_all_words_mode_caches_under_erd_all(self):
+        """
+        After _multistep_stats("heart", soln, all_words=GUESSES), at least one
+        subgroup ERD must be stored under 'erd_all', not 'erd_answers'.
+        ('heart' vs the 6-word remaining set creates a 2-word subgroup.)
+        """
+        soln = self._mid_game_soln()
+        key = self._find_subgroup_key("heart", soln.current_words)
+        self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
+
+        _multistep_stats("heart", soln, all_words=GUESSES)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        self.assertIsNotNone(sc.read(key, 'erd_all'),
+                             "ERD subgroups must be cached under 'erd_all' in any-word mode")
+
+    def test_default_mode_caches_under_erd_answers(self):
+        """
+        Without all_words, _multistep_stats uses 'erd_answers' — this is the
+        existing correct behaviour for POSSIBLE_ANSWERS / default mode.
+        """
+        soln = self._mid_game_soln()
+        key = self._find_subgroup_key("heart", soln.current_words)
+        self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
+
+        _multistep_stats("heart", soln)  # all_words=None
+
+        sc = ScoreCache(self.db, ANSWERS)
+        self.assertIsNotNone(sc.read(key, 'erd_answers'),
+                             "ERD subgroups must be cached under 'erd_answers' in default mode")
+
+
+# ---------------------------------------------------------------------------
+# Bug: _erd_solve_scores only iterates soln.current_words — in any-word mode
+# non-answer candidates (e.g. 'brain', 'train') are never evaluated.
+# After the fix, passing guesses= includes them.
+# ---------------------------------------------------------------------------
+
+class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
+    """
+    _erd_solve_scores must accept an optional guesses= parameter.  When supplied,
+    words outside current_words (non-answers) that have pre-warmed subgroup ERDs
+    must appear in the returned ranking.
+    """
+
+    def _soln(self, words, sc):
+        import types
+        return types.SimpleNamespace(
+            current_words=list(words),
+            score_cache=sc,
+            cache=ResponseCache(words),
+        )
+
+    def test_non_answer_word_appears_when_guesses_supplied(self):
+        """
+        A non-answer word with all subgroup ERDs pre-warmed appears in the
+        ranking when guesses= is passed to _erd_solve_scores.
+        """
+        answers = ANSWERS[:5]
+        non_answer = next(w for w in GUESSES if w not in ANSWERS)
+
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), answers)
+            soln = self._soln(answers, sc)
+
+            # Pre-warm all subgroup ERDs using the full GUESSES vocabulary
+            min_expected_guesses(answers, soln.cache, sc,
+                                 guesses=GUESSES, policy='erd_all')
+
+            scores = _erd_solve_scores(soln, score_cache=sc,
+                                       policy='erd_all', guesses=GUESSES)
+            self.assertIsNotNone(scores)
+            result_words = [w for w, _ in scores]
+            self.assertIn(non_answer, result_words,
+                          f"non-answer '{non_answer}' must appear in ERD ranking "
+                          f"when guesses= is supplied")
+
+    def test_without_guesses_only_answer_words_returned(self):
+        """
+        Default behaviour (no guesses=) still limits candidates to current_words.
+        This test must continue to pass after the fix.
+        """
+        answers = ANSWERS[:5]
+        non_answer = next(w for w in GUESSES if w not in ANSWERS)
+
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), answers)
+            soln = self._soln(answers, sc)
+            min_expected_guesses(answers, soln.cache, sc, guesses=answers)
+            scores = _erd_solve_scores(soln, score_cache=sc)
+            self.assertIsNotNone(scores)
+            result_words = [w for w, _ in scores]
+            for w in result_words:
+                self.assertIn(w, answers,
+                              f"without guesses=, only answer words should appear")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
