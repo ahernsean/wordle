@@ -740,6 +740,7 @@ def _erd_solve_scores(soln, score_cache=None, policy='erd_all', guesses=None):
     sc = score_cache if score_cache is not None else soln.score_cache
     cache = soln.cache
     candidates = guesses if guesses is not None else soln.current_words
+    answer_set = set(soln.current_words)
     results = []
     for word in candidates:
         if cache and word in cache.answer_words:
@@ -766,7 +767,9 @@ def _erd_solve_scores(soln, score_cache=None, policy='erd_all', guesses=None):
                 break
             cost += (k / n) * hit[1]
         if not ok:
-            return None
+            if word in answer_set:
+                return None  # answer-word miss means warmer not ready
+            continue        # non-answer miss: skip silently, try others
         results.append((word, cost))
     results.sort(key=lambda x: x[1])
     return results
@@ -819,12 +822,18 @@ def cmd_solve(gs):
         print_error("Invalid choice.")
         return
 
-    # ERD branch: no input wordlist needed, candidates are always current_words.
+    # ERD branch: candidates come from the effective guess vocabulary.
     if raw == erd_idx:
         if erd_root is None:
             print_error("ERD tree not ready yet. Wait for the [ERD ready] notification.")
             return
-        scores = _erd_solve_scores(soln, erd_sc, erd_policy)
+        if gs.input_set == InputSet.ANY_WORD:
+            erd_guesses = gs.all_words
+        elif gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
+            erd_guesses = soln.constraint_compliant_words(gs.all_words)
+        else:
+            erd_guesses = None  # POSSIBLE_ANSWERS: current_words only
+        scores = _erd_solve_scores(soln, erd_sc, erd_policy, guesses=erd_guesses)
         if scores is None:
             print_error("ERD cache incomplete — some subgroups missing.")
             return
