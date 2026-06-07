@@ -16,7 +16,7 @@ from wordle_engine import (
     calculate_response, score_groups, calculate_group_counts,
     min_expected_guesses,
 )
-from cache_sqlite import ScoreCache
+from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import _multistep_stats, _erd_solve_scores
 
 
@@ -737,6 +737,77 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
         self.assertIsNone(sc.read(key, 'erd_constrained'),
                           "hard-mode ERD values are path-dependent and must never "
                           "be persisted to the cross-game SQLite cache")
+
+
+# ---------------------------------------------------------------------------
+# MemoryScoreCache scoping by eligible-vocabulary fingerprint
+#
+# Hard-mode ERD results are valid only for the exact eligible-guess
+# vocabulary (the word set surviving every accumulated Restriction) that
+# produced them — NOT merely for a particular `current_words` snapshot.
+# Two different guess histories can coincidentally produce the same
+# `current_words` while differing in eligible vocabulary (and vice versa
+# after undo/replay), so the cache must be keyed on a fingerprint of the
+# vocabulary itself.  Entries written under one scope must be invisible
+# under another, and reachable again "for free" once that scope recurs —
+# without any explicit eviction.
+# ---------------------------------------------------------------------------
+
+class TestMemoryScoreCacheScoping(unittest.TestCase):
+
+    def test_fingerprint_is_order_independent(self):
+        """Fingerprint depends only on the set of words, not their order."""
+        a = MemoryScoreCache.fingerprint_vocabulary(["crane", "slate", "trace"])
+        b = MemoryScoreCache.fingerprint_vocabulary(["trace", "crane", "slate"])
+        self.assertEqual(a, b)
+
+    def test_fingerprint_distinguishes_different_vocabularies(self):
+        a = MemoryScoreCache.fingerprint_vocabulary(["crane", "slate", "trace"])
+        b = MemoryScoreCache.fingerprint_vocabulary(["crane", "slate", "stale"])
+        self.assertNotEqual(a, b)
+
+    def test_write_invisible_under_different_scope(self):
+        """An entry written under one vocabulary scope is a miss under another,
+        even for the identical (subset_key, policy) — preventing false hits
+        when the eligible-guess vocabulary changes but current_words coincides."""
+        mc = MemoryScoreCache()
+        key = ScoreCache.encode_subset(["crane", "slate"])
+
+        mc.set_scope(MemoryScoreCache.fingerprint_vocabulary(GUESSES))
+        mc.write(key, 'erd_constrained', 'heart', 1.5)
+        self.assertEqual(mc.read(key, 'erd_constrained'), ('heart', 1.5))
+
+        mc.set_scope(MemoryScoreCache.fingerprint_vocabulary(ANSWERS))
+        self.assertIsNone(mc.read(key, 'erd_constrained'),
+                          "entry from a different vocabulary scope must not be "
+                          "visible — it was computed against a different "
+                          "eligible-guess set and would be a false hit")
+
+    def test_entries_reachable_again_when_scope_recurs(self):
+        """Switching back to a previously-seen vocabulary makes its entries
+        reachable again at no cost — exactly the reuse undo/replay wants."""
+        mc = MemoryScoreCache()
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        fp_guesses = MemoryScoreCache.fingerprint_vocabulary(GUESSES)
+        fp_answers = MemoryScoreCache.fingerprint_vocabulary(ANSWERS)
+
+        mc.set_scope(fp_guesses)
+        mc.write(key, 'erd_constrained', 'heart', 1.5)
+
+        mc.set_scope(fp_answers)
+        mc.write(key, 'erd_constrained', 'stale', 2.0)
+
+        mc.set_scope(fp_guesses)
+        self.assertEqual(mc.read(key, 'erd_constrained'), ('heart', 1.5),
+                         "revisiting a scope must surface its own entries again")
+
+    def test_unscoped_cache_keys_by_none(self):
+        """Before set_scope is ever called, reads/writes use a stable (None)
+        scope rather than raising — a freshly constructed cache is usable."""
+        mc = MemoryScoreCache()
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        mc.write(key, 'erd_constrained', 'heart', 1.5)
+        self.assertEqual(mc.read(key, 'erd_constrained'), ('heart', 1.5))
 
 
 # ---------------------------------------------------------------------------

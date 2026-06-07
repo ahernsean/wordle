@@ -186,16 +186,37 @@ class MemoryScoreCache:
 
     Implements the same read/write/encode_subset interface as ScoreCache so it
     can be passed directly to min_expected_guesses.  Results are never persisted.
+
+    Hard-mode ERD results are valid only for the exact eligible-guess
+    vocabulary (the word set surviving every accumulated Restriction) that
+    produced them — not merely for a particular current_words snapshot, which
+    can coincide across genuinely different guess histories (e.g. via undo).
+    Entries are therefore namespaced by a fingerprint of that vocabulary
+    (see fingerprint_vocabulary / set_scope): switching scope makes entries
+    from other vocabularies invisible (no false hits) while leaving them
+    intact, so a recurring vocabulary becomes reusable again for free —
+    no explicit eviction needed.
     """
 
     def __init__(self):
-        self._data = {}  # (subset_key_bytes, policy) -> (best_word, best_score)
+        self._data = {}  # (scope, subset_key_bytes, policy) -> (best_word, best_score)
+        self._scope = None
+
+    @staticmethod
+    def fingerprint_vocabulary(words):
+        """Order-independent digest identifying an eligible-guess word set."""
+        canonical = "\n".join(sorted(words))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def set_scope(self, fingerprint):
+        """Switch the active vocabulary scope for subsequent read/write calls."""
+        self._scope = fingerprint
 
     def read(self, subset_key, policy):
-        return self._data.get((subset_key, policy))
+        return self._data.get((self._scope, subset_key, policy))
 
     def write(self, subset_key, policy, best_word, best_entropy):
-        self._data[(subset_key, policy)] = (best_word, best_entropy)
+        self._data[(self._scope, subset_key, policy)] = (best_word, best_entropy)
 
     def close(self):
         pass

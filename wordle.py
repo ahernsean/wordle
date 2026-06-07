@@ -549,6 +549,12 @@ class GameState:
             all_answers,
         )
         print(f"Score cache: {self.score_cache_path}")
+        # Long-lived: hard-mode ERD results are namespaced internally by a
+        # fingerprint of the eligible-guess vocabulary (see set_scope), so
+        # entries from earlier positions/games simply become unreachable
+        # rather than needing to be reset — and become reusable again "for
+        # free" if that exact vocabulary recurs (e.g. via undo/replay).
+        self.constrained_erd_cache = MemoryScoreCache()
         self._start_new_game()
 
     def reset_all(self):
@@ -570,13 +576,8 @@ class GameState:
         self.columns = 1
         self.input_set = InputSet.ANY_WORD
         self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
-        # Hard-mode ERD results are path-dependent — they're only valid for
-        # the exact constraint history that produced them, which a reset
-        # always discards (even when replaying toward the same answer with
-        # different guesses). Drop them so a stale cache can't be reused
-        # under a now-mismatched set of eligible guesses.
-        self.constrained_erd_cache = None        # MemoryScoreCache from last hard-mode warmer
-        self.constrained_erd_cache_words = None  # frozenset of words the cache was built for
+        # constrained_erd_cache is intentionally NOT reset here — it is
+        # long-lived and self-scoping (see __init__ and MemoryScoreCache).
 
     @property
     def single(self):
@@ -1251,7 +1252,7 @@ def _explain_conflict(pos, guess_word, recorded, hypothetical):
 
 
 def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
-                     all_words=None):
+                     all_words=None, erd_cache=None):
     """
     Compute 3-step expected entropy and group stats for a single word.
     Returns a dict with keys: step1, step2, step3, max_grp, max_grp2,
@@ -1262,8 +1263,11 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     constraint_compliant: if True, compute valid step-2 candidates per subgroup
         by applying the step-1 response constraints to all_words.  Also
         switches the ERD computation to the hard-mode guess vocabulary,
-        cached transiently under ERD_CONSTRAINED (never persisted — those
-        values are path-dependent and meaningless to other games/positions).
+        cached under ERD_CONSTRAINED.  Those values are path-dependent and
+        meaningless to other games/positions, so they must never reach the
+        persisted cross-game SQLite cache — erd_cache must be a
+        MemoryScoreCache (the caller's long-lived, vocabulary-scoped
+        gs.constrained_erd_cache when available, else a throwaway one).
     Step 3 always uses subgroup candidates — sub-subgroups are tiny.
     """
     cache = soln.cache
@@ -1413,13 +1417,16 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
         if constraint_compliant:
             # Hard-mode guess vocabulary is path-dependent (it depends on the
             # exact constraints accumulated so far), so its ERD values must
-            # never be written into the persisted, cross-game SQLite cache —
-            # a fresh transient cache keeps this computation's memoization
-            # local without polluting (or being polluted by) anything else.
+            # never be written into the persisted, cross-game SQLite cache.
+            # erd_cache (when supplied) is the long-lived, vocabulary-scoped
+            # MemoryScoreCache shared with the warmer for this position —
+            # reusing it lets try-mode and the warmer trade sub-results for
+            # free. A throwaway cache is the fallback for callers that don't
+            # have one (e.g. tests), keeping memoization local in that case.
             erd_guesses = (soln.constraint_compliant_words(all_words)
                            if all_words else None)
             erd_policy = ERD_CONSTRAINED
-            erd_score_cache = MemoryScoreCache()
+            erd_score_cache = erd_cache if erd_cache is not None else MemoryScoreCache()
         elif all_words:
             erd_guesses = all_words
             erd_policy = ERD_ALL
@@ -1465,7 +1472,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
 
 
 def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
-                   all_words=None):
+                   all_words=None, erd_cache=None):
     """Compare 2–4 words side by side."""
     n = len(soln.current_words)
 
@@ -1474,7 +1481,8 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
     for i, w in enumerate(words):
         if len(words) > 1:
             print(f'  [{i + 1}/{len(words)}] {w.upper()}', flush=True)
-        all_stats.append(_multistep_stats(w, soln, step2_pool, constraint_compliant, all_words))
+        all_stats.append(_multistep_stats(w, soln, step2_pool, constraint_compliant,
+                                           all_words, erd_cache))
 
     lw = 9  # "Entropy 1" = 9, "10-49:" = 6
 
@@ -1561,9 +1569,17 @@ def cmd_test(gs, inline=''):
 
     # Derive step-2 pool and hard-mode flag from current input-set setting
     iset = gs.input_set
+    erd_cache = None
     if iset == InputSet.CONSTRAINT_COMPLIANT:
         step2_pool = None
         constraint_compliant  = True
+        # Reuse the long-lived, vocabulary-scoped hard-mode ERD cache so
+        # try-mode and the background warmer trade sub-results for free —
+        # both use the exact same eligible-guess vocabulary for this position.
+        eligible = soln.constraint_compliant_words(gs.all_words)
+        gs.constrained_erd_cache.set_scope(
+            MemoryScoreCache.fingerprint_vocabulary(eligible))
+        erd_cache = gs.constrained_erd_cache
     elif iset == InputSet.POSSIBLE_ANSWERS:
         step2_pool = None
         constraint_compliant  = False
@@ -1579,7 +1595,7 @@ def cmd_test(gs, inline=''):
     try:
         if 2 <= len(words) <= 4:
             assert all(len(w) == 5 for w in words)
-            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words)
+            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words, erd_cache)
             return
         assert len(words) == 1 and len(words[0]) == 5
         word = words[0]
@@ -1643,7 +1659,7 @@ def cmd_test(gs, inline=''):
         # Multi-step lookahead for this word
         if n > 2:
             st = _multistep_stats(word, soln, step2_pool, constraint_compliant,
-                                  gs.all_words)
+                                  gs.all_words, erd_cache)
             mode = ('hard mode' if constraint_compliant
                     else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
@@ -2000,10 +2016,13 @@ class ERDWarmer(threading.Thread):
 
     persist=True  (ANY_WORD / POSSIBLE_ANSWERS): uses a private SQLite
                   ScoreCache connection; results survive across sessions.
-    persist=False (CONSTRAINT_COMPLIANT): uses a MemoryScoreCache; results are transient
-                  because the eligible guess set is path-dependent.
-                  Caller may pass seed_mem_cache to pre-populate sub-results
-                  from a prior run at the same position.
+    persist=False (CONSTRAINT_COMPLIANT): uses the caller-supplied
+                  seed_mem_cache (a long-lived, vocabulary-scoped
+                  MemoryScoreCache — see GameState.constrained_erd_cache).
+                  Results are transient because the eligible guess set is
+                  path-dependent, but the cache itself survives across runs:
+                  its internal scoping makes stale entries unreachable and
+                  recurring vocabularies reusable, with no caller bookkeeping.
 
     policy must be passed explicitly: ERD_ALL, ERD_ANSWERS, or ERD_CONSTRAINED.
     """
@@ -2023,7 +2042,6 @@ class ERDWarmer(threading.Thread):
         self._cancel = threading.Event()
         self.subgroups_done = 0   # incremented after each subgroup is cached
         self.subgroups_total = 0  # set after collection; 0 means still collecting
-        self.mem_cache = None     # set in run() when persist=False
 
     def stop(self):
         self._cancel.set()
@@ -2034,8 +2052,7 @@ class ERDWarmer(threading.Thread):
         if self._persist:
             score_cache = ScoreCache(self._cache_path, self._all_answers)
         else:
-            score_cache = self._seed_mem_cache or MemoryScoreCache()
-            self.mem_cache = score_cache
+            score_cache = self._seed_mem_cache
         try:
             self._warm(score_cache)
         finally:
@@ -2122,18 +2139,22 @@ def main():
         if gs.single and not gs.solutions[0]._is_full_game():
             soln0 = gs.solutions[0]
             cfg = _erd_mode_config(gs)
+            effective_guesses = cfg.guesses_fn(gs, soln0)
             seed_cache = None
             if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
-                # Reuse sub-results if position is unchanged since last run
-                # (hard-mode ERDs are path-dependent, so only valid here).
-                cur_frozen = frozenset(soln0.current_words)
-                seed_cache = (gs.constrained_erd_cache
-                              if gs.constrained_erd_cache_words == cur_frozen
-                              else None)
+                # Hard-mode ERD results are valid only for the exact eligible-
+                # guess vocabulary that produced them.  Scope the long-lived
+                # cache to that vocabulary's fingerprint: entries from other
+                # vocabularies become invisible (no false hits across undo /
+                # reset / replay), while a recurring vocabulary's entries
+                # become reusable again automatically — no eviction needed.
+                gs.constrained_erd_cache.set_scope(
+                    MemoryScoreCache.fingerprint_vocabulary(effective_guesses))
+                seed_cache = gs.constrained_erd_cache
             _warmer = ERDWarmer(
                 soln0.current_words,
                 gs.all_answers,
-                cfg.guesses_fn(gs, soln0),
+                effective_guesses,
                 gs.score_cache_path,
                 gs.cache,
                 policy=cfg.policy,
@@ -2160,9 +2181,6 @@ def main():
 
         if _warmer is not None:
             gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
-            if _warmer.mem_cache is not None:
-                gs.constrained_erd_cache = _warmer.mem_cache
-                gs.constrained_erd_cache_words = frozenset(_warmer._words)
             _warmer.stop()
             _warmer = None
 
