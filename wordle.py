@@ -1342,11 +1342,13 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     for m in _step1_methods:
         soln._persist_scores(m)
 
-    # ERD: exact expected guesses, answers-only candidates.
-    # Only computed mid-game (option C); root (full game) is too expensive
-    # for an interactive command and is left as None.
+    # ERD: exact expected guesses for the current candidates mode.
+    # Only computed mid-game; root (full game) is too expensive for an
+    # interactive command and is left as None.
     erd = None
     if not soln._is_full_game():
+        erd_guesses = all_words if all_words else None
+        erd_policy  = 'erd_all' if all_words else 'erd_answers'
         erd_t0 = time.time()
         erd_announced = False
         deadline = erd_t0 + 30
@@ -1362,7 +1364,8 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
                 print('  Computing ERD...', end='', flush=True)
                 erd_announced = True
             sub_erd = min_expected_guesses(
-                subgroup, cache, soln.score_cache, deadline
+                subgroup, cache, soln.score_cache, deadline,
+                guesses=erd_guesses, policy=erd_policy,
             )
             if sub_erd is None:
                 erd_ok = False
