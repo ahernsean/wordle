@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b59"
+BUILD = "b60"
 
 
 # ---------------------------------------------------------------------------
@@ -1942,7 +1942,7 @@ def cmd_help(gs):
   ? = This help
 
   Cache: {gs.score_cache_path}
-    {la_rows:,} subgroup rows, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
+    {la_rows:,} subgroup best-guesses, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
 """)
 
 

@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
-    calculate_response, score_groups, calculate_group_counts,
+    calculate_response, score_groups, calculate_group_counts, score_word,
     min_expected_guesses, ERD_ALL,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
@@ -487,6 +487,48 @@ class TestResponseCachePersistence(unittest.TestCase):
         cache2 = ResponseCache(ANSWERS, score_cache=sc2)
         cache2._ensure("crane")
         self.assertEqual(dict(cache2._cache["crane"]), expected)
+
+
+# ---------------------------------------------------------------------------
+# compute_lookahead — winner's max-group-size persisted alongside entropy
+# ---------------------------------------------------------------------------
+
+class TestComputeLookaheadCache(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_winner_max_group_size_persisted_alongside_entropy(self):
+        s = make_solution(db_path=self.db)
+        first_ent = score_word("piano", s.current_words, ScoringMethod.ENTROPY_GAIN,
+                               cache=s.cache)
+        s.compute_lookahead([("piano", first_ent)])
+
+        sc = ScoreCache(self.db, ANSWERS)
+        grouped = s.cache.group_words("piano", s.current_words)
+        scanned = [sg for sg in grouped.values() if len(sg) > 2]
+        self.assertTrue(scanned, "expected at least one subgroup big enough to scan")
+
+        for subgroup in scanned:
+            subset_key = ScoreCache.encode_subset(subgroup)
+            hit = sc.read(subset_key, "hard")
+            self.assertIsNotNone(hit)
+            best_word, _best_entropy = hit
+
+            minimax_scores = sc.read_scores(subset_key, "minimax")
+            self.assertIsNotNone(
+                minimax_scores,
+                "max-group-size for the cached winner should be persisted "
+                "alongside its entropy, at the same cost as computing it")
+            cached_max_grp = dict(minimax_scores)[best_word]
+            expected_max_grp = score_word(best_word, subgroup,
+                                           ScoringMethod.MINIMAX, cache=s.cache)
+            self.assertEqual(cached_max_grp, expected_max_grp)
 
 
 # ---------------------------------------------------------------------------

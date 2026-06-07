@@ -750,6 +750,15 @@ class Solution:
                             best_word = candidate
                     if lc and best_word is not None and subset_key is not None:
                         lc.write(subset_key, policy, best_word, best)
+                        # The winner's worst-case group size is just as useful
+                        # to have on hand later (e.g. for board displays) as
+                        # its entropy, and costs only one more pass over the
+                        # partition we already built to find it — so persist
+                        # it too, via the existing per-word score cache.
+                        max_grp = score_word(best_word, subgroup,
+                                             ScoringMethod.MINIMAX, cache=cache)
+                        lc.write_scores(subset_key, [(best_word, max_grp)],
+                                        ScoringMethod.MINIMAX.name.lower())
 
                 weighted_second += (cnt / n) * best
 
