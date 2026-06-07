@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b56"
+BUILD = "b57"
 
 
 # ---------------------------------------------------------------------------
@@ -1533,7 +1533,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
     # Column width: wide enough for word names AND every formatted value.
     # Using a consistent format per row means right-justifying to cw
     # automatically aligns decimal points within each row.
-    cw = max(len(w) for w in words)
+    cw = max(len(w) + 1 for w in words)  # +1 for the answer-set '*' marker
     for _, values, fmt, _ in data_rows + bucket_rows:
         for v in values:
             if v is not None:
@@ -1549,7 +1549,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
         else:
             best = max(valid) if higher_better else min(valid)
             all_tied = False
-        print(f'  {label:<{lw}} ', end='')
+        print(f'  {label:<{lw}}  ', end='')
         for i, (p, v) in enumerate(zip(padded, values)):
             if i:
                 print('  ', end='')
@@ -1561,7 +1561,8 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
         print()
 
     print(f'\n  {n:,} words:')
-    print(f'  {"":>{lw}} ' + '  '.join(w.upper().rjust(cw) for w in words))
+    print(f'  {"":>{lw}}  '
+          + '  '.join((w.upper() + _mark(w)).rjust(cw) for w in words))
 
     for label, values, fmt, hb in data_rows:
         print_row(label, values, fmt, hb)

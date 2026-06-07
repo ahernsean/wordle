@@ -2,12 +2,14 @@
 Tests for Wordle engine correctness and cache behavior.
 Run with:  python test_wordle.py
 """
+import io
 import math
 import os
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,7 +20,10 @@ from wordle_engine import (
     min_expected_guesses, ERD_ALL,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
-from wordle import _multistep_stats, _erd_solve_scores, ERDWarmer
+from wordle import (
+    _multistep_stats, _erd_solve_scores, ERDWarmer,
+    _compare_words, set_display_context,
+)
 
 
 # Small deterministic word sets used across all tests.
@@ -1163,6 +1168,54 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         self.assertEqual(order, sorted(order),
                          "subgroups must be processed smallest-first so that "
                          "larger ones can reuse already-cached sub-results")
+
+
+# ---------------------------------------------------------------------------
+# _compare_words display: answer-set marker and column spacing
+# ---------------------------------------------------------------------------
+
+class TestCompareWordsDisplay(unittest.TestCase):
+
+    @staticmethod
+    def _fake_stats(word, *args, **kwargs):
+        return dict(step1=4.0, step2=2.0, step3=1.0,
+                    wt_avg=2.5, max_grp=10, prob_finish=0.5,
+                    buckets=[1, 2, 3, 0, 0], erd=None)
+
+    def _render(self, words):
+        soln = make_solution()
+        set_display_context(soln)
+        buf = io.StringIO()
+        with mock.patch('wordle._multistep_stats', side_effect=self._fake_stats), \
+             redirect_stdout(buf):
+            _compare_words(words, soln)
+        return buf.getvalue()
+
+    def test_answer_set_words_marked_with_asterisk(self):
+        soln = make_solution()
+        self.assertIn("crane", soln.answer_set)
+        self.assertNotIn("brain", soln.answer_set)
+
+        out = self._render(["crane", "brain"])
+        header = next(l for l in out.splitlines()
+                      if l.strip().startswith('CRANE') and 'BRAIN' in l)
+        self.assertIn('CRANE*', header)
+        self.assertIn('BRAIN ', header)
+        self.assertNotIn('BRAIN*', header)
+
+    def test_extra_space_between_row_label_and_scores(self):
+        # "Entropy 1" is exactly as wide as the label column (lw == 9), and
+        # with these fake stats its formatted value ('4.0000') is exactly as
+        # wide as the score column too — so no rjust padding sneaks in and
+        # the gap we measure is purely the literal separator.
+        out = self._render(["crane", "slate"])
+        label_line = next(l for l in out.splitlines()
+                          if l.strip().startswith('Entropy 1'))
+        idx = label_line.index('Entropy 1') + len('Entropy 1')
+        gap = label_line[idx:]
+        spaces = len(gap) - len(gap.lstrip(' '))
+        self.assertEqual(spaces, 2,
+                         f"expected two spaces between label and score, got {spaces}: {label_line!r}")
 
 
 if __name__ == "__main__":
