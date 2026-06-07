@@ -717,13 +717,17 @@ class Solution:
 
 
 def min_expected_guesses(remaining, cache, score_cache,
-                          deadline=None, progress_fn=None, guesses=None):
+                          deadline=None, progress_fn=None, guesses=None,
+                          policy=None):
     """
     Exact expected guesses to solve remaining words, playing optimally.
 
     guesses: vocabulary of allowed guess words. None means answers-only
-             (restrict guesses to `remaining`). Pass the full word list for
-             all-guesses mode. Cached under policy 'erd_all' vs 'erd_answers'.
+             (restrict guesses to `remaining`).
+    policy:  cache key under which the result is stored.  Defaults to
+             'erd_all' when guesses is supplied, 'erd_answers' otherwise.
+             Pass explicitly when the caller needs a different namespace
+             (e.g. 'erd_constrained' for constraint-compliant mode).
 
     Returns None if deadline is exceeded mid-computation; partial
     results already written to score_cache are kept and valid.
@@ -732,7 +736,8 @@ def min_expected_guesses(remaining, cache, score_cache,
     if n == 1:
         return 1.0
 
-    policy = 'erd_all' if guesses is not None else 'erd_answers'
+    if policy is None:
+        policy = 'erd_all' if guesses is not None else 'erd_answers'
     guess_list = guesses if guesses is not None else remaining
 
     subset_key = ScoreCache.encode_subset(remaining)
@@ -780,7 +785,8 @@ def min_expected_guesses(remaining, cache, score_cache,
                 skip_guess = True
                 break
             sub_erd = min_expected_guesses(
-                subgroup, cache, score_cache, deadline, progress_fn, guesses
+                subgroup, cache, score_cache, deadline, progress_fn, guesses,
+                policy=policy,
             )
             if sub_erd is None:
                 timed_out = True

@@ -1998,7 +1998,8 @@ class ERDWarmer(threading.Thread):
             # block the cancel signal for long.
             deadline = time.time() + 5.0
             min_expected_guesses(sg, self._rcache, score_cache, deadline,
-                                 guesses=self._effective_guesses)
+                                 guesses=self._effective_guesses,
+                                 policy=policy)
             self.subgroups_done += 1
 
         # All subgroups done. Now compute the root (current position).
@@ -2012,6 +2013,7 @@ class ERDWarmer(threading.Thread):
             result = min_expected_guesses(
                 self._words, self._rcache, score_cache, deadline,
                 guesses=self._effective_guesses,
+                policy=policy,
             )
             if result is not None:
                 print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
