@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b55"
+BUILD = "b56"
 
 
 # ---------------------------------------------------------------------------
@@ -1232,6 +1232,7 @@ def cmd_display(gs):
             (w, s) for w, s in soln.scores
             if w in soln.current_words
         ]
+        print(f"{soln.scores_method.label}:")
         print_scored_list(filtered, soln.scores_method)
     else:
         print_word_list(soln.current_words)
