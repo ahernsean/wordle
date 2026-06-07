@@ -29,6 +29,7 @@ from wordle_engine import (
     decode_response, max_entropy,
     answer_to_restriction,
     min_expected_guesses,
+    ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
 )
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b50"
+BUILD = "b51"
 
 
 # ---------------------------------------------------------------------------
@@ -541,8 +542,6 @@ class GameState:
     def __init__(self, all_answers, all_words):
         self.all_answers = all_answers
         self.all_words = all_words
-        self.n_answers = len(all_answers)
-        self.n_words = len(all_words)
         self.cache = ResponseCache(all_answers)
         self.score_cache_path = os.path.abspath("wordle_cache.sqlite3")
         self.score_cache = ScoreCache(
@@ -708,29 +707,64 @@ def _input_wordlist(gs, soln, iset):
     return gs.all_words
 
 
+class _ERDModeConfig:
+    """ERD cache/policy/guess-vocabulary mapping for one InputSet mode.
+
+    Single source of truth for the mode → (cache, policy, persist, guesses)
+    relationship, referenced by _erd_cache_and_policy, cmd_solve, and the
+    warmer-init block in main() so the three-way mode branch lives in
+    exactly one place.
+    """
+    __slots__ = ('policy', 'persist', 'cache_attr', 'guesses_fn')
+
+    def __init__(self, policy, persist, cache_attr, guesses_fn):
+        self.policy = policy
+        self.persist = persist
+        self.cache_attr = cache_attr  # 'score_cache' or 'constrained_erd_cache'
+        self.guesses_fn = guesses_fn  # (gs, soln) -> guess vocabulary
+
+    def cache(self, gs, soln):
+        return (gs.constrained_erd_cache if self.cache_attr == 'constrained_erd_cache'
+                else soln.score_cache)
+
+
+_ERD_MODE_CONFIG = {
+    InputSet.ANY_WORD: _ERDModeConfig(
+        policy=ERD_ALL, persist=True, cache_attr='score_cache',
+        guesses_fn=lambda gs, soln: gs.all_words),
+    InputSet.CONSTRAINT_COMPLIANT: _ERDModeConfig(
+        policy=ERD_CONSTRAINED, persist=False, cache_attr='constrained_erd_cache',
+        guesses_fn=lambda gs, soln: soln.constraint_compliant_words(gs.all_words)),
+    InputSet.POSSIBLE_ANSWERS: _ERDModeConfig(
+        policy=ERD_ANSWERS, persist=True, cache_attr='score_cache',
+        guesses_fn=lambda gs, soln: soln.current_words),
+}
+
+
+def _erd_mode_config(gs):
+    """ERD config for the current input mode; any other mode behaves as ANY_WORD."""
+    return _ERD_MODE_CONFIG.get(gs.input_set, _ERD_MODE_CONFIG[InputSet.ANY_WORD])
+
+
 def _erd_cache_and_policy(gs, soln):
     """Return (score_cache, policy) appropriate for the current input mode.
 
-    ANY_WORD      → SQLite,            'erd_all'
-    CONSTRAINT_COMPLIANT        → MemoryScoreCache,  'erd_constrained'
-    POSSIBLE_ANSWERS → SQLite,            'erd_answers'
+    ANY_WORD             → SQLite,           ERD_ALL
+    CONSTRAINT_COMPLIANT → MemoryScoreCache, ERD_CONSTRAINED
+    POSSIBLE_ANSWERS     → SQLite,           ERD_ANSWERS
     """
-    if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
-        return gs.constrained_erd_cache, 'erd_constrained'
-    elif gs.input_set == InputSet.POSSIBLE_ANSWERS:
-        return soln.score_cache, 'erd_answers'
-    else:
-        return soln.score_cache, 'erd_all'
+    cfg = _erd_mode_config(gs)
+    return cfg.cache(gs, soln), cfg.policy
 
 
-def _erd_solve_scores(soln, score_cache=None, policy='erd_all', guesses=None):
+def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     """
     Rank candidates by ERD using only cached subgroup values.
     Returns sorted (word, erd_cost) list, lowest first, or None if any
     subgroup for any candidate is missing from the cache.
 
     score_cache: cache to read from; defaults to soln.score_cache (SQLite).
-    policy:      cache key ('erd_all', 'erd_answers', 'erd_constrained').
+    policy:      cache namespace (ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED).
     guesses:     candidate words to rank.  Defaults to soln.current_words
                  (answer words only).  Pass the full word list to include
                  non-answer candidates in any-word mode.
@@ -827,12 +861,7 @@ def cmd_solve(gs):
         if erd_root is None:
             print_error("ERD tree not ready yet. Wait for the [ERD ready] notification.")
             return
-        if gs.input_set == InputSet.ANY_WORD:
-            erd_guesses = gs.all_words
-        elif gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
-            erd_guesses = soln.constraint_compliant_words(gs.all_words)
-        else:
-            erd_guesses = None  # POSSIBLE_ANSWERS: current_words only
+        erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
         scores = _erd_solve_scores(soln, erd_sc, erd_policy, guesses=erd_guesses)
         if scores is None:
             print_error("ERD cache incomplete — some subgroups missing.")
@@ -1220,7 +1249,10 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     step2_pool: candidate pool for step 2. If None and not constraint_compliant,
         uses only the subgroup (answers-only mode).
     constraint_compliant: if True, compute valid step-2 candidates per subgroup
-        by applying the step-1 response constraints to all_words.
+        by applying the step-1 response constraints to all_words.  Also
+        switches the ERD computation to the hard-mode guess vocabulary,
+        cached transiently under ERD_CONSTRAINED (never persisted — those
+        values are path-dependent and meaningless to other games/positions).
     Step 3 always uses subgroup candidates — sub-subgroups are tiny.
     """
     cache = soln.cache
@@ -1367,8 +1399,24 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     # interactive command and is left as None.
     erd = None
     if not soln._is_full_game():
-        erd_guesses = all_words if all_words else None
-        erd_policy  = 'erd_all' if all_words else 'erd_answers'
+        if constraint_compliant:
+            # Hard-mode guess vocabulary is path-dependent (it depends on the
+            # exact constraints accumulated so far), so its ERD values must
+            # never be written into the persisted, cross-game SQLite cache —
+            # a fresh transient cache keeps this computation's memoization
+            # local without polluting (or being polluted by) anything else.
+            erd_guesses = (soln.constraint_compliant_words(all_words)
+                           if all_words else None)
+            erd_policy = ERD_CONSTRAINED
+            erd_score_cache = MemoryScoreCache()
+        elif all_words:
+            erd_guesses = all_words
+            erd_policy = ERD_ALL
+            erd_score_cache = soln.score_cache
+        else:
+            erd_guesses = None
+            erd_policy = ERD_ANSWERS
+            erd_score_cache = soln.score_cache
         erd_t0 = time.time()
         erd_announced = False
         deadline = erd_t0 + 30
@@ -1384,7 +1432,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
                 print('  Computing ERD...', end='', flush=True)
                 erd_announced = True
             sub_erd = min_expected_guesses(
-                subgroup, cache, soln.score_cache, deadline,
+                subgroup, cache, erd_score_cache, deadline,
                 guesses=erd_guesses, policy=erd_policy,
             )
             if sub_erd is None:
@@ -1793,8 +1841,8 @@ def cmd_candidates(gs):
         (InputSet.CONSTRAINT_COMPLIANT,        "hard mode (must use revealed info)"),
         (InputSet.POSSIBLE_ANSWERS, "possible answers"),
     ]
-    current_label = next(label for iset, label in options
-                         if iset == gs.input_set)
+    current_label = next((label for iset, label in options
+                          if iset == gs.input_set), "unknown")
     print(f"\nCandidates mode (current: {current_label}):")
     for i, (_, label) in enumerate(options, 1):
         print(f"  {i}. {label}")
@@ -1946,12 +1994,12 @@ class ERDWarmer(threading.Thread):
                   Caller may pass seed_mem_cache to pre-populate sub-results
                   from a prior run at the same position.
 
-    policy must be passed explicitly: 'erd_all', 'erd_answers', or 'erd_constrained'.
+    policy must be passed explicitly: ERD_ALL, ERD_ANSWERS, or ERD_CONSTRAINED.
     """
 
     def __init__(self, current_words, all_answers, effective_guesses,
                  score_cache_path, response_cache,
-                 policy='erd_all', persist=True, seed_mem_cache=None):
+                 policy=ERD_ALL, persist=True, seed_mem_cache=None):
         super().__init__(daemon=True, name='ERDWarmer')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
@@ -2062,33 +2110,23 @@ def main():
             _warmer = None
         if gs.single and not gs.solutions[0]._is_full_game():
             soln0 = gs.solutions[0]
+            cfg = _erd_mode_config(gs)
+            seed_cache = None
             if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
-                effective_guesses = soln0.constraint_compliant_words(gs.all_words)
-                policy = 'erd_constrained'
-                persist = False
-                # Reuse sub-results if position is unchanged since last run.
+                # Reuse sub-results if position is unchanged since last run
+                # (hard-mode ERDs are path-dependent, so only valid here).
                 cur_frozen = frozenset(soln0.current_words)
                 seed_cache = (gs.constrained_erd_cache
                               if gs.constrained_erd_cache_words == cur_frozen
                               else None)
-            elif gs.input_set == InputSet.POSSIBLE_ANSWERS:
-                effective_guesses = soln0.current_words
-                policy = 'erd_answers'
-                persist = True
-                seed_cache = None
-            else:  # ANY_WORD
-                effective_guesses = gs.all_words
-                policy = 'erd_all'
-                persist = True
-                seed_cache = None
             _warmer = ERDWarmer(
                 soln0.current_words,
                 gs.all_answers,
-                effective_guesses,
+                cfg.guesses_fn(gs, soln0),
                 gs.score_cache_path,
                 gs.cache,
-                policy=policy,
-                persist=persist,
+                policy=cfg.policy,
+                persist=cfg.persist,
                 seed_mem_cache=seed_cache,
             )
             _warmer.start()

@@ -66,22 +66,30 @@ class ScoreCache:
                 PRIMARY KEY (word, method, universe_id)
             )
         """)
-        # Drop any rows written with the old null-separated encoding.
-        # All valid 5-letter words are ASCII, so a null byte identifies old format.
-        self._conn.execute(
-            "DELETE FROM lookahead_result WHERE instr(subset_key, char(0)) > 0"
-        )
-        # Drop rows written under the old 'erd' policy (renamed to 'erd_answers'
-        # and then superseded by 'erd_all').  One-time cleanup; harmless if already done.
-        self._conn.execute(
-            "DELETE FROM lookahead_result WHERE policy = 'erd'"
-        )
-        # Drop rows written under 'erd_hard' (renamed to 'erd_constrained').
-        # Constraint-compliant mode is now always transient (MemoryScoreCache),
-        # so persisted entries are useless regardless of age.
-        self._conn.execute(
-            "DELETE FROM lookahead_result WHERE policy = 'erd_hard'"
-        )
+        # All valid 5-letter words are ASCII, so a null byte identifies the
+        # old null-separated subset-key encoding.
+        self._purge_legacy_rows("instr(subset_key, char(0)) > 0", ())
+        # 'erd' was renamed to 'erd_answers' and then superseded by 'erd_all'.
+        self._purge_legacy_rows("policy = ?", ('erd',))
+        # 'erd_hard' was renamed to 'erd_constrained'; constraint-compliant
+        # mode is now always transient (MemoryScoreCache), so any persisted
+        # rows under either name are useless regardless of age.
+        self._purge_legacy_rows("policy = ?", ('erd_hard',))
+
+    def _purge_legacy_rows(self, where, params):
+        """One-time cleanup of stale lookahead_result rows.
+
+        Once a legacy batch is gone it stays gone, so a full-table DELETE on
+        every connection open (including each ERDWarmer thread) would scan
+        the whole table for nothing.  Check existence first — LIMIT 1 lets
+        SQLite stop at the first match — and only DELETE when there's
+        actually something to remove.
+        """
+        exists = self._conn.execute(
+            f"SELECT 1 FROM lookahead_result WHERE {where} LIMIT 1", params
+        ).fetchone()
+        if exists is not None:
+            self._conn.execute(f"DELETE FROM lookahead_result WHERE {where}", params)
 
     def _ensure_universe(self):
         canonical = "\n".join(self.answer_words)
@@ -191,7 +199,3 @@ class MemoryScoreCache:
 
     def close(self):
         pass
-
-    @staticmethod
-    def encode_subset(words):
-        return ScoreCache.encode_subset(words)

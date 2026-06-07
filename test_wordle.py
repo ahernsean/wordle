@@ -665,8 +665,10 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
     def _mid_game_soln(self):
         """Apply 'piano' → leaves 6 words including subgroup-producing 'heart'."""
         soln = make_solution(db_path=self.db)
-        # 'piano' shares no a/e/i/o/u overlap with crane/rates/tales/trace/earth;
-        # guessing it against 'slate' leaves: slate, trace, stale, least, heart, share.
+        # Guessing 'piano' against answer 'slate' leaves six words: slate,
+        # trace, stale, least, heart, share.  'heart' then splits them into
+        # a 2-word subgroup (slate, stale) plus singletons — exactly the
+        # non-trivial shape these tests need.
         pattern = calculate_response("piano", "slate")
         soln.apply_guess("piano", pattern)
         self.assertFalse(soln._is_full_game())
@@ -712,6 +714,29 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
         sc = ScoreCache(self.db, ANSWERS)
         self.assertIsNotNone(sc.read(key, 'erd_answers'),
                              "ERD subgroups must be cached under 'erd_answers' in default mode")
+
+    def test_constraint_compliant_mode_does_not_fall_through_to_erd_all(self):
+        """
+        constraint_compliant=True must steer ERD to the hard-mode vocabulary
+        and policy — not silently fall through to 'erd_all' just because
+        all_words happens to be non-empty.  And because hard-mode ERDs are
+        path-dependent (the eligible guess set depends on the exact
+        constraints accumulated so far), they must never be written into
+        the persisted, cross-game SQLite cache under any policy name.
+        """
+        soln = self._mid_game_soln()
+        key = self._find_subgroup_key("heart", soln.current_words)
+        self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
+
+        _multistep_stats("heart", soln, constraint_compliant=True, all_words=GUESSES)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        self.assertIsNone(sc.read(key, 'erd_all'),
+                          "hard-mode ERD must not be computed/cached as 'erd_all' "
+                          "merely because all_words was supplied")
+        self.assertIsNone(sc.read(key, 'erd_constrained'),
+                          "hard-mode ERD values are path-dependent and must never "
+                          "be persisted to the cross-game SQLite cache")
 
 
 # ---------------------------------------------------------------------------

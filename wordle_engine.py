@@ -60,6 +60,18 @@ class InputSet(Enum):
 
 
 # ---------------------------------------------------------------------------
+# ERD cache policy names — distinguish the guess-vocabulary namespaces under
+# which min_expected_guesses results are stored.
+# ---------------------------------------------------------------------------
+
+ERD_ALL = 'erd_all'                  # any word may be guessed (SQLite, persisted)
+ERD_ANSWERS = 'erd_answers'          # guesses restricted to possible answers (SQLite, persisted)
+ERD_CONSTRAINED = 'erd_constrained'  # Wordle hard mode (in-memory, transient — path-dependent)
+
+VALID_ERD_POLICIES = frozenset({ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED})
+
+
+# ---------------------------------------------------------------------------
 # Word list loading
 # ---------------------------------------------------------------------------
 
@@ -724,10 +736,14 @@ def min_expected_guesses(remaining, cache, score_cache,
 
     guesses: vocabulary of allowed guess words. None means answers-only
              (restrict guesses to `remaining`).
-    policy:  cache key under which the result is stored.  Defaults to
-             'erd_all' when guesses is supplied, 'erd_answers' otherwise.
-             Pass explicitly when the caller needs a different namespace
-             (e.g. 'erd_constrained' for constraint-compliant mode).
+    policy:  cache namespace under which the result is stored — one of
+             ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED.  Defaults to ERD_ALL
+             when guesses is supplied, ERD_ANSWERS otherwise.  Pass
+             explicitly when the caller needs a different namespace (e.g.
+             ERD_CONSTRAINED for constraint-compliant/hard mode).  An
+             unrecognized policy raises ValueError — silently writing
+             results into the wrong namespace would corrupt that mode's
+             cache for every future game.
 
     Returns None if deadline is exceeded mid-computation; partial
     results already written to score_cache are kept and valid.
@@ -737,7 +753,12 @@ def min_expected_guesses(remaining, cache, score_cache,
         return 1.0
 
     if policy is None:
-        policy = 'erd_all' if guesses is not None else 'erd_answers'
+        policy = ERD_ALL if guesses is not None else ERD_ANSWERS
+    elif policy not in VALID_ERD_POLICIES:
+        raise ValueError(
+            f"Unknown ERD policy {policy!r}; expected one of "
+            f"{sorted(VALID_ERD_POLICIES)}"
+        )
     guess_list = guesses if guesses is not None else remaining
 
     subset_key = ScoreCache.encode_subset(remaining)
