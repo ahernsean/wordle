@@ -1908,7 +1908,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         score_cache.set_scope('test-scope')
 
         def fake_min_expected_guesses(remaining, cache, sc, deadline=None,
-                                       guesses=None, policy=None):
+                                       guesses=None, policy=None,
+                                       progress_callback=None):
             key = ScoreCache.encode_subset(remaining)
             sc.write(key, policy, remaining[0], float(len(remaining)))
             return float(len(remaining))
@@ -1947,7 +1948,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         calls = []
 
         def flaky_min_expected_guesses(remaining, cache, sc, deadline=None,
-                                        guesses=None, policy=None):
+                                        guesses=None, policy=None,
+                                        progress_callback=None):
             calls.append(len(remaining))
             budget = deadline - time.time()
             key = ScoreCache.encode_subset(remaining)
@@ -1993,7 +1995,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
         def cancel_during_root(remaining, cache, sc, deadline=None,
-                                guesses=None, policy=None):
+                                guesses=None, policy=None,
+                                progress_callback=None):
             warmer.stop()  # e.g. the user moved on; a fresh warmer supersedes this one
             return 1.8
 
@@ -2028,7 +2031,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         def recording_min_expected_guesses(remaining, cache, sc, deadline=None,
                                              guesses=None,
-                                             policy=None):
+                                             policy=None,
+                                             progress_callback=None):
             order.append(len(remaining))
             key = ScoreCache.encode_subset(remaining)
             sc.write(key, policy, remaining[0], float(len(remaining)))

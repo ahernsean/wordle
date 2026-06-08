@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b70"
+BUILD = "b71"
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +577,7 @@ class GameState:
         self.universe = GuessUniverse.ALL_WORDS
         self.compliance = ComplianceFilter.UNFILTERED
         self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
+        self.last_erd_root_progress = (0, 0, None)  # (done, total, (best_word, best_erd))
         # constrained_erd_cache is intentionally NOT reset here — it is
         # long-lived and self-scoping (see __init__ and MemoryScoreCache).
 
@@ -890,6 +891,23 @@ def _erd_cache_and_policy(gs, soln):
     return cfg.cache(gs, soln), cfg.policy
 
 
+def _erd_root_progress_tag(gs):
+    """Status-line fragment surfacing the warmer's root-scan progress and
+    its current best candidate, so the user sees live signal while waiting
+    for the root ERD instead of silence.
+
+    Returns '' when the root scan hasn't started yet (still collecting or
+    caching subgroups — nothing meaningful to show).
+    """
+    done, total, best = gs.last_erd_root_progress
+    if total == 0:
+        return ''
+    if best is not None:
+        bw, bs = best
+        return f'  [ERD: scanning {done}/{total} — best so far {bw.upper()} {bs:.3f}]'
+    return f'  [ERD: scanning {done}/{total}]'
+
+
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     """
     Rank candidates by ERD using only cached subgroup values.
@@ -975,12 +993,18 @@ def cmd_solve(gs):
         print(f"  {erd_idx}. ERD: expected remaining depth (v) [{erd_root[1]:.3f}]")
     else:
         done, total = gs.last_erd_progress
+        root_done, root_total, root_best = gs.last_erd_root_progress
         if total == 0:
             prog = 'not ready'
         elif done < total:
             prog = f'{done}/{total} subgroups'
-        else:
+        elif root_total == 0:
             prog = 'finishing root...'
+        elif root_best is not None:
+            bw, bs = root_best
+            prog = f'scanning root {root_done}/{root_total} — best so far {bw.upper()} {bs:.3f}'
+        else:
+            prog = f'scanning root {root_done}/{root_total}'
         print(f"  {erd_idx}. ERD: expected remaining depth  ({prog})")
     print(f"Choose (1-{erd_idx})? ", end='')
     try:
@@ -2062,6 +2086,8 @@ def print_status(gs):
                     hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
                     if hit is not None:
                         erd_tag = f'  [ERD: {hit[1]:.3f}]'
+                    else:
+                        erd_tag = _erd_root_progress_tag(gs)
             print(f"{n:,} words remaining{erd_tag}")
     else:
         n = len(gs.solutions)
@@ -2125,6 +2151,9 @@ class ERDWarmer(threading.Thread):
         self._cancel = threading.Event()
         self.subgroups_done = 0   # incremented after each subgroup is cached
         self.subgroups_total = 0  # set after collection; 0 means still collecting
+        self.root_done = 0        # candidates fully scored so far in the root scan
+        self.root_total = 0       # size of the root scan; 0 means not started yet
+        self.root_best = None     # (word, erd) — best candidate found so far
 
     def stop(self):
         self._cancel.set()
@@ -2211,6 +2240,42 @@ class ERDWarmer(threading.Thread):
                 progressed = True
         return still_uncached, progressed
 
+    def _ranked_root_guesses(self):
+        """Order root-scan candidates so a still-incomplete scan's running
+        best is actually meaningful, instead of an artifact of the guess
+        list's (alphabetical) file order.
+
+        Sorted by max-group-size ascending, then entropy descending: a
+        small worst-case group bounds how badly a guess can turn out, which
+        is the property ERD itself is fundamentally about, so this ordering
+        tracks ERD quality far more closely than alphabetical position does.
+        Entropy breaks ties among equal worst-cases — a sharper distribution
+        elsewhere in the partition tends to retire more words sooner. With
+        this order, "best so far" early in the scan is a real signal, not
+        a coin flip, and the true winner tends to surface early too.
+        """
+        from wordle_engine import score_groups_multi, ScoringMethod
+        methods = [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN]
+        scored = []
+        for word in self._effective_guesses:
+            if self._cancel.is_set():
+                return self._effective_guesses
+            groups = self._rcache.group_words(word, self._words)
+            counts = {pattern: len(group) for pattern, group in groups.items()}
+            scores = score_groups_multi(counts, methods)
+            scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
+                           -scores[ScoringMethod.ENTROPY_GAIN],
+                           word))
+        scored.sort()
+        return [word for _, _, word in scored]
+
+    def _on_root_progress(self, done, total, best_word, best_erd):
+        if self._cancel.is_set():
+            return
+        self.root_done = done
+        self.root_total = total
+        self.root_best = (best_word, best_erd)
+
     def _warm(self, score_cache):
         policy = self._policy
 
@@ -2241,11 +2306,15 @@ class ERDWarmer(threading.Thread):
         # this reads from cache and finishes in O(n) cache reads — fast.
         root_key = ScoreCache.encode_subset(self._words)
         if score_cache.read(root_key, policy) is None:
+            ranked_guesses = self._ranked_root_guesses()
+            if self._cancel.is_set():
+                return
             deadline = time.time() + 30.0
             result = min_expected_guesses(
                 self._words, self._rcache, score_cache, deadline,
-                guesses=self._effective_guesses,
+                guesses=ranked_guesses,
                 policy=policy,
+                progress_callback=self._on_root_progress,
             )
             if result is not None and not self._cancel.is_set():
                 print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
@@ -2328,6 +2397,8 @@ def main():
 
         if _warmer is not None:
             gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
+            gs.last_erd_root_progress = (_warmer.root_done, _warmer.root_total,
+                                         _warmer.root_best)
 
         if not cmd:
             print_status(gs)

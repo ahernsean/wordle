@@ -794,7 +794,7 @@ class Solution:
 
 def min_expected_guesses(remaining, cache, score_cache,
                           deadline=None, guesses=None,
-                          policy=None):
+                          policy=None, progress_callback=None):
     """
     Exact expected guesses to solve remaining words, playing optimally.
 
@@ -809,6 +809,16 @@ def min_expected_guesses(remaining, cache, score_cache,
              unrecognized policy raises ValueError — silently writing
              results into the wrong namespace would corrupt that mode's
              cache for every future game.
+    progress_callback: optional progress_callback(done, total, best_word,
+             best_erd), invoked once per fully-evaluated top-level
+             candidate. Deliberately NOT threaded into the recursive
+             calls below — passing it down would fire it once per
+             candidate at every depth of the search tree, drowning the
+             one signal a caller actually wants (how far the *requested*
+             scan has gotten) in noise from scans the caller never asked
+             to watch. A caller that wants visibility into a recursive
+             scan should call min_expected_guesses on that subgroup
+             directly and supply its own callback.
 
     Returns None if deadline is exceeded mid-computation; partial
     results already written to score_cache are kept and valid.
@@ -838,7 +848,7 @@ def min_expected_guesses(remaining, cache, score_cache,
     best_erd = float('inf')
     best_word = None
 
-    for guess in guess_list:
+    for i, guess in enumerate(guess_list):
         # Use the response cache for answer-vocabulary words (pre-built
         # mappings). For non-answer guess words, compute groups inline to
         # avoid polluting the response cache with 12 000 full-vocab mappings.
@@ -883,6 +893,9 @@ def min_expected_guesses(remaining, cache, score_cache,
         if cost < best_erd:
             best_erd = cost
             best_word = guess
+
+        if progress_callback is not None:
+            progress_callback(i + 1, len(guess_list), best_word, best_erd)
 
     if score_cache and best_word is not None:
         score_cache.write(subset_key, policy, best_word, best_erd)
