@@ -794,7 +794,8 @@ class Solution:
 
 def min_expected_guesses(remaining, cache, score_cache,
                           deadline=None, guesses=None,
-                          policy=None, progress_callback=None):
+                          policy=None, progress_callback=None,
+                          cancel_check=None):
     """
     Exact expected guesses to solve remaining words, playing optimally.
 
@@ -819,9 +820,21 @@ def min_expected_guesses(remaining, cache, score_cache,
              to watch. A caller that wants visibility into a recursive
              scan should call min_expected_guesses on that subgroup
              directly and supply its own callback.
+    cancel_check: optional zero-arg callable returning True once the
+             caller has abandoned this computation (e.g. the user moved
+             to a different branch). Unlike progress_callback, this IS
+             threaded into every recursive call: cancellation needs to
+             stop the search promptly at whatever depth it has reached,
+             not just between top-level candidates. Checked alongside
+             deadline — both are "stop early and return None" signals,
+             but they answer different questions. deadline bounds *this*
+             attempt's running time regardless of why it's running;
+             cancel_check answers "is this attempt's answer even still
+             wanted?" and can fire well before any deadline would.
 
-    Returns None if deadline is exceeded mid-computation; partial
-    results already written to score_cache are kept and valid.
+    Returns None if the deadline is exceeded or cancel_check fires
+    mid-computation; partial results already written to score_cache
+    are kept and valid either way.
     """
     n = len(remaining)
     if n == 1:
@@ -844,6 +857,8 @@ def min_expected_guesses(remaining, cache, score_cache,
 
     if deadline is not None and time.time() > deadline:
         return None
+    if cancel_check is not None and cancel_check():
+        return None
 
     best_erd = float('inf')
     best_word = None
@@ -861,7 +876,7 @@ def min_expected_guesses(remaining, cache, score_cache,
                 groups[pat].append(answer)
 
         cost = 1.0
-        timed_out = False
+        aborted = False  # subscan returned None — deadline or cancel_check fired
         skip_guess = False
         for subgroup in groups.values():
             k = len(subgroup)
@@ -878,16 +893,16 @@ def min_expected_guesses(remaining, cache, score_cache,
                 break
             sub_erd = min_expected_guesses(
                 subgroup, cache, score_cache, deadline, guesses,
-                policy=policy,
+                policy=policy, cancel_check=cancel_check,
             )
             if sub_erd is None:
-                timed_out = True
+                aborted = True
                 break
             cost += (k / n) * sub_erd
 
         if skip_guess:
             continue
-        if timed_out:
+        if aborted:
             return None
 
         if cost < best_erd:

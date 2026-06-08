@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b71"
+BUILD = "b72"
 
 
 # ---------------------------------------------------------------------------
@@ -2232,7 +2232,8 @@ class ERDWarmer(threading.Thread):
             deadline = time.time() + per_item_deadline
             result = min_expected_guesses(sg, self._rcache, score_cache, deadline,
                                            guesses=self._effective_guesses,
-                                           policy=policy)
+                                           policy=policy,
+                                           cancel_check=self._cancel.is_set)
             if result is None:
                 still_uncached.append((size, sg))
             else:
@@ -2309,35 +2310,33 @@ class ERDWarmer(threading.Thread):
             ranked_guesses = self._ranked_root_guesses()
             if self._cancel.is_set():
                 return
-            deadline = time.time() + 30.0
+            # No deadline here — let the scan run to completion.  The old
+            # 30-second cap wasn't actually buying responsiveness: it's a
+            # background thread, so the prompt was never blocked on it
+            # either way.  Its only real job was bounding how long a now-
+            # stale scan could keep grinding after the user moved to a
+            # different branch — but that's exactly what cancel_check now
+            # does, instantly and at every recursion depth, instead of
+            # waiting up to 30s for a deadline to catch up.  Cutting the
+            # scan into 30-second waves bought nothing: each wave's
+            # progress was already being preserved via the subgroup cache
+            # (see cache_all_scores), so a single uninterrupted run gets to
+            # the same cached end state, just without the repeated
+            # die-and-respawn cycle the user had to manually drive by
+            # pressing enter.
             result = min_expected_guesses(
-                self._words, self._rcache, score_cache, deadline,
+                self._words, self._rcache, score_cache,
                 guesses=ranked_guesses,
                 policy=policy,
                 progress_callback=self._on_root_progress,
+                cancel_check=self._cancel.is_set,
             )
             if result is not None and not self._cancel.is_set():
                 print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
                       flush=True)
-            elif result is None and not self._cancel.is_set():
-                # The 30s root deadline expired: min_expected_guesses gave up
-                # and this thread is about to exit — it will NOT retry on its
-                # own.  Without this message, the prompt would sit there with
-                # a thread that has already died, silently waiting on the
-                # user, while the user silently waits on it.  Say so loudly,
-                # asynchronously, the same way [ERD ready] announces success —
-                # and report whatever "best so far" survived the timeout, now
-                # that the quality-ordered scan makes it a meaningful signal
-                # rather than an alphabetical artifact.
-                if self.root_best is not None:
-                    bw, bs = self.root_best
-                    best_note = f'best so far {bw.upper()} {bs:.3f}'
-                else:
-                    best_note = 'no candidate finished scoring'
-                print(f'\n  [ERD: root scan timed out after 30s '
-                      f'({self.root_done}/{self.root_total} scanned, {best_note}) '
-                      f'— press enter to start a fresh attempt]',
-                      flush=True)
+            # result is None here only ever means cancel_check fired (there's
+            # no deadline to time out against) — i.e. the user moved on and a
+            # fresh warmer is about to take over.  Nothing to announce.
 
 
 def main():

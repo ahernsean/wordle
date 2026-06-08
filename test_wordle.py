@@ -1909,7 +1909,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         def fake_min_expected_guesses(remaining, cache, sc, deadline=None,
                                        guesses=None, policy=None,
-                                       progress_callback=None):
+                                       progress_callback=None,
+                                       cancel_check=None):
             key = ScoreCache.encode_subset(remaining)
             sc.write(key, policy, remaining[0], float(len(remaining)))
             return float(len(remaining))
@@ -1949,9 +1950,10 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         def flaky_min_expected_guesses(remaining, cache, sc, deadline=None,
                                         guesses=None, policy=None,
-                                        progress_callback=None):
+                                        progress_callback=None,
+                                        cancel_check=None):
             calls.append(len(remaining))
-            budget = deadline - time.time()
+            budget = (deadline - time.time()) if deadline is not None else float('inf')
             key = ScoreCache.encode_subset(remaining)
             if len(remaining) == len(group_b) and budget < 10:
                 return None  # too big for a short budget this round — move on
@@ -1996,7 +1998,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         def cancel_during_root(remaining, cache, sc, deadline=None,
                                 guesses=None, policy=None,
-                                progress_callback=None):
+                                progress_callback=None,
+                                cancel_check=None):
             warmer.stop()  # e.g. the user moved on; a fresh warmer supersedes this one
             return 1.8
 
@@ -2032,7 +2035,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         def recording_min_expected_guesses(remaining, cache, sc, deadline=None,
                                              guesses=None,
                                              policy=None,
-                                             progress_callback=None):
+                                             progress_callback=None,
+                                             cancel_check=None):
             order.append(len(remaining))
             key = ScoreCache.encode_subset(remaining)
             sc.write(key, policy, remaining[0], float(len(remaining)))
