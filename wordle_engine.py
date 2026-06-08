@@ -438,8 +438,13 @@ def cache_all_scores(word, subgroup, score_cache, subset_key, cache=None):
     Callers (compute_lookahead, min_expected_guesses, ...) just say "this
     word, for this subgroup, is worth remembering comprehensively" — they
     don't need to know what the full roster is, or to change when it grows.
+
+    Hard-mode searches pass a MemoryScoreCache, whose minimal read/write
+    interface deliberately omits write_scores: those ERD values are
+    path-dependent and must never reach the persisted cross-game cache.
+    Skip silently rather than require every transient cache to stub it out.
     """
-    if not score_cache:
+    if not score_cache or not hasattr(score_cache, 'write_scores'):
         return
     for method, value in score_word_multi(word, subgroup, list(ScoringMethod),
                                            cache=cache).items():

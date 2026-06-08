@@ -632,6 +632,19 @@ class TestCacheAllScores(unittest.TestCase):
         cache_all_scores("heart", ANSWERS[:6], None,
                          ScoreCache.encode_subset(ANSWERS[:6]), cache=cache)
 
+    def test_no_op_with_memory_score_cache(self):
+        """Hard-mode searches pass a MemoryScoreCache, whose minimal
+        read/write interface deliberately has no write_scores — those ERD
+        values are path-dependent and must never reach the persisted
+        cross-game cache. cache_all_scores must skip silently rather than
+        raise AttributeError (regression for the b67 hard-mode crash)."""
+        cache = ResponseCache(ANSWERS)
+        mc = MemoryScoreCache()
+        mc.set_scope('test-scope')
+        subgroup = ANSWERS[:6]
+        cache_all_scores("heart", subgroup, mc,
+                         ScoreCache.encode_subset(subgroup), cache=cache)
+
 
 # ---------------------------------------------------------------------------
 # compute_lookahead — winner's max-group-size persisted alongside entropy
@@ -758,6 +771,23 @@ class TestMinExpectedGuesses(unittest.TestCase):
         cost3 = min_expected_guesses(ANSWERS[:3], self.cache, None)
         cost5 = min_expected_guesses(ANSWERS[:5], self.cache, None)
         self.assertLess(cost3, cost5)
+
+    def test_works_with_memory_score_cache(self):
+        """Hard mode runs min_expected_guesses against a MemoryScoreCache
+        (gs.constrained_erd_cache), not a SQLite-backed ScoreCache. Its
+        write(...) call at the end must succeed, and the cache_all_scores(...)
+        call right after it must not blow up on MemoryScoreCache's minimal
+        interface — regression for the b67 hard-mode crash:
+        AttributeError: 'MemoryScoreCache' object has no attribute 'write_scores'.
+        """
+        mc = MemoryScoreCache()
+        mc.set_scope(MemoryScoreCache.fingerprint_vocabulary(ANSWERS))
+        subset = ANSWERS[:4]
+        result = min_expected_guesses(subset, self.cache, mc, guesses=subset)
+        self.assertIsNotNone(result)
+        hit = mc.read(ScoreCache.encode_subset(subset), ERD_ALL)
+        self.assertIsNotNone(hit)
+        self.assertAlmostEqual(hit[1], result, places=10)
 
 
 # ---------------------------------------------------------------------------
