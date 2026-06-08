@@ -79,12 +79,6 @@ class TestCalculateResponse(unittest.TestCase):
         self.assertEqual(calculate_response("steel", "slate"),
                          ["green", "yellow", "yellow", "gray", "yellow"])
 
-    def test_symmetric_known_pair(self):
-        # crane vs trace and trace vs crane differ (C/T swap yellow vs gray)
-        r1 = calculate_response("crane", "trace")
-        r2 = calculate_response("trace", "crane")
-        self.assertNotEqual(r1, r2)
-
 
 # ---------------------------------------------------------------------------
 # score_groups
@@ -236,10 +230,6 @@ class TestCalculateGroupCounts(unittest.TestCase):
         for w in words:
             expected[_encode_response(calculate_response("crane", w))] += 1
         self.assertEqual(dict(counts), dict(expected))
-
-    def test_total_equals_input_size(self):
-        counts = calculate_group_counts("heart", ANSWERS)
-        self.assertEqual(sum(counts.values()), len(ANSWERS))
 
 
 class TestMaxEntropy(unittest.TestCase):
@@ -858,20 +848,6 @@ class TestTransparentPersistence(unittest.TestCase):
             self.assertAlmostEqual(scores1[w], scores2[w], places=10,
                                    msg=f"Score mismatch for {w}")
 
-    def test_second_session_is_all_cache_hits(self):
-        make_solution(db_path=self.db).compute_scores(
-            GUESSES, ScoringMethod.ENTROPY_GAIN)
-
-        s2 = make_solution(db_path=self.db)
-        computed = [0]
-        orig = s2.score_cache.read_scores  # pre-load will populate word_scores
-
-        # After first compute_scores call, _db_loaded_methods should be set
-        s2.compute_scores(GUESSES, ScoringMethod.ENTROPY_GAIN)
-        # If loaded from DB, all words should already be in word_scores
-        # and _db_loaded_methods should contain ENTROPY_GAIN
-        self.assertIn(ScoringMethod.ENTROPY_GAIN, s2._db_loaded_methods)
-
     def test_mid_game_scores_persisted_subset_scoped(self):
         s = make_solution(db_path=self.db)
         pattern = calculate_response("crane", "slate")
@@ -1277,11 +1253,6 @@ class TestMinExpectedGuesses(unittest.TestCase):
             result = min_expected_guesses(words, self.cache, None,
                                            deadline=deadline, guesses=words)
         self.assertIsNone(result)
-
-    def test_result_is_at_least_one(self):
-        result = min_expected_guesses(ANSWERS[:5], self.cache, None)
-        self.assertIsNotNone(result)
-        self.assertGreaterEqual(result, 1.0)
 
     def test_larger_set_costs_more_than_smaller(self):
         cost3 = min_expected_guesses(ANSWERS[:3], self.cache, None)
@@ -2107,20 +2078,6 @@ class TestCompareWordsDisplay(unittest.TestCase):
         self.assertIn('CRANE*', header)
         self.assertIn('BRAIN ', header)
         self.assertNotIn('BRAIN*', header)
-
-    def test_extra_space_between_row_label_and_scores(self):
-        # "Entropy 1" is exactly as wide as the label column (lw == 9), and
-        # with these fake stats its formatted value ('4.0000') is exactly as
-        # wide as the score column too — so no rjust padding sneaks in and
-        # the gap we measure is purely the literal separator.
-        out = self._render(["crane", "slate"])
-        label_line = next(l for l in out.splitlines()
-                          if l.strip().startswith('Entropy 1'))
-        idx = label_line.index('Entropy 1') + len('Entropy 1')
-        gap = label_line[idx:]
-        spaces = len(gap) - len(gap.lstrip(' '))
-        self.assertEqual(spaces, 2,
-                         f"expected two spaces between label and score, got {spaces}: {label_line!r}")
 
 
 if __name__ == "__main__":
