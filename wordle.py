@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b66"
+BUILD = "b67"
 
 
 # ---------------------------------------------------------------------------
@@ -2136,6 +2136,15 @@ class ERDWarmer(threading.Thread):
             score_cache = ScoreCache(self._cache_path, self._all_answers)
         else:
             score_cache = self._seed_mem_cache
+        # The response_cache supplied at construction (gs.cache) wraps a
+        # SQLite connection opened on the main thread — sqlite3 connections
+        # cannot be shared across threads. Replace it with one private to
+        # this thread, backed by this thread's own connection (persist=True)
+        # or none at all (persist=False — hard mode's eligible-guess
+        # subgroups are small enough that recomputing decompositions
+        # in-memory costs nothing noticeable).
+        self._rcache = ResponseCache(self._all_answers,
+                                     score_cache if self._persist else None)
         try:
             self._warm(score_cache)
         finally:
