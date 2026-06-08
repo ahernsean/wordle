@@ -52,23 +52,53 @@ class ScoringMethod(Enum):
         return f'{value:0.4f}'
 
 
-class InputSet(Enum):
-    ANY_WORD = auto()
-    CONSTRAINT_COMPLIANT = auto()  # Wordle hard mode: next guess must satisfy all constraints
-    POSSIBLE_ANSWERS = auto()  # restrict to remaining possible answers (strictest)
-    SOLVED_WORDS = auto()
+class GuessUniverse(Enum):
+    """Which static word list a candidate guess is drawn from.
+
+    Independent of ComplianceFilter below: a player can pick a guess from
+    either list whether or not it satisfies the clues revealed so far
+    (e.g. a recognizable answer-shaped word that the clues have already
+    eliminated is still a legal — if unwise — guess in normal play).
+    """
+    ALL_WORDS = 'words'      # ~12,972 — every guessable word
+    ALL_ANSWERS = 'answers'  # ~3,200 — words that can ever be a Wordle answer
+
+
+class ComplianceFilter(Enum):
+    """Whether a candidate must satisfy every clue revealed so far.
+
+    Independent of GuessUniverse above — see its docstring. COMPLIANT is
+    real Wordle hard mode's rule (green letters fixed in position, yellow
+    letters present somewhere) applied to whichever universe is selected.
+    """
+    UNFILTERED = 'unfiltered'
+    COMPLIANT = 'compliant'
 
 
 # ---------------------------------------------------------------------------
 # ERD cache policy names — distinguish the guess-vocabulary namespaces under
-# which min_expected_guesses results are stored.
+# which min_expected_guesses results are stored. Each name spells out both
+# the GuessUniverse and ComplianceFilter it was computed under, so namespaces
+# can be told apart on sight rather than by tribal knowledge of which axis a
+# bare word like "answers" or "constrained" was meant to encode.
 # ---------------------------------------------------------------------------
 
-ERD_ALL = 'erd_all'                  # any word may be guessed (SQLite, persisted)
-ERD_ANSWERS = 'erd_answers'          # guesses restricted to possible answers (SQLite, persisted)
-ERD_CONSTRAINED = 'erd_constrained'  # Wordle hard mode (in-memory, transient — path-dependent)
+def erd_policy_name(universe, compliance):
+    """Derive the cache-namespace string for a (universe, compliance) pair."""
+    return f'erd_{universe.value}_{compliance.value}'
 
-VALID_ERD_POLICIES = frozenset({ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED})
+
+ERD_ALL = erd_policy_name(GuessUniverse.ALL_WORDS, ComplianceFilter.UNFILTERED)
+# any word may be guessed, no clue filter (SQLite, persisted)
+ERD_CONSTRAINED = erd_policy_name(GuessUniverse.ALL_WORDS, ComplianceFilter.COMPLIANT)
+# Wordle hard mode (in-memory, transient — path-dependent, never persisted)
+ERD_ANSWERS = erd_policy_name(GuessUniverse.ALL_ANSWERS, ComplianceFilter.COMPLIANT)
+# guesses restricted to possible answers (SQLite, persisted)
+ERD_ANSWERS_UNFILTERED = erd_policy_name(GuessUniverse.ALL_ANSWERS, ComplianceFilter.UNFILTERED)
+# guesses drawn from the answer-shaped list, no clue filter (SQLite, persisted)
+
+VALID_ERD_POLICIES = frozenset(
+    {ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED})
 
 
 # ---------------------------------------------------------------------------
@@ -791,10 +821,11 @@ def min_expected_guesses(remaining, cache, score_cache,
     guesses: vocabulary of allowed guess words. None means answers-only
              (restrict guesses to `remaining`).
     policy:  cache namespace under which the result is stored — one of
-             ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED.  Defaults to ERD_ALL
-             when guesses is supplied, ERD_ANSWERS otherwise.  Pass
-             explicitly when the caller needs a different namespace (e.g.
-             ERD_CONSTRAINED for constraint-compliant/hard mode).  An
+             ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED
+             (see VALID_ERD_POLICIES).  Defaults to ERD_ALL when guesses
+             is supplied, ERD_ANSWERS otherwise.  Pass explicitly when the
+             caller needs a different namespace (e.g. ERD_CONSTRAINED for
+             constraint-compliant/hard mode).  An
              unrecognized policy raises ValueError — silently writing
              results into the wrong namespace would corrupt that mode's
              cache for every future game.

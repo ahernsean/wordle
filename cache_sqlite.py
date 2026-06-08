@@ -107,6 +107,25 @@ class ScoreCache:
             CREATE INDEX IF NOT EXISTS idx_subgroup_best_by_policy
             ON subgroup_best_by_policy(universe_id, policy)
         """)
+        # ERD policy names were renamed so both axes of the (guess-universe x
+        # compliance-filter) selection are spelled out in the namespace
+        # itself — 'erd_all' named only the universe, 'erd_answers' folded
+        # both axes into one word, and 'erd_constrained' named neither
+        # explicitly. The new names are uniform: erd_<universe>_<compliance>.
+        #   erd_all     -> erd_words_unfiltered   (all words,   no clue filter)
+        #   erd_answers -> erd_answers_compliant  (answer list, clue-compliant)
+        # 'erd_constrained' has no persisted rows: hard-mode ERD is
+        # path-dependent and lives only in a transient MemoryScoreCache.
+        for old, new in (('erd_all', 'erd_words_unfiltered'),
+                         ('erd_answers', 'erd_answers_compliant')):
+            exists = self._conn.execute(
+                "SELECT 1 FROM subgroup_best_by_policy WHERE policy = ? LIMIT 1",
+                (old,)
+            ).fetchone()
+            if exists is not None:
+                self._conn.execute(
+                    "UPDATE subgroup_best_by_policy SET policy = ? WHERE policy = ?",
+                    (new, old))
         # word_scores used to be keyed only by (word, method, universe_id) —
         # i.e. scoped to the whole answer set, so it could only ever cache
         # the very first guess of a game. Replace it with a subset-scoped

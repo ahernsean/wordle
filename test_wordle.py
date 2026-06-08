@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
     calculate_response, score_groups, calculate_group_counts, score_word,
-    min_expected_guesses, ERD_ALL, cache_all_scores,
+    min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
+    ERD_ANSWERS_UNFILTERED, cache_all_scores,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -711,7 +712,7 @@ class TestMinExpectedGuesses(unittest.TestCase):
             subset = ANSWERS[:4]
             result = min_expected_guesses(subset, self.cache, sc)
             self.assertIsNotNone(result)
-            hit = sc.read(ScoreCache.encode_subset(subset), 'erd_answers')
+            hit = sc.read(ScoreCache.encode_subset(subset), ERD_ANSWERS)
             self.assertIsNotNone(hit)
             self.assertAlmostEqual(hit[1], result, places=10)
         finally:
@@ -730,7 +731,7 @@ class TestMinExpectedGuesses(unittest.TestCase):
             subset = ANSWERS[:4]
             result = min_expected_guesses(subset, self.cache, sc)
             self.assertIsNotNone(result)
-            best_word, _best_score = sc.read(ScoreCache.encode_subset(subset), 'erd_answers')
+            best_word, _best_score = sc.read(ScoreCache.encode_subset(subset), ERD_ANSWERS)
 
             subset_key = ScoreCache.encode_subset(subset)
             for method in ScoringMethod:
@@ -795,7 +796,7 @@ class TestERDSolveScores(unittest.TestCase):
             self.assertAlmostEqual(erd, 1.5)
             # Singletons are NOT in cache — confirm that
             for w in words:
-                hit = sc.read(ScoreCache.encode_subset([w]), 'erd_all')
+                hit = sc.read(ScoreCache.encode_subset([w]), ERD_ALL)
                 self.assertIsNone(hit, f"singleton {w} should not be cached")
             # _erd_solve_scores must still work
             scores = _erd_solve_scores(soln)
@@ -834,7 +835,7 @@ class TestERDSolveScores(unittest.TestCase):
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), words)
             soln, cache = self._soln_with_words(words, sc)
             min_expected_guesses(words, cache, sc, guesses=words)
-            root_hit = sc.read(ScoreCache.encode_subset(words), 'erd_all')
+            root_hit = sc.read(ScoreCache.encode_subset(words), ERD_ALL)
             self.assertIsNotNone(root_hit)
             scores = _erd_solve_scores(soln)
             self.assertIsNotNone(scores)
@@ -907,7 +908,7 @@ class TestMultistepStatsCache(unittest.TestCase):
 class TestERDPolicyParameter(unittest.TestCase):
     """
     min_expected_guesses must accept and honour an explicit policy= argument
-    so callers can separate 'erd_answers', 'erd_all', 'erd_constrained' in
+    so callers can separate ERD_ANSWERS, ERD_ALL, ERD_CONSTRAINED in
     the cache independently of whether a guesses list is supplied.
 
     All tests in this class currently fail because no policy= parameter exists.
@@ -925,26 +926,26 @@ class TestERDPolicyParameter(unittest.TestCase):
         return ScoreCache(self.db, ANSWERS)
 
     def test_explicit_policy_stored_not_derived(self):
-        """Passing policy='erd_answers' with guesses= stores under 'erd_answers', not 'erd_all'."""
+        """Passing policy=ERD_ANSWERS with guesses= stores under ERD_ANSWERS, not ERD_ALL."""
         sc = self._sc()
         subset = ANSWERS[:4]
         key = ScoreCache.encode_subset(subset)
 
         min_expected_guesses(subset, self.cache, sc,
-                             guesses=subset, policy='erd_answers')
+                             guesses=subset, policy=ERD_ANSWERS)
 
-        self.assertIsNotNone(sc.read(key, 'erd_answers'),
+        self.assertIsNotNone(sc.read(key, ERD_ANSWERS),
                              "result must be stored under the explicit policy")
-        self.assertIsNone(sc.read(key, 'erd_all'),
+        self.assertIsNone(sc.read(key, ERD_ALL),
                           "result must NOT be stored under the derived policy")
 
     def test_possible_answers_warmer_readable_by_solve(self):
         """
-        Results written with policy='erd_answers' (POSSIBLE_ANSWERS warmer) are
-        readable by _erd_solve_scores under policy='erd_answers'.
+        Results written with policy=ERD_ANSWERS (POSSIBLE_ANSWERS warmer) are
+        readable by _erd_solve_scores under policy=ERD_ANSWERS.
 
         With the bug, the warmer calls min_expected_guesses(guesses=words) which
-        stores under 'erd_all'; _erd_solve_scores looks under 'erd_answers' → miss.
+        stores under ERD_ALL; _erd_solve_scores looks under ERD_ANSWERS → miss.
         """
         words = ANSWERS[:5]
         sc = self._sc()
@@ -955,11 +956,11 @@ class TestERDPolicyParameter(unittest.TestCase):
             cache=ResponseCache(words),
         )
 
-        # Simulate POSSIBLE_ANSWERS warmer: guesses=current_words, policy='erd_answers'
+        # Simulate POSSIBLE_ANSWERS warmer: guesses=current_words, policy=ERD_ANSWERS
         min_expected_guesses(words, soln.cache, sc,
-                             guesses=words, policy='erd_answers')
+                             guesses=words, policy=ERD_ANSWERS)
 
-        scores = _erd_solve_scores(soln, score_cache=sc, policy='erd_answers')
+        scores = _erd_solve_scores(soln, score_cache=sc, policy=ERD_ANSWERS)
         self.assertIsNotNone(scores,
                              "POSSIBLE_ANSWERS ERD must be readable after warmer completes")
 
@@ -973,32 +974,32 @@ class TestERDPolicyParameter(unittest.TestCase):
         key = ScoreCache.encode_subset(subset)
 
         # Write only erd_answers (no guesses=)
-        min_expected_guesses(subset, self.cache, sc, policy='erd_answers')
-        self.assertIsNotNone(sc.read(key, 'erd_answers'),
+        min_expected_guesses(subset, self.cache, sc, policy=ERD_ANSWERS)
+        self.assertIsNotNone(sc.read(key, ERD_ANSWERS),
                              "erd_answers must be stored after first call")
-        self.assertIsNone(sc.read(key, 'erd_all'),
+        self.assertIsNone(sc.read(key, ERD_ALL),
                           "erd_all must be untouched after erd_answers-only call")
 
         # Now write erd_all (guesses=GUESSES, different vocabulary)
         min_expected_guesses(subset, self.cache, sc,
-                             guesses=GUESSES, policy='erd_all')
-        self.assertIsNotNone(sc.read(key, 'erd_all'),
+                             guesses=GUESSES, policy=ERD_ALL)
+        self.assertIsNotNone(sc.read(key, ERD_ALL),
                              "erd_all must be stored after second call")
-        self.assertIsNotNone(sc.read(key, 'erd_answers'),
+        self.assertIsNotNone(sc.read(key, ERD_ANSWERS),
                              "erd_answers must still be present — independent slot")
 
 
 # ---------------------------------------------------------------------------
 # Bug: _multistep_stats calls min_expected_guesses without guesses=, so it
-# always uses policy='erd_answers' regardless of all_words mode.
-# After the fix it passes guesses=all_words and policy='erd_all'.
+# always uses policy=ERD_ANSWERS regardless of all_words mode.
+# After the fix it passes guesses=all_words and policy=ERD_ALL.
 # ---------------------------------------------------------------------------
 
 class TestMultistepStatsERDPolicy(unittest.TestCase):
     """
     _multistep_stats surfaces ERD purely by reading the cache namespace that
-    matches the current mode — 'erd_all' for any-word, 'erd_answers' for the
-    default (possible-answers) mode, 'erd_constrained' (a transient/supplied
+    matches the current mode — ERD_ALL for any-word, ERD_ANSWERS for the
+    default (possible-answers) mode, ERD_CONSTRAINED (a transient/supplied
     MemoryScoreCache, never SQLite) for hard mode. It must read from the
     *correct* namespace for the mode in play, ignoring values cached under
     any other policy — a cross-policy hit would surface a number computed
@@ -1037,8 +1038,8 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
     def test_all_words_mode_surfaces_from_erd_all_not_erd_answers(self):
         """
         In any-word mode (all_words supplied), _multistep_stats must read the
-        subgroup ERD from 'erd_all' — and ignore a value parked under
-        'erd_answers' for the same subgroup, which was computed against a
+        subgroup ERD from ERD_ALL — and ignore a value parked under
+        ERD_ANSWERS for the same subgroup, which was computed against a
         different (answers-only) guess vocabulary and would be the wrong number.
         """
         soln = self._mid_game_soln()
@@ -1046,19 +1047,19 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
         self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
 
         sc = ScoreCache(self.db, ANSWERS)
-        sc.write(key, 'erd_answers', 'wrong-vocab-value', 9.0)
-        sc.write(key, 'erd_all', 'crane', 1.5)
+        sc.write(key, ERD_ANSWERS, 'wrong-vocab-value', 9.0)
+        sc.write(key, ERD_ALL, 'crane', 1.5)
 
         st = _multistep_stats("heart", soln, all_words=GUESSES)
         self.assertIsNotNone(st['erd'],
-                             "a cached 'erd_all' value must be surfaced")
+                             "a cached ERD_ALL value must be surfaced")
         self.assertNotAlmostEqual(st['erd'], 1.0 + 9.0 * (2 / len(soln.current_words)),
-                                  msg="must not surface the 'erd_answers' value")
+                                  msg="must not surface the ERD_ANSWERS value")
 
     def test_default_mode_surfaces_from_erd_answers_not_erd_all(self):
         """
-        Without all_words, _multistep_stats must read 'erd_answers' — and
-        ignore a value parked under 'erd_all' for the same subgroup, which
+        Without all_words, _multistep_stats must read ERD_ANSWERS — and
+        ignore a value parked under ERD_ALL for the same subgroup, which
         was computed against the full guess vocabulary and would be wrong here.
         """
         soln = self._mid_game_soln()
@@ -1066,19 +1067,19 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
         self.assertIsNotNone(key, "setup must produce a subgroup with k>=2")
 
         sc = ScoreCache(self.db, ANSWERS)
-        sc.write(key, 'erd_all', 'wrong-vocab-value', 9.0)
-        sc.write(key, 'erd_answers', 'crane', 1.5)
+        sc.write(key, ERD_ALL, 'wrong-vocab-value', 9.0)
+        sc.write(key, ERD_ANSWERS, 'crane', 1.5)
 
         st = _multistep_stats("heart", soln)  # all_words=None
         self.assertIsNotNone(st['erd'],
-                             "a cached 'erd_answers' value must be surfaced")
+                             "a cached ERD_ANSWERS value must be surfaced")
         self.assertNotAlmostEqual(st['erd'], 1.0 + 9.0 * (2 / len(soln.current_words)),
-                                  msg="must not surface the 'erd_all' value")
+                                  msg="must not surface the ERD_ALL value")
 
     def test_constraint_compliant_mode_does_not_fall_through_to_erd_all(self):
         """
         constraint_compliant=True must steer ERD to the hard-mode vocabulary
-        and policy — not silently fall through to 'erd_all' just because
+        and policy — not silently fall through to ERD_ALL just because
         all_words happens to be non-empty.  And because hard-mode ERDs are
         path-dependent (the eligible guess set depends on the exact
         constraints accumulated so far), they must never be written into
@@ -1091,10 +1092,10 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
         _multistep_stats("heart", soln, constraint_compliant=True, all_words=GUESSES)
 
         sc = ScoreCache(self.db, ANSWERS)
-        self.assertIsNone(sc.read(key, 'erd_all'),
-                          "hard-mode ERD must not be computed/cached as 'erd_all' "
+        self.assertIsNone(sc.read(key, ERD_ALL),
+                          "hard-mode ERD must not be computed/cached as ERD_ALL "
                           "merely because all_words was supplied")
-        self.assertIsNone(sc.read(key, 'erd_constrained'),
+        self.assertIsNone(sc.read(key, ERD_CONSTRAINED),
                           "hard-mode ERD values are path-dependent and must never "
                           "be persisted to the cross-game SQLite cache")
 
@@ -1170,7 +1171,7 @@ class TestMultistepStatsERDNonBlocking(unittest.TestCase):
         key = ScoreCache.encode_subset(sg)
 
         sc = ScoreCache(self.db, ANSWERS)
-        sc.write(key, 'erd_all', 'crane', 1.5)
+        sc.write(key, ERD_ALL, 'crane', 1.5)
 
         with self._refuse_to_compute():
             st = _multistep_stats("heart", soln, all_words=GUESSES)
@@ -1194,7 +1195,7 @@ class TestMultistepStatsERDNonBlocking(unittest.TestCase):
         mc = MemoryScoreCache()
         eligible = soln.constraint_compliant_words(GUESSES)
         mc.set_scope(MemoryScoreCache.fingerprint_vocabulary(eligible))
-        mc.write(key, 'erd_constrained', 'crane', 1.5)
+        mc.write(key, ERD_CONSTRAINED, 'crane', 1.5)
 
         with self._refuse_to_compute():
             st = _multistep_stats("heart", soln, constraint_compliant=True,
@@ -1240,11 +1241,11 @@ class TestMemoryScoreCacheScoping(unittest.TestCase):
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         mc.set_scope(MemoryScoreCache.fingerprint_vocabulary(GUESSES))
-        mc.write(key, 'erd_constrained', 'heart', 1.5)
-        self.assertEqual(mc.read(key, 'erd_constrained'), ('heart', 1.5))
+        mc.write(key, ERD_CONSTRAINED, 'heart', 1.5)
+        self.assertEqual(mc.read(key, ERD_CONSTRAINED), ('heart', 1.5))
 
         mc.set_scope(MemoryScoreCache.fingerprint_vocabulary(ANSWERS))
-        self.assertIsNone(mc.read(key, 'erd_constrained'),
+        self.assertIsNone(mc.read(key, ERD_CONSTRAINED),
                           "entry from a different vocabulary scope must not be "
                           "visible — it was computed against a different "
                           "eligible-guess set and would be a false hit")
@@ -1258,13 +1259,13 @@ class TestMemoryScoreCacheScoping(unittest.TestCase):
         fp_answers = MemoryScoreCache.fingerprint_vocabulary(ANSWERS)
 
         mc.set_scope(fp_guesses)
-        mc.write(key, 'erd_constrained', 'heart', 1.5)
+        mc.write(key, ERD_CONSTRAINED, 'heart', 1.5)
 
         mc.set_scope(fp_answers)
-        mc.write(key, 'erd_constrained', 'stale', 2.0)
+        mc.write(key, ERD_CONSTRAINED, 'stale', 2.0)
 
         mc.set_scope(fp_guesses)
-        self.assertEqual(mc.read(key, 'erd_constrained'), ('heart', 1.5),
+        self.assertEqual(mc.read(key, ERD_CONSTRAINED), ('heart', 1.5),
                          "revisiting a scope must surface its own entries again")
 
     def test_unscoped_cache_keys_by_none(self):
@@ -1272,8 +1273,8 @@ class TestMemoryScoreCacheScoping(unittest.TestCase):
         scope rather than raising — a freshly constructed cache is usable."""
         mc = MemoryScoreCache()
         key = ScoreCache.encode_subset(["crane", "slate"])
-        mc.write(key, 'erd_constrained', 'heart', 1.5)
-        self.assertEqual(mc.read(key, 'erd_constrained'), ('heart', 1.5))
+        mc.write(key, ERD_CONSTRAINED, 'heart', 1.5)
+        self.assertEqual(mc.read(key, ERD_CONSTRAINED), ('heart', 1.5))
 
 
 # ---------------------------------------------------------------------------
@@ -1311,10 +1312,10 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
 
             # Pre-warm all subgroup ERDs using the full GUESSES vocabulary
             min_expected_guesses(answers, soln.cache, sc,
-                                 guesses=GUESSES, policy='erd_all')
+                                 guesses=GUESSES, policy=ERD_ALL)
 
             scores = _erd_solve_scores(soln, score_cache=sc,
-                                       policy='erd_all', guesses=GUESSES)
+                                       policy=ERD_ALL, guesses=GUESSES)
             self.assertIsNotNone(scores)
             result_words = [w for w, _ in scores]
             self.assertIn(non_answer, result_words,

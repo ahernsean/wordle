@@ -23,13 +23,13 @@ except ImportError:
 import wordle_engine
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle_engine import (
-    Solution, ScoringMethod, InputSet, ResponseCache,
+    Solution, ScoringMethod, GuessUniverse, ComplianceFilter, ResponseCache,
     load_word_list, calculate_response,
     calculate_group_counts, score_groups,
     decode_response, max_entropy,
     answer_to_restriction,
     min_expected_guesses,
-    ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
+    ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
 )
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b64"
+BUILD = "b65"
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +574,8 @@ class GameState:
                                    self.cache,
                                    self.score_cache)]
         self.columns = 1
-        self.input_set = InputSet.ANY_WORD
+        self.universe = GuessUniverse.ALL_WORDS
+        self.compliance = ComplianceFilter.UNFILTERED
         self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
         # constrained_erd_cache is intentionally NOT reset here — it is
         # long-lived and self-scoping (see __init__ and MemoryScoreCache).
@@ -705,26 +706,95 @@ def cmd_guess(gs):
 # Command: Solve
 # ---------------------------------------------------------------------------
 
-def _input_wordlist(gs, soln, iset):
-    """Resolve InputSet to the appropriate word list."""
-    if iset == InputSet.CONSTRAINT_COMPLIANT:
-        return soln.constraint_compliant_words(gs.all_words)
-    if iset == InputSet.POSSIBLE_ANSWERS:
+# Candidate-mode selection grid: which static word list a guess may be drawn
+# from (GuessUniverse) is independent of whether it must satisfy every clue
+# revealed so far (ComplianceFilter) — see their docstrings in wordle_engine.
+# Every (universe, compliance) pair is a meaningful, selectable mode; the
+# dicts below are total over all four cells, by construction, rather than
+# naming three of them and leaving the fourth to be discovered later.
+
+_CANDIDATE_LABELS = {
+    (GuessUniverse.ALL_WORDS,   ComplianceFilter.UNFILTERED): "any word",
+    (GuessUniverse.ALL_WORDS,   ComplianceFilter.COMPLIANT):  "hard mode",
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.COMPLIANT):  "possible answers",
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.UNFILTERED): "answer-shaped words (unfiltered)",
+}
+
+
+def _candidate_label(universe, compliance):
+    return _CANDIDATE_LABELS[(universe, compliance)]
+
+
+def _is_hard_mode(gs):
+    """True for real Wordle hard mode: all words, filtered to clue-compliant.
+
+    The only cell of the grid whose eligible-guess vocabulary is
+    path-dependent (see _warmer_branch_key) — the other COMPLIANT cell
+    (answers-only) narrows to soln.current_words, which is already
+    keyed by position and needs no extra vocabulary fingerprint.
+    """
+    return (gs.universe is GuessUniverse.ALL_WORDS
+            and gs.compliance is ComplianceFilter.COMPLIANT)
+
+
+def _is_possible_answers_mode(gs):
+    """True for the (ALL_ANSWERS, COMPLIANT) cell — guesses narrowed to the
+    live remaining-answer set, exactly soln.current_words."""
+    return (gs.universe is GuessUniverse.ALL_ANSWERS
+            and gs.compliance is ComplianceFilter.COMPLIANT)
+
+
+def _input_wordlist(gs, soln, universe, compliance):
+    """Resolve a (universe, compliance) grid cell to its candidate word list."""
+    base = gs.all_words if universe is GuessUniverse.ALL_WORDS else gs.all_answers
+    if compliance is ComplianceFilter.UNFILTERED:
+        return base
+    if universe is GuessUniverse.ALL_ANSWERS:
         return soln.current_words
-    if iset == InputSet.SOLVED_WORDS:
-        return [
-            s.current_words[0] for s in gs.solutions
-            if len(s.current_words) == 1
-        ]
-    return gs.all_words
+    return soln.constraint_compliant_words(base)
+
+
+def _solved_words(gs):
+    """Answers of completed sub-boards — a transient multi-board display
+    filter, independent of either grid axis (it isn't a candidate-guess
+    vocabulary at all, just "what's already been solved")."""
+    return [s.current_words[0] for s in gs.solutions if len(s.current_words) == 1]
+
+
+def _resolve_candidate_selection(gs):
+    """Determine the candidate word-source for this solve/grid invocation.
+
+    Single-board games use the persistent (gs.universe, gs.compliance)
+    selection set via the 'c' command. Multi-board games prompt per
+    invocation instead — there's no single "current position" for a
+    persistent choice to describe — and additionally offer (s)olved, a
+    transient display filter with no place on the grid (see _solved_words).
+
+    Returns (universe, compliance, solved_only), or None on invalid input
+    (the caller should treat that exactly like any other bad-input abort).
+    """
+    if gs.single:
+        print(f'Candidates: {_candidate_label(gs.universe, gs.compliance)}')
+        return gs.universe, gs.compliance, False
+    print('Input words? '
+          '(h)ard mode, (a)ll, (s)olved? ', end='')
+    ch = input().strip().lower()
+    if ch == 'h':
+        return GuessUniverse.ALL_WORDS, ComplianceFilter.COMPLIANT, False
+    if ch == 'a':
+        return GuessUniverse.ALL_WORDS, ComplianceFilter.UNFILTERED, False
+    if ch == 's':
+        return None, None, True
+    print_error("Invalid choice.")
+    return None
 
 
 class _ERDModeConfig:
-    """ERD cache/policy/guess-vocabulary mapping for one InputSet mode.
+    """ERD cache/policy/guess-vocabulary mapping for one grid cell.
 
-    Single source of truth for the mode → (cache, policy, persist, guesses)
-    relationship, referenced by _erd_cache_and_policy, cmd_solve, and the
-    warmer-init block in main() so the three-way mode branch lives in
+    Single source of truth for the (universe, compliance) → (cache, policy,
+    persist, guesses) relationship, referenced by _erd_cache_and_policy,
+    cmd_solve, and the warmer-init block in main() so that mapping lives in
     exactly one place.
     """
     __slots__ = ('policy', 'persist', 'cache_attr', 'guesses_fn')
@@ -741,21 +811,29 @@ class _ERDModeConfig:
 
 
 _ERD_MODE_CONFIG = {
-    InputSet.ANY_WORD: _ERDModeConfig(
+    (GuessUniverse.ALL_WORDS, ComplianceFilter.UNFILTERED): _ERDModeConfig(
         policy=ERD_ALL, persist=True, cache_attr='score_cache',
         guesses_fn=lambda gs, soln: gs.all_words),
-    InputSet.CONSTRAINT_COMPLIANT: _ERDModeConfig(
+    (GuessUniverse.ALL_WORDS, ComplianceFilter.COMPLIANT): _ERDModeConfig(
         policy=ERD_CONSTRAINED, persist=False, cache_attr='constrained_erd_cache',
         guesses_fn=lambda gs, soln: soln.constraint_compliant_words(gs.all_words)),
-    InputSet.POSSIBLE_ANSWERS: _ERDModeConfig(
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.COMPLIANT): _ERDModeConfig(
         policy=ERD_ANSWERS, persist=True, cache_attr='score_cache',
         guesses_fn=lambda gs, soln: soln.current_words),
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.UNFILTERED): _ERDModeConfig(
+        policy=ERD_ANSWERS_UNFILTERED, persist=True, cache_attr='score_cache',
+        guesses_fn=lambda gs, soln: gs.all_answers),
 }
 
 
 def _erd_mode_config(gs):
-    """ERD config for the current input mode; any other mode behaves as ANY_WORD."""
-    return _ERD_MODE_CONFIG.get(gs.input_set, _ERD_MODE_CONFIG[InputSet.ANY_WORD])
+    """ERD config for the current (universe, compliance) grid cell.
+
+    The dict above is total over all four cells, so this is a direct
+    lookup — no fallback is needed (there is no fifth combination gs.universe
+    / gs.compliance could hold).
+    """
+    return _ERD_MODE_CONFIG[(gs.universe, gs.compliance)]
 
 
 def _warmer_branch_key(gs, soln, effective_guesses):
@@ -767,22 +845,23 @@ def _warmer_branch_key(gs, soln, effective_guesses):
     an identical one from scratch (which would race the old one to compute
     and announce the very same root result).
 
-    current_words alone is not enough in CONSTRAINT_COMPLIANT mode: the
-    eligible-guess vocabulary is path-dependent, so the same remaining-word
-    set can arise from genuinely different guess histories (e.g. via undo)
-    with different effective_guesses — hence the vocabulary fingerprint.
+    current_words alone is not enough in hard mode: the eligible-guess
+    vocabulary is path-dependent, so the same remaining-word set can arise
+    from genuinely different guess histories (e.g. via undo) with different
+    effective_guesses — hence the vocabulary fingerprint.
     """
     vocab_fp = (MemoryScoreCache.fingerprint_vocabulary(effective_guesses)
-                if gs.input_set == InputSet.CONSTRAINT_COMPLIANT else None)
-    return (tuple(sorted(soln.current_words)), gs.input_set, vocab_fp)
+                if _is_hard_mode(gs) else None)
+    return (tuple(sorted(soln.current_words)), (gs.universe, gs.compliance), vocab_fp)
 
 
 def _erd_cache_and_policy(gs, soln):
-    """Return (score_cache, policy) appropriate for the current input mode.
+    """Return (score_cache, policy) appropriate for the current grid cell.
 
-    ANY_WORD             → SQLite,           ERD_ALL
-    CONSTRAINT_COMPLIANT → MemoryScoreCache, ERD_CONSTRAINED
-    POSSIBLE_ANSWERS     → SQLite,           ERD_ANSWERS
+    (ALL_WORDS,   UNFILTERED) → SQLite,           ERD_ALL
+    (ALL_WORDS,   COMPLIANT)  → MemoryScoreCache, ERD_CONSTRAINED
+    (ALL_ANSWERS, COMPLIANT)  → SQLite,           ERD_ANSWERS
+    (ALL_ANSWERS, UNFILTERED) → SQLite,           ERD_ANSWERS_UNFILTERED
     """
     cfg = _erd_mode_config(gs)
     return cfg.cache(gs, soln), cfg.policy
@@ -908,29 +987,11 @@ def cmd_solve(gs):
         print_error("Invalid choice.")
         return
 
-    iset = gs.input_set
-    if not gs.single:
-        print('Input words? '
-              '(h)ard mode, (a)ll, (s)olved? ', end='')
-        ch = input().strip().lower()
-        if ch == 'h':
-            iset = InputSet.CONSTRAINT_COMPLIANT
-        elif ch == 'a':
-            iset = InputSet.ANY_WORD
-        elif ch == 's':
-            iset = InputSet.SOLVED_WORDS
-        else:
-            print_error("Invalid choice.")
-            return
-    else:
-        labels = {
-            InputSet.ANY_WORD:     "any word",
-            InputSet.CONSTRAINT_COMPLIANT:       "hard mode",
-            InputSet.POSSIBLE_ANSWERS: "possible answers",
-        }
-        print(f'Candidates: {labels.get(iset, iset.name)}')
-
-    wordlist = _input_wordlist(gs, soln, iset)
+    selection = _resolve_candidate_selection(gs)
+    if selection is None:
+        return
+    universe, compliance, solved_only = selection
+    wordlist = _solved_words(gs) if solved_only else _input_wordlist(gs, soln, universe, compliance)
     if not wordlist:
         print_error("No words in input set!")
         return
@@ -1005,29 +1066,11 @@ def cmd_grid(gs):
 
     set_display_context(soln)
 
-    iset = gs.input_set
-    if not gs.single:
-        print('Input words? '
-              '(h)ard mode, (a)ll, (s)olved? ', end='')
-        ch = input().strip().lower()
-        if ch == 'h':
-            iset = InputSet.CONSTRAINT_COMPLIANT
-        elif ch == 'a':
-            iset = InputSet.ANY_WORD
-        elif ch == 's':
-            iset = InputSet.SOLVED_WORDS
-        else:
-            print_error("Invalid choice.")
-            return
-    else:
-        labels = {
-            InputSet.ANY_WORD:     "any word",
-            InputSet.CONSTRAINT_COMPLIANT:       "hard mode",
-            InputSet.POSSIBLE_ANSWERS: "possible answers",
-        }
-        print(f'Candidates: {labels.get(iset, iset.name)}')
-
-    wordlist = _input_wordlist(gs, soln, iset)
+    selection = _resolve_candidate_selection(gs)
+    if selection is None:
+        return
+    universe, compliance, solved_only = selection
+    wordlist = _solved_words(gs) if solved_only else _input_wordlist(gs, soln, universe, compliance)
     if not wordlist:
         print_error("No words in input set!")
         return
@@ -1139,7 +1182,7 @@ def cmd_lookahead(gs):
             or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
         print("Computing entropy ranking for lookahead...")
         rank_words = (soln.current_words
-                      if gs.input_set == InputSet.POSSIBLE_ANSWERS
+                      if _is_possible_answers_mode(gs)
                       else gs.all_words)
         tracker = ProgressTracker(len(rank_words))
         soln.compute_scores(
@@ -1152,7 +1195,7 @@ def cmd_lookahead(gs):
     top_n = soln.scores[:count]
 
     # Possible-answers mode: restrict step-2 candidates to the subgroup
-    is_possible_answers = (gs.input_set == InputSet.POSSIBLE_ANSWERS)
+    is_possible_answers = _is_possible_answers_mode(gs)
     if is_possible_answers:
         second_step_words = None
         mode_label = "possible answers (subgroup)"
@@ -1586,12 +1629,11 @@ def cmd_test(gs, inline=''):
         print("Word(s) to test? ", end="")
         line = input().strip()
 
-    # Derive step-2 pool and hard-mode flag from current input-set setting
-    iset = gs.input_set
+    # Derive step-2 pool and hard-mode flag from the current grid selection
     erd_cache = None
-    if iset == InputSet.CONSTRAINT_COMPLIANT:
+    if _is_hard_mode(gs):
         step2_pool = None
-        constraint_compliant  = True
+        constraint_compliant = True
         # Reuse the long-lived, vocabulary-scoped hard-mode ERD cache so
         # try-mode and the background warmer trade sub-results for free —
         # both use the exact same eligible-guess vocabulary for this position.
@@ -1599,11 +1641,11 @@ def cmd_test(gs, inline=''):
         gs.constrained_erd_cache.set_scope(
             MemoryScoreCache.fingerprint_vocabulary(eligible))
         erd_cache = gs.constrained_erd_cache
-    elif iset == InputSet.POSSIBLE_ANSWERS:
+    elif gs.universe is GuessUniverse.ALL_ANSWERS:
         step2_pool = None
-        constraint_compliant  = False
-    else:  # ANY_WORD — cap at 200 top-entropy words; searching all 12k is ~65x slower
-        constraint_compliant  = False
+        constraint_compliant = False
+    else:  # all words, unfiltered — cap at 200 top-entropy; searching all 12k is ~65x slower
+        constraint_compliant = False
         if (soln.scores_updated
                 and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
             step2_pool = [w for w, _ in soln.scores[:200]]
@@ -1882,23 +1924,38 @@ def cmd_wordcount(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_candidates(gs):
-    options = [
-        (InputSet.ANY_WORD,      "any word"),
-        (InputSet.CONSTRAINT_COMPLIANT,        "hard mode (must use revealed info)"),
-        (InputSet.POSSIBLE_ANSWERS, "possible answers"),
+    universe_options = [
+        (GuessUniverse.ALL_WORDS,   "all words (~12,972)"),
+        (GuessUniverse.ALL_ANSWERS, "possible answers (~3,200)"),
     ]
-    current_label = next((label for iset, label in options
-                          if iset == gs.input_set), "unknown")
-    print(f"\nCandidates mode (current: {current_label}):")
-    for i, (_, label) in enumerate(options, 1):
+    compliance_options = [
+        (ComplianceFilter.UNFILTERED, "unfiltered"),
+        (ComplianceFilter.COMPLIANT,  "must satisfy revealed clues"),
+    ]
+    print(f"\nCandidates mode (current: {_candidate_label(gs.universe, gs.compliance)}):")
+
+    print("Draw guesses from:")
+    for i, (_, label) in enumerate(universe_options, 1):
         print(f"  {i}. {label}")
-    print("Choose (1-3)? ", end="")
+    print("Choose (1-2)? ", end="")
     try:
-        raw = int(input().strip())
-        gs.input_set = options[raw - 1][0]
-        print(f"  Candidates: {options[raw - 1][1]}")
+        universe = universe_options[int(input().strip()) - 1][0]
     except (ValueError, IndexError):
         print_error("Invalid choice.")
+        return
+
+    print("Must they satisfy every clue revealed so far?")
+    for i, (_, label) in enumerate(compliance_options, 1):
+        print(f"  {i}. {label}")
+    print("Choose (1-2)? ", end="")
+    try:
+        compliance = compliance_options[int(input().strip()) - 1][0]
+    except (ValueError, IndexError):
+        print_error("Invalid choice.")
+        return
+
+    gs.universe, gs.compliance = universe, compliance
+    print(f"  Candidates: {_candidate_label(universe, compliance)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1906,12 +1963,7 @@ def cmd_candidates(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_help(gs):
-    cand_labels = {
-        InputSet.ANY_WORD:     "all words",
-        InputSet.CONSTRAINT_COMPLIANT:       "hard mode",
-        InputSet.POSSIBLE_ANSWERS: "possible answers",
-    }
-    cand = cand_labels.get(gs.input_set, gs.input_set.name)
+    cand = _candidate_label(gs.universe, gs.compliance)
     if gs.single:
         aw = gs.solutions[0].answer_word
         sim = aw.upper() if aw else "off"
@@ -2207,7 +2259,7 @@ def main():
                 if _warmer is not None:
                     _warmer.stop()
                 seed_cache = None
-                if gs.input_set == InputSet.CONSTRAINT_COMPLIANT:
+                if _is_hard_mode(gs):
                     # Hard-mode ERD results are valid only for the exact
                     # eligible-guess vocabulary that produced them.  Scope the
                     # long-lived cache to that vocabulary's fingerprint:
