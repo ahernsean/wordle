@@ -12,10 +12,15 @@ class ScoreCache:
     """Persists per-word scores and subgroup lookahead results.
 
     Tables:
-      word_scores    — per-word scoring method results (level 1)
-      subgroup_pick  — the word a search policy picked for a subgroup,
-                       and the score that earned it the pick (levels 2+)
-      universe       — fingerprint of the answer word set
+      word_scores            — per-word scoring method results (level 1)
+      subgroup_best_by_policy — the word a search policy judged best for a
+                                subgroup, and the score that earned it that
+                                judgment (levels 2+); the "by_policy" in the
+                                table name carries the scoping that lets the
+                                best_word/best_score columns stay short —
+                                "best" is only ever read alongside the policy
+                                that decided it
+      universe               — fingerprint of the answer word set
 
     All entries are keyed by universe_id so a different answer list
     produces a clean namespace without needing a new file.
@@ -51,43 +56,61 @@ class ScoreCache:
                 PRIMARY KEY (guess, universe_id)
             )
         """)
-        # lookahead_result/best_word/best_entropy were renamed to
-        # subgroup_pick/picked_word/picked_score: "best" wrongly implied
-        # one policy's choice is objectively superior to another's — every
-        # ScoringMethod, and every search policy (lookahead vs. ERD), defines
-        # its own notion of "best" — and "entropy" is flatly wrong for
-        # ERD-policy rows, which store an expected-remaining-guesses *cost*
-        # (lower is better, the opposite sense of an entropy value, which is
-        # higher-is-better). Rename in place so existing rows survive.
+        # The subgroup-result table and its columns have been renamed twice:
+        #   lookahead_result(best_word, best_entropy)
+        #     -> subgroup_pick(picked_word, picked_score): "best" wrongly
+        #        implied one policy's choice is objectively superior to
+        #        another's, and "entropy" is flatly wrong for ERD-policy
+        #        rows, which store an expected-remaining-guesses *cost*
+        #        (lower is better — the opposite sense of entropy).
+        #   subgroup_pick(picked_word, picked_score)
+        #     -> subgroup_best_by_policy(best_word, best_score): "picked"
+        #        solved the superiority problem but read awkwardly on its
+        #        own ("the picked word for a subgroup" — picked by what?).
+        #        Moving the missing context ("by policy") into the *table*
+        #        name lets the column names stay short and natural —
+        #        "best_word"/"best_score" — since any reader of the columns
+        #        already has the table's name, and therefore the policy
+        #        column, in view.
+        # Migrate in place from either prior state so existing rows survive.
         tables = {row["name"] for row in self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        if "lookahead_result" in tables and "subgroup_pick" not in tables:
+        if "lookahead_result" in tables and "subgroup_pick" not in tables \
+                and "subgroup_best_by_policy" not in tables:
             self._conn.execute(
-                "ALTER TABLE lookahead_result RENAME TO subgroup_pick")
+                "ALTER TABLE lookahead_result RENAME TO subgroup_best_by_policy")
             self._conn.execute(
-                "ALTER TABLE subgroup_pick RENAME COLUMN best_word TO picked_word")
-            self._conn.execute(
-                "ALTER TABLE subgroup_pick RENAME COLUMN best_entropy TO picked_score")
+                "ALTER TABLE subgroup_best_by_policy RENAME COLUMN best_entropy TO best_score")
             self._conn.execute("DROP INDEX IF EXISTS idx_lookahead")
+        tables = {row["name"] for row in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "subgroup_pick" in tables and "subgroup_best_by_policy" not in tables:
+            self._conn.execute(
+                "ALTER TABLE subgroup_pick RENAME TO subgroup_best_by_policy")
+            self._conn.execute(
+                "ALTER TABLE subgroup_best_by_policy RENAME COLUMN picked_word TO best_word")
+            self._conn.execute(
+                "ALTER TABLE subgroup_best_by_policy RENAME COLUMN picked_score TO best_score")
+            self._conn.execute("DROP INDEX IF EXISTS idx_subgroup_pick")
         self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS subgroup_pick (
+            CREATE TABLE IF NOT EXISTS subgroup_best_by_policy (
                 subset_key   BLOB NOT NULL,
                 policy       TEXT NOT NULL,
                 universe_id  TEXT NOT NULL,
-                picked_word  TEXT NOT NULL,
-                picked_score REAL NOT NULL,
+                best_word    TEXT NOT NULL,
+                best_score   REAL NOT NULL,
                 updated_at   INTEGER NOT NULL,
                 PRIMARY KEY (subset_key, policy, universe_id)
             )
         """)
         self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_subgroup_pick
-            ON subgroup_pick(universe_id, policy)
+            CREATE INDEX IF NOT EXISTS idx_subgroup_best_by_policy
+            ON subgroup_best_by_policy(universe_id, policy)
         """)
         # word_scores used to be keyed only by (word, method, universe_id) —
         # i.e. scoped to the whole answer set, so it could only ever cache
         # the very first guess of a game. Replace it with a subset-scoped
-        # table (mirroring subgroup_pick) so any remaining-word position
+        # table (mirroring subgroup_best_by_policy) so any remaining-word position
         # that recurs gets its scores cached, not just the opening one.
         old_cols = {row["name"] for row in
                     self._conn.execute("PRAGMA table_info(word_scores)")}
@@ -130,7 +153,7 @@ class ScoreCache:
         self._purge_legacy_rows("policy = ?", ('erd_hard',))
 
     def _purge_legacy_rows(self, where, params):
-        """One-time cleanup of stale subgroup_pick rows.
+        """One-time cleanup of stale subgroup_best_by_policy rows.
 
         Once a legacy batch is gone it stays gone, so a full-table DELETE on
         every connection open (including each ERDWarmer thread) would scan
@@ -139,10 +162,11 @@ class ScoreCache:
         actually something to remove.
         """
         exists = self._conn.execute(
-            f"SELECT 1 FROM subgroup_pick WHERE {where} LIMIT 1", params
+            f"SELECT 1 FROM subgroup_best_by_policy WHERE {where} LIMIT 1", params
         ).fetchone()
         if exists is not None:
-            self._conn.execute(f"DELETE FROM subgroup_pick WHERE {where}", params)
+            self._conn.execute(
+                f"DELETE FROM subgroup_best_by_policy WHERE {where}", params)
 
     def _ensure_universe(self):
         canonical = "\n".join(self.answer_words)
@@ -172,36 +196,39 @@ class ScoreCache:
         return "".join(sorted(words)).encode("utf-8")
 
     def read(self, subset_key, policy):
-        """Return (picked_word, picked_score) or None on cache miss.
+        """Return (best_word, best_score) or None on cache miss.
 
-        picked_word is whichever word this policy's search judged best for
+        best_word is whichever word this policy's search judged best for
         this subgroup — judged by that policy's own metric, not some
-        universal notion of "best". picked_score is that metric's value for
-        picked_word, and its meaning is policy-dependent: an entropy in bits
+        universal notion of "best". best_score is that metric's value for
+        best_word, and its meaning is policy-dependent: an entropy in bits
         (higher is better) for lookahead policies ('full'/'hard'), or an
         expected-remaining-guesses cost (lower is better) for ERD policies
         ('erd_all'/'erd_answers'/'erd_constrained'). Callers that care about
-        the number must already know which policy they asked for.
+        the number must already know which policy they asked for — the
+        table name (subgroup_best_by_policy) and its policy column carry
+        that scoping, so the columns themselves can stay "best_word"/
+        "best_score" without re-litigating it.
         """
         row = self._conn.execute("""
-            SELECT picked_word, picked_score
-            FROM subgroup_pick
+            SELECT best_word, best_score
+            FROM subgroup_best_by_policy
             WHERE subset_key = ? AND policy = ? AND universe_id = ?
         """, (subset_key, policy, self.universe_id)).fetchone()
         if row is None:
             return None
-        return row["picked_word"], row["picked_score"]
+        return row["best_word"], row["best_score"]
 
-    def write(self, subset_key, policy, picked_word, picked_score):
-        """Store the word a policy's search picked for a subgroup, and its score."""
+    def write(self, subset_key, policy, best_word, best_score):
+        """Store the word a policy's search judged best for a subgroup, and its score."""
         now = int(time.time())
         self._conn.execute("""
-            INSERT OR REPLACE INTO subgroup_pick
+            INSERT OR REPLACE INTO subgroup_best_by_policy
                 (subset_key, policy, universe_id,
-                 picked_word, picked_score, updated_at)
+                 best_word, best_score, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (subset_key, policy, self.universe_id,
-              picked_word, picked_score, now))
+              best_word, best_score, now))
 
     # ------------------------------------------------------------------
     # Response decomposition cache (guess -> per-answer pattern bytes)
@@ -269,10 +296,10 @@ class ScoreCache:
             raise
 
     def stats(self):
-        """Return (subgroup_pick_rows, word_score_rows, decomposition_rows, last_updated_ts)."""
+        """Return (subgroup_best_rows, word_score_rows, decomposition_rows, last_updated_ts)."""
         sp = self._conn.execute("""
             SELECT COUNT(*) AS c, MAX(updated_at) AS m
-            FROM subgroup_pick WHERE universe_id = ?
+            FROM subgroup_best_by_policy WHERE universe_id = ?
         """, (self.universe_id,)).fetchone()
         ws = self._conn.execute("""
             SELECT COUNT(*) AS c FROM word_scores WHERE universe_id = ?
@@ -301,7 +328,7 @@ class MemoryScoreCache:
     """
 
     def __init__(self):
-        self._data = {}  # (scope, subset_key_bytes, policy) -> (picked_word, picked_score)
+        self._data = {}  # (scope, subset_key_bytes, policy) -> (best_word, best_score)
         self._scope = None
 
     @staticmethod
@@ -317,8 +344,8 @@ class MemoryScoreCache:
     def read(self, subset_key, policy):
         return self._data.get((self._scope, subset_key, policy))
 
-    def write(self, subset_key, policy, picked_word, picked_score):
-        self._data[(self._scope, subset_key, policy)] = (picked_word, picked_score)
+    def write(self, subset_key, policy, best_word, best_score):
+        self._data[(self._scope, subset_key, policy)] = (best_word, best_score)
 
     def close(self):
         pass

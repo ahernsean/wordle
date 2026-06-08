@@ -307,21 +307,24 @@ class TestScoreCacheSQLite(unittest.TestCase):
         conn.close()
 
         # Opening ScoreCache should rename the table/columns to
-        # subgroup_pick/picked_word/picked_score AND delete the old-format row
+        # subgroup_best_by_policy/best_word/best_score AND delete the
+        # old-format row
         ScoreCache(self.db, ANSWERS)
         conn2 = _sqlite3.connect(self.db)
         rows = conn2.execute(
-            "SELECT COUNT(*) FROM subgroup_pick WHERE instr(subset_key, char(0)) > 0"
+            "SELECT COUNT(*) FROM subgroup_best_by_policy "
+            "WHERE instr(subset_key, char(0)) > 0"
         ).fetchone()[0]
         conn2.close()
         self.assertEqual(rows, 0)
 
     def test_old_lookahead_result_table_is_renamed(self):
-        # Simulate a row persisted under the pre-rename table/column names,
-        # WITHOUT the legacy key encoding — i.e. data written between the
-        # subset-key-encoding migration and this table/column rename. Built
-        # entirely without a ScoreCache so subgroup_pick doesn't exist yet —
-        # otherwise the rename-in-place path wouldn't trigger.
+        # Simulate a row persisted under the original pre-rename table/column
+        # names, WITHOUT the legacy key encoding — i.e. data written between
+        # the subset-key-encoding migration and the table/column rename.
+        # Built entirely without a ScoreCache so neither subgroup_pick nor
+        # subgroup_best_by_policy exists yet — otherwise the rename-in-place
+        # path wouldn't trigger.
         import hashlib as _hashlib
         import sqlite3 as _sqlite3
         conn = _sqlite3.connect(self.db)
@@ -337,6 +340,37 @@ class TestScoreCacheSQLite(unittest.TestCase):
         subset_key = ScoreCache.encode_subset(["crane", "slate"])
         conn.execute(
             "INSERT OR REPLACE INTO lookahead_result VALUES (?,?,?,?,?,?)",
+            (subset_key, "hard", universe_id, "heart", 2.5, 0),
+        )
+        conn.commit()
+        conn.close()
+
+        sc = ScoreCache(self.db, ANSWERS)
+        hit = sc.read(subset_key, "hard")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit, ("heart", 2.5))
+
+    def test_old_subgroup_pick_table_is_renamed(self):
+        # Simulate a row persisted under the short-lived intermediate name
+        # (subgroup_pick/picked_word/picked_score) — a real possible state
+        # for any DB created against the commit that introduced it before
+        # this rename landed. Built without a ScoreCache so
+        # subgroup_best_by_policy doesn't exist yet.
+        import hashlib as _hashlib
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS subgroup_pick (
+                subset_key BLOB NOT NULL, policy TEXT NOT NULL,
+                universe_id TEXT NOT NULL, picked_word TEXT NOT NULL,
+                picked_score REAL NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_key, policy, universe_id)
+            )
+        """)
+        universe_id = _hashlib.sha256("\n".join(ANSWERS).encode()).hexdigest()
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        conn.execute(
+            "INSERT OR REPLACE INTO subgroup_pick VALUES (?,?,?,?,?,?)",
             (subset_key, "hard", universe_id, "heart", 2.5, 0),
         )
         conn.commit()
@@ -627,10 +661,10 @@ class TestComputeLookaheadCache(unittest.TestCase):
             subset_key = ScoreCache.encode_subset(subgroup)
             hit = sc.read(subset_key, "hard")
             self.assertIsNotNone(hit)
-            picked_word, _picked_score = hit
+            best_word, _best_score = hit
 
             # Every method besides the ranking criterion (entropy, already
-            # captured in subgroup_pick) should be persisted too — they
+            # captured in subgroup_best_by_policy) should be persisted too — they
             # all come from the same group-count partition, so there's no
             # principled reason to single any of them out.
             for method in ScoringMethod:
@@ -641,8 +675,8 @@ class TestComputeLookaheadCache(unittest.TestCase):
                     cached,
                     f"{method.name}'s score for the cached winner should be "
                     f"persisted alongside its entropy, at near-zero extra cost")
-                cached_value = dict(cached)[picked_word]
-                expected_value = score_word(picked_word, subgroup, method, cache=s.cache)
+                cached_value = dict(cached)[best_word]
+                expected_value = score_word(best_word, subgroup, method, cache=s.cache)
                 self.assertEqual(cached_value, expected_value)
 
 
@@ -696,15 +730,15 @@ class TestMinExpectedGuesses(unittest.TestCase):
             subset = ANSWERS[:4]
             result = min_expected_guesses(subset, self.cache, sc)
             self.assertIsNotNone(result)
-            picked_word, _picked_score = sc.read(ScoreCache.encode_subset(subset), 'erd_answers')
+            best_word, _best_score = sc.read(ScoreCache.encode_subset(subset), 'erd_answers')
 
             subset_key = ScoreCache.encode_subset(subset)
             for method in ScoringMethod:
                 cached = sc.read_scores(subset_key, method.name.lower())
                 self.assertIsNotNone(
                     cached, f"{method.name} should be persisted for the ERD winner")
-                expected = score_word(picked_word, subset, method, cache=self.cache)
-                self.assertEqual(dict(cached)[picked_word], expected)
+                expected = score_word(best_word, subset, method, cache=self.cache)
+                self.assertEqual(dict(cached)[best_word], expected)
         finally:
             os.unlink(tmp.name)
 
