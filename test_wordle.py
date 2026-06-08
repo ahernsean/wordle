@@ -5,10 +5,12 @@ Run with:  python test_wordle.py
 import io
 import math
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
+from collections import defaultdict
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -16,7 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
-    calculate_response, score_groups, calculate_group_counts, score_word,
+    calculate_response, score_groups, score_groups_multi, calculate_group_counts,
+    score_word, score_word_multi, load_word_list, max_entropy,
+    Restriction, answer_to_restriction, apply_guess, _encode_response,
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores,
 )
@@ -127,6 +131,176 @@ class TestScoreGroups(unittest.TestCase):
         self.assertAlmostEqual(
             score_groups(groups, ScoringMethod.PROB_FINISH), 2 / 5)
 
+    def test_empty_groups_higher_is_better_returns_zero(self):
+        self.assertEqual(score_groups({}, ScoringMethod.ENTROPY_GAIN), 0.0)
+        self.assertEqual(score_groups({}, ScoringMethod.PROB_FINISH), 0.0)
+
+    def test_empty_groups_lower_is_better_returns_infinity(self):
+        self.assertEqual(score_groups({}, ScoringMethod.WEIGHTED_AVG), float('inf'))
+        self.assertEqual(score_groups({}, ScoringMethod.MAX_GROUP_SIZE), float('inf'))
+
+    def test_unknown_method_raises(self):
+        with self.assertRaises(ValueError):
+            score_groups({0: 1}, "not-a-scoring-method")
+
+
+# ---------------------------------------------------------------------------
+# score_word / score_word_multi: cache vs. no-cache agreement, callbacks
+# ---------------------------------------------------------------------------
+
+class TestScoreWordCacheAgreement(unittest.TestCase):
+    """score_word/score_word_multi take an optional ResponseCache: with one,
+    they read pre-built pattern mappings; without one, they fall back to
+    calculate_group_counts. Both paths must produce identical scores."""
+
+    def test_score_word_with_and_without_cache_agree(self):
+        cache = ResponseCache(ANSWERS)
+        with_cache = score_word("crane", ANSWERS, ScoringMethod.ENTROPY_GAIN, cache=cache)
+        without_cache = score_word("crane", ANSWERS, ScoringMethod.ENTROPY_GAIN)
+        self.assertAlmostEqual(with_cache, without_cache)
+
+    def test_score_word_multi_with_and_without_cache_agree(self):
+        cache = ResponseCache(ANSWERS)
+        methods = list(ScoringMethod)
+        with_cache = score_word_multi("crane", ANSWERS, methods, cache=cache)
+        without_cache = score_word_multi("crane", ANSWERS, methods)
+        self.assertEqual(with_cache, without_cache)
+
+    def test_score_word_invokes_progress_callback(self):
+        calls = []
+        score_word("crane", ANSWERS, ScoringMethod.ENTROPY_GAIN,
+                   progress_callback=lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+
+    def test_score_word_multi_invokes_progress_callback(self):
+        calls = []
+        score_word_multi("crane", ANSWERS, [ScoringMethod.ENTROPY_GAIN],
+                         progress_callback=lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+
+
+# ---------------------------------------------------------------------------
+# ResponseCache: is_cached and the not-yet-mapped fallback branch
+# ---------------------------------------------------------------------------
+
+class TestResponseCacheMembership(unittest.TestCase):
+
+    def test_is_cached_reflects_first_use(self):
+        cache = ResponseCache(ANSWERS)
+        self.assertFalse(cache.is_cached("crane"))
+        cache.group_counts("crane", ANSWERS[:3])
+        self.assertTrue(cache.is_cached("crane"))
+
+    def test_group_counts_handles_word_outside_answer_universe(self):
+        """A subset word that wasn't in answer_words at cache-build time
+        (e.g. a guess-only word reachable via fallback mode) isn't in the
+        pre-built mapping — group_counts/group_words must still score it
+        correctly via the inline calculate_response fallback."""
+        small_universe = ANSWERS[:3]
+        cache = ResponseCache(small_universe)
+        outsider = "piano"
+        subset = small_universe + [outsider]
+
+        counts = cache.group_counts("crane", subset)
+        groups = cache.group_words("crane", subset)
+
+        expected_counts = calculate_group_counts("crane", subset)
+        self.assertEqual(dict(counts), dict(expected_counts))
+        self.assertEqual(sum(len(g) for g in groups.values()), len(subset))
+        self.assertTrue(any(outsider in g for g in groups.values()))
+
+
+# ---------------------------------------------------------------------------
+# Engine utility functions: load_word_list, calculate_group_counts,
+# max_entropy, Restriction, ScoringMethod display helpers
+# ---------------------------------------------------------------------------
+
+class TestLoadWordList(unittest.TestCase):
+
+    def test_strips_blank_lines_and_whitespace(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as f:
+            f.write("crane\n  slate  \n\ntrace\n")
+            path = f.name
+        try:
+            self.assertEqual(load_word_list(path), ["crane", "slate", "trace"])
+        finally:
+            os.unlink(path)
+
+
+class TestCalculateGroupCounts(unittest.TestCase):
+
+    def test_matches_per_word_calculate_response(self):
+        words = ANSWERS[:6]
+        counts = calculate_group_counts("crane", words)
+        expected = defaultdict(int)
+        for w in words:
+            expected[_encode_response(calculate_response("crane", w))] += 1
+        self.assertEqual(dict(counts), dict(expected))
+
+    def test_total_equals_input_size(self):
+        counts = calculate_group_counts("heart", ANSWERS)
+        self.assertEqual(sum(counts.values()), len(ANSWERS))
+
+
+class TestMaxEntropy(unittest.TestCase):
+
+    def test_zero_or_one_remaining_is_zero(self):
+        self.assertEqual(max_entropy(0), 0.0)
+        self.assertEqual(max_entropy(1), 0.0)
+
+    def test_matches_log2(self):
+        self.assertAlmostEqual(max_entropy(8), 3.0)
+        self.assertAlmostEqual(max_entropy(16), 4.0)
+
+
+class TestRestriction(unittest.TestCase):
+
+    def test_setitem_getitem_round_trip(self):
+        r = Restriction()
+        r[2] = ('a', 1, 'yellow')
+        self.assertEqual(r[2], ['a', 1, 'yellow'])
+        # Untouched slots remain at their defaults
+        self.assertEqual(r[0], ['', 0, None])
+
+    def test_apply_matches_apply_guess(self):
+        guess, answer = "crane", "trace"
+        response = calculate_response(guess, answer)
+        restriction = answer_to_restriction(guess, response)
+        via_restriction = restriction.apply(ANSWERS)
+        via_apply_guess = apply_guess(ANSWERS, guess, response)
+        self.assertEqual(via_restriction, via_apply_guess)
+
+    def test_apply_handles_repeated_letters_in_guess(self):
+        """A guess with a repeated letter ('sassy' has three S's) forces
+        _ignore_word's duplicate-accounting to actually mask out earlier
+        same-letter occurrences. Restriction-based filtering must agree
+        with an independent per-word calculate_response comparison —
+        two algorithms that should always produce the same subset."""
+        guess = "sassy"
+        candidates = ANSWERS + ["essay", "spans", "lasso"]
+        for answer in candidates:
+            response = calculate_response(guess, answer)
+            filtered = apply_guess(candidates, guess, response)
+            expected = [w for w in candidates
+                        if calculate_response(guess, w) == response]
+            self.assertEqual(filtered, expected, msg=f"answer={answer}")
+
+
+class TestScoringMethodDisplay(unittest.TestCase):
+
+    def test_label_is_distinct_per_method(self):
+        labels = {m.label for m in ScoringMethod}
+        self.assertEqual(len(labels), len(list(ScoringMethod)))
+
+    def test_format_score_max_group_size_is_integer(self):
+        self.assertEqual(ScoringMethod.MAX_GROUP_SIZE.format_score(7.0), "7")
+
+    def test_format_score_prob_finish_is_percentage(self):
+        self.assertEqual(ScoringMethod.PROB_FINISH.format_score(0.25), "25.0%")
+
+    def test_format_score_default_is_four_decimals(self):
+        self.assertEqual(ScoringMethod.ENTROPY_GAIN.format_score(1.5), "1.5000")
+
 
 # ---------------------------------------------------------------------------
 # Solution in-memory score cache lifecycle
@@ -160,6 +334,25 @@ class TestSolutionScoreCache(unittest.TestCase):
         self.soln.compute_scores(GUESSES, ScoringMethod.ENTROPY_GAIN,
                                  progress_callback=count)
         # All calls should be cache hits — same count as number of words
+        self.assertEqual(calls[0], len(GUESSES))
+
+    def test_second_method_extends_existing_word_entry(self):
+        """Scoring under a second method must add to a word's existing
+        word_scores entry rather than replace it — both methods' results
+        stay available from the same cache."""
+        self.soln.compute_scores(GUESSES, ScoringMethod.ENTROPY_GAIN)
+        self.soln.compute_scores(GUESSES, ScoringMethod.MAX_GROUP_SIZE)
+        for w in GUESSES:
+            entry = self.soln.word_scores[w]
+            self.assertIn(ScoringMethod.ENTROPY_GAIN, entry)
+            self.assertIn(ScoringMethod.MAX_GROUP_SIZE, entry)
+
+    def test_compute_scores_multi_second_call_is_pure_cache_hits(self):
+        methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE]
+        self.soln.compute_scores_multi(GUESSES, methods)
+        calls = [0]
+        def count(x=None): calls[0] += 1
+        self.soln.compute_scores_multi(GUESSES, methods, progress_callback=count)
         self.assertEqual(calls[0], len(GUESSES))
 
     def test_invalidate_clears_word_scores(self):
@@ -198,6 +391,133 @@ class TestSolutionScoreCache(unittest.TestCase):
         self.soln.compute_scores(GUESSES, ScoringMethod.MAX_GROUP_SIZE)
         scores = [s for _, s in self.soln.scores]
         self.assertEqual(scores, sorted(scores))
+
+
+# ---------------------------------------------------------------------------
+# Solution: undo_guess, include_letters/exclude_letters, join
+# ---------------------------------------------------------------------------
+
+class TestUndoGuess(unittest.TestCase):
+
+    def setUp(self):
+        self.soln = make_solution()
+
+    def test_no_op_on_empty_history(self):
+        self.assertFalse(self.soln.undo_guess())
+        self.assertEqual(self.soln.current_words, ANSWERS)
+
+    def test_returns_true_and_restores_prior_word_count(self):
+        before = self.soln.current_words[:]
+        pattern = calculate_response("crane", "slate")
+        self.soln.apply_guess("crane", pattern)
+        self.assertNotEqual(self.soln.current_words, before)
+
+        self.assertTrue(self.soln.undo_guess())
+        self.assertEqual(self.soln.current_words, before)
+        self.assertEqual(self.soln.guesses, [])
+
+    def test_undo_replays_remaining_history(self):
+        """Undoing the most recent of several guesses must leave current_words
+        exactly as if only the earlier guesses had ever been applied."""
+        p1 = calculate_response("crane", "heart")
+        p2 = calculate_response("slate", "heart")
+        self.soln.apply_guess("crane", p1)
+        after_first = self.soln.current_words[:]
+        self.soln.apply_guess("slate", p2)
+
+        self.assertTrue(self.soln.undo_guess())
+        self.assertEqual(self.soln.current_words, after_first)
+        self.assertEqual(self.soln.guesses, [["crane", list(p1)]])
+
+    def test_undo_clears_stale_score_cache(self):
+        pattern = calculate_response("crane", "slate")
+        self.soln.apply_guess("crane", pattern)
+        self.soln.compute_scores(GUESSES, ScoringMethod.ENTROPY_GAIN)
+        self.assertTrue(self.soln.word_scores)
+
+        self.soln.undo_guess()
+        self.assertEqual(self.soln.word_scores, {},
+                         "stale per-word scores from the undone position must "
+                         "not survive — they were computed against a different "
+                         "remaining-word set")
+
+    def test_undo_resets_fallback_flag(self):
+        # Drive current_words to empty so the all_words fallback engages.
+        soln = Solution(["crane"], GUESSES, cache=ResponseCache(["crane"]))
+        pattern = calculate_response("slate", "heart")  # crane can't match this
+        soln.apply_guess("slate", pattern)
+        self.assertTrue(soln.fallback_active)
+
+        soln.undo_guess()
+        self.assertFalse(soln.fallback_active)
+
+
+class TestIncludeExcludeLetters(unittest.TestCase):
+
+    def setUp(self):
+        self.soln = make_solution()
+
+    def test_include_keeps_only_words_with_all_letters(self):
+        self.soln.include_letters("ea")
+        for w in self.soln.current_words:
+            self.assertIn("e", w)
+            self.assertIn("a", w)
+        self.assertTrue(self.soln.current_words)
+
+    def test_exclude_removes_words_with_any_letter(self):
+        self.soln.exclude_letters("cs")
+        for w in self.soln.current_words:
+            self.assertNotIn("c", w)
+            self.assertNotIn("s", w)
+        self.assertTrue(self.soln.current_words)
+
+    def test_include_then_exclude_compose(self):
+        self.soln.include_letters("a")
+        self.soln.exclude_letters("e")
+        for w in self.soln.current_words:
+            self.assertIn("a", w)
+            self.assertNotIn("e", w)
+
+    def test_filters_invalidate_score_cache(self):
+        self.soln.compute_scores(GUESSES, ScoringMethod.ENTROPY_GAIN)
+        self.assertTrue(self.soln.word_scores)
+        self.soln.include_letters("e")
+        self.assertEqual(self.soln.word_scores, {})
+
+
+class TestSolutionJoin(unittest.TestCase):
+
+    def _soln(self, words):
+        return Solution(ANSWERS, GUESSES, cache=ResponseCache(ANSWERS))
+
+    def test_returns_none_for_empty_list(self):
+        self.assertIsNone(Solution.join([]))
+
+    def test_combines_unsolved_boards_only(self):
+        s1 = self._soln(ANSWERS)
+        s2 = self._soln(ANSWERS)
+        s3 = self._soln(ANSWERS)
+
+        s1.current_words = ["crane", "slate", "trace"]
+        s2.current_words = ["slate", "stale", "tales"]
+        s3.current_words = ["heart"]  # solved — single candidate, excluded
+
+        merged = Solution.join([s1, s2, s3])
+        self.assertEqual(merged.current_words,
+                         sorted({"crane", "slate", "trace", "stale", "tales"}))
+        self.assertNotIn("heart", merged.current_words)
+
+    def test_join_carries_forward_first_solutions_caches(self):
+        s1 = self._soln(ANSWERS)
+        s2 = self._soln(ANSWERS)
+        s1.current_words = ["crane", "slate"]
+        s2.current_words = ["trace", "stale"]
+
+        merged = Solution.join([s1, s2])
+        self.assertIs(merged.all_answers, s1.all_answers)
+        self.assertIs(merged.all_words, s1.all_words)
+        self.assertIs(merged.cache, s1.cache)
+        self.assertIs(merged.score_cache, s1.score_cache)
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +754,79 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc.write_decomposition("crane", bytes([1] * len(ANSWERS)))
         sc.write_decomposition("crane", bytes([2] * len(ANSWERS)))
         self.assertEqual(sc.read_decomposition("crane"), bytes([2] * len(ANSWERS)))
+
+    def test_stats_reflects_row_counts_and_timestamp(self):
+        """stats() backs the cache-status display ('d' command) — verify it
+        reports the right counts per table, scoped to this universe, and a
+        timestamp only once a subgroup result has been written."""
+        sc = ScoreCache(self.db, ANSWERS)
+        empty_sp, empty_ws, empty_rd, empty_mtime = sc.stats()
+        self.assertEqual((empty_sp, empty_ws, empty_rd), (0, 0, 0))
+        self.assertIsNone(empty_mtime)
+
+        key1 = ScoreCache.encode_subset(["crane", "slate"])
+        key2 = ScoreCache.encode_subset(["heart", "earth"])
+        sc.write(key1, "full", "trace", 2.0)
+        sc.write(key2, "hard", "stale", 1.5)
+        sc.write_scores(key1, [("crane", 1.0), ("slate", 0.9)], "entropy_gain")
+        sc.write_decomposition("crane", bytes([0] * len(ANSWERS)))
+
+        sp_rows, ws_rows, rd_rows, mtime = sc.stats()
+        self.assertEqual(sp_rows, 2)
+        self.assertEqual(ws_rows, 2)
+        self.assertEqual(rd_rows, 1)
+        self.assertIsNotNone(mtime)
+
+    def test_stats_scoped_to_universe(self):
+        alt_answers = ["brain", "stove", "cloud"]
+        sc1 = ScoreCache(self.db, ANSWERS)
+        sc2 = ScoreCache(self.db, alt_answers)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        sc1.write(key, "full", "trace", 2.0)
+
+        sp1, _, _, _ = sc1.stats()
+        sp2, _, _, _ = sc2.stats()
+        self.assertEqual(sp1, 1)
+        self.assertEqual(sp2, 0,
+                         "stats() must not count another universe's rows")
+
+    def test_close_releases_connection(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        sc.close()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            sc.read(ScoreCache.encode_subset(["crane"]), "full")
+
+    def test_write_scores_rolls_back_on_failure(self):
+        """A failure mid-write must not leave a partial commit — the
+        transaction is rolled back and the exception re-raised."""
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write_scores(subset_key, [("crane", 1.0)], "entropy_gain")
+
+        class FailingExecuteMany:
+            """sqlite3.Connection.executemany is a read-only slot — wrap the
+            real connection to inject a failure into one call only."""
+            def __init__(self, real):
+                self._real = real
+
+            def executemany(self, *a, **k):
+                raise sqlite3.OperationalError("boom")
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_conn = sc._conn
+        sc._conn = FailingExecuteMany(real_conn)
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                sc.write_scores(subset_key, [("slate", 2.0)], "entropy_gain")
+        finally:
+            sc._conn = real_conn
+
+        # The pre-existing row must survive untouched, and no partial
+        # row from the failed write should have leaked in.
+        result = dict(sc.read_scores(subset_key, "entropy_gain"))
+        self.assertEqual(result, {"crane": 1.0})
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +1086,108 @@ class TestComputeLookaheadCache(unittest.TestCase):
                 expected_value = score_word(best_word, subgroup, method, cache=s.cache)
                 self.assertEqual(cached_value, expected_value)
 
+    def test_size_two_subgroups_use_shortcut_without_scanning(self):
+        """A response group of exactly 2 words always costs 1 extra guess
+        (whichever the candidate scan would pick, the loser is then a
+        singleton) — compute_lookahead special-cases it to skip the scan
+        entirely rather than search a 2-candidate space for an answer that's
+        always 1.0."""
+        s = make_solution()
+        first_ent = score_word("crane", s.current_words, ScoringMethod.ENTROPY_GAIN,
+                               cache=s.cache)
+        grouped = s.cache.group_words("crane", s.current_words)
+        pair_groups = [sg for sg in grouped.values() if len(sg) == 2]
+        self.assertTrue(pair_groups, "expected at least one size-2 group for this setup")
+
+        with mock.patch('wordle_engine.score_word') as mocked:
+            results = s.compute_lookahead([("crane", first_ent)])
+        # None of the size-2 groups should have triggered a candidate scan —
+        # only score_word calls from outside compute_lookahead (there are
+        # none here) would show up.
+        mocked.assert_not_called()
+        self.assertEqual(len(results), 1)
+
+    def test_full_mode_searches_provided_candidates(self):
+        """With second_step_words supplied, the best second guess is chosen
+        from that list — not restricted to the subgroup itself (hard mode) —
+        and persisted under the 'full' policy namespace, distinct from
+        hard mode's 'hard' so the two never collide in the cache."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            s = make_solution(db_path=tmp.name)
+            first_ent = score_word("piano", s.current_words, ScoringMethod.ENTROPY_GAIN,
+                                   cache=s.cache)
+            second_step_words = ["brain", "stove", "cloud", "crane", "train"]
+
+            results = s.compute_lookahead([("piano", first_ent)],
+                                           second_step_words=second_step_words)
+            self.assertEqual(len(results), 1)
+            word, step1, step2, combined = results[0]
+            self.assertEqual(word, "piano")
+            self.assertAlmostEqual(combined, step1 + step2)
+
+            grouped = s.cache.group_words("piano", s.current_words)
+            scanned = [sg for sg in grouped.values() if len(sg) > 2]
+            self.assertTrue(scanned, "expected at least one scannable subgroup")
+            for subgroup in scanned:
+                subset_key = ScoreCache.encode_subset(subgroup)
+                hit = s.score_cache.read(subset_key, "full")
+                self.assertIsNotNone(hit)
+                self.assertIn(hit[0], second_step_words,
+                              "full-mode winner must come from second_step_words")
+                self.assertIsNone(
+                    s.score_cache.read(subset_key, "hard"),
+                    "full-mode results must not collide with hard mode's namespace")
+        finally:
+            os.unlink(tmp.name)
+
+    def test_repeat_run_reuses_cached_subgroup_results(self):
+        """A subgroup whose result is already in the SQLite lookahead cache
+        must be reused verbatim on a later run — no rescanning. Uses
+        "piano" specifically because it produces subgroups bigger than 2
+        (unlike "crane" here, whose subgroups are all <= 2 and so take the
+        cnt==2 shortcut, never touching the cache-hit-reuse code path)."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            s = make_solution(db_path=tmp.name)
+            first_ent = score_word("piano", s.current_words, ScoringMethod.ENTROPY_GAIN,
+                                   cache=s.cache)
+            grouped = s.cache.group_words("piano", s.current_words)
+            self.assertTrue(any(len(sg) > 2 for sg in grouped.values()),
+                            "test setup needs a subgroup bigger than 2 to "
+                            "exercise the cache-hit-reuse path, not the shortcut")
+
+            first_results = s.compute_lookahead([("piano", first_ent)])
+
+            with mock.patch('wordle_engine.score_word',
+                            wraps=score_word) as wrapped:
+                second_results = s.compute_lookahead([("piano", first_ent)])
+            self.assertFalse(
+                wrapped.called,
+                "every scannable subgroup was already cached by the first "
+                "run — a second run must be pure cache reads")
+            self.assertEqual(first_results, second_results)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_progress_callback_invoked_during_candidate_scan(self):
+        """progress_callback (wired to the CLI's ProgressTracker) must fire
+        once per candidate scanned in phase 2 — that's what drives the
+        on-screen progress bar during a lookahead run."""
+        s = make_solution()  # no SQLite cache — every scannable subgroup is scanned fresh
+        first_ent = score_word("piano", s.current_words, ScoringMethod.ENTROPY_GAIN,
+                               cache=s.cache)
+        grouped = s.cache.group_words("piano", s.current_words)
+        scannable = [sg for sg in grouped.values() if len(sg) > 2]
+        self.assertTrue(scannable)
+        expected_calls = sum(len(sg) for sg in scannable)
+
+        calls = []
+        s.compute_lookahead([("piano", first_ent)],
+                            progress_callback=lambda: calls.append(1))
+        self.assertEqual(len(calls), expected_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +1257,27 @@ class TestMinExpectedGuesses(unittest.TestCase):
                                       deadline=already_past)
         self.assertIsNone(result)
 
+    def test_timeout_propagates_through_recursion(self):
+        """If the deadline expires partway through a deeper recursive call,
+        that call's `None` ("too big — move on") must propagate all the way
+        back to the root rather than be silently swallowed as if the guess
+        being explored were simply a bad one."""
+        words = ANSWERS[:4]
+        deadline = time.time() + 1000  # comfortably in the future for the root check
+
+        real_time = time.time
+        calls = [0]
+        def fake_time():
+            calls[0] += 1
+            # Root's own deadline check passes; every check from then on
+            # (i.e. every recursive call) finds the deadline already blown.
+            return real_time() if calls[0] <= 1 else deadline + 1
+
+        with mock.patch('wordle_engine.time.time', side_effect=fake_time):
+            result = min_expected_guesses(words, self.cache, None,
+                                           deadline=deadline, guesses=words)
+        self.assertIsNone(result)
+
     def test_result_is_at_least_one(self):
         result = min_expected_guesses(ANSWERS[:5], self.cache, None)
         self.assertIsNotNone(result)
@@ -788,6 +1304,14 @@ class TestMinExpectedGuesses(unittest.TestCase):
         hit = mc.read(ScoreCache.encode_subset(subset), ERD_ALL)
         self.assertIsNotNone(hit)
         self.assertAlmostEqual(hit[1], result, places=10)
+
+    def test_unrecognized_policy_raises(self):
+        """An unrecognized policy must raise rather than silently write
+        results into the wrong cache namespace — that would corrupt that
+        mode's cache for every future game (see docstring)."""
+        with self.assertRaises(ValueError):
+            min_expected_guesses(ANSWERS[:3], self.cache, None,
+                                 policy="not_a_real_policy")
 
 
 # ---------------------------------------------------------------------------
@@ -1251,6 +1775,16 @@ class TestMultistepStatsERDNonBlocking(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestMemoryScoreCacheScoping(unittest.TestCase):
+
+    def test_close_is_a_harmless_no_op(self):
+        """Unlike ScoreCache.close(), MemoryScoreCache holds no SQLite
+        connection — close() must be safe to call (ERDWarmer's run() calls
+        it unconditionally) and leave the cache usable afterwards."""
+        mc = MemoryScoreCache()
+        mc.set_scope('test-scope')
+        mc.write(b'key', 'full', 'crane', 1.5)
+        mc.close()
+        self.assertEqual(mc.read(b'key', 'full'), ('crane', 1.5))
 
     def test_fingerprint_is_order_independent(self):
         """Fingerprint depends only on the set of words, not their order."""
