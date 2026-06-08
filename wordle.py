@@ -2319,6 +2319,25 @@ class ERDWarmer(threading.Thread):
             if result is not None and not self._cancel.is_set():
                 print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
                       flush=True)
+            elif result is None and not self._cancel.is_set():
+                # The 30s root deadline expired: min_expected_guesses gave up
+                # and this thread is about to exit — it will NOT retry on its
+                # own.  Without this message, the prompt would sit there with
+                # a thread that has already died, silently waiting on the
+                # user, while the user silently waits on it.  Say so loudly,
+                # asynchronously, the same way [ERD ready] announces success —
+                # and report whatever "best so far" survived the timeout, now
+                # that the quality-ordered scan makes it a meaningful signal
+                # rather than an alphabetical artifact.
+                if self.root_best is not None:
+                    bw, bs = self.root_best
+                    best_note = f'best so far {bw.upper()} {bs:.3f}'
+                else:
+                    best_note = 'no candidate finished scoring'
+                print(f'\n  [ERD: root scan timed out after 30s '
+                      f'({self.root_done}/{self.root_total} scanned, {best_note}) '
+                      f'— press enter to start a fresh attempt]',
+                      flush=True)
 
 
 def main():
