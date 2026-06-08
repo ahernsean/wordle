@@ -750,6 +750,9 @@ def _input_wordlist(gs, soln, universe, compliance):
     if compliance is ComplianceFilter.UNFILTERED:
         return base
     if universe is GuessUniverse.ALL_ANSWERS:
+        # Not constraint_compliant_words(base): current_words is already
+        # clue-compliant *and* narrowed by any manual include/exclude-letter
+        # filters, which constraint_compliant_words doesn't apply.
         return soln.current_words
     return soln.constraint_compliant_words(base)
 
@@ -787,6 +790,26 @@ def _resolve_candidate_selection(gs):
         return None, None, True
     print_error("Invalid choice.")
     return None
+
+
+def _resolve_candidate_wordlist(gs, soln):
+    """Resolve this invocation's candidate word list, or None to abort.
+
+    Wraps _resolve_candidate_selection: turns its (universe, compliance,
+    solved_only) result into the actual word list and folds in the "No
+    words in input set!" guard — the exact sequence both cmd_solve and
+    cmd_grid need and nothing else, so they can share it verbatim.
+    """
+    selection = _resolve_candidate_selection(gs)
+    if selection is None:
+        return None
+    universe, compliance, solved_only = selection
+    wordlist = (_solved_words(gs) if solved_only
+                else _input_wordlist(gs, soln, universe, compliance))
+    if not wordlist:
+        print_error("No words in input set!")
+        return None
+    return wordlist
 
 
 class _ERDModeConfig:
@@ -987,13 +1010,8 @@ def cmd_solve(gs):
         print_error("Invalid choice.")
         return
 
-    selection = _resolve_candidate_selection(gs)
-    if selection is None:
-        return
-    universe, compliance, solved_only = selection
-    wordlist = _solved_words(gs) if solved_only else _input_wordlist(gs, soln, universe, compliance)
-    if not wordlist:
-        print_error("No words in input set!")
+    wordlist = _resolve_candidate_wordlist(gs, soln)
+    if wordlist is None:
         return
 
     # Fast path: already computed this session
@@ -1066,13 +1084,8 @@ def cmd_grid(gs):
 
     set_display_context(soln)
 
-    selection = _resolve_candidate_selection(gs)
-    if selection is None:
-        return
-    universe, compliance, solved_only = selection
-    wordlist = _solved_words(gs) if solved_only else _input_wordlist(gs, soln, universe, compliance)
-    if not wordlist:
-        print_error("No words in input set!")
+    wordlist = _resolve_candidate_wordlist(gs, soln)
+    if wordlist is None:
         return
 
     methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE]
@@ -1641,10 +1654,12 @@ def cmd_test(gs, inline=''):
         gs.constrained_erd_cache.set_scope(
             MemoryScoreCache.fingerprint_vocabulary(eligible))
         erd_cache = gs.constrained_erd_cache
-    elif gs.universe is GuessUniverse.ALL_ANSWERS:
+    elif _is_possible_answers_mode(gs):
         step2_pool = None
         constraint_compliant = False
-    else:  # all words, unfiltered — cap at 200 top-entropy; searching all 12k is ~65x slower
+    else:  # unfiltered (all words, or answer-shaped words) — cap at 200
+           # top-entropy; searching all 12k is ~65x slower, and even the
+           # ~3,200-word answer-shaped vocabulary benefits from the cap
         constraint_compliant = False
         if (soln.scores_updated
                 and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
