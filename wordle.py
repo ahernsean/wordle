@@ -25,7 +25,7 @@ from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle_engine import (
     Solution, ScoringMethod, GuessUniverse, ComplianceFilter, ResponseCache,
     load_word_list, calculate_response,
-    calculate_group_counts, score_groups,
+    calculate_group_counts, score_groups, score_groups_multi,
     decode_response, max_entropy,
     answer_to_restriction,
     min_expected_guesses,
@@ -891,21 +891,33 @@ def _erd_cache_and_policy(gs, soln):
     return cfg.cache(gs, soln), cfg.policy
 
 
-def _erd_root_progress_tag(gs):
+def _erd_root_progress_tag(warmer, soln):
     """Status-line fragment surfacing the warmer's root-scan progress and
     its current best candidate, so the user sees live signal while waiting
     for the root ERD instead of silence.
 
-    Returns '' when the root scan hasn't started yet (still collecting or
-    caching subgroups — nothing meaningful to show).
+    Reads directly off the live warmer rather than a snapshot in `gs`:
+    a snapshot taken before the current command ran (e.g. a guess that
+    just narrowed current_words) would describe a now-superseded branch —
+    showing "scanning 12/87" from a 50-word position right under "8 words
+    remaining" once the guess landed. The word-set check below is what
+    catches that: if the warmer's snapshot doesn't match the position
+    we're about to display, its progress numbers aren't about this
+    position, so there's nothing honest to show yet.
+
+    Returns '' when there's no warmer for this exact position, or its
+    root scan hasn't started yet (still collecting/caching subgroups —
+    nothing meaningful to show).
     """
-    done, total, best = gs.last_erd_root_progress
-    if total == 0:
+    if warmer is None or set(warmer._words) != set(soln.current_words):
         return ''
-    if best is not None:
-        bw, bs = best
-        return f'  [ERD: scanning {done}/{total} — best so far {bw.upper()} {bs:.3f}]'
-    return f'  [ERD: scanning {done}/{total}]'
+    if warmer.root_total == 0:
+        return ''
+    if warmer.root_best is not None:
+        bw, bs = warmer.root_best
+        return (f'  [ERD: scanning {warmer.root_done}/{warmer.root_total} '
+                f'— best so far {bw.upper()} {bs:.3f}]')
+    return f'  [ERD: scanning {warmer.root_done}/{warmer.root_total}]'
 
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
@@ -2059,8 +2071,13 @@ COMMANDS = {
 }
 
 
-def print_status(gs):
-    """Print current game status."""
+def print_status(gs, warmer=None):
+    """Print current game status.
+
+    warmer: the live ERDWarmer for the current position, if any — passed
+            through so the ERD progress tag can be validated against the
+            position actually being displayed (see _erd_root_progress_tag).
+    """
     refresh_display_width()
     print(f'\n{"=" * get_display_width()}')
     if gs.single:
@@ -2087,7 +2104,7 @@ def print_status(gs):
                     if hit is not None:
                         erd_tag = f'  [ERD: {hit[1]:.3f}]'
                     else:
-                        erd_tag = _erd_root_progress_tag(gs)
+                        erd_tag = _erd_root_progress_tag(warmer, soln)
             print(f"{n:,} words remaining{erd_tag}")
     else:
         n = len(gs.solutions)
@@ -2255,7 +2272,6 @@ class ERDWarmer(threading.Thread):
         this order, "best so far" early in the scan is a real signal, not
         a coin flip, and the true winner tends to surface early too.
         """
-        from wordle_engine import score_groups_multi, ScoringMethod
         methods = [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN]
         scored = []
         for word in self._effective_guesses:
@@ -2419,7 +2435,7 @@ def main():
                                          _warmer.root_best)
 
         if not cmd:
-            print_status(gs)
+            print_status(gs, _warmer)
             continue
         handler = COMMANDS.get(cmd[0])
         if handler:
@@ -2434,7 +2450,7 @@ def main():
                 raise
         else:
             print_error(f"Unknown: {cmd}")
-        print_status(gs)
+        print_status(gs, _warmer)
 
 
 if __name__ == '__main__':
