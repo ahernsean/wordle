@@ -708,7 +708,6 @@ class Solution:
 
     def compute_lookahead(self, top_words,
                           second_step_words=None,
-                          total_callback=None,
                           progress_callback=None):
         """
         Two-step entropy lookahead on (word, first_entropy) pairs.
@@ -723,7 +722,6 @@ class Solution:
         Completed subgroup results are cached in the SQLite lookahead
         cache and reused across sessions.
 
-        total_callback(n): called once with total work units.
         progress_callback(): called per work unit.
 
         Returns sorted list of (word, step1, step2, combined)
@@ -736,34 +734,11 @@ class Solution:
         lc = self.score_cache
         policy = 'full' if full_mode else 'hard'
 
-        # Phase 1: compute group partitions, count work units
+        # Phase 1: compute group partitions
         word_data = []
-        total_work = 0
         for word, first_ent in top_words:
-            if cache:
-                grouped = cache.group_words(word, self.current_words)
-            else:
-                grouped = defaultdict(list)
-                for answer in self.current_words:
-                    pat = _encode_response(calculate_response(word, answer))
-                    grouped[pat].append(answer)
-
-            work = 0
-            for subgroup in grouped.values():
-                cnt = len(subgroup)
-                if cnt <= 2:
-                    continue
-                if lc:
-                    subset_key = ScoreCache.encode_subset(subgroup)
-                    if lc.read(subset_key, policy) is not None:
-                        continue  # cache hit — no scan needed
-                work += (len(second_step_words)
-                         if full_mode else len(subgroup))
-            total_work += work
+            grouped = cache.group_words(word, self.current_words)
             word_data.append((word, first_ent, grouped))
-
-        if total_callback:
-            total_callback(total_work)
 
         # Phase 2: second-step evaluation
         results = []
@@ -818,7 +793,7 @@ class Solution:
 
 
 def min_expected_guesses(remaining, cache, score_cache,
-                          deadline=None, progress_fn=None, guesses=None,
+                          deadline=None, guesses=None,
                           policy=None):
     """
     Exact expected guesses to solve remaining words, playing optimally.
@@ -859,8 +834,6 @@ def min_expected_guesses(remaining, cache, score_cache,
 
     if deadline is not None and time.time() > deadline:
         return None
-    if progress_fn is not None:
-        progress_fn()
 
     best_erd = float('inf')
     best_word = None
@@ -882,8 +855,6 @@ def min_expected_guesses(remaining, cache, score_cache,
         skip_guess = False
         for subgroup in groups.values():
             k = len(subgroup)
-            if k == 0:
-                continue
             # When guess is the answer, the all-green response produces a
             # singleton {guess}. We've already solved it with this guess —
             # 0 additional guesses needed for that branch.
@@ -896,7 +867,7 @@ def min_expected_guesses(remaining, cache, score_cache,
                 skip_guess = True
                 break
             sub_erd = min_expected_guesses(
-                subgroup, cache, score_cache, deadline, progress_fn, guesses,
+                subgroup, cache, score_cache, deadline, guesses,
                 policy=policy,
             )
             if sub_erd is None:
