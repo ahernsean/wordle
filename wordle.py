@@ -9,6 +9,7 @@ for a streamlined experience.
 import os
 import sys
 import shutil
+import sqlite3
 import threading
 import time
 from collections import defaultdict
@@ -39,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b80"
+BUILD = "b81"
 
 
 # ---------------------------------------------------------------------------
@@ -2267,13 +2268,20 @@ class ERDWarmer(threading.Thread):
             self.root_done = 0
             self.root_total = 0
             self.root_best = None
-            result = min_expected_guesses(
-                self._words, self._rcache, score_cache,
-                guesses=ranked_guesses,
-                policy=policy,
-                progress_callback=self._on_root_progress,
-                cancel_check=_cancel_or_paused,
-            )
+            try:
+                result = min_expected_guesses(
+                    self._words, self._rcache, score_cache,
+                    guesses=ranked_guesses,
+                    policy=policy,
+                    progress_callback=self._on_root_progress,
+                    cancel_check=_cancel_or_paused,
+                )
+            except sqlite3.OperationalError:
+                # SQLite I/O interrupted — most likely iOS suspended the app
+                # while the warmer was running in the background.  Exit the
+                # thread cleanly; partial cache writes from before the error
+                # are already durable via WAL.
+                return
             if result is not None:
                 if not self._cancel.is_set():
                     print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
