@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b84"
+BUILD = "b85"
 
 
 # ---------------------------------------------------------------------------
@@ -2156,13 +2156,16 @@ class ERDWarmer(threading.Thread):
         self._all_answers = all_answers
         self._effective_guesses = effective_guesses
         self._cache_path = score_cache_path
-        # Snapshot the caller's in-memory decomposition cache.  The warmer
-        # must open its own SQLite connection (connections aren't thread-safe),
-        # so it starts cold; pre-seeding from the caller's already-warm dict
-        # avoids re-reading every decomposition from SQLite.  The inner dicts
-        # (guess → {answer: pattern_int}) are never mutated after creation, so
-        # sharing them read-only across threads is safe.
-        self._rcache_seed = dict(response_cache._cache)
+        # Keep a live reference to the main thread's decomposition dict.
+        # The warmer must open its own SQLite connection (connections aren't
+        # thread-safe), so it can't share the caller's ResponseCache object.
+        # But the _cache dict itself is pure Python and append-only: the main
+        # thread only ever adds entries, never removes or mutates them, so
+        # reading it from the warmer thread is safe under CPython's GIL.
+        # _ranked_root_guesses checks this dict first; a hit avoids both
+        # SQLite I/O and re-computation, even for entries added after the
+        # warmer was constructed (e.g. while cmd_solve was running).
+        self._main_rcache_dict = response_cache._cache
         self._rcache = None   # set in run() after opening a thread-private connection
         self._policy = policy
         self._persist = persist
@@ -2201,7 +2204,6 @@ class ERDWarmer(threading.Thread):
         # in-memory costs nothing noticeable).
         self._rcache = ResponseCache(self._all_answers,
                                      score_cache if self._persist else None)
-        self._rcache._cache.update(self._rcache_seed)
         try:
             self._warm(score_cache)
         finally:
@@ -2231,7 +2233,18 @@ class ERDWarmer(threading.Thread):
                 self._paused.wait()      # block while main thread is busy
             if self._cancel.is_set():
                 return self._effective_guesses
-            counts = self._rcache.group_counts(word, self._words)
+            mapping = self._main_rcache_dict.get(word)
+            if mapping is not None:
+                # Use the main thread's already-computed pattern mapping.
+                # Populated by cmd_solve; reading it here is safe because
+                # inner dicts are never mutated after creation (GIL-safe).
+                counts = {}
+                for ans in self._words:
+                    pat = mapping.get(ans)
+                    if pat is not None:
+                        counts[pat] = counts.get(pat, 0) + 1
+            else:
+                counts = calculate_group_counts(word, self._words)
             scores = score_groups_multi(counts, methods)
             scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
                            -scores[ScoringMethod.ENTROPY_GAIN],
@@ -2249,34 +2262,34 @@ class ERDWarmer(threading.Thread):
     def _warm(self, score_cache):
         policy = self._policy
         root_key = ScoreCache.encode_subset(self._words)
-        if score_cache.read(root_key, policy) is not None:
-            return  # already done from a prior session
+        try:
+            if score_cache.read(root_key, policy) is not None:
+                return  # already done from a prior session
 
-        ranked_guesses = self._ranked_root_guesses()
-        if self._cancel.is_set():
-            return
+            ranked_guesses = self._ranked_root_guesses()
+            if self._cancel.is_set():
+                return
 
-        # Run the root scan directly.  Uncached subgroups are computed
-        # on-the-fly and written to the cache as a side effect (via
-        # cache_all_scores), so the cache fills progressively during the
-        # scan.  No pre-caching phase needed: the root scan is its own
-        # bottom-up fill, and progress is visible immediately.
-        #
-        # The scan may be paused mid-run when the main thread starts a
-        # foreground operation.  cancel_check returns True on both true
-        # cancellation and on pause, causing min_expected_guesses to abort
-        # and return None.  After a pause, we wait for resume and retry
-        # from the top — partial results already written to score_cache
-        # survive the abort, so the retry picks up from cache rather than
-        # starting over.
-        def _cancel_or_paused():
-            return self._cancel.is_set() or not self._paused.is_set()
+            # Run the root scan directly.  Uncached subgroups are computed
+            # on-the-fly and written to the cache as a side effect (via
+            # cache_all_scores), so the cache fills progressively during the
+            # scan.  No pre-caching phase needed: the root scan is its own
+            # bottom-up fill, and progress is visible immediately.
+            #
+            # The scan may be paused mid-run when the main thread starts a
+            # foreground operation.  cancel_check returns True on both true
+            # cancellation and on pause, causing min_expected_guesses to abort
+            # and return None.  After a pause, we wait for resume and retry
+            # from the top — partial results already written to score_cache
+            # survive the abort, so the retry picks up from cache rather than
+            # starting over.
+            def _cancel_or_paused():
+                return self._cancel.is_set() or not self._paused.is_set()
 
-        while True:
-            self.root_done = 0
-            self.root_total = 0
-            self.root_best = None
-            try:
+            while True:
+                self.root_done = 0
+                self.root_total = 0
+                self.root_best = None
                 result = min_expected_guesses(
                     self._words, self._rcache, score_cache,
                     guesses=ranked_guesses,
@@ -2284,22 +2297,21 @@ class ERDWarmer(threading.Thread):
                     progress_callback=self._on_root_progress,
                     cancel_check=_cancel_or_paused,
                 )
-            except sqlite3.OperationalError as e:
-                print(f'\n  [ERD warmer: sqlite3.OperationalError: {e} '
-                      f'(done={self.root_done}/{self.root_total})]',
-                      flush=True)
-                return
-            if result is not None:
-                if not self._cancel.is_set():
-                    print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
-                          flush=True)
-                return
-            if self._cancel.is_set():
-                return
-            # Paused — wait for the main thread to finish its operation.
-            self._paused.wait()
-            if self._cancel.is_set():
-                return
+                if result is not None:
+                    if not self._cancel.is_set():
+                        print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
+                              flush=True)
+                    return
+                if self._cancel.is_set():
+                    return
+                # Paused — wait for the main thread to finish its operation.
+                self._paused.wait()
+                if self._cancel.is_set():
+                    return
+        except sqlite3.OperationalError as e:
+            print(f'\n  [ERD warmer: sqlite3.OperationalError: {e} '
+                  f'(done={self.root_done}/{self.root_total})]',
+                  flush=True)
 
 
 def main():

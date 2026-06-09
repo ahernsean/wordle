@@ -1892,7 +1892,9 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         class FakeResponseCache:
             answer_words = words
-            _cache = {}
+
+            def __init__(self):
+                self._cache = {}
 
             @staticmethod
             def group_words(word, current_words):
@@ -1924,6 +1926,120 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         self.assertFalse(
             any('ERD ready' in str(a) for a in printed),
             "a superseded warmer must not print a stale [ERD ready] announcement")
+
+    def test_ranking_uses_live_main_cache_after_solve(self):
+        """After cmd_solve populates the main thread's ResponseCache, the
+        warmer should use those mappings directly in _ranked_root_guesses
+        instead of recomputing or hitting SQLite."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
+        main_cache = FakeResponseCache()
+        # Simulate what cmd_solve does: populate _cache with pattern mappings.
+        for word in words:
+            main_cache._cache[word] = {w: i % 3 for i, w in enumerate(words)}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        warmer = ERDWarmer(words, words, words, None, main_cache,
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
+
+        # run() must be called first to set self._rcache
+        warmer._rcache = FakeResponseCache()
+
+        # Count how many times calculate_group_counts is called as fallback.
+        calc_calls = []
+        import wordle as wordle_mod
+        original = wordle_mod.calculate_group_counts
+        def spy_calc(word, subset):
+            calc_calls.append(word)
+            return original(word, subset)
+
+        with mock.patch('wordle.calculate_group_counts', side_effect=spy_calc), \
+             mock.patch('wordle.min_expected_guesses', return_value=1.5), \
+             mock.patch('builtins.print'):
+            warmer._warm(score_cache)
+
+        # All words were in _main_rcache_dict, so calculate_group_counts
+        # should not have been called for any of them during ranking.
+        self.assertEqual(calc_calls, [],
+            "ranking should use live main-thread cache, not recompute patterns")
+
+    def test_operational_error_in_pre_loop_read_is_caught(self):
+        """sqlite3.OperationalError from score_cache.read() at the top of
+        _warm must be caught and printed rather than crashing the thread."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+        class ErrorScoreCache(MemoryScoreCache):
+            def read(self, subset_key, policy):
+                raise sqlite3.OperationalError("disk I/O error")
+
+        score_cache = ErrorScoreCache()
+        score_cache.set_scope('test-scope')
+        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
+        warmer._rcache = FakeResponseCache()
+
+        printed = []
+        with mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
+            warmer._warm(score_cache)  # must not raise
+
+        self.assertTrue(
+            any('OperationalError' in str(a) for a in printed),
+            "pre-loop OperationalError must be reported rather than silently dropped")
+
+    def test_run_sets_rcache_from_thread_private_connection(self):
+        """run() must replace self._rcache with a thread-private ResponseCache
+        before calling _warm, so _ranked_root_guesses and min_expected_guesses
+        never use the main thread's SQLite connection."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
+
+        self.assertIsNone(warmer._rcache,
+            "_rcache should be None before run() — it is set inside run()")
+
+        rcaches_seen = []
+        original_warm = warmer._warm
+        def spy_warm(sc):
+            rcaches_seen.append(warmer._rcache)
+            # Don't actually run the scan.
+        warmer._warm = spy_warm
+
+        warmer.run()
+        self.assertEqual(len(rcaches_seen), 1)
+        self.assertIsNotNone(rcaches_seen[0],
+            "run() must set _rcache before calling _warm")
+        self.assertIsNot(rcaches_seen[0], warmer._main_rcache_dict,
+            "_rcache must be a new thread-private ResponseCache, not the main dict")
 
 
 # ---------------------------------------------------------------------------
