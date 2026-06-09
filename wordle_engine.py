@@ -878,7 +878,10 @@ def min_expected_guesses(remaining, cache, score_cache,
         cost = 1.0
         aborted = False  # subscan returned None — deadline or cancel_check fired
         skip_guess = False
-        for subgroup in groups.values():
+        # Largest subgroups first: they carry the highest weight (k/n) and
+        # push `cost` up fastest, so the pruning check below fires after as
+        # few subgroup evaluations as possible.
+        for subgroup in sorted(groups.values(), key=len, reverse=True):
             k = len(subgroup)
             # When guess is the answer, the all-green response produces a
             # singleton {guess}. We've already solved it with this guess —
@@ -899,6 +902,12 @@ def min_expected_guesses(remaining, cache, score_cache,
                 aborted = True
                 break
             cost += (k / n) * sub_erd
+            # Branch-and-bound: cost is non-decreasing (every remaining
+            # subgroup contributes a positive amount), so if it already
+            # meets or beats the best known result, no later subgroup can
+            # make this guess competitive.
+            if cost >= best_erd:
+                break
 
         if skip_guess:
             continue
