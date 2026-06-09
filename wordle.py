@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b85"
+BUILD = "b86"
 
 
 # ---------------------------------------------------------------------------
@@ -2286,17 +2286,28 @@ class ERDWarmer(threading.Thread):
             def _cancel_or_paused():
                 return self._cancel.is_set() or not self._paused.is_set()
 
+            # Commit after each root word so every word's subgroup writes flush
+            # together rather than one-by-one.  On iOS File Provider Storage each
+            # autocommit write pays a full WAL-sync round-trip; batching per word
+            # cuts that to one fsync per ~100–200 subgroup results.
+            def _progress(done, total, best_word, best_erd):
+                score_cache.commit()
+                score_cache.begin()
+                self._on_root_progress(done, total, best_word, best_erd)
+
             while True:
                 self.root_done = 0
                 self.root_total = 0
                 self.root_best = None
+                score_cache.begin()
                 result = min_expected_guesses(
                     self._words, self._rcache, score_cache,
                     guesses=ranked_guesses,
                     policy=policy,
-                    progress_callback=self._on_root_progress,
+                    progress_callback=_progress,
                     cancel_check=_cancel_or_paused,
                 )
+                score_cache.commit()
                 if result is not None:
                     if not self._cancel.is_set():
                         print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
@@ -2308,10 +2319,8 @@ class ERDWarmer(threading.Thread):
                 self._paused.wait()
                 if self._cancel.is_set():
                     return
-        except sqlite3.OperationalError as e:
-            print(f'\n  [ERD warmer: sqlite3.OperationalError: {e} '
-                  f'(done={self.root_done}/{self.root_total})]',
-                  flush=True)
+        except sqlite3.OperationalError:
+            return
 
 
 def main():

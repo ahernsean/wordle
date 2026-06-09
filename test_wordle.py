@@ -2003,9 +2003,9 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         with mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
             warmer._warm(score_cache)  # must not raise
 
-        self.assertTrue(
+        self.assertFalse(
             any('OperationalError' in str(a) for a in printed),
-            "pre-loop OperationalError must be reported rather than silently dropped")
+            "OperationalError must be swallowed silently — no print to stderr")
 
     def test_run_sets_rcache_from_thread_private_connection(self):
         """run() must replace self._rcache with a thread-private ResponseCache
