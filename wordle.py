@@ -2277,10 +2277,10 @@ class ERDWarmer(threading.Thread):
                     cancel_check=_cancel_or_paused,
                 )
             except sqlite3.OperationalError:
-                # SQLite I/O interrupted — most likely iOS suspended the app
-                # while the warmer was running in the background.  Exit the
-                # thread cleanly; partial cache writes from before the error
-                # are already durable via WAL.
+                # SQLite I/O interrupted — iOS locked the device and revoked
+                # access to the encrypted database file (NSFileProtection).
+                # Exit the thread cleanly; partial cache writes before the
+                # error are already durable via WAL.
                 return
             if result is not None:
                 if not self._cancel.is_set():
