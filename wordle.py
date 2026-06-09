@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b76"
+BUILD = "b77"
 
 
 # ---------------------------------------------------------------------------
@@ -2206,8 +2206,7 @@ class ERDWarmer(threading.Thread):
         for word in self._effective_guesses:
             if self._cancel.is_set():
                 return self._effective_guesses
-            groups = self._rcache.group_words(word, self._words)
-            counts = {pattern: len(group) for pattern, group in groups.items()}
+            counts = self._rcache.group_counts(word, self._words)
             scores = score_groups_multi(counts, methods)
             scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
                            -scores[ScoringMethod.ENTROPY_GAIN],

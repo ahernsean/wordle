@@ -1897,6 +1897,10 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
             def group_words(word, current_words):
                 return {}
 
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
 
