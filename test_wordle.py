@@ -1878,103 +1878,10 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
 
 
 class TestERDWarmerKeepsWorking(unittest.TestCase):
-    """The background ERDWarmer must not artificially curtail its own work.
-
-    The user's expectation: a 30-second (or 5-second) deadline on a single
-    subgroup computation is a "this packet is too big, move on" signal — not
-    a reason to stop the thread or to skip work outright. Guessing a word and
-    sitting at the prompt for minutes should let the warmer continually build
-    out the ERD cache for that branch: every reachable subgroup, regardless
-    of size, smallest (cheapest, most reusable) first.
-    """
 
     @staticmethod
     def _word(i):
         return f"w{i:04d}"  # 5 ASCII chars, satisfies encode_subset's slicing
-
-    def test_large_subgroups_are_not_skipped(self):
-        words = [self._word(i) for i in range(120)]
-        small_group = words[:3]
-        large_group = words[3:80]  # 77 words — larger than the historical 50-word cap
-
-        class FakeResponseCache:
-            answer_words = words
-
-            @staticmethod
-            def group_words(word, current_words):
-                return {'aaaaa': small_group, 'bbbbb': large_group}
-
-        score_cache = MemoryScoreCache()
-        score_cache.set_scope('test-scope')
-
-        def fake_min_expected_guesses(remaining, cache, sc, deadline=None,
-                                       guesses=None, policy=None,
-                                       progress_callback=None,
-                                       cancel_check=None):
-            key = ScoreCache.encode_subset(remaining)
-            sc.write(key, policy, remaining[0], float(len(remaining)))
-            return float(len(remaining))
-
-        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
-                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
-
-        with mock.patch('wordle.min_expected_guesses',
-                        side_effect=fake_min_expected_guesses):
-            warmer._warm(score_cache)
-
-        large_key = ScoreCache.encode_subset(large_group)
-        self.assertIsNotNone(
-            score_cache.read(large_key, ERD_ALL),
-            "warmer skipped a subgroup of 77 words — it must keep working on "
-            "every reachable subgroup, not stop at an arbitrary size cap")
-
-    def test_timed_out_subgroup_is_retried_with_larger_budget(self):
-        """A subgroup that exceeds its deadline ("too big — move on") is not
-        abandoned forever: the warmer keeps working and circles back to it
-        with a larger per-item budget on a later pass."""
-        words = [self._word(i) for i in range(40)]
-        group_a = words[:5]
-        group_b = words[5:12]
-
-        class FakeResponseCache:
-            answer_words = words
-
-            @staticmethod
-            def group_words(word, current_words):
-                return {'aaaaa': group_a, 'bbbbb': group_b}
-
-        score_cache = MemoryScoreCache()
-        score_cache.set_scope('test-scope')
-
-        calls = []
-
-        def flaky_min_expected_guesses(remaining, cache, sc, deadline=None,
-                                        guesses=None, policy=None,
-                                        progress_callback=None,
-                                        cancel_check=None):
-            calls.append(len(remaining))
-            budget = (deadline - time.time()) if deadline is not None else float('inf')
-            key = ScoreCache.encode_subset(remaining)
-            if len(remaining) == len(group_b) and budget < 10:
-                return None  # too big for a short budget this round — move on
-            sc.write(key, policy, remaining[0], float(len(remaining)))
-            return float(len(remaining))
-
-        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
-                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
-
-        with mock.patch('wordle.min_expected_guesses',
-                        side_effect=flaky_min_expected_guesses):
-            warmer._warm(score_cache)
-
-        b_key = ScoreCache.encode_subset(group_b)
-        self.assertIsNotNone(
-            score_cache.read(b_key, ERD_ALL),
-            "a subgroup that timed out on an early pass must be cached once "
-            "the warmer revisits it with a larger budget")
-        self.assertGreater(
-            calls.count(len(group_b)), 1,
-            "the warmer must retry a timed-out subgroup rather than abandon it")
 
     def test_no_ready_message_when_superseded_mid_root_computation(self):
         """If stop() fires while the (slow, uninterruptible) root computation
@@ -2011,47 +1918,6 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         self.assertFalse(
             any('ERD ready' in str(a) for a in printed),
             "a superseded warmer must not print a stale [ERD ready] announcement")
-
-    def test_smaller_subgroups_are_attempted_before_larger_ones(self):
-        """Smallest-first ordering: cheap, widely-reused subgroups get cached
-        first, so their results are available when larger subgroups recurse
-        into them — exactly the "lower leaves cached → fast ERD" principle."""
-        words = [self._word(i) for i in range(120)]
-        small_group = words[:3]
-        large_group = words[3:80]
-
-        class FakeResponseCache:
-            answer_words = words
-
-            @staticmethod
-            def group_words(word, current_words):
-                return {'aaaaa': small_group, 'bbbbb': large_group}
-
-        score_cache = MemoryScoreCache()
-        score_cache.set_scope('test-scope')
-
-        order = []
-
-        def recording_min_expected_guesses(remaining, cache, sc, deadline=None,
-                                             guesses=None,
-                                             policy=None,
-                                             progress_callback=None,
-                                             cancel_check=None):
-            order.append(len(remaining))
-            key = ScoreCache.encode_subset(remaining)
-            sc.write(key, policy, remaining[0], float(len(remaining)))
-            return float(len(remaining))
-
-        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
-                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
-
-        with mock.patch('wordle.min_expected_guesses',
-                        side_effect=recording_min_expected_guesses):
-            warmer._warm(score_cache)
-
-        self.assertEqual(order, sorted(order),
-                         "subgroups must be processed smallest-first so that "
-                         "larger ones can reuse already-cached sub-results")
 
 
 # ---------------------------------------------------------------------------

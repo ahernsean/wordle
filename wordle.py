@@ -576,7 +576,6 @@ class GameState:
         self.columns = 1
         self.universe = GuessUniverse.ALL_WORDS
         self.compliance = ComplianceFilter.UNFILTERED
-        self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
         self.last_erd_root_progress = (0, 0, None)  # (done, total, (best_word, best_erd))
         # constrained_erd_cache is intentionally NOT reset here — it is
         # long-lived and self-scoping (see __init__ and MemoryScoreCache).
@@ -892,7 +891,7 @@ def _erd_cache_and_policy(gs, soln):
 
 
 def _erd_root_progress_tag(warmer, soln):
-    """Status-line fragment covering all ERD warmup phases for this position.
+    """Status-line fragment for ERD warmup progress on the current position.
 
     Reads directly off the live warmer rather than a snapshot in `gs`:
     a snapshot taken before the current command ran (e.g. a guess that
@@ -902,21 +901,13 @@ def _erd_root_progress_tag(warmer, soln):
     this position, so there's nothing honest to show yet.
 
     Phases in order:
-      collecting  subgroups_total == 0 (brief — no tag, not worth showing)
-      caching     0 < subgroups_done < subgroups_total
-      ordering    subgroups done, root_total == 0 (_ranked_root_guesses running)
+      ordering    root_total == 0 (_ranked_root_guesses running)
       scanning    root_total > 0
     """
     if warmer is None or set(warmer._words) != set(soln.current_words):
         return ''
-    sub_done = warmer.subgroups_done
-    sub_total = warmer.subgroups_total
-    if sub_total > 0 and sub_done < sub_total:
-        return f'  [ERD: caching {sub_done}/{sub_total} subgroups]'
     if warmer.root_total == 0:
-        if sub_total > 0:
-            return '  [ERD: ordering candidates...]'
-        return ''
+        return '  [ERD: ordering candidates...]'
     if warmer.root_best is not None:
         bw, bs = warmer.root_best
         return (f'  [ERD: scanning {warmer.root_done}/{warmer.root_total} '
@@ -1008,14 +999,9 @@ def cmd_solve(gs):
     if erd_root is not None:
         print(f"  {erd_idx}. ERD: expected remaining depth (v) [{erd_root[1]:.3f}]")
     else:
-        done, total = gs.last_erd_progress
         root_done, root_total, root_best = gs.last_erd_root_progress
-        if total == 0:
-            prog = 'not ready'
-        elif done < total:
-            prog = f'{done}/{total} subgroups'
-        elif root_total == 0:
-            prog = 'finishing root...'
+        if root_total == 0:
+            prog = 'ordering candidates...'
         elif root_best is not None:
             bw, bs = root_best
             prog = f'scanning root {root_done}/{root_total} — best so far {bw.upper()} {bs:.3f}'
@@ -2172,8 +2158,6 @@ class ERDWarmer(threading.Thread):
         self._persist = persist
         self._seed_mem_cache = seed_mem_cache
         self._cancel = threading.Event()
-        self.subgroups_done = 0   # incremented after each subgroup is cached
-        self.subgroups_total = 0  # set after collection; 0 means still collecting
         self.root_done = 0        # candidates fully scored so far in the root scan
         self.root_total = 0       # size of the root scan; 0 means not started yet
         self.root_best = None     # (word, erd) — best candidate found so far
@@ -2202,67 +2186,6 @@ class ERDWarmer(threading.Thread):
         finally:
             if self._persist:
                 score_cache.close()
-
-    def _collect_subgroups(self):
-        """Every unique subgroup any candidate word can produce, smallest first.
-
-        No size cap: the goal is to fill out the ERD cache for this branch as
-        completely as time allows.  Smallest-first ordering means the cheap,
-        widely-shared subgroups land in the cache first, so by the time the
-        warmer reaches the large ones their sub-results are already cached —
-        a "too big" subgroup on one pass can become a quick cache-assisted
-        computation on the next.
-        """
-        seen = set()
-        work = []  # (size, word_list)
-        for word in self._words:
-            if self._cancel.is_set():
-                return []
-            if self._rcache:
-                groups = self._rcache.group_words(word, self._words)
-            else:
-                groups = {}
-            for sg in groups.values():
-                k = len(sg)
-                if k <= 1:
-                    continue
-                key = ScoreCache.encode_subset(sg)
-                if key not in seen:
-                    seen.add(key)
-                    work.append((k, list(sg)))
-        work.sort()
-        return work
-
-    def _attempt_pass(self, items, score_cache, policy, per_item_deadline):
-        """Try to cache each item; return (still-uncached items, made progress?).
-
-        A per-item deadline is a "this packet is too big for now, move on"
-        signal — not a reason to give up on the item permanently or to stop
-        the thread.  Anything that times out is retried on a later pass with
-        a larger budget, once cheaper neighbors have had a chance to populate
-        the cache underneath it.
-        """
-        still_uncached = []
-        progressed = False
-        for size, sg in items:
-            if self._cancel.is_set():
-                return still_uncached, progressed
-            sk = ScoreCache.encode_subset(sg)
-            if score_cache.read(sk, policy) is not None:
-                self.subgroups_done += 1
-                progressed = True
-                continue
-            deadline = time.time() + per_item_deadline
-            result = min_expected_guesses(sg, self._rcache, score_cache, deadline,
-                                           guesses=self._effective_guesses,
-                                           policy=policy,
-                                           cancel_check=self._cancel.is_set)
-            if result is None:
-                still_uncached.append((size, sg))
-            else:
-                self.subgroups_done += 1
-                progressed = True
-        return still_uncached, progressed
 
     def _ranked_root_guesses(self):
         """Order root-scan candidates so a still-incomplete scan's running
@@ -2301,64 +2224,29 @@ class ERDWarmer(threading.Thread):
 
     def _warm(self, score_cache):
         policy = self._policy
-
-        work = self._collect_subgroups()
-        self.subgroups_total = len(work)
-        if self._cancel.is_set():
-            return
-
-        # Keep retrying whatever is left, with a growing per-item budget,
-        # for as long as each round makes progress.  A round that caches
-        # nothing new means the stragglers are genuinely too expensive right
-        # now — stop rather than spin; the position itself is attempted next
-        # regardless, and a future warmer run (e.g. after the user's next
-        # guess narrows the branch) will revisit anything still missing.
-        pending = work
-        per_item_deadline = 5.0
-        while pending and not self._cancel.is_set():
-            pending, progressed = self._attempt_pass(pending, score_cache, policy,
-                                                       per_item_deadline)
-            if not progressed:
-                break
-            per_item_deadline *= 4
-
-        if self._cancel.is_set():
-            return
-
-        # The current position itself.  If its subgroups are cached above,
-        # this reads from cache and finishes in O(n) cache reads — fast.
         root_key = ScoreCache.encode_subset(self._words)
-        if score_cache.read(root_key, policy) is None:
-            ranked_guesses = self._ranked_root_guesses()
-            if self._cancel.is_set():
-                return
-            # No deadline here — let the scan run to completion.  The old
-            # 30-second cap wasn't actually buying responsiveness: it's a
-            # background thread, so the prompt was never blocked on it
-            # either way.  Its only real job was bounding how long a now-
-            # stale scan could keep grinding after the user moved to a
-            # different branch — but that's exactly what cancel_check now
-            # does, instantly and at every recursion depth, instead of
-            # waiting up to 30s for a deadline to catch up.  Cutting the
-            # scan into 30-second waves bought nothing: each wave's
-            # progress was already being preserved via the subgroup cache
-            # (see cache_all_scores), so a single uninterrupted run gets to
-            # the same cached end state, just without the repeated
-            # die-and-respawn cycle the user had to manually drive by
-            # pressing enter.
-            result = min_expected_guesses(
-                self._words, self._rcache, score_cache,
-                guesses=ranked_guesses,
-                policy=policy,
-                progress_callback=self._on_root_progress,
-                cancel_check=self._cancel.is_set,
-            )
-            if result is not None and not self._cancel.is_set():
-                print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
-                      flush=True)
-            # result is None here only ever means cancel_check fired (there's
-            # no deadline to time out against) — i.e. the user moved on and a
-            # fresh warmer is about to take over.  Nothing to announce.
+        if score_cache.read(root_key, policy) is not None:
+            return  # already done from a prior session
+
+        ranked_guesses = self._ranked_root_guesses()
+        if self._cancel.is_set():
+            return
+
+        # Run the root scan directly.  Uncached subgroups are computed
+        # on-the-fly and written to the cache as a side effect (via
+        # cache_all_scores), so the cache fills progressively during the
+        # scan.  No pre-caching phase needed: the root scan is its own
+        # bottom-up fill, and progress is visible immediately.
+        result = min_expected_guesses(
+            self._words, self._rcache, score_cache,
+            guesses=ranked_guesses,
+            policy=policy,
+            progress_callback=self._on_root_progress,
+            cancel_check=self._cancel.is_set,
+        )
+        if result is not None and not self._cancel.is_set():
+            print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
+                  flush=True)
 
 
 def main():
@@ -2436,7 +2324,6 @@ def main():
             break
 
         if _warmer is not None:
-            gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
             gs.last_erd_root_progress = (_warmer.root_done, _warmer.root_total,
                                          _warmer.root_best)
 
