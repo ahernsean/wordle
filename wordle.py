@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b87"
+BUILD = "b88"
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +578,7 @@ class GameState:
         self.universe = GuessUniverse.ALL_WORDS
         self.compliance = ComplianceFilter.UNFILTERED
         self.last_erd_root_progress = (0, 0, None)  # (done, total, (best_word, best_erd))
+        self.warmer = None  # live reference to the current ERDWarmer, for cmd_help
         # constrained_erd_cache is intentionally NOT reset here — it is
         # long-lived and self-scoping (see __init__ and MemoryScoreCache).
 
@@ -2040,6 +2041,28 @@ def cmd_help(gs):
   Cache: {gs.score_cache_path}
     {la_rows:,} subgroup picks, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
 """)
+    warmer = gs.warmer
+    if warmer is not None and warmer.word_stats:
+        stats = warmer.word_stats
+        has_cpu = any(r[3] is not None for r in stats)
+        total_wall = sum(r[2] for r in stats)
+        total_cpu  = sum(r[3] for r in stats if r[3] is not None)
+        hdr_time = "cpu/wall" if has_cpu else "wall"
+        print(f"  ERD root scan: {len(stats)} words timed, "
+              f"{total_cpu:.1f}s cpu / {total_wall:.1f}s wall" if has_cpu
+              else f"  ERD root scan: {len(stats)} words timed, {total_wall:.1f}s wall")
+        print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>14}  {'hits':>7}  {'misses':>7}  {'hit%':>5}")
+        for rank, word, wall, cpu, hits, misses in stats:
+            if has_cpu and cpu is not None:
+                sleep_s = wall - cpu
+                sleep_tag = f"  [+{sleep_s:.0f}s sleep]" if sleep_s > 5 else ""
+                time_col = f"{cpu:5.1f}s/{wall:.1f}s{sleep_tag}"
+            else:
+                time_col = f"{wall:>6.1f}s"
+            total_reads = hits + misses
+            hit_pct = f"{100*hits/total_reads:.0f}%" if total_reads else "n/a"
+            print(f"  {rank:>5}  {word.upper():<8}  {time_col:>14}  {hits:>7,}  {misses:>7,}  {hit_pct:>5}")
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -2176,6 +2199,7 @@ class ERDWarmer(threading.Thread):
         self.root_done = 0        # candidates fully scored so far in the root scan
         self.root_total = 0       # size of the root scan; 0 means not started yet; -1 = trivial
         self.root_best = None     # (word, erd) — best candidate found so far
+        self.word_stats = []      # [(rank, word, elapsed_s, hits, misses), ...]
 
     def stop(self):
         self._cancel.set()
@@ -2286,15 +2310,44 @@ class ERDWarmer(threading.Thread):
             def _cancel_or_paused():
                 return self._cancel.is_set() or not self._paused.is_set()
 
+            # time.thread_time() measures CPU time for this thread only —
+            # it doesn't advance during iOS process suspension or while the
+            # main thread holds the GIL.  wall time is also recorded so the
+            # gap reveals how long the phone was asleep during a word.
+            _has_thread_time = hasattr(time, 'thread_time')
+            _cpu_now = time.thread_time if _has_thread_time else lambda: None
+
+            word_wall = [time.time()]
+            word_cpu  = [_cpu_now()]  # None if thread_time unavailable
+
+            def _progress(done, total, best_word, best_erd):
+                wall_elapsed = time.time() - word_wall[0]
+                cpu_t = _cpu_now()
+                cpu_elapsed = (cpu_t - word_cpu[0]
+                               if cpu_t is not None and word_cpu[0] is not None
+                               else None)
+                hits   = score_cache.read_hits
+                misses = score_cache.read_misses
+                self.word_stats.append(
+                    (done, best_word, wall_elapsed, cpu_elapsed, hits, misses))
+                score_cache.reset_read_counters()
+                word_wall[0] = time.time()
+                word_cpu[0]  = _cpu_now()
+                self._on_root_progress(done, total, best_word, best_erd)
+
             while True:
                 self.root_done = 0
                 self.root_total = 0
                 self.root_best = None
+                self.word_stats = []
+                score_cache.reset_read_counters()
+                word_wall[0] = time.time()
+                word_cpu[0]  = _cpu_now()
                 result = min_expected_guesses(
                     self._words, self._rcache, score_cache,
                     guesses=ranked_guesses,
                     policy=policy,
-                    progress_callback=self._on_root_progress,
+                    progress_callback=_progress,
                     cancel_check=_cancel_or_paused,
                 )
                 if result is not None:
@@ -2389,6 +2442,7 @@ def main():
         if _warmer is not None:
             gs.last_erd_root_progress = (_warmer.root_done, _warmer.root_total,
                                          _warmer.root_best)
+        gs.warmer = _warmer
 
         if not cmd:
             print_status(gs, _warmer)

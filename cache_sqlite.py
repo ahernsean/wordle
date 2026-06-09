@@ -37,6 +37,8 @@ class ScoreCache:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._ensure_schema()
         self.universe_id = self._ensure_universe()
+        self.read_hits = 0
+        self.read_misses = 0
 
     def _ensure_schema(self):
         self._conn.execute("""
@@ -245,8 +247,14 @@ class ScoreCache:
             WHERE subset_key = ? AND policy = ? AND universe_id = ?
         """, (subset_key, policy, self.universe_id)).fetchone()
         if row is None:
+            self.read_misses += 1
             return None
+        self.read_hits += 1
         return row["best_word"], row["best_score"]
+
+    def reset_read_counters(self):
+        self.read_hits = 0
+        self.read_misses = 0
 
     def write(self, subset_key, policy, best_word, best_score):
         """Store the word a policy's search judged best for a subgroup, and its score."""
@@ -359,6 +367,8 @@ class MemoryScoreCache:
     def __init__(self):
         self._data = {}  # (scope, subset_key_bytes, policy) -> (best_word, best_score)
         self._scope = None
+        self.read_hits = 0
+        self.read_misses = 0
 
     @staticmethod
     def fingerprint_vocabulary(words):
@@ -371,7 +381,16 @@ class MemoryScoreCache:
         self._scope = fingerprint
 
     def read(self, subset_key, policy):
-        return self._data.get((self._scope, subset_key, policy))
+        result = self._data.get((self._scope, subset_key, policy))
+        if result is None:
+            self.read_misses += 1
+        else:
+            self.read_hits += 1
+        return result
+
+    def reset_read_counters(self):
+        self.read_hits = 0
+        self.read_misses = 0
 
     def write(self, subset_key, policy, best_word, best_score):
         self._data[(self._scope, subset_key, policy)] = (best_word, best_score)
