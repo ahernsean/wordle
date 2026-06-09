@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b73"
+BUILD = "b74"
 
 
 # ---------------------------------------------------------------------------
@@ -2109,7 +2109,9 @@ def print_status(gs, warmer=None):
                         erd_tag = f'  [ERD: {hit[1]:.3f}]'
                     else:
                         erd_tag = _erd_root_progress_tag(warmer, soln)
-            print(f"{n:,} words remaining{erd_tag}")
+            print(f"{n:,} words remaining")
+            if erd_tag:
+                print(erd_tag.strip())
     else:
         n = len(gs.solutions)
         print(f'{n} wordlists')
