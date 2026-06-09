@@ -39,6 +39,7 @@ class ScoreCache:
         self.universe_id = self._ensure_universe()
         self.read_hits = 0
         self.read_misses = 0
+        self.write_count = 0
 
     def _ensure_schema(self):
         self._conn.execute("""
@@ -266,6 +267,7 @@ class ScoreCache:
             VALUES (?, ?, ?, ?, ?, ?)
         """, (subset_key, policy, self.universe_id,
               best_word, best_score, now))
+        self.write_count += 1
 
     # ------------------------------------------------------------------
     # Response decomposition cache (guess -> per-answer pattern bytes)
@@ -369,6 +371,7 @@ class MemoryScoreCache:
         self._scope = None
         self.read_hits = 0
         self.read_misses = 0
+        self.write_count = 0
 
     @staticmethod
     def fingerprint_vocabulary(words):
@@ -394,6 +397,7 @@ class MemoryScoreCache:
 
     def write(self, subset_key, policy, best_word, best_score):
         self._data[(self._scope, subset_key, policy)] = (best_word, best_score)
+        self.write_count += 1
 
     def close(self):
         pass

@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b89"
+BUILD = "b90"
 
 
 # ---------------------------------------------------------------------------
@@ -912,11 +912,19 @@ def _erd_root_progress_tag(warmer, soln):
         return ''  # trivial position (≤2 words); no scan runs
     if warmer.root_total == 0:
         return '  [ERD: ordering candidates...]'
+
+    current = warmer.current_word_tag()
+    in_progress = ''
+    if current is not None:
+        word, elapsed, writes = current
+        if elapsed >= 2.0:  # avoid noise on words that finish almost instantly
+            in_progress = f', {word.upper()} {elapsed:.0f}s +{writes} cached'
+
     if warmer.root_best is not None:
         bw, bs = warmer.root_best
-        return (f'  [ERD: scanning {warmer.root_done}/{warmer.root_total} '
+        return (f'  [ERD: scanning {warmer.root_done}/{warmer.root_total}{in_progress} '
                 f'— best so far {bw.upper()} {bs:.3f}]')
-    return f'  [ERD: scanning {warmer.root_done}/{warmer.root_total}]'
+    return f'  [ERD: scanning {warmer.root_done}/{warmer.root_total}{in_progress}]'
 
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
@@ -2209,7 +2217,17 @@ class ERDWarmer(threading.Thread):
         self.root_done = 0        # candidates fully scored so far in the root scan
         self.root_total = 0       # size of the root scan; 0 means not started yet; -1 = trivial
         self.root_best = None     # (word, erd) — best candidate found so far
-        self.word_stats = []      # [(rank, word, elapsed_s, hits, misses), ...]
+        self.word_stats = []      # [(rank, word, wall_s, cpu_s, hits, misses), ...]
+        # Live mid-word progress: a single root word can take far longer than
+        # the gap between progress_callback firings (it recurses through its
+        # whole subgroup tree before reporting). These let the status line
+        # show that work is happening *during* that word, not just between
+        # words. Read by _erd_root_progress_tag from the main thread; written
+        # only by this thread, so plain attributes are safe under the GIL.
+        self.current_word = None        # word being evaluated right now, or None
+        self.current_word_start = None  # time.time() when it started
+        self._score_cache = None        # set in _warm; live write_count source
+        self._word_write_baseline = 0   # score_cache.write_count at word start
 
     def stop(self):
         self._cancel.set()
@@ -2293,6 +2311,27 @@ class ERDWarmer(threading.Thread):
         self.root_total = total
         self.root_best = (best_word, best_erd)
 
+    def _start_word(self, score_cache, ranked_guesses, done):
+        """Mark the start of root-word ranked_guesses[done] for live progress
+        (current_word_tag below) — separate from word_stats, which only
+        records *completed* words."""
+        self.current_word = ranked_guesses[done] if done < len(ranked_guesses) else None
+        self.current_word_start = time.time()
+        self._word_write_baseline = score_cache.write_count
+
+    def current_word_tag(self):
+        """(word, elapsed_s, subgroups_written) for the root word currently
+        being evaluated, or None if nothing is in progress. Subgroup writes
+        are the clearest sign of life during a word whose subtree is large
+        enough that no progress_callback has fired yet."""
+        if self.current_word is None or self.current_word_start is None:
+            return None
+        if self._score_cache is None:
+            return None
+        elapsed = time.time() - self.current_word_start
+        writes = self._score_cache.write_count - self._word_write_baseline
+        return self.current_word, elapsed, writes
+
     def _warm(self, score_cache):
         policy = self._policy
         root_key = ScoreCache.encode_subset(self._words)
@@ -2303,6 +2342,8 @@ class ERDWarmer(threading.Thread):
             ranked_guesses = self._ranked_root_guesses()
             if self._cancel.is_set():
                 return
+
+            self._score_cache = score_cache
 
             # Run the root scan directly.  Uncached subgroups are computed
             # on-the-fly and written to the cache as a side effect (via
@@ -2347,6 +2388,7 @@ class ERDWarmer(threading.Thread):
                 word_wall[0] = time.time()
                 word_cpu[0]  = _cpu_now()
                 self._on_root_progress(done, total, best_word, best_erd)
+                self._start_word(score_cache, ranked_guesses, done)
 
             while True:
                 self.root_done = 0
@@ -2356,6 +2398,7 @@ class ERDWarmer(threading.Thread):
                 score_cache.reset_read_counters()
                 word_wall[0] = time.time()
                 word_cpu[0]  = _cpu_now()
+                self._start_word(score_cache, ranked_guesses, 0)
                 result = min_expected_guesses(
                     self._words, self._rcache, score_cache,
                     guesses=ranked_guesses,
