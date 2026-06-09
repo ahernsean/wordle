@@ -311,9 +311,7 @@ class ScoreCache:
         """Store list of (word, score) tuples for this subset/method/universe."""
         subset_hash = self._subset_hash(subset_key)
         now = int(time.time())
-        # SAVEPOINT nests safely whether or not an outer transaction is active
-        # (BEGIN would fail with "cannot start a transaction within a transaction").
-        self._conn.execute("SAVEPOINT ws")
+        self._conn.execute("BEGIN")
         try:
             self._conn.executemany("""
                 INSERT OR REPLACE INTO word_scores
@@ -321,18 +319,10 @@ class ScoreCache:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, [(subset_hash, w, method, s, self.universe_id, now)
                   for w, s in scores])
-            self._conn.execute("RELEASE SAVEPOINT ws")
+            self._conn.execute("COMMIT")
         except Exception:
-            self._conn.execute("ROLLBACK TO SAVEPOINT ws")
+            self._conn.execute("ROLLBACK")
             raise
-
-    def begin(self):
-        """Open an explicit write transaction for batching multiple writes."""
-        self._conn.execute("BEGIN")
-
-    def commit(self):
-        """Commit the current explicit write transaction."""
-        self._conn.execute("COMMIT")
 
     def stats(self):
         """Return (subgroup_best_rows, word_score_rows, decomposition_rows, last_updated_ts)."""
@@ -385,12 +375,6 @@ class MemoryScoreCache:
 
     def write(self, subset_key, policy, best_word, best_score):
         self._data[(self._scope, subset_key, policy)] = (best_word, best_score)
-
-    def begin(self):
-        pass
-
-    def commit(self):
-        pass
 
     def close(self):
         pass
