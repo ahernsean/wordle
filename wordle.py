@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b79"
+BUILD = "b80"
 
 
 # ---------------------------------------------------------------------------
@@ -1314,10 +1314,8 @@ def cmd_display(gs):
     n = len(soln.current_words)
     print(f"\n{n:,} words remaining:")
     if soln.scores_updated:
-        filtered = [
-            (w, s) for w, s in soln.scores
-            if w in soln.current_words
-        ]
+        score_map = {w: s for w, s in soln.scores if w in soln.current_words}
+        filtered = sorted(score_map.items())  # alphabetical
         print(f"{soln.scores_method.label}:")
         print_scored_list(filtered, soln.scores_method)
     else:
@@ -2224,7 +2222,7 @@ class ERDWarmer(threading.Thread):
                 self._paused.wait()      # block while main thread is busy
             if self._cancel.is_set():
                 return self._effective_guesses
-            counts = self._rcache.group_counts(word, self._words)
+            counts = calculate_group_counts(word, self._words)
             scores = score_groups_multi(counts, methods)
             scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
                            -scores[ScoringMethod.ENTROPY_GAIN],
