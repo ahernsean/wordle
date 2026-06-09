@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b81"
+BUILD = "b82"
 
 
 # ---------------------------------------------------------------------------
@@ -2276,11 +2276,10 @@ class ERDWarmer(threading.Thread):
                     progress_callback=self._on_root_progress,
                     cancel_check=_cancel_or_paused,
                 )
-            except sqlite3.OperationalError:
-                # SQLite I/O interrupted — iOS locked the device and revoked
-                # access to the encrypted database file (NSFileProtection).
-                # Exit the thread cleanly; partial cache writes before the
-                # error are already durable via WAL.
+            except sqlite3.OperationalError as e:
+                print(f'\n  [ERD warmer: sqlite3.OperationalError: {e} '
+                      f'(done={self.root_done}/{self.root_total})]',
+                      flush=True)
                 return
             if result is not None:
                 if not self._cancel.is_set():
