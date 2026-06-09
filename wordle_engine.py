@@ -864,10 +864,14 @@ def min_expected_guesses(remaining, cache, score_cache,
     best_word = None
 
     for i, guess in enumerate(guess_list):
-        # Use the response cache for answer-vocabulary words (pre-built
-        # mappings). For non-answer guess words, compute groups inline to
-        # avoid polluting the response cache with 12 000 full-vocab mappings.
-        if cache and guess in cache.answer_words:
+        # cache.group_words decomposes guess vs remaining via a persisted
+        # per-guess pattern lookup table (~0.6us/word) instead of recomputing
+        # calculate_response (~30us/word). Every new (cache-miss) subgroup
+        # re-runs this loop over the full guess_list at every recursion
+        # depth, so for non-answer guesses this difference is the dominant
+        # cost of evaluating a new subgroup. The decomposition for any guess
+        # is built once and persisted, so this is a one-time cost overall.
+        if cache:
             groups = cache.group_words(guess, remaining)
         else:
             groups = defaultdict(list)
