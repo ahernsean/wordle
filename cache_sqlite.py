@@ -107,6 +107,16 @@ class ScoreCache:
             CREATE INDEX IF NOT EXISTS idx_subgroup_best_by_policy
             ON subgroup_best_by_policy(universe_id, policy)
         """)
+        # 'subset_blob' was renamed to 'subset_key' — same encoding, cleaner
+        # name that matches every other reference in this file.  Databases
+        # migrated from lookahead_result or subgroup_pick may still carry the
+        # old column name.
+        cols = {row["name"] for row in
+                self._conn.execute("PRAGMA table_info(subgroup_best_by_policy)")}
+        if cols and "subset_key" not in cols and "subset_blob" in cols:
+            self._conn.execute(
+                "ALTER TABLE subgroup_best_by_policy "
+                "RENAME COLUMN subset_blob TO subset_key")
         # ERD policy names were renamed so both axes of the (guess-universe x
         # compliance-filter) selection are spelled out in the namespace
         # itself — 'erd_all' named only the universe, 'erd_answers' folded

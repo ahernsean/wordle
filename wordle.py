@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b77"
+BUILD = "b78"
 
 
 # ---------------------------------------------------------------------------
@@ -906,6 +906,8 @@ def _erd_root_progress_tag(warmer, soln):
     """
     if warmer is None or set(warmer._words) != set(soln.current_words):
         return ''
+    if warmer.root_total < 0:
+        return ''  # trivial position (≤2 words); no scan runs
     if warmer.root_total == 0:
         return '  [ERD: ordering candidates...]'
     if warmer.root_best is not None:
@@ -1000,7 +1002,9 @@ def cmd_solve(gs):
         print(f"  {erd_idx}. ERD: expected remaining depth (v) [{erd_root[1]:.3f}]")
     else:
         root_done, root_total, root_best = gs.last_erd_root_progress
-        if root_total == 0:
+        if root_total < 0:
+            prog = 'not ready'
+        elif root_total == 0:
             prog = 'ordering candidates...'
         elif root_best is not None:
             bw, bs = root_best
@@ -2167,7 +2171,8 @@ class ERDWarmer(threading.Thread):
 
     def run(self):
         if len(self._words) <= 2:
-            return  # nothing useful; base cases need no cache
+            self.root_total = -1  # sentinel: trivial position, no scan needed
+            return
         if self._persist:
             score_cache = ScoreCache(self._cache_path, self._all_answers)
         else:
