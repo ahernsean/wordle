@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b82"
+BUILD = "b83"
 
 
 # ---------------------------------------------------------------------------
@@ -2156,7 +2156,14 @@ class ERDWarmer(threading.Thread):
         self._all_answers = all_answers
         self._effective_guesses = effective_guesses
         self._cache_path = score_cache_path
-        self._rcache = response_cache
+        # Snapshot the caller's in-memory decomposition cache.  The warmer
+        # must open its own SQLite connection (connections aren't thread-safe),
+        # so it starts cold; pre-seeding from the caller's already-warm dict
+        # avoids re-reading every decomposition from SQLite.  The inner dicts
+        # (guess → {answer: pattern_int}) are never mutated after creation, so
+        # sharing them read-only across threads is safe.
+        self._rcache_seed = dict(response_cache._cache)
+        self._rcache = None   # set in run() after opening a thread-private connection
         self._policy = policy
         self._persist = persist
         self._seed_mem_cache = seed_mem_cache
@@ -2194,6 +2201,7 @@ class ERDWarmer(threading.Thread):
         # in-memory costs nothing noticeable).
         self._rcache = ResponseCache(self._all_answers,
                                      score_cache if self._persist else None)
+        self._rcache._cache.update(self._seed_rcache)
         try:
             self._warm(score_cache)
         finally:
@@ -2223,7 +2231,7 @@ class ERDWarmer(threading.Thread):
                 self._paused.wait()      # block while main thread is busy
             if self._cancel.is_set():
                 return self._effective_guesses
-            counts = calculate_group_counts(word, self._words)
+            counts = self._rcache.group_counts(word, self._words)
             scores = score_groups_multi(counts, methods)
             scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
                            -scores[ScoringMethod.ENTROPY_GAIN],

@@ -1892,6 +1892,7 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         class FakeResponseCache:
             answer_words = words
+            _cache = {}
 
             @staticmethod
             def group_words(word, current_words):
@@ -1915,6 +1916,7 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
             return 1.8
 
         printed = []
+        warmer._rcache = FakeResponseCache()
         with mock.patch('wordle.min_expected_guesses', side_effect=cancel_during_root), \
              mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
             warmer._warm(score_cache)
