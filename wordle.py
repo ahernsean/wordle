@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b83"
+BUILD = "b84"
 
 
 # ---------------------------------------------------------------------------
@@ -2201,7 +2201,7 @@ class ERDWarmer(threading.Thread):
         # in-memory costs nothing noticeable).
         self._rcache = ResponseCache(self._all_answers,
                                      score_cache if self._persist else None)
-        self._rcache._cache.update(self._seed_rcache)
+        self._rcache._cache.update(self._rcache_seed)
         try:
             self._warm(score_cache)
         finally:
