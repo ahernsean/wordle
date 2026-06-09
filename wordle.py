@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b78"
+BUILD = "b79"
 
 
 # ---------------------------------------------------------------------------
@@ -2162,12 +2162,21 @@ class ERDWarmer(threading.Thread):
         self._persist = persist
         self._seed_mem_cache = seed_mem_cache
         self._cancel = threading.Event()
+        self._paused = threading.Event()
+        self._paused.set()  # initially running (not paused)
         self.root_done = 0        # candidates fully scored so far in the root scan
-        self.root_total = 0       # size of the root scan; 0 means not started yet
+        self.root_total = 0       # size of the root scan; 0 means not started yet; -1 = trivial
         self.root_best = None     # (word, erd) — best candidate found so far
 
     def stop(self):
         self._cancel.set()
+        self._paused.set()  # unblock any paused wait so the thread can see _cancel
+
+    def pause(self):
+        self._paused.clear()
+
+    def resume(self):
+        self._paused.set()
 
     def run(self):
         if len(self._words) <= 2:
@@ -2211,6 +2220,10 @@ class ERDWarmer(threading.Thread):
         for word in self._effective_guesses:
             if self._cancel.is_set():
                 return self._effective_guesses
+            if not self._paused.is_set():
+                self._paused.wait()      # block while main thread is busy
+            if self._cancel.is_set():
+                return self._effective_guesses
             counts = self._rcache.group_counts(word, self._words)
             scores = score_groups_multi(counts, methods)
             scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
@@ -2241,16 +2254,39 @@ class ERDWarmer(threading.Thread):
         # cache_all_scores), so the cache fills progressively during the
         # scan.  No pre-caching phase needed: the root scan is its own
         # bottom-up fill, and progress is visible immediately.
-        result = min_expected_guesses(
-            self._words, self._rcache, score_cache,
-            guesses=ranked_guesses,
-            policy=policy,
-            progress_callback=self._on_root_progress,
-            cancel_check=self._cancel.is_set,
-        )
-        if result is not None and not self._cancel.is_set():
-            print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
-                  flush=True)
+        #
+        # The scan may be paused mid-run when the main thread starts a
+        # foreground operation.  cancel_check returns True on both true
+        # cancellation and on pause, causing min_expected_guesses to abort
+        # and return None.  After a pause, we wait for resume and retry
+        # from the top — partial results already written to score_cache
+        # survive the abort, so the retry picks up from cache rather than
+        # starting over.
+        def _cancel_or_paused():
+            return self._cancel.is_set() or not self._paused.is_set()
+
+        while True:
+            self.root_done = 0
+            self.root_total = 0
+            self.root_best = None
+            result = min_expected_guesses(
+                self._words, self._rcache, score_cache,
+                guesses=ranked_guesses,
+                policy=policy,
+                progress_callback=self._on_root_progress,
+                cancel_check=_cancel_or_paused,
+            )
+            if result is not None:
+                if not self._cancel.is_set():
+                    print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
+                          flush=True)
+                return
+            if self._cancel.is_set():
+                return
+            # Paused — wait for the main thread to finish its operation.
+            self._paused.wait()
+            if self._cancel.is_set():
+                return
 
 
 def main():
@@ -2338,10 +2374,16 @@ def main():
         if handler:
             try:
                 inline = cmd[1:].strip()
-                if inline and handler is cmd_test:
-                    cmd_test(gs, inline)
-                else:
-                    handler(gs)
+                if _warmer is not None:
+                    _warmer.pause()
+                try:
+                    if inline and handler is cmd_test:
+                        cmd_test(gs, inline)
+                    else:
+                        handler(gs)
+                finally:
+                    if _warmer is not None:
+                        _warmer.resume()
             except Exception as e:
                 print_error(f"Error: {e}")
                 raise
