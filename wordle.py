@@ -39,7 +39,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b72"
+BUILD = "b73"
 
 
 # ---------------------------------------------------------------------------
@@ -892,26 +892,30 @@ def _erd_cache_and_policy(gs, soln):
 
 
 def _erd_root_progress_tag(warmer, soln):
-    """Status-line fragment surfacing the warmer's root-scan progress and
-    its current best candidate, so the user sees live signal while waiting
-    for the root ERD instead of silence.
+    """Status-line fragment covering all ERD warmup phases for this position.
 
     Reads directly off the live warmer rather than a snapshot in `gs`:
     a snapshot taken before the current command ran (e.g. a guess that
-    just narrowed current_words) would describe a now-superseded branch —
-    showing "scanning 12/87" from a 50-word position right under "8 words
-    remaining" once the guess landed. The word-set check below is what
-    catches that: if the warmer's snapshot doesn't match the position
-    we're about to display, its progress numbers aren't about this
-    position, so there's nothing honest to show yet.
+    just narrowed current_words) would describe a now-superseded branch.
+    The word-set check below catches that: if the warmer's word set doesn't
+    match the position we're about to display, its numbers aren't about
+    this position, so there's nothing honest to show yet.
 
-    Returns '' when there's no warmer for this exact position, or its
-    root scan hasn't started yet (still collecting/caching subgroups —
-    nothing meaningful to show).
+    Phases in order:
+      collecting  subgroups_total == 0 (brief — no tag, not worth showing)
+      caching     0 < subgroups_done < subgroups_total
+      ordering    subgroups done, root_total == 0 (_ranked_root_guesses running)
+      scanning    root_total > 0
     """
     if warmer is None or set(warmer._words) != set(soln.current_words):
         return ''
+    sub_done = warmer.subgroups_done
+    sub_total = warmer.subgroups_total
+    if sub_total > 0 and sub_done < sub_total:
+        return f'  [ERD: caching {sub_done}/{sub_total} subgroups]'
     if warmer.root_total == 0:
+        if sub_total > 0:
+            return '  [ERD: ordering candidates...]'
         return ''
     if warmer.root_best is not None:
         bw, bs = warmer.root_best
