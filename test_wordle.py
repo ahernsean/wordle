@@ -550,6 +550,32 @@ class TestScoreCacheSQLite(unittest.TestCase):
         self.assertEqual(word, "heart")
         self.assertAlmostEqual(ent, 2.5)
 
+    def test_write_populates_mem_cache(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        self.assertEqual(sc._mem_cache[(subset_key, "full")], ("heart", 2.5))
+
+        # Closing the connection proves this read is served from memory,
+        # not a fresh SQLite round trip.
+        sc._conn.close()
+        self.assertEqual(sc.read(subset_key, "full"), ("heart", 2.5))
+
+    def test_read_hit_populates_mem_cache(self):
+        sc1 = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc1.write(subset_key, "hard", "earth", 1.8)
+        sc1.close()
+
+        sc2 = ScoreCache(self.db, ANSWERS)
+        first = sc2.read(subset_key, "hard")
+        self.assertEqual(first, ("earth", 1.8))
+        self.assertEqual(sc2._mem_cache[(subset_key, "hard")], ("earth", 1.8))
+
+        # A second read must not touch SQLite at all.
+        sc2._conn.close()
+        self.assertEqual(sc2.read(subset_key, "hard"), ("earth", 1.8))
+
     def test_read_miss_returns_none(self):
         sc = ScoreCache(self.db, ANSWERS)
         subset_key = ScoreCache.encode_subset(["crane", "slate"])

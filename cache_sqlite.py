@@ -40,6 +40,11 @@ class ScoreCache:
         self.read_hits = 0
         self.read_misses = 0
         self.write_count = 0
+        # In-memory mirror of subgroup_best_by_policy rows seen this session.
+        # Subgroup results are write-once/exact, so a hit here is as good as
+        # a SQLite hit but ~1000x cheaper — recursive ERD search re-reads the
+        # same small subgroups millions of times across sibling branches.
+        self._mem_cache = {}
 
     def _ensure_schema(self):
         self._conn.execute("""
@@ -242,6 +247,12 @@ class ScoreCache:
         that scoping, so the columns themselves can stay "best_word"/
         "best_score" without re-litigating it.
         """
+        mem_key = (subset_key, policy)
+        cached = self._mem_cache.get(mem_key)
+        if cached is not None:
+            self.read_hits += 1
+            return cached
+
         row = self._conn.execute("""
             SELECT best_word, best_score
             FROM subgroup_best_by_policy
@@ -251,7 +262,9 @@ class ScoreCache:
             self.read_misses += 1
             return None
         self.read_hits += 1
-        return row["best_word"], row["best_score"]
+        result = (row["best_word"], row["best_score"])
+        self._mem_cache[mem_key] = result
+        return result
 
     def reset_read_counters(self):
         self.read_hits = 0
@@ -268,6 +281,7 @@ class ScoreCache:
         """, (subset_key, policy, self.universe_id,
               best_word, best_score, now))
         self.write_count += 1
+        self._mem_cache[(subset_key, policy)] = (best_word, best_score)
 
     # ------------------------------------------------------------------
     # Response decomposition cache (guess -> per-answer pattern bytes)
