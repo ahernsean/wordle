@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b88"
+BUILD = "b89"
 
 
 # ---------------------------------------------------------------------------
@@ -2047,21 +2047,31 @@ def cmd_help(gs):
         has_cpu = any(r[3] is not None for r in stats)
         total_wall = sum(r[2] for r in stats)
         total_cpu  = sum(r[3] for r in stats if r[3] is not None)
+
+        def _fmt_t(secs):
+            if secs < 0.001:
+                return f"{secs*1000:.2f}ms"
+            if secs < 10.0:
+                return f"{secs*1000:.0f}ms"
+            return f"{secs:.1f}s"
+
+        if has_cpu:
+            print(f"  ERD root scan: {len(stats)} words timed, "
+                  f"{_fmt_t(total_cpu)} cpu / {_fmt_t(total_wall)} wall")
+        else:
+            print(f"  ERD root scan: {len(stats)} words timed, {_fmt_t(total_wall)} wall")
         hdr_time = "cpu/wall" if has_cpu else "wall"
-        print(f"  ERD root scan: {len(stats)} words timed, "
-              f"{total_cpu:.1f}s cpu / {total_wall:.1f}s wall" if has_cpu
-              else f"  ERD root scan: {len(stats)} words timed, {total_wall:.1f}s wall")
-        print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>14}  {'hits':>7}  {'misses':>7}  {'hit%':>5}")
+        print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>16}  {'hits':>7}  {'misses':>7}  {'hit%':>5}")
         for rank, word, wall, cpu, hits, misses in stats:
             if has_cpu and cpu is not None:
                 sleep_s = wall - cpu
-                sleep_tag = f"  [+{sleep_s:.0f}s sleep]" if sleep_s > 5 else ""
-                time_col = f"{cpu:5.1f}s/{wall:.1f}s{sleep_tag}"
+                sleep_tag = f"  [+{_fmt_t(sleep_s)} sleep]" if sleep_s > 5 else ""
+                time_col = f"{_fmt_t(cpu)}/{_fmt_t(wall)}{sleep_tag}"
             else:
-                time_col = f"{wall:>6.1f}s"
+                time_col = _fmt_t(wall)
             total_reads = hits + misses
             hit_pct = f"{100*hits/total_reads:.0f}%" if total_reads else "n/a"
-            print(f"  {rank:>5}  {word.upper():<8}  {time_col:>14}  {hits:>7,}  {misses:>7,}  {hit_pct:>5}")
+            print(f"  {rank:>5}  {word.upper():<8}  {time_col:>16}  {hits:>7,}  {misses:>7,}  {hit_pct:>5}")
         print()
 
 
@@ -2328,8 +2338,11 @@ class ERDWarmer(threading.Thread):
                                else None)
                 hits   = score_cache.read_hits
                 misses = score_cache.read_misses
+                # ranked_guesses[done-1] is the word just evaluated;
+                # best_word is the running best across all words so far.
+                evaluated = ranked_guesses[done - 1]
                 self.word_stats.append(
-                    (done, best_word, wall_elapsed, cpu_elapsed, hits, misses))
+                    (done, evaluated, wall_elapsed, cpu_elapsed, hits, misses))
                 score_cache.reset_read_counters()
                 word_wall[0] = time.time()
                 word_cpu[0]  = _cpu_now()
