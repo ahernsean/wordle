@@ -2067,6 +2067,74 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         self.assertIsNot(rcaches_seen[0], warmer._main_rcache_dict,
             "_rcache must be a new thread-private ResponseCache, not the main dict")
 
+    def test_cumulative_time_survives_pause_restart(self):
+        """word_stats (and root_done) reset to empty at the top of every
+        while-loop pass — a pause/resume mid-scan throws away the previous
+        pass's per-word table. cumulative_cpu_s/cumulative_wall_s must NOT
+        be reset, so they keep growing across passes even though word_stats
+        only ever shows the current pass."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
+        warmer._rcache = FakeResponseCache()
+
+        # Monotonically increasing fake clocks so wall_elapsed/cpu_elapsed
+        # are always positive, regardless of how many times each is called.
+        wall_counter = [0.0]
+        cpu_counter = [0.0]
+
+        def fake_time():
+            wall_counter[0] += 1.0
+            return wall_counter[0]
+
+        def fake_thread_time():
+            cpu_counter[0] += 1.0
+            return cpu_counter[0]
+
+        snapshot = {}
+
+        def fake_min_expected(remaining, cache, sc, deadline=None,
+                               guesses=None, policy=None,
+                               progress_callback=None, cancel_check=None):
+            if 'pass' not in snapshot:
+                snapshot['pass'] = 1
+                progress_callback(1, len(words), words[0], 1.5)
+                return None  # simulate pause: caller waits and retries
+            snapshot['pass'] = 2
+            snapshot['cpu_before_pass2'] = warmer.cumulative_cpu_s
+            snapshot['wall_before_pass2'] = warmer.cumulative_wall_s
+            progress_callback(1, len(words), words[0], 1.5)
+            progress_callback(2, len(words), words[1], 1.4)
+            return 1.4  # final result: while-loop exits
+
+        with mock.patch('wordle.time.time', side_effect=fake_time), \
+             mock.patch('wordle.time.thread_time', side_effect=fake_thread_time), \
+             mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected), \
+             mock.patch('builtins.print'):
+            warmer._warm(score_cache)
+
+        # Pass 1's single progress callback already accumulated time before
+        # pass 2 started — proving cumulative totals aren't reset alongside
+        # word_stats/root_done at the top of the while loop.
+        self.assertGreater(snapshot['cpu_before_pass2'], 0)
+        self.assertGreater(snapshot['wall_before_pass2'], 0)
+
+        # word_stats only reflects pass 2 (reset wiped pass 1's entry).
+        self.assertEqual(len(warmer.word_stats), 2)
+
+        # But the cumulative totals include both passes' contributions.
+        self.assertGreater(warmer.cumulative_cpu_s, snapshot['cpu_before_pass2'])
+        self.assertGreater(warmer.cumulative_wall_s, snapshot['wall_before_pass2'])
+
 
 # ---------------------------------------------------------------------------
 # _compare_words display: answer-set marker and column spacing

@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b93"
+BUILD = "b94"
 
 
 # ---------------------------------------------------------------------------
@@ -2064,10 +2064,14 @@ def cmd_help(gs):
             return f"{secs:.1f}s"
 
         if has_cpu:
-            print(f"  ERD root scan: {len(stats)} words timed, "
-                  f"{_fmt_t(total_cpu)} cpu / {_fmt_t(total_wall)} wall")
+            print(f"  ERD root scan: {len(stats)} words timed this pass, "
+                  f"{_fmt_t(total_cpu)} cpu / {_fmt_t(total_wall)} wall  "
+                  f"(cumulative: {_fmt_t(warmer.cumulative_cpu_s)} cpu / "
+                  f"{_fmt_t(warmer.cumulative_wall_s)} wall)")
         else:
-            print(f"  ERD root scan: {len(stats)} words timed, {_fmt_t(total_wall)} wall")
+            print(f"  ERD root scan: {len(stats)} words timed this pass, "
+                  f"{_fmt_t(total_wall)} wall  "
+                  f"(cumulative: {_fmt_t(warmer.cumulative_wall_s)} wall)")
         hdr_time = "cpu/wall" if has_cpu else "wall"
         hdr_per_miss = "cpu/miss" if has_cpu else "wall/miss"
         print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>16}  {'hits':>10}  {'misses':>7}  {hdr_per_miss:>8}")
@@ -2230,6 +2234,12 @@ class ERDWarmer(threading.Thread):
         self.current_word_start = None  # time.time() when it started
         self._score_cache = None        # set in _warm; live write_count source
         self._word_write_baseline = 0   # score_cache.write_count at word start
+        # Sums of wall_elapsed/cpu_elapsed across ALL passes (while-loop
+        # iterations) for this position, never reset. word_stats only holds
+        # the current pass — words completed in an earlier pass replay from
+        # cache near-instantly, so per-pass sums understate total work spent.
+        self.cumulative_cpu_s = 0.0
+        self.cumulative_wall_s = 0.0
 
     def stop(self):
         self._cancel.set()
@@ -2379,6 +2389,9 @@ class ERDWarmer(threading.Thread):
                 cpu_elapsed = (cpu_t - word_cpu[0]
                                if cpu_t is not None and word_cpu[0] is not None
                                else None)
+                self.cumulative_wall_s += wall_elapsed
+                if cpu_elapsed is not None:
+                    self.cumulative_cpu_s += cpu_elapsed
                 hits   = score_cache.read_hits
                 misses = score_cache.read_misses
                 # ranked_guesses[done-1] is the word just evaluated;
