@@ -193,7 +193,7 @@ class ScoreCache:
         """One-time cleanup of stale subgroup_best_by_policy rows.
 
         Once a legacy batch is gone it stays gone, so a full-table DELETE on
-        every connection open (including each ERDWarmer thread) would scan
+        every connection open (including each ERDSolver thread) would scan
         the whole table for nothing.  Check existence first — LIMIT 1 lets
         SQLite stop at the first match — and only DELETE when there's
         actually something to remove.

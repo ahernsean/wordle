@@ -27,7 +27,7 @@ from wordle_engine import (
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
-    _multistep_stats, _erd_solve_scores, ERDWarmer,
+    _multistep_stats, _erd_solve_scores, ERDSolver,
     _compare_words, set_display_context,
 )
 
@@ -1728,12 +1728,12 @@ class TestERDPolicyParameter(unittest.TestCase):
         self.assertIsNone(sc.read(key, ERD_ALL),
                           "result must NOT be stored under the derived policy")
 
-    def test_possible_answers_warmer_readable_by_solve(self):
+    def test_possible_answers_results_readable_by_solve(self):
         """
-        Results written with policy=ERD_ANSWERS (POSSIBLE_ANSWERS warmer) are
+        Results written with policy=ERD_ANSWERS (POSSIBLE_ANSWERS solver) are
         readable by _erd_solve_scores under policy=ERD_ANSWERS.
 
-        With the bug, the warmer calls min_expected_guesses(guesses=words) which
+        With the bug, the solver calls min_expected_guesses(guesses=words) which
         stores under ERD_ALL; _erd_solve_scores looks under ERD_ANSWERS → miss.
         """
         words = ANSWERS[:5]
@@ -1745,13 +1745,13 @@ class TestERDPolicyParameter(unittest.TestCase):
             cache=ResponseCache(words),
         )
 
-        # Simulate POSSIBLE_ANSWERS warmer: guesses=current_words, policy=ERD_ANSWERS
+        # Simulate POSSIBLE_ANSWERS solver: guesses=current_words, policy=ERD_ANSWERS
         min_expected_guesses(words, soln.cache, sc,
                              guesses=words, policy=ERD_ANSWERS)
 
         scores = _erd_solve_scores(soln, score_cache=sc, policy=ERD_ANSWERS)
         self.assertIsNotNone(scores,
-                             "POSSIBLE_ANSWERS ERD must be readable after warmer completes")
+                             "POSSIBLE_ANSWERS ERD must be readable after solver completes")
 
     def test_erd_all_and_erd_answers_do_not_share_cache_slots(self):
         """
@@ -1894,13 +1894,13 @@ class TestMultistepStatsERDPolicy(unittest.TestCase):
 #
 # Exact ERD computation (min_expected_guesses) over a large guess vocabulary
 # is combinatorially expensive — a single subgroup can take tens of seconds.
-# That cost belongs solely to the background ERDWarmer, which uses its own
+# That cost belongs solely to the background ERDSolver, which uses its own
 # short deadlines to detect when it has bitten off more than it can chew.
-# The foreground must instead simply *surface* whatever the warmer has
+# The foreground must instead simply *surface* whatever the solver has
 # already cached: an instant, recursion-free cache read per subgroup. If a
 # subgroup isn't cached yet, ERD is reported as unavailable (None) rather
 # than computed live — exactly mirroring how print_status's ERD tag already
-# works. As the warmer (running continuously in the background) populates
+# works. As the solver (running continuously in the background) populates
 # more of the cache over time, more subgroups become surfaceable for free.
 # ---------------------------------------------------------------------------
 
@@ -1935,7 +1935,7 @@ class TestMultistepStatsERDNonBlocking(unittest.TestCase):
             'wordle.min_expected_guesses',
             side_effect=AssertionError(
                 "_multistep_stats must never invoke min_expected_guesses — "
-                "ERD computation belongs to the background warmer only"))
+                "ERD computation belongs to the background solver only"))
 
     def test_uncached_subgroup_yields_none_without_computing(self):
         """A cache miss must surface as 'not yet available' (None), not
@@ -1973,7 +1973,7 @@ class TestMultistepStatsERDNonBlocking(unittest.TestCase):
 
     def test_constraint_compliant_uses_supplied_cache_only(self):
         """Hard mode must surface from the caller-supplied erd_cache (the
-        long-lived MemoryScoreCache shared with the warmer) without ever
+        long-lived MemoryScoreCache shared with the solver) without ever
         computing — same non-blocking contract as any-word mode."""
         soln = self._mid_game_soln()
         sg = self._subgroup("heart", soln.current_words)
@@ -2013,7 +2013,7 @@ class TestMemoryScoreCacheScoping(unittest.TestCase):
 
     def test_close_is_a_harmless_no_op(self):
         """Unlike ScoreCache.close(), MemoryScoreCache holds no SQLite
-        connection — close() must be safe to call (ERDWarmer's run() calls
+        connection — close() must be safe to call (ERDSolver's run() calls
         it unconditionally) and leave the cache usable afterwards."""
         mc = MemoryScoreCache()
         mc.set_scope('test-scope')
@@ -2085,7 +2085,7 @@ class TestMemoryScoreCacheScoping(unittest.TestCase):
 class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
     """
     _erd_solve_scores must accept an optional guesses= parameter.  When supplied,
-    words outside current_words (non-answers) that have pre-warmed subgroup ERDs
+    words outside current_words (non-answers) that have pre-solved subgroup ERDs
     must appear in the returned ranking.
     """
 
@@ -2099,7 +2099,7 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
 
     def test_non_answer_word_appears_when_guesses_supplied(self):
         """
-        A non-answer word with all subgroup ERDs pre-warmed appears in the
+        A non-answer word with all subgroup ERDs pre-solved appears in the
         ranking when guesses= is passed to _erd_solve_scores.
         """
         answers = ANSWERS[:5]
@@ -2109,7 +2109,7 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), answers)
             soln = self._soln(answers, sc)
 
-            # Pre-warm all subgroup ERDs using the full GUESSES vocabulary
+            # Pre-solve all subgroup ERDs using the full GUESSES vocabulary
             min_expected_guesses(answers, soln.cache, sc,
                                  guesses=GUESSES, policy=ERD_ALL)
 
@@ -2208,7 +2208,7 @@ class TestERDSolveScoresUncachedSubgroupSkipped(unittest.TestCase):
             self.assertIn(w, result_words)
 
 
-class TestERDWarmerKeepsWorking(unittest.TestCase):
+class TestERDSolverKeepsWorking(unittest.TestCase):
 
     @staticmethod
     def _word(i):
@@ -2216,8 +2216,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
     def test_no_ready_message_when_superseded_mid_root_computation(self):
         """If stop() fires while the (slow, uninterruptible) root computation
-        is in flight, the warmer must not announce a result on the way out —
-        a superseded warmer racing a fresh one to print the same value is
+        is in flight, the solver must not announce a result on the way out —
+        a superseded solver racing a fresh one to print the same value is
         exactly what produces duplicate "[ERD ready]" lines at the prompt."""
         words = [self._word(i) for i in range(10)]
 
@@ -2238,29 +2238,29 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
 
-        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
         def cancel_during_root(remaining, cache, sc, deadline=None,
                                 guesses=None, policy=None,
                                 progress_callback=None,
                                 cancel_check=None):
-            warmer.stop()  # e.g. the user moved on; a fresh warmer supersedes this one
+            solver.stop()  # e.g. the user moved on; a fresh solver supersedes this one
             return 1.8
 
         printed = []
-        warmer._rcache = FakeResponseCache()
+        solver._rcache = FakeResponseCache()
         with mock.patch('wordle.min_expected_guesses', side_effect=cancel_during_root), \
              mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
-            warmer._warm(score_cache)
+            solver._solve(score_cache)
 
         self.assertFalse(
             any('ERD ready' in str(a) for a in printed),
-            "a superseded warmer must not print a stale [ERD ready] announcement")
+            "a superseded solver must not print a stale [ERD ready] announcement")
 
     def test_ranking_uses_live_main_cache_after_solve(self):
         """After cmd_solve populates the main thread's ResponseCache, the
-        warmer should use those mappings directly in _ranked_root_guesses
+        solver should use those mappings directly in _ranked_root_guesses
         instead of recomputing or hitting SQLite."""
         words = [self._word(i) for i in range(10)]
 
@@ -2286,11 +2286,11 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
-        warmer = ERDWarmer(words, words, words, None, main_cache,
+        solver = ERDSolver(words, words, words, None, main_cache,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
         # run() must be called first to set self._rcache
-        warmer._rcache = FakeResponseCache()
+        solver._rcache = FakeResponseCache()
 
         # Count how many times calculate_group_counts is called as fallback.
         calc_calls = []
@@ -2303,7 +2303,7 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         with mock.patch('wordle.calculate_group_counts', side_effect=spy_calc), \
              mock.patch('wordle.min_expected_guesses', return_value=1.5), \
              mock.patch('builtins.print'):
-            warmer._warm(score_cache)
+            solver._solve(score_cache)
 
         # All words were in _main_rcache_dict, so calculate_group_counts
         # should not have been called for any of them during ranking.
@@ -2312,7 +2312,7 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
     def test_operational_error_in_pre_loop_read_is_caught(self):
         """sqlite3.OperationalError from score_cache.read() at the top of
-        _warm must be caught and printed rather than crashing the thread."""
+        _solve must be caught and printed rather than crashing the thread."""
         words = [self._word(i) for i in range(10)]
 
         class FakeResponseCache:
@@ -2327,13 +2327,13 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         score_cache = ErrorScoreCache()
         score_cache.set_scope('test-scope')
-        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
-        warmer._rcache = FakeResponseCache()
+        solver._rcache = FakeResponseCache()
 
         printed = []
         with mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
-            warmer._warm(score_cache)  # must not raise
+            solver._solve(score_cache)  # must not raise
 
         self.assertFalse(
             any('OperationalError' in str(a) for a in printed),
@@ -2341,7 +2341,7 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
     def test_run_sets_rcache_from_thread_private_connection(self):
         """run() must replace self._rcache with a thread-private ResponseCache
-        before calling _warm, so _ranked_root_guesses and min_expected_guesses
+        before calling _solve, so _ranked_root_guesses and min_expected_guesses
         never use the main thread's SQLite connection."""
         words = [self._word(i) for i in range(10)]
 
@@ -2353,24 +2353,24 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
-        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
-        self.assertIsNone(warmer._rcache,
+        self.assertIsNone(solver._rcache,
             "_rcache should be None before run() — it is set inside run()")
 
         rcaches_seen = []
-        original_warm = warmer._warm
-        def spy_warm(sc):
-            rcaches_seen.append(warmer._rcache)
+        original_solve = solver._solve
+        def spy_solve(sc):
+            rcaches_seen.append(solver._rcache)
             # Don't actually run the scan.
-        warmer._warm = spy_warm
+        solver._solve = spy_solve
 
-        warmer.run()
+        solver.run()
         self.assertEqual(len(rcaches_seen), 1)
         self.assertIsNotNone(rcaches_seen[0],
-            "run() must set _rcache before calling _warm")
-        self.assertIsNot(rcaches_seen[0], warmer._main_rcache_dict,
+            "run() must set _rcache before calling _solve")
+        self.assertIsNot(rcaches_seen[0], solver._main_rcache_dict,
             "_rcache must be a new thread-private ResponseCache, not the main dict")
 
     def test_cumulative_time_survives_pause_restart(self):
@@ -2389,9 +2389,9 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
 
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
-        warmer = ERDWarmer(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
-        warmer._rcache = FakeResponseCache()
+        solver._rcache = FakeResponseCache()
 
         # Monotonically increasing fake clocks so wall_elapsed/cpu_elapsed
         # are always positive, regardless of how many times each is called.
@@ -2416,8 +2416,8 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
                 progress_callback(1, len(words), words[0], 1.5)
                 return None  # simulate pause: caller waits and retries
             snapshot['pass'] = 2
-            snapshot['cpu_before_pass2'] = warmer.cumulative_cpu_s
-            snapshot['wall_before_pass2'] = warmer.cumulative_wall_s
+            snapshot['cpu_before_pass2'] = solver.cumulative_cpu_s
+            snapshot['wall_before_pass2'] = solver.cumulative_wall_s
             progress_callback(1, len(words), words[0], 1.5)
             progress_callback(2, len(words), words[1], 1.4)
             return 1.4  # final result: while-loop exits
@@ -2426,7 +2426,7 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
              mock.patch('wordle.time.thread_time', side_effect=fake_thread_time), \
              mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected), \
              mock.patch('builtins.print'):
-            warmer._warm(score_cache)
+            solver._solve(score_cache)
 
         # Pass 1's single progress callback already accumulated time before
         # pass 2 started — proving cumulative totals aren't reset alongside
@@ -2435,11 +2435,11 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
         self.assertGreater(snapshot['wall_before_pass2'], 0)
 
         # word_stats only reflects pass 2 (reset wiped pass 1's entry).
-        self.assertEqual(len(warmer.word_stats), 2)
+        self.assertEqual(len(solver.word_stats), 2)
 
         # But the cumulative totals include both passes' contributions.
-        self.assertGreater(warmer.cumulative_cpu_s, snapshot['cpu_before_pass2'])
-        self.assertGreater(warmer.cumulative_wall_s, snapshot['wall_before_pass2'])
+        self.assertGreater(solver.cumulative_cpu_s, snapshot['cpu_before_pass2'])
+        self.assertGreater(solver.cumulative_wall_s, snapshot['wall_before_pass2'])
 
 
 # ---------------------------------------------------------------------------

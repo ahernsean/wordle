@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b103"
+BUILD = "b104"
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +578,7 @@ class GameState:
         self.universe = GuessUniverse.ALL_WORDS
         self.compliance = ComplianceFilter.UNFILTERED
         self.last_erd_root_progress = (0, 0, None)  # (done, total, (best_word, best_erd))
-        self.warmer = None  # live reference to the current ERDWarmer, for cmd_help
+        self.solver = None  # live reference to the current ERDSolver, for cmd_help
         # constrained_erd_cache is intentionally NOT reset here — it is
         # long-lived and self-scoping (see __init__ and MemoryScoreCache).
 
@@ -731,7 +731,7 @@ def _is_hard_mode(gs):
     """True for real Wordle hard mode: all words, filtered to clue-compliant.
 
     The only cell of the grid whose eligible-guess vocabulary is
-    path-dependent (see _warmer_branch_key) — the other COMPLIANT cell
+    path-dependent (see _solver_branch_key) — the other COMPLIANT cell
     (answers-only) narrows to soln.current_words, which is already
     keyed by position and needs no extra vocabulary fingerprint.
     """
@@ -819,7 +819,7 @@ class _ERDModeConfig:
 
     Single source of truth for the (universe, compliance) → (cache, policy,
     persist, guesses) relationship, referenced by _erd_cache_and_policy,
-    cmd_solve, and the warmer-init block in main() so that mapping lives in
+    cmd_solve, and the solver-init block in main() so that mapping lives in
     exactly one place.
     """
     __slots__ = ('policy', 'persist', 'cache_attr', 'guesses_fn')
@@ -861,10 +861,10 @@ def _erd_mode_config(gs):
     return _ERD_MODE_CONFIG[(gs.universe, gs.compliance)]
 
 
-def _warmer_branch_key(gs, soln, effective_guesses):
-    """Identifies the (position, guess-vocabulary) a warmer is working on.
+def _solver_branch_key(gs, soln, effective_guesses):
+    """Identifies the (position, guess-vocabulary) a solver is working on.
 
-    Two snapshots compare equal exactly when a running warmer is still doing
+    Two snapshots compare equal exactly when a running solver is still doing
     useful work for the branch the user is now looking at — i.e. when it is
     safe to just let it keep going rather than tearing it down and starting
     an identical one from scratch (which would race the old one to compute
@@ -892,13 +892,13 @@ def _erd_cache_and_policy(gs, soln):
     return cfg.cache(gs, soln), cfg.policy
 
 
-def _erd_root_progress_tag(warmer, soln):
-    """Status-line fragment for ERD warmup progress on the current position.
+def _erd_root_progress_tag(solver, soln):
+    """Status-line fragment for ERD solve progress on the current position.
 
-    Reads directly off the live warmer rather than a snapshot in `gs`:
+    Reads directly off the live solver rather than a snapshot in `gs`:
     a snapshot taken before the current command ran (e.g. a guess that
     just narrowed current_words) would describe a now-superseded branch.
-    The word-set check below catches that: if the warmer's word set doesn't
+    The word-set check below catches that: if the solver's word set doesn't
     match the position we're about to display, its numbers aren't about
     this position, so there's nothing honest to show yet.
 
@@ -906,25 +906,25 @@ def _erd_root_progress_tag(warmer, soln):
       ordering    root_total == 0 (_ranked_root_guesses running)
       scanning    root_total > 0
     """
-    if warmer is None or set(warmer._words) != set(soln.current_words):
+    if solver is None or set(solver._words) != set(soln.current_words):
         return ''
-    if warmer.root_total < 0:
+    if solver.root_total < 0:
         return ''  # trivial position (≤2 words); no scan runs
-    if warmer.root_total == 0:
+    if solver.root_total == 0:
         return '  [ERD: ordering candidates...]'
 
-    current = warmer.current_word_tag()
+    current = solver.current_word_tag()
     in_progress = ''
     if current is not None:
         word, elapsed, writes = current
         if elapsed >= 2.0:  # avoid noise on words that finish almost instantly
             in_progress = f', {word.upper()} {elapsed:.0f}s +{writes} cached'
 
-    if warmer.root_best is not None:
-        bw, bs = warmer.root_best
-        return (f'  [ERD: scanning {warmer.root_done}/{warmer.root_total}{in_progress} '
+    if solver.root_best is not None:
+        bw, bs = solver.root_best
+        return (f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress} '
                 f'— best so far {bw.upper()} {bs:.3f}]')
-    return f'  [ERD: scanning {warmer.root_done}/{warmer.root_total}{in_progress}]'
+    return f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress}]'
 
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
@@ -1532,12 +1532,12 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     # purely from cache — never computed here. Exact ERD search over a large
     # guess vocabulary is combinatorially expensive (a single subgroup can
     # take tens of seconds), and that cost belongs solely to the background
-    # ERDWarmer, which uses its own short deadlines to detect when it has
+    # ERDSolver, which uses its own short deadlines to detect when it has
     # bitten off more than it can chew. The foreground must never block on
     # it: each subgroup is an instant cache read, exactly mirroring how
     # print_status's ERD tag already works. A miss means "not cached yet" —
     # reported as unavailable (None) — not a cue to compute it live. As the
-    # warmer keeps populating the cache in the background, more of these
+    # solver keeps populating the cache in the background, more of these
     # lookups become hits for free.
     erd = None
     if not soln._is_full_game():
@@ -1546,9 +1546,9 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
             # vocabulary depends on the exact constraints accumulated so
             # far) and must never reach the persisted, cross-game SQLite
             # cache. erd_cache (when supplied) is the long-lived,
-            # vocabulary-scoped MemoryScoreCache shared with the warmer for
+            # vocabulary-scoped MemoryScoreCache shared with the solver for
             # this position — surfacing from it lets try-mode see whatever
-            # the warmer has already found. A throwaway empty cache is the
+            # the solver has already found. A throwaway empty cache is the
             # fallback for callers that don't have one (e.g. tests), which
             # simply means nothing is surfaceable yet.
             erd_policy = ERD_CONSTRAINED
@@ -1691,7 +1691,7 @@ def cmd_test(gs, inline=''):
         step2_pool = None
         constraint_compliant = True
         # Reuse the long-lived, vocabulary-scoped hard-mode ERD cache so
-        # try-mode and the background warmer trade sub-results for free —
+        # try-mode and the background solver trade sub-results for free —
         # both use the exact same eligible-guess vocabulary for this position.
         eligible = soln.constraint_compliant_words(gs.all_words)
         gs.constrained_erd_cache.set_scope(
@@ -2116,9 +2116,9 @@ def cmd_help(gs):
   Cache: {gs.score_cache_path}
     {la_rows:,} subgroup picks, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
 """)
-    warmer = gs.warmer
-    if warmer is not None and warmer.word_stats:
-        stats = warmer.word_stats
+    solver = gs.solver
+    if solver is not None and solver.word_stats:
+        stats = solver.word_stats
         has_cpu = any(r[3] is not None for r in stats)
         total_wall = sum(r[2] for r in stats)
         total_cpu  = sum(r[3] for r in stats if r[3] is not None)
@@ -2133,12 +2133,12 @@ def cmd_help(gs):
         if has_cpu:
             print(f"  ERD root scan: {len(stats)} words timed this pass, "
                   f"{_fmt_t(total_cpu)} cpu / {_fmt_t(total_wall)} wall  "
-                  f"(cumulative: {_fmt_t(warmer.cumulative_cpu_s)} cpu / "
-                  f"{_fmt_t(warmer.cumulative_wall_s)} wall)")
+                  f"(cumulative: {_fmt_t(solver.cumulative_cpu_s)} cpu / "
+                  f"{_fmt_t(solver.cumulative_wall_s)} wall)")
         else:
             print(f"  ERD root scan: {len(stats)} words timed this pass, "
                   f"{_fmt_t(total_wall)} wall  "
-                  f"(cumulative: {_fmt_t(warmer.cumulative_wall_s)} wall)")
+                  f"(cumulative: {_fmt_t(solver.cumulative_wall_s)} wall)")
         hdr_time = "cpu/wall" if has_cpu else "wall"
         hdr_per_miss = "cpu/miss" if has_cpu else "wall/miss"
         print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>16}  {'hits':>10}  {'misses':>7}  {hdr_per_miss:>8}")
@@ -2179,10 +2179,10 @@ COMMANDS = {
 }
 
 
-def print_status(gs, warmer=None):
+def print_status(gs, solver=None):
     """Print current game status.
 
-    warmer: the live ERDWarmer for the current position, if any — passed
+    solver: the live ERDSolver for the current position, if any — passed
             through so the ERD progress tag can be validated against the
             position actually being displayed (see _erd_root_progress_tag).
     """
@@ -2212,7 +2212,7 @@ def print_status(gs, warmer=None):
                     if hit is not None:
                         erd_tag = f'  [ERD: {hit[1]:.3f} {hit[0].upper()}]'
                     else:
-                        erd_tag = _erd_root_progress_tag(warmer, soln)
+                        erd_tag = _erd_root_progress_tag(solver, soln)
             print(f"{n:,} words remaining")
             if erd_tag:
                 print(erd_tag.strip())
@@ -2241,10 +2241,10 @@ def print_status(gs, warmer=None):
 
 
 # ---------------------------------------------------------------------------
-# ERD background warmer
+# ERD background solver
 # ---------------------------------------------------------------------------
 
-class ERDWarmer(threading.Thread):
+class ERDSolver(threading.Thread):
     """Daemon thread: fills the ERD cache proactively for the current position.
 
     Runs while the main thread blocks on input(), giving background ERD
@@ -2266,20 +2266,20 @@ class ERDWarmer(threading.Thread):
     def __init__(self, current_words, all_answers, effective_guesses,
                  score_cache_path, response_cache,
                  policy=ERD_ALL, persist=True, seed_mem_cache=None):
-        super().__init__(daemon=True, name='ERDWarmer')
+        super().__init__(daemon=True, name='ERDSolver')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
         self._effective_guesses = effective_guesses
         self._cache_path = score_cache_path
         # Keep a live reference to the main thread's decomposition dict.
-        # The warmer must open its own SQLite connection (connections aren't
+        # The solver must open its own SQLite connection (connections aren't
         # thread-safe), so it can't share the caller's ResponseCache object.
         # But the _cache dict itself is pure Python and append-only: the main
         # thread only ever adds entries, never removes or mutates them, so
-        # reading it from the warmer thread is safe under CPython's GIL.
+        # reading it from the solver thread is safe under CPython's GIL.
         # _ranked_root_guesses checks this dict first; a hit avoids both
         # SQLite I/O and re-computation, even for entries added after the
-        # warmer was constructed (e.g. while cmd_solve was running).
+        # solver was constructed (e.g. while cmd_solve was running).
         self._main_rcache_dict = response_cache._cache
         # Index into the per-guess pattern blobs in _main_rcache_dict — built
         # from the same canonical answer list, so positions agree with the
@@ -2305,7 +2305,7 @@ class ERDWarmer(threading.Thread):
         # only by this thread, so plain attributes are safe under the GIL.
         self.current_word = None        # word being evaluated right now, or None
         self.current_word_start = None  # time.time() when it started
-        self._score_cache = None        # set in _warm; live write_count source
+        self._score_cache = None        # set in _solve; live write_count source
         self._word_write_baseline = 0   # score_cache.write_count at word start
         # Sums of wall_elapsed/cpu_elapsed across ALL passes (while-loop
         # iterations) for this position, never reset. word_stats only holds
@@ -2342,7 +2342,7 @@ class ERDWarmer(threading.Thread):
         self._rcache = ResponseCache(self._all_answers,
                                      score_cache if self._persist else None)
         try:
-            self._warm(score_cache)
+            self._solve(score_cache)
         finally:
             if self._persist:
                 score_cache.close()
@@ -2418,7 +2418,7 @@ class ERDWarmer(threading.Thread):
         writes = self._score_cache.write_count - self._word_write_baseline
         return self.current_word, elapsed, writes
 
-    def _warm(self, score_cache):
+    def _solve(self, score_cache):
         policy = self._policy
         root_key = ScoreCache.encode_subset(self._words)
         try:
@@ -2522,14 +2522,14 @@ def main():
     gs = GameState(all_answers, all_words)
 
     print_status(gs)
-    _warmer = None
-    _warmer_key = None
+    _solver = None
+    _solver_key = None
     while True:
-        # Keep a warmer running for the current game position across REPL
+        # Keep a solver running for the current game position across REPL
         # turns — tearing it down and rebuilding it on every keystroke (even
         # when the branch hasn't changed) starves it of the very thing that
         # makes it useful: minutes of uninterrupted background time to build
-        # out the ERD cache.  It also raced a fresh warmer against the old
+        # out the ERD cache.  It also raced a fresh solver against the old
         # one's still-finishing root computation, producing duplicate
         # "[ERD ready]" announcements for the same value.  Replace it only
         # when the branch actually changes (or the game ends); otherwise let
@@ -2538,10 +2538,10 @@ def main():
             soln0 = gs.solutions[0]
             cfg = _erd_mode_config(gs)
             effective_guesses = cfg.guesses_fn(gs, soln0)
-            branch_key = _warmer_branch_key(gs, soln0, effective_guesses)
-            if _warmer is None or not _warmer.is_alive() or branch_key != _warmer_key:
-                if _warmer is not None:
-                    _warmer.stop()
+            branch_key = _solver_branch_key(gs, soln0, effective_guesses)
+            if _solver is None or not _solver.is_alive() or branch_key != _solver_key:
+                if _solver is not None:
+                    _solver.stop()
                 seed_cache = None
                 if _is_hard_mode(gs):
                     # Hard-mode ERD results are valid only for the exact
@@ -2553,7 +2553,7 @@ def main():
                     # automatically — no eviction needed.
                     gs.constrained_erd_cache.set_scope(branch_key[2])
                     seed_cache = gs.constrained_erd_cache
-                _warmer = ERDWarmer(
+                _solver = ERDSolver(
                     soln0.current_words,
                     gs.all_answers,
                     effective_guesses,
@@ -2563,58 +2563,58 @@ def main():
                     persist=cfg.persist,
                     seed_mem_cache=seed_cache,
                 )
-                _warmer.start()
-                _warmer_key = branch_key
-        elif _warmer is not None:
-            _warmer.stop()
-            _warmer = None
-            _warmer_key = None
+                _solver.start()
+                _solver_key = branch_key
+        elif _solver is not None:
+            _solver.stop()
+            _solver = None
+            _solver_key = None
 
         print(f"\n{datetime.now().strftime('%H:%M:%S')}")
         print(f"Command (gsbldtixurawcv?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:
-            if _warmer is not None:
-                _warmer.stop()
+            if _solver is not None:
+                _solver.stop()
             print()
             print("Exiting.")
             break
         except KeyboardInterrupt:
-            if _warmer is not None:
-                _warmer.stop()
+            if _solver is not None:
+                _solver.stop()
             print()
             print("Interrupted.")
             break
 
-        if _warmer is not None:
-            gs.last_erd_root_progress = (_warmer.root_done, _warmer.root_total,
-                                         _warmer.root_best)
-        gs.warmer = _warmer
+        if _solver is not None:
+            gs.last_erd_root_progress = (_solver.root_done, _solver.root_total,
+                                         _solver.root_best)
+        gs.solver = _solver
 
         if not cmd:
-            print_status(gs, _warmer)
+            print_status(gs, _solver)
             continue
         handler = COMMANDS.get(cmd[0])
         if handler:
             try:
                 inline = cmd[1:].strip()
-                if _warmer is not None:
-                    _warmer.pause()
+                if _solver is not None:
+                    _solver.pause()
                 try:
                     if inline and handler is cmd_test:
                         cmd_test(gs, inline)
                     else:
                         handler(gs)
                 finally:
-                    if _warmer is not None:
-                        _warmer.resume()
+                    if _solver is not None:
+                        _solver.resume()
             except Exception as e:
                 print_error(f"Error: {e}")
                 raise
         else:
             print_error(f"Unknown: {cmd}")
-        print_status(gs, _warmer)
+        print_status(gs, _solver)
 
 
 if __name__ == '__main__':
