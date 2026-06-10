@@ -282,58 +282,64 @@ def calculate_group_counts(test_word, words):
 class ResponseCache:
     """Lazily caches word-to-pattern mappings for each guess word.
 
-    For each guess word G, stores a dict mapping every answer word
-    to its encoded response pattern (int 0-242). This is built
-    once per guess word on first access, then all subsequent
-    scoring against any subset is just dict lookups and counting.
+    For each guess word G, stores a compact bytes blob giving every answer
+    word's encoded response pattern (int 0-242), one byte per answer in
+    canonical (self.answer_words) order. This is built once per guess word
+    on first access, then all subsequent scoring against any subset is just
+    an index lookup (via _answer_index) and counting.
+
+    A {answer: pattern} dict per guess costs ~100KB (Python dict/str/int
+    overhead dominates the single byte of real information per entry).
+    Scoring the full guess vocabulary (~13,000 words) against any position
+    would then build a ~1.3GB cache — enough to OOM a memory-constrained
+    host. The bytes blob costs ~3.2KB per guess instead, ~32x smaller, with
+    the same O(1) lookup via the shared _answer_index.
     """
 
     def __init__(self, answer_words, score_cache=None):
         self.answer_words = answer_words
         self.score_cache = score_cache
-        self._cache = {}   # guess → {answer → pattern_int}
+        self._answer_index = {word: i for i, word in enumerate(answer_words)}
+        self._cache = {}   # guess → bytes (pattern_int per answer, canonical order)
 
     def _ensure(self, guess):
         """Build the mapping for guess if not cached, persisting/reloading via SQLite.
 
-        The decomposition (guess -> {answer: pattern}) is the same for every
+        The decomposition (guess -> pattern bytes) is the same for every
         position in every session against this answer universe, so it is
         cached to disk as a compact byte blob — one byte per answer word, in
         canonical (self.answer_words) order — keyed only by guess+universe.
         """
         if guess in self._cache:
             return
-        mapping = self._load_decomposition(guess)
-        if mapping is None:
-            mapping = {}
-            for answer in self.answer_words:
-                resp = calculate_response(guess, answer)
-                mapping[answer] = _encode_response(resp)
-            self._store_decomposition(guess, mapping)
-        self._cache[guess] = mapping
+        blob = self._load_decomposition(guess)
+        if blob is None:
+            blob = bytes(
+                _encode_response(calculate_response(guess, answer))
+                for answer in self.answer_words
+            )
+            self._store_decomposition(guess, blob)
+        self._cache[guess] = blob
 
     def _load_decomposition(self, guess):
         if not self.score_cache:
             return None
-        blob = self.score_cache.read_decomposition(guess)
-        if blob is None:
-            return None
-        return {answer: blob[i] for i, answer in enumerate(self.answer_words)}
+        return self.score_cache.read_decomposition(guess)
 
-    def _store_decomposition(self, guess, mapping):
+    def _store_decomposition(self, guess, blob):
         if not self.score_cache:
             return
-        blob = bytes(mapping[answer] for answer in self.answer_words)
         self.score_cache.write_decomposition(guess, blob)
 
     def group_counts(self, guess, subset):
         """Return {pattern_int: count} for guess vs subset."""
         self._ensure(guess)
-        mapping = self._cache[guess]
+        blob = self._cache[guess]
         counts = defaultdict(int)
         for word in subset:
-            if word in mapping:
-                counts[mapping[word]] += 1
+            idx = self._answer_index.get(word)
+            if idx is not None:
+                counts[blob[idx]] += 1
             else:
                 resp = calculate_response(guess, word)
                 counts[_encode_response(resp)] += 1
@@ -342,11 +348,12 @@ class ResponseCache:
     def group_words(self, guess, subset):
         """Return {pattern_int: [words]} for guess vs subset."""
         self._ensure(guess)
-        mapping = self._cache[guess]
+        blob = self._cache[guess]
         groups = defaultdict(list)
         for word in subset:
-            if word in mapping:
-                groups[mapping[word]].append(word)
+            idx = self._answer_index.get(word)
+            if idx is not None:
+                groups[blob[idx]].append(word)
             else:
                 resp = calculate_response(guess, word)
                 groups[_encode_response(resp)].append(word)

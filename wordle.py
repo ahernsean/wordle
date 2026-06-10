@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b98"
+BUILD = "b99"
 
 
 # ---------------------------------------------------------------------------
@@ -2279,6 +2279,11 @@ class ERDWarmer(threading.Thread):
         # SQLite I/O and re-computation, even for entries added after the
         # warmer was constructed (e.g. while cmd_solve was running).
         self._main_rcache_dict = response_cache._cache
+        # Index into the per-guess pattern blobs in _main_rcache_dict — built
+        # from the same canonical answer list, so positions agree with the
+        # main thread's ResponseCache without sharing its (thread-unsafe)
+        # SQLite-backed instance.
+        self._main_rcache_index = {w: i for i, w in enumerate(self._all_answers)}
         self._rcache = None   # set in run() after opening a thread-private connection
         self._policy = policy
         self._persist = persist
@@ -2365,13 +2370,14 @@ class ERDWarmer(threading.Thread):
                 return self._effective_guesses
             mapping = self._main_rcache_dict.get(word)
             if mapping is not None:
-                # Use the main thread's already-computed pattern mapping.
+                # Use the main thread's already-computed pattern blob.
                 # Populated by cmd_solve; reading it here is safe because
-                # inner dicts are never mutated after creation (GIL-safe).
+                # blobs are never mutated after creation (GIL-safe).
                 counts = {}
                 for ans in self._words:
-                    pat = mapping.get(ans)
-                    if pat is not None:
+                    idx = self._main_rcache_index.get(ans)
+                    if idx is not None:
+                        pat = mapping[idx]
                         counts[pat] = counts.get(pat, 0) + 1
             else:
                 counts = calculate_group_counts(word, self._words)

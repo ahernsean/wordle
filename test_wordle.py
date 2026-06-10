@@ -1010,25 +1010,25 @@ class TestResponseCachePersistence(unittest.TestCase):
         sc1 = ScoreCache(self.db, ANSWERS)
         cache1 = ResponseCache(ANSWERS, score_cache=sc1)
         cache1._ensure("crane")
-        expected = dict(cache1._cache["crane"])
+        expected = bytes(cache1._cache["crane"])
 
         sc2 = ScoreCache(self.db, ANSWERS)
         cache2 = ResponseCache(ANSWERS, score_cache=sc2)
         with mock.patch('wordle_engine.calculate_response') as fake_calc:
             cache2._ensure("crane")
             fake_calc.assert_not_called()
-        self.assertEqual(dict(cache2._cache["crane"]), expected)
+        self.assertEqual(bytes(cache2._cache["crane"]), expected)
 
     def test_decomposition_reload_matches_freshly_computed(self):
         sc1 = ScoreCache(self.db, ANSWERS)
         cache1 = ResponseCache(ANSWERS, score_cache=sc1)
         cache1._ensure("crane")
-        expected = dict(cache1._cache["crane"])
+        expected = bytes(cache1._cache["crane"])
 
         sc2 = ScoreCache(self.db, ANSWERS)
         cache2 = ResponseCache(ANSWERS, score_cache=sc2)
         cache2._ensure("crane")
-        self.assertEqual(dict(cache2._cache["crane"]), expected)
+        self.assertEqual(bytes(cache2._cache["crane"]), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -2279,9 +2279,10 @@ class TestERDWarmerKeepsWorking(unittest.TestCase):
                 return {}
 
         main_cache = FakeResponseCache()
-        # Simulate what cmd_solve does: populate _cache with pattern mappings.
+        # Simulate what cmd_solve does: populate _cache with pattern blobs
+        # (one byte per answer word, in canonical `words` order).
         for word in words:
-            main_cache._cache[word] = {w: i % 3 for i, w in enumerate(words)}
+            main_cache._cache[word] = bytes(i % 3 for i in range(len(words)))
 
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
