@@ -23,7 +23,7 @@ from wordle_engine import (
     score_word, score_word_multi, load_word_list, max_entropy,
     Restriction, answer_to_restriction, apply_guess, _encode_response,
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
-    ERD_ANSWERS_UNFILTERED, cache_all_scores,
+    ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -845,6 +845,51 @@ class TestScoreCacheSQLite(unittest.TestCase):
         result = dict(sc.read_scores(subset_key, "entropy_gain"))
         self.assertEqual(result, {"crane": 1.0})
 
+    def test_read_detail_returns_word_score_and_timestamp(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        before = int(time.time())
+        sc.write(key, "erd_words_unfiltered", "crane", 1.5)
+        after = int(time.time())
+
+        detail = sc.read_detail(key, "erd_words_unfiltered")
+        self.assertEqual(detail[0], "crane")
+        self.assertAlmostEqual(detail[1], 1.5)
+        self.assertGreaterEqual(detail[2], before)
+        self.assertLessEqual(detail[2], after)
+
+    def test_read_detail_miss_returns_none(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        self.assertIsNone(sc.read_detail(key, "erd_words_unfiltered"))
+
+    def test_delete_removes_entry(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write(key, "erd_words_unfiltered", "crane", 1.5)
+
+        sc.delete(key, "erd_words_unfiltered")
+
+        self.assertIsNone(sc.read(key, "erd_words_unfiltered"))
+        self.assertIsNone(sc.read_detail(key, "erd_words_unfiltered"))
+        self.assertNotIn((key, "erd_words_unfiltered"), sc._mem_cache)
+
+    def test_delete_persists_across_connections(self):
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        sc1 = ScoreCache(self.db, ANSWERS)
+        sc1.write(key, "erd_words_unfiltered", "crane", 1.5)
+        sc1.delete(key, "erd_words_unfiltered")
+        sc1.close()
+
+        sc2 = ScoreCache(self.db, ANSWERS)
+        self.assertIsNone(sc2.read(key, "erd_words_unfiltered"))
+
+    def test_delete_of_missing_entry_is_a_no_op(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.delete(key, "erd_words_unfiltered")  # must not raise
+        self.assertIsNone(sc.read(key, "erd_words_unfiltered"))
+
 
 # ---------------------------------------------------------------------------
 # Transparent SQLite persistence across sessions
@@ -1364,6 +1409,144 @@ class TestMinExpectedGuessesLowerBoundPruning(unittest.TestCase):
                 self.assertAlmostEqual(
                     pruned, expected, places=10,
                     msg=f"mismatch for {subset}")
+
+
+# ---------------------------------------------------------------------------
+# verify_erd_cache
+# ---------------------------------------------------------------------------
+
+class _MultiPartitionCache:
+    """Stub for soln.cache: group_words(word, subset) returns a fixed
+    partition keyed only by `word`, ignoring `subset`. Each test below
+    only ever looks up the (word, subset) pairs it set up, so a
+    word-keyed table is enough to drive verify_erd_cache deterministically
+    without a real ResponseCache."""
+
+    def __init__(self, partitions):
+        self._partitions = partitions
+
+    def group_words(self, word, subset):
+        return self._partitions[word]
+
+
+class TestVerifyErdCache(unittest.TestCase):
+    """verify_erd_cache reconstructs 1 + sum (k_i/n)*sub_score from a cached
+    entry's own subtree and compares it to the entry's stored best_score —
+    without recomputing anything via min_expected_guesses."""
+
+    WORDS = ["alpha", "beta", "c1", "c2", "c3", "c4"]
+
+    # 'alpha' splits the 6 words into: itself (self, contributes 0),
+    # 'beta' (non-self singleton, contributes 1/6), and two cached size-2
+    # groups each worth 1.5 (contributing (2/6)*1.5 = 0.5 each).
+    ROOT_PARTITION = {
+        'self': ['alpha'], 'other': ['beta'],
+        'g1': ['c1', 'c2'], 'g2': ['c3', 'c4'],
+    }
+    # Each size-2 group splits into a self singleton and one other
+    # singleton: 1 + (1/2)*1 = 1.5.
+    PAIR1_PARTITION = {'self': ['c1'], 'other': ['c2']}
+    PAIR2_PARTITION = {'self': ['c3'], 'other': ['c4']}
+
+    ROOT_SCORE = 13 / 6  # 1 + 1/6 + 0.5 + 0.5
+
+    def _full_cache(self):
+        return _MultiPartitionCache({
+            'alpha': self.ROOT_PARTITION,
+            'c1': self.PAIR1_PARTITION,
+            'c3': self.PAIR2_PARTITION,
+        })
+
+    def test_uncached_root_reports_uncached(self):
+        sc = MemoryScoreCache()
+        sc.set_scope('test')
+        cache = _MultiPartitionCache({})
+
+        report = verify_erd_cache(self.WORDS, cache, sc, ERD_ALL)
+
+        self.assertEqual(len(report), 1)
+        self.assertEqual(report[0]['status'], 'uncached')
+
+    def test_fully_consistent_tree_reports_match(self):
+        sc = MemoryScoreCache()
+        sc.set_scope('test')
+        sc.write(ScoreCache.encode_subset(self.WORDS), ERD_ALL,
+                 'alpha', self.ROOT_SCORE)
+        sc.write(ScoreCache.encode_subset(['c1', 'c2']), ERD_ALL, 'c1', 1.5)
+        sc.write(ScoreCache.encode_subset(['c3', 'c4']), ERD_ALL, 'c3', 1.5)
+
+        report = verify_erd_cache(self.WORDS, self._full_cache(), sc, ERD_ALL)
+
+        self.assertEqual(len(report), 3)
+        for r in report:
+            self.assertEqual(r['status'], 'match', r)
+            self.assertTrue(r['complete'], r)
+            self.assertAlmostEqual(r['reconstructed'], r['best_score'])
+
+    def test_uncached_subgroups_report_incomplete(self):
+        # Root entry whose g1/g2 subgroups were never cached — e.g. pruned
+        # away entirely by cost_lb (b95) without recursing into them.
+        sc = MemoryScoreCache()
+        sc.set_scope('test')
+        sc.write(ScoreCache.encode_subset(self.WORDS), ERD_ALL, 'alpha', 10.0)
+        cache = _MultiPartitionCache({'alpha': self.ROOT_PARTITION})
+
+        report = verify_erd_cache(self.WORDS, cache, sc, ERD_ALL)
+
+        self.assertEqual(len(report), 1)
+        root = report[0]
+        self.assertEqual(root['status'], 'incomplete')
+        self.assertFalse(root['complete'])
+        self.assertLess(root['reconstructed'], root['best_score'])
+
+    def test_inconsistent_root_reports_mismatch(self):
+        # Subtree (g1, g2) is internally consistent at 1.5 each, but the
+        # root's stored score (2.0) doesn't match the reconstruction from
+        # that subtree (13/6 ~= 2.1667) — a provable contradiction.
+        sc = MemoryScoreCache()
+        sc.set_scope('test')
+        sc.write(ScoreCache.encode_subset(self.WORDS), ERD_ALL, 'alpha', 2.0)
+        sc.write(ScoreCache.encode_subset(['c1', 'c2']), ERD_ALL, 'c1', 1.5)
+        sc.write(ScoreCache.encode_subset(['c3', 'c4']), ERD_ALL, 'c3', 1.5)
+
+        report = verify_erd_cache(self.WORDS, self._full_cache(), sc, ERD_ALL)
+
+        root = report[0]
+        self.assertEqual(root['status'], 'mismatch')
+        self.assertAlmostEqual(root['reconstructed'], self.ROOT_SCORE)
+        self.assertAlmostEqual(root['best_score'], 2.0)
+
+    def test_partial_sum_exceeding_best_score_is_mismatch(self):
+        # Even with g2 uncached, g1 alone (0.5) plus the 'beta' singleton
+        # (1/6) plus the base 1.0 already exceeds a too-low claimed score.
+        sc = MemoryScoreCache()
+        sc.set_scope('test')
+        sc.write(ScoreCache.encode_subset(self.WORDS), ERD_ALL, 'alpha', 1.5)
+        sc.write(ScoreCache.encode_subset(['c1', 'c2']), ERD_ALL, 'c1', 1.5)
+        cache = _MultiPartitionCache({
+            'alpha': self.ROOT_PARTITION, 'c1': self.PAIR1_PARTITION,
+        })
+
+        report = verify_erd_cache(self.WORDS, cache, sc, ERD_ALL)
+
+        root = report[0]
+        self.assertEqual(root['status'], 'mismatch')
+        self.assertFalse(root['complete'])
+        self.assertGreater(root['reconstructed'], root['best_score'])
+
+    def test_max_nodes_caps_report_length(self):
+        sc = MemoryScoreCache()
+        sc.set_scope('test')
+        sc.write(ScoreCache.encode_subset(self.WORDS), ERD_ALL,
+                 'alpha', self.ROOT_SCORE)
+        sc.write(ScoreCache.encode_subset(['c1', 'c2']), ERD_ALL, 'c1', 1.5)
+        sc.write(ScoreCache.encode_subset(['c3', 'c4']), ERD_ALL, 'c3', 1.5)
+
+        report = verify_erd_cache(self.WORDS, self._full_cache(), sc, ERD_ALL,
+                                   max_nodes=1)
+
+        self.assertEqual(len(report), 1)
+        self.assertEqual(report[0]['status'], 'match')
 
 
 # ---------------------------------------------------------------------------

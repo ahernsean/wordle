@@ -29,7 +29,7 @@ from wordle_engine import (
     calculate_group_counts, score_groups, score_groups_multi,
     decode_response, max_entropy,
     answer_to_restriction,
-    min_expected_guesses,
+    min_expected_guesses, verify_erd_cache,
     ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
 )
 
@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b97"
+BUILD = "b98"
 
 
 # ---------------------------------------------------------------------------
@@ -1908,6 +1908,67 @@ def cmd_undo(gs):
 
 
 # ---------------------------------------------------------------------------
+# Command: Verify ERD cache
+# ---------------------------------------------------------------------------
+
+def cmd_verify_erd(gs):
+    if gs.single:
+        soln = gs.solutions[0]
+    else:
+        result = pick_one(gs, "Verify. ")
+        if result is None:
+            return
+        _, soln = result
+
+    set_display_context(soln)
+
+    if soln._is_full_game():
+        print_error("No ERD entry to verify for the starting position.")
+        return
+
+    erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+    if erd_sc is None:
+        print_error("ERD not available for this mode.")
+        return
+
+    words = soln.current_words
+    report = verify_erd_cache(words, soln.cache, erd_sc, erd_policy)
+    root = report[0]
+
+    print(f"\nERD cache check: {len(words)} words, policy {erd_policy}")
+    if root['status'] == 'uncached':
+        print("  Not cached yet.")
+        return
+
+    print(f"  root: best={root['best_word'].upper()} {root['best_score']:.4f}  "
+          f"reconstructed={root['reconstructed']:.4f}  [{root['status'].upper()}]")
+
+    if isinstance(erd_sc, ScoreCache):
+        detail = erd_sc.read_detail(ScoreCache.encode_subset(words), erd_policy)
+        if detail:
+            ts = datetime.fromtimestamp(detail[2]).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"  written: {ts} local")
+
+    counts = {}
+    for r in report:
+        counts[r['status']] = counts.get(r['status'], 0) + 1
+    summary = ", ".join(f"{n} {s}" for s, n in counts.items())
+    print(f"  checked {len(report)} cached subtree node(s): {summary}")
+
+    mismatches = [r for r in report if r['status'] == 'mismatch']
+    for r in mismatches[:5]:
+        print(f"    MISMATCH: {r['n']}-word subset, best={r['best_word'].upper()} "
+              f"{r['best_score']:.4f} vs reconstructed {r['reconstructed']:.4f}")
+
+    if root['status'] == 'mismatch' and isinstance(erd_sc, ScoreCache):
+        print("\n  Root entry contradicts its own cached subtree.")
+        print("  d = delete it so it recomputes  (anything else = leave it)")
+        if input().strip().lower() == 'd':
+            erd_sc.delete(ScoreCache.encode_subset(words), erd_policy)
+            print("  Deleted.")
+
+
+# ---------------------------------------------------------------------------
 # Command: Answer (simulation mode)
 # ---------------------------------------------------------------------------
 
@@ -2043,6 +2104,7 @@ def cmd_help(gs):
   i = Include letters (filter)
   x = eXclude letters (filter)
   u = Undo last guess  ({nguesses} guesses so far)
+  v = Verify ERD cache entry for this position
   r = Reset
   a = Answer for simulation ({sim})
   w = Game count (quordle, etc.)
@@ -2106,6 +2168,7 @@ COMMANDS = {
     'i': cmd_include,
     'x': cmd_exclude,
     'u': cmd_undo,
+    'v': cmd_verify_erd,
     'r': cmd_reset,
     'a': cmd_answer,
     'w': cmd_wordcount,
@@ -2498,7 +2561,7 @@ def main():
             _warmer_key = None
 
         print(f"\n{datetime.now().strftime('%H:%M:%S')}")
-        print(f"Command (gsbldtixurawc?)? ", end="")
+        print(f"Command (gsbldtixurawcv?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:

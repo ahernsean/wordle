@@ -953,3 +953,78 @@ def min_expected_guesses(remaining, cache, score_cache,
         cache_all_scores(best_word, remaining, score_cache, subset_key, cache=cache)
 
     return best_erd
+
+
+def verify_erd_cache(words, cache, score_cache, policy, max_nodes=2000):
+    """Spot-check a cached ERD entry against its own cached subtree.
+
+    For `words` and (recursively) every cached subgroup reachable through
+    best_word's response partition, recompute
+    1 + sum_i (k_i/n) * sub_best_score_i
+    from whatever subgroup entries are themselves cached, and compare it to
+    the entry's own best_score. Every cached sub_best_score is >= 1, so a
+    partial sum (some subgroups uncached) can only be <= the true total —
+    if it already exceeds best_score, best_score itself must be wrong.
+
+    This catches a cached entry that is internally inconsistent with its
+    own subtree (e.g. left over from a different/older computation) without
+    needing to recompute anything from scratch. It cannot prove a
+    self-consistent value is the *correct* one, but a contradiction proves
+    it is *wrong*.
+
+    Returns a list of dicts (BFS order, root first), each with keys
+    n, best_word, best_score, reconstructed, complete, status, subset_key.
+    status is one of:
+      'uncached'   - no entry for this subset (only possible for the root)
+      'match'      - reconstruction matches best_score and every k>=2
+                     subgroup was cached
+      'incomplete' - some k>=2 subgroup is uncached, but the partial
+                     reconstruction is still consistent (<= best_score)
+      'mismatch'   - reconstruction (partial or complete) contradicts
+                     best_score
+    Capped at max_nodes entries.
+    """
+    root_key = ScoreCache.encode_subset(words)
+    hit = score_cache.read(root_key, policy)
+    if hit is None:
+        return [{'n': len(words), 'subset_key': root_key, 'status': 'uncached'}]
+
+    visited = {root_key}
+    queue = [(words, root_key, hit[0], hit[1])]
+    report = []
+    while queue and len(report) < max_nodes:
+        cur_words, cur_key, cur_word, cur_score = queue.pop(0)
+        n = len(cur_words)
+        groups = cache.group_words(cur_word, cur_words)
+        reconstructed = 1.0
+        complete = True
+        for sg in groups.values():
+            k = len(sg)
+            if k == 0:
+                continue
+            if k == 1 and sg[0] == cur_word:
+                continue  # self: solved, contributes 0
+            if k == 1:
+                reconstructed += 1.0 / n
+                continue
+            sg_key = ScoreCache.encode_subset(sg)
+            sub_hit = score_cache.read(sg_key, policy)
+            if sub_hit is None:
+                complete = False
+                continue
+            reconstructed += (k / n) * sub_hit[1]
+            if sg_key not in visited and len(report) + len(queue) < max_nodes:
+                visited.add(sg_key)
+                queue.append((sg, sg_key, sub_hit[0], sub_hit[1]))
+
+        if complete:
+            status = 'match' if abs(reconstructed - cur_score) < 1e-9 else 'mismatch'
+        else:
+            status = 'mismatch' if reconstructed > cur_score + 1e-9 else 'incomplete'
+
+        report.append({
+            'n': n, 'best_word': cur_word, 'best_score': cur_score,
+            'reconstructed': reconstructed, 'complete': complete,
+            'status': status, 'subset_key': cur_key,
+        })
+    return report

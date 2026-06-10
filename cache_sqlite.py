@@ -283,6 +283,34 @@ class ScoreCache:
         self.write_count += 1
         self._mem_cache[(subset_key, policy)] = (best_word, best_score)
 
+    def read_detail(self, subset_key, policy):
+        """Like read(), but also returns the unix timestamp of the last write.
+
+        Returns (best_word, best_score, updated_at) or None on a miss. Used
+        by cache spot-checks (e.g. wordle.py's verify command) to show when
+        a cached entry was written, alongside the per-prompt timestamps.
+        """
+        row = self._conn.execute("""
+            SELECT best_word, best_score, updated_at
+            FROM subgroup_best_by_policy
+            WHERE subset_key = ? AND policy = ? AND universe_id = ?
+        """, (subset_key, policy, self.universe_id)).fetchone()
+        if row is None:
+            return None
+        return (row["best_word"], row["best_score"], row["updated_at"])
+
+    def delete(self, subset_key, policy):
+        """Remove a cached subgroup result so it gets recomputed.
+
+        For invalidating an entry a spot-check has found to be inconsistent
+        with its own cached subtree.
+        """
+        self._conn.execute("""
+            DELETE FROM subgroup_best_by_policy
+            WHERE subset_key = ? AND policy = ? AND universe_id = ?
+        """, (subset_key, policy, self.universe_id))
+        self._mem_cache.pop((subset_key, policy), None)
+
     # ------------------------------------------------------------------
     # Response decomposition cache (guess -> per-answer pattern bytes)
     # ------------------------------------------------------------------
