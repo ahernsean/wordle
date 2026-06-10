@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b101"
+BUILD = "b102"
 
 
 # ---------------------------------------------------------------------------
@@ -2498,9 +2498,9 @@ class ERDWarmer(threading.Thread):
                 if result is not None:
                     if not self._cancel.is_set():
                         word = self.root_best[0] if self.root_best else None
-                        word_tag = f' — {word.upper()}' if word else ''
-                        print(f'\n  [ERD ready: {result:.3f} expected remaining '
-                              f'depth{word_tag}]', flush=True)
+                        word_tag = f' {word.upper()}' if word else ''
+                        print(f'\n  [ERD ready: {result:.3f}{word_tag}]',
+                              flush=True)
                     return
                 if self._cancel.is_set():
                     return
