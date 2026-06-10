@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b96"
+BUILD = "b97"
 
 
 # ---------------------------------------------------------------------------
@@ -2497,7 +2497,8 @@ def main():
             _warmer = None
             _warmer_key = None
 
-        print(f"\nCommand (gsbldtixurawc?)? ", end="")
+        print(f"\n{datetime.now().strftime('%H:%M:%S')}")
+        print(f"Command (gsbldtixurawc?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:
