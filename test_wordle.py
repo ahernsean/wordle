@@ -2252,7 +2252,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         solver._rcache = FakeResponseCache()
         with mock.patch('wordle.min_expected_guesses', side_effect=cancel_during_root), \
              mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
-            solver._solve(score_cache)
+            solver._scan(score_cache)
 
         self.assertFalse(
             any('ERD ready' in str(a) for a in printed),
@@ -2303,7 +2303,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         with mock.patch('wordle.calculate_group_counts', side_effect=spy_calc), \
              mock.patch('wordle.min_expected_guesses', return_value=1.5), \
              mock.patch('builtins.print'):
-            solver._solve(score_cache)
+            solver._scan(score_cache)
 
         # All words were in _main_rcache_dict, so calculate_group_counts
         # should not have been called for any of them during ranking.
@@ -2312,7 +2312,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
     def test_operational_error_in_pre_loop_read_is_caught(self):
         """sqlite3.OperationalError from score_cache.read() at the top of
-        _solve must be caught and printed rather than crashing the thread."""
+        _scan must be caught and printed rather than crashing the thread."""
         words = [self._word(i) for i in range(10)]
 
         class FakeResponseCache:
@@ -2333,7 +2333,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         printed = []
         with mock.patch('builtins.print', side_effect=lambda *a, **k: printed.append(a)):
-            solver._solve(score_cache)  # must not raise
+            solver._scan(score_cache)  # must not raise
 
         self.assertFalse(
             any('OperationalError' in str(a) for a in printed),
@@ -2341,7 +2341,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
     def test_run_sets_rcache_from_thread_private_connection(self):
         """run() must replace self._rcache with a thread-private ResponseCache
-        before calling _solve, so _ranked_root_guesses and min_expected_guesses
+        before calling _scan, so _ranked_root_guesses and min_expected_guesses
         never use the main thread's SQLite connection."""
         words = [self._word(i) for i in range(10)]
 
@@ -2360,16 +2360,16 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
             "_rcache should be None before run() — it is set inside run()")
 
         rcaches_seen = []
-        original_solve = solver._solve
-        def spy_solve(sc):
+        original_scan = solver._scan
+        def spy_scan(sc):
             rcaches_seen.append(solver._rcache)
             # Don't actually run the scan.
-        solver._solve = spy_solve
+        solver._scan = spy_scan
 
         solver.run()
         self.assertEqual(len(rcaches_seen), 1)
         self.assertIsNotNone(rcaches_seen[0],
-            "run() must set _rcache before calling _solve")
+            "run() must set _rcache before calling _scan")
         self.assertIsNot(rcaches_seen[0], solver._main_rcache_dict,
             "_rcache must be a new thread-private ResponseCache, not the main dict")
 
@@ -2426,7 +2426,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
              mock.patch('wordle.time.thread_time', side_effect=fake_thread_time), \
              mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected), \
              mock.patch('builtins.print'):
-            solver._solve(score_cache)
+            solver._scan(score_cache)
 
         # Pass 1's single progress callback already accumulated time before
         # pass 2 started — proving cumulative totals aren't reset alongside

@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b104"
+BUILD = "b105"
 
 
 # ---------------------------------------------------------------------------
@@ -893,7 +893,7 @@ def _erd_cache_and_policy(gs, soln):
 
 
 def _erd_root_progress_tag(solver, soln):
-    """Status-line fragment for ERD solve progress on the current position.
+    """Status-line fragment for ERD scan progress on the current position.
 
     Reads directly off the live solver rather than a snapshot in `gs`:
     a snapshot taken before the current command ran (e.g. a guess that
@@ -2305,7 +2305,7 @@ class ERDSolver(threading.Thread):
         # only by this thread, so plain attributes are safe under the GIL.
         self.current_word = None        # word being evaluated right now, or None
         self.current_word_start = None  # time.time() when it started
-        self._score_cache = None        # set in _solve; live write_count source
+        self._score_cache = None        # set in _scan; live write_count source
         self._word_write_baseline = 0   # score_cache.write_count at word start
         # Sums of wall_elapsed/cpu_elapsed across ALL passes (while-loop
         # iterations) for this position, never reset. word_stats only holds
@@ -2342,7 +2342,7 @@ class ERDSolver(threading.Thread):
         self._rcache = ResponseCache(self._all_answers,
                                      score_cache if self._persist else None)
         try:
-            self._solve(score_cache)
+            self._scan(score_cache)
         finally:
             if self._persist:
                 score_cache.close()
@@ -2418,7 +2418,7 @@ class ERDSolver(threading.Thread):
         writes = self._score_cache.write_count - self._word_write_baseline
         return self.current_word, elapsed, writes
 
-    def _solve(self, score_cache):
+    def _scan(self, score_cache):
         policy = self._policy
         root_key = ScoreCache.encode_subset(self._words)
         try:
