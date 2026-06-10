@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b95"
+BUILD = "b96"
 
 
 # ---------------------------------------------------------------------------
@@ -930,8 +930,12 @@ def _erd_root_progress_tag(warmer, soln):
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     """
     Rank candidates by ERD using only cached subgroup values.
-    Returns sorted (word, erd_cost) list, lowest first, or None if any
-    subgroup for any candidate is missing from the cache.
+    Returns sorted (word, erd_cost) list, lowest first, for every candidate
+    whose subgroups are all cached. Candidates with an uncached subgroup
+    (e.g. pruned by cost_lb in min_expected_guesses, so never recursed into)
+    are skipped rather than failing the whole ranking — the chosen ERD
+    winner is always fully cached, since it can't have been pruned. Returns
+    None only if not a single candidate could be scored.
 
     score_cache: cache to read from; defaults to soln.score_cache (SQLite).
     policy:      cache namespace (ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED).
@@ -944,7 +948,6 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     sc = score_cache if score_cache is not None else soln.score_cache
     cache = soln.cache
     candidates = guesses if guesses is not None else soln.current_words
-    answer_set = set(soln.current_words)
     results = []
     for word in candidates:
         if cache and word in cache.answer_words:
@@ -971,10 +974,10 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
                 break
             cost += (k / n) * hit[1]
         if not ok:
-            if word in answer_set:
-                return None  # answer-word miss means warmer not ready
-            continue        # non-answer miss: skip silently, try others
+            continue  # uncached subgroup — skip this candidate, try others
         results.append((word, cost))
+    if not results:
+        return None
     results.sort(key=lambda x: x[1])
     return results
 

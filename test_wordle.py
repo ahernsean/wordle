@@ -1958,6 +1958,73 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
                               f"without guesses=, only answer words should appear")
 
 
+# ---------------------------------------------------------------------------
+# Regression: cost_lb pruning (b95) means min_expected_guesses no longer
+# recurses into every candidate's subgroups, so the cache can be missing
+# subgroup entries for answer-word candidates that were pruned outright.
+# _erd_solve_scores must skip those candidates rather than aborting the
+# whole ranking.
+# ---------------------------------------------------------------------------
+
+class _FixedPartitionCache:
+    """Stub for soln.cache: every word partitions current_words the same
+    way (`full_groups`), except `split_word`, which produces a single
+    oversized group (`split_groups`) whose ERD was never cached — as if
+    cost_lb pruning skipped recursing into it entirely."""
+
+    def __init__(self, answer_words, full_groups, split_word, split_groups):
+        self.answer_words = answer_words
+        self._full_groups = full_groups
+        self._split_word = split_word
+        self._split_groups = split_groups
+
+    def group_words(self, word, subset):
+        if word == self._split_word:
+            return self._split_groups
+        return self._full_groups
+
+
+class TestERDSolveScoresUncachedSubgroupSkipped(unittest.TestCase):
+
+    def test_candidate_with_uncached_subgroup_is_skipped_not_aborted(self):
+        words = ["alpha", "beta", "c1", "c2", "c3", "c4"]
+        # Every word except "beta" splits current_words into two cached
+        # size-2 groups plus two self/other singletons (sums to 6).
+        full_groups = {
+            'g1': ["c1", "c2"],
+            'g2': ["c3", "c4"],
+            'self': ["alpha"],
+            'other': ["beta"],
+        }
+        # "beta" instead produces one big size-4 group whose ERD is not
+        # in the cache — the pruned candidate.
+        split_groups = {
+            'big': ["c1", "c2", "c3", "c4"],
+            'self': ["beta"],
+            'other': ["alpha"],
+        }
+        cache = _FixedPartitionCache(words, full_groups, "beta", split_groups)
+
+        mc = MemoryScoreCache()
+        mc.set_scope('test-scope')
+        mc.write(ScoreCache.encode_subset(["c1", "c2"]), ERD_ALL, "x", 1.5)
+        mc.write(ScoreCache.encode_subset(["c3", "c4"]), ERD_ALL, "x", 1.5)
+        # Deliberately do NOT write an entry for ["c1","c2","c3","c4"] —
+        # this is the "pruned, never recursed into" subgroup.
+
+        import types
+        soln = types.SimpleNamespace(current_words=words, cache=cache)
+
+        scores = _erd_solve_scores(soln, score_cache=mc, policy=ERD_ALL)
+        self.assertIsNotNone(
+            scores, "a fully-cached candidate must still produce a ranking")
+        result_words = [w for w, _ in scores]
+        self.assertNotIn("beta", result_words,
+                         "candidate with an uncached subgroup must be skipped")
+        for w in ["alpha", "c1", "c2", "c3", "c4"]:
+            self.assertIn(w, result_words)
+
+
 class TestERDWarmerKeepsWorking(unittest.TestCase):
 
     @staticmethod
