@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b99"
+BUILD = "b100"
 
 
 # ---------------------------------------------------------------------------
@@ -1045,6 +1045,8 @@ def cmd_solve(gs):
         print("\nERD:")
         print("Best guesses:")
         print_scored_list(scores, method=None)
+        print(f"({len(scores)} of {len(erd_guesses):,} candidates fully "
+              f"resolved; the rest were pruned during the root scan)")
         return
 
     try:
