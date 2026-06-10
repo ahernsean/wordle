@@ -259,6 +259,22 @@ def apply_guess(words, try_word, response):
     return restriction.apply(words)
 
 
+def enumerate_branches(words, guess_word):
+    """Partition `words` by every non-winning response to `guess_word`.
+
+    Returns [(response_code, branch_words), ...] for response codes 0-241
+    (242 == all-green == the win, excluded) whose branch has >= 2 words —
+    smaller branches need no ERD entry (a singleton is solved next guess
+    by definition).
+    """
+    branches = []
+    for code in range(242):
+        branch_words = apply_guess(words, guess_word, decode_response(code))
+        if len(branch_words) >= 2:
+            branches.append((code, branch_words))
+    return branches
+
+
 # ---------------------------------------------------------------------------
 # Group analysis
 # ---------------------------------------------------------------------------
@@ -462,6 +478,57 @@ def cache_all_scores(word, subgroup, score_cache, subset_key, cache=None):
     for method, value in score_word_multi(word, subgroup, list(ScoringMethod),
                                            cache=cache).items():
         score_cache.write_scores(subset_key, [(word, value)], method.name.lower())
+
+
+def rank_guesses_by_group_then_entropy(words, candidates, rcache, score_cache,
+                                        cancel_check=None):
+    """Order `candidates` by 1-level max-group-size (asc) then entropy gain
+    (desc) for the position `words` — reads/writes the SAME word_scores
+    cache Solution.compute_scores_multi uses (ScoreCache.encode_subset(words)
+    + method.name.lower()), so work here and work done by 's' at this exact
+    position are mutually reusable.
+
+    cancel_check: optional zero-arg callable, checked once per candidate; if
+    it returns True, ranking stops and `candidates` is returned unchanged
+    (any word_scores already read/written stays valid).
+    """
+    methods = (ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN)
+    has_read = score_cache and hasattr(score_cache, 'read_scores')
+    has_write = score_cache and hasattr(score_cache, 'write_scores')
+    word_scores = {}
+    if has_read:
+        subset_key = ScoreCache.encode_subset(words)
+        for method in methods:
+            cached = score_cache.read_scores(subset_key, method.name.lower())
+            if cached:
+                for w, s in cached:
+                    word_scores.setdefault(w, {})[method] = s
+
+    to_write = {m: [] for m in methods}
+    scored = []
+    for word in candidates:
+        if cancel_check is not None and cancel_check():
+            return list(candidates)
+        cached = word_scores.get(word, {})
+        if all(m in cached for m in methods):
+            scores = cached
+        else:
+            groups = rcache.group_counts(word, words)
+            scores = score_groups_multi(groups, methods)
+            for m in methods:
+                if m not in cached:
+                    to_write[m].append((word, scores[m]))
+        scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
+                       -scores[ScoringMethod.ENTROPY_GAIN], word))
+
+    if has_write:
+        subset_key = ScoreCache.encode_subset(words)
+        for method, rows in to_write.items():
+            if rows:
+                score_cache.write_scores(subset_key, rows, method.name.lower())
+
+    scored.sort()
+    return [w for _, _, w in scored]
 
 
 def max_entropy(n):

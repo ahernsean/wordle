@@ -22,13 +22,16 @@ from wordle_engine import (
     calculate_response, score_groups, score_groups_multi, calculate_group_counts,
     score_word, score_word_multi, load_word_list, max_entropy,
     Restriction, answer_to_restriction, apply_guess, _encode_response,
+    decode_response, _ALL_GREEN_PATTERN,
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
+    enumerate_branches, rank_guesses_by_group_then_entropy,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
     _multistep_stats, _erd_solve_scores, ERDSolver,
     _compare_words, set_display_context,
+    BranchPrecacheSolver, format_response,
 )
 
 
@@ -275,6 +278,32 @@ class TestRestriction(unittest.TestCase):
             expected = [w for w in candidates
                         if calculate_response(guess, w) == response]
             self.assertEqual(filtered, expected, msg=f"answer={answer}")
+
+
+class TestEnumerateBranches(unittest.TestCase):
+
+    def test_partition_covers_all_words(self):
+        words = ANSWERS
+        guess_word = "heart"
+        branches = enumerate_branches(words, guess_word)
+
+        codes = [code for code, _ in branches]
+        self.assertNotIn(_ALL_GREEN_PATTERN, codes)
+        self.assertEqual(len(codes), len(set(codes)))
+
+        for code, branch_words in branches:
+            self.assertGreaterEqual(len(branch_words), 2)
+            self.assertEqual(
+                branch_words,
+                apply_guess(words, guess_word, decode_response(code)))
+
+        # Branches plus the excluded (<2-word, including the win) groups
+        # exactly partition the original word list.
+        branch_total = sum(len(bw) for _, bw in branches)
+        excluded_total = sum(
+            len(apply_guess(words, guess_word, decode_response(code)))
+            for code in range(243) if code not in codes)
+        self.assertEqual(branch_total + excluded_total, len(words))
 
 
 class TestScoringMethodDisplay(unittest.TestCase):
@@ -1085,6 +1114,114 @@ class TestCacheAllScores(unittest.TestCase):
         subgroup = ANSWERS[:6]
         cache_all_scores("heart", subgroup, mc,
                          ScoreCache.encode_subset(subgroup), cache=cache)
+
+
+# ---------------------------------------------------------------------------
+# rank_guesses_by_group_then_entropy — shared word_scores cache with cmd_solve
+# ---------------------------------------------------------------------------
+
+class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _expected_order(self, words, candidates, cache):
+        scored = []
+        for word in candidates:
+            groups = cache.group_counts(word, words)
+            scores = score_groups_multi(
+                groups, (ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN))
+            scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
+                            -scores[ScoringMethod.ENTROPY_GAIN], word))
+        scored.sort()
+        return [w for _, _, w in scored]
+
+    def test_uses_word_scores_populated_by_compute_scores_multi(self):
+        """If 's' (compute_scores_multi) already populated word_scores for
+        this position, ranking must use those cached scores rather than
+        recomputing via rcache.group_counts."""
+        words = ANSWERS[:6]
+        candidates = GUESSES
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            cache = ResponseCache(ANSWERS, score_cache=sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.current_words = words
+            soln.compute_scores_multi(
+                candidates, [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN])
+
+            expected_order = self._expected_order(words, candidates, cache)
+
+            class ExplodingResponseCache:
+                @staticmethod
+                def group_counts(word, subset):
+                    raise AssertionError(
+                        "ranking should use cached word_scores, not recompute")
+
+            ranked = rank_guesses_by_group_then_entropy(
+                words, candidates, ExplodingResponseCache(), sc)
+            self.assertEqual(ranked, expected_order)
+        finally:
+            sc.close()
+
+    def test_populates_word_scores_for_later_compute_scores_multi(self):
+        """If ERD ranking runs first at this position, it must persist
+        MAX_GROUP_SIZE/ENTROPY_GAIN into word_scores so a later 's'
+        (compute_scores_multi) at the same position hits the cache instead
+        of recomputing via score_word_multi."""
+        words = ANSWERS[:6]
+        candidates = GUESSES
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            cache = ResponseCache(ANSWERS, score_cache=sc)
+
+            rank_guesses_by_group_then_entropy(words, candidates, cache, sc)
+
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.current_words = words
+            with mock.patch('wordle_engine.score_word_multi') as spy:
+                soln.compute_scores_multi(
+                    candidates,
+                    [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN])
+            spy.assert_not_called()
+        finally:
+            sc.close()
+
+    def test_cancel_check_immediate_returns_input_unchanged(self):
+        words = ANSWERS[:6]
+        candidates = list(GUESSES)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            cache = ResponseCache(ANSWERS, score_cache=sc)
+            ranked = rank_guesses_by_group_then_entropy(
+                words, candidates, cache, sc, cancel_check=lambda: True)
+            self.assertEqual(ranked, candidates)
+
+            subset_key = ScoreCache.encode_subset(words)
+            self.assertIsNone(sc.read_scores(subset_key, 'max_group_size'))
+            self.assertIsNone(sc.read_scores(subset_key, 'entropy_gain'))
+        finally:
+            sc.close()
+
+    def test_memory_score_cache_no_attribute_error(self):
+        """MemoryScoreCache (hard mode) lacks read_scores/write_scores —
+        ranking must degrade to 'always compute', not raise AttributeError."""
+        words = ANSWERS[:6]
+        candidates = list(GUESSES)
+        cache = ResponseCache(ANSWERS)
+        mc = MemoryScoreCache()
+        mc.set_scope('test-scope')
+
+        ranked = rank_guesses_by_group_then_entropy(words, candidates, cache, mc)
+        self.assertEqual(ranked, self._expected_order(words, candidates, cache))
 
 
 # ---------------------------------------------------------------------------
@@ -2238,7 +2375,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
 
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
         def cancel_during_root(remaining, cache, sc, deadline=None,
@@ -2258,57 +2395,40 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
             any('ERD ready' in str(a) for a in printed),
             "a superseded solver must not print a stale [ERD ready] announcement")
 
-    def test_ranking_uses_live_main_cache_after_solve(self):
-        """After cmd_solve populates the main thread's ResponseCache, the
-        solver should use those mappings directly in _ranked_root_guesses
-        instead of recomputing or hitting SQLite."""
+    def test_ranking_uses_word_scores_cache(self):
+        """If 's' (cmd_solve / compute_scores_multi) already populated
+        word_scores for this exact position, _ranked_root_guesses must use
+        those cached MAX_GROUP_SIZE/ENTROPY_GAIN scores directly instead of
+        recomputing via rcache.group_counts."""
         words = [self._word(i) for i in range(10)]
 
-        class FakeResponseCache:
-            answer_words = words
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            score_cache = ScoreCache(tmp.name, words)
 
-            def __init__(self):
-                self._cache = {}
+            # Simulate what cmd_solve does: compute_scores_multi populates
+            # and persists word_scores for this position.
+            cache = ResponseCache(words, score_cache)
+            soln = Solution(words, words, cache=cache, score_cache=score_cache)
+            soln.compute_scores_multi(
+                words, [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN])
 
-            @staticmethod
-            def group_words(word, current_words):
-                return {}
+            class ExplodingResponseCache:
+                @staticmethod
+                def group_counts(word, subset):
+                    raise AssertionError(
+                        "ranking should use cached word_scores, not recompute")
 
-            @staticmethod
-            def group_counts(word, current_words):
-                return {}
+            solver = ERDSolver(words, words, words, None,
+                               policy=ERD_ALL, persist=True)
+            solver._rcache = ExplodingResponseCache()
 
-        main_cache = FakeResponseCache()
-        # Simulate what cmd_solve does: populate _cache with pattern blobs
-        # (one byte per answer word, in canonical `words` order).
-        for word in words:
-            main_cache._cache[word] = bytes(i % 3 for i in range(len(words)))
-
-        score_cache = MemoryScoreCache()
-        score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, main_cache,
-                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
-
-        # run() must be called first to set self._rcache
-        solver._rcache = FakeResponseCache()
-
-        # Count how many times calculate_group_counts is called as fallback.
-        calc_calls = []
-        import wordle as wordle_mod
-        original = wordle_mod.calculate_group_counts
-        def spy_calc(word, subset):
-            calc_calls.append(word)
-            return original(word, subset)
-
-        with mock.patch('wordle.calculate_group_counts', side_effect=spy_calc), \
-             mock.patch('wordle.min_expected_guesses', return_value=1.5), \
-             mock.patch('builtins.print'):
-            solver._scan(score_cache)
-
-        # All words were in _main_rcache_dict, so calculate_group_counts
-        # should not have been called for any of them during ranking.
-        self.assertEqual(calc_calls, [],
-            "ranking should use live main-thread cache, not recompute patterns")
+            ranked = solver._ranked_root_guesses(score_cache)
+            self.assertEqual(set(ranked), set(words))
+        finally:
+            score_cache.close()
+            os.unlink(tmp.name)
 
     def test_operational_error_in_pre_loop_read_is_caught(self):
         """sqlite3.OperationalError from score_cache.read() at the top of
@@ -2327,7 +2447,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         score_cache = ErrorScoreCache()
         score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
         solver._rcache = FakeResponseCache()
 
@@ -2353,7 +2473,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
         self.assertIsNone(solver._rcache,
@@ -2368,10 +2488,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         solver.run()
         self.assertEqual(len(rcaches_seen), 1)
-        self.assertIsNotNone(rcaches_seen[0],
-            "run() must set _rcache before calling _scan")
-        self.assertIsNot(rcaches_seen[0], solver._main_rcache_dict,
-            "_rcache must be a new thread-private ResponseCache, not the main dict")
+        self.assertIsInstance(rcaches_seen[0], ResponseCache,
+            "run() must set _rcache to a thread-private ResponseCache before calling _scan")
 
     def test_cumulative_time_survives_pause_restart(self):
         """word_stats (and root_done) reset to empty at the top of every
@@ -2387,9 +2505,17 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
             def __init__(self):
                 self._cache = {}
 
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
         solver._rcache = FakeResponseCache()
 
@@ -2440,6 +2566,122 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         # But the cumulative totals include both passes' contributions.
         self.assertGreater(solver.cumulative_cpu_s, snapshot['cpu_before_pass2'])
         self.assertGreater(solver.cumulative_wall_s, snapshot['wall_before_pass2'])
+
+
+# ---------------------------------------------------------------------------
+# BranchPrecacheSolver: precache ERD for sibling branches of a guess
+# ---------------------------------------------------------------------------
+
+class TestBranchPrecacheSolver(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    @staticmethod
+    def _branches():
+        # Three tiny, disjoint synthetic branches (3 words each), paired
+        # with arbitrary valid response codes for _branch_label.
+        return [
+            (0, ANSWERS[0:3]),
+            (1, ANSWERS[3:6]),
+            (2, ANSWERS[6:9]),
+        ]
+
+    def test_run_populates_erd_for_every_branch(self):
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.branches_done, solver.branches_total)
+        self.assertEqual(solver.branches_done, 3)
+        self.assertEqual(solver.branches_skipped, 0)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            for _, words in branches:
+                hit = sc.read(ScoreCache.encode_subset(words), ERD_ALL)
+                self.assertIsNotNone(hit)
+        finally:
+            sc.close()
+
+    def test_skips_already_cached_branch_and_fills_others(self):
+        """Simulates the live ERDSolver having already filled one branch's
+        ERD entry (e.g. in an earlier game): precache must skip it
+        (resumability/meshing) while still filling the other branch."""
+        branches = self._branches()[:2]
+        live_solved_words = branches[0][1]
+        other_words = branches[1][1]
+
+        sc = ScoreCache(self.db, ANSWERS)
+        cache = ResponseCache(ANSWERS, sc)
+        min_expected_guesses(live_solved_words, cache, sc,
+                              guesses=GUESSES, policy=ERD_ALL)
+        sc.close()
+
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.branches_skipped, 1)
+        self.assertEqual(solver.branches_done, 2)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            self.assertIsNotNone(
+                sc.read(ScoreCache.encode_subset(other_words), ERD_ALL))
+        finally:
+            sc.close()
+
+    def test_stopped_before_run_prints_nothing(self):
+        """If stop() fires before run() is even scheduled (e.g. the user
+        made a guess immediately after 'p'), run() must not print a stale
+        '[Precache: starting ...]' announcement for work it never starts —
+        same principle as ERDSolver's no-stale-ready-message guarantee."""
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+        solver.stop()
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            solver.run()
+
+        self.assertEqual(out.getvalue(), '')
+        self.assertEqual(solver.branches_done, 0)
+
+    def test_stop_mid_run_returns_promptly(self):
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        from wordle_engine import min_expected_guesses as real_min_expected
+        call_count = [0]
+
+        def fake_min_expected(*args, **kwargs):
+            call_count[0] += 1
+            solver.stop()  # e.g. the user made a guess mid-branch
+            return real_min_expected(*args, **kwargs)
+
+        with mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected), \
+             redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(call_count[0], 1)
+        self.assertEqual(solver.branches_done, 0)
 
 
 # ---------------------------------------------------------------------------
