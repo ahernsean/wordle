@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b102"
+BUILD = "b103"
 
 
 # ---------------------------------------------------------------------------
@@ -2210,7 +2210,7 @@ def print_status(gs, warmer=None):
                 if erd_sc is not None:
                     hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
                     if hit is not None:
-                        erd_tag = f'  [ERD: {hit[1]:.3f}]'
+                        erd_tag = f'  [ERD: {hit[1]:.3f} {hit[0].upper()}]'
                     else:
                         erd_tag = _erd_root_progress_tag(warmer, soln)
             print(f"{n:,} words remaining")
