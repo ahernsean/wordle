@@ -19,7 +19,7 @@ from cache_sqlite import ScoreCache
 class ScoringMethod(Enum):
     WEIGHTED_AVG = auto()     # sum(n_i^2) / N  — lower is better
     ENTROPY_GAIN = auto()     # Shannon entropy (bits of info gained)
-    MINIMAX = auto()          # max(n_i)
+    MAX_GROUP_SIZE = auto()   # max(n_i)
     PROB_FINISH = auto()      # P(next guess solves it)
 
     @property
@@ -27,7 +27,7 @@ class ScoringMethod(Enum):
         labels = {
             ScoringMethod.WEIGHTED_AVG:   "Weighted avg remaining",
             ScoringMethod.ENTROPY_GAIN:   "Entropy gain (bits)",
-            ScoringMethod.MINIMAX:        "Worst-case group size",
+            ScoringMethod.MAX_GROUP_SIZE:        "Worst-case group size",
             ScoringMethod.PROB_FINISH:    "P(finish next turn)",
         }
         return labels[self]
@@ -45,18 +45,60 @@ class ScoringMethod(Enum):
 
     def format_score(self, value):
         """Format a score value for display."""
-        if self == ScoringMethod.MINIMAX:
+        if self == ScoringMethod.MAX_GROUP_SIZE:
             return str(int(value))
         if self == ScoringMethod.PROB_FINISH:
             return f'{value:.1%}'
         return f'{value:0.4f}'
 
 
-class InputSet(Enum):
-    ALL_GUESSES = auto()
-    HARD_MODE = auto()        # real Wordle hard mode: satisfies all constraints
-    CURRENT_WORDLIST = auto() # restrict to remaining possible answers (strictest)
-    SOLVED_WORDS = auto()
+class GuessUniverse(Enum):
+    """Which static word list a candidate guess is drawn from.
+
+    Independent of ComplianceFilter below: a player can pick a guess from
+    either list whether or not it satisfies the clues revealed so far
+    (e.g. a recognizable answer-shaped word that the clues have already
+    eliminated is still a legal — if unwise — guess in normal play).
+    """
+    ALL_WORDS = 'words'      # ~12,972 — every guessable word
+    ALL_ANSWERS = 'answers'  # ~3,200 — words that can ever be a Wordle answer
+
+
+class ComplianceFilter(Enum):
+    """Whether a candidate must satisfy every clue revealed so far.
+
+    Independent of GuessUniverse above — see its docstring. COMPLIANT is
+    real Wordle hard mode's rule (green letters fixed in position, yellow
+    letters present somewhere) applied to whichever universe is selected.
+    """
+    UNFILTERED = 'unfiltered'
+    COMPLIANT = 'compliant'
+
+
+# ---------------------------------------------------------------------------
+# ERD cache policy names — distinguish the guess-vocabulary namespaces under
+# which min_expected_guesses results are stored. Each name spells out both
+# the GuessUniverse and ComplianceFilter it was computed under, so namespaces
+# can be told apart on sight rather than by tribal knowledge of which axis a
+# bare word like "answers" or "constrained" was meant to encode.
+# ---------------------------------------------------------------------------
+
+def erd_policy_name(universe, compliance):
+    """Derive the cache-namespace string for a (universe, compliance) pair."""
+    return f'erd_{universe.value}_{compliance.value}'
+
+
+ERD_ALL = erd_policy_name(GuessUniverse.ALL_WORDS, ComplianceFilter.UNFILTERED)
+# any word may be guessed, no clue filter (SQLite, persisted)
+ERD_CONSTRAINED = erd_policy_name(GuessUniverse.ALL_WORDS, ComplianceFilter.COMPLIANT)
+# Wordle hard mode (in-memory, transient — path-dependent, never persisted)
+ERD_ANSWERS = erd_policy_name(GuessUniverse.ALL_ANSWERS, ComplianceFilter.COMPLIANT)
+# guesses restricted to possible answers (SQLite, persisted)
+ERD_ANSWERS_UNFILTERED = erd_policy_name(GuessUniverse.ALL_ANSWERS, ComplianceFilter.UNFILTERED)
+# guesses drawn from the answer-shaped list, no clue filter (SQLite, persisted)
+
+VALID_ERD_POLICIES = frozenset(
+    {ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED})
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +165,12 @@ def decode_response(code):
         result.append(_RESPONSE_NAMES[code % 3])
         code //= 3
     return result[::-1]
+
+
+# All-green ("GGGGG") is the unique pattern produced only when guess==answer,
+# so a group keyed on this pattern is always exactly {guess} when present —
+# used by min_expected_guesses to detect the "self" group at O(1).
+_ALL_GREEN_PATTERN = _encode_response(['green'] * 5)
 
 
 # ---------------------------------------------------------------------------
@@ -234,33 +282,64 @@ def calculate_group_counts(test_word, words):
 class ResponseCache:
     """Lazily caches word-to-pattern mappings for each guess word.
 
-    For each guess word G, stores a dict mapping every answer word
-    to its encoded response pattern (int 0-242). This is built
-    once per guess word on first access, then all subsequent
-    scoring against any subset is just dict lookups and counting.
+    For each guess word G, stores a compact bytes blob giving every answer
+    word's encoded response pattern (int 0-242), one byte per answer in
+    canonical (self.answer_words) order. This is built once per guess word
+    on first access, then all subsequent scoring against any subset is just
+    an index lookup (via _answer_index) and counting.
+
+    A {answer: pattern} dict per guess costs ~100KB (Python dict/str/int
+    overhead dominates the single byte of real information per entry).
+    Scoring the full guess vocabulary (~13,000 words) against any position
+    would then build a ~1.3GB cache — enough to OOM a memory-constrained
+    host. The bytes blob costs ~3.2KB per guess instead, ~32x smaller, with
+    the same O(1) lookup via the shared _answer_index.
     """
 
-    def __init__(self, answer_words):
+    def __init__(self, answer_words, score_cache=None):
         self.answer_words = answer_words
-        self._cache = {}   # guess → {answer → pattern_int}
+        self.score_cache = score_cache
+        self._answer_index = {word: i for i, word in enumerate(answer_words)}
+        self._cache = {}   # guess → bytes (pattern_int per answer, canonical order)
 
     def _ensure(self, guess):
-        """Build the mapping for guess if not cached."""
-        if guess not in self._cache:
-            mapping = {}
-            for answer in self.answer_words:
-                resp = calculate_response(guess, answer)
-                mapping[answer] = _encode_response(resp)
-            self._cache[guess] = mapping
+        """Build the mapping for guess if not cached, persisting/reloading via SQLite.
+
+        The decomposition (guess -> pattern bytes) is the same for every
+        position in every session against this answer universe, so it is
+        cached to disk as a compact byte blob — one byte per answer word, in
+        canonical (self.answer_words) order — keyed only by guess+universe.
+        """
+        if guess in self._cache:
+            return
+        blob = self._load_decomposition(guess)
+        if blob is None:
+            blob = bytes(
+                _encode_response(calculate_response(guess, answer))
+                for answer in self.answer_words
+            )
+            self._store_decomposition(guess, blob)
+        self._cache[guess] = blob
+
+    def _load_decomposition(self, guess):
+        if not self.score_cache:
+            return None
+        return self.score_cache.read_decomposition(guess)
+
+    def _store_decomposition(self, guess, blob):
+        if not self.score_cache:
+            return
+        self.score_cache.write_decomposition(guess, blob)
 
     def group_counts(self, guess, subset):
         """Return {pattern_int: count} for guess vs subset."""
         self._ensure(guess)
-        mapping = self._cache[guess]
+        blob = self._cache[guess]
         counts = defaultdict(int)
         for word in subset:
-            if word in mapping:
-                counts[mapping[word]] += 1
+            idx = self._answer_index.get(word)
+            if idx is not None:
+                counts[blob[idx]] += 1
             else:
                 resp = calculate_response(guess, word)
                 counts[_encode_response(resp)] += 1
@@ -269,11 +348,12 @@ class ResponseCache:
     def group_words(self, guess, subset):
         """Return {pattern_int: [words]} for guess vs subset."""
         self._ensure(guess)
-        mapping = self._cache[guess]
+        blob = self._cache[guess]
         groups = defaultdict(list)
         for word in subset:
-            if word in mapping:
-                groups[mapping[word]].append(word)
+            idx = self._answer_index.get(word)
+            if idx is not None:
+                groups[blob[idx]].append(word)
             else:
                 resp = calculate_response(guess, word)
                 groups[_encode_response(resp)].append(word)
@@ -294,7 +374,7 @@ def score_groups(groups, method=ScoringMethod.ENTROPY_GAIN):
 
     - WEIGHTED_AVG: sum(n_i^2)/N. Lower is better.
     - ENTROPY_GAIN: Shannon entropy in bits. Higher is better.
-    - MINIMAX: max(n_i). Lower is better.
+    - MAX_GROUP_SIZE: max(n_i). Lower is better.
     - PROB_FINISH: fraction of remaining words in size-1
       groups (game ends next turn). Higher is better.
     """
@@ -317,7 +397,7 @@ def score_groups(groups, method=ScoringMethod.ENTROPY_GAIN):
                 entropy -= p * math.log2(p)
         return entropy
 
-    elif method == ScoringMethod.MINIMAX:
+    elif method == ScoringMethod.MAX_GROUP_SIZE:
         return max(sizes)
 
     elif method == ScoringMethod.PROB_FINISH:
@@ -359,6 +439,31 @@ def score_word_multi(word, remaining_words, methods,
     return score_groups_multi(groups, methods)
 
 
+def cache_all_scores(word, subgroup, score_cache, subset_key, cache=None):
+    """Derive and persist every ScoringMethod's view of `word` against `subgroup`.
+
+    score_groups' methods all read off the same group-count partition, so
+    once that partition is in hand for one method, the rest are nearly free
+    to derive — persisting only the method an algorithm happened to be
+    ranking by would be an arbitrary cutoff.
+
+    This is the ONE place that enumerates ScoringMethod for caching purposes.
+    Callers (compute_lookahead, min_expected_guesses, ...) just say "this
+    word, for this subgroup, is worth remembering comprehensively" — they
+    don't need to know what the full roster is, or to change when it grows.
+
+    Hard-mode searches pass a MemoryScoreCache, whose minimal read/write
+    interface deliberately omits write_scores: those ERD values are
+    path-dependent and must never reach the persisted cross-game cache.
+    Skip silently rather than require every transient cache to stub it out.
+    """
+    if not score_cache or not hasattr(score_cache, 'write_scores'):
+        return
+    for method, value in score_word_multi(word, subgroup, list(ScoringMethod),
+                                           cache=cache).items():
+        score_cache.write_scores(subset_key, [(word, value)], method.name.lower())
+
+
 def max_entropy(n):
     """Theoretical maximum entropy for n remaining words: log2(n)."""
     if n <= 1:
@@ -376,14 +481,14 @@ class Solution:
     answers, guess history, cached scores, and (optionally) a known
     answer word for simulation mode.
 
-    If all_guesses is provided, falls back to it when the answer
+    If all_words is provided, falls back to it when the answer
     list is exhausted (word not in answer list).
     """
 
-    def __init__(self, answer_words, all_guesses=None,
+    def __init__(self, answer_words, all_words=None,
                  cache=None, score_cache=None):
         self.all_answers = answer_words
-        self.all_guesses = all_guesses
+        self.all_words = all_words
         self.cache = cache
         self.score_cache = score_cache
         self.reset()
@@ -411,25 +516,32 @@ class Solution:
         return len(self.guesses) == 0
 
     def _ensure_scores_loaded(self, method):
-        """Transparently load full-game scores from SQLite into word_scores."""
-        if not self.score_cache or not self._is_full_game():
+        """Transparently load this position's scores from SQLite into word_scores.
+
+        Cached entries are scoped to the current remaining-word subset (not
+        just the full answer set), so any position that recurs — not only
+        the opening guess — benefits from the cache.
+        """
+        if not self.score_cache:
             return
         if method in self._db_loaded_methods:
             return
         self._db_loaded_methods.add(method)
-        cached = self.score_cache.read_scores(method.name.lower())
+        subset_key = ScoreCache.encode_subset(self.current_words)
+        cached = self.score_cache.read_scores(subset_key, method.name.lower())
         if cached:
             for w, s in cached:
                 self.word_scores.setdefault(w, {})[method] = s
 
     def _persist_scores(self, method):
-        """Transparently write full-game scores from word_scores to SQLite."""
-        if not self.score_cache or not self._is_full_game():
+        """Transparently write this position's scores from word_scores to SQLite."""
+        if not self.score_cache:
             return
         scores = [(w, s[method]) for w, s in self.word_scores.items()
                   if method in s]
         if scores:
-            self.score_cache.write_scores(scores, method.name.lower())
+            subset_key = ScoreCache.encode_subset(self.current_words)
+            self.score_cache.write_scores(subset_key, scores, method.name.lower())
 
     @property
     def answer_set(self):
@@ -442,7 +554,7 @@ class Solution:
         """
         Apply a guess and its response, filtering the word list.
 
-        If the result is empty and all_guesses is available, replays
+        If the result is empty and all_words is available, replays
         all guesses against the full guess vocabulary as a fallback.
         Returns the number of remaining words (caller should check
         for fallback_active).
@@ -456,9 +568,9 @@ class Solution:
 
         # Fallback: replay all guesses against full vocabulary
         if (len(self.current_words) == 0
-                and self.all_guesses
+                and self.all_words
                 and not self.fallback_active):
-            words = self.all_guesses[:]
+            words = self.all_words[:]
             for gw, gr in self.guesses:
                 words = apply_guess(words, gw, gr)
             if words:
@@ -485,13 +597,13 @@ class Solution:
             self._answer_set = None
         return True
 
-    def hard_mode_words(self, all_guesses):
+    def constraint_compliant_words(self, all_words):
         """
-        Return words from all_guesses consistent with all prior responses.
+        Return words from all_words consistent with all prior responses.
         This is real Wordle hard mode: must satisfy green/yellow constraints
         but is not restricted to remaining answers.
         """
-        words = list(all_guesses)
+        words = list(all_words)
         for gw, gr in self.guesses:
             words = apply_guess(words, gw, gr)
         return words
@@ -525,7 +637,7 @@ class Solution:
             return None
         first = solutions[0]
         out = Solution(first.all_answers,
-                       first.all_guesses,
+                       first.all_words,
                        first.cache,
                        first.score_cache)
         combined = set()
@@ -609,7 +721,6 @@ class Solution:
 
     def compute_lookahead(self, top_words,
                           second_step_words=None,
-                          total_callback=None,
                           progress_callback=None):
         """
         Two-step entropy lookahead on (word, first_entropy) pairs.
@@ -624,7 +735,6 @@ class Solution:
         Completed subgroup results are cached in the SQLite lookahead
         cache and reused across sessions.
 
-        total_callback(n): called once with total work units.
         progress_callback(): called per work unit.
 
         Returns sorted list of (word, step1, step2, combined)
@@ -637,34 +747,11 @@ class Solution:
         lc = self.score_cache
         policy = 'full' if full_mode else 'hard'
 
-        # Phase 1: compute group partitions, count work units
+        # Phase 1: compute group partitions
         word_data = []
-        total_work = 0
         for word, first_ent in top_words:
-            if cache:
-                grouped = cache.group_words(word, self.current_words)
-            else:
-                grouped = defaultdict(list)
-                for answer in self.current_words:
-                    pat = _encode_response(calculate_response(word, answer))
-                    grouped[pat].append(answer)
-
-            work = 0
-            for subgroup in grouped.values():
-                cnt = len(subgroup)
-                if cnt <= 2:
-                    continue
-                if lc:
-                    subset_key = ScoreCache.encode_subset(subgroup)
-                    if lc.read(subset_key, policy) is not None:
-                        continue  # cache hit — no scan needed
-                work += (len(second_step_words)
-                         if full_mode else len(subgroup))
-            total_work += work
+            grouped = cache.group_words(word, self.current_words)
             word_data.append((word, first_ent, grouped))
-
-        if total_callback:
-            total_callback(total_work)
 
         # Phase 2: second-step evaluation
         results = []
@@ -706,6 +793,8 @@ class Solution:
                             best_word = candidate
                     if lc and best_word is not None and subset_key is not None:
                         lc.write(subset_key, policy, best_word, best)
+                        cache_all_scores(best_word, subgroup, lc, subset_key,
+                                         cache=cache)
 
                 weighted_second += (cnt / n) * best
 
@@ -717,35 +806,84 @@ class Solution:
 
 
 def min_expected_guesses(remaining, cache, score_cache,
-                          deadline=None, progress_fn=None):
+                          deadline=None, guesses=None,
+                          policy=None, progress_callback=None,
+                          cancel_check=None):
     """
     Exact expected guesses to solve remaining words, playing optimally.
 
-    Uses words in `remaining` as candidates (answers-only). Memoizes
-    completed subgroups in score_cache with policy='erd'.
+    guesses: vocabulary of allowed guess words. None means answers-only
+             (restrict guesses to `remaining`).
+    policy:  cache namespace under which the result is stored — one of
+             ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED
+             (see VALID_ERD_POLICIES).  Defaults to ERD_ALL when guesses
+             is supplied, ERD_ANSWERS otherwise.  Pass explicitly when the
+             caller needs a different namespace (e.g. ERD_CONSTRAINED for
+             constraint-compliant/hard mode).  An
+             unrecognized policy raises ValueError — silently writing
+             results into the wrong namespace would corrupt that mode's
+             cache for every future game.
+    progress_callback: optional progress_callback(done, total, best_word,
+             best_erd), invoked once per fully-evaluated top-level
+             candidate. Deliberately NOT threaded into the recursive
+             calls below — passing it down would fire it once per
+             candidate at every depth of the search tree, drowning the
+             one signal a caller actually wants (how far the *requested*
+             scan has gotten) in noise from scans the caller never asked
+             to watch. A caller that wants visibility into a recursive
+             scan should call min_expected_guesses on that subgroup
+             directly and supply its own callback.
+    cancel_check: optional zero-arg callable returning True once the
+             caller has abandoned this computation (e.g. the user moved
+             to a different branch). Unlike progress_callback, this IS
+             threaded into every recursive call: cancellation needs to
+             stop the search promptly at whatever depth it has reached,
+             not just between top-level candidates. Checked alongside
+             deadline — both are "stop early and return None" signals,
+             but they answer different questions. deadline bounds *this*
+             attempt's running time regardless of why it's running;
+             cancel_check answers "is this attempt's answer even still
+             wanted?" and can fire well before any deadline would.
 
-    Returns None if deadline is exceeded mid-computation; partial
-    results already written to score_cache are kept and valid.
+    Returns None if the deadline is exceeded or cancel_check fires
+    mid-computation; partial results already written to score_cache
+    are kept and valid either way.
     """
     n = len(remaining)
     if n == 1:
         return 1.0
 
+    if policy is None:
+        policy = ERD_ALL if guesses is not None else ERD_ANSWERS
+    elif policy not in VALID_ERD_POLICIES:
+        raise ValueError(
+            f"Unknown ERD policy {policy!r}; expected one of "
+            f"{sorted(VALID_ERD_POLICIES)}"
+        )
+    guess_list = guesses if guesses is not None else remaining
+
     subset_key = ScoreCache.encode_subset(remaining)
     if score_cache:
-        hit = score_cache.read(subset_key, 'erd')
+        hit = score_cache.read(subset_key, policy)
         if hit is not None:
             return hit[1]
 
     if deadline is not None and time.time() > deadline:
         return None
-    if progress_fn is not None:
-        progress_fn()
+    if cancel_check is not None and cancel_check():
+        return None
 
     best_erd = float('inf')
     best_word = None
 
-    for guess in remaining:
+    for i, guess in enumerate(guess_list):
+        # cache.group_words decomposes guess vs remaining via a persisted
+        # per-guess pattern lookup table (~0.6us/word) instead of recomputing
+        # calculate_response (~30us/word). Every new (cache-miss) subgroup
+        # re-runs this loop over the full guess_list at every recursion
+        # depth, so for non-answer guesses this difference is the dominant
+        # cost of evaluating a new subgroup. The decomposition for any guess
+        # is built once and persisted, so this is a one-time cost overall.
         if cache:
             groups = cache.group_words(guess, remaining)
         else:
@@ -754,33 +892,146 @@ def min_expected_guesses(remaining, cache, score_cache,
                 pat = _encode_response(calculate_response(guess, answer))
                 groups[pat].append(answer)
 
+        # Admissible lower bound on this guess's cost — no recursion needed.
+        # For any subgroup of size k, sub_erd >= 2 - 1/k: an oracle guess
+        # that splits k words into k singletons (one of which is "self",
+        # contributing 0) needs 1 + (k-1)/k = 2 - 1/k expected guesses, and
+        # since sub_erd >= 1 for every part, no other partition of k can give
+        # a lower weighted sum. Summing (k_i/n)*(2 - 1/k_i) over this guess's
+        # groups (sizes sum to n) telescopes to 2 - G/n, where G = len(groups);
+        # the "self" group {guess}, if present, contributes 0 instead of 1/n.
+        # So cost >= 3 - (G + has_self)/n. If even this best case can't beat
+        # best_erd, skip the guess entirely — exact for k <= 243 (a perfect
+        # all-singleton split is achievable within the 243 response patterns),
+        # and a valid-but-looser bound for k > 243.
+        has_self = _ALL_GREEN_PATTERN in groups
+        cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+        if cost_lb >= best_erd:
+            continue
+
         cost = 1.0
-        timed_out = False
-        for subgroup in groups.values():
+        aborted = False  # subscan returned None — deadline or cancel_check fired
+        skip_guess = False
+        # Largest subgroups first: they carry the highest weight (k/n) and
+        # push `cost` up fastest, so the pruning check below fires after as
+        # few subgroup evaluations as possible.
+        for subgroup in sorted(groups.values(), key=len, reverse=True):
             k = len(subgroup)
-            if k == 0:
-                continue
             # When guess is the answer, the all-green response produces a
             # singleton {guess}. We've already solved it with this guess —
             # 0 additional guesses needed for that branch.
             if k == 1 and subgroup[0] == guess:
                 continue
+            if k >= n:
+                # All remaining words gave the same response — this guess
+                # provides zero information and cannot make progress.
+                # Skip it to prevent infinite recursion.
+                skip_guess = True
+                break
             sub_erd = min_expected_guesses(
-                subgroup, cache, score_cache, deadline, progress_fn
+                subgroup, cache, score_cache, deadline, guesses,
+                policy=policy, cancel_check=cancel_check,
             )
             if sub_erd is None:
-                timed_out = True
+                aborted = True
                 break
             cost += (k / n) * sub_erd
+            # Branch-and-bound: cost is non-decreasing (every remaining
+            # subgroup contributes a positive amount), so if it already
+            # meets or beats the best known result, no later subgroup can
+            # make this guess competitive.
+            if cost >= best_erd:
+                break
 
-        if timed_out:
+        if skip_guess:
+            continue
+        if aborted:
             return None
 
         if cost < best_erd:
             best_erd = cost
             best_word = guess
 
+        if progress_callback is not None:
+            progress_callback(i + 1, len(guess_list), best_word, best_erd)
+
     if score_cache and best_word is not None:
-        score_cache.write(subset_key, 'erd', best_word, best_erd)
+        score_cache.write(subset_key, policy, best_word, best_erd)
+        cache_all_scores(best_word, remaining, score_cache, subset_key, cache=cache)
 
     return best_erd
+
+
+def verify_erd_cache(words, cache, score_cache, policy, max_nodes=2000):
+    """Spot-check a cached ERD entry against its own cached subtree.
+
+    For `words` and (recursively) every cached subgroup reachable through
+    best_word's response partition, recompute
+    1 + sum_i (k_i/n) * sub_best_score_i
+    from whatever subgroup entries are themselves cached, and compare it to
+    the entry's own best_score. Every cached sub_best_score is >= 1, so a
+    partial sum (some subgroups uncached) can only be <= the true total —
+    if it already exceeds best_score, best_score itself must be wrong.
+
+    This catches a cached entry that is internally inconsistent with its
+    own subtree (e.g. left over from a different/older computation) without
+    needing to recompute anything from scratch. It cannot prove a
+    self-consistent value is the *correct* one, but a contradiction proves
+    it is *wrong*.
+
+    Returns a list of dicts (BFS order, root first), each with keys
+    n, best_word, best_score, reconstructed, complete, status, subset_key.
+    status is one of:
+      'uncached'   - no entry for this subset (only possible for the root)
+      'match'      - reconstruction matches best_score and every k>=2
+                     subgroup was cached
+      'incomplete' - some k>=2 subgroup is uncached, but the partial
+                     reconstruction is still consistent (<= best_score)
+      'mismatch'   - reconstruction (partial or complete) contradicts
+                     best_score
+    Capped at max_nodes entries.
+    """
+    root_key = ScoreCache.encode_subset(words)
+    hit = score_cache.read(root_key, policy)
+    if hit is None:
+        return [{'n': len(words), 'subset_key': root_key, 'status': 'uncached'}]
+
+    visited = {root_key}
+    queue = [(words, root_key, hit[0], hit[1])]
+    report = []
+    while queue and len(report) < max_nodes:
+        cur_words, cur_key, cur_word, cur_score = queue.pop(0)
+        n = len(cur_words)
+        groups = cache.group_words(cur_word, cur_words)
+        reconstructed = 1.0
+        complete = True
+        for sg in groups.values():
+            k = len(sg)
+            if k == 0:
+                continue
+            if k == 1 and sg[0] == cur_word:
+                continue  # self: solved, contributes 0
+            if k == 1:
+                reconstructed += 1.0 / n
+                continue
+            sg_key = ScoreCache.encode_subset(sg)
+            sub_hit = score_cache.read(sg_key, policy)
+            if sub_hit is None:
+                complete = False
+                continue
+            reconstructed += (k / n) * sub_hit[1]
+            if sg_key not in visited and len(report) + len(queue) < max_nodes:
+                visited.add(sg_key)
+                queue.append((sg, sg_key, sub_hit[0], sub_hit[1]))
+
+        if complete:
+            status = 'match' if abs(reconstructed - cur_score) < 1e-9 else 'mismatch'
+        else:
+            status = 'mismatch' if reconstructed > cur_score + 1e-9 else 'incomplete'
+
+        report.append({
+            'n': n, 'best_word': cur_word, 'best_score': cur_score,
+            'reconstructed': reconstructed, 'complete': complete,
+            'status': status, 'subset_key': cur_key,
+        })
+    return report

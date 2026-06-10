@@ -9,6 +9,7 @@ for a streamlined experience.
 import os
 import sys
 import shutil
+import sqlite3
 import threading
 import time
 from collections import defaultdict
@@ -21,14 +22,15 @@ except ImportError:
     console = None
 
 import wordle_engine
-from cache_sqlite import ScoreCache
+from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle_engine import (
-    Solution, ScoringMethod, InputSet, ResponseCache,
+    Solution, ScoringMethod, GuessUniverse, ComplianceFilter, ResponseCache,
     load_word_list, calculate_response,
-    calculate_group_counts, score_groups,
+    calculate_group_counts, score_groups, score_groups_multi,
     decode_response, max_entropy,
     answer_to_restriction,
-    min_expected_guesses,
+    min_expected_guesses, verify_erd_cache,
+    ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
 )
 
 # ---------------------------------------------------------------------------
@@ -36,9 +38,9 @@ from wordle_engine import (
 # ---------------------------------------------------------------------------
 
 ANSWER_FILE = "NYT_wordlist.txt"
-GUESS_FILE = "wordle.txt"
+WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b41"
+BUILD = "b105"
 
 
 # ---------------------------------------------------------------------------
@@ -538,33 +540,47 @@ def print_guesses(soln):
 class GameState:
     """Shared state for all command handlers."""
 
-    def __init__(self, all_answers, all_guesses):
+    def __init__(self, all_answers, all_words):
         self.all_answers = all_answers
-        self.all_guesses = all_guesses
-        self.n_answers = len(all_answers)
-        self.n_guesses = len(all_guesses)
-        self.cache = ResponseCache(all_answers)
+        self.all_words = all_words
         self.score_cache_path = os.path.abspath("wordle_cache.sqlite3")
         self.score_cache = ScoreCache(
             self.score_cache_path,
             all_answers,
         )
+        self.cache = ResponseCache(all_answers, self.score_cache)
         print(f"Score cache: {self.score_cache_path}")
-        self.solutions = [Solution(all_answers,
-                                   all_guesses,
-                                   self.cache,
-                                   self.score_cache)]
-        self.columns = 1
-        self.input_set = InputSet.ALL_GUESSES
-        self.last_erd_progress = (0, 0)  # (done, total) from most recent warmer
+        # Long-lived: hard-mode ERD results are namespaced internally by a
+        # fingerprint of the eligible-guess vocabulary (see set_scope), so
+        # entries from earlier positions/games simply become unreachable
+        # rather than needing to be reset — and become reusable again "for
+        # free" if that exact vocabulary recurs (e.g. via undo/replay).
+        self.constrained_erd_cache = MemoryScoreCache()
+        self._start_new_game()
 
     def reset_all(self):
+        """Abandon the current game(s) and start fresh — same word lists,
+        same persistent caches, but every other piece of per-game state
+        (solutions, mode, ERD progress/cache) goes back to its initial value.
+
+        Centralized here and in __init__ so a freshly-started game and a
+        reset game can never drift out of sync: any new per-game field only
+        needs to be added in _start_new_game to be reset correctly too.
+        """
+        self._start_new_game()
+
+    def _start_new_game(self):
         self.solutions = [Solution(self.all_answers,
-                                   self.all_guesses,
+                                   self.all_words,
                                    self.cache,
                                    self.score_cache)]
         self.columns = 1
-        self.input_set = InputSet.ALL_GUESSES
+        self.universe = GuessUniverse.ALL_WORDS
+        self.compliance = ComplianceFilter.UNFILTERED
+        self.last_erd_root_progress = (0, 0, None)  # (done, total, (best_word, best_erd))
+        self.solver = None  # live reference to the current ERDSolver, for cmd_help
+        # constrained_erd_cache is intentionally NOT reset here — it is
+        # long-lived and self-scoping (see __init__ and MemoryScoreCache).
 
     @property
     def single(self):
@@ -692,32 +708,255 @@ def cmd_guess(gs):
 # Command: Solve
 # ---------------------------------------------------------------------------
 
-def _input_wordlist(gs, soln, iset):
-    """Resolve InputSet to the appropriate word list."""
-    if iset == InputSet.HARD_MODE:
-        return soln.hard_mode_words(gs.all_guesses)
-    if iset == InputSet.CURRENT_WORDLIST:
+# Candidate-mode selection grid: which static word list a guess may be drawn
+# from (GuessUniverse) is independent of whether it must satisfy every clue
+# revealed so far (ComplianceFilter) — see their docstrings in wordle_engine.
+# Every (universe, compliance) pair is a meaningful, selectable mode; the
+# dicts below are total over all four cells, by construction, rather than
+# naming three of them and leaving the fourth to be discovered later.
+
+_CANDIDATE_LABELS = {
+    (GuessUniverse.ALL_WORDS,   ComplianceFilter.UNFILTERED): "any word",
+    (GuessUniverse.ALL_WORDS,   ComplianceFilter.COMPLIANT):  "hard mode",
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.COMPLIANT):  "possible answers",
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.UNFILTERED): "answer-shaped words (unfiltered)",
+}
+
+
+def _candidate_label(universe, compliance):
+    return _CANDIDATE_LABELS[(universe, compliance)]
+
+
+def _is_hard_mode(gs):
+    """True for real Wordle hard mode: all words, filtered to clue-compliant.
+
+    The only cell of the grid whose eligible-guess vocabulary is
+    path-dependent (see _solver_branch_key) — the other COMPLIANT cell
+    (answers-only) narrows to soln.current_words, which is already
+    keyed by position and needs no extra vocabulary fingerprint.
+    """
+    return (gs.universe is GuessUniverse.ALL_WORDS
+            and gs.compliance is ComplianceFilter.COMPLIANT)
+
+
+def _is_possible_answers_mode(gs):
+    """True for the (ALL_ANSWERS, COMPLIANT) cell — guesses narrowed to the
+    live remaining-answer set, exactly soln.current_words."""
+    return (gs.universe is GuessUniverse.ALL_ANSWERS
+            and gs.compliance is ComplianceFilter.COMPLIANT)
+
+
+def _input_wordlist(gs, soln, universe, compliance):
+    """Resolve a (universe, compliance) grid cell to its candidate word list."""
+    base = gs.all_words if universe is GuessUniverse.ALL_WORDS else gs.all_answers
+    if compliance is ComplianceFilter.UNFILTERED:
+        return base
+    if universe is GuessUniverse.ALL_ANSWERS:
+        # Not constraint_compliant_words(base): current_words is already
+        # clue-compliant *and* narrowed by any manual include/exclude-letter
+        # filters, which constraint_compliant_words doesn't apply.
         return soln.current_words
-    if iset == InputSet.SOLVED_WORDS:
-        return [
-            s.current_words[0] for s in gs.solutions
-            if len(s.current_words) == 1
-        ]
-    return gs.all_guesses
+    return soln.constraint_compliant_words(base)
 
 
-def _erd_solve_scores(soln):
+def _solved_words(gs):
+    """Answers of completed sub-boards — a transient multi-board display
+    filter, independent of either grid axis (it isn't a candidate-guess
+    vocabulary at all, just "what's already been solved")."""
+    return [s.current_words[0] for s in gs.solutions if len(s.current_words) == 1]
+
+
+def _resolve_candidate_selection(gs):
+    """Determine the candidate word-source for this solve/grid invocation.
+
+    Single-board games use the persistent (gs.universe, gs.compliance)
+    selection set via the 'c' command. Multi-board games prompt per
+    invocation instead — there's no single "current position" for a
+    persistent choice to describe — and additionally offer (s)olved, a
+    transient display filter with no place on the grid (see _solved_words).
+
+    Returns (universe, compliance, solved_only), or None on invalid input
+    (the caller should treat that exactly like any other bad-input abort).
     """
-    Rank all current_words candidates by ERD using only cached values.
-    Returns sorted (word, erd_cost) list, lowest first, or None if any
-    subgroup is missing from the cache.
+    if gs.single:
+        print(f'Candidates: {_candidate_label(gs.universe, gs.compliance)}')
+        return gs.universe, gs.compliance, False
+    print('Input words? '
+          '(h)ard mode, (a)ll, (s)olved? ', end='')
+    ch = input().strip().lower()
+    if ch == 'h':
+        return GuessUniverse.ALL_WORDS, ComplianceFilter.COMPLIANT, False
+    if ch == 'a':
+        return GuessUniverse.ALL_WORDS, ComplianceFilter.UNFILTERED, False
+    if ch == 's':
+        return None, None, True
+    print_error("Invalid choice.")
+    return None
+
+
+def _resolve_candidate_wordlist(gs, soln):
+    """Resolve this invocation's candidate word list, or None to abort.
+
+    Wraps _resolve_candidate_selection: turns its (universe, compliance,
+    solved_only) result into the actual word list and folds in the "No
+    words in input set!" guard — the exact sequence both cmd_solve and
+    cmd_grid need and nothing else, so they can share it verbatim.
     """
+    selection = _resolve_candidate_selection(gs)
+    if selection is None:
+        return None
+    universe, compliance, solved_only = selection
+    wordlist = (_solved_words(gs) if solved_only
+                else _input_wordlist(gs, soln, universe, compliance))
+    if not wordlist:
+        print_error("No words in input set!")
+        return None
+    return wordlist
+
+
+class _ERDModeConfig:
+    """ERD cache/policy/guess-vocabulary mapping for one grid cell.
+
+    Single source of truth for the (universe, compliance) → (cache, policy,
+    persist, guesses) relationship, referenced by _erd_cache_and_policy,
+    cmd_solve, and the solver-init block in main() so that mapping lives in
+    exactly one place.
+    """
+    __slots__ = ('policy', 'persist', 'cache_attr', 'guesses_fn')
+
+    def __init__(self, policy, persist, cache_attr, guesses_fn):
+        self.policy = policy
+        self.persist = persist
+        self.cache_attr = cache_attr  # 'score_cache' or 'constrained_erd_cache'
+        self.guesses_fn = guesses_fn  # (gs, soln) -> guess vocabulary
+
+    def cache(self, gs, soln):
+        return (gs.constrained_erd_cache if self.cache_attr == 'constrained_erd_cache'
+                else soln.score_cache)
+
+
+_ERD_MODE_CONFIG = {
+    (GuessUniverse.ALL_WORDS, ComplianceFilter.UNFILTERED): _ERDModeConfig(
+        policy=ERD_ALL, persist=True, cache_attr='score_cache',
+        guesses_fn=lambda gs, soln: gs.all_words),
+    (GuessUniverse.ALL_WORDS, ComplianceFilter.COMPLIANT): _ERDModeConfig(
+        policy=ERD_CONSTRAINED, persist=False, cache_attr='constrained_erd_cache',
+        guesses_fn=lambda gs, soln: soln.constraint_compliant_words(gs.all_words)),
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.COMPLIANT): _ERDModeConfig(
+        policy=ERD_ANSWERS, persist=True, cache_attr='score_cache',
+        guesses_fn=lambda gs, soln: soln.current_words),
+    (GuessUniverse.ALL_ANSWERS, ComplianceFilter.UNFILTERED): _ERDModeConfig(
+        policy=ERD_ANSWERS_UNFILTERED, persist=True, cache_attr='score_cache',
+        guesses_fn=lambda gs, soln: gs.all_answers),
+}
+
+
+def _erd_mode_config(gs):
+    """ERD config for the current (universe, compliance) grid cell.
+
+    The dict above is total over all four cells, so this is a direct
+    lookup — no fallback is needed (there is no fifth combination gs.universe
+    / gs.compliance could hold).
+    """
+    return _ERD_MODE_CONFIG[(gs.universe, gs.compliance)]
+
+
+def _solver_branch_key(gs, soln, effective_guesses):
+    """Identifies the (position, guess-vocabulary) a solver is working on.
+
+    Two snapshots compare equal exactly when a running solver is still doing
+    useful work for the branch the user is now looking at — i.e. when it is
+    safe to just let it keep going rather than tearing it down and starting
+    an identical one from scratch (which would race the old one to compute
+    and announce the very same root result).
+
+    current_words alone is not enough in hard mode: the eligible-guess
+    vocabulary is path-dependent, so the same remaining-word set can arise
+    from genuinely different guess histories (e.g. via undo) with different
+    effective_guesses — hence the vocabulary fingerprint.
+    """
+    vocab_fp = (MemoryScoreCache.fingerprint_vocabulary(effective_guesses)
+                if _is_hard_mode(gs) else None)
+    return (tuple(sorted(soln.current_words)), (gs.universe, gs.compliance), vocab_fp)
+
+
+def _erd_cache_and_policy(gs, soln):
+    """Return (score_cache, policy) appropriate for the current grid cell.
+
+    (ALL_WORDS,   UNFILTERED) → SQLite,           ERD_ALL
+    (ALL_WORDS,   COMPLIANT)  → MemoryScoreCache, ERD_CONSTRAINED
+    (ALL_ANSWERS, COMPLIANT)  → SQLite,           ERD_ANSWERS
+    (ALL_ANSWERS, UNFILTERED) → SQLite,           ERD_ANSWERS_UNFILTERED
+    """
+    cfg = _erd_mode_config(gs)
+    return cfg.cache(gs, soln), cfg.policy
+
+
+def _erd_root_progress_tag(solver, soln):
+    """Status-line fragment for ERD scan progress on the current position.
+
+    Reads directly off the live solver rather than a snapshot in `gs`:
+    a snapshot taken before the current command ran (e.g. a guess that
+    just narrowed current_words) would describe a now-superseded branch.
+    The word-set check below catches that: if the solver's word set doesn't
+    match the position we're about to display, its numbers aren't about
+    this position, so there's nothing honest to show yet.
+
+    Phases in order:
+      ordering    root_total == 0 (_ranked_root_guesses running)
+      scanning    root_total > 0
+    """
+    if solver is None or set(solver._words) != set(soln.current_words):
+        return ''
+    if solver.root_total < 0:
+        return ''  # trivial position (≤2 words); no scan runs
+    if solver.root_total == 0:
+        return '  [ERD: ordering candidates...]'
+
+    current = solver.current_word_tag()
+    in_progress = ''
+    if current is not None:
+        word, elapsed, writes = current
+        if elapsed >= 2.0:  # avoid noise on words that finish almost instantly
+            in_progress = f', {word.upper()} {elapsed:.0f}s +{writes} cached'
+
+    if solver.root_best is not None:
+        bw, bs = solver.root_best
+        return (f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress} '
+                f'— best so far {bw.upper()} {bs:.3f}]')
+    return f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress}]'
+
+
+def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
+    """
+    Rank candidates by ERD using only cached subgroup values.
+    Returns sorted (word, erd_cost) list, lowest first, for every candidate
+    whose subgroups are all cached. Candidates with an uncached subgroup
+    (e.g. pruned by cost_lb in min_expected_guesses, so never recursed into)
+    are skipped rather than failing the whole ranking — the chosen ERD
+    winner is always fully cached, since it can't have been pruned. Returns
+    None only if not a single candidate could be scored.
+
+    score_cache: cache to read from; defaults to soln.score_cache (SQLite).
+    policy:      cache namespace (ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED).
+    guesses:     candidate words to rank.  Defaults to soln.current_words
+                 (answer words only).  Pass the full word list to include
+                 non-answer candidates in any-word mode.
+    """
+    from wordle_engine import _encode_response
     n = len(soln.current_words)
-    sc = soln.score_cache
+    sc = score_cache if score_cache is not None else soln.score_cache
     cache = soln.cache
+    candidates = guesses if guesses is not None else soln.current_words
     results = []
-    for word in soln.current_words:
-        groups = cache.group_words(word, soln.current_words) if cache else {}
+    for word in candidates:
+        if cache and word in cache.answer_words:
+            groups = cache.group_words(word, soln.current_words)
+        else:
+            groups = defaultdict(list)
+            for answer in soln.current_words:
+                pat = _encode_response(calculate_response(word, answer))
+                groups[pat].append(answer)
         cost = 1.0
         ok = True
         for sg in groups.values():
@@ -729,14 +968,16 @@ def _erd_solve_scores(soln):
             if k == 1:
                 cost += 1.0 / n  # base case: one word left = 1 more guess
                 continue
-            hit = sc.read(ScoreCache.encode_subset(sg), 'erd')
+            hit = sc.read(ScoreCache.encode_subset(sg), policy)
             if hit is None:
                 ok = False
                 break
             cost += (k / n) * hit[1]
         if not ok:
-            return None
+            continue  # uncached subgroup — skip this candidate, try others
         results.append((word, cost))
+    if not results:
+        return None
     results.sort(key=lambda x: x[1])
     return results
 
@@ -756,11 +997,13 @@ def cmd_solve(gs):
 
     set_display_context(soln)
 
-    # ERD option: available only when the full tree for this position is cached.
+    # ERD option: available when the full tree for this position is cached
+    # for the current input mode.
     erd_root = None
-    if not soln._is_full_game():
+    erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+    if not soln._is_full_game() and erd_sc is not None:
         root_key = ScoreCache.encode_subset(soln.current_words)
-        erd_root = soln.score_cache.read(root_key, 'erd')
+        erd_root = erd_sc.read(root_key, erd_policy)
 
     methods = list(ScoringMethod)
     erd_idx = len(methods) + 1
@@ -771,13 +1014,16 @@ def cmd_solve(gs):
     if erd_root is not None:
         print(f"  {erd_idx}. ERD: expected remaining depth (v) [{erd_root[1]:.3f}]")
     else:
-        done, total = gs.last_erd_progress
-        if total == 0:
+        root_done, root_total, root_best = gs.last_erd_root_progress
+        if root_total < 0:
             prog = 'not ready'
-        elif done < total:
-            prog = f'{done}/{total} subgroups'
+        elif root_total == 0:
+            prog = 'ordering candidates...'
+        elif root_best is not None:
+            bw, bs = root_best
+            prog = f'scanning root {root_done}/{root_total} — best so far {bw.upper()} {bs:.3f}'
         else:
-            prog = 'finishing root...'
+            prog = f'scanning root {root_done}/{root_total}'
         print(f"  {erd_idx}. ERD: expected remaining depth  ({prog})")
     print(f"Choose (1-{erd_idx})? ", end='')
     try:
@@ -786,18 +1032,21 @@ def cmd_solve(gs):
         print_error("Invalid choice.")
         return
 
-    # ERD branch: no input wordlist needed, candidates are always current_words.
+    # ERD branch: candidates come from the effective guess vocabulary.
     if raw == erd_idx:
         if erd_root is None:
             print_error("ERD tree not ready yet. Wait for the [ERD ready] notification.")
             return
-        scores = _erd_solve_scores(soln)
+        erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
+        scores = _erd_solve_scores(soln, erd_sc, erd_policy, guesses=erd_guesses)
         if scores is None:
             print_error("ERD cache incomplete — some subgroups missing.")
             return
         print("\nERD:")
         print("Best guesses:")
         print_scored_list(scores, method=None)
+        print(f"({len(scores)} of {len(erd_guesses):,} candidates fully "
+              f"resolved; the rest were pruned during the root scan)")
         return
 
     try:
@@ -806,31 +1055,8 @@ def cmd_solve(gs):
         print_error("Invalid choice.")
         return
 
-    iset = gs.input_set
-    if not gs.single:
-        print('Input words? '
-              '(h)ard mode, (a)ll, (s)olved? ', end='')
-        ch = input().strip().lower()
-        if ch == 'h':
-            iset = InputSet.HARD_MODE
-        elif ch == 'a':
-            iset = InputSet.ALL_GUESSES
-        elif ch == 's':
-            iset = InputSet.SOLVED_WORDS
-        else:
-            print_error("Invalid choice.")
-            return
-    else:
-        labels = {
-            InputSet.ALL_GUESSES:     "all guesses",
-            InputSet.HARD_MODE:       "hard mode",
-            InputSet.CURRENT_WORDLIST: "answers only",
-        }
-        print(f'Input: {labels.get(iset, iset.name)}')
-
-    wordlist = _input_wordlist(gs, soln, iset)
-    if not wordlist:
-        print_error("No words in input set!")
+    wordlist = _resolve_candidate_wordlist(gs, soln)
+    if wordlist is None:
         return
 
     # Fast path: already computed this session
@@ -903,34 +1129,11 @@ def cmd_grid(gs):
 
     set_display_context(soln)
 
-    iset = gs.input_set
-    if not gs.single:
-        print('Input words? '
-              '(h)ard mode, (a)ll, (s)olved? ', end='')
-        ch = input().strip().lower()
-        if ch == 'h':
-            iset = InputSet.HARD_MODE
-        elif ch == 'a':
-            iset = InputSet.ALL_GUESSES
-        elif ch == 's':
-            iset = InputSet.SOLVED_WORDS
-        else:
-            print_error("Invalid choice.")
-            return
-    else:
-        labels = {
-            InputSet.ALL_GUESSES:     "all guesses",
-            InputSet.HARD_MODE:       "hard mode",
-            InputSet.CURRENT_WORDLIST: "answers only",
-        }
-        print(f'Input: {labels.get(iset, iset.name)}')
-
-    wordlist = _input_wordlist(gs, soln, iset)
-    if not wordlist:
-        print_error("No words in input set!")
+    wordlist = _resolve_candidate_wordlist(gs, soln)
+    if wordlist is None:
         return
 
-    methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX]
+    methods = [ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE]
     n_in = len(wordlist)
     n_rem = len(soln.current_words)
     print(f"\nScoring {n_in:,} guesses vs "
@@ -947,7 +1150,7 @@ def cmd_grid(gs):
     # Build flat list for Pareto analysis
     word_ent_mx = [
         (word, scores[ScoringMethod.ENTROPY_GAIN],
-         int(scores[ScoringMethod.MINIMAX]))
+         int(scores[ScoringMethod.MAX_GROUP_SIZE]))
         for word, scores in results
     ]
 
@@ -1037,8 +1240,8 @@ def cmd_lookahead(gs):
             or soln.scores_method != ScoringMethod.ENTROPY_GAIN):
         print("Computing entropy ranking for lookahead...")
         rank_words = (soln.current_words
-                      if gs.input_set == InputSet.CURRENT_WORDLIST
-                      else gs.all_guesses)
+                      if _is_possible_answers_mode(gs)
+                      else gs.all_words)
         tracker = ProgressTracker(len(rank_words))
         soln.compute_scores(
             rank_words,
@@ -1049,11 +1252,11 @@ def cmd_lookahead(gs):
 
     top_n = soln.scores[:count]
 
-    # Answers-only mode: restrict step-2 candidates to the subgroup
-    is_answers_only = (gs.input_set == InputSet.CURRENT_WORDLIST)
-    if is_answers_only:
+    # Possible-answers mode: restrict step-2 candidates to the subgroup
+    is_possible_answers = _is_possible_answers_mode(gs)
+    if is_possible_answers:
         second_step_words = None
-        mode_label = "answers only (subgroup)"
+        mode_label = "possible answers (subgroup)"
     else:
         step2_count = max(count * count, 100)
         second_step_words = [w for w, _s in soln.scores[:step2_count]]
@@ -1126,10 +1329,9 @@ def cmd_display(gs):
     n = len(soln.current_words)
     print(f"\n{n:,} words remaining:")
     if soln.scores_updated:
-        filtered = [
-            (w, s) for w, s in soln.scores
-            if w in soln.current_words
-        ]
+        score_map = {w: s for w, s in soln.scores if w in soln.current_words}
+        filtered = sorted(score_map.items())  # alphabetical
+        print(f"{soln.scores_method.label}:")
         print_scored_list(filtered, soln.scores_method)
     else:
         print_word_list(soln.current_words)
@@ -1168,24 +1370,30 @@ def _explain_conflict(pos, guess_word, recorded, hypothetical):
     return f"{letter}: expected {rec}, got {hyp}"
 
 
-def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
-                     all_guesses=None):
+def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
+                     all_words=None, erd_cache=None):
     """
     Compute 3-step expected entropy and group stats for a single word.
     Returns a dict with keys: step1, step2, step3, max_grp, max_grp2,
     wt_avg, prob_finish, buckets.
 
-    step2_pool: candidate pool for step 2. If None and not hard_mode,
+    step2_pool: candidate pool for step 2. If None and not constraint_compliant,
         uses only the subgroup (answers-only mode).
-    hard_mode: if True, compute valid step-2 candidates per subgroup
-        by applying the step-1 response constraints to all_guesses.
+    constraint_compliant: if True, compute valid step-2 candidates per subgroup
+        by applying the step-1 response constraints to all_words.  Also
+        switches the ERD computation to the hard-mode guess vocabulary,
+        cached under ERD_CONSTRAINED.  Those values are path-dependent and
+        meaningless to other games/positions, so they must never reach the
+        persisted cross-game SQLite cache — erd_cache must be a
+        MemoryScoreCache (the caller's long-lived, vocabulary-scoped
+        gs.constrained_erd_cache when available, else a throwaway one).
     Step 3 always uses subgroup candidates — sub-subgroups are tiny.
     """
     cache = soln.cache
     remaining = soln.current_words
     n = len(remaining)
 
-    _step1_methods = (ScoringMethod.ENTROPY_GAIN, ScoringMethod.MINIMAX,
+    _step1_methods = (ScoringMethod.ENTROPY_GAIN, ScoringMethod.MAX_GROUP_SIZE,
                       ScoringMethod.WEIGHTED_AVG, ScoringMethod.PROB_FINISH)
     for m in _step1_methods:
         soln._ensure_scores_loaded(m)
@@ -1201,17 +1409,17 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     _cached = soln.word_scores.get(word, {})
     if all(m in _cached for m in _step1_methods):
         step1    = _cached[ScoringMethod.ENTROPY_GAIN]
-        max_grp  = int(_cached[ScoringMethod.MINIMAX])
+        max_grp  = int(_cached[ScoringMethod.MAX_GROUP_SIZE])
         wt_avg   = _cached[ScoringMethod.WEIGHTED_AVG]
         prob_fin = _cached[ScoringMethod.PROB_FINISH]
     else:
         group_counts = {p: len(g) for p, g in s1_groups.items()}
         step1    = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
         wt_avg   = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
-        max_grp  = int(score_groups(group_counts, ScoringMethod.MINIMAX))
+        max_grp  = int(score_groups(group_counts, ScoringMethod.MAX_GROUP_SIZE))
         prob_fin = score_groups(group_counts, ScoringMethod.PROB_FINISH)
         soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
-        soln.word_scores[word][ScoringMethod.MINIMAX]      = float(max_grp)
+        soln.word_scores[word][ScoringMethod.MAX_GROUP_SIZE]      = float(max_grp)
         soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
         soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
 
@@ -1227,7 +1435,7 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     # For step-2 SQLite caching, hard mode can't be keyed by subgroup key alone
     # because cands2 depends on the specific (word, pattern) constraint set.
     lc = soln.score_cache
-    policy = None if hard_mode else ('full' if step2_pool is not None else 'hard')
+    policy = None if constraint_compliant else ('full' if step2_pool is not None else 'hard')
 
     step2 = 0.0
     step3 = 0.0
@@ -1240,9 +1448,9 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
         if k <= 1:
             continue
 
-        if hard_mode and all_guesses:
+        if constraint_compliant and all_words:
             resp = decode_response(pat)
-            cands2 = answer_to_restriction(word, resp).apply(all_guesses)
+            cands2 = answer_to_restriction(word, resp).apply(all_words)
         elif step2_pool is not None:
             cands2 = step2_pool
         else:
@@ -1320,14 +1528,37 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     for m in _step1_methods:
         soln._persist_scores(m)
 
-    # ERD: exact expected guesses, answers-only candidates.
-    # Only computed mid-game (option C); root (full game) is too expensive
-    # for an interactive command and is left as None.
+    # ERD: exact expected guesses for the current candidates mode, surfaced
+    # purely from cache — never computed here. Exact ERD search over a large
+    # guess vocabulary is combinatorially expensive (a single subgroup can
+    # take tens of seconds), and that cost belongs solely to the background
+    # ERDSolver, which uses its own short deadlines to detect when it has
+    # bitten off more than it can chew. The foreground must never block on
+    # it: each subgroup is an instant cache read, exactly mirroring how
+    # print_status's ERD tag already works. A miss means "not cached yet" —
+    # reported as unavailable (None) — not a cue to compute it live. As the
+    # solver keeps populating the cache in the background, more of these
+    # lookups become hits for free.
     erd = None
     if not soln._is_full_game():
-        erd_t0 = time.time()
-        erd_announced = False
-        deadline = erd_t0 + 30
+        if constraint_compliant:
+            # Hard-mode ERD values are path-dependent (the eligible guess
+            # vocabulary depends on the exact constraints accumulated so
+            # far) and must never reach the persisted, cross-game SQLite
+            # cache. erd_cache (when supplied) is the long-lived,
+            # vocabulary-scoped MemoryScoreCache shared with the solver for
+            # this position — surfacing from it lets try-mode see whatever
+            # the solver has already found. A throwaway empty cache is the
+            # fallback for callers that don't have one (e.g. tests), which
+            # simply means nothing is surfaceable yet.
+            erd_policy = ERD_CONSTRAINED
+            erd_score_cache = erd_cache if erd_cache is not None else MemoryScoreCache()
+        elif all_words:
+            erd_policy = ERD_ALL
+            erd_score_cache = soln.score_cache
+        else:
+            erd_policy = ERD_ANSWERS
+            erd_score_cache = soln.score_cache
         erd_cost = 1.0
         erd_ok = True
         for subgroup in s1_groups.values():
@@ -1336,18 +1567,15 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
                 continue
             if k == 1 and subgroup[0] == word:
                 continue  # all-green branch: already solved, 0 more guesses
-            if not erd_announced and time.time() - erd_t0 > 5:
-                print('  Computing ERD...', end='', flush=True)
-                erd_announced = True
-            sub_erd = min_expected_guesses(
-                subgroup, cache, soln.score_cache, deadline
-            )
+            if k == 1:
+                sub_erd = 1.0  # singleton: exactly one more guess, always cached-equivalent
+            else:
+                hit = erd_score_cache.read(ScoreCache.encode_subset(subgroup), erd_policy)
+                sub_erd = hit[1] if hit is not None else None
             if sub_erd is None:
                 erd_ok = False
                 break
             erd_cost += (k / n) * sub_erd
-        if erd_announced:
-            print()
         if erd_ok:
             erd = erd_cost
 
@@ -1360,8 +1588,8 @@ def _multistep_stats(word, soln, step2_pool=None, hard_mode=False,
     }
 
 
-def _compare_words(words, soln, step2_pool=None, hard_mode=False,
-                   all_guesses=None):
+def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
+                   all_words=None, erd_cache=None):
     """Compare 2–4 words side by side."""
     n = len(soln.current_words)
 
@@ -1370,7 +1598,8 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
     for i, w in enumerate(words):
         if len(words) > 1:
             print(f'  [{i + 1}/{len(words)}] {w.upper()}', flush=True)
-        all_stats.append(_multistep_stats(w, soln, step2_pool, hard_mode, all_guesses))
+        all_stats.append(_multistep_stats(w, soln, step2_pool, constraint_compliant,
+                                           all_words, erd_cache))
 
     lw = 9  # "Entropy 1" = 9, "10-49:" = 6
 
@@ -1403,7 +1632,7 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
     # Column width: wide enough for word names AND every formatted value.
     # Using a consistent format per row means right-justifying to cw
     # automatically aligns decimal points within each row.
-    cw = max(len(w) for w in words)
+    cw = max(len(w) + 1 for w in words)  # +1 for the answer-set '*' marker
     for _, values, fmt, _ in data_rows + bucket_rows:
         for v in values:
             if v is not None:
@@ -1419,7 +1648,7 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
         else:
             best = max(valid) if higher_better else min(valid)
             all_tied = False
-        print(f'  {label:<{lw}} ', end='')
+        print(f'  {label:<{lw}}  ', end='')
         for i, (p, v) in enumerate(zip(padded, values)):
             if i:
                 print('  ', end='')
@@ -1431,7 +1660,8 @@ def _compare_words(words, soln, step2_pool=None, hard_mode=False,
         print()
 
     print(f'\n  {n:,} words:')
-    print(f'  {"":>{lw}} ' + '  '.join(w.upper().rjust(cw) for w in words))
+    print(f'  {"":>{lw}}  '
+          + '  '.join((w.upper() + _mark(w)).rjust(cw) for w in words))
 
     for label, values, fmt, hb in data_rows:
         print_row(label, values, fmt, hb)
@@ -1455,16 +1685,25 @@ def cmd_test(gs, inline=''):
         print("Word(s) to test? ", end="")
         line = input().strip()
 
-    # Derive step-2 pool and hard-mode flag from current input-set setting
-    iset = gs.input_set
-    if iset == InputSet.HARD_MODE:
+    # Derive step-2 pool and hard-mode flag from the current grid selection
+    erd_cache = None
+    if _is_hard_mode(gs):
         step2_pool = None
-        hard_mode  = True
-    elif iset == InputSet.CURRENT_WORDLIST:
+        constraint_compliant = True
+        # Reuse the long-lived, vocabulary-scoped hard-mode ERD cache so
+        # try-mode and the background solver trade sub-results for free —
+        # both use the exact same eligible-guess vocabulary for this position.
+        eligible = soln.constraint_compliant_words(gs.all_words)
+        gs.constrained_erd_cache.set_scope(
+            MemoryScoreCache.fingerprint_vocabulary(eligible))
+        erd_cache = gs.constrained_erd_cache
+    elif _is_possible_answers_mode(gs):
         step2_pool = None
-        hard_mode  = False
-    else:  # ALL_GUESSES — cap at 200 top-entropy words; searching all 12k is ~65x slower
-        hard_mode  = False
+        constraint_compliant = False
+    else:  # unfiltered (all words, or answer-shaped words) — cap at 200
+           # top-entropy; searching all 12k is ~65x slower, and even the
+           # ~3,200-word answer-shaped vocabulary benefits from the cap
+        constraint_compliant = False
         if (soln.scores_updated
                 and soln.scores_method == ScoringMethod.ENTROPY_GAIN):
             step2_pool = [w for w, _ in soln.scores[:200]]
@@ -1475,7 +1714,7 @@ def cmd_test(gs, inline=''):
     try:
         if 2 <= len(words) <= 4:
             assert all(len(w) == 5 for w in words)
-            _compare_words(words, soln, step2_pool, hard_mode, gs.all_guesses)
+            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words, erd_cache)
             return
         assert len(words) == 1 and len(words[0]) == 5
         word = words[0]
@@ -1538,10 +1777,10 @@ def cmd_test(gs, inline=''):
 
         # Multi-step lookahead for this word
         if n > 2:
-            st = _multistep_stats(word, soln, step2_pool, hard_mode,
-                                  gs.all_guesses)
-            mode = ('hard mode' if hard_mode
-                    else (f'top {len(step2_pool)}' if step2_pool else 'answers only'))
+            st = _multistep_stats(word, soln, step2_pool, constraint_compliant,
+                                  gs.all_words, erd_cache)
+            mode = ('hard mode' if constraint_compliant
+                    else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
             erd   = st.get('erd')
@@ -1671,6 +1910,67 @@ def cmd_undo(gs):
 
 
 # ---------------------------------------------------------------------------
+# Command: Verify ERD cache
+# ---------------------------------------------------------------------------
+
+def cmd_verify_erd(gs):
+    if gs.single:
+        soln = gs.solutions[0]
+    else:
+        result = pick_one(gs, "Verify. ")
+        if result is None:
+            return
+        _, soln = result
+
+    set_display_context(soln)
+
+    if soln._is_full_game():
+        print_error("No ERD entry to verify for the starting position.")
+        return
+
+    erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+    if erd_sc is None:
+        print_error("ERD not available for this mode.")
+        return
+
+    words = soln.current_words
+    report = verify_erd_cache(words, soln.cache, erd_sc, erd_policy)
+    root = report[0]
+
+    print(f"\nERD cache check: {len(words)} words, policy {erd_policy}")
+    if root['status'] == 'uncached':
+        print("  Not cached yet.")
+        return
+
+    print(f"  root: best={root['best_word'].upper()} {root['best_score']:.4f}  "
+          f"reconstructed={root['reconstructed']:.4f}  [{root['status'].upper()}]")
+
+    if isinstance(erd_sc, ScoreCache):
+        detail = erd_sc.read_detail(ScoreCache.encode_subset(words), erd_policy)
+        if detail:
+            ts = datetime.fromtimestamp(detail[2]).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"  written: {ts} local")
+
+    counts = {}
+    for r in report:
+        counts[r['status']] = counts.get(r['status'], 0) + 1
+    summary = ", ".join(f"{n} {s}" for s, n in counts.items())
+    print(f"  checked {len(report)} cached subtree node(s): {summary}")
+
+    mismatches = [r for r in report if r['status'] == 'mismatch']
+    for r in mismatches[:5]:
+        print(f"    MISMATCH: {r['n']}-word subset, best={r['best_word'].upper()} "
+              f"{r['best_score']:.4f} vs reconstructed {r['reconstructed']:.4f}")
+
+    if root['status'] == 'mismatch' and isinstance(erd_sc, ScoreCache):
+        print("\n  Root entry contradicts its own cached subtree.")
+        print("  d = delete it so it recomputes  (anything else = leave it)")
+        if input().strip().lower() == 'd':
+            erd_sc.delete(ScoreCache.encode_subset(words), erd_policy)
+            print("  Deleted.")
+
+
+# ---------------------------------------------------------------------------
 # Command: Answer (simulation mode)
 # ---------------------------------------------------------------------------
 
@@ -1723,7 +2023,7 @@ def cmd_wordcount(gs):
         if wc < 1:
             raise ValueError
         gs.solutions = [
-            Solution(gs.all_answers, gs.all_guesses,
+            Solution(gs.all_answers, gs.all_words,
                      gs.cache, gs.score_cache)
             for _ in range(wc)
         ]
@@ -1742,37 +2042,39 @@ def cmd_wordcount(gs):
 # Command: Hard mode toggle
 # ---------------------------------------------------------------------------
 
-def cmd_hardmode(gs):
-    cycle = {
-        InputSet.ALL_GUESSES:      InputSet.HARD_MODE,
-        InputSet.HARD_MODE:        InputSet.CURRENT_WORDLIST,
-        InputSet.CURRENT_WORDLIST: InputSet.ALL_GUESSES,
-    }
-    labels = {
-        InputSet.ALL_GUESSES:      "all guesses (normal)",
-        InputSet.HARD_MODE:        "hard mode (satisfies constraints)",
-        InputSet.CURRENT_WORDLIST: "answers only (strictest)",
-    }
-    gs.input_set = cycle.get(gs.input_set, InputSet.ALL_GUESSES)
-    print(f"  Input set: {labels[gs.input_set]}")
+def cmd_candidates(gs):
+    universe_options = [
+        (GuessUniverse.ALL_WORDS,   "all words (~12,972)"),
+        (GuessUniverse.ALL_ANSWERS, "possible answers (~3,200)"),
+    ]
+    compliance_options = [
+        (ComplianceFilter.UNFILTERED, "unfiltered"),
+        (ComplianceFilter.COMPLIANT,  "must satisfy revealed clues"),
+    ]
+    print(f"\nCandidates mode (current: {_candidate_label(gs.universe, gs.compliance)}):")
 
+    print("Draw guesses from:")
+    for i, (_, label) in enumerate(universe_options, 1):
+        print(f"  {i}. {label}")
+    print("Choose (1-2)? ", end="")
+    try:
+        universe = universe_options[int(input().strip()) - 1][0]
+    except (ValueError, IndexError):
+        print_error("Invalid choice.")
+        return
 
-# ---------------------------------------------------------------------------
-# Command: Cache info
-# ---------------------------------------------------------------------------
+    print("Must they satisfy every clue revealed so far?")
+    for i, (_, label) in enumerate(compliance_options, 1):
+        print(f"  {i}. {label}")
+    print("Choose (1-2)? ", end="")
+    try:
+        compliance = compliance_options[int(input().strip()) - 1][0]
+    except (ValueError, IndexError):
+        print_error("Invalid choice.")
+        return
 
-def cmd_cacheinfo(gs):
-    lc = gs.score_cache
-    la_rows, ws_rows, mtime = lc.stats()
-    if mtime:
-        ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
-    else:
-        ts = "n/a"
-    print("\nScore cache:")
-    print(f"  db path:       {gs.score_cache_path}")
-    print(f"  subgroup rows: {la_rows:,}")
-    print(f"  word scores:   {ws_rows:,}")
-    print(f"  last write:    {ts}")
+    gs.universe, gs.compliance = universe, compliance
+    print(f"  Candidates: {_candidate_label(universe, compliance)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1780,12 +2082,7 @@ def cmd_cacheinfo(gs):
 # ---------------------------------------------------------------------------
 
 def cmd_help(gs):
-    iset_labels = {
-        InputSet.ALL_GUESSES:      "all guesses",
-        InputSet.HARD_MODE:        "hard mode",
-        InputSet.CURRENT_WORDLIST: "answers only",
-    }
-    iset = iset_labels.get(gs.input_set, gs.input_set.name)
+    cand = _candidate_label(gs.universe, gs.compliance)
     if gs.single:
         aw = gs.solutions[0].answer_word
         sim = aw.upper() if aw else "off"
@@ -1796,6 +2093,9 @@ def cmd_help(gs):
         )
         sim = f"{sim_count}/{len(gs.solutions)} set"
         nguesses = "?"
+    lc = gs.score_cache
+    la_rows, ws_rows, rd_rows, mtime = lc.stats()
+    cache_ts = (datetime.utcfromtimestamp(mtime).isoformat() + "Z") if mtime else "n/a"
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
@@ -1806,13 +2106,54 @@ def cmd_help(gs):
   i = Include letters (filter)
   x = eXclude letters (filter)
   u = Undo last guess  ({nguesses} guesses so far)
+  v = Verify ERD cache entry for this position
   r = Reset
   a = Answer for simulation ({sim})
   w = Game count (quordle, etc.)
-  h = Input set: {iset}
-  c = Cache info
+  c = Candidates: {cand}
   ? = This help
+
+  Cache: {gs.score_cache_path}
+    {la_rows:,} subgroup picks, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
 """)
+    solver = gs.solver
+    if solver is not None and solver.word_stats:
+        stats = solver.word_stats
+        has_cpu = any(r[3] is not None for r in stats)
+        total_wall = sum(r[2] for r in stats)
+        total_cpu  = sum(r[3] for r in stats if r[3] is not None)
+
+        def _fmt_t(secs):
+            if secs < 0.001:
+                return f"{secs*1000:.2f}ms"
+            if secs < 10.0:
+                return f"{secs*1000:.0f}ms"
+            return f"{secs:.1f}s"
+
+        if has_cpu:
+            print(f"  ERD root scan: {len(stats)} words timed this pass, "
+                  f"{_fmt_t(total_cpu)} cpu / {_fmt_t(total_wall)} wall  "
+                  f"(cumulative: {_fmt_t(solver.cumulative_cpu_s)} cpu / "
+                  f"{_fmt_t(solver.cumulative_wall_s)} wall)")
+        else:
+            print(f"  ERD root scan: {len(stats)} words timed this pass, "
+                  f"{_fmt_t(total_wall)} wall  "
+                  f"(cumulative: {_fmt_t(solver.cumulative_wall_s)} wall)")
+        hdr_time = "cpu/wall" if has_cpu else "wall"
+        hdr_per_miss = "cpu/miss" if has_cpu else "wall/miss"
+        print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>16}  {'hits':>10}  {'misses':>7}  {hdr_per_miss:>8}")
+        for rank, word, wall, cpu, hits, misses in stats:
+            if has_cpu and cpu is not None:
+                sleep_s = wall - cpu
+                sleep_tag = f"  [+{_fmt_t(sleep_s)} sleep]" if sleep_s > 5 else ""
+                time_col = f"{_fmt_t(cpu)}/{_fmt_t(wall)}{sleep_tag}"
+                primary_t = cpu
+            else:
+                time_col = _fmt_t(wall)
+                primary_t = wall
+            per_miss = _fmt_t(primary_t / misses) if misses else "n/a"
+            print(f"  {rank:>5}  {word.upper():<8}  {time_col:>16}  {hits:>10,}  {misses:>7,}  {per_miss:>8}")
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -1829,17 +2170,22 @@ COMMANDS = {
     'i': cmd_include,
     'x': cmd_exclude,
     'u': cmd_undo,
+    'v': cmd_verify_erd,
     'r': cmd_reset,
     'a': cmd_answer,
     'w': cmd_wordcount,
-    'h': cmd_hardmode,
-    'c': cmd_cacheinfo,
+    'c': cmd_candidates,
     '?': cmd_help,
 }
 
 
-def print_status(gs):
-    """Print current game status."""
+def print_status(gs, solver=None):
+    """Print current game status.
+
+    solver: the live ERDSolver for the current position, if any — passed
+            through so the ERD progress tag can be validated against the
+            position actually being displayed (see _erd_root_progress_tag).
+    """
     refresh_display_width()
     print(f'\n{"=" * get_display_width()}')
     if gs.single:
@@ -1860,11 +2206,16 @@ def print_status(gs):
         else:
             erd_tag = ''
             if not soln._is_full_game():
-                sk = ScoreCache.encode_subset(words)
-                hit = soln.score_cache.read(sk, 'erd')
-                if hit is not None:
-                    erd_tag = f'  [ERD: {hit[1]:.3f}]'
-            print(f"{n:,} words remaining{erd_tag}")
+                erd_sc, erd_pol = _erd_cache_and_policy(gs, soln)
+                if erd_sc is not None:
+                    hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
+                    if hit is not None:
+                        erd_tag = f'  [ERD: {hit[1]:.3f} {hit[0].upper()}]'
+                    else:
+                        erd_tag = _erd_root_progress_tag(solver, soln)
+            print(f"{n:,} words remaining")
+            if erd_tag:
+                print(erd_tag.strip())
     else:
         n = len(gs.solutions)
         print(f'{n} wordlists')
@@ -1890,162 +2241,380 @@ def print_status(gs):
 
 
 # ---------------------------------------------------------------------------
-# ERD background warmer
+# ERD background solver
 # ---------------------------------------------------------------------------
 
-_WARM_MAX_SUBGROUP = 50  # subgroups larger than this are skipped during warmup
-
-
-class ERDWarmer(threading.Thread):
+class ERDSolver(threading.Thread):
     """Daemon thread: fills the ERD cache proactively for the current position.
 
     Runs while the main thread blocks on input(), giving background ERD
-    computation at zero latency cost to the user.  Uses its own ScoreCache
-    connection so it does not contend with the main thread's connection.
-    Stop is signalled via an Event; the thread checks it between subgroups.
+    computation at zero latency cost to the user.
+
+    persist=True  (ANY_WORD / POSSIBLE_ANSWERS): uses a private SQLite
+                  ScoreCache connection; results survive across sessions.
+    persist=False (CONSTRAINT_COMPLIANT): uses the caller-supplied
+                  seed_mem_cache (a long-lived, vocabulary-scoped
+                  MemoryScoreCache — see GameState.constrained_erd_cache).
+                  Results are transient because the eligible guess set is
+                  path-dependent, but the cache itself survives across runs:
+                  its internal scoping makes stale entries unreachable and
+                  recurring vocabularies reusable, with no caller bookkeeping.
+
+    policy must be passed explicitly: ERD_ALL, ERD_ANSWERS, or ERD_CONSTRAINED.
     """
 
-    def __init__(self, current_words, all_answers, score_cache_path, response_cache):
-        super().__init__(daemon=True, name='ERDWarmer')
+    def __init__(self, current_words, all_answers, effective_guesses,
+                 score_cache_path, response_cache,
+                 policy=ERD_ALL, persist=True, seed_mem_cache=None):
+        super().__init__(daemon=True, name='ERDSolver')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
+        self._effective_guesses = effective_guesses
         self._cache_path = score_cache_path
-        self._rcache = response_cache
+        # Keep a live reference to the main thread's decomposition dict.
+        # The solver must open its own SQLite connection (connections aren't
+        # thread-safe), so it can't share the caller's ResponseCache object.
+        # But the _cache dict itself is pure Python and append-only: the main
+        # thread only ever adds entries, never removes or mutates them, so
+        # reading it from the solver thread is safe under CPython's GIL.
+        # _ranked_root_guesses checks this dict first; a hit avoids both
+        # SQLite I/O and re-computation, even for entries added after the
+        # solver was constructed (e.g. while cmd_solve was running).
+        self._main_rcache_dict = response_cache._cache
+        # Index into the per-guess pattern blobs in _main_rcache_dict — built
+        # from the same canonical answer list, so positions agree with the
+        # main thread's ResponseCache without sharing its (thread-unsafe)
+        # SQLite-backed instance.
+        self._main_rcache_index = {w: i for i, w in enumerate(self._all_answers)}
+        self._rcache = None   # set in run() after opening a thread-private connection
+        self._policy = policy
+        self._persist = persist
+        self._seed_mem_cache = seed_mem_cache
         self._cancel = threading.Event()
-        self.subgroups_done = 0   # incremented after each subgroup is cached
-        self.subgroups_total = 0  # set after collection; 0 means still collecting
+        self._paused = threading.Event()
+        self._paused.set()  # initially running (not paused)
+        self.root_done = 0        # candidates fully scored so far in the root scan
+        self.root_total = 0       # size of the root scan; 0 means not started yet; -1 = trivial
+        self.root_best = None     # (word, erd) — best candidate found so far
+        self.word_stats = []      # [(rank, word, wall_s, cpu_s, hits, misses), ...]
+        # Live mid-word progress: a single root word can take far longer than
+        # the gap between progress_callback firings (it recurses through its
+        # whole subgroup tree before reporting). These let the status line
+        # show that work is happening *during* that word, not just between
+        # words. Read by _erd_root_progress_tag from the main thread; written
+        # only by this thread, so plain attributes are safe under the GIL.
+        self.current_word = None        # word being evaluated right now, or None
+        self.current_word_start = None  # time.time() when it started
+        self._score_cache = None        # set in _scan; live write_count source
+        self._word_write_baseline = 0   # score_cache.write_count at word start
+        # Sums of wall_elapsed/cpu_elapsed across ALL passes (while-loop
+        # iterations) for this position, never reset. word_stats only holds
+        # the current pass — words completed in an earlier pass replay from
+        # cache near-instantly, so per-pass sums understate total work spent.
+        self.cumulative_cpu_s = 0.0
+        self.cumulative_wall_s = 0.0
 
     def stop(self):
         self._cancel.set()
+        self._paused.set()  # unblock any paused wait so the thread can see _cancel
+
+    def pause(self):
+        self._paused.clear()
+
+    def resume(self):
+        self._paused.set()
 
     def run(self):
         if len(self._words) <= 2:
-            return  # nothing useful; base cases need no cache
-        score_cache = ScoreCache(self._cache_path, self._all_answers)
+            self.root_total = -1  # sentinel: trivial position, no scan needed
+            return
+        if self._persist:
+            score_cache = ScoreCache(self._cache_path, self._all_answers)
+        else:
+            score_cache = self._seed_mem_cache
+        # The response_cache supplied at construction (gs.cache) wraps a
+        # SQLite connection opened on the main thread — sqlite3 connections
+        # cannot be shared across threads. Replace it with one private to
+        # this thread, backed by this thread's own connection (persist=True)
+        # or none at all (persist=False — hard mode's eligible-guess
+        # subgroups are small enough that recomputing decompositions
+        # in-memory costs nothing noticeable).
+        self._rcache = ResponseCache(self._all_answers,
+                                     score_cache if self._persist else None)
         try:
-            self._warm(score_cache)
+            self._scan(score_cache)
         finally:
-            score_cache.close()
+            if self._persist:
+                score_cache.close()
 
-    def _warm(self, score_cache):
-        # Collect every unique subgroup produced by each candidate word.
-        seen = set()
-        work = []  # (size, word_list)
-        for word in self._words:
+    def _ranked_root_guesses(self):
+        """Order root-scan candidates so a still-incomplete scan's running
+        best is actually meaningful, instead of an artifact of the guess
+        list's (alphabetical) file order.
+
+        Sorted by max-group-size ascending, then entropy descending: a
+        small worst-case group bounds how badly a guess can turn out, which
+        is the property ERD itself is fundamentally about, so this ordering
+        tracks ERD quality far more closely than alphabetical position does.
+        Entropy breaks ties among equal worst-cases — a sharper distribution
+        elsewhere in the partition tends to retire more words sooner. With
+        this order, "best so far" early in the scan is a real signal, not
+        a coin flip, and the true winner tends to surface early too.
+        """
+        methods = [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN]
+        scored = []
+        for word in self._effective_guesses:
             if self._cancel.is_set():
-                return
-            if self._rcache:
-                groups = self._rcache.group_words(word, self._words)
+                return self._effective_guesses
+            if not self._paused.is_set():
+                self._paused.wait()      # block while main thread is busy
+            if self._cancel.is_set():
+                return self._effective_guesses
+            mapping = self._main_rcache_dict.get(word)
+            if mapping is not None:
+                # Use the main thread's already-computed pattern blob.
+                # Populated by cmd_solve; reading it here is safe because
+                # blobs are never mutated after creation (GIL-safe).
+                counts = {}
+                for ans in self._words:
+                    idx = self._main_rcache_index.get(ans)
+                    if idx is not None:
+                        pat = mapping[idx]
+                        counts[pat] = counts.get(pat, 0) + 1
             else:
-                groups = {}
-            for sg in groups.values():
-                k = len(sg)
-                if k <= 1 or k > _WARM_MAX_SUBGROUP:
-                    continue
-                key = ScoreCache.encode_subset(sg)
-                if key not in seen:
-                    seen.add(key)
-                    work.append((k, list(sg)))
+                counts = calculate_group_counts(word, self._words)
+            scores = score_groups_multi(counts, methods)
+            scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
+                           -scores[ScoringMethod.ENTROPY_GAIN],
+                           word))
+        scored.sort()
+        return [word for _, _, word in scored]
 
-        # Smallest subgroups first: fastest to compute, most reuse as
-        # sub-subgroups of larger ones computed later.
-        work.sort()
-        self.subgroups_total = len(work)  # now bounded; 0 = still collecting
-
-        for _size, sg in work:
-            if self._cancel.is_set():
-                return
-            sk = ScoreCache.encode_subset(sg)
-            if score_cache.read(sk, 'erd') is not None:
-                self.subgroups_done += 1
-                continue  # already in cache
-            # Short deadline so an unexpectedly expensive subgroup doesn't
-            # block the cancel signal for long.
-            deadline = time.time() + 5.0
-            min_expected_guesses(sg, self._rcache, score_cache, deadline)
-            self.subgroups_done += 1
-
-        # All subgroups done. Now compute the root (current position).
-        # If all first-level subgroups were cached above, this reads from
-        # cache and finishes in O(n) SQLite reads — fast.
+    def _on_root_progress(self, done, total, best_word, best_erd):
         if self._cancel.is_set():
             return
+        self.root_done = done
+        self.root_total = total
+        self.root_best = (best_word, best_erd)
+
+    def _start_word(self, score_cache, ranked_guesses, done):
+        """Mark the start of root-word ranked_guesses[done] for live progress
+        (current_word_tag below) — separate from word_stats, which only
+        records *completed* words."""
+        self.current_word = ranked_guesses[done] if done < len(ranked_guesses) else None
+        self.current_word_start = time.time()
+        self._word_write_baseline = score_cache.write_count
+
+    def current_word_tag(self):
+        """(word, elapsed_s, subgroups_written) for the root word currently
+        being evaluated, or None if nothing is in progress. Subgroup writes
+        are the clearest sign of life during a word whose subtree is large
+        enough that no progress_callback has fired yet."""
+        if self.current_word is None or self.current_word_start is None:
+            return None
+        if self._score_cache is None:
+            return None
+        elapsed = time.time() - self.current_word_start
+        writes = self._score_cache.write_count - self._word_write_baseline
+        return self.current_word, elapsed, writes
+
+    def _scan(self, score_cache):
+        policy = self._policy
         root_key = ScoreCache.encode_subset(self._words)
-        if score_cache.read(root_key, 'erd') is None:
-            deadline = time.time() + 30.0
-            result = min_expected_guesses(
-                self._words, self._rcache, score_cache, deadline
-            )
-            if result is not None:
-                print(f'\n  [ERD ready: {result:.3f} expected remaining depth]',
-                      flush=True)
+        try:
+            if score_cache.read(root_key, policy) is not None:
+                return  # already done from a prior session
+
+            ranked_guesses = self._ranked_root_guesses()
+            if self._cancel.is_set():
+                return
+
+            self._score_cache = score_cache
+
+            # Run the root scan directly.  Uncached subgroups are computed
+            # on-the-fly and written to the cache as a side effect (via
+            # cache_all_scores), so the cache fills progressively during the
+            # scan.  No pre-caching phase needed: the root scan is its own
+            # bottom-up fill, and progress is visible immediately.
+            #
+            # The scan may be paused mid-run when the main thread starts a
+            # foreground operation.  cancel_check returns True on both true
+            # cancellation and on pause, causing min_expected_guesses to abort
+            # and return None.  After a pause, we wait for resume and retry
+            # from the top — partial results already written to score_cache
+            # survive the abort, so the retry picks up from cache rather than
+            # starting over.
+            def _cancel_or_paused():
+                return self._cancel.is_set() or not self._paused.is_set()
+
+            # time.thread_time() measures CPU time for this thread only —
+            # it doesn't advance during iOS process suspension or while the
+            # main thread holds the GIL.  wall time is also recorded so the
+            # gap reveals how long the phone was asleep during a word.
+            _has_thread_time = hasattr(time, 'thread_time')
+            _cpu_now = time.thread_time if _has_thread_time else lambda: None
+
+            word_wall = [time.time()]
+            word_cpu  = [_cpu_now()]  # None if thread_time unavailable
+
+            def _progress(done, total, best_word, best_erd):
+                wall_elapsed = time.time() - word_wall[0]
+                cpu_t = _cpu_now()
+                cpu_elapsed = (cpu_t - word_cpu[0]
+                               if cpu_t is not None and word_cpu[0] is not None
+                               else None)
+                self.cumulative_wall_s += wall_elapsed
+                if cpu_elapsed is not None:
+                    self.cumulative_cpu_s += cpu_elapsed
+                hits   = score_cache.read_hits
+                misses = score_cache.read_misses
+                # ranked_guesses[done-1] is the word just evaluated;
+                # best_word is the running best across all words so far.
+                evaluated = ranked_guesses[done - 1]
+                self.word_stats.append(
+                    (done, evaluated, wall_elapsed, cpu_elapsed, hits, misses))
+                score_cache.reset_read_counters()
+                word_wall[0] = time.time()
+                word_cpu[0]  = _cpu_now()
+                self._on_root_progress(done, total, best_word, best_erd)
+                self._start_word(score_cache, ranked_guesses, done)
+
+            while True:
+                self.root_done = 0
+                self.root_total = 0
+                self.root_best = None
+                self.word_stats = []
+                score_cache.reset_read_counters()
+                word_wall[0] = time.time()
+                word_cpu[0]  = _cpu_now()
+                self._start_word(score_cache, ranked_guesses, 0)
+                result = min_expected_guesses(
+                    self._words, self._rcache, score_cache,
+                    guesses=ranked_guesses,
+                    policy=policy,
+                    progress_callback=_progress,
+                    cancel_check=_cancel_or_paused,
+                )
+                if result is not None:
+                    if not self._cancel.is_set():
+                        word = self.root_best[0] if self.root_best else None
+                        word_tag = f' {word.upper()}' if word else ''
+                        print(f'\n  [ERD ready: {result:.3f}{word_tag}]',
+                              flush=True)
+                    return
+                if self._cancel.is_set():
+                    return
+                # Paused — wait for the main thread to finish its operation.
+                self._paused.wait()
+                if self._cancel.is_set():
+                    return
+        except sqlite3.OperationalError:
+            return
 
 
 def main():
     print(f"wordle.py {BUILD}")
     all_answers = load_word_list(ANSWER_FILE)
-    all_guesses = load_word_list(GUESS_FILE)
+    all_words = load_word_list(WORDS_FILE)
     print(f"Loaded {len(all_answers):,} answers, "
-          f"{len(all_guesses):,} guesses.")
+          f"{len(all_words):,} guesses.")
 
-    gs = GameState(all_answers, all_guesses)
+    gs = GameState(all_answers, all_words)
 
     print_status(gs)
-    _warmer = None
+    _solver = None
+    _solver_key = None
     while True:
-        # Start a fresh warmer for the current game position.  It runs
-        # while input() blocks and is stopped as soon as the user types.
-        if _warmer is not None:
-            _warmer.stop()
-            _warmer = None
+        # Keep a solver running for the current game position across REPL
+        # turns — tearing it down and rebuilding it on every keystroke (even
+        # when the branch hasn't changed) starves it of the very thing that
+        # makes it useful: minutes of uninterrupted background time to build
+        # out the ERD cache.  It also raced a fresh solver against the old
+        # one's still-finishing root computation, producing duplicate
+        # "[ERD ready]" announcements for the same value.  Replace it only
+        # when the branch actually changes (or the game ends); otherwise let
+        # it keep going while input() blocks.
         if gs.single and not gs.solutions[0]._is_full_game():
             soln0 = gs.solutions[0]
-            _warmer = ERDWarmer(
-                soln0.current_words,
-                gs.all_answers,
-                gs.score_cache_path,
-                gs.cache,
-            )
-            _warmer.start()
+            cfg = _erd_mode_config(gs)
+            effective_guesses = cfg.guesses_fn(gs, soln0)
+            branch_key = _solver_branch_key(gs, soln0, effective_guesses)
+            if _solver is None or not _solver.is_alive() or branch_key != _solver_key:
+                if _solver is not None:
+                    _solver.stop()
+                seed_cache = None
+                if _is_hard_mode(gs):
+                    # Hard-mode ERD results are valid only for the exact
+                    # eligible-guess vocabulary that produced them.  Scope the
+                    # long-lived cache to that vocabulary's fingerprint:
+                    # entries from other vocabularies become invisible (no
+                    # false hits across undo / reset / replay), while a
+                    # recurring vocabulary's entries become reusable again
+                    # automatically — no eviction needed.
+                    gs.constrained_erd_cache.set_scope(branch_key[2])
+                    seed_cache = gs.constrained_erd_cache
+                _solver = ERDSolver(
+                    soln0.current_words,
+                    gs.all_answers,
+                    effective_guesses,
+                    gs.score_cache_path,
+                    gs.cache,
+                    policy=cfg.policy,
+                    persist=cfg.persist,
+                    seed_mem_cache=seed_cache,
+                )
+                _solver.start()
+                _solver_key = branch_key
+        elif _solver is not None:
+            _solver.stop()
+            _solver = None
+            _solver_key = None
 
-        print(f"\nCommand (gsbldtixurаwhc?)? ", end="")
+        print(f"\n{datetime.now().strftime('%H:%M:%S')}")
+        print(f"Command (gsbldtixurawcv?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:
-            if _warmer is not None:
-                _warmer.stop()
+            if _solver is not None:
+                _solver.stop()
             print()
             print("Exiting.")
             break
         except KeyboardInterrupt:
-            if _warmer is not None:
-                _warmer.stop()
+            if _solver is not None:
+                _solver.stop()
             print()
             print("Interrupted.")
             break
 
-        if _warmer is not None:
-            gs.last_erd_progress = (_warmer.subgroups_done, _warmer.subgroups_total)
-            _warmer.stop()
-            _warmer = None
+        if _solver is not None:
+            gs.last_erd_root_progress = (_solver.root_done, _solver.root_total,
+                                         _solver.root_best)
+        gs.solver = _solver
 
         if not cmd:
-            print_status(gs)
+            print_status(gs, _solver)
             continue
         handler = COMMANDS.get(cmd[0])
         if handler:
             try:
                 inline = cmd[1:].strip()
-                if inline and handler is cmd_test:
-                    cmd_test(gs, inline)
-                else:
-                    handler(gs)
+                if _solver is not None:
+                    _solver.pause()
+                try:
+                    if inline and handler is cmd_test:
+                        cmd_test(gs, inline)
+                    else:
+                        handler(gs)
+                finally:
+                    if _solver is not None:
+                        _solver.resume()
             except Exception as e:
                 print_error(f"Error: {e}")
                 raise
         else:
             print_error(f"Unknown: {cmd}")
-        print_status(gs)
+        print_status(gs, _solver)
 
 
 if __name__ == '__main__':
