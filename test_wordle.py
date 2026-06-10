@@ -3,6 +3,7 @@ Tests for Wordle engine correctness and cache behavior.
 Run with:  python test_wordle.py
 """
 import io
+import itertools
 import math
 import os
 import sqlite3
@@ -1309,6 +1310,60 @@ class TestMinExpectedGuesses(unittest.TestCase):
         with self.assertRaises(ValueError):
             min_expected_guesses(ANSWERS[:3], self.cache, None,
                                  policy="not_a_real_policy")
+
+
+# ---------------------------------------------------------------------------
+# min_expected_guesses: cost_lb admissible-bound pruning
+# ---------------------------------------------------------------------------
+
+def _brute_force_erd(remaining, cache, guess_list):
+    """Reference ERD computation with NO pruning of any kind: every guess
+    and every subgroup is evaluated, with no cost_lb check and no
+    cost >= best_erd branch-and-bound break. Mirrors the base-case and
+    skip-guess handling of min_expected_guesses exactly so the two can be
+    compared directly."""
+    n = len(remaining)
+    if n == 1:
+        return 1.0
+    best = float('inf')
+    for guess in guess_list:
+        groups = cache.group_words(guess, remaining)
+        cost = 1.0
+        skip = False
+        for subgroup in groups.values():
+            k = len(subgroup)
+            if k == 1 and subgroup[0] == guess:
+                continue
+            if k >= n:
+                skip = True
+                break
+            cost += (k / n) * _brute_force_erd(subgroup, cache, guess_list)
+        if skip:
+            continue
+        best = min(best, cost)
+    return best
+
+
+class TestMinExpectedGuessesLowerBoundPruning(unittest.TestCase):
+    """The cost_lb admissible lower bound (cost_lb = 3 - (G + has_self) / n,
+    derived from sub_erd(k) >= 2 - 1/k for any subgroup of size k) lets
+    min_expected_guesses skip a candidate guess without recursing into any
+    of its subgroups. Since the bound never overestimates the guess's true
+    cost, the chosen ERD must be identical to an unpruned search."""
+
+    def setUp(self):
+        self.cache = ResponseCache(ANSWERS)
+
+    def test_pruning_matches_brute_force(self):
+        for size in (2, 3, 4):
+            for subset in itertools.combinations(ANSWERS, size):
+                subset = list(subset)
+                pruned = min_expected_guesses(subset, self.cache, None,
+                                               guesses=GUESSES)
+                expected = _brute_force_erd(subset, self.cache, GUESSES)
+                self.assertAlmostEqual(
+                    pruned, expected, places=10,
+                    msg=f"mismatch for {subset}")
 
 
 # ---------------------------------------------------------------------------

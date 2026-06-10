@@ -167,6 +167,12 @@ def decode_response(code):
     return result[::-1]
 
 
+# All-green ("GGGGG") is the unique pattern produced only when guess==answer,
+# so a group keyed on this pattern is always exactly {guess} when present —
+# used by min_expected_guesses to detect the "self" group at O(1).
+_ALL_GREEN_PATTERN = _encode_response(['green'] * 5)
+
+
 # ---------------------------------------------------------------------------
 # Restriction system
 # ---------------------------------------------------------------------------
@@ -878,6 +884,23 @@ def min_expected_guesses(remaining, cache, score_cache,
             for answer in remaining:
                 pat = _encode_response(calculate_response(guess, answer))
                 groups[pat].append(answer)
+
+        # Admissible lower bound on this guess's cost — no recursion needed.
+        # For any subgroup of size k, sub_erd >= 2 - 1/k: an oracle guess
+        # that splits k words into k singletons (one of which is "self",
+        # contributing 0) needs 1 + (k-1)/k = 2 - 1/k expected guesses, and
+        # since sub_erd >= 1 for every part, no other partition of k can give
+        # a lower weighted sum. Summing (k_i/n)*(2 - 1/k_i) over this guess's
+        # groups (sizes sum to n) telescopes to 2 - G/n, where G = len(groups);
+        # the "self" group {guess}, if present, contributes 0 instead of 1/n.
+        # So cost >= 3 - (G + has_self)/n. If even this best case can't beat
+        # best_erd, skip the guess entirely — exact for k <= 243 (a perfect
+        # all-singleton split is achievable within the 243 response patterns),
+        # and a valid-but-looser bound for k > 243.
+        has_self = _ALL_GREEN_PATTERN in groups
+        cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+        if cost_lb >= best_erd:
+            continue
 
         cost = 1.0
         aborted = False  # subscan returned None — deadline or cancel_check fired
