@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b92"
+BUILD = "b93"
 
 
 # ---------------------------------------------------------------------------
@@ -2069,17 +2069,19 @@ def cmd_help(gs):
         else:
             print(f"  ERD root scan: {len(stats)} words timed, {_fmt_t(total_wall)} wall")
         hdr_time = "cpu/wall" if has_cpu else "wall"
-        print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>16}  {'hits':>7}  {'misses':>7}  {'hit%':>5}")
+        hdr_per_miss = "cpu/miss" if has_cpu else "wall/miss"
+        print(f"  {'rank':>5}  {'word':<8}  {hdr_time:>16}  {'hits':>10}  {'misses':>7}  {hdr_per_miss:>8}")
         for rank, word, wall, cpu, hits, misses in stats:
             if has_cpu and cpu is not None:
                 sleep_s = wall - cpu
                 sleep_tag = f"  [+{_fmt_t(sleep_s)} sleep]" if sleep_s > 5 else ""
                 time_col = f"{_fmt_t(cpu)}/{_fmt_t(wall)}{sleep_tag}"
+                primary_t = cpu
             else:
                 time_col = _fmt_t(wall)
-            total_reads = hits + misses
-            hit_pct = f"{100*hits/total_reads:.0f}%" if total_reads else "n/a"
-            print(f"  {rank:>5}  {word.upper():<8}  {time_col:>16}  {hits:>7,}  {misses:>7,}  {hit_pct:>5}")
+                primary_t = wall
+            per_miss = _fmt_t(primary_t / misses) if misses else "n/a"
+            print(f"  {rank:>5}  {word.upper():<8}  {time_col:>16}  {hits:>10,}  {misses:>7,}  {per_miss:>8}")
         print()
 
 
