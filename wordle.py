@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b111"
+BUILD = "b112"
 
 
 # ---------------------------------------------------------------------------
@@ -2041,10 +2041,12 @@ def cmd_precache(gs):
         print("Nothing to precache (no branch has 2+ words).")
         return
 
-    # Smallest branches first: ERD cost grows steeply with branch size, so
-    # this clears the many cheap branches quickly and leaves the few large,
-    # slow ones (e.g. an all-gray response) running last.
-    branches.sort(key=lambda b: len(b[1]))
+    # Largest (most probable) branches first: branch_words is a subset of
+    # current_words, so its size is exactly that response's probability
+    # under a uniform prior over the remaining answers. Cache the
+    # most-likely real-game outcomes first, even though they're also the
+    # slowest to compute.
+    branches.sort(key=lambda b: len(b[1]), reverse=True)
 
     # Upfront scan so the status line is accurate immediately, rather than
     # only catching up as the background loop reaches each cached branch.
