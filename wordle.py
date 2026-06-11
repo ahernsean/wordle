@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b108"
+BUILD = "b109"
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,7 @@ ANSI_COLORS = {
     "red": "\033[31m",
     "green": "\033[32m",
     "yellow": "\033[33m",
+    "gray": "\033[90m",
 }
 ANSI_RESET = "\033[0m"
 ANSI_BOLD  = "\033[1m" if SUPPORTS_COLOR else ""
@@ -247,6 +248,7 @@ def colored_text(color):
         "red":    (1, 0, 0),
         "green":  (0, 0.6, 0),
         "yellow": (0.6, 0.6, 0),
+        "gray":   (0.5, 0.5, 0.5),
     }
     if IS_PYTHONISTA and console is not None:
         if isinstance(color, list):
@@ -2684,7 +2686,7 @@ class BranchPrecacheSolver(threading.Thread):
                     if now - last_print[0] >= 30:
                         last_print[0] = now
                         print(f'\n  [Precache {self._branch_label(code)}: '
-                              f'{done:,}/{total:,}, best so far '
+                              f'{done:,}/{total:,} best so far '
                               f'{best_word.upper()} {best_erd:.3f}]', flush=True)
 
                 while True:
