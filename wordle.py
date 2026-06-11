@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b124"
+BUILD = "b125"
 
 
 # ---------------------------------------------------------------------------
@@ -2158,8 +2158,7 @@ def cmd_precache(gs):
     gs.precache_solver.start()
     print(f"Precaching ERD for {len(branches)} branches of "
           f"{guess_word.upper()} in the background "
-          f"({len(precached_keys)} already cached). "
-          f"Making a guess will stop it.")
+          f"({len(precached_keys)} already cached).")
 
 
 # ---------------------------------------------------------------------------
