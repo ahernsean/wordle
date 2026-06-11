@@ -10,6 +10,8 @@ import os
 import sys
 import shutil
 import sqlite3
+import logging
+import platform
 import threading
 import time
 from collections import defaultdict
@@ -28,8 +30,8 @@ from wordle_engine import (
     load_word_list, calculate_response,
     calculate_group_counts, score_groups, score_groups_multi,
     decode_response, max_entropy,
-    answer_to_restriction,
-    min_expected_guesses, verify_erd_cache,
+    answer_to_restriction, enumerate_branches,
+    min_expected_guesses, verify_erd_cache, rank_guesses_by_group_then_entropy,
     ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
 )
 
@@ -40,7 +42,16 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b105"
+LOG_FILE = "wordle_debug.log"
+BUILD = "b129"
+
+# Diagnostic log for background solver threads (ERDSolver,
+# BranchPrecacheSolver) — periodic progress, lifecycle events, and any
+# swallowed sqlite3.OperationalError with a full traceback. main() attaches
+# a FileHandler; the NullHandler keeps logging silent (no stderr noise) when
+# main() hasn't run, e.g. under the test suite.
+logger = logging.getLogger("wordle")
+logger.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +70,40 @@ SUPPORTS_COLOR = (
     )
 )
 
+
+def _platform_label():
+    """'iPhone'/'iPad'/'macOS'/'Linux'/'Windows' + kernel release.
+
+    iOS and macOS both report platform.system() == 'Darwin' — uname()'s
+    machine field is what distinguishes them on iOS, where it's the device
+    hardware identifier (e.g. 'iPhone14,2', 'iPad13,4') rather than an
+    arch string like 'arm64'.
+    """
+    uname = platform.uname()
+    if uname.system == 'Darwin':
+        machine = uname.machine.lower()
+        if machine.startswith('iphone'):
+            return f'iPhone {uname.release}'
+        if machine.startswith('ipad'):
+            return f'iPad {uname.release}'
+        return f'macOS {uname.release}'
+    return f'{uname.system} {uname.release}'
+
+
 ANSI_COLORS = {
     "red": "\033[31m",
     "green": "\033[32m",
     "yellow": "\033[33m",
+    "gray": "\033[90m",
 }
 ANSI_RESET = "\033[0m"
-ANSI_BOLD  = "\033[1m" if SUPPORTS_COLOR else ""
+
+PYTHONISTA_COLORS = {
+    "red":    (1, 0, 0),
+    "green":  (0, 0.6, 0),
+    "yellow": (0.6, 0.6, 0),
+    "gray":   (0.5, 0.5, 0.5),
+}
 
 if console is not None:
     console.set_color()
@@ -76,6 +114,14 @@ def reset_color():
         console.set_color()
     elif SUPPORTS_COLOR:
         print(ANSI_RESET, end="")
+
+
+def _start_color(color):
+    """Switch subsequent output to `color` on the current platform."""
+    if IS_PYTHONISTA and console is not None:
+        console.set_color(*PYTHONISTA_COLORS[color])
+    elif SUPPORTS_COLOR and color in ANSI_COLORS:
+        print(ANSI_COLORS[color], end="")
 
 
 _width_cache: list = [None]  # [cols] — refreshed once per REPL cycle
@@ -243,20 +289,7 @@ def _detect_display_width() -> int:
 
 @contextlib.contextmanager
 def colored_text(color):
-    pythonista_colors = {
-        "red":    (1, 0, 0),
-        "green":  (0, 0.6, 0),
-        "yellow": (0.6, 0.6, 0),
-    }
-    if IS_PYTHONISTA and console is not None:
-        if isinstance(color, list):
-            console.set_color(*color)
-        elif color in pythonista_colors:
-            console.set_color(*pythonista_colors[color])
-        else:
-            reset_color()
-    elif SUPPORTS_COLOR and color in ANSI_COLORS:
-        print(ANSI_COLORS[color], end="")
+    _start_color(color)
     try:
         yield
     finally:
@@ -274,6 +307,68 @@ def print_success(msg):
 
 
 # ---------------------------------------------------------------------------
+# Color markup
+#
+# `mark(color, text)` wraps text in a sentinel pair (Unicode Private-Use-Area
+# characters, guaranteed not to collide with real text). `render_markup` is
+# the single function that turns those sentinels into output for the current
+# platform: ANSI escapes, console.set_color() calls, or nothing (sentinels
+# stripped) in plain mode. Sentinels are recognized with plain `==`/`in`
+# checks on individual characters -- no regex needed.
+#
+# Use this for one print() that mixes several colors on a line (response
+# patterns, status lines). To wrap a block of code in a single color, use
+# colored_text()/print_error()/print_success() instead.
+# ---------------------------------------------------------------------------
+
+MARK_RESET = ''
+MARK_RED = ''
+MARK_GREEN = ''
+MARK_YELLOW = ''
+MARK_GRAY = ''
+
+_COLOR_MARKS = {
+    "red": MARK_RED,
+    "green": MARK_GREEN,
+    "yellow": MARK_YELLOW,
+    "gray": MARK_GRAY,
+}
+_MARK_COLORS = {v: k for k, v in _COLOR_MARKS.items()}
+
+
+def mark(color, text):
+    """Wrap `text` in a sentinel pair so render_markup() colors it."""
+    return f'{_COLOR_MARKS[color]}{text}{MARK_RESET}'
+
+
+def render_markup(text, end='\n'):
+    """Print a string built with mark()/MARK_* sentinels."""
+    if IS_PYTHONISTA and console is not None:
+        for ch in text:
+            if ch == MARK_RESET:
+                console.set_color()
+            elif ch in _MARK_COLORS:
+                console.set_color(*PYTHONISTA_COLORS[_MARK_COLORS[ch]])
+            else:
+                print(ch, end='')
+        print(end, end='')
+        return
+    if SUPPORTS_COLOR:
+        out = []
+        for ch in text:
+            if ch == MARK_RESET:
+                out.append(ANSI_RESET)
+            elif ch in _MARK_COLORS:
+                out.append(ANSI_COLORS[_MARK_COLORS[ch]])
+            else:
+                out.append(ch)
+        print(''.join(out), end=end)
+    else:
+        print(''.join(ch for ch in text if ch not in _MARK_COLORS
+                       and ch != MARK_RESET), end=end)
+
+
+# ---------------------------------------------------------------------------
 # Response formatting and parsing
 # ---------------------------------------------------------------------------
 
@@ -285,22 +380,34 @@ def format_response(response):
     return ''.join(RESPONSE_ABBREV[r] for r in response)
 
 
-def print_colored_pattern(response):
-    """Print a -yg pattern string with colors."""
+def _pattern_markup(response):
+    """Build a -yg markup string: each square colored per its response."""
+    parts = []
     for sq in response:
         ch = RESPONSE_ABBREV.get(sq, '?')
-        if sq in ('green', 'yellow'):
-            with colored_text(sq):
-                print(ch, end='')
-        else:
-            print(ch, end='')
+        parts.append(mark(sq, ch) if sq in _COLOR_MARKS else ch)
+    return ''.join(parts)
+
+
+def print_colored_pattern(response):
+    """Print a -yg pattern string with colors."""
+    render_markup(_pattern_markup(response), end='')
+
+
+def print_line_with_pattern(prefix, response, suffix=''):
+    """Print `prefix` + a colored -yg pattern + `suffix`, ending the
+    line with a newline. Central helper for any line that embeds a
+    response pattern (precache's "Branch ---g- |..." header, the live
+    solver's "Targeted scan of WORD ---g-" title)."""
+    render_markup(f'{prefix}{_pattern_markup(response)}{suffix}')
 
 
 def print_colored_word(word, response):
     """Print a word with each letter colored by its response."""
-    for letter, color in zip(word, response):
-        with colored_text(color):
-            print(letter.upper(), end='')
+    render_markup(
+        ''.join(mark(color, letter.upper())
+                for letter, color in zip(word, response)),
+        end='')
 
 
 def _is_gray_char(ch):
@@ -556,6 +663,10 @@ class GameState:
         # rather than needing to be reset — and become reusable again "for
         # free" if that exact vocabulary recurs (e.g. via undo/replay).
         self.constrained_erd_cache = MemoryScoreCache()
+        # Long-lived background precache thread (see BranchPrecacheSolver) —
+        # not reset by _start_new_game; stopped via the position-changed
+        # check in main() instead.
+        self.precache_solver = None
         self._start_new_game()
 
     def reset_all(self):
@@ -581,6 +692,7 @@ class GameState:
         self.solver = None  # live reference to the current ERDSolver, for cmd_help
         # constrained_erd_cache is intentionally NOT reset here — it is
         # long-lived and self-scoping (see __init__ and MemoryScoreCache).
+        # precache_solver is also intentionally NOT reset here — see __init__.
 
     @property
     def single(self):
@@ -892,39 +1004,59 @@ def _erd_cache_and_policy(gs, soln):
     return cfg.cache(gs, soln), cfg.policy
 
 
-def _erd_root_progress_tag(solver, soln):
-    """Status-line fragment for ERD scan progress on the current position.
+def _format_cache_timestamp(mtime):
+    """Human-readable last-write time for a ScoreCache.stats() mtime, or
+    'n/a' if the cache has never been written to."""
+    if not mtime:
+        return "n/a"
+    return datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
 
-    Reads directly off the live solver rather than a snapshot in `gs`:
-    a snapshot taken before the current command ran (e.g. a guess that
-    just narrowed current_words) would describe a now-superseded branch.
-    The word-set check below catches that: if the solver's word set doesn't
-    match the position we're about to display, its numbers aren't about
-    this position, so there's nothing honest to show yet.
 
-    Phases in order:
-      ordering    root_total == 0 (_ranked_root_guesses running)
-      scanning    root_total > 0
+def _current_candidate_tag(score_cache, word, start_time):
+    """(word, elapsed_s, hits, misses) for the in-progress root-scan
+    candidate `word`, started at `start_time` — or None if no candidate is
+    currently in progress.
+
+    hits/misses are score_cache.read_hits/read_misses accumulated since the
+    previous candidate finished (each candidate's start resets these
+    counters), so they describe *this* candidate's cache activity so far.
     """
-    if solver is None or set(solver._words) != set(soln.current_words):
-        return ''
-    if solver.root_total < 0:
-        return ''  # trivial position (≤2 words); no scan runs
-    if solver.root_total == 0:
-        return '  [ERD: ordering candidates...]'
+    if word is None or start_time is None or score_cache is None:
+        return None
+    return word, time.time() - start_time, score_cache.read_hits, score_cache.read_misses
 
-    current = solver.current_word_tag()
-    in_progress = ''
-    if current is not None:
-        word, elapsed, writes = current
-        if elapsed >= 2.0:  # avoid noise on words that finish almost instantly
-            in_progress = f', {word.upper()} {elapsed:.0f}s +{writes} cached'
 
-    if solver.root_best is not None:
-        bw, bs = solver.root_best
-        return (f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress} '
-                f'— best so far {bw.upper()} {bs:.3f}]')
-    return f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress}]'
+def _format_scan_progress(root_done, root_total, root_best, culled,
+                           current_tag, indent=0, suffix=''):
+    """Lines reporting progress through one ERD root scan: candidates
+    done/total (+ optional suffix, e.g. ' cands'), how many were culled by
+    the admissible lower bound, the best candidate found so far, and (if
+    available) the in-progress candidate's elapsed time and cache hit/miss
+    counts.
+
+    Shared by the pre-prompt status block, ERDSolver's periodic "Targeted
+    scan" report, and BranchPrecacheSolver's periodic "Root-word scan"
+    report. current_tag is (word, elapsed_s, hits, misses) or None — see
+    _current_candidate_tag. Every line is prefixed with `indent` spaces;
+    the candidate line gets two more.
+    """
+    pad = ' ' * indent
+    best_part = ''
+    if root_best is not None:
+        bw, bs = root_best
+        best_part = f', best: {bw.upper()} {bs:.3f}'
+    lines = [f'{pad}{root_done:,}/{root_total:,}{suffix}, '
+             f'{culled:,} culled{best_part}']
+    if current_tag is not None:
+        word, elapsed, hits, misses = current_tag
+        lines.append(f'{pad}  {word.upper()}: {elapsed:.0f}s, '
+                      f'{hits:,} hit/{misses:,} miss')
+    return lines
+
+
+def _format_branch_header(words_count):
+    """'N words | ERD: computing...'"""
+    return f'{words_count:,} words | ERD: computing...'
 
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
@@ -1021,9 +1153,9 @@ def cmd_solve(gs):
             prog = 'ordering candidates...'
         elif root_best is not None:
             bw, bs = root_best
-            prog = f'scanning root {root_done}/{root_total} — best so far {bw.upper()} {bs:.3f}'
+            prog = f'scanning root {root_done:,}/{root_total:,} — best so far {bw.upper()} {bs:.3f}'
         else:
-            prog = f'scanning root {root_done}/{root_total}'
+            prog = f'scanning root {root_done:,}/{root_total:,}'
         print(f"  {erd_idx}. ERD: expected remaining depth  ({prog})")
     print(f"Choose (1-{erd_idx})? ", end='')
     try:
@@ -1609,7 +1741,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
         ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
-        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
+        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.2%}', True),
     ]
     if any(v is not None for v in erd_vals):
         data_rows.append(('ERD', erd_vals, '{:.3f}', False))
@@ -1971,6 +2103,75 @@ def cmd_verify_erd(gs):
 
 
 # ---------------------------------------------------------------------------
+# Command: Precache ERD for sibling branches
+# ---------------------------------------------------------------------------
+
+def cmd_precache(gs):
+    if gs.precache_solver is not None and gs.precache_solver.is_alive():
+        s = gs.precache_solver
+        print(f"\nPrecache running for {s.guess_word.upper()}: "
+              f"{s.branches_done}/{s.branches_total} branches done "
+              f"({s.branches_skipped} pre-cached).")
+        print("Stop it? (y/N) ", end='')
+        if input().strip().lower() == 'y':
+            s.stop()
+            gs.precache_solver = None
+            print("Stopped.")
+        return
+
+    if not gs.single:
+        print_error("Precache requires a single board.")
+        return
+    soln = gs.solutions[0]
+    if not soln._is_full_game():
+        print_error("Precache search can be run only at the root with "
+                     "no guesses applied. Press 'r' to reset, then "
+                     "'p' again.")
+        return
+    set_display_context(soln)
+
+    cfg = _erd_mode_config(gs)
+    if cfg.policy != ERD_ALL or not cfg.persist:
+        print_error("Precache only available in 'any word / any answer' "
+                     "mode (press 'c' to switch).")
+        return
+
+    print("\nGuess word to precache branches for? ", end='')
+    guess_word = input().strip().lower()
+    if len(guess_word) != 5 or guess_word not in gs.all_words:
+        print_error("Invalid word.")
+        return
+
+    branches = enumerate_branches(soln.current_words, guess_word)
+    if not branches:
+        print("Nothing to precache (no branch has 2+ words).")
+        return
+
+    # Largest (most probable) branches first: branch_words is a subset of
+    # current_words, so its size is exactly that response's probability
+    # under a uniform prior over the remaining answers. Cache the
+    # most-likely real-game outcomes first, even though they're also the
+    # slowest to compute.
+    branches.sort(key=lambda b: len(b[1]), reverse=True)
+
+    # Upfront scan so the status line is accurate immediately, rather than
+    # only catching up as the background loop reaches each cached branch.
+    precached_keys = {
+        ScoreCache.encode_subset(words) for _, words in branches
+        if gs.score_cache.read(ScoreCache.encode_subset(words), ERD_ALL) is not None
+    }
+
+    gs.precache_solver = BranchPrecacheSolver(
+        guess_word, branches, gs.all_answers, gs.all_words,
+        gs.score_cache_path, anchor_word_count=len(soln.current_words),
+        precached_keys=precached_keys)
+    gs.precache_solver.start()
+    print(f"Precaching ERD for {len(branches)} branches of "
+          f"{guess_word.upper()} in the background "
+          f"({len(precached_keys)} already cached).")
+
+
+# ---------------------------------------------------------------------------
 # Command: Answer (simulation mode)
 # ---------------------------------------------------------------------------
 
@@ -2095,7 +2296,7 @@ def cmd_help(gs):
         nguesses = "?"
     lc = gs.score_cache
     la_rows, ws_rows, rd_rows, mtime = lc.stats()
-    cache_ts = (datetime.utcfromtimestamp(mtime).isoformat() + "Z") if mtime else "n/a"
+    cache_ts = _format_cache_timestamp(mtime)
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
@@ -2107,6 +2308,7 @@ def cmd_help(gs):
   x = eXclude letters (filter)
   u = Undo last guess  ({nguesses} guesses so far)
   v = Verify ERD cache entry for this position
+  p = Precache ERD for sibling branches of a guess (only before 1st guess)
   r = Reset
   a = Answer for simulation ({sim})
   w = Game count (quordle, etc.)
@@ -2171,6 +2373,7 @@ COMMANDS = {
     'x': cmd_exclude,
     'u': cmd_undo,
     'v': cmd_verify_erd,
+    'p': cmd_precache,
     'r': cmd_reset,
     'a': cmd_answer,
     'w': cmd_wordcount,
@@ -2182,9 +2385,13 @@ COMMANDS = {
 def print_status(gs, solver=None):
     """Print current game status.
 
-    solver: the live ERDSolver for the current position, if any — passed
-            through so the ERD progress tag can be validated against the
-            position actually being displayed (see _erd_root_progress_tag).
+    solver: the live ERDSolver for the current position, if any — read
+            directly (not via a snapshot in `gs`) so a guess that just
+            narrowed current_words can't show a now-superseded branch's
+            progress. The word-set check below catches that: if the
+            solver's word set doesn't match the position being displayed,
+            its numbers aren't about this position, so there's nothing
+            honest to show yet.
     """
     refresh_display_width()
     print(f'\n{"=" * get_display_width()}')
@@ -2202,20 +2409,33 @@ def print_status(gs, solver=None):
             with colored_text("red"):
                 print("No words remaining!")
         elif n == 1:
-            print_success(f"Solved: {words[0]}")
+            nguesses = len(soln.guesses)
+            label = "guess" if nguesses == 1 else "guesses"
+            print_success(f"Solved: {words[0]} | {nguesses} {label}")
         else:
-            erd_tag = ''
+            nguesses = len(soln.guesses)
+            label = "guess" if nguesses == 1 else "guesses"
+            line = f"{n:,} words left | {nguesses} {label} so far"
+            scan_lines = []
             if not soln._is_full_game():
                 erd_sc, erd_pol = _erd_cache_and_policy(gs, soln)
                 if erd_sc is not None:
                     hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
                     if hit is not None:
-                        erd_tag = f'  [ERD: {hit[1]:.3f} {hit[0].upper()}]'
-                    else:
-                        erd_tag = _erd_root_progress_tag(solver, soln)
-            print(f"{n:,} words remaining")
-            if erd_tag:
-                print(erd_tag.strip())
+                        line += f' | {hit[1]:.3f} {hit[0].upper()}'
+                    elif solver is not None and set(solver._words) == set(words):
+                        if solver.root_total == 0:
+                            scan_lines = ['ERD: ordering candidates...']
+                        elif solver.root_total > 0:
+                            scan_lines = _format_scan_progress(
+                                solver.root_done, solver.root_total,
+                                solver.root_best, solver.culled,
+                                solver.current_word_tag(), suffix=' cands')
+            elif gs.precache_solver is not None and gs.precache_solver.is_alive():
+                scan_lines = [gs.precache_solver.branches_line()]
+            print(line)
+            for scan_line in scan_lines:
+                print(scan_line)
     else:
         n = len(gs.solutions)
         print(f'{n} wordlists')
@@ -2264,49 +2484,39 @@ class ERDSolver(threading.Thread):
     """
 
     def __init__(self, current_words, all_answers, effective_guesses,
-                 score_cache_path, response_cache,
-                 policy=ERD_ALL, persist=True, seed_mem_cache=None):
+                 score_cache_path,
+                 policy=ERD_ALL, persist=True, seed_mem_cache=None,
+                 last_guess=None):
         super().__init__(daemon=True, name='ERDSolver')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
         self._effective_guesses = effective_guesses
         self._cache_path = score_cache_path
-        # Keep a live reference to the main thread's decomposition dict.
-        # The solver must open its own SQLite connection (connections aren't
-        # thread-safe), so it can't share the caller's ResponseCache object.
-        # But the _cache dict itself is pure Python and append-only: the main
-        # thread only ever adds entries, never removes or mutates them, so
-        # reading it from the solver thread is safe under CPython's GIL.
-        # _ranked_root_guesses checks this dict first; a hit avoids both
-        # SQLite I/O and re-computation, even for entries added after the
-        # solver was constructed (e.g. while cmd_solve was running).
-        self._main_rcache_dict = response_cache._cache
-        # Index into the per-guess pattern blobs in _main_rcache_dict — built
-        # from the same canonical answer list, so positions agree with the
-        # main thread's ResponseCache without sharing its (thread-unsafe)
-        # SQLite-backed instance.
-        self._main_rcache_index = {w: i for i, w in enumerate(self._all_answers)}
         self._rcache = None   # set in run() after opening a thread-private connection
         self._policy = policy
         self._persist = persist
         self._seed_mem_cache = seed_mem_cache
+        # (word, response) of the guess that produced _words — used only to
+        # title the periodic "Targeted scan" report (see _scan). None in
+        # tests that construct an ERDSolver directly without a Solution.
+        self._last_guess = last_guess
         self._cancel = threading.Event()
         self._paused = threading.Event()
         self._paused.set()  # initially running (not paused)
         self.root_done = 0        # candidates fully scored so far in the root scan
         self.root_total = 0       # size of the root scan; 0 means not started yet; -1 = trivial
         self.root_best = None     # (word, erd) — best candidate found so far
+        self.culled = 0           # top-level candidates pruned without recursing
         self.word_stats = []      # [(rank, word, wall_s, cpu_s, hits, misses), ...]
         # Live mid-word progress: a single root word can take far longer than
         # the gap between progress_callback firings (it recurses through its
         # whole subgroup tree before reporting). These let the status line
-        # show that work is happening *during* that word, not just between
-        # words. Read by _erd_root_progress_tag from the main thread; written
+        # and the periodic report show that work is happening *during* that
+        # word, not just between words. Read from the main thread; written
         # only by this thread, so plain attributes are safe under the GIL.
         self.current_word = None        # word being evaluated right now, or None
         self.current_word_start = None  # time.time() when it started
-        self._score_cache = None        # set in _scan; live write_count source
-        self._word_write_baseline = 0   # score_cache.write_count at word start
+        self._score_cache = None        # set in _scan; current_word_tag's source
         # Sums of wall_elapsed/cpu_elapsed across ALL passes (while-loop
         # iterations) for this position, never reset. word_stats only holds
         # the current pass — words completed in an earlier pass replay from
@@ -2347,7 +2557,7 @@ class ERDSolver(threading.Thread):
             if self._persist:
                 score_cache.close()
 
-    def _ranked_root_guesses(self):
+    def _ranked_root_guesses(self, score_cache):
         """Order root-scan candidates so a still-incomplete scan's running
         best is actually meaningful, instead of an artifact of the guess
         list's (alphabetical) file order.
@@ -2361,34 +2571,19 @@ class ERDSolver(threading.Thread):
         this order, "best so far" early in the scan is a real signal, not
         a coin flip, and the true winner tends to surface early too.
         """
-        methods = [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN]
-        scored = []
-        for word in self._effective_guesses:
+        def _cancel_check():
             if self._cancel.is_set():
-                return self._effective_guesses
+                return True
             if not self._paused.is_set():
                 self._paused.wait()      # block while main thread is busy
-            if self._cancel.is_set():
-                return self._effective_guesses
-            mapping = self._main_rcache_dict.get(word)
-            if mapping is not None:
-                # Use the main thread's already-computed pattern blob.
-                # Populated by cmd_solve; reading it here is safe because
-                # blobs are never mutated after creation (GIL-safe).
-                counts = {}
-                for ans in self._words:
-                    idx = self._main_rcache_index.get(ans)
-                    if idx is not None:
-                        pat = mapping[idx]
-                        counts[pat] = counts.get(pat, 0) + 1
-            else:
-                counts = calculate_group_counts(word, self._words)
-            scores = score_groups_multi(counts, methods)
-            scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
-                           -scores[ScoringMethod.ENTROPY_GAIN],
-                           word))
-        scored.sort()
-        return [word for _, _, word in scored]
+            return self._cancel.is_set()
+
+        if self._cancel.is_set():
+            return self._effective_guesses
+        return rank_guesses_by_group_then_entropy(
+            self._words, self._effective_guesses, self._rcache, score_cache,
+            cancel_check=_cancel_check,
+        )
 
     def _on_root_progress(self, done, total, best_word, best_erd):
         if self._cancel.is_set():
@@ -2400,23 +2595,18 @@ class ERDSolver(threading.Thread):
     def _start_word(self, score_cache, ranked_guesses, done):
         """Mark the start of root-word ranked_guesses[done] for live progress
         (current_word_tag below) — separate from word_stats, which only
-        records *completed* words."""
+        records *completed* words. Resets the cache's read counters so
+        current_word_tag's hit/miss counts describe only this candidate."""
         self.current_word = ranked_guesses[done] if done < len(ranked_guesses) else None
         self.current_word_start = time.time()
-        self._word_write_baseline = score_cache.write_count
+        score_cache.reset_read_counters()
 
     def current_word_tag(self):
-        """(word, elapsed_s, subgroups_written) for the root word currently
-        being evaluated, or None if nothing is in progress. Subgroup writes
-        are the clearest sign of life during a word whose subtree is large
-        enough that no progress_callback has fired yet."""
-        if self.current_word is None or self.current_word_start is None:
-            return None
-        if self._score_cache is None:
-            return None
-        elapsed = time.time() - self.current_word_start
-        writes = self._score_cache.write_count - self._word_write_baseline
-        return self.current_word, elapsed, writes
+        """(word, elapsed_s, hits, misses) for the root word currently being
+        evaluated, or None if nothing is in progress — see
+        _current_candidate_tag."""
+        return _current_candidate_tag(self._score_cache, self.current_word,
+                                       self.current_word_start)
 
     def _scan(self, score_cache):
         policy = self._policy
@@ -2425,11 +2615,13 @@ class ERDSolver(threading.Thread):
             if score_cache.read(root_key, policy) is not None:
                 return  # already done from a prior session
 
-            ranked_guesses = self._ranked_root_guesses()
+            self._score_cache = score_cache
+            ranked_guesses = self._ranked_root_guesses(score_cache)
             if self._cancel.is_set():
                 return
 
-            self._score_cache = score_cache
+            logger.info("ERDSolver scan started: %d words, policy=%s",
+                         len(self._words), policy)
 
             # Run the root scan directly.  Uncached subgroups are computed
             # on-the-fly and written to the cache as a side effect (via
@@ -2457,6 +2649,36 @@ class ERDSolver(threading.Thread):
             word_wall = [time.time()]
             word_cpu  = [_cpu_now()]  # None if thread_time unavailable
 
+            # Periodic "Targeted scan" report — same shape and 30s cadence
+            # as BranchPrecacheSolver's "Root-word scan" report, for the one
+            # position this solver is scanning. Only prints if last_guess
+            # was supplied (always true from main(); some tests omit it).
+            last_print = [time.time()]
+
+            def _maybe_print():
+                if self._last_guess is None:
+                    return
+                now = time.time()
+                if now - last_print[0] < 30:
+                    return
+                last_print[0] = now
+                last_word, last_resp = self._last_guess
+                logger.info(
+                    "Targeted scan of %s %s: %d/%d done, %d culled, "
+                    "best=%s, candidate=%s",
+                    last_word.upper(), format_response(last_resp),
+                    self.root_done, self.root_total, self.culled,
+                    self.root_best, self.current_word_tag())
+                print()
+                print_line_with_pattern(
+                    f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} '
+                    f'Targeted scan of {last_word.upper()} ', last_resp)
+                lines = ['  ' + _format_branch_header(len(self._words))]
+                lines.extend(_format_scan_progress(
+                    self.root_done, self.root_total, self.root_best,
+                    self.culled, self.current_word_tag(), indent=2))
+                print('\n'.join(lines), flush=True)
+
             def _progress(done, total, best_word, best_erd):
                 wall_elapsed = time.time() - word_wall[0]
                 cpu_t = _cpu_now()
@@ -2473,18 +2695,23 @@ class ERDSolver(threading.Thread):
                 evaluated = ranked_guesses[done - 1]
                 self.word_stats.append(
                     (done, evaluated, wall_elapsed, cpu_elapsed, hits, misses))
-                score_cache.reset_read_counters()
+                # done counts every top-level candidate considered, including
+                # ones cost_lb-pruned with no recursion at all (so no
+                # _progress call); word_stats only counts ones that ran to
+                # completion. The gap is candidates culled before recursing.
+                self.culled = done - len(self.word_stats)
                 word_wall[0] = time.time()
                 word_cpu[0]  = _cpu_now()
                 self._on_root_progress(done, total, best_word, best_erd)
                 self._start_word(score_cache, ranked_guesses, done)
+                _maybe_print()
 
             while True:
                 self.root_done = 0
                 self.root_total = 0
                 self.root_best = None
+                self.culled = 0
                 self.word_stats = []
-                score_cache.reset_read_counters()
                 word_wall[0] = time.time()
                 word_cpu[0]  = _cpu_now()
                 self._start_word(score_cache, ranked_guesses, 0)
@@ -2494,6 +2721,7 @@ class ERDSolver(threading.Thread):
                     policy=policy,
                     progress_callback=_progress,
                     cancel_check=_cancel_or_paused,
+                    heartbeat=_maybe_print,
                 )
                 if result is not None:
                     if not self._cancel.is_set():
@@ -2501,19 +2729,290 @@ class ERDSolver(threading.Thread):
                         word_tag = f' {word.upper()}' if word else ''
                         print(f'\n  [ERD ready: {result:.3f}{word_tag}]',
                               flush=True)
+                        logger.info("ERD ready: %.3f%s", result, word_tag)
+                    else:
+                        logger.info("ERDSolver cancelled before result delivered")
                     return
                 if self._cancel.is_set():
+                    logger.info("ERDSolver cancelled mid-scan")
                     return
                 # Paused — wait for the main thread to finish its operation.
                 self._paused.wait()
                 if self._cancel.is_set():
+                    logger.info("ERDSolver cancelled while paused")
                     return
         except sqlite3.OperationalError:
+            logger.exception(
+                "ERDSolver scan aborted (OperationalError): %d words, "
+                "policy=%s, %d/%d done, %d culled, candidate=%s",
+                len(self._words), policy, self.root_done, self.root_total,
+                self.culled, self.current_word_tag())
             return
 
 
+# ---------------------------------------------------------------------------
+# Branch precache background solver
+# ---------------------------------------------------------------------------
+
+class BranchPrecacheSolver(threading.Thread):
+    """Daemon thread: fills subgroup_best_by_policy (ERD_ALL) for every
+    not-yet-cached branch of `guess_word`, one at a time, in `branches`
+    order. Always persist=True (SQLite) — precaching only makes sense for
+    the persisted, universe-scoped ERD_ALL cache.
+
+    Resumable for free: each branch is skipped if score_cache.read(root_key,
+    ERD_ALL) already has an entry — whether written by an earlier precache
+    run or by the live ERDSolver after the user actually played that branch.
+
+    rcache is built once and shared across all branches in this run.
+    ResponseCache._ensure caches each guess's decomposition blob after first
+    load, so the first non-skipped branch loads/builds the decomposition
+    blobs (mostly already in response_decomposition from prior runs), and
+    every subsequent branch's group_counts/group_words calls are pure
+    in-memory lookups.
+    """
+
+    def __init__(self, guess_word, branches, all_answers, all_words,
+                 score_cache_path, anchor_word_count, precached_keys=frozenset()):
+        super().__init__(daemon=True, name='BranchPrecacheSolver')
+        self.guess_word = guess_word
+        self._branches = branches            # [(code, branch_words), ...]
+        self._all_answers = all_answers
+        self._all_words = all_words
+        self._cache_path = score_cache_path
+        self.anchor_word_count = anchor_word_count
+        self._cancel = threading.Event()
+        self._paused = threading.Event()
+        self._paused.set()
+        # precached_keys: encode_subset() keys found cached by cmd_precache's
+        # upfront scan, so the status line is accurate from the first
+        # moment instead of only catching up as run()'s loop reaches them.
+        self._precached_keys = precached_keys
+        self.branches_total = len(branches)
+        self.branches_done = len(precached_keys)
+        self.branches_skipped = len(precached_keys)
+        self.current_branch_code = None
+        self.current_branch_size = None
+        self.root_done = 0
+        self.root_total = 0
+        self.root_best = None
+        self.culled = 0
+        # Live mid-candidate progress, mirroring ERDSolver — see
+        # _current_candidate_tag / current_word_tag.
+        self.current_word = None
+        self.current_word_start = None
+        self._score_cache = None  # set in run(); current_word_tag's source
+
+    def stop(self):
+        self._cancel.set()
+        self._paused.set()
+
+    def pause(self):
+        self._paused.clear()
+
+    def resume(self):
+        self._paused.set()
+
+    def _start_word(self, score_cache, ranked_guesses, done):
+        """Mark the start of candidate ranked_guesses[done] for live
+        progress — see ERDSolver._start_word."""
+        self.current_word = ranked_guesses[done] if done < len(ranked_guesses) else None
+        self.current_word_start = time.time()
+        score_cache.reset_read_counters()
+
+    def current_word_tag(self):
+        """(word, elapsed_s, hits, misses) for the candidate currently being
+        evaluated, or None — see _current_candidate_tag."""
+        return _current_candidate_tag(self._score_cache, self.current_word,
+                                       self.current_word_start)
+
+    def branches_line(self, done=False):
+        """'Branches: D/T[ done], S hit/C miss' — S branches were already
+        cached (a "hit" against the persisted ERD_ALL cache) and C were
+        computed this run (a "miss")."""
+        computed = self.branches_done - self.branches_skipped
+        suffix = ' done' if done else ''
+        return (f'Branches: {self.branches_done}/{self.branches_total}{suffix}, '
+                f'{self.branches_skipped} hit/{computed} miss')
+
+    def _branches_starting_line(self):
+        return f'Branches: 0/{self.branches_total}, {self.branches_skipped} cached'
+
+    def run(self):
+        if self._cancel.is_set():
+            return
+        score_cache = ScoreCache(self._cache_path, self._all_answers)
+        rcache = ResponseCache(self._all_answers, score_cache)
+        self._score_cache = score_cache
+
+        def _title():
+            return (f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} '
+                    f'Root-word scan of {self.guess_word.upper()}')
+
+        try:
+            if self._cancel.is_set():
+                return
+            print(f'\n{_title()}\n{self._branches_starting_line()}', flush=True)
+            logger.info("BranchPrecacheSolver started: %s, %d branches (%d pre-cached)",
+                         self.guess_word.upper(), self.branches_total,
+                         self.branches_skipped)
+            for code, words in self._branches:
+                if self._cancel.is_set():
+                    return
+                if not self._paused.is_set():
+                    self._paused.wait()
+                if self._cancel.is_set():
+                    return
+
+                self.current_branch_code = code
+                self.current_branch_size = len(words)
+                root_key = ScoreCache.encode_subset(words)
+                if root_key in self._precached_keys:
+                    continue  # already counted by cmd_precache's upfront scan
+                if score_cache.read(root_key, ERD_ALL) is not None:
+                    self.branches_skipped += 1
+                    self.branches_done += 1
+                    continue
+
+                def _ranking_cancel_check():
+                    if self._cancel.is_set():
+                        return True
+                    if not self._paused.is_set():
+                        self._paused.wait()
+                    return self._cancel.is_set()
+
+                def _cancel_or_paused():
+                    return self._cancel.is_set() or not self._paused.is_set()
+
+                ranked = rank_guesses_by_group_then_entropy(
+                    words, self._all_words, rcache, score_cache,
+                    cancel_check=_ranking_cancel_check)
+                if self._cancel.is_set():
+                    return
+
+                response_pat = decode_response(code)
+                logger.info("Branch %s (%d words) starting (%d/%d branches)",
+                             format_response(response_pat), len(words),
+                             self.branches_done + 1, self.branches_total)
+                last_print = [time.time()]
+                progress_calls = [0]
+
+                def _maybe_print():
+                    now = time.time()
+                    if now - last_print[0] < 30:
+                        return
+                    last_print[0] = now
+                    logger.info(
+                        "Root-word scan of %s, branch %s (%d words): "
+                        "%d/%d done, %d culled, best=%s, candidate=%s",
+                        self.guess_word.upper(), format_response(response_pat),
+                        self.current_branch_size, self.root_done, self.root_total,
+                        self.culled, self.root_best, self.current_word_tag())
+                    print()
+                    print(_title())
+                    print(self.branches_line())
+                    print_line_with_pattern(
+                        '  Branch ', response_pat,
+                        f' | {self.current_branch_size:,} words | '
+                        f'ERD: computing...')
+                    print('\n'.join(_format_scan_progress(
+                        self.root_done, self.root_total, self.root_best,
+                        self.culled, self.current_word_tag(), indent=2)),
+                        flush=True)
+
+                def _progress(done, total, best_word, best_erd):
+                    self.root_done = done
+                    self.root_total = total
+                    self.root_best = (best_word, best_erd)
+                    progress_calls[0] += 1
+                    # done counts every top-level candidate considered,
+                    # including ones cost_lb-pruned with no recursion at
+                    # all; progress_calls only counts ones that ran to
+                    # completion. The gap between them is candidates culled
+                    # by the admissible lower bound before recursing.
+                    self.culled = done - progress_calls[0]
+                    self._start_word(score_cache, ranked, done)
+                    _maybe_print()
+
+                while True:
+                    self.root_done = 0
+                    self.root_total = len(ranked)
+                    self.root_best = None
+                    self.culled = 0
+                    progress_calls[0] = 0
+                    self._start_word(score_cache, ranked, 0)
+                    result = min_expected_guesses(
+                        words, rcache, score_cache,
+                        guesses=ranked, policy=ERD_ALL,
+                        progress_callback=_progress,
+                        cancel_check=_cancel_or_paused,
+                        # Fires on every recursive call, including cache
+                        # hits — unlike _progress, which can go quiet for a
+                        # long time while the first top-level candidate
+                        # (best_erd still unbounded) recurses through its
+                        # whole subtree.
+                        heartbeat=_maybe_print)
+                    if result is not None:
+                        break
+                    if self._cancel.is_set():
+                        return
+                    self._paused.wait()
+                    if self._cancel.is_set():
+                        return
+
+                self.branches_done += 1
+                best_word, _ = score_cache.read(root_key, ERD_ALL)
+                logger.info("Branch %s done: %.3f %s (%d/%d branches, %d culled)",
+                             format_response(response_pat), result, best_word.upper(),
+                             self.branches_done, self.branches_total, self.culled)
+                print()
+                print(_title())
+                print(self.branches_line())
+                print_line_with_pattern(
+                    '  Branch ', response_pat,
+                    f' | {self.current_branch_size:,} words | '
+                    f'done: {result:.3f} {best_word.upper()}')
+                print(f'  {self.culled:,}/{self.root_total:,} culled',
+                      flush=True)
+
+            print(f'\n{_title()}\n{self.branches_line(done=True)}', flush=True)
+            logger.info("BranchPrecacheSolver complete: %s, %d/%d branches (%d pre-cached)",
+                         self.guess_word.upper(), self.branches_done,
+                         self.branches_total, self.branches_skipped)
+        except sqlite3.OperationalError:
+            logger.exception(
+                "BranchPrecacheSolver aborted (OperationalError): %s, "
+                "branch=%s (%d/%d branches), candidate=%s",
+                self.guess_word.upper(),
+                format_response(decode_response(self.current_branch_code))
+                    if self.current_branch_code is not None else None,
+                self.branches_done, self.branches_total,
+                self.current_word_tag())
+            return
+        finally:
+            logger.info(
+                "BranchPrecacheSolver exiting: %s, %d/%d branches done "
+                "(%d cached), current branch=%s, candidate=%s",
+                self.guess_word.upper(), self.branches_done, self.branches_total,
+                self.branches_skipped,
+                format_response(decode_response(self.current_branch_code))
+                    if self.current_branch_code is not None else None,
+                self.current_word_tag())
+            score_cache.close()
+
+
 def main():
-    print(f"wordle.py {BUILD}")
+    log_path = os.path.abspath(LOG_FILE)
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(threadName)-20s %(levelname)-7s %(message)s"))
+    logger.addHandler(file_handler)
+    logger.setLevel(logging.INFO)
+    logger.info("=== %s started (%s) ===", BUILD, _platform_label())
+
+    print(f"{BUILD} {_platform_label()}")
+    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Debug log: {log_path}")
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)
     print(f"Loaded {len(all_answers):,} answers, "
@@ -2521,10 +3020,29 @@ def main():
 
     gs = GameState(all_answers, all_words)
 
+    sp_rows, ws_rows, rd_rows, mtime = gs.score_cache.stats()
+    print(f"Cache: {sp_rows:,} subgroup picks")
+    print(f"  {ws_rows:,} word scores, {rd_rows:,} decomps")
+    print(f"  last write {_format_cache_timestamp(mtime)}")
+
     print_status(gs)
     _solver = None
     _solver_key = None
     while True:
+        # Precache and the live branch ERDSolver must never run concurrently
+        # (see BranchPrecacheSolver) — stop precache the moment the position
+        # changes: a guess, an include/exclude filter, or leaving single-board
+        # mode. It does not auto-resume; the user must press 'p' again.
+        if gs.precache_solver is not None and gs.precache_solver.is_alive():
+            soln0 = gs.solutions[0] if gs.single else None
+            if (soln0 is None
+                    or not soln0._is_full_game()
+                    or len(soln0.current_words) != gs.precache_solver.anchor_word_count):
+                gs.precache_solver.stop()
+                gs.precache_solver = None
+        elif gs.precache_solver is not None and not gs.precache_solver.is_alive():
+            gs.precache_solver = None
+
         # Keep a solver running for the current game position across REPL
         # turns — tearing it down and rebuilding it on every keystroke (even
         # when the branch hasn't changed) starves it of the very thing that
@@ -2558,10 +3076,10 @@ def main():
                     gs.all_answers,
                     effective_guesses,
                     gs.score_cache_path,
-                    gs.cache,
                     policy=cfg.policy,
                     persist=cfg.persist,
                     seed_mem_cache=seed_cache,
+                    last_guess=tuple(soln0.guesses[-1]),
                 )
                 _solver.start()
                 _solver_key = branch_key
@@ -2570,19 +3088,23 @@ def main():
             _solver = None
             _solver_key = None
 
-        print(f"\n{datetime.now().strftime('%H:%M:%S')}")
-        print(f"Command (gsbldtixurawcv?)? ", end="")
+        print(datetime.now().strftime('%H:%M:%S'))
+        print(f"Command (gsbldtixurawcvp?)? ", end="")
         try:
             cmd = input().strip()
         except EOFError:
             if _solver is not None:
                 _solver.stop()
+            if gs.precache_solver is not None:
+                gs.precache_solver.stop()
             print()
             print("Exiting.")
             break
         except KeyboardInterrupt:
             if _solver is not None:
                 _solver.stop()
+            if gs.precache_solver is not None:
+                gs.precache_solver.stop()
             print()
             print("Interrupted.")
             break
@@ -2601,6 +3123,8 @@ def main():
                 inline = cmd[1:].strip()
                 if _solver is not None:
                     _solver.pause()
+                if gs.precache_solver is not None:
+                    gs.precache_solver.pause()
                 try:
                     if inline and handler is cmd_test:
                         cmd_test(gs, inline)
@@ -2609,6 +3133,8 @@ def main():
                 finally:
                     if _solver is not None:
                         _solver.resume()
+                    if gs.precache_solver is not None:
+                        gs.precache_solver.resume()
             except Exception as e:
                 print_error(f"Error: {e}")
                 raise

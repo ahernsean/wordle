@@ -6,29 +6,43 @@ import io
 import itertools
 import math
 import os
+import platform
+import re
 import sqlite3
 import sys
 import tempfile
 import time
+import types
 import unittest
 from collections import defaultdict
 from contextlib import redirect_stdout
+from datetime import datetime
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wordle_engine import (
-    Solution, ScoringMethod, ResponseCache,
+    Solution, ScoringMethod, ResponseCache, GuessUniverse, ComplianceFilter,
     calculate_response, score_groups, score_groups_multi, calculate_group_counts,
     score_word, score_word_multi, load_word_list, max_entropy,
     Restriction, answer_to_restriction, apply_guess, _encode_response,
+    decode_response, _ALL_GREEN_PATTERN,
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
+    enumerate_branches, rank_guesses_by_group_then_entropy,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
     _multistep_stats, _erd_solve_scores, ERDSolver,
     _compare_words, set_display_context,
+    BranchPrecacheSolver, format_response, print_status,
+    _format_cache_timestamp, _current_candidate_tag,
+    _format_scan_progress, _format_branch_header, _platform_label,
+    print_line_with_pattern,
+    colored_text, reset_color, print_error, print_success,
+    print_colored_pattern, print_colored_word, ANSI_COLORS, ANSI_RESET,
+    mark, render_markup, MARK_RESET, MARK_RED, MARK_GREEN, MARK_YELLOW,
+    MARK_GRAY,
 )
 
 
@@ -277,6 +291,32 @@ class TestRestriction(unittest.TestCase):
             self.assertEqual(filtered, expected, msg=f"answer={answer}")
 
 
+class TestEnumerateBranches(unittest.TestCase):
+
+    def test_partition_covers_all_words(self):
+        words = ANSWERS
+        guess_word = "heart"
+        branches = enumerate_branches(words, guess_word)
+
+        codes = [code for code, _ in branches]
+        self.assertNotIn(_ALL_GREEN_PATTERN, codes)
+        self.assertEqual(len(codes), len(set(codes)))
+
+        for code, branch_words in branches:
+            self.assertGreaterEqual(len(branch_words), 2)
+            self.assertEqual(
+                branch_words,
+                apply_guess(words, guess_word, decode_response(code)))
+
+        # Branches plus the excluded (<2-word, including the win) groups
+        # exactly partition the original word list.
+        branch_total = sum(len(bw) for _, bw in branches)
+        excluded_total = sum(
+            len(apply_guess(words, guess_word, decode_response(code)))
+            for code in range(243) if code not in codes)
+        self.assertEqual(branch_total + excluded_total, len(words))
+
+
 class TestScoringMethodDisplay(unittest.TestCase):
 
     def test_label_is_distinct_per_method(self):
@@ -287,7 +327,7 @@ class TestScoringMethodDisplay(unittest.TestCase):
         self.assertEqual(ScoringMethod.MAX_GROUP_SIZE.format_score(7.0), "7")
 
     def test_format_score_prob_finish_is_percentage(self):
-        self.assertEqual(ScoringMethod.PROB_FINISH.format_score(0.25), "25.0%")
+        self.assertEqual(ScoringMethod.PROB_FINISH.format_score(0.25), "25.00%")
 
     def test_format_score_default_is_four_decimals(self):
         self.assertEqual(ScoringMethod.ENTROPY_GAIN.format_score(1.5), "1.5000")
@@ -613,6 +653,89 @@ class TestScoreCacheSQLite(unittest.TestCase):
         key = ScoreCache.encode_subset(words)
         self.assertEqual(len(key), 15)
         self.assertNotIn(b"\x00", key)
+
+    def test_checkpoint_truncates_wal_and_persists_writes(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        sc.checkpoint()
+
+        wal_path = self.db + "-wal"
+        self.assertTrue(
+            not os.path.exists(wal_path) or os.path.getsize(wal_path) == 0,
+            "checkpoint should fold the WAL into the main db file")
+
+        # A fresh connection (simulating a copy of just the .sqlite3 file)
+        # must see the checkpointed write.
+        sc2 = ScoreCache(self.db, ANSWERS)
+        try:
+            self.assertEqual(sc2.read(subset_key, "full"), ("heart", 2.5))
+        finally:
+            sc2.close()
+        sc.close()
+
+    def test_close_checkpoints(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        sc.close()
+
+        wal_path = self.db + "-wal"
+        self.assertTrue(
+            not os.path.exists(wal_path) or os.path.getsize(wal_path) == 0,
+            "close() should leave a self-contained .sqlite3 file")
+
+    def test_checkpoint_swallows_disk_io_error(self):
+        """A transient OperationalError (e.g. iCloud File Provider Storage
+        holding the lock TRUNCATE needs) must not propagate — the WAL still
+        has every committed write, so a failed checkpoint loses nothing."""
+        sc = ScoreCache(self.db, ANSWERS)
+
+        class FailingCheckpoint:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if sql.startswith("PRAGMA wal_checkpoint"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_conn = sc._conn
+        sc._conn = FailingCheckpoint(real_conn)
+        try:
+            sc.checkpoint()  # must not raise
+        finally:
+            sc._conn = real_conn
+        sc.close()
+
+    def test_close_releases_connection_when_checkpoint_fails(self):
+        """close() must still release the connection even when its
+        checkpoint() call hits a disk I/O error."""
+        sc = ScoreCache(self.db, ANSWERS)
+
+        class FailingCheckpoint:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if sql.startswith("PRAGMA wal_checkpoint"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *a, **k)
+
+            def close(self):
+                self._real.close()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        sc._conn = FailingCheckpoint(sc._conn)
+        sc.close()  # must not raise
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            sc.read(ScoreCache.encode_subset(["crane"]), "full")
 
     def test_encode_subset_is_order_independent(self):
         self.assertEqual(
@@ -1088,6 +1211,114 @@ class TestCacheAllScores(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# rank_guesses_by_group_then_entropy — shared word_scores cache with cmd_solve
+# ---------------------------------------------------------------------------
+
+class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _expected_order(self, words, candidates, cache):
+        scored = []
+        for word in candidates:
+            groups = cache.group_counts(word, words)
+            scores = score_groups_multi(
+                groups, (ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN))
+            scored.append((scores[ScoringMethod.MAX_GROUP_SIZE],
+                            -scores[ScoringMethod.ENTROPY_GAIN], word))
+        scored.sort()
+        return [w for _, _, w in scored]
+
+    def test_uses_word_scores_populated_by_compute_scores_multi(self):
+        """If 's' (compute_scores_multi) already populated word_scores for
+        this position, ranking must use those cached scores rather than
+        recomputing via rcache.group_counts."""
+        words = ANSWERS[:6]
+        candidates = GUESSES
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            cache = ResponseCache(ANSWERS, score_cache=sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.current_words = words
+            soln.compute_scores_multi(
+                candidates, [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN])
+
+            expected_order = self._expected_order(words, candidates, cache)
+
+            class ExplodingResponseCache:
+                @staticmethod
+                def group_counts(word, subset):
+                    raise AssertionError(
+                        "ranking should use cached word_scores, not recompute")
+
+            ranked = rank_guesses_by_group_then_entropy(
+                words, candidates, ExplodingResponseCache(), sc)
+            self.assertEqual(ranked, expected_order)
+        finally:
+            sc.close()
+
+    def test_populates_word_scores_for_later_compute_scores_multi(self):
+        """If ERD ranking runs first at this position, it must persist
+        MAX_GROUP_SIZE/ENTROPY_GAIN into word_scores so a later 's'
+        (compute_scores_multi) at the same position hits the cache instead
+        of recomputing via score_word_multi."""
+        words = ANSWERS[:6]
+        candidates = GUESSES
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            cache = ResponseCache(ANSWERS, score_cache=sc)
+
+            rank_guesses_by_group_then_entropy(words, candidates, cache, sc)
+
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.current_words = words
+            with mock.patch('wordle_engine.score_word_multi') as spy:
+                soln.compute_scores_multi(
+                    candidates,
+                    [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN])
+            spy.assert_not_called()
+        finally:
+            sc.close()
+
+    def test_cancel_check_immediate_returns_input_unchanged(self):
+        words = ANSWERS[:6]
+        candidates = list(GUESSES)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            cache = ResponseCache(ANSWERS, score_cache=sc)
+            ranked = rank_guesses_by_group_then_entropy(
+                words, candidates, cache, sc, cancel_check=lambda: True)
+            self.assertEqual(ranked, candidates)
+
+            subset_key = ScoreCache.encode_subset(words)
+            self.assertIsNone(sc.read_scores(subset_key, 'max_group_size'))
+            self.assertIsNone(sc.read_scores(subset_key, 'entropy_gain'))
+        finally:
+            sc.close()
+
+    def test_memory_score_cache_no_attribute_error(self):
+        """MemoryScoreCache (hard mode) lacks read_scores/write_scores —
+        ranking must degrade to 'always compute', not raise AttributeError."""
+        words = ANSWERS[:6]
+        candidates = list(GUESSES)
+        cache = ResponseCache(ANSWERS)
+        mc = MemoryScoreCache()
+        mc.set_scope('test-scope')
+
+        ranked = rank_guesses_by_group_then_entropy(words, candidates, cache, mc)
+        self.assertEqual(ranked, self._expected_order(words, candidates, cache))
+
+
+# ---------------------------------------------------------------------------
 # compute_lookahead — winner's max-group-size persisted alongside entropy
 # ---------------------------------------------------------------------------
 
@@ -1355,6 +1586,43 @@ class TestMinExpectedGuesses(unittest.TestCase):
         with self.assertRaises(ValueError):
             min_expected_guesses(ANSWERS[:3], self.cache, None,
                                  policy="not_a_real_policy")
+
+    def test_heartbeat_fires_for_root_and_recursive_calls(self):
+        """heartbeat fires once per min_expected_guesses invocation at
+        every recursion depth — far more often than progress_callback,
+        which only fires once per fully-evaluated top-level candidate and
+        can go silent for a long time during a single candidate's deep
+        recursive evaluation (best_erd still unbounded, nothing prunable
+        yet)."""
+        subset = ANSWERS[:4]
+        heartbeats = []
+        progress_calls = []
+        min_expected_guesses(
+            subset, self.cache, None, guesses=GUESSES,
+            heartbeat=lambda: heartbeats.append(1),
+            progress_callback=lambda *a: progress_calls.append(a))
+        self.assertGreaterEqual(len(heartbeats), 1)
+        self.assertGreater(len(heartbeats), len(progress_calls))
+
+    def test_heartbeat_fires_once_on_cache_hit_root(self):
+        """A cached root returns immediately with no recursion at all —
+        but heartbeat must still fire for that single invocation, so a
+        caller relying on it for liveness never sees total silence."""
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            subset = ANSWERS[:4]
+            min_expected_guesses(subset, self.cache, sc)  # populate cache
+
+            heartbeats = []
+            result = min_expected_guesses(
+                subset, self.cache, sc,
+                heartbeat=lambda: heartbeats.append(1))
+            self.assertIsNotNone(result)
+            self.assertEqual(heartbeats, [1])
+        finally:
+            os.unlink(tmp.name)
 
 
 # ---------------------------------------------------------------------------
@@ -2238,13 +2506,13 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
 
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
         def cancel_during_root(remaining, cache, sc, deadline=None,
                                 guesses=None, policy=None,
                                 progress_callback=None,
-                                cancel_check=None):
+                                cancel_check=None, heartbeat=None):
             solver.stop()  # e.g. the user moved on; a fresh solver supersedes this one
             return 1.8
 
@@ -2258,57 +2526,40 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
             any('ERD ready' in str(a) for a in printed),
             "a superseded solver must not print a stale [ERD ready] announcement")
 
-    def test_ranking_uses_live_main_cache_after_solve(self):
-        """After cmd_solve populates the main thread's ResponseCache, the
-        solver should use those mappings directly in _ranked_root_guesses
-        instead of recomputing or hitting SQLite."""
+    def test_ranking_uses_word_scores_cache(self):
+        """If 's' (cmd_solve / compute_scores_multi) already populated
+        word_scores for this exact position, _ranked_root_guesses must use
+        those cached MAX_GROUP_SIZE/ENTROPY_GAIN scores directly instead of
+        recomputing via rcache.group_counts."""
         words = [self._word(i) for i in range(10)]
 
-        class FakeResponseCache:
-            answer_words = words
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            score_cache = ScoreCache(tmp.name, words)
 
-            def __init__(self):
-                self._cache = {}
+            # Simulate what cmd_solve does: compute_scores_multi populates
+            # and persists word_scores for this position.
+            cache = ResponseCache(words, score_cache)
+            soln = Solution(words, words, cache=cache, score_cache=score_cache)
+            soln.compute_scores_multi(
+                words, [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN])
 
-            @staticmethod
-            def group_words(word, current_words):
-                return {}
+            class ExplodingResponseCache:
+                @staticmethod
+                def group_counts(word, subset):
+                    raise AssertionError(
+                        "ranking should use cached word_scores, not recompute")
 
-            @staticmethod
-            def group_counts(word, current_words):
-                return {}
+            solver = ERDSolver(words, words, words, None,
+                               policy=ERD_ALL, persist=True)
+            solver._rcache = ExplodingResponseCache()
 
-        main_cache = FakeResponseCache()
-        # Simulate what cmd_solve does: populate _cache with pattern blobs
-        # (one byte per answer word, in canonical `words` order).
-        for word in words:
-            main_cache._cache[word] = bytes(i % 3 for i in range(len(words)))
-
-        score_cache = MemoryScoreCache()
-        score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, main_cache,
-                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
-
-        # run() must be called first to set self._rcache
-        solver._rcache = FakeResponseCache()
-
-        # Count how many times calculate_group_counts is called as fallback.
-        calc_calls = []
-        import wordle as wordle_mod
-        original = wordle_mod.calculate_group_counts
-        def spy_calc(word, subset):
-            calc_calls.append(word)
-            return original(word, subset)
-
-        with mock.patch('wordle.calculate_group_counts', side_effect=spy_calc), \
-             mock.patch('wordle.min_expected_guesses', return_value=1.5), \
-             mock.patch('builtins.print'):
-            solver._scan(score_cache)
-
-        # All words were in _main_rcache_dict, so calculate_group_counts
-        # should not have been called for any of them during ranking.
-        self.assertEqual(calc_calls, [],
-            "ranking should use live main-thread cache, not recompute patterns")
+            ranked = solver._ranked_root_guesses(score_cache)
+            self.assertEqual(set(ranked), set(words))
+        finally:
+            score_cache.close()
+            os.unlink(tmp.name)
 
     def test_operational_error_in_pre_loop_read_is_caught(self):
         """sqlite3.OperationalError from score_cache.read() at the top of
@@ -2327,7 +2578,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         score_cache = ErrorScoreCache()
         score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
         solver._rcache = FakeResponseCache()
 
@@ -2353,7 +2604,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
 
         self.assertIsNone(solver._rcache,
@@ -2368,10 +2619,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         solver.run()
         self.assertEqual(len(rcaches_seen), 1)
-        self.assertIsNotNone(rcaches_seen[0],
-            "run() must set _rcache before calling _scan")
-        self.assertIsNot(rcaches_seen[0], solver._main_rcache_dict,
-            "_rcache must be a new thread-private ResponseCache, not the main dict")
+        self.assertIsInstance(rcaches_seen[0], ResponseCache,
+            "run() must set _rcache to a thread-private ResponseCache before calling _scan")
 
     def test_cumulative_time_survives_pause_restart(self):
         """word_stats (and root_done) reset to empty at the top of every
@@ -2387,9 +2636,17 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
             def __init__(self):
                 self._cache = {}
 
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
         score_cache = MemoryScoreCache()
         score_cache.set_scope('test-scope')
-        solver = ERDSolver(words, words, words, None, FakeResponseCache(),
+        solver = ERDSolver(words, words, words, None,
                            policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
         solver._rcache = FakeResponseCache()
 
@@ -2410,7 +2667,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
-                               progress_callback=None, cancel_check=None):
+                               progress_callback=None, cancel_check=None,
+                               heartbeat=None):
             if 'pass' not in snapshot:
                 snapshot['pass'] = 1
                 progress_callback(1, len(words), words[0], 1.5)
@@ -2440,6 +2698,881 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         # But the cumulative totals include both passes' contributions.
         self.assertGreater(solver.cumulative_cpu_s, snapshot['cpu_before_pass2'])
         self.assertGreater(solver.cumulative_wall_s, snapshot['wall_before_pass2'])
+
+    def test_targeted_scan_periodic_report(self):
+        """When constructed with last_guess, _scan must periodically print a
+        'Targeted scan of WORD <pattern>' report — same shape as
+        BranchPrecacheSolver's 'Root-word scan' report — driven by the
+        heartbeat callback, every 30s."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache,
+                           last_guess=("salet", ["gray"] * 5))
+        solver._rcache = FakeResponseCache()
+
+        counter = itertools.count()
+
+        def fake_min_expected(remaining, cache, sc, deadline=None,
+                               guesses=None, policy=None,
+                               progress_callback=None, cancel_check=None,
+                               heartbeat=None):
+            heartbeat()
+            return 1.5
+
+        out = io.StringIO()
+        with mock.patch('wordle.time.time', side_effect=lambda: next(counter) * 31), \
+             mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected):
+            with redirect_stdout(out):
+                solver._scan(score_cache)
+
+        text = out.getvalue()
+        self.assertIn("Targeted scan of SALET -----", text)
+        self.assertIn(f"{len(words)} words | ERD: computing...", text)
+        self.assertIn("0/0, 0 culled", text)
+        self.assertRegex(text, r'\d+s, \d+ hit/\d+ miss')
+
+    def test_no_targeted_scan_report_without_last_guess(self):
+        """last_guess defaults to None (e.g. tests that construct an
+        ERDSolver directly) — _maybe_print must be a no-op in that case,
+        even when 30+ seconds appear to have elapsed."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
+        solver._rcache = FakeResponseCache()
+
+        counter = itertools.count()
+
+        def fake_min_expected(remaining, cache, sc, deadline=None,
+                               guesses=None, policy=None,
+                               progress_callback=None, cancel_check=None,
+                               heartbeat=None):
+            heartbeat()
+            return 1.5
+
+        out = io.StringIO()
+        with mock.patch('wordle.time.time', side_effect=lambda: next(counter) * 31), \
+             mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected):
+            with redirect_stdout(out):
+                solver._scan(score_cache)
+
+        self.assertNotIn("Targeted scan", out.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# BranchPrecacheSolver: precache ERD for sibling branches of a guess
+# ---------------------------------------------------------------------------
+
+class TestBranchPrecacheSolver(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    @staticmethod
+    def _branches():
+        # Three tiny, disjoint synthetic branches (3 words each), paired
+        # with arbitrary valid response codes (used to format the branch
+        # pattern in the periodic report).
+        return [
+            (0, ANSWERS[0:3]),
+            (1, ANSWERS[3:6]),
+            (2, ANSWERS[6:9]),
+        ]
+
+    def test_run_populates_erd_for_every_branch(self):
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.branches_done, solver.branches_total)
+        self.assertEqual(solver.branches_done, 3)
+        self.assertEqual(solver.branches_skipped, 0)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            for _, words in branches:
+                hit = sc.read(ScoreCache.encode_subset(words), ERD_ALL)
+                self.assertIsNotNone(hit)
+        finally:
+            sc.close()
+
+    def test_tracks_root_total_culled(self):
+        """root_total is set to len(ranked) (the candidate vocabulary)
+        before min_expected_guesses starts — so the status line has
+        something to show even before the first top-level candidate
+        fully resolves — and culled (driven by the progress callback) ends
+        up populated for the last branch processed."""
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.root_total, len(GUESSES))
+        self.assertGreaterEqual(solver.culled, 0)
+
+    def test_periodic_print_reports_culled_and_current_candidate(self):
+        """The periodic print (driven by either the per-candidate progress
+        callback or the per-subgroup heartbeat) must report how many
+        top-level candidates were culled by cost_lb pruning and the
+        in-progress candidate's elapsed time and cache hit/miss counts —
+        the signal that's missing while a single top-level candidate's deep
+        recursion is still running."""
+        branches = self._branches()[:1]
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        # Force every _maybe_print() check ("now - last_print >= 30") to
+        # see 30+ seconds elapsed on every call.
+        counter = itertools.count()
+        out = io.StringIO()
+        with mock.patch('wordle.time.time', side_effect=lambda: next(counter) * 31), \
+             redirect_stdout(out):
+            solver.run()
+
+        text = out.getvalue()
+        self.assertIn("culled", text)
+        self.assertRegex(text, r'\d+s, \d+ hit/\d+ miss')
+
+    def test_skips_already_cached_branch_and_fills_others(self):
+        """Simulates the live ERDSolver having already filled one branch's
+        ERD entry (e.g. in an earlier game): precache must skip it
+        (resumability/meshing) while still filling the other branch."""
+        branches = self._branches()[:2]
+        live_solved_words = branches[0][1]
+        other_words = branches[1][1]
+
+        sc = ScoreCache(self.db, ANSWERS)
+        cache = ResponseCache(ANSWERS, sc)
+        min_expected_guesses(live_solved_words, cache, sc,
+                              guesses=GUESSES, policy=ERD_ALL)
+        sc.close()
+
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.branches_skipped, 1)
+        self.assertEqual(solver.branches_done, 2)
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            self.assertIsNotNone(
+                sc.read(ScoreCache.encode_subset(other_words), ERD_ALL))
+        finally:
+            sc.close()
+
+    def test_precached_keys_seed_counts_immediately_without_double_counting(self):
+        """cmd_precache's upfront scan passes already-cached branch keys in;
+        the status line (branches_done/branches_skipped) must reflect them
+        before run() ever starts, and run() must not re-count them."""
+        branches = self._branches()[:2]
+        live_solved_words = branches[0][1]
+        other_words = branches[1][1]
+
+        sc = ScoreCache(self.db, ANSWERS)
+        cache = ResponseCache(ANSWERS, sc)
+        min_expected_guesses(live_solved_words, cache, sc,
+                              guesses=GUESSES, policy=ERD_ALL)
+        sc.close()
+
+        precached_keys = {ScoreCache.encode_subset(live_solved_words)}
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS), precached_keys=precached_keys)
+
+        # Accurate immediately, before run() processes anything.
+        self.assertEqual(solver.branches_done, 1)
+        self.assertEqual(solver.branches_skipped, 1)
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.branches_done, 2)
+        self.assertEqual(solver.branches_skipped, 1)  # not double-counted
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            self.assertIsNotNone(
+                sc.read(ScoreCache.encode_subset(other_words), ERD_ALL))
+        finally:
+            sc.close()
+
+    def test_stopped_before_run_prints_nothing(self):
+        """If stop() fires before run() is even scheduled (e.g. the user
+        made a guess immediately after 'p'), run() must not print a stale
+        '[Precache: starting ...]' announcement for work it never starts —
+        same principle as ERDSolver's no-stale-ready-message guarantee."""
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+        solver.stop()
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            solver.run()
+
+        self.assertEqual(out.getvalue(), '')
+        self.assertEqual(solver.branches_done, 0)
+
+    def test_stop_mid_run_returns_promptly(self):
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        from wordle_engine import min_expected_guesses as real_min_expected
+        call_count = [0]
+
+        def fake_min_expected(*args, **kwargs):
+            call_count[0] += 1
+            solver.stop()  # e.g. the user made a guess mid-branch
+            return real_min_expected(*args, **kwargs)
+
+        with mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected), \
+             redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(call_count[0], 1)
+        self.assertEqual(solver.branches_done, 0)
+
+
+# ---------------------------------------------------------------------------
+# _platform_label: distinguish iPhone/iPad/macOS/Linux/Windows for the banner
+# ---------------------------------------------------------------------------
+
+class TestPlatformLabel(unittest.TestCase):
+
+    @staticmethod
+    def _uname(system, release, machine):
+        return platform.uname_result(
+            system=system, node='', release=release, version='', machine=machine)
+
+    def test_linux(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Linux', '6.18.5', 'x86_64')):
+            self.assertEqual(_platform_label(), 'Linux 6.18.5')
+
+    def test_windows(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Windows', '10', 'AMD64')):
+            self.assertEqual(_platform_label(), 'Windows 10')
+
+    def test_macos(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Darwin', '25.5.0', 'arm64')):
+            self.assertEqual(_platform_label(), 'macOS 25.5.0')
+
+    def test_iphone(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Darwin', '25.5.0', 'iPhone14,2')):
+            self.assertEqual(_platform_label(), 'iPhone 25.5.0')
+
+    def test_ipad(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Darwin', '25.5.0', 'iPad13,4')):
+            self.assertEqual(_platform_label(), 'iPad 25.5.0')
+
+
+# ---------------------------------------------------------------------------
+# Shared scan-progress formatting helpers
+# ---------------------------------------------------------------------------
+
+class TestFormatCacheTimestamp(unittest.TestCase):
+
+    def test_none_is_na(self):
+        self.assertEqual(_format_cache_timestamp(None), "n/a")
+
+    def test_zero_is_na(self):
+        self.assertEqual(_format_cache_timestamp(0), "n/a")
+
+    def test_formats_epoch_seconds(self):
+        ts = datetime(2026, 6, 11, 14, 2, 18).timestamp()
+        self.assertEqual(_format_cache_timestamp(ts), "2026-06-11 14:02:18")
+
+
+class TestCurrentCandidateTag(unittest.TestCase):
+
+    def test_none_word_returns_none(self):
+        self.assertIsNone(_current_candidate_tag(MemoryScoreCache(), None, time.time()))
+
+    def test_none_start_time_returns_none(self):
+        self.assertIsNone(_current_candidate_tag(MemoryScoreCache(), "arise", None))
+
+    def test_none_score_cache_returns_none(self):
+        self.assertIsNone(_current_candidate_tag(None, "arise", time.time()))
+
+    def test_returns_word_elapsed_hits_misses(self):
+        sc = MemoryScoreCache()
+        sc.read_hits = 12
+        sc.read_misses = 3
+        word, elapsed, hits, misses = _current_candidate_tag(sc, "arise", time.time() - 5)
+        self.assertEqual(word, "arise")
+        self.assertGreaterEqual(elapsed, 5)
+        self.assertEqual(hits, 12)
+        self.assertEqual(misses, 3)
+
+
+class TestFormatScanProgress(unittest.TestCase):
+
+    def test_basic_no_best_no_current(self):
+        lines = _format_scan_progress(234, 12972, None, 4772, None)
+        self.assertEqual(lines, ["234/12,972, 4,772 culled"])
+
+    def test_with_best(self):
+        lines = _format_scan_progress(234, 12972, ("arise", 3.142), 4772, None)
+        self.assertEqual(lines, ["234/12,972, 4,772 culled, best: ARISE 3.142"])
+
+    def test_with_current_candidate(self):
+        lines = _format_scan_progress(234, 12972, ("arise", 3.142), 4772,
+                                        ("grind", 23.4, 12, 3))
+        self.assertEqual(lines, [
+            "234/12,972, 4,772 culled, best: ARISE 3.142",
+            "  GRIND: 23s, 12 hit/3 miss",
+        ])
+
+    def test_indent_and_suffix(self):
+        lines = _format_scan_progress(234, 12972, None, 4772, None,
+                                        indent=2, suffix=' cands')
+        self.assertEqual(lines, ["  234/12,972 cands, 4,772 culled"])
+
+    def test_indent_applies_to_current_candidate_line_too(self):
+        lines = _format_scan_progress(234, 12972, None, 4772,
+                                        ("grind", 23.4, 12, 3), indent=2)
+        self.assertEqual(lines, [
+            "  234/12,972, 4,772 culled",
+            "    GRIND: 23s, 12 hit/3 miss",
+        ])
+
+
+class TestFormatBranchHeader(unittest.TestCase):
+
+    def test_computing(self):
+        self.assertEqual(_format_branch_header(315),
+                         "315 words | ERD: computing...")
+
+
+class TestPrintLineWithPattern(unittest.TestCase):
+
+    def test_prefix_pattern_suffix(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_line_with_pattern(
+                '  Branch ', response, ' | 315 words | ERD: computing...')
+        text = out.getvalue()
+        # Pattern characters appear, in order, between prefix and suffix —
+        # any ANSI color codes from SUPPORTS_COLOR are stripped out.
+        stripped = re.sub(r'\033\[\d*m', '', text)
+        self.assertEqual(stripped,
+                         '  Branch -ygy- | 315 words | ERD: computing...\n')
+
+
+# ---------------------------------------------------------------------------
+# Color output: characterization tests across plain / ANSI / Pythonista.
+#
+# These pin down CURRENT behavior so a future markup/renderer refactor can't
+# silently change what gets printed. SUPPORTS_COLOR, IS_PYTHONISTA, and
+# console are module-level constants computed once at import time, but every
+# color function below re-reads them from the module namespace on each call,
+# so mock.patch.multiple('wordle', ...) is enough to exercise all 3 modes.
+# ---------------------------------------------------------------------------
+
+class FakeConsole:
+    """Records set_color() calls, mimicking Pythonista's `console` module."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_color(self, *args):
+        self.calls.append(args)
+
+
+def _capture_stdout(fn):
+    out = io.StringIO()
+    with redirect_stdout(out):
+        fn()
+    return out.getvalue()
+
+
+class TestMark(unittest.TestCase):
+    """mark() is pure string-building — sentinel insertion is independent
+    of platform/rendering mode."""
+
+    def test_wraps_text_in_color_sentinel_and_reset(self):
+        self.assertEqual(mark('red', 'X'), f'{MARK_RED}X{MARK_RESET}')
+
+    def test_each_color_has_its_own_sentinel(self):
+        self.assertEqual(mark('green', 'g'), f'{MARK_GREEN}g{MARK_RESET}')
+        self.assertEqual(mark('yellow', 'y'), f'{MARK_YELLOW}y{MARK_RESET}')
+        self.assertEqual(mark('gray', '-'), f'{MARK_GRAY}-{MARK_RESET}')
+
+    def test_sentinels_are_distinct(self):
+        sentinels = {MARK_RESET, MARK_RED, MARK_GREEN, MARK_YELLOW, MARK_GRAY}
+        self.assertEqual(len(sentinels), 5)
+
+
+class TestColorOutputPlain(unittest.TestCase):
+    """SUPPORTS_COLOR=False, IS_PYTHONISTA=False — the worst case to guard:
+    plain output must be exactly the plain text, with no escape codes or
+    other markup mixed in."""
+
+    def setUp(self):
+        patcher = mock.patch.multiple('wordle', SUPPORTS_COLOR=False,
+                                       IS_PYTHONISTA=False, console=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_print_error(self):
+        self.assertEqual(_capture_stdout(lambda: print_error("bad")), "bad\n")
+
+    def test_print_success(self):
+        self.assertEqual(_capture_stdout(lambda: print_success("ok")), "ok\n")
+
+    def test_colored_text_is_no_op(self):
+        def fn():
+            with colored_text("red"):
+                print("X", end='')
+        self.assertEqual(_capture_stdout(fn), "X")
+
+    def test_reset_color_prints_nothing(self):
+        self.assertEqual(_capture_stdout(reset_color), "")
+
+    def test_print_colored_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        self.assertEqual(
+            _capture_stdout(lambda: print_colored_pattern(response)), "-ygy-")
+
+    def test_print_colored_word(self):
+        response = ['green', 'yellow', 'gray']
+        self.assertEqual(
+            _capture_stdout(lambda: print_colored_word("cat", response)), "CAT")
+
+    def test_print_line_with_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_line_with_pattern(
+            '  Branch ', response, ' | 315 words'))
+        self.assertEqual(out, '  Branch -ygy- | 315 words\n')
+
+    def test_render_markup_strips_all_sentinels(self):
+        text = 'A' + mark('red', 'B') + 'C' + mark('green', 'D') + MARK_RESET
+        self.assertEqual(
+            _capture_stdout(lambda: render_markup(text, end='')), 'ABCD')
+
+    def test_render_markup_default_end_is_newline(self):
+        self.assertEqual(_capture_stdout(lambda: render_markup('hi')), 'hi\n')
+
+
+class TestColorOutputANSI(unittest.TestCase):
+    """SUPPORTS_COLOR=True, IS_PYTHONISTA=False — Linux terminal output."""
+
+    def setUp(self):
+        patcher = mock.patch.multiple('wordle', SUPPORTS_COLOR=True,
+                                       IS_PYTHONISTA=False, console=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_print_error(self):
+        self.assertEqual(_capture_stdout(lambda: print_error("bad")),
+                         f"{ANSI_COLORS['red']}bad\n{ANSI_RESET}")
+
+    def test_print_success(self):
+        self.assertEqual(_capture_stdout(lambda: print_success("ok")),
+                         f"{ANSI_COLORS['green']}ok\n{ANSI_RESET}")
+
+    def test_colored_text_wraps_with_escapes(self):
+        def fn():
+            with colored_text("red"):
+                print("X", end='')
+        self.assertEqual(_capture_stdout(fn),
+                         f"{ANSI_COLORS['red']}X{ANSI_RESET}")
+
+    def test_reset_color_prints_reset_code(self):
+        self.assertEqual(_capture_stdout(reset_color), ANSI_RESET)
+
+    def test_print_colored_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_colored_pattern(response))
+        expected = (
+            ANSI_COLORS['gray'] + "-" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + ANSI_COLORS['green'] + "g" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + ANSI_COLORS['gray'] + "-" + ANSI_RESET
+        )
+        self.assertEqual(out, expected)
+
+    def test_print_colored_word(self):
+        response = ['green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_colored_word("cat", response))
+        expected = (
+            ANSI_COLORS['green'] + "C" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "A" + ANSI_RESET
+            + ANSI_COLORS['gray'] + "T" + ANSI_RESET
+        )
+        self.assertEqual(out, expected)
+
+    def test_print_line_with_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_line_with_pattern(
+            '  Branch ', response, ' | 315 words'))
+        expected = (
+            "  Branch "
+            + ANSI_COLORS['gray'] + "-" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + ANSI_COLORS['green'] + "g" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + ANSI_COLORS['gray'] + "-" + ANSI_RESET
+            + " | 315 words\n"
+        )
+        self.assertEqual(out, expected)
+
+    def test_render_markup_translates_sentinels_to_ansi(self):
+        text = 'A' + mark('red', 'B') + 'C'
+        out = _capture_stdout(lambda: render_markup(text, end=''))
+        expected = 'A' + ANSI_COLORS['red'] + 'B' + ANSI_RESET + 'C'
+        self.assertEqual(out, expected)
+
+
+class TestColorOutputPythonista(unittest.TestCase):
+    """IS_PYTHONISTA=True — color comes from console.set_color() calls;
+    stdout itself stays plain text (no escape codes on this path)."""
+
+    def setUp(self):
+        self.console = FakeConsole()
+        patcher = mock.patch.multiple('wordle', SUPPORTS_COLOR=True,
+                                       IS_PYTHONISTA=True, console=self.console)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_print_error(self):
+        text = _capture_stdout(lambda: print_error("bad"))
+        self.assertEqual(text, "bad\n")
+        self.assertEqual(self.console.calls, [(1, 0, 0), ()])
+
+    def test_print_success(self):
+        text = _capture_stdout(lambda: print_success("ok"))
+        self.assertEqual(text, "ok\n")
+        self.assertEqual(self.console.calls, [(0, 0.6, 0), ()])
+
+    def test_reset_color_calls_set_color_with_no_args(self):
+        text = _capture_stdout(reset_color)
+        self.assertEqual(text, "")
+        self.assertEqual(self.console.calls, [()])
+
+    def test_print_colored_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        text = _capture_stdout(lambda: print_colored_pattern(response))
+        self.assertEqual(text, "-ygy-")
+        self.assertEqual(self.console.calls, [
+            (0.5, 0.5, 0.5), (),
+            (0.6, 0.6, 0), (),
+            (0, 0.6, 0), (),
+            (0.6, 0.6, 0), (),
+            (0.5, 0.5, 0.5), (),
+        ])
+
+    def test_print_colored_word(self):
+        response = ['green', 'yellow', 'gray']
+        text = _capture_stdout(lambda: print_colored_word("cat", response))
+        self.assertEqual(text, "CAT")
+        self.assertEqual(self.console.calls, [
+            (0, 0.6, 0), (),
+            (0.6, 0.6, 0), (),
+            (0.5, 0.5, 0.5), (),
+        ])
+
+    def test_print_line_with_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        text = _capture_stdout(lambda: print_line_with_pattern(
+            '  Branch ', response, ' | 315 words'))
+        self.assertEqual(text, "  Branch -ygy- | 315 words\n")
+        self.assertEqual(self.console.calls, [
+            (0.5, 0.5, 0.5), (),
+            (0.6, 0.6, 0), (),
+            (0, 0.6, 0), (),
+            (0.6, 0.6, 0), (),
+            (0.5, 0.5, 0.5), (),
+        ])
+
+    def test_render_markup_calls_set_color(self):
+        text = 'A' + mark('red', 'B') + 'C'
+        out = _capture_stdout(lambda: render_markup(text, end=''))
+        self.assertEqual(out, 'ABC')
+        self.assertEqual(self.console.calls, [(1, 0, 0), ()])
+
+
+# ---------------------------------------------------------------------------
+# BranchPrecacheSolver.branches_line / _branches_starting_line
+# ---------------------------------------------------------------------------
+
+class TestBranchesLine(unittest.TestCase):
+
+    @staticmethod
+    def _solver(branches_done, branches_total, branches_skipped):
+        s = BranchPrecacheSolver.__new__(BranchPrecacheSolver)
+        s.branches_done = branches_done
+        s.branches_total = branches_total
+        s.branches_skipped = branches_skipped
+        return s
+
+    def test_starting_line(self):
+        s = self._solver(0, 124, 42)
+        self.assertEqual(s._branches_starting_line(), "Branches: 0/124, 42 cached")
+
+    def test_active_line_shows_hit_and_miss(self):
+        s = self._solver(5, 124, 4)
+        self.assertEqual(s.branches_line(), "Branches: 5/124, 4 hit/1 miss")
+
+    def test_done_line(self):
+        s = self._solver(124, 124, 42)
+        self.assertEqual(s.branches_line(done=True),
+                         "Branches: 124/124 done, 42 hit/82 miss")
+
+
+# ---------------------------------------------------------------------------
+# current_word_tag: 4-tuple (word, elapsed, hits, misses) for both solvers
+# ---------------------------------------------------------------------------
+
+class TestCurrentWordTag(unittest.TestCase):
+
+    @staticmethod
+    def _word(i):
+        return f"w{i:04d}"
+
+    def test_erd_solver_current_word_tag(self):
+        words = [self._word(i) for i in range(10)]
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False)
+        sc = MemoryScoreCache()
+        solver._score_cache = sc
+        solver._start_word(sc, words, 0)
+        sc.read_hits = 5
+        sc.read_misses = 2
+
+        word, elapsed, hits, misses = solver.current_word_tag()
+        self.assertEqual(word, words[0])
+        self.assertGreaterEqual(elapsed, 0)
+        self.assertEqual(hits, 5)
+        self.assertEqual(misses, 2)
+
+    def test_erd_solver_no_current_word_returns_none(self):
+        words = [self._word(i) for i in range(10)]
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False)
+        self.assertIsNone(solver.current_word_tag())
+
+    def test_branch_precache_solver_current_word_tag(self):
+        words = [self._word(i) for i in range(10)]
+        solver = BranchPrecacheSolver(
+            "heart", [(0, words)], words, words, None,
+            anchor_word_count=len(words))
+        sc = MemoryScoreCache()
+        solver._score_cache = sc
+        solver._start_word(sc, words, 1)
+        sc.read_hits = 7
+        sc.read_misses = 1
+
+        word, elapsed, hits, misses = solver.current_word_tag()
+        self.assertEqual(word, words[1])
+        self.assertGreaterEqual(elapsed, 0)
+        self.assertEqual(hits, 7)
+        self.assertEqual(misses, 1)
+
+
+# ---------------------------------------------------------------------------
+# print_status (single-board): idle line, ERD hit, ordering/scanning, precache
+# ---------------------------------------------------------------------------
+
+class TestPrintStatusSingleBoard(unittest.TestCase):
+
+    @staticmethod
+    def _gs(soln, precache_solver=None):
+        return types.SimpleNamespace(
+            single=True,
+            solutions=[soln],
+            universe=GuessUniverse.ALL_WORDS,
+            compliance=ComplianceFilter.UNFILTERED,
+            constrained_erd_cache=None,
+            precache_solver=precache_solver,
+        )
+
+    def test_idle_root_single_line(self):
+        soln = make_solution()
+        gs = self._gs(soln)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn(f"{len(ANSWERS)} words left | 0 guesses so far", text)
+        self.assertNotIn("Branches:", text)
+
+    def test_root_with_precache_shows_branches_line(self):
+        soln = make_solution()
+        precache = types.SimpleNamespace(
+            is_alive=lambda: True,
+            branches_line=lambda: "Branches: 5/124, 4 hit/1 miss",
+        )
+        gs = self._gs(soln, precache_solver=precache)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn(f"{len(ANSWERS)} words left | 0 guesses so far", text)
+        self.assertIn("Branches: 5/124, 4 hit/1 miss", text)
+
+    def test_solved_shows_guess_count(self):
+        soln = make_solution()
+        soln.guesses = [["salet", ["yellow", "gray", "gray", "yellow", "yellow"]],
+                        ["tenor", ["green", "green", "green", "green", "green"]]]
+        soln.current_words = ["tenor"]
+
+        gs = self._gs(soln)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn("Solved: tenor | 2 guesses", text)
+
+    def test_solved_singular_guess(self):
+        soln = make_solution()
+        soln.guesses = [["tenor", ["green", "green", "green", "green", "green"]]]
+        soln.current_words = ["tenor"]
+
+        gs = self._gs(soln)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn("Solved: tenor | 1 guess", text)
+        self.assertNotIn("1 guesses", text)
+
+    def test_non_root_with_erd_hit(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            cache = ResponseCache(ANSWERS, sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.guesses = [["salet", ["gray"] * 5]]
+            soln.current_words = ANSWERS[:3]
+            sc.write(ScoreCache.encode_subset(soln.current_words), ERD_ALL,
+                     "arise", 3.142)
+
+            gs = self._gs(soln)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                print_status(gs)
+            text = out.getvalue()
+            self.assertIn("3 words left | 1 guess so far | 3.142 ARISE", text)
+        finally:
+            sc.close()
+            os.unlink(tmp.name)
+
+    def test_non_root_solver_ordering(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            cache = ResponseCache(ANSWERS, sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.guesses = [["salet", ["gray"] * 5]]
+            soln.current_words = ANSWERS[:3]
+
+            solver = ERDSolver.__new__(ERDSolver)
+            solver._words = soln.current_words
+            solver.root_total = 0
+
+            gs = self._gs(soln)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                print_status(gs, solver)
+            text = out.getvalue()
+            self.assertIn("3 words left | 1 guess so far", text)
+            self.assertIn("ERD: ordering candidates...", text)
+        finally:
+            sc.close()
+            os.unlink(tmp.name)
+
+    def test_non_root_solver_scanning(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            cache = ResponseCache(ANSWERS, sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.guesses = [["salet", ["gray"] * 5]]
+            soln.current_words = ANSWERS[:3]
+
+            solver = ERDSolver.__new__(ERDSolver)
+            solver._words = soln.current_words
+            solver.root_total = 12972
+            solver.root_done = 234
+            solver.root_best = ("arise", 3.142)
+            solver.culled = 4772
+            solver._score_cache = None
+            solver.current_word = None
+            solver.current_word_start = None
+
+            gs = self._gs(soln)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                print_status(gs, solver)
+            text = out.getvalue()
+            self.assertIn("3 words left | 1 guess so far", text)
+            self.assertIn("234/12,972 cands, 4,772 culled, best: ARISE 3.142", text)
+        finally:
+            sc.close()
+            os.unlink(tmp.name)
 
 
 # ---------------------------------------------------------------------------

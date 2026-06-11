@@ -6,3 +6,4 @@ __pycache__/
 wordle_cache.sqlite3
 wordle_cache.sqlite3-shm
 wordle_cache.sqlite3-wal
+wordle_debug.log

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 import time
 from pathlib import Path
+
+logger = logging.getLogger("wordle")
 
 
 class ScoreCache:
@@ -217,7 +220,28 @@ class ScoreCache:
         return universe_id
 
     def close(self):
+        self.checkpoint()
         self._conn.close()
+
+    def checkpoint(self):
+        """Fold the WAL into the main database file (PRAGMA wal_checkpoint(TRUNCATE)).
+
+        Leaves wordle_cache.sqlite3 self-contained with no -wal/-shm
+        sidecars, so it's always safe to copy off-device - and the latest
+        writes survive even if iOS suspends/kills the process without a
+        clean close().
+
+        This is an optimization, not a durability requirement: every write
+        is already committed to the WAL, so a failed checkpoint loses
+        nothing. On iOS the cache file lives under iCloud's File Provider
+        Storage, where a sync pass can transiently hold the exclusive lock
+        TRUNCATE needs - swallow that rather than letting it take down a
+        background solver thread (or close()) over a no-op.
+        """
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError as exc:
+            logger.warning("wal_checkpoint(TRUNCATE) failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Subgroup lookahead cache (levels 2+)
