@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b116"
+BUILD = "b117"
 
 
 # ---------------------------------------------------------------------------
@@ -2923,7 +2923,7 @@ def main():
             _solver = None
             _solver_key = None
 
-        print(f"\n{datetime.now().strftime('%H:%M:%S')}")
+        print(datetime.now().strftime('%H:%M:%S'))
         print(f"Command (gsbldtixurawcvp?)? ", end="")
         try:
             cmd = input().strip()
