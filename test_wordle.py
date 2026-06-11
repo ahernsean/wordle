@@ -643,6 +643,37 @@ class TestScoreCacheSQLite(unittest.TestCase):
         self.assertEqual(len(key), 15)
         self.assertNotIn(b"\x00", key)
 
+    def test_checkpoint_truncates_wal_and_persists_writes(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        sc.checkpoint()
+
+        wal_path = self.db + "-wal"
+        self.assertTrue(
+            not os.path.exists(wal_path) or os.path.getsize(wal_path) == 0,
+            "checkpoint should fold the WAL into the main db file")
+
+        # A fresh connection (simulating a copy of just the .sqlite3 file)
+        # must see the checkpointed write.
+        sc2 = ScoreCache(self.db, ANSWERS)
+        try:
+            self.assertEqual(sc2.read(subset_key, "full"), ("heart", 2.5))
+        finally:
+            sc2.close()
+        sc.close()
+
+    def test_close_checkpoints(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(subset_key, "full", "heart", 2.5)
+        sc.close()
+
+        wal_path = self.db + "-wal"
+        self.assertTrue(
+            not os.path.exists(wal_path) or os.path.getsize(wal_path) == 0,
+            "close() should leave a self-contained .sqlite3 file")
+
     def test_encode_subset_is_order_independent(self):
         self.assertEqual(
             ScoreCache.encode_subset(["slate", "crane"]),

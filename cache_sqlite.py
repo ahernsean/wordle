@@ -217,7 +217,18 @@ class ScoreCache:
         return universe_id
 
     def close(self):
+        self.checkpoint()
         self._conn.close()
+
+    def checkpoint(self):
+        """Fold the WAL into the main database file (PRAGMA wal_checkpoint(TRUNCATE)).
+
+        Leaves wordle_cache.sqlite3 self-contained with no -wal/-shm
+        sidecars, so it's always safe to copy off-device - and the latest
+        writes survive even if iOS suspends/kills the process without a
+        clean close().
+        """
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # ------------------------------------------------------------------
     # Subgroup lookahead cache (levels 2+)

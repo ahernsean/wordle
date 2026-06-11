@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b113"
+BUILD = "b114"
 
 
 # ---------------------------------------------------------------------------
@@ -2024,7 +2024,8 @@ def cmd_precache(gs):
     soln = gs.solutions[0]
     if not soln._is_full_game():
         print_error("Precache only available before the first guess "
-                     "(it would collide with the live ERD solver).")
+                     "(it would collide with the live ERD solver for this "
+                     "position). Press 'r' to reset, then 'p' again.")
         return
     set_display_context(soln)
 
@@ -2705,6 +2706,7 @@ class BranchPrecacheSolver(threading.Thread):
                     now = time.time()
                     if now - last_print[0] >= 30:
                         last_print[0] = now
+                        score_cache.checkpoint()
                         print(f'\n{_ts()}  [Precache {self._branch_label(code)}: '
                               f'{done:,}/{total:,} best so far '
                               f'{best_word.upper()} {best_erd:.3f} '
