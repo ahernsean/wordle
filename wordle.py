@@ -2048,11 +2048,9 @@ def cmd_precache(gs):
         return
     soln = gs.solutions[0]
     if not soln._is_full_game():
-        print_error("Precache only pays off at the root: it's the one "
-                     "position every game starts from, so a warmed cache "
-                     "helps next time. Once you've guessed, this position "
-                     "is specific to this game and won't recur. "
-                     "Press 'r' to reset, then 'p' again.")
+        print_error("Precache only available before the first guess "
+                     "(it would collide with the live ERD solver for this "
+                     "position). Press 'r' to reset, then 'p' again.")
         return
     set_display_context(soln)
 
