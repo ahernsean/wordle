@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b112"
+BUILD = "b113"
 
 
 # ---------------------------------------------------------------------------
@@ -943,9 +943,13 @@ def _print_precache_progress(gs):
           f'{s.branches_done}/{s.branches_total} branches '
           f'({s.branches_skipped} cached)', end='')
     if s.current_branch_size is not None and s.root_total > 0:
-        print(', current ', end='')
-        print_colored_word(s.guess_word, decode_response(s.current_branch_code))
-        print(f' {s.current_branch_size:,} words '
+        pattern = format_response(decode_response(s.current_branch_code))
+        # Plain text only here, deliberately: this line can be the last
+        # thing printed before the device sleeps for hours, and on
+        # Pythonista a console.set_color() left active across a long
+        # background gap bleeds into the whole console on wake.
+        print(f', current {s.guess_word.upper()} {pattern} '
+              f'{s.current_branch_size:,} words '
               f'{s.root_done:,}/{s.root_total:,}', end='')
         if s.root_best is not None:
             bw, bs = s.root_best
@@ -2647,10 +2651,14 @@ class BranchPrecacheSolver(threading.Thread):
             return
         score_cache = ScoreCache(self._cache_path, self._all_answers)
         rcache = ResponseCache(self._all_answers, score_cache)
+
+        def _ts():
+            return datetime.now().strftime('%H:%M:%S')
+
         try:
             if self._cancel.is_set():
                 return
-            print(f'\n  [Precache: starting {self.branches_total} branches for '
+            print(f'\n{_ts()}  [Precache: starting {self.branches_total} branches for '
                   f'{self.guess_word.upper()}]', flush=True)
             for code, words in self._branches:
                 if self._cancel.is_set():
@@ -2697,7 +2705,7 @@ class BranchPrecacheSolver(threading.Thread):
                     now = time.time()
                     if now - last_print[0] >= 30:
                         last_print[0] = now
-                        print(f'\n  [Precache {self._branch_label(code)}: '
+                        print(f'\n{_ts()}  [Precache {self._branch_label(code)}: '
                               f'{done:,}/{total:,} best so far '
                               f'{best_word.upper()} {best_erd:.3f} '
                               f'(cache {self.cache_hits:,} hits / '
@@ -2725,12 +2733,12 @@ class BranchPrecacheSolver(threading.Thread):
 
                 self.branches_done += 1
                 best_word, _ = score_cache.read(root_key, ERD_ALL)
-                print(f'\n  [Precache {self._branch_label(code)} done: '
+                print(f'\n{_ts()}  [Precache {self._branch_label(code)} done: '
                       f'{result:.3f} {best_word.upper()}  '
                       f'({self.branches_done}/{self.branches_total} branches, '
                       f'{self.branches_skipped} pre-cached)]', flush=True)
 
-            print(f'\n  [Precache complete: {self.branches_done}/'
+            print(f'\n{_ts()}  [Precache complete: {self.branches_done}/'
                   f'{self.branches_total} branches for '
                   f'{self.guess_word.upper()} '
                   f'({self.branches_skipped} were already cached)]', flush=True)
