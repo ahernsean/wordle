@@ -39,6 +39,8 @@ from wordle import (
     _format_cache_timestamp, _current_candidate_tag,
     _format_scan_progress, _format_branch_header, _platform_label,
     print_line_with_pattern,
+    colored_text, reset_color, print_error, print_success,
+    print_colored_pattern, print_colored_word, ANSI_COLORS, ANSI_RESET,
 )
 
 
@@ -3059,6 +3061,197 @@ class TestPrintLineWithPattern(unittest.TestCase):
         stripped = re.sub(r'\033\[\d*m', '', text)
         self.assertEqual(stripped,
                          '  Branch -ygy- | 315 words | ERD: computing...\n')
+
+
+# ---------------------------------------------------------------------------
+# Color output: characterization tests across plain / ANSI / Pythonista.
+#
+# These pin down CURRENT behavior so a future markup/renderer refactor can't
+# silently change what gets printed. SUPPORTS_COLOR, IS_PYTHONISTA, and
+# console are module-level constants computed once at import time, but every
+# color function below re-reads them from the module namespace on each call,
+# so mock.patch.multiple('wordle', ...) is enough to exercise all 3 modes.
+# ---------------------------------------------------------------------------
+
+class FakeConsole:
+    """Records set_color() calls, mimicking Pythonista's `console` module."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_color(self, *args):
+        self.calls.append(args)
+
+
+def _capture_stdout(fn):
+    out = io.StringIO()
+    with redirect_stdout(out):
+        fn()
+    return out.getvalue()
+
+
+class TestColorOutputPlain(unittest.TestCase):
+    """SUPPORTS_COLOR=False, IS_PYTHONISTA=False — the worst case to guard:
+    plain output must be exactly the plain text, with no escape codes or
+    other markup mixed in."""
+
+    def setUp(self):
+        patcher = mock.patch.multiple('wordle', SUPPORTS_COLOR=False,
+                                       IS_PYTHONISTA=False, console=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_print_error(self):
+        self.assertEqual(_capture_stdout(lambda: print_error("bad")), "bad\n")
+
+    def test_print_success(self):
+        self.assertEqual(_capture_stdout(lambda: print_success("ok")), "ok\n")
+
+    def test_colored_text_is_no_op(self):
+        def fn():
+            with colored_text("red"):
+                print("X", end='')
+        self.assertEqual(_capture_stdout(fn), "X")
+
+    def test_reset_color_prints_nothing(self):
+        self.assertEqual(_capture_stdout(reset_color), "")
+
+    def test_print_colored_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        self.assertEqual(
+            _capture_stdout(lambda: print_colored_pattern(response)), "-ygy-")
+
+    def test_print_colored_word(self):
+        response = ['green', 'yellow', 'gray']
+        self.assertEqual(
+            _capture_stdout(lambda: print_colored_word("cat", response)), "CAT")
+
+    def test_print_line_with_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_line_with_pattern(
+            '  Branch ', response, ' | 315 words'))
+        self.assertEqual(out, '  Branch -ygy- | 315 words\n')
+
+
+class TestColorOutputAnsi(unittest.TestCase):
+    """SUPPORTS_COLOR=True, IS_PYTHONISTA=False — Linux terminal output."""
+
+    def setUp(self):
+        patcher = mock.patch.multiple('wordle', SUPPORTS_COLOR=True,
+                                       IS_PYTHONISTA=False, console=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_print_error(self):
+        self.assertEqual(_capture_stdout(lambda: print_error("bad")),
+                         f"{ANSI_COLORS['red']}bad\n{ANSI_RESET}")
+
+    def test_print_success(self):
+        self.assertEqual(_capture_stdout(lambda: print_success("ok")),
+                         f"{ANSI_COLORS['green']}ok\n{ANSI_RESET}")
+
+    def test_colored_text_wraps_with_escapes(self):
+        def fn():
+            with colored_text("red"):
+                print("X", end='')
+        self.assertEqual(_capture_stdout(fn),
+                         f"{ANSI_COLORS['red']}X{ANSI_RESET}")
+
+    def test_reset_color_prints_reset_code(self):
+        self.assertEqual(_capture_stdout(reset_color), ANSI_RESET)
+
+    def test_print_colored_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_colored_pattern(response))
+        expected = (
+            "-"
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + ANSI_COLORS['green'] + "g" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + "-"
+        )
+        self.assertEqual(out, expected)
+
+    def test_print_colored_word(self):
+        response = ['green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_colored_word("cat", response))
+        expected = (
+            ANSI_COLORS['green'] + "C" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "A" + ANSI_RESET
+            + ANSI_COLORS['gray'] + "T" + ANSI_RESET
+        )
+        self.assertEqual(out, expected)
+
+    def test_print_line_with_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = _capture_stdout(lambda: print_line_with_pattern(
+            '  Branch ', response, ' | 315 words'))
+        expected = (
+            "  Branch -"
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + ANSI_COLORS['green'] + "g" + ANSI_RESET
+            + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
+            + "- | 315 words\n"
+        )
+        self.assertEqual(out, expected)
+
+
+class TestColorOutputPythonista(unittest.TestCase):
+    """IS_PYTHONISTA=True — color comes from console.set_color() calls;
+    stdout itself stays plain text (no escape codes on this path)."""
+
+    def setUp(self):
+        self.console = FakeConsole()
+        patcher = mock.patch.multiple('wordle', SUPPORTS_COLOR=True,
+                                       IS_PYTHONISTA=True, console=self.console)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_print_error(self):
+        text = _capture_stdout(lambda: print_error("bad"))
+        self.assertEqual(text, "bad\n")
+        self.assertEqual(self.console.calls, [(1, 0, 0), ()])
+
+    def test_print_success(self):
+        text = _capture_stdout(lambda: print_success("ok"))
+        self.assertEqual(text, "ok\n")
+        self.assertEqual(self.console.calls, [(0, 0.6, 0), ()])
+
+    def test_reset_color_calls_set_color_with_no_args(self):
+        text = _capture_stdout(reset_color)
+        self.assertEqual(text, "")
+        self.assertEqual(self.console.calls, [()])
+
+    def test_print_colored_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        text = _capture_stdout(lambda: print_colored_pattern(response))
+        self.assertEqual(text, "-ygy-")
+        self.assertEqual(self.console.calls, [
+            (0.6, 0.6, 0), (),
+            (0, 0.6, 0), (),
+            (0.6, 0.6, 0), (),
+        ])
+
+    def test_print_colored_word(self):
+        response = ['green', 'yellow', 'gray']
+        text = _capture_stdout(lambda: print_colored_word("cat", response))
+        self.assertEqual(text, "CAT")
+        self.assertEqual(self.console.calls, [
+            (0, 0.6, 0), (),
+            (0.6, 0.6, 0), (),
+            (0.5, 0.5, 0.5), (),
+        ])
+
+    def test_print_line_with_pattern(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        text = _capture_stdout(lambda: print_line_with_pattern(
+            '  Branch ', response, ' | 315 words'))
+        self.assertEqual(text, "  Branch -ygy- | 315 words\n")
+        self.assertEqual(self.console.calls, [
+            (0.6, 0.6, 0), (),
+            (0, 0.6, 0), (),
+            (0.6, 0.6, 0), (),
+        ])
 
 
 # ---------------------------------------------------------------------------
