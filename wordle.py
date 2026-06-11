@@ -43,7 +43,7 @@ ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = "wordle_debug.log"
-BUILD = "b128"
+BUILD = "b129"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -381,11 +381,11 @@ def format_response(response):
 
 
 def _pattern_markup(response):
-    """Build a -yg markup string: green/yellow squares colored, others plain."""
+    """Build a -yg markup string: each square colored per its response."""
     parts = []
     for sq in response:
         ch = RESPONSE_ABBREV.get(sq, '?')
-        parts.append(mark(sq, ch) if sq in ('green', 'yellow') else ch)
+        parts.append(mark(sq, ch) if sq in _COLOR_MARKS else ch)
     return ''.join(parts)
 
 

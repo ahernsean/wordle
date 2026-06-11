@@ -3243,11 +3243,11 @@ class TestColorOutputANSI(unittest.TestCase):
         response = ['gray', 'yellow', 'green', 'yellow', 'gray']
         out = _capture_stdout(lambda: print_colored_pattern(response))
         expected = (
-            "-"
+            ANSI_COLORS['gray'] + "-" + ANSI_RESET
             + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
             + ANSI_COLORS['green'] + "g" + ANSI_RESET
             + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
-            + "-"
+            + ANSI_COLORS['gray'] + "-" + ANSI_RESET
         )
         self.assertEqual(out, expected)
 
@@ -3266,11 +3266,13 @@ class TestColorOutputANSI(unittest.TestCase):
         out = _capture_stdout(lambda: print_line_with_pattern(
             '  Branch ', response, ' | 315 words'))
         expected = (
-            "  Branch -"
+            "  Branch "
+            + ANSI_COLORS['gray'] + "-" + ANSI_RESET
             + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
             + ANSI_COLORS['green'] + "g" + ANSI_RESET
             + ANSI_COLORS['yellow'] + "y" + ANSI_RESET
-            + "- | 315 words\n"
+            + ANSI_COLORS['gray'] + "-" + ANSI_RESET
+            + " | 315 words\n"
         )
         self.assertEqual(out, expected)
 
@@ -3312,9 +3314,11 @@ class TestColorOutputPythonista(unittest.TestCase):
         text = _capture_stdout(lambda: print_colored_pattern(response))
         self.assertEqual(text, "-ygy-")
         self.assertEqual(self.console.calls, [
+            (0.5, 0.5, 0.5), (),
             (0.6, 0.6, 0), (),
             (0, 0.6, 0), (),
             (0.6, 0.6, 0), (),
+            (0.5, 0.5, 0.5), (),
         ])
 
     def test_print_colored_word(self):
@@ -3333,9 +3337,11 @@ class TestColorOutputPythonista(unittest.TestCase):
             '  Branch ', response, ' | 315 words'))
         self.assertEqual(text, "  Branch -ygy- | 315 words\n")
         self.assertEqual(self.console.calls, [
+            (0.5, 0.5, 0.5), (),
             (0.6, 0.6, 0), (),
             (0, 0.6, 0), (),
             (0.6, 0.6, 0), (),
+            (0.5, 0.5, 0.5), (),
         ])
 
     def test_render_markup_calls_set_color(self):
