@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b106"
+BUILD = "b107"
 
 
 # ---------------------------------------------------------------------------
@@ -2036,12 +2036,21 @@ def cmd_precache(gs):
         print("Nothing to precache (no branch has 2+ words).")
         return
 
+    # Upfront scan so the status line is accurate immediately, rather than
+    # only catching up as the background loop reaches each cached branch.
+    precached_keys = {
+        ScoreCache.encode_subset(words) for _, words in branches
+        if gs.score_cache.read(ScoreCache.encode_subset(words), ERD_ALL) is not None
+    }
+
     gs.precache_solver = BranchPrecacheSolver(
         guess_word, branches, gs.all_answers, gs.all_words,
-        gs.score_cache_path, anchor_word_count=len(soln.current_words))
+        gs.score_cache_path, anchor_word_count=len(soln.current_words),
+        precached_keys=precached_keys)
     gs.precache_solver.start()
     print(f"Precaching ERD for {len(branches)} branches of "
-          f"{guess_word.upper()} in the background. "
+          f"{guess_word.upper()} in the background "
+          f"({len(precached_keys)} already cached). "
           f"Making a guess will stop it.")
 
 
@@ -2584,7 +2593,7 @@ class BranchPrecacheSolver(threading.Thread):
     """
 
     def __init__(self, guess_word, branches, all_answers, all_words,
-                 score_cache_path, anchor_word_count):
+                 score_cache_path, anchor_word_count, precached_keys=frozenset()):
         super().__init__(daemon=True, name='BranchPrecacheSolver')
         self.guess_word = guess_word
         self._branches = branches            # [(code, branch_words), ...]
@@ -2595,9 +2604,13 @@ class BranchPrecacheSolver(threading.Thread):
         self._cancel = threading.Event()
         self._paused = threading.Event()
         self._paused.set()
+        # precached_keys: encode_subset() keys found cached by cmd_precache's
+        # upfront scan, so the status line is accurate from the first
+        # moment instead of only catching up as run()'s loop reaches them.
+        self._precached_keys = precached_keys
         self.branches_total = len(branches)
-        self.branches_done = 0
-        self.branches_skipped = 0
+        self.branches_done = len(precached_keys)
+        self.branches_skipped = len(precached_keys)
         self.current_branch_code = None
         self.current_branch_size = None
         self.root_done = 0
@@ -2638,6 +2651,8 @@ class BranchPrecacheSolver(threading.Thread):
                 self.current_branch_code = code
                 self.current_branch_size = len(words)
                 root_key = ScoreCache.encode_subset(words)
+                if root_key in self._precached_keys:
+                    continue  # already counted by cmd_precache's upfront scan
                 if score_cache.read(root_key, ERD_ALL) is not None:
                     self.branches_skipped += 1
                     self.branches_done += 1

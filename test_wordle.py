@@ -2644,6 +2644,42 @@ class TestBranchPrecacheSolver(unittest.TestCase):
         finally:
             sc.close()
 
+    def test_precached_keys_seed_counts_immediately_without_double_counting(self):
+        """cmd_precache's upfront scan passes already-cached branch keys in;
+        the status line (branches_done/branches_skipped) must reflect them
+        before run() ever starts, and run() must not re-count them."""
+        branches = self._branches()[:2]
+        live_solved_words = branches[0][1]
+        other_words = branches[1][1]
+
+        sc = ScoreCache(self.db, ANSWERS)
+        cache = ResponseCache(ANSWERS, sc)
+        min_expected_guesses(live_solved_words, cache, sc,
+                              guesses=GUESSES, policy=ERD_ALL)
+        sc.close()
+
+        precached_keys = {ScoreCache.encode_subset(live_solved_words)}
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS), precached_keys=precached_keys)
+
+        # Accurate immediately, before run() processes anything.
+        self.assertEqual(solver.branches_done, 1)
+        self.assertEqual(solver.branches_skipped, 1)
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.branches_done, 2)
+        self.assertEqual(solver.branches_skipped, 1)  # not double-counted
+
+        sc = ScoreCache(self.db, ANSWERS)
+        try:
+            self.assertIsNotNone(
+                sc.read(ScoreCache.encode_subset(other_words), ERD_ALL))
+        finally:
+            sc.close()
+
     def test_stopped_before_run_prints_nothing(self):
         """If stop() fires before run() is even scheduled (e.g. the user
         made a guess immediately after 'p'), run() must not print a stale
