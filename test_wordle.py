@@ -3175,6 +3175,32 @@ class TestPrintStatusSingleBoard(unittest.TestCase):
         self.assertIn(f"{len(ANSWERS)} words left | 0 guesses so far", text)
         self.assertIn("Branches: 5/124, 4 hit/1 miss", text)
 
+    def test_solved_shows_guess_count(self):
+        soln = make_solution()
+        soln.guesses = [["salet", ["yellow", "gray", "gray", "yellow", "yellow"]],
+                        ["tenor", ["green", "green", "green", "green", "green"]]]
+        soln.current_words = ["tenor"]
+
+        gs = self._gs(soln)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn("Solved: tenor | 2 guesses", text)
+
+    def test_solved_singular_guess(self):
+        soln = make_solution()
+        soln.guesses = [["tenor", ["green", "green", "green", "green", "green"]]]
+        soln.current_words = ["tenor"]
+
+        gs = self._gs(soln)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn("Solved: tenor | 1 guess", text)
+        self.assertNotIn("1 guesses", text)
+
     def test_non_root_with_erd_hit(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
         tmp.close()
