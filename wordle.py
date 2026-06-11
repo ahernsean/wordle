@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b117"
+BUILD = "b118"
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +59,26 @@ SUPPORTS_COLOR = (
         and os.environ.get("TERM") != "dumb"
     )
 )
+
+
+def _platform_label():
+    """'iPhone'/'iPad'/'macOS'/'Linux'/'Windows' + kernel release.
+
+    iOS and macOS both report platform.system() == 'Darwin' — uname()'s
+    machine field is what distinguishes them on iOS, where it's the device
+    hardware identifier (e.g. 'iPhone14,2', 'iPad13,4') rather than an
+    arch string like 'arm64'.
+    """
+    uname = platform.uname()
+    if uname.system == 'Darwin':
+        machine = uname.machine.lower()
+        if machine.startswith('iphone'):
+            return f'iPhone {uname.release}'
+        if machine.startswith('ipad'):
+            return f'iPad {uname.release}'
+        return f'macOS {uname.release}'
+    return f'{uname.system} {uname.release}'
+
 
 ANSI_COLORS = {
     "red": "\033[31m",
@@ -2845,8 +2865,7 @@ class BranchPrecacheSolver(threading.Thread):
 
 
 def main():
-    uname = platform.uname()
-    print(f"{BUILD} {uname.system} {uname.release}")
+    print(f"{BUILD} {_platform_label()}")
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)

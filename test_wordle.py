@@ -6,6 +6,7 @@ import io
 import itertools
 import math
 import os
+import platform
 import sqlite3
 import sys
 import tempfile
@@ -35,7 +36,7 @@ from wordle import (
     _compare_words, set_display_context,
     BranchPrecacheSolver, format_response, print_status,
     _format_cache_timestamp, _current_candidate_tag,
-    _format_scan_progress, _format_branch_header,
+    _format_scan_progress, _format_branch_header, _platform_label,
 )
 
 
@@ -2925,6 +2926,43 @@ class TestBranchPrecacheSolver(unittest.TestCase):
 
         self.assertEqual(call_count[0], 1)
         self.assertEqual(solver.branches_done, 0)
+
+
+# ---------------------------------------------------------------------------
+# _platform_label: distinguish iPhone/iPad/macOS/Linux/Windows for the banner
+# ---------------------------------------------------------------------------
+
+class TestPlatformLabel(unittest.TestCase):
+
+    @staticmethod
+    def _uname(system, release, machine):
+        return platform.uname_result(
+            system=system, node='', release=release, version='', machine=machine)
+
+    def test_linux(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Linux', '6.18.5', 'x86_64')):
+            self.assertEqual(_platform_label(), 'Linux 6.18.5')
+
+    def test_windows(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Windows', '10', 'AMD64')):
+            self.assertEqual(_platform_label(), 'Windows 10')
+
+    def test_macos(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Darwin', '25.5.0', 'arm64')):
+            self.assertEqual(_platform_label(), 'macOS 25.5.0')
+
+    def test_iphone(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Darwin', '25.5.0', 'iPhone14,2')):
+            self.assertEqual(_platform_label(), 'iPhone 25.5.0')
+
+    def test_ipad(self):
+        with mock.patch('wordle.platform.uname',
+                         return_value=self._uname('Darwin', '25.5.0', 'iPad13,4')):
+            self.assertEqual(_platform_label(), 'iPad 25.5.0')
 
 
 # ---------------------------------------------------------------------------
