@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b126"
+BUILD = "b127"
 
 
 # ---------------------------------------------------------------------------
@@ -2867,7 +2867,6 @@ class BranchPrecacheSolver(threading.Thread):
                     if now - last_print[0] < 30:
                         return
                     last_print[0] = now
-                    score_cache.checkpoint()
                     print()
                     print(_title())
                     print(self.branches_line())
