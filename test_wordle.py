@@ -316,7 +316,7 @@ class TestScoringMethodDisplay(unittest.TestCase):
         self.assertEqual(ScoringMethod.MAX_GROUP_SIZE.format_score(7.0), "7")
 
     def test_format_score_prob_finish_is_percentage(self):
-        self.assertEqual(ScoringMethod.PROB_FINISH.format_score(0.25), "25.0%")
+        self.assertEqual(ScoringMethod.PROB_FINISH.format_score(0.25), "25.00%")
 
     def test_format_score_default_is_four_decimals(self):
         self.assertEqual(ScoringMethod.ENTROPY_GAIN.format_score(1.5), "1.5000")

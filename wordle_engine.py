@@ -48,7 +48,7 @@ class ScoringMethod(Enum):
         if self == ScoringMethod.MAX_GROUP_SIZE:
             return str(int(value))
         if self == ScoringMethod.PROB_FINISH:
-            return f'{value:.1%}'
+            return f'{value:.2%}'
         return f'{value:0.4f}'
 
 

@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b107"
+BUILD = "b108"
 
 
 # ---------------------------------------------------------------------------
@@ -927,26 +927,28 @@ def _erd_root_progress_tag(solver, soln):
 
     if solver.root_best is not None:
         bw, bs = solver.root_best
-        return (f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress} '
+        return (f'  [ERD: scanning {solver.root_done:,}/{solver.root_total:,}{in_progress} '
                 f'— best so far {bw.upper()} {bs:.3f}]')
-    return f'  [ERD: scanning {solver.root_done}/{solver.root_total}{in_progress}]'
+    return f'  [ERD: scanning {solver.root_done:,}/{solver.root_total:,}{in_progress}]'
 
 
-def _precache_progress_tag(gs):
-    """Status-line fragment for a running BranchPrecacheSolver, if any."""
+def _print_precache_progress(gs):
+    """Print the status-line summary for a running BranchPrecacheSolver, if any."""
     s = gs.precache_solver
     if s is None or not s.is_alive():
-        return ''
-    branch_info = ''
+        return
+    print(f'  [Precache {s.guess_word.upper()}: '
+          f'{s.branches_done}/{s.branches_total} branches '
+          f'({s.branches_skipped} cached)', end='')
     if s.current_branch_size is not None and s.root_total > 0:
-        branch_info = (f', current {s.current_branch_size}w '
-                        f'{s.root_done}/{s.root_total}')
+        print(', current ', end='')
+        print_colored_word(s.guess_word, decode_response(s.current_branch_code))
+        print(f' {s.current_branch_size:,} words '
+              f'{s.root_done:,}/{s.root_total:,}', end='')
         if s.root_best is not None:
             bw, bs = s.root_best
-            branch_info += f' best {bw.upper()} {bs:.3f}'
-    return (f'  [Precache {s.guess_word.upper()}: '
-            f'{s.branches_done}/{s.branches_total} branches '
-            f'({s.branches_skipped} cached){branch_info}]')
+            print(f' best {bw.upper()} {bs:.3f}', end='')
+    print(']')
 
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
@@ -1043,9 +1045,9 @@ def cmd_solve(gs):
             prog = 'ordering candidates...'
         elif root_best is not None:
             bw, bs = root_best
-            prog = f'scanning root {root_done}/{root_total} — best so far {bw.upper()} {bs:.3f}'
+            prog = f'scanning root {root_done:,}/{root_total:,} — best so far {bw.upper()} {bs:.3f}'
         else:
-            prog = f'scanning root {root_done}/{root_total}'
+            prog = f'scanning root {root_done:,}/{root_total:,}'
         print(f"  {erd_idx}. ERD: expected remaining depth  ({prog})")
     print(f"Choose (1-{erd_idx})? ", end='')
     try:
@@ -1631,7 +1633,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
         ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
-        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
+        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.2%}', True),
     ]
     if any(v is not None for v in erd_vals):
         data_rows.append(('ERD', erd_vals, '{:.3f}', False))
@@ -2302,9 +2304,7 @@ def print_status(gs, solver=None):
             print(f"{n:,} words remaining")
             if erd_tag:
                 print(erd_tag.strip())
-            precache_tag = _precache_progress_tag(gs)
-            if precache_tag:
-                print(precache_tag.strip())
+            _print_precache_progress(gs)
     else:
         n = len(gs.solutions)
         print(f'{n} wordlists')
@@ -2684,7 +2684,7 @@ class BranchPrecacheSolver(threading.Thread):
                     if now - last_print[0] >= 30:
                         last_print[0] = now
                         print(f'\n  [Precache {self._branch_label(code)}: '
-                              f'{done}/{total}, best so far '
+                              f'{done:,}/{total:,}, best so far '
                               f'{best_word.upper()} {best_erd:.3f}]', flush=True)
 
                 while True:
