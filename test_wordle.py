@@ -41,6 +41,8 @@ from wordle import (
     print_line_with_pattern,
     colored_text, reset_color, print_error, print_success,
     print_colored_pattern, print_colored_word, ANSI_COLORS, ANSI_RESET,
+    mark, render_markup, MARK_RESET, MARK_RED, MARK_GREEN, MARK_YELLOW,
+    MARK_GRAY,
 )
 
 
@@ -3090,6 +3092,23 @@ def _capture_stdout(fn):
     return out.getvalue()
 
 
+class TestMark(unittest.TestCase):
+    """mark() is pure string-building — sentinel insertion is independent
+    of platform/rendering mode."""
+
+    def test_wraps_text_in_color_sentinel_and_reset(self):
+        self.assertEqual(mark('red', 'X'), f'{MARK_RED}X{MARK_RESET}')
+
+    def test_each_color_has_its_own_sentinel(self):
+        self.assertEqual(mark('green', 'g'), f'{MARK_GREEN}g{MARK_RESET}')
+        self.assertEqual(mark('yellow', 'y'), f'{MARK_YELLOW}y{MARK_RESET}')
+        self.assertEqual(mark('gray', '-'), f'{MARK_GRAY}-{MARK_RESET}')
+
+    def test_sentinels_are_distinct(self):
+        sentinels = {MARK_RESET, MARK_RED, MARK_GREEN, MARK_YELLOW, MARK_GRAY}
+        self.assertEqual(len(sentinels), 5)
+
+
 class TestColorOutputPlain(unittest.TestCase):
     """SUPPORTS_COLOR=False, IS_PYTHONISTA=False — the worst case to guard:
     plain output must be exactly the plain text, with no escape codes or
@@ -3132,8 +3151,16 @@ class TestColorOutputPlain(unittest.TestCase):
             '  Branch ', response, ' | 315 words'))
         self.assertEqual(out, '  Branch -ygy- | 315 words\n')
 
+    def test_render_markup_strips_all_sentinels(self):
+        text = 'A' + mark('red', 'B') + 'C' + mark('green', 'D') + MARK_RESET
+        self.assertEqual(
+            _capture_stdout(lambda: render_markup(text, end='')), 'ABCD')
 
-class TestColorOutputAnsi(unittest.TestCase):
+    def test_render_markup_default_end_is_newline(self):
+        self.assertEqual(_capture_stdout(lambda: render_markup('hi')), 'hi\n')
+
+
+class TestColorOutputANSI(unittest.TestCase):
     """SUPPORTS_COLOR=True, IS_PYTHONISTA=False — Linux terminal output."""
 
     def setUp(self):
@@ -3195,6 +3222,12 @@ class TestColorOutputAnsi(unittest.TestCase):
         )
         self.assertEqual(out, expected)
 
+    def test_render_markup_translates_sentinels_to_ansi(self):
+        text = 'A' + mark('red', 'B') + 'C'
+        out = _capture_stdout(lambda: render_markup(text, end=''))
+        expected = 'A' + ANSI_COLORS['red'] + 'B' + ANSI_RESET + 'C'
+        self.assertEqual(out, expected)
+
 
 class TestColorOutputPythonista(unittest.TestCase):
     """IS_PYTHONISTA=True — color comes from console.set_color() calls;
@@ -3252,6 +3285,12 @@ class TestColorOutputPythonista(unittest.TestCase):
             (0, 0.6, 0), (),
             (0.6, 0.6, 0), (),
         ])
+
+    def test_render_markup_calls_set_color(self):
+        text = 'A' + mark('red', 'B') + 'C'
+        out = _capture_stdout(lambda: render_markup(text, end=''))
+        self.assertEqual(out, 'ABC')
+        self.assertEqual(self.console.calls, [(1, 0, 0), ()])
 
 
 # ---------------------------------------------------------------------------

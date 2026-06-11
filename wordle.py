@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b123"
+BUILD = "b124"
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,13 @@ ANSI_COLORS = {
     "gray": "\033[90m",
 }
 ANSI_RESET = "\033[0m"
-ANSI_BOLD  = "\033[1m" if SUPPORTS_COLOR else ""
+
+PYTHONISTA_COLORS = {
+    "red":    (1, 0, 0),
+    "green":  (0, 0.6, 0),
+    "yellow": (0.6, 0.6, 0),
+    "gray":   (0.5, 0.5, 0.5),
+}
 
 if console is not None:
     console.set_color()
@@ -98,6 +104,14 @@ def reset_color():
         console.set_color()
     elif SUPPORTS_COLOR:
         print(ANSI_RESET, end="")
+
+
+def _start_color(color):
+    """Switch subsequent output to `color` on the current platform."""
+    if IS_PYTHONISTA and console is not None:
+        console.set_color(*PYTHONISTA_COLORS[color])
+    elif SUPPORTS_COLOR and color in ANSI_COLORS:
+        print(ANSI_COLORS[color], end="")
 
 
 _width_cache: list = [None]  # [cols] — refreshed once per REPL cycle
@@ -265,21 +279,7 @@ def _detect_display_width() -> int:
 
 @contextlib.contextmanager
 def colored_text(color):
-    pythonista_colors = {
-        "red":    (1, 0, 0),
-        "green":  (0, 0.6, 0),
-        "yellow": (0.6, 0.6, 0),
-        "gray":   (0.5, 0.5, 0.5),
-    }
-    if IS_PYTHONISTA and console is not None:
-        if isinstance(color, list):
-            console.set_color(*color)
-        elif color in pythonista_colors:
-            console.set_color(*pythonista_colors[color])
-        else:
-            reset_color()
-    elif SUPPORTS_COLOR and color in ANSI_COLORS:
-        print(ANSI_COLORS[color], end="")
+    _start_color(color)
     try:
         yield
     finally:
@@ -297,6 +297,68 @@ def print_success(msg):
 
 
 # ---------------------------------------------------------------------------
+# Color markup
+#
+# `mark(color, text)` wraps text in a sentinel pair (Unicode Private-Use-Area
+# characters, guaranteed not to collide with real text). `render_markup` is
+# the single function that turns those sentinels into output for the current
+# platform: ANSI escapes, console.set_color() calls, or nothing (sentinels
+# stripped) in plain mode. Sentinels are recognized with plain `==`/`in`
+# checks on individual characters -- no regex needed.
+#
+# Use this for one print() that mixes several colors on a line (response
+# patterns, status lines). To wrap a block of code in a single color, use
+# colored_text()/print_error()/print_success() instead.
+# ---------------------------------------------------------------------------
+
+MARK_RESET = ''
+MARK_RED = ''
+MARK_GREEN = ''
+MARK_YELLOW = ''
+MARK_GRAY = ''
+
+_COLOR_MARKS = {
+    "red": MARK_RED,
+    "green": MARK_GREEN,
+    "yellow": MARK_YELLOW,
+    "gray": MARK_GRAY,
+}
+_MARK_COLORS = {v: k for k, v in _COLOR_MARKS.items()}
+
+
+def mark(color, text):
+    """Wrap `text` in a sentinel pair so render_markup() colors it."""
+    return f'{_COLOR_MARKS[color]}{text}{MARK_RESET}'
+
+
+def render_markup(text, end='\n'):
+    """Print a string built with mark()/MARK_* sentinels."""
+    if IS_PYTHONISTA and console is not None:
+        for ch in text:
+            if ch == MARK_RESET:
+                console.set_color()
+            elif ch in _MARK_COLORS:
+                console.set_color(*PYTHONISTA_COLORS[_MARK_COLORS[ch]])
+            else:
+                print(ch, end='')
+        print(end, end='')
+        return
+    if SUPPORTS_COLOR:
+        out = []
+        for ch in text:
+            if ch == MARK_RESET:
+                out.append(ANSI_RESET)
+            elif ch in _MARK_COLORS:
+                out.append(ANSI_COLORS[_MARK_COLORS[ch]])
+            else:
+                out.append(ch)
+        print(''.join(out), end=end)
+    else:
+        print(''.join(ch for ch in text if ch not in _MARK_COLORS
+                       and ch != MARK_RESET), end=end)
+
+
+# ---------------------------------------------------------------------------
 # Response formatting and parsing
 # ---------------------------------------------------------------------------
 
@@ -308,15 +370,18 @@ def format_response(response):
     return ''.join(RESPONSE_ABBREV[r] for r in response)
 
 
-def print_colored_pattern(response):
-    """Print a -yg pattern string with colors."""
+def _pattern_markup(response):
+    """Build a -yg markup string: green/yellow squares colored, others plain."""
+    parts = []
     for sq in response:
         ch = RESPONSE_ABBREV.get(sq, '?')
-        if sq in ('green', 'yellow'):
-            with colored_text(sq):
-                print(ch, end='')
-        else:
-            print(ch, end='')
+        parts.append(mark(sq, ch) if sq in ('green', 'yellow') else ch)
+    return ''.join(parts)
+
+
+def print_colored_pattern(response):
+    """Print a -yg pattern string with colors."""
+    render_markup(_pattern_markup(response), end='')
 
 
 def print_line_with_pattern(prefix, response, suffix=''):
@@ -324,16 +389,15 @@ def print_line_with_pattern(prefix, response, suffix=''):
     line with a newline. Central helper for any line that embeds a
     response pattern (precache's "Branch ---g- |..." header, the live
     solver's "Targeted scan of WORD ---g-" title)."""
-    print(prefix, end='')
-    print_colored_pattern(response)
-    print(suffix)
+    render_markup(f'{prefix}{_pattern_markup(response)}{suffix}')
 
 
 def print_colored_word(word, response):
     """Print a word with each letter colored by its response."""
-    for letter, color in zip(word, response):
-        with colored_text(color):
-            print(letter.upper(), end='')
+    render_markup(
+        ''.join(mark(color, letter.upper())
+                for letter, color in zip(word, response)),
+        end='')
 
 
 def _is_gray_char(ch):
