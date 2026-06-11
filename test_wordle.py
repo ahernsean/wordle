@@ -685,6 +685,58 @@ class TestScoreCacheSQLite(unittest.TestCase):
             not os.path.exists(wal_path) or os.path.getsize(wal_path) == 0,
             "close() should leave a self-contained .sqlite3 file")
 
+    def test_checkpoint_swallows_disk_io_error(self):
+        """A transient OperationalError (e.g. iCloud File Provider Storage
+        holding the lock TRUNCATE needs) must not propagate — the WAL still
+        has every committed write, so a failed checkpoint loses nothing."""
+        sc = ScoreCache(self.db, ANSWERS)
+
+        class FailingCheckpoint:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if sql.startswith("PRAGMA wal_checkpoint"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_conn = sc._conn
+        sc._conn = FailingCheckpoint(real_conn)
+        try:
+            sc.checkpoint()  # must not raise
+        finally:
+            sc._conn = real_conn
+        sc.close()
+
+    def test_close_releases_connection_when_checkpoint_fails(self):
+        """close() must still release the connection even when its
+        checkpoint() call hits a disk I/O error."""
+        sc = ScoreCache(self.db, ANSWERS)
+
+        class FailingCheckpoint:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if sql.startswith("PRAGMA wal_checkpoint"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *a, **k)
+
+            def close(self):
+                self._real.close()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        sc._conn = FailingCheckpoint(sc._conn)
+        sc.close()  # must not raise
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            sc.read(ScoreCache.encode_subset(["crane"]), "full")
+
     def test_encode_subset_is_order_independent(self):
         self.assertEqual(
             ScoreCache.encode_subset(["slate", "crane"]),

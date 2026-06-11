@@ -227,8 +227,18 @@ class ScoreCache:
         sidecars, so it's always safe to copy off-device - and the latest
         writes survive even if iOS suspends/kills the process without a
         clean close().
+
+        This is an optimization, not a durability requirement: every write
+        is already committed to the WAL, so a failed checkpoint loses
+        nothing. On iOS the cache file lives under iCloud's File Provider
+        Storage, where a sync pass can transiently hold the exclusive lock
+        TRUNCATE needs - swallow that rather than letting it take down a
+        background solver thread (or close()) over a no-op.
         """
-        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
 
     # ------------------------------------------------------------------
     # Subgroup lookahead cache (levels 2+)

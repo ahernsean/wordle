@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b125"
+BUILD = "b126"
 
 
 # ---------------------------------------------------------------------------
