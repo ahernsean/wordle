@@ -7,6 +7,7 @@ import itertools
 import math
 import os
 import platform
+import re
 import sqlite3
 import sys
 import tempfile
@@ -37,6 +38,7 @@ from wordle import (
     BranchPrecacheSolver, format_response, print_status,
     _format_cache_timestamp, _current_candidate_tag,
     _format_scan_progress, _format_branch_header, _platform_label,
+    print_line_with_pattern,
 )
 
 
@@ -3038,22 +3040,25 @@ class TestFormatScanProgress(unittest.TestCase):
 
 class TestFormatBranchHeader(unittest.TestCase):
 
-    def test_computing_no_pattern(self):
+    def test_computing(self):
         self.assertEqual(_format_branch_header(315),
                          "315 words | ERD: computing...")
 
-    def test_computing_with_pattern(self):
-        self.assertEqual(_format_branch_header(315, pattern="-----"),
-                         "Branch ----- | 315 words | ERD: computing...")
 
-    def test_done_no_pattern(self):
-        self.assertEqual(_format_branch_header(315, done_result=(2.905, "grind")),
-                         "315 words | done: 2.905 GRIND")
+class TestPrintLineWithPattern(unittest.TestCase):
 
-    def test_done_with_pattern(self):
-        self.assertEqual(
-            _format_branch_header(315, pattern="-----", done_result=(2.905, "grind")),
-            "Branch ----- | 315 words | done: 2.905 GRIND")
+    def test_prefix_pattern_suffix(self):
+        response = ['gray', 'yellow', 'green', 'yellow', 'gray']
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_line_with_pattern(
+                '  Branch ', response, ' | 315 words | ERD: computing...')
+        text = out.getvalue()
+        # Pattern characters appear, in order, between prefix and suffix —
+        # any ANSI color codes from SUPPORTS_COLOR are stripped out.
+        stripped = re.sub(r'\033\[\d*m', '', text)
+        self.assertEqual(stripped,
+                         '  Branch -ygy- | 315 words | ERD: computing...\n')
 
 
 # ---------------------------------------------------------------------------

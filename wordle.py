@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b121"
+BUILD = "b122"
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +317,16 @@ def print_colored_pattern(response):
                 print(ch, end='')
         else:
             print(ch, end='')
+
+
+def print_line_with_pattern(prefix, response, suffix=''):
+    """Print `prefix` + a colored -yg pattern + `suffix`, ending the
+    line with a newline. Central helper for any line that embeds a
+    response pattern (precache's "Branch ---g- |..." header, the live
+    solver's "Targeted scan of WORD ---g-" title)."""
+    print(prefix, end='')
+    print_colored_pattern(response)
+    print(suffix)
 
 
 def print_colored_word(word, response):
@@ -970,17 +980,9 @@ def _format_scan_progress(root_done, root_total, root_best, culled,
     return lines
 
 
-def _format_branch_header(words_count, pattern=None, done_result=None):
-    """'N words | ERD: computing...' — or, with `pattern` (precache),
-    'Branch PATTERN | N words | ERD: computing...'; with `done_result`
-    (erd, word) instead of '...computing...', '... | done: X.XXX WORD'."""
-    prefix = f'Branch {pattern} | ' if pattern is not None else ''
-    if done_result is not None:
-        erd, word = done_result
-        status = f'done: {erd:.3f} {word.upper()}'
-    else:
-        status = 'ERD: computing...'
-    return f'{prefix}{words_count:,} words | {status}'
+def _format_branch_header(words_count):
+    """'N words | ERD: computing...'"""
+    return f'{words_count:,} words | ERD: computing...'
 
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
@@ -2585,14 +2587,15 @@ class ERDSolver(threading.Thread):
                     return
                 last_print[0] = now
                 last_word, last_resp = self._last_guess
-                title = (f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} '
-                         f'Targeted scan of {last_word.upper()} '
-                         f'{format_response(last_resp)}')
-                lines = [title, '  ' + _format_branch_header(len(self._words))]
+                print()
+                print_line_with_pattern(
+                    f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} '
+                    f'Targeted scan of {last_word.upper()} ', last_resp)
+                lines = ['  ' + _format_branch_header(len(self._words))]
                 lines.extend(_format_scan_progress(
                     self.root_done, self.root_total, self.root_best,
                     self.culled, self.current_word_tag(), indent=2))
-                print('\n' + '\n'.join(lines), flush=True)
+                print('\n'.join(lines), flush=True)
 
             def _progress(done, total, best_word, best_erd):
                 wall_elapsed = time.time() - word_wall[0]
@@ -2792,7 +2795,7 @@ class BranchPrecacheSolver(threading.Thread):
                 if self._cancel.is_set():
                     return
 
-                pattern = format_response(decode_response(code))
+                response_pat = decode_response(code)
                 last_print = [time.time()]
                 progress_calls = [0]
 
@@ -2802,13 +2805,17 @@ class BranchPrecacheSolver(threading.Thread):
                         return
                     last_print[0] = now
                     score_cache.checkpoint()
-                    lines = [_title(), self.branches_line(),
-                             '  ' + _format_branch_header(
-                                 self.current_branch_size, pattern=pattern)]
-                    lines.extend(_format_scan_progress(
+                    print()
+                    print(_title())
+                    print(self.branches_line())
+                    print_line_with_pattern(
+                        '  Branch ', response_pat,
+                        f' | {self.current_branch_size:,} words | '
+                        f'ERD: computing...')
+                    print('\n'.join(_format_scan_progress(
                         self.root_done, self.root_total, self.root_best,
-                        self.culled, self.current_word_tag(), indent=2))
-                    print('\n' + '\n'.join(lines), flush=True)
+                        self.culled, self.current_word_tag(), indent=2)),
+                        flush=True)
 
                 def _progress(done, total, best_word, best_erd):
                     self.root_done = done
@@ -2852,12 +2859,15 @@ class BranchPrecacheSolver(threading.Thread):
 
                 self.branches_done += 1
                 best_word, _ = score_cache.read(root_key, ERD_ALL)
-                lines = [_title(), self.branches_line(),
-                         '  ' + _format_branch_header(
-                             self.current_branch_size, pattern=pattern,
-                             done_result=(result, best_word)),
-                         f'  {self.culled:,}/{self.root_total:,} culled']
-                print('\n' + '\n'.join(lines), flush=True)
+                print()
+                print(_title())
+                print(self.branches_line())
+                print_line_with_pattern(
+                    '  Branch ', response_pat,
+                    f' | {self.current_branch_size:,} words | '
+                    f'done: {result:.3f} {best_word.upper()}')
+                print(f'  {self.culled:,}/{self.root_total:,} culled',
+                      flush=True)
 
             print(f'\n{_title()}\n{self.branches_line(done=True)}', flush=True)
         except sqlite3.OperationalError:
