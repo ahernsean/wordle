@@ -10,15 +10,17 @@ import sqlite3
 import sys
 import tempfile
 import time
+import types
 import unittest
 from collections import defaultdict
 from contextlib import redirect_stdout
+from datetime import datetime
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wordle_engine import (
-    Solution, ScoringMethod, ResponseCache,
+    Solution, ScoringMethod, ResponseCache, GuessUniverse, ComplianceFilter,
     calculate_response, score_groups, score_groups_multi, calculate_group_counts,
     score_word, score_word_multi, load_word_list, max_entropy,
     Restriction, answer_to_restriction, apply_guess, _encode_response,
@@ -31,7 +33,9 @@ from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
     _multistep_stats, _erd_solve_scores, ERDSolver,
     _compare_words, set_display_context,
-    BranchPrecacheSolver, format_response, _print_precache_progress,
+    BranchPrecacheSolver, format_response, print_status,
+    _format_cache_timestamp, _current_candidate_tag,
+    _format_scan_progress, _format_branch_header,
 )
 
 
@@ -2449,7 +2453,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def cancel_during_root(remaining, cache, sc, deadline=None,
                                 guesses=None, policy=None,
                                 progress_callback=None,
-                                cancel_check=None):
+                                cancel_check=None, heartbeat=None):
             solver.stop()  # e.g. the user moved on; a fresh solver supersedes this one
             return 1.8
 
@@ -2604,7 +2608,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
 
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
-                               progress_callback=None, cancel_check=None):
+                               progress_callback=None, cancel_check=None,
+                               heartbeat=None):
             if 'pass' not in snapshot:
                 snapshot['pass'] = 1
                 progress_callback(1, len(words), words[0], 1.5)
@@ -2635,6 +2640,98 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         self.assertGreater(solver.cumulative_cpu_s, snapshot['cpu_before_pass2'])
         self.assertGreater(solver.cumulative_wall_s, snapshot['wall_before_pass2'])
 
+    def test_targeted_scan_periodic_report(self):
+        """When constructed with last_guess, _scan must periodically print a
+        'Targeted scan of WORD <pattern>' report — same shape as
+        BranchPrecacheSolver's 'Root-word scan' report — driven by the
+        heartbeat callback, every 30s."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache,
+                           last_guess=("salet", ["gray"] * 5))
+        solver._rcache = FakeResponseCache()
+
+        counter = itertools.count()
+
+        def fake_min_expected(remaining, cache, sc, deadline=None,
+                               guesses=None, policy=None,
+                               progress_callback=None, cancel_check=None,
+                               heartbeat=None):
+            heartbeat()
+            return 1.5
+
+        out = io.StringIO()
+        with mock.patch('wordle.time.time', side_effect=lambda: next(counter) * 31), \
+             mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected):
+            with redirect_stdout(out):
+                solver._scan(score_cache)
+
+        text = out.getvalue()
+        self.assertIn("Targeted scan of SALET -----", text)
+        self.assertIn(f"{len(words)} words | ERD: computing...", text)
+        self.assertIn("0/0, 0 culled", text)
+        self.assertRegex(text, r'\d+s, \d+ hit/\d+ miss')
+
+    def test_no_targeted_scan_report_without_last_guess(self):
+        """last_guess defaults to None (e.g. tests that construct an
+        ERDSolver directly) — _maybe_print must be a no-op in that case,
+        even when 30+ seconds appear to have elapsed."""
+        words = [self._word(i) for i in range(10)]
+
+        class FakeResponseCache:
+            answer_words = words
+
+            def __init__(self):
+                self._cache = {}
+
+            @staticmethod
+            def group_words(word, current_words):
+                return {}
+
+            @staticmethod
+            def group_counts(word, current_words):
+                return {}
+
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False, seed_mem_cache=score_cache)
+        solver._rcache = FakeResponseCache()
+
+        counter = itertools.count()
+
+        def fake_min_expected(remaining, cache, sc, deadline=None,
+                               guesses=None, policy=None,
+                               progress_callback=None, cancel_check=None,
+                               heartbeat=None):
+            heartbeat()
+            return 1.5
+
+        out = io.StringIO()
+        with mock.patch('wordle.time.time', side_effect=lambda: next(counter) * 31), \
+             mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected):
+            with redirect_stdout(out):
+                solver._scan(score_cache)
+
+        self.assertNotIn("Targeted scan", out.getvalue())
+
 
 # ---------------------------------------------------------------------------
 # BranchPrecacheSolver: precache ERD for sibling branches of a guess
@@ -2653,7 +2750,8 @@ class TestBranchPrecacheSolver(unittest.TestCase):
     @staticmethod
     def _branches():
         # Three tiny, disjoint synthetic branches (3 words each), paired
-        # with arbitrary valid response codes for _branch_label.
+        # with arbitrary valid response codes (used to format the branch
+        # pattern in the periodic report).
         return [
             (0, ANSWERS[0:3]),
             (1, ANSWERS[3:6]),
@@ -2681,13 +2779,12 @@ class TestBranchPrecacheSolver(unittest.TestCase):
         finally:
             sc.close()
 
-    def test_tracks_root_total_culled_and_nodes_visited(self):
+    def test_tracks_root_total_culled(self):
         """root_total is set to len(ranked) (the candidate vocabulary)
         before min_expected_guesses starts — so the status line has
         something to show even before the first top-level candidate
-        fully resolves — and nodes_visited/culled (driven by the
-        heartbeat/progress callbacks) end up populated for the last
-        branch processed."""
+        fully resolves — and culled (driven by the progress callback) ends
+        up populated for the last branch processed."""
         branches = self._branches()
         solver = BranchPrecacheSolver(
             "heart", branches, ANSWERS, GUESSES, self.db,
@@ -2697,16 +2794,15 @@ class TestBranchPrecacheSolver(unittest.TestCase):
             solver.run()
 
         self.assertEqual(solver.root_total, len(GUESSES))
-        self.assertGreater(solver.nodes_visited, 0)
         self.assertGreaterEqual(solver.culled, 0)
 
-    def test_periodic_print_reports_culled_and_visited(self):
+    def test_periodic_print_reports_culled_and_current_candidate(self):
         """The periodic print (driven by either the per-candidate progress
         callback or the per-subgroup heartbeat) must report how many
-        top-level candidates were culled by cost_lb pruning and how many
-        subgroups have been visited so far — the signal that's missing
-        while a single top-level candidate's deep recursion is still
-        running."""
+        top-level candidates were culled by cost_lb pruning and the
+        in-progress candidate's elapsed time and cache hit/miss counts —
+        the signal that's missing while a single top-level candidate's deep
+        recursion is still running."""
         branches = self._branches()[:1]
         solver = BranchPrecacheSolver(
             "heart", branches, ANSWERS, GUESSES, self.db,
@@ -2722,7 +2818,7 @@ class TestBranchPrecacheSolver(unittest.TestCase):
 
         text = out.getvalue()
         self.assertIn("culled", text)
-        self.assertIn("subgroups visited", text)
+        self.assertRegex(text, r'\d+s, \d+ hit/\d+ miss')
 
     def test_skips_already_cached_branch_and_fills_others(self):
         """Simulates the live ERDSolver having already filled one branch's
@@ -2832,80 +2928,292 @@ class TestBranchPrecacheSolver(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _print_precache_progress: status-line summary for BranchPrecacheSolver
+# Shared scan-progress formatting helpers
 # ---------------------------------------------------------------------------
 
-class TestPrintPrecacheProgress(unittest.TestCase):
-    """branches_skipped is a fixed baseline — branches that were already
-    cached *before this run started*. It does not grow as this run
-    completes new branches, which previously read as "(3 cached)" never
-    changing even after a 4th branch finished. The status line must show
-    a separate, growing "computed this run" count alongside it, plus the
-    culled/visited counters that give visibility during a single
-    candidate's long recursive evaluation."""
+class TestFormatCacheTimestamp(unittest.TestCase):
 
-    def _solver_stub(self, **overrides):
-        import types
-        s = types.SimpleNamespace(
-            guess_word="salet",
-            branches_done=4,
-            branches_total=124,
-            branches_skipped=3,
-            current_branch_code=0,
-            current_branch_size=315,
-            root_done=3245,
-            root_total=12972,
-            root_best=("grind", 2.905),
-            culled=1200,
-            nodes_visited=50000,
-            cache_hits=138144,
-            cache_misses=2539,
-        )
-        s.is_alive = lambda: True
-        for k, v in overrides.items():
-            setattr(s, k, v)
+    def test_none_is_na(self):
+        self.assertEqual(_format_cache_timestamp(None), "n/a")
+
+    def test_zero_is_na(self):
+        self.assertEqual(_format_cache_timestamp(0), "n/a")
+
+    def test_formats_epoch_seconds(self):
+        ts = datetime(2026, 6, 11, 14, 2, 18).timestamp()
+        self.assertEqual(_format_cache_timestamp(ts), "2026-06-11 14:02:18")
+
+
+class TestCurrentCandidateTag(unittest.TestCase):
+
+    def test_none_word_returns_none(self):
+        self.assertIsNone(_current_candidate_tag(MemoryScoreCache(), None, time.time()))
+
+    def test_none_start_time_returns_none(self):
+        self.assertIsNone(_current_candidate_tag(MemoryScoreCache(), "arise", None))
+
+    def test_none_score_cache_returns_none(self):
+        self.assertIsNone(_current_candidate_tag(None, "arise", time.time()))
+
+    def test_returns_word_elapsed_hits_misses(self):
+        sc = MemoryScoreCache()
+        sc.read_hits = 12
+        sc.read_misses = 3
+        word, elapsed, hits, misses = _current_candidate_tag(sc, "arise", time.time() - 5)
+        self.assertEqual(word, "arise")
+        self.assertGreaterEqual(elapsed, 5)
+        self.assertEqual(hits, 12)
+        self.assertEqual(misses, 3)
+
+
+class TestFormatScanProgress(unittest.TestCase):
+
+    def test_basic_no_best_no_current(self):
+        lines = _format_scan_progress(234, 12972, None, 4772, None)
+        self.assertEqual(lines, ["234/12,972, 4,772 culled"])
+
+    def test_with_best(self):
+        lines = _format_scan_progress(234, 12972, ("arise", 3.142), 4772, None)
+        self.assertEqual(lines, ["234/12,972, 4,772 culled, best: ARISE 3.142"])
+
+    def test_with_current_candidate(self):
+        lines = _format_scan_progress(234, 12972, ("arise", 3.142), 4772,
+                                        ("grind", 23.4, 12, 3))
+        self.assertEqual(lines, [
+            "234/12,972, 4,772 culled, best: ARISE 3.142",
+            "  GRIND: 23s, 12 hit/3 miss",
+        ])
+
+    def test_indent_and_suffix(self):
+        lines = _format_scan_progress(234, 12972, None, 4772, None,
+                                        indent=2, suffix=' cands')
+        self.assertEqual(lines, ["  234/12,972 cands, 4,772 culled"])
+
+    def test_indent_applies_to_current_candidate_line_too(self):
+        lines = _format_scan_progress(234, 12972, None, 4772,
+                                        ("grind", 23.4, 12, 3), indent=2)
+        self.assertEqual(lines, [
+            "  234/12,972, 4,772 culled",
+            "    GRIND: 23s, 12 hit/3 miss",
+        ])
+
+
+class TestFormatBranchHeader(unittest.TestCase):
+
+    def test_computing_no_pattern(self):
+        self.assertEqual(_format_branch_header(315),
+                         "315 words | ERD: computing...")
+
+    def test_computing_with_pattern(self):
+        self.assertEqual(_format_branch_header(315, pattern="-----"),
+                         "Branch ----- | 315 words | ERD: computing...")
+
+    def test_done_no_pattern(self):
+        self.assertEqual(_format_branch_header(315, done_result=(2.905, "grind")),
+                         "315 words | done: 2.905 GRIND")
+
+    def test_done_with_pattern(self):
+        self.assertEqual(
+            _format_branch_header(315, pattern="-----", done_result=(2.905, "grind")),
+            "Branch ----- | 315 words | done: 2.905 GRIND")
+
+
+# ---------------------------------------------------------------------------
+# BranchPrecacheSolver.branches_line / _branches_starting_line
+# ---------------------------------------------------------------------------
+
+class TestBranchesLine(unittest.TestCase):
+
+    @staticmethod
+    def _solver(branches_done, branches_total, branches_skipped):
+        s = BranchPrecacheSolver.__new__(BranchPrecacheSolver)
+        s.branches_done = branches_done
+        s.branches_total = branches_total
+        s.branches_skipped = branches_skipped
         return s
 
-    def _printed(self, solver):
-        import types
-        gs = types.SimpleNamespace(precache_solver=solver)
+    def test_starting_line(self):
+        s = self._solver(0, 124, 42)
+        self.assertEqual(s._branches_starting_line(), "Branches: 0/124, 42 cached")
+
+    def test_active_line_shows_hit_and_miss(self):
+        s = self._solver(5, 124, 4)
+        self.assertEqual(s.branches_line(), "Branches: 5/124, 4 hit/1 miss")
+
+    def test_done_line(self):
+        s = self._solver(124, 124, 42)
+        self.assertEqual(s.branches_line(done=True),
+                         "Branches: 124/124 done, 42 hit/82 miss")
+
+
+# ---------------------------------------------------------------------------
+# current_word_tag: 4-tuple (word, elapsed, hits, misses) for both solvers
+# ---------------------------------------------------------------------------
+
+class TestCurrentWordTag(unittest.TestCase):
+
+    @staticmethod
+    def _word(i):
+        return f"w{i:04d}"
+
+    def test_erd_solver_current_word_tag(self):
+        words = [self._word(i) for i in range(10)]
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False)
+        sc = MemoryScoreCache()
+        solver._score_cache = sc
+        solver._start_word(sc, words, 0)
+        sc.read_hits = 5
+        sc.read_misses = 2
+
+        word, elapsed, hits, misses = solver.current_word_tag()
+        self.assertEqual(word, words[0])
+        self.assertGreaterEqual(elapsed, 0)
+        self.assertEqual(hits, 5)
+        self.assertEqual(misses, 2)
+
+    def test_erd_solver_no_current_word_returns_none(self):
+        words = [self._word(i) for i in range(10)]
+        solver = ERDSolver(words, words, words, None,
+                           policy=ERD_ALL, persist=False)
+        self.assertIsNone(solver.current_word_tag())
+
+    def test_branch_precache_solver_current_word_tag(self):
+        words = [self._word(i) for i in range(10)]
+        solver = BranchPrecacheSolver(
+            "heart", [(0, words)], words, words, None,
+            anchor_word_count=len(words))
+        sc = MemoryScoreCache()
+        solver._score_cache = sc
+        solver._start_word(sc, words, 1)
+        sc.read_hits = 7
+        sc.read_misses = 1
+
+        word, elapsed, hits, misses = solver.current_word_tag()
+        self.assertEqual(word, words[1])
+        self.assertGreaterEqual(elapsed, 0)
+        self.assertEqual(hits, 7)
+        self.assertEqual(misses, 1)
+
+
+# ---------------------------------------------------------------------------
+# print_status (single-board): idle line, ERD hit, ordering/scanning, precache
+# ---------------------------------------------------------------------------
+
+class TestPrintStatusSingleBoard(unittest.TestCase):
+
+    @staticmethod
+    def _gs(soln, precache_solver=None):
+        return types.SimpleNamespace(
+            single=True,
+            solutions=[soln],
+            universe=GuessUniverse.ALL_WORDS,
+            compliance=ComplianceFilter.UNFILTERED,
+            constrained_erd_cache=None,
+            precache_solver=precache_solver,
+        )
+
+    def test_idle_root_single_line(self):
+        soln = make_solution()
+        gs = self._gs(soln)
         out = io.StringIO()
         with redirect_stdout(out):
-            _print_precache_progress(gs)
-        return out.getvalue()
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn(f"{len(ANSWERS)} words left | 0 guesses so far", text)
+        self.assertNotIn("Branches:", text)
 
-    def test_dead_solver_prints_nothing(self):
-        gs_solver = self._solver_stub()
-        gs_solver.is_alive = lambda: False
-        self.assertEqual(self._printed(gs_solver), '')
+    def test_root_with_precache_shows_branches_line(self):
+        soln = make_solution()
+        precache = types.SimpleNamespace(
+            is_alive=lambda: True,
+            branches_line=lambda: "Branches: 5/124, 4 hit/1 miss",
+        )
+        gs = self._gs(soln, precache_solver=precache)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn(f"{len(ANSWERS)} words left | 0 guesses so far", text)
+        self.assertIn("Branches: 5/124, 4 hit/1 miss", text)
 
-    def test_distinguishes_baseline_cached_from_computed_this_run(self):
-        line = self._printed(self._solver_stub())
-        self.assertIn("4/124 branches", line)
-        self.assertIn("3 were already cached", line)
-        self.assertIn("1 computed this run", line)
+    def test_non_root_with_erd_hit(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            cache = ResponseCache(ANSWERS, sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.guesses = [["salet", ["gray"] * 5]]
+            soln.current_words = ANSWERS[:3]
+            sc.write(ScoreCache.encode_subset(soln.current_words), ERD_ALL,
+                     "arise", 3.142)
 
-    def test_baseline_count_unchanged_after_finishing_a_branch(self):
-        """Finishing one more branch (branches_done 4 -> 5, branches_skipped
-        unchanged at 3) must increase 'computed this run' (1 -> 2) while
-        the baseline stays put — the change a user expects to see."""
-        before = self._printed(self._solver_stub(branches_done=4, branches_skipped=3))
-        after = self._printed(self._solver_stub(branches_done=5, branches_skipped=3))
-        self.assertIn("3 were already cached, 1 computed this run", before)
-        self.assertIn("3 were already cached, 2 computed this run", after)
+            gs = self._gs(soln)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                print_status(gs)
+            text = out.getvalue()
+            self.assertIn("3 words left | 1 guess so far | 3.142 ARISE", text)
+        finally:
+            sc.close()
+            os.unlink(tmp.name)
 
-    def test_shows_culled_and_visited_counts(self):
-        line = self._printed(self._solver_stub())
-        self.assertIn("1,200 culled", line)
-        self.assertIn("50,000 visited", line)
+    def test_non_root_solver_ordering(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            cache = ResponseCache(ANSWERS, sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.guesses = [["salet", ["gray"] * 5]]
+            soln.current_words = ANSWERS[:3]
 
-    def test_no_current_branch_section_when_root_total_zero(self):
-        """root_total == 0 means we're between branches (ranking not
-        finished yet) — no 'current ...' section, and no culled/visited
-        counts that would be stale from the previous branch."""
-        line = self._printed(self._solver_stub(root_total=0))
-        self.assertNotIn("current", line)
-        self.assertNotIn("culled", line)
+            solver = ERDSolver.__new__(ERDSolver)
+            solver._words = soln.current_words
+            solver.root_total = 0
+
+            gs = self._gs(soln)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                print_status(gs, solver)
+            text = out.getvalue()
+            self.assertIn("3 words left | 1 guess so far", text)
+            self.assertIn("ERD: ordering candidates...", text)
+        finally:
+            sc.close()
+            os.unlink(tmp.name)
+
+    def test_non_root_solver_scanning(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            cache = ResponseCache(ANSWERS, sc)
+            soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
+            soln.guesses = [["salet", ["gray"] * 5]]
+            soln.current_words = ANSWERS[:3]
+
+            solver = ERDSolver.__new__(ERDSolver)
+            solver._words = soln.current_words
+            solver.root_total = 12972
+            solver.root_done = 234
+            solver.root_best = ("arise", 3.142)
+            solver.culled = 4772
+            solver._score_cache = None
+            solver.current_word = None
+            solver.current_word_start = None
+
+            gs = self._gs(soln)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                print_status(gs, solver)
+            text = out.getvalue()
+            self.assertIn("3 words left | 1 guess so far", text)
+            self.assertIn("234/12,972 cands, 4,772 culled, best: ARISE 3.142", text)
+        finally:
+            sc.close()
+            os.unlink(tmp.name)
 
 
 # ---------------------------------------------------------------------------
