@@ -41,7 +41,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b119"
+BUILD = "b120"
 
 
 # ---------------------------------------------------------------------------
@@ -2048,9 +2048,10 @@ def cmd_precache(gs):
         return
     soln = gs.solutions[0]
     if not soln._is_full_game():
-        print_error("Precache only available before the first guess "
-                     "(it would collide with the live ERD solver for this "
-                     "position). Press 'r' to reset, then 'p' again.")
+        print_error("Precache is anchored to the root word list: your "
+                     "current universe/compliance settings with no "
+                     "guesses applied yet. Press 'r' to reset, then "
+                     "'p' again.")
         return
     set_display_context(soln)
 
