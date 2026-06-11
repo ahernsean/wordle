@@ -31,7 +31,7 @@ from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
     _multistep_stats, _erd_solve_scores, ERDSolver,
     _compare_words, set_display_context,
-    BranchPrecacheSolver, format_response,
+    BranchPrecacheSolver, format_response, _print_precache_progress,
 )
 
 
@@ -1524,6 +1524,43 @@ class TestMinExpectedGuesses(unittest.TestCase):
             min_expected_guesses(ANSWERS[:3], self.cache, None,
                                  policy="not_a_real_policy")
 
+    def test_heartbeat_fires_for_root_and_recursive_calls(self):
+        """heartbeat fires once per min_expected_guesses invocation at
+        every recursion depth — far more often than progress_callback,
+        which only fires once per fully-evaluated top-level candidate and
+        can go silent for a long time during a single candidate's deep
+        recursive evaluation (best_erd still unbounded, nothing prunable
+        yet)."""
+        subset = ANSWERS[:4]
+        heartbeats = []
+        progress_calls = []
+        min_expected_guesses(
+            subset, self.cache, None, guesses=GUESSES,
+            heartbeat=lambda: heartbeats.append(1),
+            progress_callback=lambda *a: progress_calls.append(a))
+        self.assertGreaterEqual(len(heartbeats), 1)
+        self.assertGreater(len(heartbeats), len(progress_calls))
+
+    def test_heartbeat_fires_once_on_cache_hit_root(self):
+        """A cached root returns immediately with no recursion at all —
+        but heartbeat must still fire for that single invocation, so a
+        caller relying on it for liveness never sees total silence."""
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            subset = ANSWERS[:4]
+            min_expected_guesses(subset, self.cache, sc)  # populate cache
+
+            heartbeats = []
+            result = min_expected_guesses(
+                subset, self.cache, sc,
+                heartbeat=lambda: heartbeats.append(1))
+            self.assertIsNotNone(result)
+            self.assertEqual(heartbeats, [1])
+        finally:
+            os.unlink(tmp.name)
+
 
 # ---------------------------------------------------------------------------
 # min_expected_guesses: cost_lb admissible-bound pruning
@@ -2644,6 +2681,49 @@ class TestBranchPrecacheSolver(unittest.TestCase):
         finally:
             sc.close()
 
+    def test_tracks_root_total_culled_and_nodes_visited(self):
+        """root_total is set to len(ranked) (the candidate vocabulary)
+        before min_expected_guesses starts — so the status line has
+        something to show even before the first top-level candidate
+        fully resolves — and nodes_visited/culled (driven by the
+        heartbeat/progress callbacks) end up populated for the last
+        branch processed."""
+        branches = self._branches()
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        with redirect_stdout(io.StringIO()):
+            solver.run()
+
+        self.assertEqual(solver.root_total, len(GUESSES))
+        self.assertGreater(solver.nodes_visited, 0)
+        self.assertGreaterEqual(solver.culled, 0)
+
+    def test_periodic_print_reports_culled_and_visited(self):
+        """The periodic print (driven by either the per-candidate progress
+        callback or the per-subgroup heartbeat) must report how many
+        top-level candidates were culled by cost_lb pruning and how many
+        subgroups have been visited so far — the signal that's missing
+        while a single top-level candidate's deep recursion is still
+        running."""
+        branches = self._branches()[:1]
+        solver = BranchPrecacheSolver(
+            "heart", branches, ANSWERS, GUESSES, self.db,
+            anchor_word_count=len(ANSWERS))
+
+        # Force every _maybe_print() check ("now - last_print >= 30") to
+        # see 30+ seconds elapsed on every call.
+        counter = itertools.count()
+        out = io.StringIO()
+        with mock.patch('wordle.time.time', side_effect=lambda: next(counter) * 31), \
+             redirect_stdout(out):
+            solver.run()
+
+        text = out.getvalue()
+        self.assertIn("culled", text)
+        self.assertIn("subgroups visited", text)
+
     def test_skips_already_cached_branch_and_fills_others(self):
         """Simulates the live ERDSolver having already filled one branch's
         ERD entry (e.g. in an earlier game): precache must skip it
@@ -2749,6 +2829,83 @@ class TestBranchPrecacheSolver(unittest.TestCase):
 
         self.assertEqual(call_count[0], 1)
         self.assertEqual(solver.branches_done, 0)
+
+
+# ---------------------------------------------------------------------------
+# _print_precache_progress: status-line summary for BranchPrecacheSolver
+# ---------------------------------------------------------------------------
+
+class TestPrintPrecacheProgress(unittest.TestCase):
+    """branches_skipped is a fixed baseline — branches that were already
+    cached *before this run started*. It does not grow as this run
+    completes new branches, which previously read as "(3 cached)" never
+    changing even after a 4th branch finished. The status line must show
+    a separate, growing "computed this run" count alongside it, plus the
+    culled/visited counters that give visibility during a single
+    candidate's long recursive evaluation."""
+
+    def _solver_stub(self, **overrides):
+        import types
+        s = types.SimpleNamespace(
+            guess_word="salet",
+            branches_done=4,
+            branches_total=124,
+            branches_skipped=3,
+            current_branch_code=0,
+            current_branch_size=315,
+            root_done=3245,
+            root_total=12972,
+            root_best=("grind", 2.905),
+            culled=1200,
+            nodes_visited=50000,
+            cache_hits=138144,
+            cache_misses=2539,
+        )
+        s.is_alive = lambda: True
+        for k, v in overrides.items():
+            setattr(s, k, v)
+        return s
+
+    def _printed(self, solver):
+        import types
+        gs = types.SimpleNamespace(precache_solver=solver)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            _print_precache_progress(gs)
+        return out.getvalue()
+
+    def test_dead_solver_prints_nothing(self):
+        gs_solver = self._solver_stub()
+        gs_solver.is_alive = lambda: False
+        self.assertEqual(self._printed(gs_solver), '')
+
+    def test_distinguishes_baseline_cached_from_computed_this_run(self):
+        line = self._printed(self._solver_stub())
+        self.assertIn("4/124 branches", line)
+        self.assertIn("3 were already cached", line)
+        self.assertIn("1 computed this run", line)
+
+    def test_baseline_count_unchanged_after_finishing_a_branch(self):
+        """Finishing one more branch (branches_done 4 -> 5, branches_skipped
+        unchanged at 3) must increase 'computed this run' (1 -> 2) while
+        the baseline stays put — the change a user expects to see."""
+        before = self._printed(self._solver_stub(branches_done=4, branches_skipped=3))
+        after = self._printed(self._solver_stub(branches_done=5, branches_skipped=3))
+        self.assertIn("3 were already cached, 1 computed this run", before)
+        self.assertIn("3 were already cached, 2 computed this run", after)
+
+    def test_shows_culled_and_visited_counts(self):
+        line = self._printed(self._solver_stub())
+        self.assertIn("1,200 culled", line)
+        self.assertIn("50,000 visited", line)
+
+    def test_no_current_branch_section_when_root_total_zero(self):
+        """root_total == 0 means we're between branches (ranking not
+        finished yet) — no 'current ...' section, and no culled/visited
+        counts that would be stale from the previous branch."""
+        line = self._printed(self._solver_stub(root_total=0))
+        self.assertNotIn("current", line)
+        self.assertNotIn("culled", line)
 
 
 # ---------------------------------------------------------------------------

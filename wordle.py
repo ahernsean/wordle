@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b114"
+BUILD = "b115"
 
 
 # ---------------------------------------------------------------------------
@@ -939,9 +939,11 @@ def _print_precache_progress(gs):
     s = gs.precache_solver
     if s is None or not s.is_alive():
         return
+    computed_this_run = s.branches_done - s.branches_skipped
     print(f'  [Precache {s.guess_word.upper()}: '
           f'{s.branches_done}/{s.branches_total} branches '
-          f'({s.branches_skipped} cached)', end='')
+          f'({s.branches_skipped} were already cached, '
+          f'{computed_this_run} computed this run)', end='')
     if s.current_branch_size is not None and s.root_total > 0:
         pattern = format_response(decode_response(s.current_branch_code))
         # Plain text only here, deliberately: this line can be the last
@@ -954,6 +956,7 @@ def _print_precache_progress(gs):
         if s.root_best is not None:
             bw, bs = s.root_best
             print(f' best {bw.upper()} {bs:.3f}', end='')
+        print(f', {s.culled:,} culled, {s.nodes_visited:,} visited', end='')
         print(f', cache {s.cache_hits:,} hits / {s.cache_misses:,} misses', end='')
     print(']')
 
@@ -2631,6 +2634,8 @@ class BranchPrecacheSolver(threading.Thread):
         self.root_done = 0
         self.root_total = 0
         self.root_best = None
+        self.culled = 0
+        self.nodes_visited = 0
         self.cache_hits = 0
         self.cache_misses = 0
 
@@ -2696,35 +2701,67 @@ class BranchPrecacheSolver(threading.Thread):
                     return
 
                 last_print = [time.time()]
+                progress_calls = [0]
+
+                def _maybe_print():
+                    now = time.time()
+                    if now - last_print[0] < 30:
+                        return
+                    last_print[0] = now
+                    score_cache.checkpoint()
+                    self.cache_hits = score_cache.read_hits
+                    self.cache_misses = score_cache.read_misses
+                    if self.root_best is not None:
+                        bw, be = self.root_best
+                        best_part = f'best so far {bw.upper()} {be:.3f}'
+                    else:
+                        best_part = 'no candidate fully resolved yet'
+                    print(f'\n{_ts()}  [Precache {self._branch_label(code)}: '
+                          f'{self.root_done:,}/{self.root_total:,} {best_part}, '
+                          f'{self.culled:,} culled, '
+                          f'{self.nodes_visited:,} subgroups visited '
+                          f'(cache {self.cache_hits:,} hits / '
+                          f'{self.cache_misses:,} misses)]', flush=True)
 
                 def _progress(done, total, best_word, best_erd):
                     self.root_done = done
                     self.root_total = total
                     self.root_best = (best_word, best_erd)
-                    self.cache_hits = score_cache.read_hits
-                    self.cache_misses = score_cache.read_misses
-                    now = time.time()
-                    if now - last_print[0] >= 30:
-                        last_print[0] = now
-                        score_cache.checkpoint()
-                        print(f'\n{_ts()}  [Precache {self._branch_label(code)}: '
-                              f'{done:,}/{total:,} best so far '
-                              f'{best_word.upper()} {best_erd:.3f} '
-                              f'(cache {self.cache_hits:,} hits / '
-                              f'{self.cache_misses:,} misses)]', flush=True)
+                    progress_calls[0] += 1
+                    # done counts every top-level candidate considered,
+                    # including ones cost_lb-pruned with no recursion at
+                    # all; progress_calls only counts ones that ran to
+                    # completion. The gap between them is candidates culled
+                    # by the admissible lower bound before recursing.
+                    self.culled = done - progress_calls[0]
+                    _maybe_print()
+
+                def _heartbeat():
+                    # Fires on every recursive min_expected_guesses call
+                    # (every subgroup visited, cache hit or miss) — unlike
+                    # _progress, which can go silent for a long time while
+                    # the first top-level candidate (best_erd still
+                    # unbounded, nothing prunable yet) recurses through its
+                    # whole subtree.
+                    self.nodes_visited += 1
+                    _maybe_print()
 
                 while True:
                     self.root_done = 0
-                    self.root_total = 0
+                    self.root_total = len(ranked)
                     self.root_best = None
+                    self.culled = 0
+                    self.nodes_visited = 0
                     self.cache_hits = 0
                     self.cache_misses = 0
+                    progress_calls[0] = 0
                     score_cache.reset_read_counters()
                     result = min_expected_guesses(
                         words, rcache, score_cache,
                         guesses=ranked, policy=ERD_ALL,
                         progress_callback=_progress,
-                        cancel_check=_cancel_or_paused)
+                        cancel_check=_cancel_or_paused,
+                        heartbeat=_heartbeat)
                     if result is not None:
                         break
                     if self._cancel.is_set():
@@ -2735,10 +2772,13 @@ class BranchPrecacheSolver(threading.Thread):
 
                 self.branches_done += 1
                 best_word, _ = score_cache.read(root_key, ERD_ALL)
+                computed_this_run = self.branches_done - self.branches_skipped
                 print(f'\n{_ts()}  [Precache {self._branch_label(code)} done: '
                       f'{result:.3f} {best_word.upper()}  '
-                      f'({self.branches_done}/{self.branches_total} branches, '
-                      f'{self.branches_skipped} pre-cached)]', flush=True)
+                      f'({self.branches_done}/{self.branches_total} branches: '
+                      f'{self.branches_skipped} were already cached, '
+                      f'{computed_this_run} computed this run; '
+                      f'{self.nodes_visited:,} subgroups visited)]', flush=True)
 
             print(f'\n{_ts()}  [Precache complete: {self.branches_done}/'
                   f'{self.branches_total} branches for '

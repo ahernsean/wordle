@@ -875,7 +875,7 @@ class Solution:
 def min_expected_guesses(remaining, cache, score_cache,
                           deadline=None, guesses=None,
                           policy=None, progress_callback=None,
-                          cancel_check=None):
+                          cancel_check=None, heartbeat=None):
     """
     Exact expected guesses to solve remaining words, playing optimally.
 
@@ -911,12 +911,23 @@ def min_expected_guesses(remaining, cache, score_cache,
              attempt's running time regardless of why it's running;
              cancel_check answers "is this attempt's answer even still
              wanted?" and can fire well before any deadline would.
+    heartbeat: optional zero-arg callable invoked once per invocation of
+             min_expected_guesses, at every recursion depth (cache hits
+             included). Like cancel_check (and unlike progress_callback)
+             this IS threaded into every recursive call: a single
+             top-level candidate's full evaluation can recurse through a
+             huge subtree with best_erd still at its initial value (no
+             pruning possible yet), during which progress_callback never
+             fires. heartbeat gives a liveness signal throughout that
+             recursion. Keep it cheap — it may fire millions of times.
 
     Returns None if the deadline is exceeded or cancel_check fires
     mid-computation; partial results already written to score_cache
     are kept and valid either way.
     """
     n = len(remaining)
+    if heartbeat is not None:
+        heartbeat()
     if n == 1:
         return 1.0
 
@@ -997,7 +1008,7 @@ def min_expected_guesses(remaining, cache, score_cache,
                 break
             sub_erd = min_expected_guesses(
                 subgroup, cache, score_cache, deadline, guesses,
-                policy=policy, cancel_check=cancel_check,
+                policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
             )
             if sub_erd is None:
                 aborted = True
