@@ -40,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b109"
+BUILD = "b110"
 
 
 # ---------------------------------------------------------------------------
@@ -950,6 +950,7 @@ def _print_precache_progress(gs):
         if s.root_best is not None:
             bw, bs = s.root_best
             print(f' best {bw.upper()} {bs:.3f}', end='')
+        print(f', cache {s.cache_hits:,} hits / {s.cache_misses:,} misses', end='')
     print(']')
 
 
@@ -2183,7 +2184,7 @@ def cmd_help(gs):
         nguesses = "?"
     lc = gs.score_cache
     la_rows, ws_rows, rd_rows, mtime = lc.stats()
-    cache_ts = (datetime.utcfromtimestamp(mtime).isoformat() + "Z") if mtime else "n/a"
+    cache_ts = (datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S') + " local") if mtime else "n/a"
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
@@ -2618,6 +2619,8 @@ class BranchPrecacheSolver(threading.Thread):
         self.root_done = 0
         self.root_total = 0
         self.root_best = None
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def stop(self):
         self._cancel.set()
@@ -2682,17 +2685,24 @@ class BranchPrecacheSolver(threading.Thread):
                     self.root_done = done
                     self.root_total = total
                     self.root_best = (best_word, best_erd)
+                    self.cache_hits = score_cache.read_hits
+                    self.cache_misses = score_cache.read_misses
                     now = time.time()
                     if now - last_print[0] >= 30:
                         last_print[0] = now
                         print(f'\n  [Precache {self._branch_label(code)}: '
                               f'{done:,}/{total:,} best so far '
-                              f'{best_word.upper()} {best_erd:.3f}]', flush=True)
+                              f'{best_word.upper()} {best_erd:.3f} '
+                              f'(cache {self.cache_hits:,} hits / '
+                              f'{self.cache_misses:,} misses)]', flush=True)
 
                 while True:
                     self.root_done = 0
                     self.root_total = 0
                     self.root_best = None
+                    self.cache_hits = 0
+                    self.cache_misses = 0
+                    score_cache.reset_read_counters()
                     result = min_expected_guesses(
                         words, rcache, score_cache,
                         guesses=ranked, policy=ERD_ALL,
