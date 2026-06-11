@@ -7,7 +7,6 @@ for a streamlined experience.
 """
 
 import os
-import platform
 import sys
 import shutil
 import sqlite3
@@ -41,7 +40,7 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b116"
+BUILD = "b115"
 
 
 # ---------------------------------------------------------------------------
@@ -78,23 +77,6 @@ def reset_color():
         console.set_color()
     elif SUPPORTS_COLOR:
         print(ANSI_RESET, end="")
-
-
-def _platform_name():
-    """Human-readable platform string for the startup banner.
-
-    Pythonista runs on iOS/iPadOS only; platform.machine() there returns
-    the device hardware identifier (e.g. "iPad13,1", "iPhone14,2"), which
-    is enough to tell iPadOS from iOS.
-    """
-    if IS_PYTHONISTA:
-        machine = platform.machine()
-        if machine.startswith("iPad"):
-            return f"iPadOS ({machine})"
-        if machine.startswith("iPhone") or machine.startswith("iPod"):
-            return f"iOS ({machine})"
-        return f"Pythonista ({machine})"
-    return f"{platform.system()} {platform.release()}"
 
 
 _width_cache: list = [None]  # [cols] — refreshed once per REPL cycle
@@ -917,14 +899,6 @@ def _erd_cache_and_policy(gs, soln):
     return cfg.cache(gs, soln), cfg.policy
 
 
-def _position_tag(soln):
-    """Brief 'where are we' indicator for the status block: 'Root' before
-    any guesses have been made, else 'Guess N' for the guess about to be
-    made (N = guesses made so far + 1)."""
-    n = len(soln.guesses)
-    return "Root" if n == 0 else f"Guess {n + 1}"
-
-
 def _erd_root_progress_tag(solver, soln):
     """Status-line fragment for ERD scan progress on the current position.
 
@@ -944,7 +918,7 @@ def _erd_root_progress_tag(solver, soln):
     if solver.root_total < 0:
         return ''  # trivial position (≤2 words); no scan runs
     if solver.root_total == 0:
-        return 'ERD: ordering candidates...'
+        return '  [ERD: ordering candidates...]'
 
     current = solver.current_word_tag()
     in_progress = ''
@@ -955,37 +929,36 @@ def _erd_root_progress_tag(solver, soln):
 
     if solver.root_best is not None:
         bw, bs = solver.root_best
-        return (f'ERD: scanning {solver.root_done:,}/{solver.root_total:,}{in_progress} '
-                f'— best so far {bw.upper()} {bs:.3f}')
-    return f'ERD: scanning {solver.root_done:,}/{solver.root_total:,}{in_progress}'
+        return (f'  [ERD: scanning {solver.root_done:,}/{solver.root_total:,}{in_progress} '
+                f'— best so far {bw.upper()} {bs:.3f}]')
+    return f'  [ERD: scanning {solver.root_done:,}/{solver.root_total:,}{in_progress}]'
 
 
 def _print_precache_progress(gs):
-    """Print the status-line summary for a running BranchPrecacheSolver, if any.
-
-    Deliberately brief: branch/word cache hit-vs-miss, culled-vs-computed
-    counts, and subgroups-visited live in the periodic multi-line report the
-    background thread prints directly (see BranchPrecacheSolver.run) — this
-    line just answers "where are we" at a glance.
-
-    Plain text only, deliberately: this line can be the last thing printed
-    before the device sleeps for hours, and on Pythonista a
-    console.set_color() left active across a long background gap bleeds
-    into the whole console on wake.
-    """
+    """Print the status-line summary for a running BranchPrecacheSolver, if any."""
     s = gs.precache_solver
     if s is None or not s.is_alive():
         return
-    print(f'Precache {s.guess_word.upper()}: '
-          f'{s.branches_done}/{s.branches_total} branches cached', end='')
+    computed_this_run = s.branches_done - s.branches_skipped
+    print(f'  [Precache {s.guess_word.upper()}: '
+          f'{s.branches_done}/{s.branches_total} branches '
+          f'({s.branches_skipped} were already cached, '
+          f'{computed_this_run} computed this run)', end='')
     if s.current_branch_size is not None and s.root_total > 0:
         pattern = format_response(decode_response(s.current_branch_code))
-        print(f' -- current {pattern} ({s.current_branch_size:,} words): '
+        # Plain text only here, deliberately: this line can be the last
+        # thing printed before the device sleeps for hours, and on
+        # Pythonista a console.set_color() left active across a long
+        # background gap bleeds into the whole console on wake.
+        print(f', current {s.guess_word.upper()} {pattern} '
+              f'{s.current_branch_size:,} words '
               f'{s.root_done:,}/{s.root_total:,}', end='')
         if s.root_best is not None:
             bw, bs = s.root_best
-            print(f', best {bw.upper()} {bs:.3f}', end='')
-    print()
+            print(f' best {bw.upper()} {bs:.3f}', end='')
+        print(f', {s.culled:,} culled, {s.nodes_visited:,} visited', end='')
+        print(f', cache {s.cache_hits:,} hits / {s.cache_misses:,} misses', end='')
+    print(']')
 
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
@@ -2039,7 +2012,8 @@ def cmd_precache(gs):
     if gs.precache_solver is not None and gs.precache_solver.is_alive():
         s = gs.precache_solver
         print(f"\nPrecache running for {s.guess_word.upper()}: "
-              f"{s.branches_done}/{s.branches_total} branches cached.")
+              f"{s.branches_done}/{s.branches_total} branches done "
+              f"({s.branches_skipped} pre-cached).")
         print("Stop it? (y/N) ", end='')
         if input().strip().lower() == 'y':
             s.stop()
@@ -2322,7 +2296,6 @@ def print_status(gs, solver=None):
     print(f'\n{"=" * get_display_width()}')
     if gs.single:
         soln = gs.solutions[0]
-        print(_position_tag(soln))
         if soln.answer_word:
             with colored_text("yellow"):
                 print(f"Sim: {soln.answer_word.upper()}")
@@ -2343,12 +2316,12 @@ def print_status(gs, solver=None):
                 if erd_sc is not None:
                     hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
                     if hit is not None:
-                        erd_tag = f'ERD: {hit[1]:.3f} {hit[0].upper()}'
+                        erd_tag = f'  [ERD: {hit[1]:.3f} {hit[0].upper()}]'
                     else:
                         erd_tag = _erd_root_progress_tag(solver, soln)
             print(f"{n:,} words remaining")
             if erd_tag:
-                print(erd_tag)
+                print(erd_tag.strip())
             _print_precache_progress(gs)
     else:
         n = len(gs.solutions)
@@ -2372,7 +2345,6 @@ def print_status(gs, solver=None):
                         print(f'  sim:{soln.answer_word}',
                               end='')
                 print()
-    print(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
 
 # ---------------------------------------------------------------------------
@@ -2687,14 +2659,13 @@ class BranchPrecacheSolver(threading.Thread):
         rcache = ResponseCache(self._all_answers, score_cache)
 
         def _ts():
-            return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            return datetime.now().strftime('%H:%M:%S')
 
         try:
             if self._cancel.is_set():
                 return
-            print(f'\n{_ts()}  Precache {self.guess_word.upper()}: starting '
-                  f'{self.branches_total} branches '
-                  f'({self.branches_skipped} already cached)', flush=True)
+            print(f'\n{_ts()}  [Precache: starting {self.branches_total} branches for '
+                  f'{self.guess_word.upper()}]', flush=True)
             for code, words in self._branches:
                 if self._cancel.is_set():
                     return
@@ -2745,19 +2716,12 @@ class BranchPrecacheSolver(threading.Thread):
                         best_part = f'best so far {bw.upper()} {be:.3f}'
                     else:
                         best_part = 'no candidate fully resolved yet'
-                    branch_misses = self.branches_done - self.branches_skipped
-                    print(f'\n{_ts()}  Precache {self.guess_word.upper()} -- '
-                          f'branch {self.branches_done + 1:,}/{self.branches_total:,} '
-                          f'(cache {self.branches_skipped:,} hit / '
-                          f'{branch_misses:,} miss)', flush=True)
-                    print(f'  {self._branch_label(code)} '
-                          f'({self.current_branch_size:,} words): '
-                          f'word {self.root_done:,}/{self.root_total:,} '
-                          f'(cache {self.cache_hits:,} hit / '
-                          f'{self.cache_misses:,} miss, '
-                          f'{self.nodes_visited:,} subgroups visited)', flush=True)
-                    print(f'  computed {progress_calls[0]:,}, '
-                          f'culled {self.culled:,} -- {best_part}', flush=True)
+                    print(f'\n{_ts()}  [Precache {self._branch_label(code)}: '
+                          f'{self.root_done:,}/{self.root_total:,} {best_part}, '
+                          f'{self.culled:,} culled, '
+                          f'{self.nodes_visited:,} subgroups visited '
+                          f'(cache {self.cache_hits:,} hits / '
+                          f'{self.cache_misses:,} misses)]', flush=True)
 
                 def _progress(done, total, best_word, best_erd):
                     self.root_done = done
@@ -2808,22 +2772,18 @@ class BranchPrecacheSolver(threading.Thread):
 
                 self.branches_done += 1
                 best_word, _ = score_cache.read(root_key, ERD_ALL)
-                branch_misses = self.branches_done - self.branches_skipped
-                print(f'\n{_ts()}  Precache {self.guess_word.upper()} -- '
-                      f'branch {self.branches_done:,}/{self.branches_total:,} done: '
-                      f'{result:.3f} {best_word.upper()} '
-                      f'(cache {self.branches_skipped:,} hit / '
-                      f'{branch_misses:,} miss)', flush=True)
-                print(f'  {self._branch_label(code)} '
-                      f'({self.current_branch_size:,} words): '
-                      f'{progress_calls[0]:,} computed, {self.culled:,} culled, '
-                      f'{self.nodes_visited:,} subgroups visited', flush=True)
+                computed_this_run = self.branches_done - self.branches_skipped
+                print(f'\n{_ts()}  [Precache {self._branch_label(code)} done: '
+                      f'{result:.3f} {best_word.upper()}  '
+                      f'({self.branches_done}/{self.branches_total} branches: '
+                      f'{self.branches_skipped} were already cached, '
+                      f'{computed_this_run} computed this run; '
+                      f'{self.nodes_visited:,} subgroups visited)]', flush=True)
 
-            branch_misses = self.branches_done - self.branches_skipped
-            print(f'\n{_ts()}  Precache {self.guess_word.upper()} complete: '
-                  f'{self.branches_done}/{self.branches_total} branches '
-                  f'(cache {self.branches_skipped} hit / '
-                  f'{branch_misses} miss)', flush=True)
+            print(f'\n{_ts()}  [Precache complete: {self.branches_done}/'
+                  f'{self.branches_total} branches for '
+                  f'{self.guess_word.upper()} '
+                  f'({self.branches_skipped} were already cached)]', flush=True)
         except sqlite3.OperationalError:
             return
         finally:
@@ -2832,8 +2792,6 @@ class BranchPrecacheSolver(threading.Thread):
 
 def main():
     print(f"wordle.py {BUILD}")
-    print(f"Started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  -  "
-          f"{_platform_name()}")
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)
     print(f"Loaded {len(all_answers):,} answers, "
@@ -2903,6 +2861,7 @@ def main():
             _solver = None
             _solver_key = None
 
+        print(f"\n{datetime.now().strftime('%H:%M:%S')}")
         print(f"Command (gsbldtixurawcvp?)? ", end="")
         try:
             cmd = input().strip()

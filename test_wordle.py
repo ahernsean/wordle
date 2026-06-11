@@ -32,7 +32,6 @@ from wordle import (
     _multistep_stats, _erd_solve_scores, ERDSolver,
     _compare_words, set_display_context,
     BranchPrecacheSolver, format_response, _print_precache_progress,
-    _position_tag, _platform_name,
 )
 
 
@@ -2833,66 +2832,17 @@ class TestBranchPrecacheSolver(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _position_tag: "Root" / "Guess N" indicator for the status block
-# ---------------------------------------------------------------------------
-
-class TestPositionTag(unittest.TestCase):
-
-    def test_root_before_any_guesses(self):
-        soln = make_solution()
-        self.assertEqual(_position_tag(soln), "Root")
-
-    def test_guess_two_after_one_guess(self):
-        soln = make_solution()
-        soln.guesses.append(["crane", ["gray"] * 5])
-        self.assertEqual(_position_tag(soln), "Guess 2")
-
-    def test_guess_four_after_three_guesses(self):
-        soln = make_solution()
-        for _ in range(3):
-            soln.guesses.append(["crane", ["gray"] * 5])
-        self.assertEqual(_position_tag(soln), "Guess 4")
-
-
-# ---------------------------------------------------------------------------
-# _platform_name: startup-banner platform string
-# ---------------------------------------------------------------------------
-
-class TestPlatformName(unittest.TestCase):
-
-    def test_linux(self):
-        with mock.patch('wordle.IS_PYTHONISTA', False), \
-             mock.patch('wordle.platform.system', return_value='Linux'), \
-             mock.patch('wordle.platform.release', return_value='6.18.5'):
-            self.assertEqual(_platform_name(), 'Linux 6.18.5')
-
-    def test_ipad_under_pythonista(self):
-        with mock.patch('wordle.IS_PYTHONISTA', True), \
-             mock.patch('wordle.platform.machine', return_value='iPad13,1'):
-            self.assertEqual(_platform_name(), 'iPadOS (iPad13,1)')
-
-    def test_iphone_under_pythonista(self):
-        with mock.patch('wordle.IS_PYTHONISTA', True), \
-             mock.patch('wordle.platform.machine', return_value='iPhone14,2'):
-            self.assertEqual(_platform_name(), 'iOS (iPhone14,2)')
-
-    def test_unrecognized_machine_under_pythonista(self):
-        with mock.patch('wordle.IS_PYTHONISTA', True), \
-             mock.patch('wordle.platform.machine', return_value='i386'):
-            self.assertEqual(_platform_name(), 'Pythonista (i386)')
-
-
-# ---------------------------------------------------------------------------
 # _print_precache_progress: status-line summary for BranchPrecacheSolver
 # ---------------------------------------------------------------------------
 
 class TestPrintPrecacheProgress(unittest.TestCase):
-    """The per-prompt status line is deliberately brief: it just shows
-    branches_done/branches_total ("currently cached"), plus where the
-    current branch's word-level scan stands. branches_skipped, culled,
-    nodes_visited, and cache hit/miss detail live in the periodic
-    multi-line report the background thread prints directly (see
-    BranchPrecacheSolver.run / TestBranchPrecacheSolver), not here."""
+    """branches_skipped is a fixed baseline — branches that were already
+    cached *before this run started*. It does not grow as this run
+    completes new branches, which previously read as "(3 cached)" never
+    changing even after a 4th branch finished. The status line must show
+    a separate, growing "computed this run" count alongside it, plus the
+    culled/visited counters that give visibility during a single
+    candidate's long recursive evaluation."""
 
     def _solver_stub(self, **overrides):
         import types
@@ -2929,27 +2879,33 @@ class TestPrintPrecacheProgress(unittest.TestCase):
         gs_solver.is_alive = lambda: False
         self.assertEqual(self._printed(gs_solver), '')
 
-    def test_shows_branches_cached_count(self):
+    def test_distinguishes_baseline_cached_from_computed_this_run(self):
         line = self._printed(self._solver_stub())
-        self.assertIn("4/124 branches cached", line)
+        self.assertIn("4/124 branches", line)
+        self.assertIn("3 were already cached", line)
+        self.assertIn("1 computed this run", line)
 
-    def test_branches_cached_count_grows_as_branches_finish(self):
-        before = self._printed(self._solver_stub(branches_done=4))
-        after = self._printed(self._solver_stub(branches_done=5))
-        self.assertIn("4/124 branches cached", before)
-        self.assertIn("5/124 branches cached", after)
+    def test_baseline_count_unchanged_after_finishing_a_branch(self):
+        """Finishing one more branch (branches_done 4 -> 5, branches_skipped
+        unchanged at 3) must increase 'computed this run' (1 -> 2) while
+        the baseline stays put — the change a user expects to see."""
+        before = self._printed(self._solver_stub(branches_done=4, branches_skipped=3))
+        after = self._printed(self._solver_stub(branches_done=5, branches_skipped=3))
+        self.assertIn("3 were already cached, 1 computed this run", before)
+        self.assertIn("3 were already cached, 2 computed this run", after)
 
-    def test_shows_current_branch_progress_and_best(self):
+    def test_shows_culled_and_visited_counts(self):
         line = self._printed(self._solver_stub())
-        self.assertIn("315 words", line)
-        self.assertIn("3,245/12,972", line)
-        self.assertIn("GRIND 2.905", line)
+        self.assertIn("1,200 culled", line)
+        self.assertIn("50,000 visited", line)
 
     def test_no_current_branch_section_when_root_total_zero(self):
         """root_total == 0 means we're between branches (ranking not
-        finished yet) — no 'current ...' section."""
+        finished yet) — no 'current ...' section, and no culled/visited
+        counts that would be stale from the previous branch."""
         line = self._printed(self._solver_stub(root_total=0))
         self.assertNotIn("current", line)
+        self.assertNotIn("culled", line)
 
 
 # ---------------------------------------------------------------------------
