@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 import time
 from pathlib import Path
+
+logger = logging.getLogger("wordle")
 
 
 class ScoreCache:
@@ -237,8 +240,8 @@ class ScoreCache:
         """
         try:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as exc:
+            logger.warning("wal_checkpoint(TRUNCATE) failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Subgroup lookahead cache (levels 2+)

@@ -10,6 +10,7 @@ import os
 import sys
 import shutil
 import sqlite3
+import logging
 import platform
 import threading
 import time
@@ -41,7 +42,16 @@ from wordle_engine import (
 ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
-BUILD = "b127"
+LOG_FILE = "wordle_debug.log"
+BUILD = "b128"
+
+# Diagnostic log for background solver threads (ERDSolver,
+# BranchPrecacheSolver) — periodic progress, lifecycle events, and any
+# swallowed sqlite3.OperationalError with a full traceback. main() attaches
+# a FileHandler; the NullHandler keeps logging silent (no stderr noise) when
+# main() hasn't run, e.g. under the test suite.
+logger = logging.getLogger("wordle")
+logger.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------
@@ -2610,6 +2620,9 @@ class ERDSolver(threading.Thread):
             if self._cancel.is_set():
                 return
 
+            logger.info("ERDSolver scan started: %d words, policy=%s",
+                         len(self._words), policy)
+
             # Run the root scan directly.  Uncached subgroups are computed
             # on-the-fly and written to the cache as a side effect (via
             # cache_all_scores), so the cache fills progressively during the
@@ -2650,6 +2663,12 @@ class ERDSolver(threading.Thread):
                     return
                 last_print[0] = now
                 last_word, last_resp = self._last_guess
+                logger.info(
+                    "Targeted scan of %s %s: %d/%d done, %d culled, "
+                    "best=%s, candidate=%s",
+                    last_word.upper(), format_response(last_resp),
+                    self.root_done, self.root_total, self.culled,
+                    self.root_best, self.current_word_tag())
                 print()
                 print_line_with_pattern(
                     f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} '
@@ -2710,14 +2729,24 @@ class ERDSolver(threading.Thread):
                         word_tag = f' {word.upper()}' if word else ''
                         print(f'\n  [ERD ready: {result:.3f}{word_tag}]',
                               flush=True)
+                        logger.info("ERD ready: %.3f%s", result, word_tag)
+                    else:
+                        logger.info("ERDSolver cancelled before result delivered")
                     return
                 if self._cancel.is_set():
+                    logger.info("ERDSolver cancelled mid-scan")
                     return
                 # Paused — wait for the main thread to finish its operation.
                 self._paused.wait()
                 if self._cancel.is_set():
+                    logger.info("ERDSolver cancelled while paused")
                     return
         except sqlite3.OperationalError:
+            logger.exception(
+                "ERDSolver scan aborted (OperationalError): %d words, "
+                "policy=%s, %d/%d done, %d culled, candidate=%s",
+                len(self._words), policy, self.root_done, self.root_total,
+                self.culled, self.current_word_tag())
             return
 
 
@@ -2824,6 +2853,9 @@ class BranchPrecacheSolver(threading.Thread):
             if self._cancel.is_set():
                 return
             print(f'\n{_title()}\n{self._branches_starting_line()}', flush=True)
+            logger.info("BranchPrecacheSolver started: %s, %d branches (%d pre-cached)",
+                         self.guess_word.upper(), self.branches_total,
+                         self.branches_skipped)
             for code, words in self._branches:
                 if self._cancel.is_set():
                     return
@@ -2859,6 +2891,9 @@ class BranchPrecacheSolver(threading.Thread):
                     return
 
                 response_pat = decode_response(code)
+                logger.info("Branch %s (%d words) starting (%d/%d branches)",
+                             format_response(response_pat), len(words),
+                             self.branches_done + 1, self.branches_total)
                 last_print = [time.time()]
                 progress_calls = [0]
 
@@ -2867,6 +2902,12 @@ class BranchPrecacheSolver(threading.Thread):
                     if now - last_print[0] < 30:
                         return
                     last_print[0] = now
+                    logger.info(
+                        "Root-word scan of %s, branch %s (%d words): "
+                        "%d/%d done, %d culled, best=%s, candidate=%s",
+                        self.guess_word.upper(), format_response(response_pat),
+                        self.current_branch_size, self.root_done, self.root_total,
+                        self.culled, self.root_best, self.current_word_tag())
                     print()
                     print(_title())
                     print(self.branches_line())
@@ -2921,6 +2962,9 @@ class BranchPrecacheSolver(threading.Thread):
 
                 self.branches_done += 1
                 best_word, _ = score_cache.read(root_key, ERD_ALL)
+                logger.info("Branch %s done: %.3f %s (%d/%d branches, %d culled)",
+                             format_response(response_pat), result, best_word.upper(),
+                             self.branches_done, self.branches_total, self.culled)
                 print()
                 print(_title())
                 print(self.branches_line())
@@ -2932,15 +2976,43 @@ class BranchPrecacheSolver(threading.Thread):
                       flush=True)
 
             print(f'\n{_title()}\n{self.branches_line(done=True)}', flush=True)
+            logger.info("BranchPrecacheSolver complete: %s, %d/%d branches (%d pre-cached)",
+                         self.guess_word.upper(), self.branches_done,
+                         self.branches_total, self.branches_skipped)
         except sqlite3.OperationalError:
+            logger.exception(
+                "BranchPrecacheSolver aborted (OperationalError): %s, "
+                "branch=%s (%d/%d branches), candidate=%s",
+                self.guess_word.upper(),
+                format_response(decode_response(self.current_branch_code))
+                    if self.current_branch_code is not None else None,
+                self.branches_done, self.branches_total,
+                self.current_word_tag())
             return
         finally:
+            logger.info(
+                "BranchPrecacheSolver exiting: %s, %d/%d branches done "
+                "(%d cached), current branch=%s, candidate=%s",
+                self.guess_word.upper(), self.branches_done, self.branches_total,
+                self.branches_skipped,
+                format_response(decode_response(self.current_branch_code))
+                    if self.current_branch_code is not None else None,
+                self.current_word_tag())
             score_cache.close()
 
 
 def main():
+    log_path = os.path.abspath(LOG_FILE)
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(threadName)-20s %(levelname)-7s %(message)s"))
+    logger.addHandler(file_handler)
+    logger.setLevel(logging.INFO)
+    logger.info("=== %s started (%s) ===", BUILD, _platform_label())
+
     print(f"{BUILD} {_platform_label()}")
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Debug log: {log_path}")
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)
     print(f"Loaded {len(all_answers):,} answers, "
