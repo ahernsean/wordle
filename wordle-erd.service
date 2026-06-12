@@ -1,0 +1,28 @@
+[Unit]
+Description=Wordle ERD_ALL parallel precache supervisor
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ahern/work/wordle
+ExecStart=/usr/bin/python3.13 /home/ahern/work/wordle/erd_search.py run --workers 6
+Restart=on-failure
+RestartSec=10
+
+# Graceful shutdown: SIGTERM -> stop_event -> workers finish current heartbeat
+# tick and exit cleanly.  Workers deep in a large subgroup may take a little
+# longer to notice cancel_check, hence the generous TimeoutStopSec.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# Be a good citizen on an otherwise-idle box.
+Nice=10
+
+# Cgroup memory backstop: independent of the worker-level recycling that
+# controls _mem_cache growth, this hard-caps the whole service if something
+# goes wrong.  Leaves ~1-3 GB headroom for the OS on a 16 GB box.
+MemoryHigh=12G
+MemoryMax=14G
+
+[Install]
+WantedBy=default.target
