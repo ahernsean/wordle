@@ -40,6 +40,13 @@ def main(worker_id: int, cache_path: str, queue_path: str,
     Runs until stop_event is set or recycle_after subgroups complete,
     then exits so the supervisor respawns it fresh.
     """
+    # Reset signal handlers inherited from the supervisor process.  Without
+    # this, p.terminate() (SIGTERM from the supervisor to recycle a worker)
+    # triggers the inherited _sighandler which calls stop_event.set() on the
+    # shared multiprocessing.Event, incorrectly stopping all other workers.
+    import signal as _signal
+    _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+    _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
     _setup_logging(worker_id)
     logger.info('worker-%d starting (pid=%d)', worker_id, os.getpid())
 
