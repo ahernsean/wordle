@@ -91,8 +91,8 @@ def cmd_bootstrap(args):
             groups = rcache.group_words(word, all_answers)
             priority = 1 if word in priority_words else 0
             rows = [
-                (encode_subset(branch), len(branch), priority)
-                for branch in groups.values() if len(branch) >= 2
+                (encode_subset(branch), len(branch), priority, word, code)
+                for code, branch in groups.items() if len(branch) >= 2
             ]
             if rows:
                 queue.add_pending_many(rows)
@@ -257,7 +257,7 @@ def _print_status(args):
         counts = queue.counts_by_status()
         words = queue.words_by_status()
         total = queue.total_subgroups()
-        hbs = queue.heartbeats()
+        hbs = queue.heartbeats_with_source()
         bootstrap_status = queue.get_meta('bootstrap_status')
         queue.close()
         queue_ok = True
@@ -324,15 +324,21 @@ def _print_status(args):
     for hb in hbs:
         age_s = now_ts - hb['updated_at']
         uptime_s = now_ts - (hb['started_at'] or now_ts)
-        subject = ''
-        if hb['current_subset_key']:
+        stale = '  !! STALE !!' if age_s > 120 else ''
+        pri = hb['priority']
+        pri_tag = '[P1]' if pri == 1 else '[P0]' if pri == 0 else '[??]'
+        src = ''
+        if hb['source_word'] and hb['source_pattern'] is not None:
+            from erd_queue import fmt_pattern
+            src = (f'{hb["source_word"].upper()} '
+                   f'{fmt_pattern(hb["source_pattern"])}')
+        elif hb['current_subset_key']:
             from erd_queue import decode_subset
             ws = decode_subset(bytes(hb['current_subset_key']))
-            subject = (f' {ws[0].upper()}..{ws[-1].upper()}'
-                       f' ({hb["n_words"]}w)')
-        stale = '  !! STALE !!' if age_s > 120 else ''
+            src = f'{ws[0].upper()}..{ws[-1].upper()}'
+        n_words = hb['n_words'] or 0
         print(f'  {hb["worker_id"]:<12s}  pid={hb["pid"]:<7d}'
-              f'{subject:<30s}'
+              f'  {pri_tag}  {src:<20s}  ({n_words}w)'
               f'  done={hb["subgroups_done"]:<6d}'
               f'  up={_fmt_duration(uptime_s)}'
               f'  hb={age_s}s ago'

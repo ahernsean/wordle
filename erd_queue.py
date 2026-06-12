@@ -21,18 +21,30 @@ def decode_subset(blob: bytes) -> list[str]:
     return [blob[i:i + 5].decode() for i in range(0, len(blob), 5)]
 
 
+def fmt_pattern(code: int) -> str:
+    """Format a response code as a 5-char string: g=green, y=yellow, -=gray."""
+    chars = {0: '-', 1: 'y', 2: 'g'}
+    digits = []
+    for _ in range(5):
+        digits.append(code % 3)
+        code //= 3
+    return ''.join(chars[d] for d in reversed(digits))
+
+
 _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS pending_subgroups (
-    subset_key   BLOB    NOT NULL,
-    n_words      INTEGER NOT NULL,
-    priority     INTEGER NOT NULL DEFAULT 0,
-    status       TEXT    NOT NULL DEFAULT 'pending',
-    claimed_by   TEXT,
-    claimed_at   INTEGER,
-    completed_at INTEGER,
+    subset_key     BLOB    NOT NULL,
+    n_words        INTEGER NOT NULL,
+    priority       INTEGER NOT NULL DEFAULT 0,
+    source_word    TEXT,
+    source_pattern INTEGER,
+    status         TEXT    NOT NULL DEFAULT 'pending',
+    claimed_by     TEXT,
+    claimed_at     INTEGER,
+    completed_at   INTEGER,
     PRIMARY KEY (subset_key)
 );
 
@@ -66,6 +78,17 @@ class ErdQueue:
                                      isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns introduced after the initial schema, if missing."""
+        existing = {r['name'] for r in
+                    self._conn.execute('PRAGMA table_info(pending_subgroups)')}
+        for col, defn in [('source_word', 'TEXT'),
+                          ('source_pattern', 'INTEGER')]:
+            if col not in existing:
+                self._conn.execute(
+                    f'ALTER TABLE pending_subgroups ADD COLUMN {col} {defn}')
 
     def close(self):
         self._conn.close()
@@ -75,20 +98,27 @@ class ErdQueue:
     # ------------------------------------------------------------------
 
     def add_pending_many(self, rows):
-        """Insert (subset_key, n_words, priority) rows, ignoring duplicates.
+        """Insert (subset_key, n_words, priority, source_word, source_pattern) rows.
 
-        Dedup is via PRIMARY KEY(subset_key) + INSERT OR IGNORE, so the same
-        branch subgroup appearing under multiple root words is enqueued once.
-        An existing row keeps its current priority — if it was already inserted
-        with priority=1 from a VIP word, a later INSERT OR IGNORE with
-        priority=0 leaves it untouched (which is the desired behaviour).
+        Uses an UPSERT so that:
+        - A row inserted for the first time is added as 'pending'.
+        - A row already present has its priority UPGRADED (never downgraded),
+          e.g. a subgroup first inserted at priority=0 by an earlier root word
+          is correctly promoted to priority=1 when a VIP word (SALET) is
+          bootstrapped later.
+        - source_word / source_pattern record the first root word whose branch
+          produced this subgroup (kept for display in `status`).
         """
         self._conn.execute("BEGIN")
         try:
             self._conn.executemany("""
-                INSERT OR IGNORE INTO pending_subgroups
-                    (subset_key, n_words, priority, status)
-                VALUES (?, ?, ?, 'pending')
+                INSERT INTO pending_subgroups
+                    (subset_key, n_words, priority, source_word, source_pattern, status)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+                ON CONFLICT(subset_key) DO UPDATE SET
+                    priority       = MAX(priority, excluded.priority),
+                    source_word    = COALESCE(source_word, excluded.source_word),
+                    source_pattern = COALESCE(source_pattern, excluded.source_pattern)
             """, rows)
             self._conn.execute("COMMIT")
         except Exception:
@@ -196,10 +226,18 @@ class ErdQueue:
             "SELECT COUNT(*) FROM pending_subgroups"
         ).fetchone()[0]
 
-    def heartbeats(self):
-        return self._conn.execute(
-            "SELECT * FROM worker_heartbeat ORDER BY worker_id"
-        ).fetchall()
+    def heartbeats_with_source(self):
+        """Return heartbeat rows joined with source_word/pattern/priority."""
+        return self._conn.execute("""
+            SELECT h.*,
+                   p.priority,
+                   p.source_word,
+                   p.source_pattern
+            FROM worker_heartbeat h
+            LEFT JOIN pending_subgroups p
+                   ON h.current_subset_key = p.subset_key
+            ORDER BY h.worker_id
+        """).fetchall()
 
     # ------------------------------------------------------------------
     # run_meta key-value store
