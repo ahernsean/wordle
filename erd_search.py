@@ -38,7 +38,7 @@ from datetime import datetime
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
 from erd_queue import ErdQueue, encode_subset
-import erd_worker
+import erd_swarm
 
 ANSWER_FILE = 'NYT_wordlist.txt'
 WORDS_FILE = 'wordle.txt'
@@ -136,8 +136,10 @@ def cmd_bootstrap(args):
 def cmd_run(args):
     queue = ErdQueue(args.queue)
     stale = queue.reset_stale_in_progress()
-    if stale:
-        print(f'Reset {stale} stale in_progress rows to pending.')
+    nb, nc = queue.reset_active_branches()
+    if stale or nb or nc:
+        print(f'Recovery: {stale} pending rows reset, '
+              f'{nb} in-progress branches / {nc} chunk claims cleared.')
 
     bootstrap_status = queue.get_meta('bootstrap_status')
     if bootstrap_status != 'done' and not args.allow_partial_queue:
@@ -149,9 +151,9 @@ def cmd_run(args):
     queue.close()
 
     _setup_supervisor_logging()
-    logger.info('Supervisor starting: %d workers, recycle_after=%d, '
-                'recycle_hours=%.1f', args.workers, args.recycle_after,
-                args.recycle_hours)
+    logger.info('Supervisor starting: %d workers, divisor=%d, max_chunks=%d, '
+                'recycle_hours=%.1f', args.workers, args.divisor,
+                args.max_chunks, args.recycle_hours)
 
     stop_event = multiprocessing.Event()
 
@@ -166,7 +168,7 @@ def cmd_run(args):
     procs: dict[int, tuple] = {}
     for i in range(args.workers):
         procs[i] = _spawn_worker(i, args, stop_event)
-    print(f'Started {args.workers} workers  (pid={os.getpid()}).')
+    print(f'Started {args.workers} swarm workers  (pid={os.getpid()}).')
     print(f'Monitor: python3.13 erd_search.py status --watch')
     print(f'Stop:    kill {os.getpid()}  or  Ctrl-C')
 
@@ -185,15 +187,24 @@ def cmd_run(args):
                 p.join(timeout=10)
                 procs[wid] = _spawn_worker(wid, args, stop_event)
 
-        # Check for overall completion.
+        # Free chunks claimed by a worker that died mid-chunk so they get
+        # redone rather than stranding a branch one chunk short of finalizing.
         q = ErdQueue(args.queue)
+        freed = q.reclaim_stale_chunks(args.stale_chunk_seconds)
+        if freed:
+            logger.info('Reclaimed %d stale chunk claim(s).', freed)
         counts = q.counts_by_status()
+        in_flight = len(q.branches_in_progress())
         q.close()
+
+        # Done when the queue holds no pending or in-progress branches and no
+        # branch is still being swarmed.
         if (counts.get('pending', 0) == 0
                 and counts.get('in_progress', 0) == 0
+                and in_flight == 0
                 and counts):
-            logger.info('Queue drained — all subgroups done.')
-            print('\nQueue empty — all subgroups done.')
+            logger.info('Queue drained — all branches done.')
+            print('\nQueue empty — all branches done.')
             stop_event.set()
 
     logger.info('Supervisor stopping all workers...')
@@ -208,10 +219,9 @@ def cmd_run(args):
 
 def _spawn_worker(worker_id: int, args, stop_event):
     p = multiprocessing.Process(
-        target=erd_worker.main,
-        args=(worker_id, args.cache, args.queue,
-              args.recycle_after, args.checkpoint_every,
-              stop_event),
+        target=erd_swarm.swarm_worker,
+        args=(worker_id, args.cache, args.queue, stop_event,
+              args.divisor, args.max_chunks),
         daemon=False,
         name=f'erd-worker-{worker_id}',
     )
@@ -251,26 +261,32 @@ def cmd_status(args):
 
 def _print_status(args):
     now_ts = int(time.time())
+    from erd_queue import fmt_pattern
 
-    # Queue stats
+    # Queue + swarm state
     try:
         queue = ErdQueue(args.queue)
         counts = queue.counts_by_status()
-        words = queue.words_by_status()
-        total = queue.total_subgroups()
-        hbs = queue.heartbeats_with_source()
+        branches = queue.branches_in_progress()
+        hbs = queue.heartbeats_with_branch()
+        worker_counts = queue.worker_counts_by_branch()
         bootstrap_status = queue.get_meta('bootstrap_status')
+        # Per-branch done-chunk counts for the in-progress branches.
+        done_chunks = {bytes(b['subset_key']): queue.branch_done_chunks(b['subset_key'])
+                       for b in branches}
         queue.close()
         queue_ok = True
     except Exception as e:
         print(f'Queue unavailable: {e}')
         queue_ok = False
-        counts = words = {}
-        total = 0
+        counts = {}
+        branches = []
         hbs = []
+        worker_counts = {}
+        done_chunks = {}
         bootstrap_status = None
 
-    # Cache stats
+    # Cache throughput
     try:
         all_answers = load_word_list(ANSWER_FILE)
         sc = ScoreCache(args.cache, all_answers)
@@ -282,75 +298,87 @@ def _print_status(args):
             "SELECT COUNT(*) FROM subgroup_best_by_policy "
             "WHERE policy=? AND universe_id=? AND updated_at>?",
             (ERD_ALL, sc.universe_id, now_ts - 300)).fetchone()[0]
-        uid_short = sc.universe_id[:16]
         sc.close()
         cache_ok = True
     except Exception as e:
         print(f'Cache unavailable: {e}')
         cache_ok = False
         total_erd = recent = 0
-        uid_short = '?'
 
-    print(f'ERD_ALL Precache — '
-          f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    # Aggregate cache-hit and pruning effectiveness across live workers.
+    live = [h for h in hbs if now_ts - h['updated_at'] <= 120]
+    hits = sum(h['cache_hits'] or 0 for h in live)
+    misses = sum(h['cache_misses'] or 0 for h in live)
+    n_ok = sum(h['n_ok'] or 0 for h in live)
+    n_pruned = sum(h['n_pruned'] or 0 for h in live)
+    hit_pct = (100.0 * hits / (hits + misses)) if (hits + misses) else None
+    prune_pct = (100.0 * n_pruned / (n_ok + n_pruned)) if (n_ok + n_pruned) else None
+
+    print(f'ERD_ALL Precache — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     if bootstrap_status != 'done':
         print(f'  !! bootstrap: {bootstrap_status or "not started"} !!')
-    print()
 
     if queue_ok:
-        print('Queue  (erd_queue.sqlite3):')
-        for status in ('pending', 'in_progress', 'done'):
-            n = counts.get(status, 0)
-            w = words.get(status, 0)
-            print(f'  {status:12s}  {n:8,} subgroups   {w:12,} words')
-        print(f'  {"total":12s}  {total:8,} subgroups')
-        print()
-
+        print(f'Queue:  pending {counts.get("pending", 0):,}   '
+              f'done {counts.get("done", 0):,}   '
+              f'branches in progress {len(branches)}')
     if cache_ok:
-        rate = recent / 5.0   # rows per minute
-        print(f'Cache  (wordle_cache.sqlite3, universe {uid_short}...):')
-        print(f'  {total_erd:,} ERD_ALL rows total')
-        print(f'  +{recent:,} in last 5 min  (~{rate:.1f}/min fill-in rate)')
-        print()
+        extra = ''
+        if hit_pct is not None:
+            extra += f'   hits {hit_pct:.0f}%'
+        if prune_pct is not None:
+            extra += f'   pruned {prune_pct:.0f}%'
+        print(f'Cache:  {total_erd:,} rows   +{recent:,}/5m{extra}')
+    print()
 
-    print('Workers:')
+    # Branches in progress — the real progress unit.
+    print('Branches in progress:')
+    if not branches:
+        print('  (none)')
+    for b in branches:
+        key = bytes(b['subset_key'])
+        n_chunks = ErdQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
+        done = done_chunks.get(key, 0)
+        pct = 100.0 * done / n_chunks if n_chunks else 0.0
+        src = (f'{b["source_word"].upper()} {fmt_pattern(b["source_pattern"])}'
+               if b['source_word'] and b['source_pattern'] is not None
+               else '-----')
+        bw = (b['best_word'] or '-----').upper()
+        be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '  ---'
+        nw = b['n_words'] or 0
+        wk = worker_counts.get(key, 0)
+        created = b['created_at'] or now_ts
+        el = now_ts - created
+        eta = ''
+        if 0 < done < n_chunks and el > 0:
+            rem = (n_chunks - done) / (done / el)
+            eta = f'  ~{_fmt_duration(int(rem))}'
+        print(f'  {src:<13s} {nw:4d}w  chunks {done:3d}/{n_chunks:<3d} '
+              f'({pct:3.0f}%)  {bw} {be:>5s}  {wk}w{eta}')
+    print()
+
+    # Workers — liveness only (alive and moving, or stuck/idle).
+    print('Workers (health):')
     if not hbs:
         print('  (none active)')
-    from erd_queue import fmt_pattern, decode_subset
-    for hb in hbs:
-        age_s  = now_ts - hb['updated_at']
-        up_s   = now_ts - (hb['started_at'] or now_ts)
-        stale  = '  !!STALE!!' if age_s > 120 else ''
-
-        pri    = hb['priority']
-        tag    = '[P1]' if pri == 1 else '[P0]' if pri == 0 else '[??]'
-
-        if hb['source_word'] and hb['source_pattern'] is not None:
-            src = f'{hb["source_word"].upper()} {fmt_pattern(hb["source_pattern"])}'
-        elif hb['current_subset_key']:
-            ws  = decode_subset(bytes(hb['current_subset_key']))
-            src = f'{ws[0].upper()}..{ws[-1].upper()}'
-        else:
-            src = '-----'
-
-        n = hb['n_words'] or 0
-
-        cd = hb['candidates_done']
-        ct = hb['candidates_total']
-        if cd is not None and ct:
-            cands = f'{cd:5d}/{ct}'
-        elif ct:
-            cands = f'    0/{ct}'
-        else:
-            cands = '    -/-----'
-
-        bw  = (hb['best_word'] or '-----').upper()
-        be  = f'{hb["best_erd"]:.3f}' if hb['best_erd'] is not None else '  ---'
-
-        print(f'  {hb["worker_id"]:<10s} {tag}  {src:<13s} {n:5d}w'
-              f'  {cands}  {bw} {be:>5s}'
-              f'  d={hb["subgroups_done"]:<4d} {_fmt_duration(up_s):>7s}  hb={age_s}s'
-              f'{stale}')
+    for h in sorted(hbs, key=lambda r: r['worker_id']):
+        age = now_ts - h['updated_at']
+        flag = '  !!STALE' if age > 120 else ''
+        key = h['current_subset_key']
+        if key is None:
+            print(f'  {h["worker_id"]:<10s} idle{"":40s}hb={age}s{flag}')
+            continue
+        src = (f'{h["source_word"].upper()} {fmt_pattern(h["source_pattern"])}'
+               if h['source_word'] and h['source_pattern'] is not None
+               else '-----')
+        chunk = h['chunk_idx'] if h['chunk_idx'] is not None else '-'
+        held = now_ts - (h['chunk_started_at'] or now_ts)
+        rate = h['cand_rate']
+        rate_s = f'{rate/1000:.1f}k c/s' if rate else '  -  '
+        slow = '  !!slow' if (rate is not None and rate < 100 and held > 20) else ''
+        print(f'  {h["worker_id"]:<10s} {src:<13s} chunk {str(chunk):>3s} '
+              f'held {_fmt_duration(held):>5s}  {rate_s:>9s}  '
+              f'done {h["chunks_done"]:<4d} hb={age}s{flag}{slow}')
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -466,21 +494,21 @@ def cmd_export(args):
 
 
 # ---------------------------------------------------------------------------
-# solve-branch (cooperative candidate-level solve of one subgroup)
+# solve-branch (swarm N workers on one branch's candidate guesses)
 # ---------------------------------------------------------------------------
 
 def cmd_solve_branch(args):
-    """Solve one subgroup by swarming N workers across the candidate guesses.
+    """Solve one branch by swarming N workers across its candidate guesses.
 
     For a branch too large for a single worker to finish (e.g. an opener's
     all-gray response), this fans the ~12,972 candidate guesses out across
     workers sharing one running best ERD, instead of grinding them serially.
-    Writes the result (and every sub-subgroup, as a recursion side effect) to
+    Writes the result (and every sub-branch, as a recursion side effect) to
     the persistent cache.
     """
     import threading
     from erd_queue import parse_pattern, fmt_pattern
-    from erd_split import run_split_solve
+    from erd_swarm import run_branch_solve
 
     all_answers = load_word_list(ANSWER_FILE)
     word = args.word.strip().lower()
@@ -508,23 +536,20 @@ def cmd_solve_branch(args):
               f'(pass --force to recompute)')
         return
 
-    n_chunks_box = {}
     stop = threading.Event()
 
     def monitor():
-        """Poll the split row and print live progress until solving finishes."""
+        """Poll the branch row and print live progress until it finishes."""
         started = time.time()
         while not stop.is_set():
             try:
                 q = ErdQueue(args.queue)
-                row = q.get_split(subset_key)
+                row = q.get_branch(subset_key)
                 if row is not None:
-                    n_cand = row['n_candidates']
-                    chunk = row['chunk']
-                    n_chunks = ErdQueue.n_chunks_for(n_cand, chunk)
-                    n_chunks_box['n'] = n_chunks
-                    done = q.split_done_chunks(subset_key)
-                    bw, be = q.read_split_best(subset_key)
+                    n_chunks = ErdQueue.n_chunks_for(
+                        row['n_candidates'], row['chunk_size'])
+                    done = q.branch_done_chunks(subset_key)
+                    bw, be = q.read_branch_best(subset_key)
                     el = int(time.time() - started)
                     pct = 100.0 * done / n_chunks if n_chunks else 0.0
                     best = (f'{bw.upper()} {be:.4f}'
@@ -542,18 +567,18 @@ def cmd_solve_branch(args):
                 pass
             stop.wait(3.0)
 
-    mon = threading.Thread(target=monitor, daemon=True)
-    mon.start()
-    t0 = time.time()
     if args.force:
-        # Recompute: drop any stale split + cached entry so we start clean.
         sc2 = ScoreCache(args.cache, all_answers)
         sc2.delete(subset_key, ERD_ALL)
         sc2.close()
 
-    result = run_split_solve(
-        subset_key, branch, n_workers=args.workers, chunk=args.chunk,
+    mon = threading.Thread(target=monitor, daemon=True)
+    mon.start()
+    t0 = time.time()
+    result = run_branch_solve(
+        subset_key, branch, n_workers=args.workers,
         cache_path=args.cache, queue_path=args.queue,
+        divisor=args.divisor, max_chunks=args.max_chunks,
         priority=args.priority, source_word=word, source_pattern=code)
 
     stop.set()
@@ -608,21 +633,23 @@ def main():
     # -- run --
     p_run = sub.add_parser('run', help='Start the parallel precache supervisor')
     p_run.add_argument('--workers', type=int, default=6, metavar='N',
-                       help='Number of worker processes (default: 6)')
+                       help='Number of swarm worker processes (default: 6)')
     p_run.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_run.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_run.add_argument('--recycle-after', type=int, default=1000,
-                       metavar='N',
-                       help='Respawn worker after N completed subgroups '
-                            '(controls _mem_cache growth, default: 1000)')
+    p_run.add_argument('--divisor', type=int, default=3, metavar='D',
+                       help='Chunk-count divisor: a branch is cut into about '
+                            'n_words/D chunks (default: 3). Lower = finer '
+                            'chunks / more sharing on hard branches.')
+    p_run.add_argument('--max-chunks', type=int, default=256, metavar='N',
+                       help='Cap on chunks per branch (default: 256)')
     p_run.add_argument('--recycle-hours', type=float, default=3.0,
                        metavar='H',
-                       help='Also respawn after H hours wall time '
-                            '(default: 3)')
-    p_run.add_argument('--checkpoint-every', type=int, default=100,
-                       metavar='N',
-                       help='WAL checkpoint every N completed subgroups '
-                            'per worker (default: 100)')
+                       help='Respawn each worker after H hours wall time, to '
+                            'bound ScoreCache memory growth (default: 3)')
+    p_run.add_argument('--stale-chunk-seconds', type=int, default=600,
+                       metavar='S',
+                       help='Reclaim a chunk claimed but not completed within '
+                            'S seconds (crashed worker; default: 600)')
     p_run.add_argument('--allow-partial-queue', action='store_true',
                        help='Start workers even if bootstrap is not complete')
 
@@ -646,12 +673,12 @@ def main():
                            "all-gray, or --pattern=-y-g-)")
     p_sb.add_argument('--workers', type=int, default=6, metavar='N',
                       help='Worker processes to swarm the branch (default: 6)')
-    p_sb.add_argument('--chunk', type=int, default=128, metavar='N',
-                      help='Candidate guesses per claimable chunk '
-                           '(default: 128; smaller = finer load balance, '
-                           'more coordination writes)')
+    p_sb.add_argument('--divisor', type=int, default=3, metavar='D',
+                      help='Chunk-count divisor: ~n_words/D chunks (default: 3)')
+    p_sb.add_argument('--max-chunks', type=int, default=256, metavar='N',
+                      help='Cap on chunks for the branch (default: 256)')
     p_sb.add_argument('--priority', type=int, default=1, metavar='P',
-                      help='Priority recorded on the split (default: 1)')
+                      help='Priority recorded on the branch (default: 1)')
     p_sb.add_argument('--force', action='store_true',
                       help='Recompute even if the branch is already cached')
     p_sb.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
