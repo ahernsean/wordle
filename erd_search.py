@@ -17,6 +17,11 @@ status      Read-only progress snapshot: queue counts, cache throughput,
 reset-stale Reset any 'in_progress' queue rows to 'pending'.  Done
             automatically by 'run' on startup; exposed here for manual
             recovery without restarting workers.
+
+export      Create a trimmed snapshot of the cache containing only the
+            tables needed on iPhone (universe, response_decomposition,
+            subgroup_best_by_policy).  Safe to run while workers are
+            active.  Re-running is incremental (INSERT OR IGNORE).
 """
 
 from __future__ import annotations
@@ -345,6 +350,108 @@ def _fmt_duration(seconds: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# export
+# ---------------------------------------------------------------------------
+
+EXPORT_TABLES = ['universe', 'response_decomposition', 'subgroup_best_by_policy']
+DEFAULT_EXPORT = 'wordle_erd_export.sqlite3'
+
+
+def cmd_export(args):
+    """Create a trimmed export file with only the iPhone-useful tables.
+
+    Safe to run while workers are active: WAL mode allows concurrent reads,
+    so the export sees a consistent snapshot without stopping anything.
+    Re-running is incremental: INSERT OR IGNORE skips rows already present,
+    so you can refresh the export file at any time.
+    """
+    import sqlite3 as _sqlite3
+    import re
+
+    export_path = args.output or DEFAULT_EXPORT
+    cache_path = os.path.abspath(args.cache)
+    export_path = os.path.abspath(export_path)
+
+    print(f'Source : {cache_path}')
+    print(f'Export : {export_path}')
+    print()
+
+    conn = _sqlite3.connect(export_path, timeout=30.0, isolation_level=None)
+    conn.row_factory = _sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    conn.execute(f"ATTACH DATABASE '{cache_path}' AS src")
+
+    try:
+        conn.execute('BEGIN')
+
+        total_new = 0
+        for table in EXPORT_TABLES:
+            # Copy CREATE TABLE statement from source, adding IF NOT EXISTS.
+            schema_row = conn.execute(
+                "SELECT sql FROM src.sqlite_master "
+                "WHERE type='table' AND name=?", (table,)).fetchone()
+            if schema_row is None:
+                print(f'  {table}: not found in source, skipping')
+                continue
+
+            create_sql = re.sub(
+                r'^(CREATE\s+TABLE\s+)',
+                r'\1IF NOT EXISTS ',
+                schema_row[0],
+                count=1, flags=re.IGNORECASE)
+            conn.execute(create_sql)
+
+            # Copy indexes.
+            for idx_row in conn.execute(
+                    "SELECT sql FROM src.sqlite_master "
+                    "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+                    (table,)):
+                idx_sql = re.sub(
+                    r'^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)',
+                    r'\1IF NOT EXISTS ',
+                    idx_row[0],
+                    count=1, flags=re.IGNORECASE)
+                try:
+                    conn.execute(idx_sql)
+                except _sqlite3.OperationalError:
+                    pass  # already exists
+
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info({table})')]
+            col_list = ', '.join(cols)
+            conn.execute(f"""
+                INSERT OR IGNORE INTO main.{table} ({col_list})
+                SELECT {col_list} FROM src.{table}
+            """)
+            n = conn.execute('SELECT changes()').fetchone()[0]
+            total = conn.execute(
+                f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+            print(f'  {table}: +{n:,} new rows  ({total:,} total)')
+            total_new += n
+
+        conn.execute('COMMIT')
+        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
+        size_mb = os.path.getsize(export_path) / 1e6
+        print(f'\nDone.  {export_path}  ({size_mb:.0f} MB)')
+        if total_new == 0:
+            print('(Already up to date.)')
+
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.execute('DETACH DATABASE src')
+        except Exception:
+            pass
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # reset-stale
 # ---------------------------------------------------------------------------
 
@@ -412,6 +519,14 @@ def main():
                             help='Reset in_progress rows to pending')
     p_rst.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
 
+    # -- export --
+    p_exp = sub.add_parser('export',
+                            help='Create a trimmed iPhone-ready cache snapshot')
+    p_exp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH',
+                       help=f'Source cache (default: {DEFAULT_CACHE})')
+    p_exp.add_argument('--output', default=DEFAULT_EXPORT, metavar='PATH',
+                       help=f'Output file (default: {DEFAULT_EXPORT})')
+
     args = parser.parse_args()
 
     dispatch = {
@@ -419,6 +534,7 @@ def main():
         'run': cmd_run,
         'status': cmd_status,
         'reset-stale': cmd_reset_stale,
+        'export': cmd_export,
     }
     dispatch[args.cmd](args)
 

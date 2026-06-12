@@ -56,10 +56,17 @@ def main():
     try:
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute(f"ATTACH DATABASE '{args.source}' AS src")
+
+        src_tables = {r[0] for r in conn.execute(
+            "SELECT name FROM src.sqlite_master WHERE type='table'")}
+
         conn.execute('BEGIN')
 
         total_new = 0
         for table in TABLES:
+            if table not in src_tables:
+                print(f'  {table}: not in source, skipping')
+                continue
             cols = _all_cols(conn, table)
             col_list = ', '.join(cols)
 
