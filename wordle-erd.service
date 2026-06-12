@@ -9,17 +9,17 @@ ExecStart=/usr/bin/python3.13 /home/ahern/work/wordle/erd_search.py run --worker
 Restart=on-failure
 RestartSec=10
 
-# Graceful shutdown: SIGTERM -> stop_event -> workers finish current heartbeat
-# tick and exit cleanly.  Workers deep in a large subgroup may take a little
-# longer to notice cancel_check, hence the generous TimeoutStopSec.
+# Graceful shutdown: SIGTERM -> stop_event -> workers stop claiming chunks and
+# exit.  A worker deep in one candidate's recursion may take a little longer to
+# notice cancel_check, hence the generous TimeoutStopSec.
 KillSignal=SIGTERM
 TimeoutStopSec=120
 
 # Be a good citizen on an otherwise-idle box.
 Nice=10
 
-# Cgroup memory backstop: independent of the worker-level recycling that
-# controls _mem_cache growth, this hard-caps the whole service if something
+# Cgroup memory backstop: independent of the hourly worker recycling that bounds
+# per-worker ScoreCache memory, this hard-caps the whole service if something
 # goes wrong.  Leaves ~1-3 GB headroom for the OS on a 16 GB box.
 MemoryHigh=12G
 MemoryMax=14G

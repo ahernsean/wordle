@@ -323,14 +323,6 @@ class ErdQueue:
             "SELECT status, COUNT(*) c FROM pending_subgroups GROUP BY status"
         )}
 
-    def words_by_status(self) -> dict:
-        """Total answer-words covered by subgroups in each status bucket."""
-        rows = self._conn.execute("""
-            SELECT status, SUM(n_words) total
-            FROM pending_subgroups GROUP BY status
-        """).fetchall()
-        return {r["status"]: (r["total"] or 0) for r in rows}
-
     def total_subgroups(self) -> int:
         return self._conn.execute(
             "SELECT COUNT(*) FROM pending_subgroups"
