@@ -376,9 +376,10 @@ def _print_status(args):
         rate = h['cand_rate']
         rate_s = f'{rate/1000:.1f}k c/s' if rate else '  -  '
         slow = '  !!slow' if (rate is not None and rate < 100 and held > 20) else ''
+        done = h['chunks_done'] or 0
         print(f'  {h["worker_id"]:<10s} {src:<13s} chunk {str(chunk):>3s} '
               f'held {_fmt_duration(held):>5s}  {rate_s:>9s}  '
-              f'done {h["chunks_done"]:<4d} hb={age}s{flag}{slow}')
+              f'done {done:<4d} hb={age}s{flag}{slow}')
 
 
 def _fmt_duration(seconds: int) -> str:
