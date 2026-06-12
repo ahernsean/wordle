@@ -3018,10 +3018,19 @@ def main():
     print(f"Loaded {len(all_answers):,} answers, "
           f"{len(all_words):,} guesses.")
 
+    # Opening a large cache runs schema-migration probes that can scan the
+    # multi-million-row tables, and stats() below COUNTs them — each takes a
+    # few seconds on a full cache.  Announce both so a slow open doesn't look
+    # like a hang.
+    print("Opening cache (schema check)...", flush=True)
+    _t0 = time.time()
     gs = GameState(all_answers, all_words)
+    print(f"  opened in {time.time() - _t0:.1f}s")
 
+    print("Counting cache rows...", flush=True)
+    _t0 = time.time()
     sp_rows, ws_rows, rd_rows, mtime = gs.score_cache.stats()
-    print(f"Cache: {sp_rows:,} subgroup picks")
+    print(f"Cache: {sp_rows:,} subgroup picks  ({time.time() - _t0:.1f}s)")
     print(f"  {ws_rows:,} word scores, {rd_rows:,} decomps")
     print(f"  last write {_format_cache_timestamp(mtime)}")
 
