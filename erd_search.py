@@ -321,27 +321,40 @@ def _print_status(args):
     print('Workers:')
     if not hbs:
         print('  (none active)')
+    from erd_queue import fmt_pattern, decode_subset
     for hb in hbs:
-        age_s = now_ts - hb['updated_at']
-        uptime_s = now_ts - (hb['started_at'] or now_ts)
-        stale = '  !! STALE !!' if age_s > 120 else ''
-        pri = hb['priority']
-        pri_tag = '[P1]' if pri == 1 else '[P0]' if pri == 0 else '[??]'
-        src = ''
+        age_s  = now_ts - hb['updated_at']
+        up_s   = now_ts - (hb['started_at'] or now_ts)
+        stale  = '  !!STALE!!' if age_s > 120 else ''
+
+        pri    = hb['priority']
+        tag    = '[P1]' if pri == 1 else '[P0]' if pri == 0 else '[??]'
+
         if hb['source_word'] and hb['source_pattern'] is not None:
-            from erd_queue import fmt_pattern
-            src = (f'{hb["source_word"].upper()} '
-                   f'{fmt_pattern(hb["source_pattern"])}')
+            src = f'{hb["source_word"].upper()} {fmt_pattern(hb["source_pattern"])}'
         elif hb['current_subset_key']:
-            from erd_queue import decode_subset
-            ws = decode_subset(bytes(hb['current_subset_key']))
+            ws  = decode_subset(bytes(hb['current_subset_key']))
             src = f'{ws[0].upper()}..{ws[-1].upper()}'
-        n_words = hb['n_words'] or 0
-        print(f'  {hb["worker_id"]:<12s}  pid={hb["pid"]:<7d}'
-              f'  {pri_tag}  {src:<20s}  ({n_words}w)'
-              f'  done={hb["subgroups_done"]:<6d}'
-              f'  up={_fmt_duration(uptime_s)}'
-              f'  hb={age_s}s ago'
+        else:
+            src = '-----'
+
+        n = hb['n_words'] or 0
+
+        cd = hb['candidates_done']
+        ct = hb['candidates_total']
+        if cd is not None and ct:
+            cands = f'{cd:5d}/{ct}'
+        elif ct:
+            cands = f'    0/{ct}'
+        else:
+            cands = '    -/-----'
+
+        bw  = (hb['best_word'] or '-----').upper()
+        be  = f'{hb["best_erd"]:.3f}' if hb['best_erd'] is not None else '  ---'
+
+        print(f'  {hb["worker_id"]:<10s} {tag}  {src:<13s} {n:5d}w'
+              f'  {cands}  {bw} {be:>5s}'
+              f'  d={hb["subgroups_done"]:<4d} {_fmt_duration(up_s):>7s}  hb={age_s}s'
               f'{stale}')
 
 

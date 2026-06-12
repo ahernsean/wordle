@@ -60,7 +60,11 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     n_words            INTEGER,
     started_at         INTEGER,
     updated_at         INTEGER NOT NULL,
-    subgroups_done     INTEGER NOT NULL DEFAULT 0
+    subgroups_done     INTEGER NOT NULL DEFAULT 0,
+    candidates_done    INTEGER,
+    candidates_total   INTEGER,
+    best_word          TEXT,
+    best_erd           REAL
 );
 
 CREATE TABLE IF NOT EXISTS run_meta (
@@ -89,6 +93,16 @@ class ErdQueue:
             if col not in existing:
                 self._conn.execute(
                     f'ALTER TABLE pending_subgroups ADD COLUMN {col} {defn}')
+
+        existing_hb = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
+        for col, defn in [('candidates_done',  'INTEGER'),
+                          ('candidates_total', 'INTEGER'),
+                          ('best_word',        'TEXT'),
+                          ('best_erd',         'REAL')]:
+            if col not in existing_hb:
+                self._conn.execute(
+                    f'ALTER TABLE worker_heartbeat ADD COLUMN {col} {defn}')
 
     def close(self):
         self._conn.close()
@@ -190,15 +204,19 @@ class ErdQueue:
 
     def heartbeat(self, worker_id: str, pid: int,
                   current_subset_key, n_words,
-                  started_at: int, subgroups_done: int):
+                  started_at: int, subgroups_done: int,
+                  candidates_done=None, candidates_total=None,
+                  best_word=None, best_erd=None):
         now = int(time.time())
         self._conn.execute("""
             INSERT OR REPLACE INTO worker_heartbeat
                 (worker_id, pid, current_subset_key, n_words,
-                 started_at, updated_at, subgroups_done)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 started_at, updated_at, subgroups_done,
+                 candidates_done, candidates_total, best_word, best_erd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_subset_key, n_words,
-              started_at, now, subgroups_done))
+              started_at, now, subgroups_done,
+              candidates_done, candidates_total, best_word, best_erd))
 
     def clear_heartbeat(self, worker_id: str):
         self._conn.execute(

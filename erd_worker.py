@@ -64,14 +64,21 @@ def main(worker_id: int, cache_path: str, queue_path: str,
     def cancel_check() -> bool:
         return stop_event.is_set()
 
-    def _write_heartbeat(current_key=None, n=None):
+    # Candidate progress — updated by progress_callback, read by heartbeat.
+    cand_state = {'done': None, 'total': None, 'word': None, 'erd': None}
+
+    def _write_heartbeat(current_key=None, n=None, force=False):
         nonlocal last_hb_time
         now = time.time()
-        if now - last_hb_time < 2.0:
+        if not force and now - last_hb_time < 2.0:
             return
         last_hb_time = now
         queue.heartbeat(worker_name, os.getpid(), current_key, n,
-                        started_at, done_count)
+                        started_at, done_count,
+                        candidates_done=cand_state['done'],
+                        candidates_total=cand_state['total'],
+                        best_word=cand_state['word'],
+                        best_erd=cand_state['erd'])
 
     try:
         while not stop_event.is_set() and done_count < recycle_after:
@@ -94,6 +101,10 @@ def main(worker_id: int, cache_path: str, queue_path: str,
                 continue
 
             words = decode_subset(subset_key)
+            cand_state['done'] = 0
+            cand_state['total'] = None
+            cand_state['word'] = None
+            cand_state['erd'] = None
 
             # Pre-rank candidates so the best guesses come first — identical
             # to BranchPrecacheSolver's approach.  Passing the ranked list to
@@ -107,6 +118,15 @@ def main(worker_id: int, cache_path: str, queue_path: str,
                 # it on next run.
                 break
 
+            cand_state['total'] = len(ranked)
+
+            def progress_callback(done, total, best_word, best_erd):
+                cand_state['done'] = done
+                cand_state['total'] = total
+                cand_state['word'] = best_word
+                cand_state['erd'] = best_erd
+                _write_heartbeat(subset_key, n_words, force=True)
+
             def heartbeat():
                 _write_heartbeat(subset_key, n_words)
 
@@ -116,6 +136,7 @@ def main(worker_id: int, cache_path: str, queue_path: str,
                 policy=ERD_ALL,
                 cancel_check=cancel_check,
                 heartbeat=heartbeat,
+                progress_callback=progress_callback,
             )
 
             if result is None:
