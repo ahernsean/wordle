@@ -44,8 +44,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('source',
-                        help='Source cache file (e.g. from iPhone)')
+    parser.add_argument('source', nargs='?', default='wordle_erd_export.sqlite3',
+                        help='Source cache file (default: wordle_erd_export.sqlite3)')
     parser.add_argument('--target', default=DEFAULT_TARGET, metavar='PATH',
                         help=f'Target cache file (default: {DEFAULT_TARGET})')
     parser.add_argument('--dry-run', action='store_true',
