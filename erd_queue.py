@@ -31,6 +31,25 @@ def fmt_pattern(code: int) -> str:
     return ''.join(chars[d] for d in reversed(digits))
 
 
+def parse_pattern(s: str) -> int:
+    """Inverse of fmt_pattern: a 5-char response string to its int code.
+
+    Accepts g/green, y/yellow, and -/./gray (any of '-' '.' 'x' for gray).
+    Matches _encode_response: leftmost char is the most significant trit.
+    """
+    vals = {'g': 2, 'green': 2, 'y': 1, 'yellow': 1,
+            '-': 0, '.': 0, 'x': 0, 'gray': 0, 'grey': 0}
+    s = s.strip().lower()
+    if len(s) != 5:
+        raise ValueError(f'pattern must be 5 characters, got {s!r}')
+    code = 0
+    for ch in s:
+        if ch not in vals:
+            raise ValueError(f'bad pattern char {ch!r} in {s!r}')
+        code = code * 3 + vals[ch]
+    return code
+
+
 _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -70,6 +89,45 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
 CREATE TABLE IF NOT EXISTS run_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- A single subgroup currently being solved cooperatively by many workers,
+-- each evaluating a disjoint slice of the candidate guesses (the "split").
+-- best_erd is the running minimum cost across all candidates: it only ever
+-- decreases, and is a real achieved value, so any worker may read it as a
+-- branch-and-bound bound.  status open -> finalized exactly once, by the
+-- worker that observes full chunk coverage; that worker writes the top-level
+-- ERD entry to the persistent cache.
+CREATE TABLE IF NOT EXISTS split_subgroups (
+    subset_key     BLOB    PRIMARY KEY,
+    n_words        INTEGER NOT NULL,
+    n_candidates   INTEGER NOT NULL,
+    chunk          INTEGER NOT NULL,
+    ranked_blob    BLOB    NOT NULL,
+    priority       INTEGER NOT NULL DEFAULT 0,
+    source_word    TEXT,
+    source_pattern INTEGER,
+    best_erd       REAL,
+    best_word      TEXT,
+    status         TEXT    NOT NULL DEFAULT 'open',
+    created_at     INTEGER,
+    finalized_at   INTEGER
+);
+
+-- One row per claimed candidate chunk of a split.  A row's existence is an
+-- ADVISORY claim ("someone is probably evaluating this slice"); only done=1
+-- is AUTHORITATIVE ("this slice is fully evaluated and folded into best_erd").
+-- Coverage = all n_chunks rows with done=1.  A crashed worker leaves a
+-- done=0 row that stale-reclaim deletes, turning the slice back into an
+-- unclaimed gap to be redone — never skipped.
+CREATE TABLE IF NOT EXISTS split_chunks (
+    subset_key BLOB    NOT NULL,
+    idx        INTEGER NOT NULL,
+    claimed_by TEXT,
+    claimed_at INTEGER,
+    done       INTEGER NOT NULL DEFAULT 0,
+    done_at    INTEGER,
+    PRIMARY KEY (subset_key, idx)
 );
 """
 
@@ -255,6 +313,148 @@ class ErdQueue:
             LEFT JOIN pending_subgroups p
                    ON h.current_subset_key = p.subset_key
             ORDER BY h.worker_id
+        """).fetchall()
+
+    # ------------------------------------------------------------------
+    # Split (candidate-level cooperative solve of one subgroup)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def n_chunks_for(n_candidates: int, chunk: int) -> int:
+        return (n_candidates + chunk - 1) // chunk
+
+    @staticmethod
+    def chunk_range(idx: int, chunk: int, n_candidates: int):
+        lo = idx * chunk
+        hi = min(lo + chunk, n_candidates)
+        return lo, hi
+
+    def create_split(self, subset_key, n_words, n_candidates, chunk,
+                     ranked_blob, priority=0, source_word=None,
+                     source_pattern=None) -> bool:
+        """Register a subgroup as an open split, if not already present.
+
+        Idempotent: the first worker to reach a subgroup creates the split
+        (storing the one-time-ranked candidate order as ranked_blob); later
+        workers see it already exists and just join.  Returns True if this
+        call created the row, False if it already existed.
+        """
+        now = int(time.time())
+        cur = self._conn.execute("""
+            INSERT OR IGNORE INTO split_subgroups
+                (subset_key, n_words, n_candidates, chunk, ranked_blob,
+                 priority, source_word, source_pattern, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (subset_key, n_words, n_candidates, chunk, ranked_blob,
+              priority, source_word, source_pattern, now))
+        return cur.rowcount == 1
+
+    def get_split(self, subset_key):
+        return self._conn.execute(
+            "SELECT * FROM split_subgroups WHERE subset_key = ?",
+            (subset_key,)).fetchone()
+
+    def claim_split_chunk(self, subset_key, worker_id, n_chunks):
+        """Atomically claim the lowest-indexed chunk that has no row yet.
+
+        A chunk with an existing row is either in-flight (done=0, another
+        worker) or complete (done=1); either way we don't re-hand it out here.
+        Stale done=0 rows are freed separately by reclaim_stale_chunks, which
+        deletes them so they reappear as gaps.  Returns the chunk idx, or None
+        if every chunk already has a row (the split is fully claimed — the
+        worker should look elsewhere, NOT block).
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            taken = {r["idx"] for r in self._conn.execute(
+                "SELECT idx FROM split_chunks WHERE subset_key = ?",
+                (subset_key,))}
+            idx = None
+            for c in range(n_chunks):
+                if c not in taken:
+                    idx = c
+                    break
+            if idx is None:
+                self._conn.execute("COMMIT")
+                return None
+            now = int(time.time())
+            self._conn.execute("""
+                INSERT INTO split_chunks
+                    (subset_key, idx, claimed_by, claimed_at, done)
+                VALUES (?, ?, ?, ?, 0)
+            """, (subset_key, idx, worker_id, now))
+            self._conn.execute("COMMIT")
+            return idx
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def complete_split_chunk(self, subset_key, idx):
+        """Mark a chunk authoritatively complete (done=1)."""
+        now = int(time.time())
+        self._conn.execute("""
+            UPDATE split_chunks SET done = 1, done_at = ?
+            WHERE subset_key = ? AND idx = ?
+        """, (now, subset_key, idx))
+
+    def update_split_best(self, subset_key, best_word, best_erd):
+        """Lower the split's running best (monotone — never raises it)."""
+        self._conn.execute("""
+            UPDATE split_subgroups
+            SET best_erd = ?, best_word = ?
+            WHERE subset_key = ?
+              AND (best_erd IS NULL OR ? < best_erd)
+        """, (best_erd, best_word, subset_key, best_erd))
+
+    def read_split_best(self, subset_key):
+        """Return (best_word, best_erd) or (None, None)."""
+        row = self._conn.execute(
+            "SELECT best_word, best_erd FROM split_subgroups WHERE subset_key = ?",
+            (subset_key,)).fetchone()
+        if row is None:
+            return (None, None)
+        return (row["best_word"], row["best_erd"])
+
+    def split_done_chunks(self, subset_key) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM split_chunks WHERE subset_key = ? AND done = 1",
+            (subset_key,)).fetchone()[0]
+
+    def try_finalize_split(self, subset_key) -> bool:
+        """Atomically transition open -> finalized, exactly once.
+
+        Returns True only for the single caller that wins the transition; that
+        caller is then responsible for writing the top-level ERD entry to the
+        persistent cache.  Returns False if another worker already finalized
+        (or the split is gone).  Caller must have confirmed full coverage
+        first; the WHERE status='open' guard makes the write idempotent.
+        """
+        now = int(time.time())
+        cur = self._conn.execute("""
+            UPDATE split_subgroups SET status = 'finalized', finalized_at = ?
+            WHERE subset_key = ? AND status = 'open'
+        """, (now, subset_key))
+        return cur.rowcount == 1
+
+    def reclaim_stale_chunks(self, max_age_seconds: int) -> int:
+        """Delete in-flight (done=0) chunk claims older than max_age_seconds.
+
+        A deleted claim turns its slice back into an unclaimed gap, so the work
+        is redone rather than silently skipped.  done=1 rows are never touched.
+        Returns the number of claims freed.
+        """
+        cutoff = int(time.time()) - max_age_seconds
+        self._conn.execute("""
+            DELETE FROM split_chunks
+            WHERE done = 0 AND claimed_at < ?
+        """, (cutoff,))
+        return self._conn.execute("SELECT changes()").fetchone()[0]
+
+    def open_splits(self):
+        """Open splits, highest priority first — for swarm scheduling."""
+        return self._conn.execute("""
+            SELECT * FROM split_subgroups WHERE status = 'open'
+            ORDER BY priority DESC, n_words DESC
         """).fetchall()
 
     # ------------------------------------------------------------------

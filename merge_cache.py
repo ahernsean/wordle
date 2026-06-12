@@ -50,6 +50,8 @@ def main():
                         help=f'Target cache file (default: {DEFAULT_TARGET})')
     parser.add_argument('--dry-run', action='store_true',
                         help='Report counts without writing anything')
+    parser.add_argument('--delete-source', action='store_true',
+                        help='Delete source file after successful merge')
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.target, timeout=30.0, isolation_level=None)
@@ -103,6 +105,13 @@ def main():
             conn.execute('COMMIT')
             conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             print(f'\nTotal: {total_new:,} rows inserted')
+            if args.delete_source:
+                import os
+                for suffix in ('', '-shm', '-wal'):
+                    p = args.source + suffix
+                    if os.path.exists(p):
+                        os.remove(p)
+                print(f'Deleted {args.source}')
 
     except Exception as e:
         try:

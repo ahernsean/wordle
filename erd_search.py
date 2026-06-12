@@ -92,7 +92,8 @@ def cmd_bootstrap(args):
             priority = 1 if word in priority_words else 0
             rows = [
                 (encode_subset(branch), len(branch), priority, word, code)
-                for code, branch in groups.items() if len(branch) >= 2
+                for code, branch in groups.items()
+                if 2 <= len(branch) <= args.max_size
             ]
             if rows:
                 queue.add_pending_many(rows)
@@ -309,13 +310,7 @@ def _print_status(args):
         rate = recent / 5.0   # rows per minute
         print(f'Cache  (wordle_cache.sqlite3, universe {uid_short}...):')
         print(f'  {total_erd:,} ERD_ALL rows total')
-        print(f'  +{recent:,} in last 5 min  (~{rate:.1f}/min)')
-        if rate > 0 and queue_ok:
-            remaining = (counts.get('pending', 0) +
-                         counts.get('in_progress', 0))
-            eta_min = remaining / rate
-            print(f'  ETA (rough, ignores side-effect fill-in): '
-                  f'~{_fmt_duration(int(eta_min * 60))}')
+        print(f'  +{recent:,} in last 5 min  (~{rate:.1f}/min fill-in rate)')
         print()
 
     print('Workers:')
@@ -471,6 +466,108 @@ def cmd_export(args):
 
 
 # ---------------------------------------------------------------------------
+# solve-branch (cooperative candidate-level solve of one subgroup)
+# ---------------------------------------------------------------------------
+
+def cmd_solve_branch(args):
+    """Solve one subgroup by swarming N workers across the candidate guesses.
+
+    For a branch too large for a single worker to finish (e.g. an opener's
+    all-gray response), this fans the ~12,972 candidate guesses out across
+    workers sharing one running best ERD, instead of grinding them serially.
+    Writes the result (and every sub-subgroup, as a recursion side effect) to
+    the persistent cache.
+    """
+    import threading
+    from erd_queue import parse_pattern, fmt_pattern
+    from erd_split import run_split_solve
+
+    all_answers = load_word_list(ANSWER_FILE)
+    word = args.word.strip().lower()
+    code = parse_pattern(args.pattern)
+
+    sc = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    groups = rcache.group_words(word, all_answers)
+    branch = groups.get(code, [])
+    pat = fmt_pattern(code)
+
+    if len(branch) < 2:
+        print(f'{word.upper()} {pat}: branch has {len(branch)} word(s) — '
+              f'nothing to solve (singletons resolve on the next guess).')
+        sc.close()
+        return
+
+    subset_key = encode_subset(branch)
+    existing = sc.read(subset_key, ERD_ALL)
+    sc.close()
+
+    print(f'{word.upper()} {pat}  —  {len(branch)} words')
+    if existing is not None and not args.force:
+        print(f'Already cached: {existing[0].upper()} ERD={existing[1]:.4f}  '
+              f'(pass --force to recompute)')
+        return
+
+    n_chunks_box = {}
+    stop = threading.Event()
+
+    def monitor():
+        """Poll the split row and print live progress until solving finishes."""
+        started = time.time()
+        while not stop.is_set():
+            try:
+                q = ErdQueue(args.queue)
+                row = q.get_split(subset_key)
+                if row is not None:
+                    n_cand = row['n_candidates']
+                    chunk = row['chunk']
+                    n_chunks = ErdQueue.n_chunks_for(n_cand, chunk)
+                    n_chunks_box['n'] = n_chunks
+                    done = q.split_done_chunks(subset_key)
+                    bw, be = q.read_split_best(subset_key)
+                    el = int(time.time() - started)
+                    pct = 100.0 * done / n_chunks if n_chunks else 0.0
+                    best = (f'{bw.upper()} {be:.4f}'
+                            if bw is not None else 'searching...')
+                    eta = ''
+                    if done > 0 and done < n_chunks:
+                        rate = done / max(1, el)            # chunks/sec
+                        rem = (n_chunks - done) / rate if rate else 0
+                        eta = f'  ETA {_fmt_duration(int(rem))}'
+                    print(f'\r  chunks {done:4d}/{n_chunks:<4d} ({pct:4.0f}%)  '
+                          f'best={best:<18s}  {_fmt_duration(el)}{eta}   ',
+                          end='', flush=True)
+                q.close()
+            except Exception:
+                pass
+            stop.wait(3.0)
+
+    mon = threading.Thread(target=monitor, daemon=True)
+    mon.start()
+    t0 = time.time()
+    if args.force:
+        # Recompute: drop any stale split + cached entry so we start clean.
+        sc2 = ScoreCache(args.cache, all_answers)
+        sc2.delete(subset_key, ERD_ALL)
+        sc2.close()
+
+    result = run_split_solve(
+        subset_key, branch, n_workers=args.workers, chunk=args.chunk,
+        cache_path=args.cache, queue_path=args.queue,
+        priority=args.priority, source_word=word, source_pattern=code)
+
+    stop.set()
+    mon.join(timeout=4)
+    print()
+    elapsed = _fmt_duration(int(time.time() - t0))
+    if result is not None:
+        print(f'Done in {elapsed}:  {word.upper()} {pat}  ->  '
+              f'{result[0].upper()}  ERD={result[1]:.4f}')
+    else:
+        print(f'No result after {elapsed} — check workers / rerun to resume.')
+
+
+# ---------------------------------------------------------------------------
 # reset-stale
 # ---------------------------------------------------------------------------
 
@@ -503,6 +600,10 @@ def main():
     p_boot.add_argument('--priority-words', nargs='+', metavar='WORD',
                         help='Root words whose branches are worked first '
                              '(e.g. --priority-words salet crane)')
+    p_boot.add_argument('--max-size', type=int, default=300, metavar='N',
+                        help='Skip branches with more than N answer words '
+                             '(default: 300; excludes computationally '
+                             'infeasible large subgroups from poor root words)')
 
     # -- run --
     p_run = sub.add_parser('run', help='Start the parallel precache supervisor')
@@ -533,6 +634,29 @@ def main():
                         metavar='SECONDS',
                         help='Repeat every SECONDS (default 30)')
 
+    # -- solve-branch --
+    p_sb = sub.add_parser('solve-branch',
+                          help='Swarm N workers to solve one large branch')
+    p_sb.add_argument('--word', required=True, metavar='WORD',
+                      help='Opening guess word (e.g. salet)')
+    p_sb.add_argument('--pattern', required=True, metavar='PAT',
+                      help="Response pattern, 5 chars: g=green y=yellow, gray "
+                           "as . or - (use dots to avoid the shell/argparse "
+                           "leading-dash trap, e.g. --pattern ..... for "
+                           "all-gray, or --pattern=-y-g-)")
+    p_sb.add_argument('--workers', type=int, default=6, metavar='N',
+                      help='Worker processes to swarm the branch (default: 6)')
+    p_sb.add_argument('--chunk', type=int, default=128, metavar='N',
+                      help='Candidate guesses per claimable chunk '
+                           '(default: 128; smaller = finer load balance, '
+                           'more coordination writes)')
+    p_sb.add_argument('--priority', type=int, default=1, metavar='P',
+                      help='Priority recorded on the split (default: 1)')
+    p_sb.add_argument('--force', action='store_true',
+                      help='Recompute even if the branch is already cached')
+    p_sb.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_sb.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+
     # -- reset-stale --
     p_rst = sub.add_parser('reset-stale',
                             help='Reset in_progress rows to pending')
@@ -554,6 +678,7 @@ def main():
         'status': cmd_status,
         'reset-stale': cmd_reset_stale,
         'export': cmd_export,
+        'solve-branch': cmd_solve_branch,
     }
     dispatch[args.cmd](args)
 

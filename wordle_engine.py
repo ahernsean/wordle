@@ -872,6 +872,70 @@ class Solution:
         return results
 
 
+def evaluate_guess(remaining, guess, cache, score_cache, *,
+                   n=None, best_erd=float('inf'),
+                   deadline=None, guesses=None, policy=ERD_ALL,
+                   cancel_check=None, heartbeat=None):
+    """Evaluate one candidate `guess`'s exact ERD for solving `remaining`.
+
+    This is the body of min_expected_guesses' top-level candidate loop,
+    extracted verbatim so a parallel coordinator can distribute candidates of
+    the SAME `remaining` across workers while sharing one running `best_erd`
+    as the branch-and-bound bound.  Recursion into sub-subgroups stays
+    single-threaded and writes each result to score_cache, so concurrent
+    callers evaluating different candidates of the same `remaining` share all
+    sub-subgroup work through the persistent cache.
+
+    `best_erd` is the best (lowest) exact cost found so far across candidates,
+    used to prune: any real achieved cost is a valid upper bound, so passing a
+    bound discovered by another worker is always safe and only prunes harder.
+
+    Returns (status, cost):
+      ('ok', cost)      fully evaluated; cost is the exact ERD and < best_erd.
+      ('pruned', None)  cannot beat best_erd (eliminated by the cost lower
+                        bound, or by branch-and-bound part-way through).
+      ('useless', None) yields no information (a response group is all of
+                        `remaining`); can never make progress.
+      ('abort', None)   deadline or cancel_check fired; caller must stop.
+    """
+    if n is None:
+        n = len(remaining)
+    if cache:
+        groups = cache.group_words(guess, remaining)
+    else:
+        groups = defaultdict(list)
+        for answer in remaining:
+            pat = _encode_response(calculate_response(guess, answer))
+            groups[pat].append(answer)
+
+    # Admissible lower bound on this guess's cost — see the long-form
+    # derivation in min_expected_guesses' history; cost >= 3 - (G + has_self)/n.
+    has_self = _ALL_GREEN_PATTERN in groups
+    cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+    if cost_lb >= best_erd:
+        return ('pruned', None)
+
+    cost = 1.0
+    # Largest subgroups first: highest weight (k/n), pushes cost up fastest so
+    # the branch-and-bound check fires after as few sub-evaluations as possible.
+    for subgroup in sorted(groups.values(), key=len, reverse=True):
+        k = len(subgroup)
+        if k == 1 and subgroup[0] == guess:
+            continue  # self: solved by this guess, 0 further guesses
+        if k >= n:
+            return ('useless', None)  # zero information — would recurse forever
+        sub_erd = min_expected_guesses(
+            subgroup, cache, score_cache, deadline, guesses,
+            policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
+        )
+        if sub_erd is None:
+            return ('abort', None)
+        cost += (k / n) * sub_erd
+        if cost >= best_erd:
+            return ('pruned', None)
+    return ('ok', cost)
+
+
 def min_expected_guesses(remaining, cache, score_cache,
                           deadline=None, guesses=None,
                           policy=None, progress_callback=None,
@@ -955,76 +1019,17 @@ def min_expected_guesses(remaining, cache, score_cache,
     best_word = None
 
     for i, guess in enumerate(guess_list):
-        # cache.group_words decomposes guess vs remaining via a persisted
-        # per-guess pattern lookup table (~0.6us/word) instead of recomputing
-        # calculate_response (~30us/word). Every new (cache-miss) subgroup
-        # re-runs this loop over the full guess_list at every recursion
-        # depth, so for non-answer guesses this difference is the dominant
-        # cost of evaluating a new subgroup. The decomposition for any guess
-        # is built once and persisted, so this is a one-time cost overall.
-        if cache:
-            groups = cache.group_words(guess, remaining)
-        else:
-            groups = defaultdict(list)
-            for answer in remaining:
-                pat = _encode_response(calculate_response(guess, answer))
-                groups[pat].append(answer)
-
-        # Admissible lower bound on this guess's cost — no recursion needed.
-        # For any subgroup of size k, sub_erd >= 2 - 1/k: an oracle guess
-        # that splits k words into k singletons (one of which is "self",
-        # contributing 0) needs 1 + (k-1)/k = 2 - 1/k expected guesses, and
-        # since sub_erd >= 1 for every part, no other partition of k can give
-        # a lower weighted sum. Summing (k_i/n)*(2 - 1/k_i) over this guess's
-        # groups (sizes sum to n) telescopes to 2 - G/n, where G = len(groups);
-        # the "self" group {guess}, if present, contributes 0 instead of 1/n.
-        # So cost >= 3 - (G + has_self)/n. If even this best case can't beat
-        # best_erd, skip the guess entirely — exact for k <= 243 (a perfect
-        # all-singleton split is achievable within the 243 response patterns),
-        # and a valid-but-looser bound for k > 243.
-        has_self = _ALL_GREEN_PATTERN in groups
-        cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
-        if cost_lb >= best_erd:
-            continue
-
-        cost = 1.0
-        aborted = False  # subscan returned None — deadline or cancel_check fired
-        skip_guess = False
-        # Largest subgroups first: they carry the highest weight (k/n) and
-        # push `cost` up fastest, so the pruning check below fires after as
-        # few subgroup evaluations as possible.
-        for subgroup in sorted(groups.values(), key=len, reverse=True):
-            k = len(subgroup)
-            # When guess is the answer, the all-green response produces a
-            # singleton {guess}. We've already solved it with this guess —
-            # 0 additional guesses needed for that branch.
-            if k == 1 and subgroup[0] == guess:
-                continue
-            if k >= n:
-                # All remaining words gave the same response — this guess
-                # provides zero information and cannot make progress.
-                # Skip it to prevent infinite recursion.
-                skip_guess = True
-                break
-            sub_erd = min_expected_guesses(
-                subgroup, cache, score_cache, deadline, guesses,
-                policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
-            )
-            if sub_erd is None:
-                aborted = True
-                break
-            cost += (k / n) * sub_erd
-            # Branch-and-bound: cost is non-decreasing (every remaining
-            # subgroup contributes a positive amount), so if it already
-            # meets or beats the best known result, no later subgroup can
-            # make this guess competitive.
-            if cost >= best_erd:
-                break
-
-        if skip_guess:
-            continue
-        if aborted:
+        status, cost = evaluate_guess(
+            remaining, guess, cache, score_cache,
+            n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
+            policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
+        )
+        if status == 'abort':
             return None
+        if status != 'ok':
+            # 'pruned'/'useless' — this guess can't win; skip without firing
+            # progress_callback (it signals fully-evaluated candidates only).
+            continue
 
         if cost < best_erd:
             best_erd = cost
