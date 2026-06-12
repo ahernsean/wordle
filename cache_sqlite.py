@@ -11,6 +11,14 @@ from pathlib import Path
 logger = logging.getLogger("wordle")
 
 
+def _is_disk_io_error(exc):
+    """True if exc is the transient 'disk I/O error' OperationalError that
+    iCloud File Provider Storage raises when a sync pass holds the lock on
+    the cache file or its WAL — see ScoreCache.checkpoint.
+    """
+    return "disk I/O error" in str(exc)
+
+
 class ScoreCache:
     """Persists per-word scores and subgroup lookahead results.
 
@@ -295,16 +303,33 @@ class ScoreCache:
         self.read_misses = 0
 
     def write(self, subset_key, policy, best_word, best_score):
-        """Store the word a policy's search judged best for a subgroup, and its score."""
+        """Store the word a policy's search judged best for a subgroup, and its score.
+
+        A transient 'disk I/O error' (e.g. iCloud File Provider Storage
+        holding the cache file's lock during a sync pass — see checkpoint())
+        is logged and swallowed rather than propagated: this runs at every
+        level of a min_expected_guesses recursion, so letting it raise would
+        unwind the entire call stack and abort the background solver thread,
+        discarding every result computed this run — not just this one.
+        best_word/best_score are still recorded in _mem_cache so this run's
+        recursion keeps the memoization benefit even when the on-disk write
+        fails; the row is simply recomputed on a later run.
+        """
         now = int(time.time())
-        self._conn.execute("""
-            INSERT OR REPLACE INTO subgroup_best_by_policy
-                (subset_key, policy, universe_id,
-                 best_word, best_score, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (subset_key, policy, self.universe_id,
-              best_word, best_score, now))
-        self.write_count += 1
+        try:
+            self._conn.execute("""
+                INSERT OR REPLACE INTO subgroup_best_by_policy
+                    (subset_key, policy, universe_id,
+                     best_word, best_score, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (subset_key, policy, self.universe_id,
+                  best_word, best_score, now))
+            self.write_count += 1
+        except sqlite3.OperationalError as exc:
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("write(%s, %s, %.3f) failed: %s",
+                            policy, best_word, best_score, exc)
         self._mem_cache[(subset_key, policy)] = (best_word, best_score)
 
     def read_detail(self, subset_key, policy):
@@ -355,13 +380,24 @@ class ScoreCache:
         return row["patterns"]
 
     def write_decomposition(self, guess, patterns):
-        """Store the pattern-byte blob (one byte per answer, canonical order)."""
+        """Store the pattern-byte blob (one byte per answer, canonical order).
+
+        Swallows a transient 'disk I/O error' the same way write() does —
+        see its docstring. ResponseCache._ensure caches the blob in memory
+        regardless, so this run proceeds unaffected; only the on-disk copy
+        is missing until a later run repersists it.
+        """
         now = int(time.time())
-        self._conn.execute("""
-            INSERT OR REPLACE INTO response_decomposition
-                (guess, universe_id, patterns, updated_at)
-            VALUES (?, ?, ?, ?)
-        """, (guess, self.universe_id, patterns, now))
+        try:
+            self._conn.execute("""
+                INSERT OR REPLACE INTO response_decomposition
+                    (guess, universe_id, patterns, updated_at)
+                VALUES (?, ?, ?, ?)
+            """, (guess, self.universe_id, patterns, now))
+        except sqlite3.OperationalError as exc:
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("write_decomposition(%s) failed: %s", guess, exc)
 
     # ------------------------------------------------------------------
     # Word score cache (level 1, all ScoringMethods)
@@ -384,11 +420,15 @@ class ScoreCache:
         return [(r["word"], r["score"]) for r in rows]
 
     def write_scores(self, subset_key, scores, method):
-        """Store list of (word, score) tuples for this subset/method/universe."""
+        """Store list of (word, score) tuples for this subset/method/universe.
+
+        Swallows a transient 'disk I/O error' the same way write() does —
+        see its docstring.
+        """
         subset_hash = self._subset_hash(subset_key)
         now = int(time.time())
-        self._conn.execute("BEGIN")
         try:
+            self._conn.execute("BEGIN")
             self._conn.executemany("""
                 INSERT OR REPLACE INTO word_scores
                     (subset_hash, word, method, score, universe_id, updated_at)
@@ -396,6 +436,14 @@ class ScoreCache:
             """, [(subset_hash, w, method, s, self.universe_id, now)
                   for w, s in scores])
             self._conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("write_scores(..., %s) failed: %s", method, exc)
         except Exception:
             self._conn.execute("ROLLBACK")
             raise

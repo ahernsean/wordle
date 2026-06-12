@@ -711,6 +711,93 @@ class TestScoreCacheSQLite(unittest.TestCase):
             sc._conn = real_conn
         sc.close()
 
+    def test_write_swallows_disk_io_error(self):
+        """A transient 'disk I/O error' from the INSERT must not propagate —
+        it would unwind every enclosing min_expected_guesses recursion and
+        abort the calling background-solver thread (see ScoreCache.write)."""
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+
+        class FailingWrite:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if sql.lstrip().startswith("INSERT OR REPLACE INTO subgroup_best_by_policy"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_conn = sc._conn
+        sc._conn = FailingWrite(real_conn)
+        try:
+            sc.write(subset_key, "full", "heart", 2.5)  # must not raise
+        finally:
+            sc._conn = real_conn
+
+        self.assertIsNone(sc.read_detail(subset_key, "full"),
+                          "failed write must not be persisted")
+        self.assertEqual(sc._mem_cache[(subset_key, "full")], ("heart", 2.5),
+                          "result must still be memoized for this run")
+        sc.close()
+
+    def test_write_decomposition_swallows_disk_io_error(self):
+        """Same as test_write_swallows_disk_io_error, for the
+        response_decomposition cache populated via ResponseCache._ensure
+        inside min_expected_guesses recursion."""
+        sc = ScoreCache(self.db, ANSWERS)
+
+        class FailingWrite:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if sql.lstrip().startswith("INSERT OR REPLACE INTO response_decomposition"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_conn = sc._conn
+        sc._conn = FailingWrite(real_conn)
+        try:
+            sc.write_decomposition("crane", bytes([1] * len(ANSWERS)))  # must not raise
+        finally:
+            sc._conn = real_conn
+
+        self.assertIsNone(sc.read_decomposition("crane"))
+        sc.close()
+
+    def test_write_scores_swallows_disk_io_error(self):
+        """Same as test_write_swallows_disk_io_error, for the word_scores
+        cache populated by cache_all_scores inside min_expected_guesses
+        recursion."""
+        sc = ScoreCache(self.db, ANSWERS)
+        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+
+        class FailingExecuteMany:
+            def __init__(self, real):
+                self._real = real
+
+            def executemany(self, *a, **k):
+                raise sqlite3.OperationalError("disk I/O error")
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_conn = sc._conn
+        sc._conn = FailingExecuteMany(real_conn)
+        try:
+            sc.write_scores(subset_key, [("crane", 1.0)], "entropy_gain")  # must not raise
+        finally:
+            sc._conn = real_conn
+
+        self.assertIsNone(sc.read_scores(subset_key, "entropy_gain"))
+        sc.close()
+
     def test_close_releases_connection_when_checkpoint_fails(self):
         """close() must still release the connection even when its
         checkpoint() call hits a disk I/O error."""
@@ -1527,6 +1614,46 @@ class TestMinExpectedGuesses(unittest.TestCase):
                     cached, f"{method.name} should be persisted for the ERD winner")
                 expected = score_word(best_word, subset, method, cache=self.cache)
                 self.assertEqual(dict(cached)[best_word], expected)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_disk_io_error_during_write_does_not_abort_recursion(self):
+        """A transient 'disk I/O error' from score_cache.write() must not
+        propagate out of min_expected_guesses — it would unwind every
+        enclosing recursive call and abort the calling background-solver
+        thread, discarding the whole computation (see
+        cache_sqlite.ScoreCache.write)."""
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, ANSWERS)
+            real_conn = sc._conn
+
+            class FailingWrite:
+                def __init__(self, real):
+                    self._real = real
+
+                def execute(self, sql, *a, **k):
+                    if sql.lstrip().startswith("INSERT OR REPLACE INTO subgroup_best_by_policy"):
+                        raise sqlite3.OperationalError("disk I/O error")
+                    return self._real.execute(sql, *a, **k)
+
+                def __getattr__(self, name):
+                    return getattr(self._real, name)
+
+            sc._conn = FailingWrite(real_conn)
+            try:
+                subset = ANSWERS[:4]
+                result = min_expected_guesses(subset, self.cache, sc)
+            finally:
+                sc._conn = real_conn
+
+            self.assertIsNotNone(result)
+            # Still memoized in-process even though persistence failed.
+            hit = sc.read(ScoreCache.encode_subset(subset), ERD_ANSWERS)
+            self.assertIsNotNone(hit)
+            self.assertAlmostEqual(hit[1], result, places=10)
+            sc.close()
         finally:
             os.unlink(tmp.name)
 
