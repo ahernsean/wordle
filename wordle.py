@@ -2449,8 +2449,7 @@ def print_status(gs, solver=None):
                             solver.root_best, solver.culled,
                             solver.current_word_tag(), suffix=' cands')
             # Scoring method cache status: one LIMIT 1 probe per method.
-            # Only meaningful post-guess — at the root the scan is vacuous.
-            if soln.score_cache is not None and not soln._is_full_game():
+            if soln.score_cache is not None:
                 subset_key = ScoreCache.encode_subset(words)
                 cached_methods = [
                     label for m in ScoringMethod
@@ -2460,7 +2459,7 @@ def print_status(gs, solver=None):
                         subset_key, m.name.lower())
                 ]
                 if cached_methods:
-                    scan_lines.append(f'Scores: {" ".join(cached_methods)}')
+                    scan_lines.append(f'Scores ready: {" ".join(cached_methods)}')
             if gs.precache_solver is not None and gs.precache_solver.is_alive():
                 scan_lines.append(gs.precache_solver.branches_line())
             print(line)
