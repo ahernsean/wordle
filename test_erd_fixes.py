@@ -186,5 +186,15 @@ class TestMultistepKeyConsistency(unittest.TestCase):
         self.assertIn("step1", st)
 
 
+class TestLastWriteTs(_TmpDB, unittest.TestCase):
+    def test_none_when_empty_then_timestamp_after_write(self):
+        sc = ScoreCache(self.path("c.sqlite3"), WORDS)
+        self.addCleanup(sc.close)
+        self.assertIsNone(sc.last_write_ts())  # no ERD rows yet
+        sc.write(ScoreCache.encode_subset(WORDS), ERD_ALL, "crane", 1.5,
+                 max_depth=2, solve_budget=None)
+        self.assertIsNotNone(sc.last_write_ts())
+
+
 if __name__ == "__main__":
     unittest.main()

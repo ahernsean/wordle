@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 
 import wordle
 from wordle import (
-    parse_response, _explain_conflict, _multistep_stats, _erd_candidate_coverage,
+    parse_response, _explain_conflict, _multistep_stats,
     cmd_solve, cmd_grid, cmd_test, cmd_include, cmd_exclude, cmd_undo,
     cmd_answer, cmd_help, print_status, ERDSolver, Solution,
     GuessUniverse, ComplianceFilter,
@@ -75,13 +75,6 @@ class TestMultistepNoCacheGroups(unittest.TestCase):
         st = _multistep_stats("piano", soln, step2_pool=None,
                               constraint_compliant=False)
         self.assertGreaterEqual(st["step2"], 0.0)
-
-    def test_coverage_helper_no_cache(self):
-        soln = Solution(ANSWERS, GUESSES, cache=None, score_cache=None)
-        sc = MemoryScoreCache()
-        sc.set_scope("s")
-        covered, total = _erd_candidate_coverage(soln, sc, ERD_ALL)
-        self.assertEqual(total, len(ANSWERS))
 
 
 class TestMultiBoardCandidateSelection(CliTestCase):

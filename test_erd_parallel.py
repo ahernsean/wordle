@@ -59,6 +59,9 @@ class TestParallelSwarmSolve(unittest.TestCase):
         """Register the branch and run n_workers cooperating threads; return
         the finalized (best_word, best_erd) the swarm wrote to the cache."""
         cache_path, queue_path = self._fresh_db(tag)
+        # Apply schema migrations once before the worker threads open the cache
+        # concurrently (production always has a single pre-open first).
+        ScoreCache(cache_path, BRANCH).close()
         chunk_size = ErdQueue.chunk_size_for(
             len(BRANCH), len(CANDIDATES), DIVISOR, MAX_CHUNKS)
         q = ErdQueue(queue_path)

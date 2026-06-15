@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 
 import wordle
 from wordle import (
-    ProgressTracker, _erd_solve_scores, _erd_candidate_coverage,
+    ProgressTracker, _erd_solve_scores,
     _solver_branch_key, _multistep_stats, cmd_guess, cmd_solve, cmd_display,
     cmd_test, cmd_include, cmd_exclude, cmd_reset, cmd_undo, cmd_answer,
     cmd_verify_erd, cmd_help, print_status, ERDSolver,
@@ -68,11 +68,6 @@ class TestErdHelpers(unittest.TestCase):
         # No subgroup cached → every candidate skipped → None.
         self.assertIsNone(
             _erd_solve_scores(self.soln, self.sc, ERD_ALL, guesses=["crane"]))
-
-    def test_erd_candidate_coverage_counts(self):
-        covered, total = _erd_candidate_coverage(self.soln, self.sc, ERD_ALL)
-        self.assertEqual(total, len(self.soln.current_words))
-        self.assertGreaterEqual(covered, 0)
 
     def test_solver_branch_key_hard_mode_fingerprints(self):
         from wordle import GameState  # avoid import cycle at top
