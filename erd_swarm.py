@@ -281,7 +281,7 @@ class _BranchWorker:
                     self.queue.update_branch_best(subset_key, local_word,
                                                   local_best, local_md)
                     shared_best = local_best
-            elif status == 'pruned':
+            elif status in ('pruned', 'cutoff'):
                 self.n_pruned += 1
             else:
                 self.n_useless += 1
@@ -348,7 +348,8 @@ class _BranchWorker:
         Large sub-branches are promoted to the swarm and solved across workers;
         small ones return None so the engine solves them inline (cheap, and
         still visible — the heartbeat is threaded through that recursion).
-        Returns (cost, max_depth, floor) or None to inline.
+        Returns the engine's (cost, max_depth, floor, cutoff) tuple, or None to
+        inline.  Cooperative results are always exact, so cutoff is False.
         """
         if budget is None or len(words) < PROMOTE_MIN_SIZE:
             return None
@@ -356,7 +357,8 @@ class _BranchWorker:
 
     def cooperative_solve(self, words, budget):
         """Solve sub-branch `words` at `budget` cooperatively, returning the
-        engine's (cost, max_depth, floor) tuple.
+        engine's (cost, max_depth, floor, cutoff) tuple (cutoff always False —
+        a cooperative solve runs to the exact optimum).
 
         Registers the sub-branch as a first-class swarm branch, then *helps*
         solve it — claiming and evaluating its chunks alongside any other
@@ -369,7 +371,7 @@ class _BranchWorker:
         reuse = _cache_reuse(
             self.score_cache.read_with_depth(subset_key, ERD_ALL), budget)
         if reuse is not None:
-            return reuse
+            return (*reuse, False)
 
         n_words = len(words)
         chunk_size = ErdQueue.chunk_size_for(
@@ -387,7 +389,7 @@ class _BranchWorker:
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(subset_key, ERD_ALL), budget)
             if reuse is not None:
-                return reuse
+                return (*reuse, False)
             if self.queue.get_branch(subset_key) is None:
                 break                       # finalized as a loss + deleted
             idx = self.queue.claim_chunk(subset_key, self.name, n_chunks)
@@ -403,7 +405,8 @@ class _BranchWorker:
 
         if self.cancel():
             return None
-        return (float('inf'), None, True)   # finalized as a loss (no strategy)
+        # Finalized as a loss: proven unsolvable (not a cutoff).
+        return (float('inf'), None, True, False)
 
     # -- scheduling: claim one chunk of the best available branch -----------
 

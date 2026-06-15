@@ -181,6 +181,13 @@ _ALL_GREEN_PATTERN = _encode_response(['green'] * 5)
 # across the mix; the optimum genuinely varies by branch difficulty (see notes).
 ORDER_MIN_N = 8
 
+# Alpha-beta ceiling slack.  When a subgroup is solved with a derived ceiling we
+# add this tiny margin so floating-point rounding in the ceiling arithmetic can
+# never cut off a candidate that would in fact (just barely) beat the bound — a
+# false cutoff would only cost a missed cache write, never correctness, but the
+# margin makes "never wrongly discard a true winner" exact rather than probable.
+_CEIL_EPS = 1e-9
+
 
 # ---------------------------------------------------------------------------
 # Restriction system
@@ -956,7 +963,9 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
     has_self = _ALL_GREEN_PATTERN in groups
     cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
     if cost_lb >= best_erd:
-        return ('pruned', None, None, False)
+        # Provably can't beat the bound (but may well be feasible) — a cutoff,
+        # not infeasibility.  See the 'cutoff' contract in _solve_subset.
+        return ('cutoff', None, None, False)
 
     cost = 1.0
     cand_md = 1 if budget is not None else None
@@ -964,19 +973,46 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
     sub_budget = None if budget is None else budget - 1
     # Largest subgroups first: highest weight (k/n), pushes cost up fastest so
     # the branch-and-bound check fires after as few sub-evaluations as possible.
-    for subgroup in sorted(groups.values(), key=len, reverse=True):
+    ordered = sorted(groups.values(), key=len, reverse=True)
+
+    # Alpha-beta: solve each subgroup under a derived ceiling so a deep node
+    # prunes from a tight bound instead of inf.  rest_lb[i] is an admissible
+    # lower bound on the weighted cost of the subgroups *after* position i
+    # (each subgroup of size k costs >= lb(k); the all-singletons split attains
+    # it, so it never over-counts).  The self singleton contributes 0.
+    def _sub_lb(sg):
+        if len(sg) == 1:
+            return 0.0 if sg[0] == guess else 1.0
+        return 2.0 - 1.0 / len(sg)
+
+    rest_lb = [0.0] * (len(ordered) + 1)
+    for i in range(len(ordered) - 1, -1, -1):
+        rest_lb[i] = rest_lb[i + 1] + (len(ordered[i]) / n) * _sub_lb(ordered[i])
+
+    for i, subgroup in enumerate(ordered):
         k = len(subgroup)
         if k == 1 and subgroup[0] == guess:
             continue  # self: solved by this guess, 0 further guesses
         if k >= n:
             return ('useless', None, None, floor)  # zero information
+        # Max ERD this subgroup may have for the candidate to still beat the
+        # bound, assuming the remaining siblings achieve only their lower bound.
+        if best_erd == float('inf'):
+            sub_ceiling = float('inf')
+        else:
+            sub_ceiling = (best_erd - cost - rest_lb[i + 1]) * (n / k) + _CEIL_EPS
         sub = _solve_subset(
             subgroup, cache, score_cache, sub_budget, deadline, guesses,
             policy, cancel_check, heartbeat, depth + 1, depth_observer, None,
-            subbranch_solver)
+            subbranch_solver, ceiling=sub_ceiling)
         if sub is None:
             return ('abort', None, None, floor)
-        sub_cost, sub_md, sub_floor = sub
+        sub_cost, sub_md, sub_floor, sub_cutoff = sub
+        if sub_cutoff:
+            # Subgroup search stopped at >= its ceiling: this candidate's cost
+            # is therefore >= best_erd.  Discard it (sub_cost is only a lower
+            # bound) WITHOUT marking taint — we never proved infeasibility.
+            return ('cutoff', None, cand_md, floor)
         floor = floor or sub_floor
         if sub_cost == float('inf'):
             # Subgroup unsolvable within budget — this candidate is infeasible.
@@ -985,19 +1021,35 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
         if budget is not None:
             cand_md = max(cand_md, 1 + sub_md)
         if cost >= best_erd:
-            return ('pruned', None, cand_md, floor)
+            return ('cutoff', None, cand_md, floor)
     return ('ok', cost, cand_md, floor)
 
 
 def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, depth, depth_observer,
-                  progress_callback, subbranch_solver=None):
+                  progress_callback, subbranch_solver=None,
+                  ceiling=float('inf')):
     """Budget-aware core of min_expected_guesses.
 
-    Returns (cost, max_depth, floor_hit), or None on deadline/cancel abort.
-    cost == inf means `remaining` cannot be solved within `budget` (and
-    floor_hit is True).  budget None = unlimited (legacy behaviour: floor
-    never fires, max_depth untracked/None, results cached as unconstrained).
+    Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
+    abort.
+
+    cutoff distinguishes the two ways a search can fail to return an exact
+    optimum, which the cache MUST treat differently:
+      cutoff=False  cost is exact (the true optimum), OR a definite budget
+                    floor: cost == inf with floor_hit means `remaining` was
+                    *proven* unsolvable within `budget`.  Either way reusable.
+      cutoff=True   alpha-beta gave up early — every candidate priced out at
+                    >= `ceiling`, so all we know is cost >= ceiling SO FAR;
+                    solvability was never determined.  cost is only a lower
+                    bound (= ceiling); the caller must NOT cache it.
+
+    ceiling seeds the branch-and-bound bound (best_erd) so a deep node prunes
+    from a tight value instead of inf.  Default inf = no alpha-beta pressure
+    (legacy behaviour); a cutoff can then never occur (best_erd stays inf).
+
+    budget None = unlimited (legacy: floor never fires, max_depth None,
+    results cached as unconstrained).
     """
     n = len(remaining)
     if heartbeat is not None:
@@ -1005,12 +1057,12 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
     if depth_observer is not None:
         depth_observer(depth, n)
     if budget is not None and budget < 1:
-        return (float('inf'), None, True)   # no guess available at all
+        return (float('inf'), None, True, False)   # no guess available at all
     if n == 1:
-        return (1.0, 1, False)
+        return (1.0, 1, False, False)
     if budget is not None and budget < 2:
         # >=2 words need >=2 guesses (guess one; if wrong, play the other).
-        return (float('inf'), None, True)
+        return (float('inf'), None, True, False)
 
     if policy is None:
         policy = ERD_ALL if guesses is not None else ERD_ANSWERS
@@ -1026,7 +1078,7 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
         reuse = _cache_reuse(
             score_cache.read_with_depth(subset_key, policy), budget)
         if reuse is not None:
-            return reuse
+            return (*reuse, False)   # cached values are exact optima
 
     if deadline is not None and time.time() > deadline:
         return None
@@ -1054,10 +1106,14 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
                 c * c for c in cache.group_counts(g, remaining).values()),
         )
 
-    best_erd = float('inf')
+    # Seed the bound with the alpha-beta ceiling: any candidate that can't beat
+    # it is a cutoff, and if none can we report a cutoff (lower bound) rather
+    # than a spurious optimum.
+    best_erd = ceiling
     best_word = None
     best_md = None
     node_floor = False
+    cutoff_occurred = False
 
     for i, guess in enumerate(guess_list):
         status, cost, md, floor = evaluate_guess(
@@ -1070,6 +1126,9 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
         if status == 'abort':
             return None
         node_floor = node_floor or floor
+        if status == 'cutoff':
+            cutoff_occurred = True
+            continue
         if status != 'ok':
             continue
 
@@ -1082,19 +1141,26 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
             progress_callback(i + 1, len(guess_list), best_word, best_erd)
 
     if best_word is None:
-        # No feasible guess: unsolvable within budget (or degenerate set).
-        return (float('inf'), None, True)
+        if cutoff_occurred:
+            # Every candidate priced out at >= ceiling but none was proven
+            # infeasible: a lower bound only (= ceiling), solvability unknown.
+            # Do NOT cache — return a cutoff so the caller discards it.
+            return (ceiling, None, node_floor, True)
+        # No feasible guess and no cutoff: proven unsolvable within budget.
+        return (float('inf'), None, True, False)
 
     if score_cache:
         # Untainted (floor never fired) => unconstrained optimum, reusable at
         # any budget >= max_depth: solve_budget NULL.  Tainted => valid only at
-        # this budget: solve_budget = budget.
+        # this budget: solve_budget = budget.  best_erd here is the EXACT
+        # optimum: finding a candidate below the ceiling means the ceiling only
+        # pruned provably-worse candidates, so the value is universally valid.
         solve_budget = None if (budget is None or not node_floor) else budget
         score_cache.write(subset_key, policy, best_word, best_erd,
                           max_depth=best_md, solve_budget=solve_budget)
         cache_all_scores(best_word, remaining, score_cache, subset_key, cache=cache)
 
-    return (best_erd, best_md, node_floor)
+    return (best_erd, best_md, node_floor, False)
 
 
 def min_expected_guesses(remaining, cache, score_cache,
@@ -1128,7 +1194,7 @@ def min_expected_guesses(remaining, cache, score_cache,
                         depth_observer, progress_callback, subbranch_solver)
     if res is None:
         return None
-    cost, _md, _floor = res
+    cost, _md, _floor, _cutoff = res
     if budget is not None and cost == float('inf'):
         return None   # unsolvable within budget
     return cost
