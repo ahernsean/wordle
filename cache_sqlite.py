@@ -498,6 +498,15 @@ class ScoreCache:
         """Compact, fixed-size key for a (potentially large) subset blob."""
         return hashlib.sha256(subset_key).hexdigest()
 
+    def has_scores(self, subset_key, method):
+        """Return True if any scores are cached for this subset/method/universe."""
+        subset_hash = self._subset_hash(subset_key)
+        return self._conn.execute("""
+            SELECT 1 FROM word_scores
+            WHERE subset_hash = ? AND method = ? AND universe_id = ?
+            LIMIT 1
+        """, (subset_hash, method, self.universe_id)).fetchone() is not None
+
     def read_scores(self, subset_key, method):
         """Return list of (word, score) for this subset/method/universe, or None if empty."""
         subset_hash = self._subset_hash(subset_key)

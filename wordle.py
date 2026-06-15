@@ -1132,40 +1132,6 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     return results
 
 
-def _erd_candidate_coverage(soln, score_cache, policy):
-    """Count how many of soln.current_words have all their ERD subgroups cached.
-
-    Returns (covered, total).  A word is "covered" when every response
-    subgroup it would produce against current_words either is a singleton
-    (cost is always 1 more guess, no lookup needed) or has a cached ERD
-    result.  Covered words can be immediately ERD-ranked; uncovered ones
-    are still being computed in the background.
-    """
-    from wordle_engine import _encode_response
-    cache = soln.cache
-    covered = 0
-    for word in soln.current_words:
-        if cache and word in cache.answer_words:
-            groups = cache.group_words(word, soln.current_words)
-        else:
-            groups = defaultdict(list)
-            for answer in soln.current_words:
-                pat = _encode_response(calculate_response(word, answer))
-                groups[pat].append(answer)
-        ok = True
-        for sg in groups.values():
-            k = len(sg)
-            if k == 0 or k == 1:
-                continue  # solved or singleton — no cache lookup needed
-            hit = score_cache.read(ScoreCache.encode_subset(sg), policy)
-            if hit is None:
-                ok = False
-                break
-        if ok:
-            covered += 1
-    return covered, len(soln.current_words)
-
-
 def cmd_solve(gs):
     if gs.single:
         soln = gs.solutions[0]
@@ -2483,13 +2449,15 @@ def print_status(gs, solver=None):
                                 solver.root_done, solver.root_total,
                                 solver.root_best, solver.culled,
                                 solver.current_word_tag(), suffix=' cands')
-                # Scoring method cache status: one point read per method.
+                # Scoring method cache status: one LIMIT 1 probe per method.
                 if soln.score_cache is not None:
                     subset_key = ScoreCache.encode_subset(words)
                     cached_methods = [
-                        _METHOD_SHORT[m] for m in ScoringMethod
-                        if soln.score_cache.read_scores(
-                            subset_key, m.name.lower()) is not None
+                        label for m in ScoringMethod
+                        for label in (_METHOD_SHORT.get(m),)
+                        if label is not None
+                        and soln.score_cache.has_scores(
+                            subset_key, m.name.lower())
                     ]
                     if cached_methods:
                         scan_lines.append(f'Scores: {" ".join(cached_methods)}')
@@ -3085,11 +3053,9 @@ def main():
     gs = GameState(all_answers, all_words)
     _open_s = time.time() - _t0
     _size_str = _fmt_size(os.path.getsize(gs.score_cache_path))
-    _mtime_str = datetime.fromtimestamp(
-        os.path.getmtime(gs.score_cache_path)
-    ).strftime('%Y-%m-%d %H:%M')
+    _, _, _, _db_mtime = gs.score_cache.stats()
     print(f"  {_size_str}, opened in {_open_s:.1f}s")
-    print(f"  last write {_mtime_str}")
+    print(f"  last write {_format_cache_timestamp(_db_mtime)}")
     _root_hit = gs.score_cache.read(
         ScoreCache.encode_subset(all_answers), ERD_ALL)
     if _root_hit is not None:
