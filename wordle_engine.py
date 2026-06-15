@@ -172,6 +172,11 @@ def decode_response(code):
 # used by min_expected_guesses to detect the "self" group at O(1).
 _ALL_GREEN_PATTERN = _encode_response(['green'] * 5)
 
+# Best-first candidate ordering kicks in only for nodes at least this large.
+# Ordering scans the full candidate vocab once (O(|vocab|*n)); below this size
+# the subtree it would prune is too small to repay that scan.
+ORDER_MIN_N = 8
+
 
 # ---------------------------------------------------------------------------
 # Restriction system
@@ -872,34 +877,69 @@ class Solution:
         return results
 
 
+def _cache_reuse(entry, budget):
+    """Decide whether a cached entry is valid at `budget` (None = unlimited).
+
+    entry is (best_word, best_score, max_depth, solve_budget) or None.
+    Returns (cost, max_depth, tainted) to reuse, or None to recompute.
+
+    Reuse rules (see cache_sqlite schema):
+      unlimited (budget None): reuse legacy (max_depth None) and untainted
+        (solve_budget None) entries — both are unconstrained optima; reject a
+        tainted (solve_budget set) entry, which is budget-specific.
+      budgeted: reject legacy (unknown depth); an untainted entry is valid
+        when max_depth <= budget; a tainted entry only at solve_budget==budget.
+    A reused tainted entry propagates tainted=True (its subtree hit the floor).
+    """
+    if entry is None:
+        return None
+    _bw, score, md, sb = entry
+    if budget is None:
+        if sb is not None:
+            return None
+        return (score, md, False)
+    if md is None:
+        return None
+    if sb is None:
+        return (score, md, False) if md <= budget else None
+    return (score, md, True) if sb == budget else None
+
+
 def evaluate_guess(remaining, guess, cache, score_cache, *,
                    n=None, best_erd=float('inf'),
                    deadline=None, guesses=None, policy=ERD_ALL,
-                   cancel_check=None, heartbeat=None):
+                   cancel_check=None, heartbeat=None,
+                   depth=0, depth_observer=None, budget=None,
+                   subbranch_solver=None):
     """Evaluate one candidate `guess`'s exact ERD for solving `remaining`.
 
-    This is the body of min_expected_guesses' top-level candidate loop,
-    extracted verbatim so a parallel coordinator can distribute candidates of
-    the SAME `remaining` across workers while sharing one running `best_erd`
-    as the branch-and-bound bound.  Recursion into sub-subgroups stays
-    single-threaded and writes each result to score_cache, so concurrent
-    callers evaluating different candidates of the same `remaining` share all
-    sub-subgroup work through the persistent cache.
+    This is the body of the top-level candidate loop, extracted so a parallel
+    coordinator can distribute candidates of the SAME `remaining` across
+    workers while sharing one running `best_erd` as the branch-and-bound bound.
+    Recursion stays single-threaded and writes each sub-result to score_cache.
 
-    `best_erd` is the best (lowest) exact cost found so far across candidates,
-    used to prune: any real achieved cost is a valid upper bound, so passing a
-    bound discovered by another worker is always safe and only prunes harder.
+    budget: guesses available to solve `remaining` from this point (None =
+    unlimited).  A subgroup that can't be solved within budget-1 makes this
+    candidate infeasible (cost inf) and marks floor_hit — the depth cap fired.
 
-    Returns (status, cost):
-      ('ok', cost)      fully evaluated; cost is the exact ERD and < best_erd.
-      ('pruned', None)  cannot beat best_erd (eliminated by the cost lower
-                        bound, or by branch-and-bound part-way through).
-      ('useless', None) yields no information (a response group is all of
-                        `remaining`); can never make progress.
-      ('abort', None)   deadline or cancel_check fired; caller must stop.
+    Returns (status, cost, max_depth, floor_hit):
+      ('ok', cost, md, floor)  fully evaluated; cost < best_erd; md is this
+                               strategy's worst-case line length (None when
+                               unlimited — not tracked).
+      ('pruned', None, md, floor)   can't beat best_erd, OR infeasible within
+                               budget (a subgroup hit the floor).
+      ('useless', None, None, floor) a response group is all of `remaining`.
+      ('abort', None, None, floor)  deadline/cancel fired; caller must stop.
+    floor_hit is always returned (even on early returns) so the caller can
+    aggregate taint across all candidates it tries, including discarded ones.
     """
     if n is None:
         n = len(remaining)
+    # Liveness tick: fire once per candidate evaluation (the dominant work
+    # unit).  Guarantees a progress signal even through a long run of guesses
+    # that all prune below without recursing.  Observation only.
+    if heartbeat is not None:
+        heartbeat()
     if cache:
         groups = cache.group_words(guess, remaining)
     else:
@@ -908,14 +948,16 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
             pat = _encode_response(calculate_response(guess, answer))
             groups[pat].append(answer)
 
-    # Admissible lower bound on this guess's cost — see the long-form
-    # derivation in min_expected_guesses' history; cost >= 3 - (G + has_self)/n.
+    # Admissible lower bound on this guess's cost — cost >= 3 - (G + has_self)/n.
     has_self = _ALL_GREEN_PATTERN in groups
     cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
     if cost_lb >= best_erd:
-        return ('pruned', None)
+        return ('pruned', None, None, False)
 
     cost = 1.0
+    cand_md = 1 if budget is not None else None
+    floor = False
+    sub_budget = None if budget is None else budget - 1
     # Largest subgroups first: highest weight (k/n), pushes cost up fastest so
     # the branch-and-bound check fires after as few sub-evaluations as possible.
     for subgroup in sorted(groups.values(), key=len, reverse=True):
@@ -923,77 +965,48 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
         if k == 1 and subgroup[0] == guess:
             continue  # self: solved by this guess, 0 further guesses
         if k >= n:
-            return ('useless', None)  # zero information — would recurse forever
-        sub_erd = min_expected_guesses(
-            subgroup, cache, score_cache, deadline, guesses,
-            policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
-        )
-        if sub_erd is None:
-            return ('abort', None)
-        cost += (k / n) * sub_erd
+            return ('useless', None, None, floor)  # zero information
+        sub = _solve_subset(
+            subgroup, cache, score_cache, sub_budget, deadline, guesses,
+            policy, cancel_check, heartbeat, depth + 1, depth_observer, None,
+            subbranch_solver)
+        if sub is None:
+            return ('abort', None, None, floor)
+        sub_cost, sub_md, sub_floor = sub
+        floor = floor or sub_floor
+        if sub_cost == float('inf'):
+            # Subgroup unsolvable within budget — this candidate is infeasible.
+            return ('pruned', None, None, True)
+        cost += (k / n) * sub_cost
+        if budget is not None:
+            cand_md = max(cand_md, 1 + sub_md)
         if cost >= best_erd:
-            return ('pruned', None)
-    return ('ok', cost)
+            return ('pruned', None, cand_md, floor)
+    return ('ok', cost, cand_md, floor)
 
 
-def min_expected_guesses(remaining, cache, score_cache,
-                          deadline=None, guesses=None,
-                          policy=None, progress_callback=None,
-                          cancel_check=None, heartbeat=None):
-    """
-    Exact expected guesses to solve remaining words, playing optimally.
+def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
+                  policy, cancel_check, heartbeat, depth, depth_observer,
+                  progress_callback, subbranch_solver=None):
+    """Budget-aware core of min_expected_guesses.
 
-    guesses: vocabulary of allowed guess words. None means answers-only
-             (restrict guesses to `remaining`).
-    policy:  cache namespace under which the result is stored — one of
-             ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED
-             (see VALID_ERD_POLICIES).  Defaults to ERD_ALL when guesses
-             is supplied, ERD_ANSWERS otherwise.  Pass explicitly when the
-             caller needs a different namespace (e.g. ERD_CONSTRAINED for
-             constraint-compliant/hard mode).  An
-             unrecognized policy raises ValueError — silently writing
-             results into the wrong namespace would corrupt that mode's
-             cache for every future game.
-    progress_callback: optional progress_callback(done, total, best_word,
-             best_erd), invoked once per fully-evaluated top-level
-             candidate. Deliberately NOT threaded into the recursive
-             calls below — passing it down would fire it once per
-             candidate at every depth of the search tree, drowning the
-             one signal a caller actually wants (how far the *requested*
-             scan has gotten) in noise from scans the caller never asked
-             to watch. A caller that wants visibility into a recursive
-             scan should call min_expected_guesses on that subgroup
-             directly and supply its own callback.
-    cancel_check: optional zero-arg callable returning True once the
-             caller has abandoned this computation (e.g. the user moved
-             to a different branch). Unlike progress_callback, this IS
-             threaded into every recursive call: cancellation needs to
-             stop the search promptly at whatever depth it has reached,
-             not just between top-level candidates. Checked alongside
-             deadline — both are "stop early and return None" signals,
-             but they answer different questions. deadline bounds *this*
-             attempt's running time regardless of why it's running;
-             cancel_check answers "is this attempt's answer even still
-             wanted?" and can fire well before any deadline would.
-    heartbeat: optional zero-arg callable invoked once per invocation of
-             min_expected_guesses, at every recursion depth (cache hits
-             included). Like cancel_check (and unlike progress_callback)
-             this IS threaded into every recursive call: a single
-             top-level candidate's full evaluation can recurse through a
-             huge subtree with best_erd still at its initial value (no
-             pruning possible yet), during which progress_callback never
-             fires. heartbeat gives a liveness signal throughout that
-             recursion. Keep it cheap — it may fire millions of times.
-
-    Returns None if the deadline is exceeded or cancel_check fires
-    mid-computation; partial results already written to score_cache
-    are kept and valid either way.
+    Returns (cost, max_depth, floor_hit), or None on deadline/cancel abort.
+    cost == inf means `remaining` cannot be solved within `budget` (and
+    floor_hit is True).  budget None = unlimited (legacy behaviour: floor
+    never fires, max_depth untracked/None, results cached as unconstrained).
     """
     n = len(remaining)
     if heartbeat is not None:
         heartbeat()
+    if depth_observer is not None:
+        depth_observer(depth, n)
+    if budget is not None and budget < 1:
+        return (float('inf'), None, True)   # no guess available at all
     if n == 1:
-        return 1.0
+        return (1.0, 1, False)
+    if budget is not None and budget < 2:
+        # >=2 words need >=2 guesses (guess one; if wrong, play the other).
+        return (float('inf'), None, True)
 
     if policy is None:
         policy = ERD_ALL if guesses is not None else ERD_ANSWERS
@@ -1006,43 +1019,115 @@ def min_expected_guesses(remaining, cache, score_cache,
 
     subset_key = ScoreCache.encode_subset(remaining)
     if score_cache:
-        hit = score_cache.read(subset_key, policy)
-        if hit is not None:
-            return hit[1]
+        reuse = _cache_reuse(
+            score_cache.read_with_depth(subset_key, policy), budget)
+        if reuse is not None:
+            return reuse
 
     if deadline is not None and time.time() > deadline:
         return None
     if cancel_check is not None and cancel_check():
         return None
 
+    # Recursive parallelism: on a cache miss, offer this sub-branch to the
+    # swarm.  The solver decides (by size) whether to solve it cooperatively
+    # across workers (returns a result) or decline (None) so we solve inline.
+    # Correctness-neutral: a solver that inlines yields the identical ERD.
+    if subbranch_solver is not None:
+        delegated = subbranch_solver(remaining, budget)
+        if delegated is not None:
+            return delegated
+
+    # Best-first ordering: evaluate the strongest splitter first (key = expected
+    # remaining set size, Σ k²; smaller is better) so the branch-and-bound bound
+    # (best_erd) is tight from the 2nd candidate on, letting evaluate_guess's
+    # partial-sum cutoff prune the rest before they recurse.  Order-only — the
+    # minimum, and therefore every cached result, is unchanged.
+    if cache and n >= ORDER_MIN_N and len(guess_list) > 1:
+        guess_list = sorted(
+            guess_list,
+            key=lambda g: sum(
+                c * c for c in cache.group_counts(g, remaining).values()),
+        )
+
     best_erd = float('inf')
     best_word = None
+    best_md = None
+    node_floor = False
 
     for i, guess in enumerate(guess_list):
-        status, cost = evaluate_guess(
+        status, cost, md, floor = evaluate_guess(
             remaining, guess, cache, score_cache,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
+            depth=depth, depth_observer=depth_observer, budget=budget,
+            subbranch_solver=subbranch_solver,
         )
         if status == 'abort':
             return None
+        node_floor = node_floor or floor
         if status != 'ok':
-            # 'pruned'/'useless' — this guess can't win; skip without firing
-            # progress_callback (it signals fully-evaluated candidates only).
             continue
 
         if cost < best_erd:
             best_erd = cost
             best_word = guess
+            best_md = md
 
         if progress_callback is not None:
             progress_callback(i + 1, len(guess_list), best_word, best_erd)
 
-    if score_cache and best_word is not None:
-        score_cache.write(subset_key, policy, best_word, best_erd)
+    if best_word is None:
+        # No feasible guess: unsolvable within budget (or degenerate set).
+        return (float('inf'), None, True)
+
+    if score_cache:
+        # Untainted (floor never fired) => unconstrained optimum, reusable at
+        # any budget >= max_depth: solve_budget NULL.  Tainted => valid only at
+        # this budget: solve_budget = budget.
+        solve_budget = None if (budget is None or not node_floor) else budget
+        score_cache.write(subset_key, policy, best_word, best_erd,
+                          max_depth=best_md, solve_budget=solve_budget)
         cache_all_scores(best_word, remaining, score_cache, subset_key, cache=cache)
 
-    return best_erd
+    return (best_erd, best_md, node_floor)
+
+
+def min_expected_guesses(remaining, cache, score_cache,
+                          deadline=None, guesses=None,
+                          policy=None, progress_callback=None,
+                          cancel_check=None, heartbeat=None,
+                          depth=0, depth_observer=None, budget=None,
+                          subbranch_solver=None):
+    """
+    Exact expected guesses to solve remaining words, playing optimally.
+
+    With budget=None this is the classic unlimited-depth ERD.  With an integer
+    budget it is depth-limited: the minimum expected guesses among strategies
+    that are *guaranteed to win within `budget` guesses* — a candidate with a
+    better average but a branch that can't finish in time is rejected.
+
+    guesses: vocabulary of allowed guess words. None means answers-only.
+    policy:  cache namespace (see VALID_ERD_POLICIES).  Defaults to ERD_ALL
+             when guesses is supplied, ERD_ANSWERS otherwise.
+    progress_callback: progress_callback(done, total, best_word, best_erd),
+             once per fully-evaluated top-level candidate (top level only).
+    cancel_check / heartbeat / depth_observer: threaded into every recursive
+             call (see _solve_subset / evaluate_guess).
+
+    Returns the expected-guesses cost, or None if the deadline/cancel fired or
+    (when budgeted) `remaining` is unsolvable within budget.  Partial results
+    already written to score_cache are kept and valid either way.
+    """
+    res = _solve_subset(remaining, cache, score_cache, budget, deadline,
+                        guesses, policy, cancel_check, heartbeat, depth,
+                        depth_observer, progress_callback, subbranch_solver)
+    if res is None:
+        return None
+    cost, _md, _floor = res
+    if budget is not None and cost == float('inf'):
+        return None   # unsolvable within budget
+    return cost
 
 
 def verify_erd_cache(words, cache, score_cache, policy, max_nodes=2000):

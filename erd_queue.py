@@ -94,7 +94,14 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     n_pruned           INTEGER,     -- candidates eliminated by the shared bound
     n_ok               INTEGER,     -- candidates fully evaluated
     best_word          TEXT,
-    best_erd           REAL
+    best_erd           REAL,
+    cur_candidate      TEXT,        -- candidate word currently under evaluation
+    cand_n_seen        INTEGER,     -- candidates evaluated so far in this chunk
+    cand_chunk_size    INTEGER,     -- total candidates in this chunk
+    cur_max_depth      INTEGER,     -- deepest recursion level in current candidate
+    cur_nodes          INTEGER,     -- monotonic node counter (forward-progress)
+    node_rate          REAL,        -- nodes/sec since last heartbeat
+    cur_path           TEXT         -- live recursion spine: subset sizes by depth
 );
 
 CREATE TABLE IF NOT EXISTS run_meta (
@@ -179,10 +186,29 @@ class ErdQueue:
                           ('n_pruned',         'INTEGER'),
                           ('n_ok',             'INTEGER'),
                           ('best_word',        'TEXT'),
-                          ('best_erd',         'REAL')]:
+                          ('best_erd',         'REAL'),
+                          ('cur_candidate',    'TEXT'),
+                          ('cand_n_seen',      'INTEGER'),
+                          ('cand_chunk_size',  'INTEGER'),
+                          ('cur_max_depth',    'INTEGER'),
+                          ('cur_nodes',        'INTEGER'),
+                          ('node_rate',        'REAL'),
+                          ('cur_path',         'TEXT')]:
             if col not in existing_hb:
                 self._conn.execute(
                     f'ALTER TABLE worker_heartbeat ADD COLUMN {col} {defn}')
+
+        # Depth-limited ERD: each branch is solved at a guess budget; track the
+        # winner's worst-case line length (best_max_depth) and whether the cap
+        # excluded any candidate (tainted), aggregated across all workers.
+        existing_ab = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(active_branches)')}
+        for col, defn in [('budget',         'INTEGER'),
+                          ('best_max_depth', 'INTEGER'),
+                          ('tainted',        'INTEGER NOT NULL DEFAULT 0')]:
+            if col not in existing_ab:
+                self._conn.execute(
+                    f'ALTER TABLE active_branches ADD COLUMN {col} {defn}')
 
     def close(self):
         self._conn.close()
@@ -296,19 +322,24 @@ class ErdQueue:
                   current_subset_key, n_words, started_at: int,
                   chunks_done: int, chunk_idx=None, chunk_started_at=None,
                   cand_rate=None, cache_hits=None, cache_misses=None,
-                  n_pruned=None, n_ok=None, best_word=None, best_erd=None):
+                  n_pruned=None, n_ok=None, best_word=None, best_erd=None,
+                  cur_candidate=None, cand_n_seen=None, cand_chunk_size=None,
+                  cur_max_depth=None, cur_nodes=None, node_rate=None,
+                  cur_path=None):
         now = int(time.time())
         self._conn.execute("""
             INSERT OR REPLACE INTO worker_heartbeat
                 (worker_id, pid, current_subset_key, n_words, started_at,
                  updated_at, chunks_done, chunk_idx, chunk_started_at,
                  cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
-                 best_word, best_erd)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 best_word, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+                 cur_max_depth, cur_nodes, node_rate, cur_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_subset_key, n_words, started_at,
               now, chunks_done, chunk_idx, chunk_started_at,
               cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
-              best_word, best_erd))
+              best_word, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+              cur_max_depth, cur_nodes, node_rate, cur_path))
 
     def clear_heartbeat(self, worker_id: str):
         self._conn.execute(
@@ -375,21 +406,23 @@ class ErdQueue:
         return lo, hi
 
     def create_branch(self, subset_key, n_words, n_candidates, chunk_size,
-                      priority=0, source_word=None, source_pattern=None) -> bool:
+                      priority=0, source_word=None, source_pattern=None,
+                      budget=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
         from the queue creates it; others that race simply see it exists and
-        join.  Returns True if this call created the row.
+        join.  Returns True if this call created the row.  budget is the guess
+        budget the branch is solved under (depth-limited ERD).
         """
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
                 (subset_key, n_words, n_candidates, chunk_size,
-                 priority, source_word, source_pattern, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                 priority, source_word, source_pattern, status, created_at, budget)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
         """, (subset_key, n_words, n_candidates, chunk_size,
-              priority, source_word, source_pattern, now))
+              priority, source_word, source_pattern, now, budget))
         return cur.rowcount == 1
 
     def get_branch(self, subset_key):
@@ -440,14 +473,19 @@ class ErdQueue:
             WHERE subset_key = ? AND idx = ?
         """, (now, subset_key, idx))
 
-    def update_branch_best(self, subset_key, best_word, best_erd):
-        """Lower the branch's running best (monotone — never raises it)."""
+    def update_branch_best(self, subset_key, best_word, best_erd, max_depth=None):
+        """Lower the branch's running best (monotone — never raises it).
+
+        max_depth is the winning candidate's worst-case line length; it is
+        stored atomically with the best it belongs to, so best_max_depth always
+        describes the current best_word.
+        """
         self._conn.execute("""
             UPDATE active_branches
-            SET best_erd = ?, best_word = ?
+            SET best_erd = ?, best_word = ?, best_max_depth = ?
             WHERE subset_key = ?
               AND (best_erd IS NULL OR ? < best_erd)
-        """, (best_erd, best_word, subset_key, best_erd))
+        """, (best_erd, best_word, max_depth, subset_key, best_erd))
 
     def read_branch_best(self, subset_key):
         """Return (best_word, best_erd) or (None, None)."""
@@ -457,6 +495,25 @@ class ErdQueue:
         if row is None:
             return (None, None)
         return (row["best_word"], row["best_erd"])
+
+    def mark_branch_tainted(self, subset_key):
+        """Set the branch's taint flag (monotone OR): some candidate, in some
+        worker, was excluded by the depth cap, so the branch's ERD is only
+        valid at its solve budget."""
+        self._conn.execute(
+            "UPDATE active_branches SET tainted = 1 WHERE subset_key = ?",
+            (subset_key,))
+
+    def read_branch_meta(self, subset_key):
+        """Return (best_word, best_erd, best_max_depth, tainted, budget) or
+        None — everything finalize needs to write a depth-limited cache entry."""
+        row = self._conn.execute(
+            "SELECT best_word, best_erd, best_max_depth, tainted, budget "
+            "FROM active_branches WHERE subset_key = ?", (subset_key,)).fetchone()
+        if row is None:
+            return None
+        return (row["best_word"], row["best_erd"], row["best_max_depth"],
+                bool(row["tainted"]), row["budget"])
 
     def branch_done_chunks(self, subset_key) -> int:
         return self._conn.execute(

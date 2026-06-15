@@ -133,7 +133,28 @@ def cmd_bootstrap(args):
 # run (supervisor)
 # ---------------------------------------------------------------------------
 
+def _checkpoint_cache_on_start(cache_path):
+    """Flush any leftover WAL into the main DB through SQLite's own recovery.
+
+    A worker killed mid-write leaves a -wal holding committed transactions.
+    NEVER delete that file: SQLite replays it on the next open, and removing
+    it discards committed data and corrupts the main DB.  Instead open the
+    DB single-threaded and TRUNCATE-checkpoint, which is the blessed way to
+    drain the WAL cleanly before the worker swarm starts hammering it.
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect(cache_path, timeout=60)
+        conn.execute('PRAGMA busy_timeout = 60000')
+        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        conn.close()
+        print('Startup: WAL checkpointed clean.')
+    except sqlite3.Error as e:
+        print(f'Startup: WAL checkpoint failed: {e}', file=sys.stderr)
+
+
 def cmd_run(args):
+    _checkpoint_cache_on_start(args.cache)
     queue = ErdQueue(args.queue)
     stale = queue.reset_stale_in_progress()
     nb, nc = queue.reset_active_branches()
@@ -289,7 +310,7 @@ def _print_status(args):
     # Cache throughput
     try:
         all_answers = load_word_list(ANSWER_FILE)
-        sc = ScoreCache(args.cache, all_answers)
+        sc = ScoreCache(args.cache, all_answers, checkpoint_on_close=False)
         total_erd = sc._conn.execute(
             "SELECT COUNT(*) FROM subgroup_best_by_policy "
             "WHERE policy=? AND universe_id=?",
@@ -375,11 +396,22 @@ def _print_status(args):
         held = now_ts - (h['chunk_started_at'] or now_ts)
         rate = h['cand_rate']
         rate_s = f'{rate/1000:.1f}k c/s' if rate else '  -  '
-        slow = '  !!slow' if (rate is not None and rate < 100 and held > 20) else ''
         done = h['chunks_done'] or 0
+        cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
+        n_seen = (h['cand_n_seen'] if 'cand_n_seen' in h.keys() else None) or 0
+        c_total = (h['cand_chunk_size'] if 'cand_chunk_size' in h.keys() else None) or 0
+        mdepth = (h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
+        nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
+        nrate = (h['node_rate'] if 'node_rate' in h.keys() else None) or 0.0
+        path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
+        # Forward-progress flag: heartbeat fresh but no nodes moving == real hang.
+        moving = '  !!HANG' if (age <= 10 and nrate == 0 and nodes) else ''
+        cand_s = (f' [{cur} {n_seen}/{c_total} d{mdepth} '
+                  f'{nodes/1e6:.1f}M nodes {nrate/1000:.0f}k/s sp:{path}]'
+                  if cur else '')
         print(f'  {h["worker_id"]:<10s} {src:<13s} chunk {str(chunk):>3s} '
-              f'held {_fmt_duration(held):>5s}  {rate_s:>9s}  '
-              f'done {done:<4d} hb={age}s{flag}{slow}')
+              f'held {_fmt_duration(held):>5s}  '
+              f'done {done:<4d} hb={age}s{flag}{moving}{cand_s}')
 
 
 def _fmt_duration(seconds: int) -> str:
