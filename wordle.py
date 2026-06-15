@@ -2435,34 +2435,43 @@ def print_status(gs, solver=None):
             label = "guess" if nguesses == 1 else "guesses"
             line = f"{n:,} words left | {nguesses} {label} so far"
             scan_lines = []
-            if not soln._is_full_game():
-                erd_sc, erd_pol = _erd_cache_and_policy(gs, soln)
-                if erd_sc is not None:
-                    hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
-                    if hit is not None:
-                        line += f' | {hit[1]:.3f} {hit[0].upper()}'
-                    elif solver is not None and set(solver._words) == set(words):
-                        if solver.root_total == 0:
-                            scan_lines = ['ERD: ordering candidates...']
-                        elif solver.root_total > 0:
-                            scan_lines = _format_scan_progress(
-                                solver.root_done, solver.root_total,
-                                solver.root_best, solver.culled,
-                                solver.current_word_tag(), suffix=' cands')
-                # Scoring method cache status: one LIMIT 1 probe per method.
-                if soln.score_cache is not None:
-                    subset_key = ScoreCache.encode_subset(words)
-                    cached_methods = [
-                        label for m in ScoringMethod
-                        for label in (_METHOD_SHORT.get(m),)
-                        if label is not None
-                        and soln.score_cache.has_scores(
-                            subset_key, m.name.lower())
-                    ]
-                    if cached_methods:
-                        scan_lines.append(f'Scores: {" ".join(cached_methods)}')
-            elif gs.precache_solver is not None and gs.precache_solver.is_alive():
-                scan_lines = [gs.precache_solver.branches_line()]
+            erd_sc, erd_pol = _erd_cache_and_policy(gs, soln)
+            if erd_sc is not None:
+                hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
+                if hit is not None:
+                    line += f' | {hit[1]:.3f} {hit[0].upper()}'
+                elif solver is not None and set(solver._words) == set(words):
+                    if solver.root_total == 0:
+                        scan_lines = ['ERD: ordering candidates...']
+                    elif solver.root_total > 0:
+                        scan_lines = _format_scan_progress(
+                            solver.root_done, solver.root_total,
+                            solver.root_best, solver.culled,
+                            solver.current_word_tag(), suffix=' cands')
+                else:
+                    erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
+                    scored = _erd_solve_scores(soln, erd_sc, erd_pol,
+                                               guesses=erd_guesses)
+                    if scored:
+                        total = len(erd_guesses)
+                        bw, bs = scored[0]
+                        scan_lines = _format_scan_progress(
+                            len(scored), total, (bw, bs), 0, None,
+                            suffix=' cands')
+            # Scoring method cache status: one LIMIT 1 probe per method.
+            if soln.score_cache is not None:
+                subset_key = ScoreCache.encode_subset(words)
+                cached_methods = [
+                    label for m in ScoringMethod
+                    for label in (_METHOD_SHORT.get(m),)
+                    if label is not None
+                    and soln.score_cache.has_scores(
+                        subset_key, m.name.lower())
+                ]
+                if cached_methods:
+                    scan_lines.append(f'Scores: {" ".join(cached_methods)}')
+            if gs.precache_solver is not None and gs.precache_solver.is_alive():
+                scan_lines.append(gs.precache_solver.branches_line())
             print(line)
             for scan_line in scan_lines:
                 print(scan_line)
