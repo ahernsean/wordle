@@ -59,7 +59,27 @@ class ScoreCache:
         # same small subgroups millions of times across sibling branches.
         self._mem_cache = {}
 
+    def _is_migration_done(self, name):
+        """Return True if migration `name` has been recorded as complete."""
+        return self._conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?", (name,)
+        ).fetchone() is not None
+
+    def _mark_migration_done(self, name):
+        """Record migration `name` as complete so it is skipped on future opens."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, completed_at) VALUES (?, ?)",
+            (name, int(time.time()))
+        )
+
     def _ensure_schema(self):
+        # Must be first: every migration guard below reads from this table.
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name         TEXT PRIMARY KEY,
+                completed_at INTEGER NOT NULL
+            )
+        """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS universe (
                 universe_id  TEXT PRIMARY KEY,
@@ -174,16 +194,18 @@ class ScoreCache:
         #   erd_answers -> erd_answers_compliant  (answer list, clue-compliant)
         # 'erd_constrained' has no persisted rows: hard-mode ERD is
         # path-dependent and lives only in a transient MemoryScoreCache.
-        for old, new in (('erd_all', 'erd_words_unfiltered'),
-                         ('erd_answers', 'erd_answers_compliant')):
-            exists = self._conn.execute(
-                "SELECT 1 FROM subgroup_best_by_policy WHERE policy = ? LIMIT 1",
-                (old,)
-            ).fetchone()
-            if exists is not None:
-                self._conn.execute(
-                    "UPDATE subgroup_best_by_policy SET policy = ? WHERE policy = ?",
-                    (new, old))
+        if not self._is_migration_done('rename_erd_policies'):
+            for old, new in (('erd_all', 'erd_words_unfiltered'),
+                             ('erd_answers', 'erd_answers_compliant')):
+                exists = self._conn.execute(
+                    "SELECT 1 FROM subgroup_best_by_policy WHERE policy = ? LIMIT 1",
+                    (old,)
+                ).fetchone()
+                if exists is not None:
+                    self._conn.execute(
+                        "UPDATE subgroup_best_by_policy SET policy = ? WHERE policy = ?",
+                        (new, old))
+            self._mark_migration_done('rename_erd_policies')
         # word_scores used to be keyed only by (word, method, universe_id) —
         # i.e. scoped to the whole answer set, so it could only ever cache
         # the very first guess of a game. Replace it with a subset-scoped
@@ -211,25 +233,30 @@ class ScoreCache:
         # via existence-first LIMIT 1 (see _purge_legacy_rows) so a table with
         # no such rows — the steady state once this has run once — costs only
         # a single indexed-or-not probe, not a full scan, on every connection.
-        stale_method = self._conn.execute(
-            "SELECT 1 FROM word_scores WHERE method = 'minimax' LIMIT 1"
-        ).fetchone()
-        if stale_method is not None:
-            self._conn.execute("""
-                UPDATE word_scores SET method = 'max_group_size'
-                WHERE method = 'minimax'
-            """)
+        if not self._is_migration_done('rename_method_minimax'):
+            stale_method = self._conn.execute(
+                "SELECT 1 FROM word_scores WHERE method = 'minimax' LIMIT 1"
+            ).fetchone()
+            if stale_method is not None:
+                self._conn.execute("""
+                    UPDATE word_scores SET method = 'max_group_size'
+                    WHERE method = 'minimax'
+                """)
+            self._mark_migration_done('rename_method_minimax')
         # All valid 5-letter words are ASCII, so a null byte identifies the
         # old null-separated subset-key encoding.
-        self._purge_legacy_rows("instr(subset_key, char(0)) > 0", ())
+        self._purge_legacy_rows("instr(subset_key, char(0)) > 0", (),
+                                migration_name='purge_null_sep_keys')
         # 'erd' was renamed to 'erd_answers' and then superseded by 'erd_all'.
-        self._purge_legacy_rows("policy = ?", ('erd',))
+        self._purge_legacy_rows("policy = ?", ('erd',),
+                                migration_name='purge_policy_erd')
         # 'erd_hard' was renamed to 'erd_constrained'; constraint-compliant
         # mode is now always transient (MemoryScoreCache), so any persisted
         # rows under either name are useless regardless of age.
-        self._purge_legacy_rows("policy = ?", ('erd_hard',))
+        self._purge_legacy_rows("policy = ?", ('erd_hard',),
+                                migration_name='purge_policy_erd_hard')
 
-    def _purge_legacy_rows(self, where, params):
+    def _purge_legacy_rows(self, where, params, migration_name=None):
         """One-time cleanup of stale subgroup_best_by_policy rows.
 
         Once a legacy batch is gone it stays gone, so a full-table DELETE on
@@ -237,13 +264,20 @@ class ScoreCache:
         the whole table for nothing.  Check existence first — LIMIT 1 lets
         SQLite stop at the first match — and only DELETE when there's
         actually something to remove.
+
+        migration_name: if given, skip the entire check on future opens once
+        it has been recorded as done in schema_migrations.
         """
+        if migration_name and self._is_migration_done(migration_name):
+            return
         exists = self._conn.execute(
             f"SELECT 1 FROM subgroup_best_by_policy WHERE {where} LIMIT 1", params
         ).fetchone()
         if exists is not None:
             self._conn.execute(
                 f"DELETE FROM subgroup_best_by_policy WHERE {where}", params)
+        if migration_name:
+            self._mark_migration_done(migration_name)
 
     def _ensure_universe(self):
         canonical = "\n".join(self.answer_words)

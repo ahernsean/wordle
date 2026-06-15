@@ -935,7 +935,13 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_old_minimax_method_key_is_migrated(self):
         # Simulate rows persisted under the pre-rename method key.
+        # Compute universe_id directly (same formula as ScoreCache._ensure_universe)
+        # so no ScoreCache open marks the migration done before we insert legacy data.
         import sqlite3 as _sqlite3
+        import hashlib as _hashlib
+        universe_id = _hashlib.sha256(
+            "\n".join(ANSWERS).encode()
+        ).hexdigest()
         conn = _sqlite3.connect(self.db)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS word_scores (
@@ -947,7 +953,6 @@ class TestScoreCacheSQLite(unittest.TestCase):
         """)
         subset_key = ScoreCache.encode_subset(["crane", "slate"])
         subset_hash = ScoreCache._subset_hash(subset_key)
-        universe_id = ScoreCache(self.db, ANSWERS).universe_id
         conn.execute(
             "INSERT OR REPLACE INTO word_scores VALUES (?,?,?,?,?,?)",
             (subset_hash, "crane", "minimax", 4.0, universe_id, 0),
@@ -3804,7 +3809,8 @@ class TestPrintStatusSingleBoard(unittest.TestCase):
                 print_status(gs, solver)
             text = out.getvalue()
             self.assertIn("3 words left | 1 guess so far", text)
-            self.assertIn("ERD: ordering candidates...", text)
+            self.assertIn("ERD:", text)
+            self.assertIn("ordering candidates...", text)
         finally:
             sc.close()
             os.unlink(tmp.name)

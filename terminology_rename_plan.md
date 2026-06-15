@@ -59,3 +59,57 @@ data values, already migrated once, and not identifiers.
 
 Do it as one dedicated PR with the full test suite green, not folded into a
 feature change.
+
+---
+
+## Deferred: opening ERD progress N/M at startup
+
+The startup message shows "Opening ERD: in progress" when the root position
+isn't solved yet.  The user wants N/M (candidates evaluated / total) instead.
+
+The problem: checking coverage candidate-by-candidate requires O(covered ×
+subgroups_per_word) SQLite reads, which is fast when coverage is 0% (breaks on
+first miss) but gets **slower** as coverage grows (more subgroups to verify per
+covered word).  In testing, 0% coverage takes ~3s and 50% coverage would take
+~9s — worse as the solver makes progress.
+
+**Fix requires a metadata counter** (incrementing a `cache_stats` row on each
+ERD write in `ScoreCache.write()`) so the count can be read in O(1) at startup.
+The counter would track `(policy, universe_id) → subgroup_count`.  Linking this
+count back to "candidates fully covered" still requires knowing the subgroup
+structure, but tracking the raw subgroup count is a good starting point.
+
+---
+
+## Collision: "universe" means two different things
+
+There are two unrelated concepts both called "universe":
+
+**`universe_id` / `universe` table (cache_sqlite.py)** — a SHA-256 fingerprint
+of the *answer word list* (the 3,200 NYT words).  It namespaces cache rows so
+that a different answer list produces a clean, non-conflicting namespace in the
+same database file.  This can change — if NYT updates their word list, the
+fingerprint changes and all prior cache entries become unreachable.
+
+**`GuessUniverse` enum (wordle_engine.py)** — which words are eligible as
+*guesses*: the full 12,972-word dictionary (`ALL_WORDS`) or only the 3,200
+answer words (`ALL_ANSWERS`).  This is a per-session strategy toggle (the `c`
+command), completely independent of the answer list.
+
+### Rename target
+
+| current | rename to | where |
+|---|---|---|
+| `universe_id` (column/var) | `answer_list_id` | cache_sqlite.py, schema |
+| `universe` (table) | `answer_list` | cache_sqlite.py, schema |
+| `_ensure_universe` (method) | `_ensure_answer_list` | cache_sqlite.py |
+
+`GuessUniverse` stays — it correctly describes what it is (the universe of
+valid guesses).
+
+### Coordination note
+
+`universe_id` is in a shared SQLite schema (Linux + phone).  The rename needs
+the same migration-chain treatment as the other table/column renames: add
+`ALTER TABLE universe RENAME TO answer_list` and update the column reference in
+`_ensure_schema`, guarded by the `schema_migrations` table so it runs once.

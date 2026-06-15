@@ -619,6 +619,24 @@ def print_word_list(words, limit=20):
         print(f'    ... ({len(words)} total)')
 
 
+def _fmt_size(n):
+    """Format a byte count as a human-readable string (e.g. '3.7 GB')."""
+    for unit in ('B', 'KB', 'MB'):
+        if n < 1024:
+            return f'{n:.0f} {unit}'
+        n /= 1024
+    return f'{n:.1f} GB' if n < 1024 else f'{n / 1024:.1f} TB'
+
+
+# Short labels for scoring methods used in status lines.
+_METHOD_SHORT = {
+    ScoringMethod.ENTROPY_GAIN:   'ent',
+    ScoringMethod.MAX_GROUP_SIZE: 'max',
+    ScoringMethod.WEIGHTED_AVG:   'wt',
+    ScoringMethod.PROB_FINISH:    'p%',
+}
+
+
 def print_guesses(soln):
     """Print guess history with colored output."""
     reset_color()
@@ -1112,6 +1130,40 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
         return None
     results.sort(key=lambda x: x[1])
     return results
+
+
+def _erd_candidate_coverage(soln, score_cache, policy):
+    """Count how many of soln.current_words have all their ERD subgroups cached.
+
+    Returns (covered, total).  A word is "covered" when every response
+    subgroup it would produce against current_words either is a singleton
+    (cost is always 1 more guess, no lookup needed) or has a cached ERD
+    result.  Covered words can be immediately ERD-ranked; uncovered ones
+    are still being computed in the background.
+    """
+    from wordle_engine import _encode_response
+    cache = soln.cache
+    covered = 0
+    for word in soln.current_words:
+        if cache and word in cache.answer_words:
+            groups = cache.group_words(word, soln.current_words)
+        else:
+            groups = defaultdict(list)
+            for answer in soln.current_words:
+                pat = _encode_response(calculate_response(word, answer))
+                groups[pat].append(answer)
+        ok = True
+        for sg in groups.values():
+            k = len(sg)
+            if k == 0 or k == 1:
+                continue  # solved or singleton — no cache lookup needed
+            hit = score_cache.read(ScoreCache.encode_subset(sg), policy)
+            if hit is None:
+                ok = False
+                break
+        if ok:
+            covered += 1
+    return covered, len(soln.current_words)
 
 
 def cmd_solve(gs):
@@ -2431,6 +2483,16 @@ def print_status(gs, solver=None):
                                 solver.root_done, solver.root_total,
                                 solver.root_best, solver.culled,
                                 solver.current_word_tag(), suffix=' cands')
+                # Scoring method cache status: one point read per method.
+                if soln.score_cache is not None:
+                    subset_key = ScoreCache.encode_subset(words)
+                    cached_methods = [
+                        _METHOD_SHORT[m] for m in ScoringMethod
+                        if soln.score_cache.read_scores(
+                            subset_key, m.name.lower()) is not None
+                    ]
+                    if cached_methods:
+                        scan_lines.append(f'Scores: {" ".join(cached_methods)}')
             elif gs.precache_solver is not None and gs.precache_solver.is_alive():
                 scan_lines = [gs.precache_solver.branches_line()]
             print(line)
@@ -3018,21 +3080,22 @@ def main():
     print(f"Loaded {len(all_answers):,} answers, "
           f"{len(all_words):,} guesses.")
 
-    # Opening a large cache runs schema-migration probes that can scan the
-    # multi-million-row tables, and stats() below COUNTs them — each takes a
-    # few seconds on a full cache.  Announce both so a slow open doesn't look
-    # like a hang.
-    print("Opening cache (schema check)...", flush=True)
+    print("Opening cache...", flush=True)
     _t0 = time.time()
     gs = GameState(all_answers, all_words)
-    print(f"  opened in {time.time() - _t0:.1f}s")
-
-    print("Counting cache rows...", flush=True)
-    _t0 = time.time()
-    sp_rows, ws_rows, rd_rows, mtime = gs.score_cache.stats()
-    print(f"Cache: {sp_rows:,} subgroup picks  ({time.time() - _t0:.1f}s)")
-    print(f"  {ws_rows:,} word scores, {rd_rows:,} decomps")
-    print(f"  last write {_format_cache_timestamp(mtime)}")
+    _open_s = time.time() - _t0
+    _size_str = _fmt_size(os.path.getsize(gs.score_cache_path))
+    _mtime_str = datetime.fromtimestamp(
+        os.path.getmtime(gs.score_cache_path)
+    ).strftime('%Y-%m-%d %H:%M')
+    print(f"  {_size_str}, opened in {_open_s:.1f}s")
+    print(f"  last write {_mtime_str}")
+    _root_hit = gs.score_cache.read(
+        ScoreCache.encode_subset(all_answers), ERD_ALL)
+    if _root_hit is not None:
+        print(f"  Opening ERD: solved · {_root_hit[0].upper()} {_root_hit[1]:.3f}")
+    else:
+        print(f"  Opening ERD: in progress")
 
     print_status(gs)
     _solver = None
