@@ -631,8 +631,8 @@ def _fmt_size(n):
 # Short labels for scoring methods used in status lines.
 _METHOD_SHORT = {
     ScoringMethod.ENTROPY_GAIN:   'ent',
-    ScoringMethod.MAX_GROUP_SIZE: 'max',
-    ScoringMethod.WEIGHTED_AVG:   'wt',
+    ScoringMethod.MAX_GROUP_SIZE: 'g-max',
+    ScoringMethod.WEIGHTED_AVG:   'g-wt',
     ScoringMethod.PROB_FINISH:    'p%',
 }
 
