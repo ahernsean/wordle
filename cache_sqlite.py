@@ -37,9 +37,11 @@ class ScoreCache:
     produces a clean namespace without needing a new file.
     """
 
-    def __init__(self, db_path, answer_words, timeout=30.0):
+    def __init__(self, db_path, answer_words, timeout=30.0,
+                 checkpoint_on_close=True):
         self.db_path = Path(db_path)
         self.answer_words = list(answer_words)
+        self.checkpoint_on_close = checkpoint_on_close
         self._conn = sqlite3.connect(
             self.db_path, timeout=timeout, isolation_level=None
         )
@@ -136,6 +138,33 @@ class ScoreCache:
             self._conn.execute(
                 "ALTER TABLE subgroup_best_by_policy "
                 "RENAME COLUMN subset_blob TO subset_key")
+        # max_depth: worst-case line length of best_word's strategy.  ERD is
+        # now depth-limited ("expected remaining depth AND a guaranteed win
+        # within budget"), so a cached entry is only reusable at a remaining
+        # budget B when max_depth <= B.  Existing rows predate this and get
+        # NULL — read as "depth unknown", hence never budget-safe, so they're
+        # recomputed under the cap rather than trusted.  Nullable so the
+        # column adds cleanly to a multi-GB file (metadata-only ALTER).
+        cols = {row["name"] for row in
+                self._conn.execute("PRAGMA table_info(subgroup_best_by_policy)")}
+        if cols and "max_depth" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subgroup_best_by_policy ADD COLUMN max_depth INTEGER")
+        # solve_budget encodes the reuse range of a depth-limited entry:
+        #   NULL  -> untainted: the cap never excluded any candidate anywhere,
+        #            so the value IS the unconstrained optimum.  Reusable at
+        #            any remaining budget >= max_depth.
+        #   = b   -> tainted: a sibling candidate was killed by the cap, so
+        #            this winner is only optimal *at budget b* (one more guess
+        #            could revive the killed sibling).  Reusable only when the
+        #            remaining budget == b.
+        # Legacy rows are NULL but also have NULL max_depth, so the budget-aware
+        # reader rejects them (unknown depth) and recomputes.
+        cols = {row["name"] for row in
+                self._conn.execute("PRAGMA table_info(subgroup_best_by_policy)")}
+        if cols and "solve_budget" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subgroup_best_by_policy ADD COLUMN solve_budget INTEGER")
         # ERD policy names were renamed so both axes of the (guess-universe x
         # compliance-filter) selection are spelled out in the namespace
         # itself — 'erd_all' named only the universe, 'erd_answers' folded
@@ -228,7 +257,8 @@ class ScoreCache:
         return universe_id
 
     def close(self):
-        self.checkpoint()
+        if self.checkpoint_on_close:
+            self.checkpoint()
         self._conn.close()
 
     def checkpoint(self):
@@ -279,14 +309,33 @@ class ScoreCache:
         that scoping, so the columns themselves can stay "best_word"/
         "best_score" without re-litigating it.
         """
-        mem_key = (subset_key, policy)
-        cached = self._mem_cache.get(mem_key)
+        cached = self._mem_cache.get((subset_key, policy))
+        if cached is not None:
+            self.read_hits += 1
+            return cached[:2]
+        full = self._read_full(subset_key, policy)
+        if full is None:
+            return None
+        return full[:2]
+
+    def read_with_depth(self, subset_key, policy):
+        """Like read(), but returns (best_word, best_score, max_depth, solve_budget).
+
+        max_depth is the worst-case line length of best_word's strategy (None
+        for legacy rows).  solve_budget is the reuse-range marker (see schema):
+        None = untainted, reusable at any budget >= max_depth; an int b =
+        tainted, reusable only at remaining budget == b.  A budget-aware caller
+        must apply that rule; a legacy row (max_depth None) is never reusable.
+        """
+        cached = self._mem_cache.get((subset_key, policy))
         if cached is not None:
             self.read_hits += 1
             return cached
+        return self._read_full(subset_key, policy)
 
+    def _read_full(self, subset_key, policy):
         row = self._conn.execute("""
-            SELECT best_word, best_score
+            SELECT best_word, best_score, max_depth, solve_budget
             FROM subgroup_best_by_policy
             WHERE subset_key = ? AND policy = ? AND universe_id = ?
         """, (subset_key, policy, self.universe_id)).fetchone()
@@ -294,16 +343,22 @@ class ScoreCache:
             self.read_misses += 1
             return None
         self.read_hits += 1
-        result = (row["best_word"], row["best_score"])
-        self._mem_cache[mem_key] = result
+        result = (row["best_word"], row["best_score"],
+                  row["max_depth"], row["solve_budget"])
+        self._mem_cache[(subset_key, policy)] = result
         return result
 
     def reset_read_counters(self):
         self.read_hits = 0
         self.read_misses = 0
 
-    def write(self, subset_key, policy, best_word, best_score):
-        """Store the word a policy's search judged best for a subgroup, and its score.
+    def write(self, subset_key, policy, best_word, best_score,
+              max_depth=None, solve_budget=None):
+        """Store the word a policy's search judged best for a subgroup, its
+        score, and (for depth-limited ERD) the worst-case line length of that
+        strategy plus its reuse-range marker.  max_depth=None marks a
+        legacy/unbudgeted write; solve_budget None=untainted, int=tainted at
+        that budget (see read_with_depth / schema).
 
         A transient 'disk I/O error' (e.g. iCloud File Provider Storage
         holding the cache file's lock during a sync pass — see checkpoint())
@@ -320,17 +375,18 @@ class ScoreCache:
             self._conn.execute("""
                 INSERT OR REPLACE INTO subgroup_best_by_policy
                     (subset_key, policy, universe_id,
-                     best_word, best_score, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     best_word, best_score, updated_at, max_depth, solve_budget)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (subset_key, policy, self.universe_id,
-                  best_word, best_score, now))
+                  best_word, best_score, now, max_depth, solve_budget))
             self.write_count += 1
         except sqlite3.OperationalError as exc:
             if not _is_disk_io_error(exc):
                 raise
             logger.warning("write(%s, %s, %.3f) failed: %s",
                             policy, best_word, best_score, exc)
-        self._mem_cache[(subset_key, policy)] = (best_word, best_score)
+        self._mem_cache[(subset_key, policy)] = (
+            best_word, best_score, max_depth, solve_budget)
 
     def read_detail(self, subset_key, policy):
         """Like read(), but also returns the unix timestamp of the last write.
@@ -481,7 +537,8 @@ class MemoryScoreCache:
     """
 
     def __init__(self):
-        self._data = {}  # (scope, subset_key_bytes, policy) -> (best_word, best_score)
+        # (scope, subset_key, policy) -> (best_word, best_score, max_depth, solve_budget)
+        self._data = {}
         self._scope = None
         self.read_hits = 0
         self.read_misses = 0
@@ -501,16 +558,26 @@ class MemoryScoreCache:
         result = self._data.get((self._scope, subset_key, policy))
         if result is None:
             self.read_misses += 1
-        else:
-            self.read_hits += 1
+            return None
+        self.read_hits += 1
+        return result[:2]
+
+    def read_with_depth(self, subset_key, policy):
+        result = self._data.get((self._scope, subset_key, policy))
+        if result is None:
+            self.read_misses += 1
+            return None
+        self.read_hits += 1
         return result
 
     def reset_read_counters(self):
         self.read_hits = 0
         self.read_misses = 0
 
-    def write(self, subset_key, policy, best_word, best_score):
-        self._data[(self._scope, subset_key, policy)] = (best_word, best_score)
+    def write(self, subset_key, policy, best_word, best_score,
+              max_depth=None, solve_budget=None):
+        self._data[(self._scope, subset_key, policy)] = (
+            best_word, best_score, max_depth, solve_budget)
         self.write_count += 1
 
     def close(self):

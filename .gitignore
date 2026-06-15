@@ -7,3 +7,13 @@ wordle_cache.sqlite3
 wordle_cache.sqlite3-shm
 wordle_cache.sqlite3-wal
 wordle_debug.log
+
+# ERD parallel precache runtime files
+erd_queue.sqlite3
+erd_queue.sqlite3-shm
+erd_queue.sqlite3-wal
+erd_search.log
+erd_worker_*.log
+wordle_erd_export.sqlite3
+wordle_erd_export.sqlite3-shm
+wordle_erd_export.sqlite3-wal

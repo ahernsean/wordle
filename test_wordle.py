@@ -29,7 +29,8 @@ from wordle_engine import (
     decode_response, _ALL_GREEN_PATTERN,
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
-    enumerate_branches, rank_guesses_by_group_then_entropy,
+    enumerate_branches, rank_guesses_by_group_then_entropy, _cache_reuse,
+    _solve_subset,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -595,7 +596,8 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc = ScoreCache(self.db, ANSWERS)
         subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
         sc.write(subset_key, "full", "heart", 2.5)
-        self.assertEqual(sc._mem_cache[(subset_key, "full")], ("heart", 2.5))
+        self.assertEqual(sc._mem_cache[(subset_key, "full")],
+                         ("heart", 2.5, None, None))
 
         # Closing the connection proves this read is served from memory,
         # not a fresh SQLite round trip.
@@ -611,7 +613,8 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc2 = ScoreCache(self.db, ANSWERS)
         first = sc2.read(subset_key, "hard")
         self.assertEqual(first, ("earth", 1.8))
-        self.assertEqual(sc2._mem_cache[(subset_key, "hard")], ("earth", 1.8))
+        self.assertEqual(sc2._mem_cache[(subset_key, "hard")],
+                         ("earth", 1.8, None, None))
 
         # A second read must not touch SQLite at all.
         sc2._conn.close()
@@ -739,7 +742,8 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
         self.assertIsNone(sc.read_detail(subset_key, "full"),
                           "failed write must not be persisted")
-        self.assertEqual(sc._mem_cache[(subset_key, "full")], ("heart", 2.5),
+        self.assertEqual(sc._mem_cache[(subset_key, "full")],
+                          ("heart", 2.5, None, None),
                           "result must still be memoized for this run")
         sc.close()
 
@@ -1679,7 +1683,14 @@ class TestMinExpectedGuesses(unittest.TestCase):
             # (i.e. every recursive call) finds the deadline already blown.
             return real_time() if calls[0] <= 1 else deadline + 1
 
-        with mock.patch('wordle_engine.time.time', side_effect=fake_time):
+        # Pin best-first ordering OFF for this test.  Timeout propagation is
+        # independent of candidate ordering, but ordering can solve a tiny set
+        # in one ply (all-singleton split, then cost_lb prunes the rest),
+        # leaving no deeper recursive call for the deadline to interrupt.  With
+        # ordering off the set deterministically recurses, exercising the path
+        # under test regardless of how ORDER_MIN_N is later tuned.
+        with mock.patch('wordle_engine.ORDER_MIN_N', 10 ** 9), \
+             mock.patch('wordle_engine.time.time', side_effect=fake_time):
             result = min_expected_guesses(words, self.cache, None,
                                            deadline=deadline, guesses=words)
         self.assertIsNone(result)
@@ -1750,6 +1761,128 @@ class TestMinExpectedGuesses(unittest.TestCase):
             self.assertEqual(heartbeats, [1])
         finally:
             os.unlink(tmp.name)
+
+
+class TestDepthLimitedERD(unittest.TestCase):
+    """Budget-limited ERD: the minimum expected guesses among strategies that
+    are guaranteed to win within `budget`.  A generous budget reproduces the
+    unlimited optimum; a budget below a position's worst-case line makes it
+    infeasible (None) — a position you would lose in a real game."""
+
+    # 8 words sharing the suffix "ound"; each distinguishing first letter
+    # (b/f/h/m/p/r/s/w) appears nowhere in "ound", so answers-only guessing
+    # isolates exactly one word at a time — a clean linear probe with a
+    # worst-case line of 8 and ERD = (1+..+8)/8 = 4.5.
+    LINEAR = ["bound", "found", "hound", "mound",
+              "pound", "round", "sound", "wound"]
+
+    def setUp(self):
+        self.cache = ResponseCache(ANSWERS)
+        self.lcache = ResponseCache(self.LINEAR)
+
+    def test_generous_budget_matches_unlimited(self):
+        subset = ANSWERS[:6]
+        unlimited = min_expected_guesses(subset, self.cache, None, guesses=subset)
+        budgeted = min_expected_guesses(subset, self.cache, None,
+                                        guesses=subset, budget=6)
+        self.assertAlmostEqual(unlimited, budgeted, places=10)
+
+    def test_pair_needs_budget_two(self):
+        pair = [ANSWERS[0], ANSWERS[1]]
+        self.assertAlmostEqual(
+            min_expected_guesses(pair, self.cache, None, guesses=pair, budget=2),
+            1.5, places=10)
+        self.assertIsNone(
+            min_expected_guesses(pair, self.cache, None, guesses=pair, budget=1))
+
+    def test_infeasible_below_worst_case_depth(self):
+        # Exactly fits at budget 8 (worst-case line length), infeasible at 7.
+        fit = min_expected_guesses(self.LINEAR, self.lcache, None,
+                                   guesses=self.LINEAR, budget=8)
+        self.assertAlmostEqual(fit, 4.5, places=10)
+        self.assertIsNone(
+            min_expected_guesses(self.LINEAR, self.lcache, None,
+                                 guesses=self.LINEAR, budget=7))
+
+    def test_max_depth_persisted(self):
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, self.LINEAR)
+            lcache = ResponseCache(self.LINEAR, score_cache=sc)
+            min_expected_guesses(self.LINEAR, lcache, sc,
+                                 guesses=self.LINEAR, budget=8)
+            entry = sc.read_with_depth(
+                ScoreCache.encode_subset(self.LINEAR), ERD_ALL)
+            self.assertIsNotNone(entry)
+            _bw, _score, max_depth, solve_budget = entry
+            self.assertEqual(max_depth, 8)         # worst-case line length
+            self.assertIsNone(solve_budget)        # untainted: budget 8 fit exactly
+        finally:
+            os.unlink(tmp.name)
+
+
+class TestSubbranchSolverHook(unittest.TestCase):
+    """The subbranch_solver hook lets the swarm divert a sub-branch to a
+    cooperative parallel solve.  It must be correctness-neutral: a hook that
+    simply solves inline yields the identical ERD as no hook at all."""
+
+    def setUp(self):
+        self.cache = ResponseCache(ANSWERS)
+
+    def test_inline_hook_matches_no_hook(self):
+        subset = ANSWERS[:8]
+        without = min_expected_guesses(subset, self.cache, None,
+                                       guesses=GUESSES, budget=6)
+
+        calls = []
+        def inline_solver(words, budget):
+            calls.append(len(words))
+            # Solve inline (no further delegation) -> identical to recursion.
+            return _solve_subset(words, self.cache, None, budget, None, GUESSES,
+                                 ERD_ALL, None, None, 0, None, None, None)
+
+        with_hook = min_expected_guesses(subset, self.cache, None,
+                                         guesses=GUESSES, budget=6,
+                                         subbranch_solver=inline_solver)
+        self.assertEqual(without, with_hook)
+        self.assertTrue(calls)  # the hook actually fired on sub-branches
+
+    def test_declining_hook_falls_through(self):
+        subset = ANSWERS[:8]
+        without = min_expected_guesses(subset, self.cache, None,
+                                       guesses=GUESSES, budget=6)
+        # A hook that always declines (returns None) must change nothing.
+        with_decline = min_expected_guesses(
+            subset, self.cache, None, guesses=GUESSES, budget=6,
+            subbranch_solver=lambda w, b: None)
+        self.assertEqual(without, with_decline)
+
+
+class TestCacheReuseRule(unittest.TestCase):
+    """_cache_reuse decides whether a cached (best_word, score, max_depth,
+    solve_budget) entry is valid at a given remaining budget."""
+
+    def test_unlimited_reuses_legacy_and_untainted_not_tainted(self):
+        # legacy (max_depth None) and untainted (solve_budget None) are
+        # unconstrained optima -> reusable unlimited; tainted is budget-specific.
+        self.assertEqual(_cache_reuse(("w", 3.0, None, None), None), (3.0, None, False))
+        self.assertEqual(_cache_reuse(("w", 3.0, 4, None), None), (3.0, 4, False))
+        self.assertIsNone(_cache_reuse(("w", 3.0, 4, 5), None))
+        self.assertIsNone(_cache_reuse(None, None))
+
+    def test_budgeted_rejects_legacy(self):
+        self.assertIsNone(_cache_reuse(("w", 3.0, None, None), 5))
+
+    def test_budgeted_untainted_valid_when_fits(self):
+        self.assertEqual(_cache_reuse(("w", 3.0, 4, None), 5), (3.0, 4, False))
+        self.assertEqual(_cache_reuse(("w", 3.0, 5, None), 5), (3.0, 5, False))
+        self.assertIsNone(_cache_reuse(("w", 3.0, 6, None), 5))   # too deep
+
+    def test_budgeted_tainted_valid_only_at_exact_budget(self):
+        self.assertEqual(_cache_reuse(("w", 3.0, 4, 5), 5), (3.0, 4, True))
+        self.assertIsNone(_cache_reuse(("w", 3.0, 4, 5), 6))      # revive siblings
+        self.assertIsNone(_cache_reuse(("w", 3.0, 4, 5), 4))
 
 
 # ---------------------------------------------------------------------------
@@ -2494,11 +2627,15 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
 
     def test_non_answer_word_appears_when_guesses_supplied(self):
         """
-        A non-answer word with all subgroup ERDs pre-solved appears in the
-        ranking when guesses= is passed to _erd_solve_scores.
+        Non-answer words are eligible for the ranking when guesses= is supplied
+        (the bug was that _erd_solve_scores only ever scored answer words).
+
+        Assert that *some* non-answer appears — not a specific one.  Candidate
+        ordering / cost_lb pruning may legitimately drop any individual weak
+        guess from the ranking (a pruned candidate's subgroups are never cached,
+        so it is skipped), and that is orthogonal to the invariant under test.
         """
         answers = ANSWERS[:5]
-        non_answer = next(w for w in GUESSES if w not in ANSWERS)
 
         with tempfile.TemporaryDirectory() as d:
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), answers)
@@ -2512,9 +2649,11 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
                                        policy=ERD_ALL, guesses=GUESSES)
             self.assertIsNotNone(scores)
             result_words = [w for w, _ in scores]
-            self.assertIn(non_answer, result_words,
-                          f"non-answer '{non_answer}' must appear in ERD ranking "
-                          f"when guesses= is supplied")
+            non_answers = [w for w in result_words if w not in ANSWERS]
+            self.assertTrue(
+                non_answers,
+                "at least one non-answer must appear in the ERD ranking when "
+                f"guesses= is supplied; got only answers: {result_words}")
 
     def test_without_guesses_only_answer_words_returned(self):
         """
