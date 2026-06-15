@@ -3053,7 +3053,7 @@ def main():
     gs = GameState(all_answers, all_words)
     _open_s = time.time() - _t0
     _size_str = _fmt_size(os.path.getsize(gs.score_cache_path))
-    _, _, _, _db_mtime = gs.score_cache.stats()
+    _db_mtime = gs.score_cache.last_write_ts()
     print(f"  {_size_str}, opened in {_open_s:.1f}s")
     print(f"  last write {_format_cache_timestamp(_db_mtime)}")
     _root_hit = gs.score_cache.read(

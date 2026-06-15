@@ -148,6 +148,12 @@ class ScoreCache:
             CREATE INDEX IF NOT EXISTS idx_subgroup_best_by_policy
             ON subgroup_best_by_policy(universe_id, policy)
         """)
+        # Covers MAX(updated_at) WHERE universe_id = ? — used by last_write_ts()
+        # on every startup. Without this index, that query scans all 3M+ rows.
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_subgroup_updated
+            ON subgroup_best_by_policy(universe_id, updated_at)
+        """)
         # 'subset_blob' was renamed to 'subset_key' — same encoding, cleaner
         # name that matches every other reference in this file.  Databases
         # migrated from lookahead_result or subgroup_pick may still carry the
@@ -546,6 +552,14 @@ class ScoreCache:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+    def last_write_ts(self):
+        """Return the unix timestamp of the most recent ERD write, or None."""
+        row = self._conn.execute("""
+            SELECT MAX(updated_at) AS m
+            FROM subgroup_best_by_policy WHERE universe_id = ?
+        """, (self.universe_id,)).fetchone()
+        return row["m"] if row else None
 
     def stats(self):
         """Return (subgroup_best_rows, word_score_rows, decomposition_rows, last_updated_ts)."""
