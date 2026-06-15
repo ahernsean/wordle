@@ -442,6 +442,16 @@ class ErdQueue:
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            # Never hand out (and thereby re-create) a chunk for a branch that
+            # has been finalized and deleted: a worker still looping on it would
+            # otherwise redo the whole branch from scratch.  Checked inside the
+            # write transaction so it can't race the finalize+delete.
+            br = self._conn.execute(
+                "SELECT status FROM active_branches WHERE subset_key = ?",
+                (subset_key,)).fetchone()
+            if br is None or br["status"] != "open":
+                self._conn.execute("COMMIT")
+                return None
             taken = {r["idx"] for r in self._conn.execute(
                 "SELECT idx FROM branch_chunks WHERE subset_key = ?",
                 (subset_key,))}

@@ -512,18 +512,21 @@ class _BranchWorker:
         n_chunks = ErdQueue.n_chunks_for(branch['n_candidates'],
                                          branch['chunk_size'])
         while not self.cancel():
+            # Stop the moment the branch is finalized (and its rows deleted) by
+            # any worker: otherwise claim_chunk, seeing no chunk rows for the
+            # now-deleted branch, would re-create them and redo the whole branch
+            # from scratch — doubling (or worse) the work for a large branch.
+            if self.queue.get_branch(subset_key) is None:
+                break
             idx = self.queue.claim_chunk(subset_key, self.name, n_chunks)
             if idx is None:
                 # Every chunk is claimed.  If coverage is complete, finalize and
-                # stop.  If the branch is already gone (finalized + deleted by a
-                # sibling), stop.  Otherwise some chunks are held by siblings —
-                # there is NO supervisor in this path, so free any whose holder
-                # has died and retry, rather than abandoning the branch one
-                # chunk short of finalizing (which would strand it forever).
+                # stop.  Otherwise some chunks are held by siblings — there is NO
+                # supervisor in this path, so free any whose holder has died and
+                # retry, rather than abandoning the branch one chunk short of
+                # finalizing (which would strand it forever).
                 if self.queue.branch_done_chunks(subset_key) >= n_chunks:
                     self.maybe_finalize(subset_key, words, n_chunks)
-                    break
-                if self.queue.get_branch(subset_key) is None:
                     break
                 self._heartbeat(subset_key, branch['n_words'], None, None, None,
                                 None, None, force=True)

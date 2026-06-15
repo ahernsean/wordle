@@ -155,6 +155,11 @@ def _checkpoint_cache_on_start(cache_path):
 
 def cmd_run(args):
     _checkpoint_cache_on_start(args.cache)
+    # Apply any pending ScoreCache schema migrations single-threaded now, before
+    # the worker processes open the cache concurrently — concurrent first-open
+    # would race on ALTER TABLE ADD COLUMN ("duplicate column name").
+    ScoreCache(args.cache, load_word_list(ANSWER_FILE),
+               checkpoint_on_close=False).close()
     queue = ErdQueue(args.queue)
     stale = queue.reset_stale_in_progress()
     nb, nc = queue.reset_active_branches()
