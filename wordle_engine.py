@@ -174,8 +174,11 @@ _ALL_GREEN_PATTERN = _encode_response(['green'] * 5)
 
 # Best-first candidate ordering kicks in only for nodes at least this large.
 # Ordering scans the full candidate vocab once (O(|vocab|*n)); below this size
-# the subtree it would prune is too small to repay that scan.
-ORDER_MIN_N = 8
+# the subtree it would prune is too small to repay that scan.  Tuned (=6): a
+# sweep showed the hard-branch win grows as gates drop toward ~4, but ordering
+# trivial nodes (n<=5) just adds scan cost the eval count can't see — and shifts
+# tie-breaks/pruning at small sizes for ~no gain.  6 captures ~90% of the win.
+ORDER_MIN_N = 6
 
 
 # ---------------------------------------------------------------------------
