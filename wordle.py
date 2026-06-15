@@ -2448,18 +2448,9 @@ def print_status(gs, solver=None):
                             solver.root_done, solver.root_total,
                             solver.root_best, solver.culled,
                             solver.current_word_tag(), suffix=' cands')
-                else:
-                    erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
-                    scored = _erd_solve_scores(soln, erd_sc, erd_pol,
-                                               guesses=erd_guesses)
-                    if scored:
-                        total = len(erd_guesses)
-                        bw, bs = scored[0]
-                        scan_lines = _format_scan_progress(
-                            len(scored), total, (bw, bs), 0, None,
-                            suffix=' cands')
             # Scoring method cache status: one LIMIT 1 probe per method.
-            if soln.score_cache is not None:
+            # Only meaningful post-guess — at the root the scan is vacuous.
+            if soln.score_cache is not None and not soln._is_full_game():
                 subset_key = ScoreCache.encode_subset(words)
                 cached_methods = [
                     label for m in ScoringMethod
