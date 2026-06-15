@@ -44,6 +44,11 @@ WORDS_FILE = 'wordle.txt'
 
 BEST_REFRESH_SECONDS = 0.25   # how often a worker re-reads the shared bound
 HB_SECONDS = 2.0              # liveness heartbeat cadence during a long chunk
+# A worker that hasn't heartbeat within this many seconds is presumed dead, and
+# only then are its in-flight chunks reclaimed.  Must be many multiples of
+# HB_SECONDS so a live-but-busy worker is never mistaken for dead (which would
+# let its slice be redone and finalized before it folds in a better candidate).
+HB_TIMEOUT_SECONDS = 120
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
@@ -401,6 +406,15 @@ class _BranchWorker:
             elif self.queue.branch_done_chunks(subset_key) >= n_chunks:
                 self.maybe_finalize(subset_key, words, n_chunks)
             else:
+                # Every chunk is claimed but coverage isn't complete: some are
+                # held by other workers.  Heartbeat first (so THIS worker, which
+                # still holds its own parent chunk up the stack, isn't itself
+                # presumed dead while it waits), then free any sub-chunk whose
+                # holder has died so we can re-claim it rather than wait forever
+                # — there may be no supervisor in the standalone solve path.
+                self._heartbeat(subset_key, n_words, None, None, None,
+                                None, None, force=True)
+                self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
                 time.sleep(0.05)            # chunks in flight elsewhere; let them land
 
         if self.cancel():
@@ -535,9 +549,22 @@ def _focused_worker(subset_key, worker_id, cache_path, queue_path,
         while True:
             idx = w.queue.claim_chunk(subset_key, w.name, n_chunks)
             if idx is None:
+                # Every chunk is claimed.  If coverage is complete, finalize and
+                # stop.  If the branch is already gone (finalized + deleted by a
+                # sibling), stop.  Otherwise some chunks are held by siblings —
+                # there is NO supervisor in this path, so free any whose holder
+                # has died and retry, rather than abandoning the branch one
+                # chunk short of finalizing (which would strand it forever).
                 if w.queue.branch_done_chunks(subset_key) >= n_chunks:
                     w.maybe_finalize(subset_key, words, n_chunks)
-                break
+                    break
+                if w.queue.get_branch(subset_key) is None:
+                    break
+                w._heartbeat(subset_key, branch['n_words'], None, None, None,
+                             None, None, force=True)
+                w.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
+                time.sleep(0.1)
+                continue
             if w.evaluate_chunk(subset_key, words, branch['n_words'],
                                 w._ranked_for(subset_key, words), idx,
                                 branch['chunk_size'], budget=budget):

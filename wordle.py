@@ -1551,9 +1551,13 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     if cache:
         s1_groups = cache.group_words(word, remaining)
     else:
+        # Key by the same integer response code cache.group_words uses, so the
+        # constraint-compliant branch below (decode_response(pat)) works whether
+        # or not a ResponseCache was supplied — a tuple key would raise there.
+        from wordle_engine import _encode_response
         s1_groups = defaultdict(list)
         for answer in remaining:
-            pat = tuple(calculate_response(word, answer))
+            pat = _encode_response(calculate_response(word, answer))
             s1_groups[pat].append(answer)
 
     _cached = soln.word_scores.get(word, {})
