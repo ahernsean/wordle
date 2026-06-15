@@ -1555,7 +1555,14 @@ class TestMinExpectedGuesses(unittest.TestCase):
             # (i.e. every recursive call) finds the deadline already blown.
             return real_time() if calls[0] <= 1 else deadline + 1
 
-        with mock.patch('wordle_engine.time.time', side_effect=fake_time):
+        # Pin best-first ordering OFF for this test.  Timeout propagation is
+        # independent of candidate ordering, but ordering can solve a tiny set
+        # in one ply (all-singleton split, then cost_lb prunes the rest),
+        # leaving no deeper recursive call for the deadline to interrupt.  With
+        # ordering off the set deterministically recurses, exercising the path
+        # under test regardless of how ORDER_MIN_N is later tuned.
+        with mock.patch('wordle_engine.ORDER_MIN_N', 10 ** 9), \
+             mock.patch('wordle_engine.time.time', side_effect=fake_time):
             result = min_expected_guesses(words, self.cache, None,
                                            deadline=deadline, guesses=words)
         self.assertIsNone(result)
@@ -2492,11 +2499,15 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
 
     def test_non_answer_word_appears_when_guesses_supplied(self):
         """
-        A non-answer word with all subgroup ERDs pre-solved appears in the
-        ranking when guesses= is passed to _erd_solve_scores.
+        Non-answer words are eligible for the ranking when guesses= is supplied
+        (the bug was that _erd_solve_scores only ever scored answer words).
+
+        Assert that *some* non-answer appears — not a specific one.  Candidate
+        ordering / cost_lb pruning may legitimately drop any individual weak
+        guess from the ranking (a pruned candidate's subgroups are never cached,
+        so it is skipped), and that is orthogonal to the invariant under test.
         """
         answers = ANSWERS[:5]
-        non_answer = next(w for w in GUESSES if w not in ANSWERS)
 
         with tempfile.TemporaryDirectory() as d:
             sc = ScoreCache(os.path.join(d, 'test.sqlite3'), answers)
@@ -2510,9 +2521,11 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
                                        policy=ERD_ALL, guesses=GUESSES)
             self.assertIsNotNone(scores)
             result_words = [w for w, _ in scores]
-            self.assertIn(non_answer, result_words,
-                          f"non-answer '{non_answer}' must appear in ERD ranking "
-                          f"when guesses= is supplied")
+            non_answers = [w for w in result_words if w not in ANSWERS]
+            self.assertTrue(
+                non_answers,
+                "at least one non-answer must appear in the ERD ranking when "
+                f"guesses= is supplied; got only answers: {result_words}")
 
     def test_without_guesses_only_answer_words_returned(self):
         """
