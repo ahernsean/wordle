@@ -155,6 +155,11 @@ def _checkpoint_cache_on_start(cache_path):
 
 def cmd_run(args):
     _checkpoint_cache_on_start(args.cache)
+    # Apply any pending ScoreCache schema migrations single-threaded now, before
+    # the worker processes open the cache concurrently — concurrent first-open
+    # would race on ALTER TABLE ADD COLUMN ("duplicate column name").
+    ScoreCache(args.cache, load_word_list(ANSWER_FILE),
+               checkpoint_on_close=False).close()
     queue = ErdQueue(args.queue)
     stale = queue.reset_stale_in_progress()
     nb, nc = queue.reset_active_branches()
@@ -196,21 +201,29 @@ def cmd_run(args):
     while not stop_event.is_set():
         time.sleep(5)
 
+        q = ErdQueue(args.queue)
         for wid, (p, started_at) in list(procs.items()):
             age = time.time() - started_at
             if not p.is_alive():
                 logger.info('Worker %d exited (age=%.0fs), respawning', wid, age)
+                _reap_worker(q, wid)
                 procs[wid] = _spawn_worker(wid, args, stop_event)
             elif age > args.recycle_hours * 3600:
                 logger.info('Worker %d recycle-hours hit (age=%.0fs), '
                             'terminating and respawning', wid, age)
                 p.terminate()
                 p.join(timeout=10)
+                if p.is_alive():
+                    logger.warning('Worker %d did not exit on SIGTERM; killing',
+                                   wid)
+                    p.kill()
+                    p.join(timeout=10)
+                _reap_worker(q, wid)
                 procs[wid] = _spawn_worker(wid, args, stop_event)
 
-        # Free chunks claimed by a worker that died mid-chunk so they get
-        # redone rather than stranding a branch one chunk short of finalizing.
-        q = ErdQueue(args.queue)
+        # Backstop: free chunks held by any worker that died WITHOUT being
+        # reaped above (e.g. it crashed and we haven't noticed yet).  Gated on
+        # heartbeat liveness, so a slow-but-alive worker is never reclaimed.
         freed = q.reclaim_stale_chunks(args.stale_chunk_seconds)
         if freed:
             logger.info('Reclaimed %d stale chunk claim(s).', freed)
@@ -236,6 +249,23 @@ def cmd_run(args):
         p.join(timeout=30)
     logger.info('Supervisor exited.')
     print('All workers stopped.')
+
+
+def _reap_worker(queue, worker_id: int):
+    """Free a dead/killed worker's in-flight chunk claims and clear its
+    heartbeat, BEFORE a replacement of the same name starts heartbeating.
+
+    Without this, a respawned worker-N would refresh the 'worker-N' heartbeat,
+    making the previous instance's orphaned (done=0) chunks look like they're
+    held by a live worker — so the liveness-gated reclaim would never free them
+    and the affected branches would never finalize.
+    """
+    name = f'worker-{worker_id}'
+    freed = queue.reclaim_chunks_of_worker(name)
+    queue.clear_heartbeat(name)
+    if freed:
+        logger.info('Reaped worker %d: freed %d chunk claim(s).',
+                    worker_id, freed)
 
 
 def _spawn_worker(worker_id: int, args, stop_event):
@@ -681,8 +711,10 @@ def main():
                             'bound ScoreCache memory growth (default: 3)')
     p_run.add_argument('--stale-chunk-seconds', type=int, default=600,
                        metavar='S',
-                       help='Reclaim a chunk claimed but not completed within '
-                            'S seconds (crashed worker; default: 600)')
+                       help='Backstop: reclaim a chunk whose worker has not '
+                            'heartbeat within S seconds (presumed crashed; '
+                            'live workers heartbeat every ~2s, so they are '
+                            'never reclaimed; default: 600)')
     p_run.add_argument('--allow-partial-queue', action='store_true',
                        help='Start workers even if bootstrap is not complete')
 

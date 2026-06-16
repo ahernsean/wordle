@@ -43,7 +43,7 @@ ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = "wordle_debug.log"
-BUILD = "b133"
+BUILD = "b134"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -105,7 +105,7 @@ PYTHONISTA_COLORS = {
     "gray":   (0.5, 0.5, 0.5),
 }
 
-if console is not None:
+if console is not None:  # pragma: no cover - Pythonista console only
     console.set_color()
 
 
@@ -147,7 +147,7 @@ def _detect_display_width() -> int:
         except ValueError:
             pass
 
-    if IS_PYTHONISTA and console is not None:
+    if IS_PYTHONISTA and console is not None:  # pragma: no cover - iOS/Pythonista-only ObjC view walking
         try:
             import ui
             w_points = None
@@ -1111,7 +1111,7 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
         ok = True
         for sg in groups.values():
             k = len(sg)
-            if k == 0:
+            if k == 0:  # pragma: no cover - defensive: response groups are never empty
                 continue
             if k == 1 and sg[0] == word:
                 continue  # all-green branch: solved, 0 extra guesses
@@ -1189,7 +1189,7 @@ def cmd_solve(gs):
             return
         erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
         scores = _erd_solve_scores(soln, erd_sc, erd_policy, guesses=erd_guesses)
-        if scores is None:
+        if scores is None:  # pragma: no cover - defensive: a cached root implies cached subgroups
             print_error("ERD cache incomplete — some subgroups missing.")
             return
         print("\nERD:")
@@ -1421,7 +1421,7 @@ def cmd_lookahead(gs):
     for word, first_ent in top_n:
         if soln.cache:
             grouped = soln.cache.group_words(word, soln.current_words)
-        else:
+        else:  # pragma: no cover - defensive: callers always supply a ResponseCache
             grouped = defaultdict(list)
             for answer in soln.current_words:
                 from wordle_engine import _encode_response
@@ -1551,9 +1551,13 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     if cache:
         s1_groups = cache.group_words(word, remaining)
     else:
+        # Key by the same integer response code cache.group_words uses, so the
+        # constraint-compliant branch below (decode_response(pat)) works whether
+        # or not a ResponseCache was supplied — a tuple key would raise there.
+        from wordle_engine import _encode_response
         s1_groups = defaultdict(list)
         for answer in remaining:
-            pat = tuple(calculate_response(word, answer))
+            pat = _encode_response(calculate_response(word, answer))
             s1_groups[pat].append(answer)
 
     _cached = soln.word_scores.get(word, {})
@@ -1615,14 +1619,14 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
             # One group computation to get sub-subgroups for step 3
             if cache:
                 best2_grps = cache.group_words(best2_word, subgroup)
-            else:
+            else:  # pragma: no cover - defensive: callers always supply a ResponseCache
                 best2_grps = defaultdict(list)
                 for ans in subgroup:
                     p2 = tuple(calculate_response(best2_word, ans))
                     best2_grps[p2].append(ans)
         else:
             # Announce progress only if we've been computing more than 5 seconds
-            if not _prog['on'] and time.time() - t0 > 5:
+            if not _prog['on'] and time.time() - t0 > 5:  # pragma: no cover - timing-only progress print
                 suffix = '2, 3' if _prog['step3'] else '2'
                 print(f'  Computing entropy...{suffix}', end='', flush=True)
                 _prog['on'] = True
@@ -1907,7 +1911,7 @@ def cmd_test(gs, inline=''):
         # Scores
         if soln.cache:
             groups = soln.cache.group_counts(word, soln.current_words)
-        else:
+        else:  # pragma: no cover - defensive: callers always supply a ResponseCache
             groups = calculate_group_counts(word, soln.current_words)
         n = len(soln.current_words)
         in_answers = _mark(word).strip()
@@ -2079,7 +2083,7 @@ def cmd_verify_erd(gs):
         return
 
     erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
-    if erd_sc is None:
+    if erd_sc is None:  # pragma: no cover - defensive: every grid cell maps to a cache
         print_error("ERD not available for this mode.")
         return
 
@@ -2108,11 +2112,11 @@ def cmd_verify_erd(gs):
     print(f"  checked {len(report)} cached subtree node(s): {summary}")
 
     mismatches = [r for r in report if r['status'] == 'mismatch']
-    for r in mismatches[:5]:
+    for r in mismatches[:5]:  # pragma: no cover - integrity report; only on a corrupted cache
         print(f"    MISMATCH: {r['n']}-word subset, best={r['best_word'].upper()} "
               f"{r['best_score']:.4f} vs reconstructed {r['reconstructed']:.4f}")
 
-    if root['status'] == 'mismatch' and isinstance(erd_sc, ScoreCache):
+    if root['status'] == 'mismatch' and isinstance(erd_sc, ScoreCache):  # pragma: no cover - only on a corrupted cache
         print("\n  Root entry contradicts its own cached subtree.")
         print("  d = delete it so it recomputes  (anything else = leave it)")
         if input().strip().lower() == 'd':
@@ -2600,7 +2604,7 @@ class ERDSolver(threading.Thread):
         this order, "best so far" early in the scan is a real signal, not
         a coin flip, and the true winner tends to surface early too.
         """
-        def _cancel_check():
+        def _cancel_check():  # pragma: no cover - cancel/pause race during ranking
             if self._cancel.is_set():
                 return True
             if not self._paused.is_set():
@@ -2767,7 +2771,7 @@ class ERDSolver(threading.Thread):
                     return
                 # Paused — wait for the main thread to finish its operation.
                 self._paused.wait()
-                if self._cancel.is_set():
+                if self._cancel.is_set():  # pragma: no cover - cancel-while-paused race
                     logger.info("ERDSolver cancelled while paused")
                     return
         except sqlite3.OperationalError:
@@ -2886,11 +2890,11 @@ class BranchPrecacheSolver(threading.Thread):
                          self.guess_word.upper(), self.branches_total,
                          self.branches_skipped)
             for code, words in self._branches:
-                if self._cancel.is_set():
+                if self._cancel.is_set():  # pragma: no cover - per-branch cancel/pause race
                     return
-                if not self._paused.is_set():
+                if not self._paused.is_set():  # pragma: no cover - per-branch cancel/pause race
                     self._paused.wait()
-                if self._cancel.is_set():
+                if self._cancel.is_set():  # pragma: no cover - per-branch cancel/pause race
                     return
 
                 self.current_branch_code = code
@@ -2903,7 +2907,7 @@ class BranchPrecacheSolver(threading.Thread):
                     self.branches_done += 1
                     continue
 
-                def _ranking_cancel_check():
+                def _ranking_cancel_check():  # pragma: no cover - cancel/pause race during ranking
                     if self._cancel.is_set():
                         return True
                     if not self._paused.is_set():
@@ -2983,10 +2987,10 @@ class BranchPrecacheSolver(threading.Thread):
                         heartbeat=_maybe_print)
                     if result is not None:
                         break
-                    if self._cancel.is_set():
+                    if self._cancel.is_set():  # pragma: no cover - cancel/pause-retry race
                         return
-                    self._paused.wait()
-                    if self._cancel.is_set():
+                    self._paused.wait()  # pragma: no cover - cancel/pause-retry race
+                    if self._cancel.is_set():  # pragma: no cover - cancel/pause-retry race
                         return
 
                 self.branches_done += 1
@@ -3030,7 +3034,7 @@ class BranchPrecacheSolver(threading.Thread):
             score_cache.close()
 
 
-def main():
+def main():  # pragma: no cover - interactive REPL loop, exercised manually
     log_path = os.path.abspath(LOG_FILE)
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(logging.Formatter(

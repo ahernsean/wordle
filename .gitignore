@@ -17,3 +17,9 @@ erd_worker_*.log
 wordle_erd_export.sqlite3
 wordle_erd_export.sqlite3-shm
 wordle_erd_export.sqlite3-wal
+
+# Coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

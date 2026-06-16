@@ -99,9 +99,17 @@ def main():
         if not pending:
             return
         sc._conn.execute('BEGIN')
+        # Guard with max_depth IS NULL: if a worker has, since the snapshot,
+        # rewritten this entry with a real depth (and possibly a tainted
+        # solve_budget), this UPDATE must NOT clobber its solve_budget back to
+        # NULL — that would mislabel a budget-specific entry as reusable at any
+        # budget and yield wrong ERD answers.  The guard makes the backfill a
+        # no-op on any row a worker has already filled in, so it is safe to run
+        # concurrently and is naturally idempotent.
         sc._conn.executemany(
             "UPDATE subgroup_best_by_policy SET max_depth=?, solve_budget=NULL "
-            "WHERE subset_key=? AND policy=? AND universe_id=?",
+            "WHERE subset_key=? AND policy=? AND universe_id=? "
+            "AND max_depth IS NULL",
             [(md, k, ERD_ALL, uid) for md, k in pending])
         sc._conn.execute('COMMIT')
         pending.clear()

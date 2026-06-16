@@ -442,6 +442,16 @@ class ErdQueue:
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            # Never hand out (and thereby re-create) a chunk for a branch that
+            # has been finalized and deleted: a worker still looping on it would
+            # otherwise redo the whole branch from scratch.  Checked inside the
+            # write transaction so it can't race the finalize+delete.
+            br = self._conn.execute(
+                "SELECT status FROM active_branches WHERE subset_key = ?",
+                (subset_key,)).fetchone()
+            if br is None or br["status"] != "open":
+                self._conn.execute("COMMIT")
+                return None
             taken = {r["idx"] for r in self._conn.execute(
                 "SELECT idx FROM branch_chunks WHERE subset_key = ?",
                 (subset_key,))}
@@ -542,18 +552,51 @@ class ErdQueue:
         self._conn.execute(
             "DELETE FROM active_branches WHERE subset_key = ?", (subset_key,))
 
-    def reclaim_stale_chunks(self, max_age_seconds: int) -> int:
-        """Delete in-flight (done=0) chunk claims older than max_age_seconds.
+    def reclaim_stale_chunks(self, heartbeat_timeout_seconds: int,
+                             min_claim_age_seconds: int = None) -> int:
+        """Free in-flight (done=0) chunk claims whose worker is no longer alive.
 
-        A deleted claim turns its slice back into an unclaimed gap, so the work
-        is redone rather than silently skipped.  done=1 rows are never touched.
-        Returns the number of claims freed.
+        Liveness is proved by the worker's heartbeat (worker_heartbeat.updated_at,
+        refreshed every couple of seconds while it works).  A done=0 chunk is
+        reclaimed only when its claiming worker has NOT heartbeat within
+        heartbeat_timeout_seconds — i.e. it has crashed or hung.  Crucially, a
+        slow-but-alive worker (one still heartbeating) is never reclaimed: doing
+        so would let a second worker re-evaluate the same slice and finalize the
+        branch BEFORE the original folds in a better candidate, writing a
+        suboptimal ERD to the permanent cache.
+
+        min_claim_age_seconds (default: heartbeat_timeout_seconds) is a floor on
+        claim age, so a freshly claimed chunk isn't reclaimed in the brief window
+        before its worker's first heartbeat lands.  done=1 rows are never
+        touched.  Returns the number of claims freed.
         """
-        cutoff = int(time.time()) - max_age_seconds
+        now = int(time.time())
+        hb_cutoff = now - heartbeat_timeout_seconds
+        age_floor = now - (min_claim_age_seconds
+                           if min_claim_age_seconds is not None
+                           else heartbeat_timeout_seconds)
         self._conn.execute("""
             DELETE FROM branch_chunks
-            WHERE done = 0 AND claimed_at < ?
-        """, (cutoff,))
+            WHERE done = 0
+              AND claimed_at < ?
+              AND claimed_by NOT IN (
+                  SELECT worker_id FROM worker_heartbeat
+                  WHERE updated_at >= ?
+              )
+        """, (age_floor, hb_cutoff))
+        return self._conn.execute("SELECT changes()").fetchone()[0]
+
+    def reclaim_chunks_of_worker(self, worker_id: str) -> int:
+        """Free all in-flight (done=0) chunk claims held by a specific worker.
+
+        Called by the supervisor when it kills/respawns a worker, so that
+        instance's chunks are freed deterministically BEFORE a replacement of
+        the same name starts heartbeating (which would otherwise make the dead
+        instance's claims look live again).  done=1 rows are never touched.
+        """
+        self._conn.execute(
+            "DELETE FROM branch_chunks WHERE done = 0 AND claimed_by = ?",
+            (worker_id,))
         return self._conn.execute("SELECT changes()").fetchone()[0]
 
     def branches_in_progress(self):

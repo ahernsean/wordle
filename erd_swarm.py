@@ -44,6 +44,11 @@ WORDS_FILE = 'wordle.txt'
 
 BEST_REFRESH_SECONDS = 0.25   # how often a worker re-reads the shared bound
 HB_SECONDS = 2.0              # liveness heartbeat cadence during a long chunk
+# A worker that hasn't heartbeat within this many seconds is presumed dead, and
+# only then are its in-flight chunks reclaimed.  Must be many multiples of
+# HB_SECONDS so a live-but-busy worker is never mistaken for dead (which would
+# let its slice be redone and finalized before it folds in a better candidate).
+HB_TIMEOUT_SECONDS = 120
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
@@ -401,6 +406,15 @@ class _BranchWorker:
             elif self.queue.branch_done_chunks(subset_key) >= n_chunks:
                 self.maybe_finalize(subset_key, words, n_chunks)
             else:
+                # Every chunk is claimed but coverage isn't complete: some are
+                # held by other workers.  Heartbeat first (so THIS worker, which
+                # still holds its own parent chunk up the stack, isn't itself
+                # presumed dead while it waits), then free any sub-chunk whose
+                # holder has died so we can re-claim it rather than wait forever
+                # — there may be no supervisor in the standalone solve path.
+                self._heartbeat(subset_key, n_words, None, None, None,
+                                None, None, force=True)
+                self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
                 time.sleep(0.05)            # chunks in flight elsewhere; let them land
 
         if self.cancel():
@@ -483,6 +497,49 @@ class _BranchWorker:
             self._maybe_checkpoint()
             self._check_ram()
 
+    # -- focused single-branch loop (standalone solve-branch) ---------------
+
+    def solve_branch_focused(self, subset_key):
+        """Help solve one already-registered branch to completion: claim and
+        evaluate its chunks alongside any sibling workers, finalizing it once
+        every chunk is done.  The body of _focused_worker, factored out so it
+        can be driven directly (signal setup stays in the process wrapper)."""
+        branch = self.queue.get_branch(subset_key)
+        if branch is None or branch['status'] != 'open':
+            return
+        words = decode_subset(subset_key)
+        budget = branch['budget'] or ROOT_BUDGET
+        n_chunks = ErdQueue.n_chunks_for(branch['n_candidates'],
+                                         branch['chunk_size'])
+        while not self.cancel():
+            # Stop the moment the branch is finalized (and its rows deleted) by
+            # any worker: otherwise claim_chunk, seeing no chunk rows for the
+            # now-deleted branch, would re-create them and redo the whole branch
+            # from scratch — doubling (or worse) the work for a large branch.
+            if self.queue.get_branch(subset_key) is None:
+                break
+            idx = self.queue.claim_chunk(subset_key, self.name, n_chunks)
+            if idx is None:
+                # Every chunk is claimed.  If coverage is complete, finalize and
+                # stop.  Otherwise some chunks are held by siblings — there is NO
+                # supervisor in this path, so free any whose holder has died and
+                # retry, rather than abandoning the branch one chunk short of
+                # finalizing (which would strand it forever).
+                if self.queue.branch_done_chunks(subset_key) >= n_chunks:
+                    self.maybe_finalize(subset_key, words, n_chunks)
+                    break
+                self._heartbeat(subset_key, branch['n_words'], None, None, None,
+                                None, None, force=True)
+                self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
+                time.sleep(0.1)
+                continue
+            if self.evaluate_chunk(subset_key, words, branch['n_words'],
+                                   self._ranked_for(subset_key, words), idx,
+                                   branch['chunk_size'], budget=budget):
+                if self.queue.branch_done_chunks(subset_key) >= n_chunks:
+                    self.maybe_finalize(subset_key, words, n_chunks)
+                    break
+
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,
                  divisor=3, max_chunks=256):
@@ -525,35 +582,23 @@ def _focused_worker(subset_key, worker_id, cache_path, queue_path,
     w = _BranchWorker(worker_id, cache_path, queue_path, None,
                       divisor, max_chunks)
     try:
-        branch = w.queue.get_branch(subset_key)
-        if branch is None or branch['status'] != 'open':
-            return
-        words = decode_subset(subset_key)
-        budget = branch['budget'] or ROOT_BUDGET
-        n_chunks = ErdQueue.n_chunks_for(branch['n_candidates'],
-                                         branch['chunk_size'])
-        while True:
-            idx = w.queue.claim_chunk(subset_key, w.name, n_chunks)
-            if idx is None:
-                if w.queue.branch_done_chunks(subset_key) >= n_chunks:
-                    w.maybe_finalize(subset_key, words, n_chunks)
-                break
-            if w.evaluate_chunk(subset_key, words, branch['n_words'],
-                                w._ranked_for(subset_key, words), idx,
-                                branch['chunk_size'], budget=budget):
-                if w.queue.branch_done_chunks(subset_key) >= n_chunks:
-                    w.maybe_finalize(subset_key, words, n_chunks)
-                    break
+        w.solve_branch_focused(subset_key)
     finally:
         w.close()
 
 
 def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
                      divisor=3, max_chunks=256, priority=1,
-                     source_word=None, source_pattern=None, budget=ROOT_BUDGET):
+                     source_word=None, source_pattern=None, budget=ROOT_BUDGET,
+                     timeout=None):
     """Solve one branch by swarming N workers across its candidates.
 
-    Returns (best_word, best_erd) or None.
+    n_workers is capped at the number of chunks so we never spawn a process
+    that will immediately find no work and exit.
+
+    Returns (best_word, best_erd) or None.  If timeout is given (seconds),
+    any worker still running after that long is killed and the result will be
+    None (branch unfinished).
     """
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)
@@ -568,6 +613,8 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
 
     chunk_size = ErdQueue.chunk_size_for(
         len(words), len(all_words), divisor, max_chunks)
+    n_chunks = ErdQueue.n_chunks_for(len(all_words), chunk_size)
+    actual_workers = min(n_workers, n_chunks)
     queue.create_branch(subset_key, len(words), len(all_words), chunk_size,
                         priority=priority, source_word=source_word,
                         source_pattern=source_pattern, budget=budget)
@@ -577,11 +624,15 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
     procs = [mp.Process(target=_focused_worker,
                         args=(subset_key, w, cache_path, queue_path,
                               divisor, max_chunks))
-             for w in range(n_workers)]
+             for w in range(actual_workers)]
     for p in procs:
         p.start()
     for p in procs:
-        p.join()
+        p.join(timeout=timeout)
+    for p in procs:
+        if p.is_alive():
+            p.kill()
+            p.join()
 
     score_cache = ScoreCache(cache_path, all_answers)
     try:

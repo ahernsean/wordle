@@ -5,14 +5,23 @@ Usage
 -----
   python3.13 merge_cache.py <source_db> [--target PATH] [--dry-run]
 
-Adds all rows from <source_db> that are not already present in --target
-using INSERT OR IGNORE across all four cache tables.  Safe because every
-cache table is deterministic given the same answer-word universe: matching
-keys imply identical values, so there can never be a conflict, only additions.
+Adds rows from <source_db> not already present in --target across all four
+cache tables.  Three of them (universe, response_decomposition, word_scores)
+are deterministic given the same answer-word universe — matching keys imply
+identical values — so INSERT OR IGNORE is exact.
 
-Run with --dry-run first to see how many rows would be added.  Prefer to run
-while workers are stopped (or at least briefly paused) to avoid competing for
-the SQLite write lock, though the 30s timeout makes concurrent use safe.
+subgroup_best_by_policy is the exception: its primary key
+(subset_key, policy, universe_id) does NOT include solve_budget, so two caches
+can legitimately hold DIFFERENT entries for the same key — e.g. one solved
+unconstrained (solve_budget NULL, reusable at any budget) and one solved under
+a depth cap (solve_budget set, reusable only at that budget).  The unconstrained
+entry strictly dominates (see wordle_engine._cache_reuse), so for that table we
+let an incoming untainted row replace an existing tainted one, rather than
+silently keeping whichever the target happened to have first.
+
+Run with --dry-run first to see how many rows would be added/upgraded.  Prefer
+to run while workers are stopped (or at least briefly paused) to avoid competing
+for the SQLite write lock, though the 30s timeout makes concurrent use safe.
 """
 
 from __future__ import annotations
@@ -32,6 +41,37 @@ TABLES = [
 ]
 
 DEFAULT_TARGET = 'wordle_cache.sqlite3'
+
+# Columns the untainted-preference UPSERT for subgroup_best_by_policy needs.
+_ERD_UPSERT_COLS = {'subset_key', 'policy', 'universe_id', 'solve_budget',
+                    'best_word', 'best_score', 'updated_at', 'max_depth'}
+
+
+def _insert_sql(table: str, cols: list[str]) -> str:
+    """INSERT statement for a merge batch.
+
+    For subgroup_best_by_policy, a key collision can pit a tainted entry against
+    an untainted one (the PK omits solve_budget); the untainted entry is
+    strictly more reusable, so an incoming untainted row replaces an existing
+    tainted one.  Every other table — and any conflict that isn't
+    tainted->untainted — is a plain INSERT OR IGNORE (keep what's there).
+    """
+    col_list = ', '.join(cols)
+    placeholders = ', '.join('?' * len(cols))
+    if table == 'subgroup_best_by_policy' and _ERD_UPSERT_COLS <= set(cols):
+        return f"""
+            INSERT INTO main.{table} ({col_list}) VALUES ({placeholders})
+            ON CONFLICT(subset_key, policy, universe_id) DO UPDATE SET
+                best_word    = excluded.best_word,
+                best_score   = excluded.best_score,
+                updated_at   = excluded.updated_at,
+                max_depth    = excluded.max_depth,
+                solve_budget = excluded.solve_budget
+            WHERE main.{table}.solve_budget IS NOT NULL
+              AND excluded.solve_budget IS NULL
+        """
+    return (f'INSERT OR IGNORE INTO main.{table} ({col_list}) '
+            f'VALUES ({placeholders})')
 
 
 def _pk_cols(conn, table: str) -> list[str]:
@@ -62,7 +102,7 @@ def _copy_table_with_progress(conn, table) -> int:
     """
     cols = _all_cols(conn, table)
     col_list = ', '.join(cols)
-    placeholders = ', '.join('?' * len(cols))
+    insert_sql = _insert_sql(table, cols)
     total = conn.execute(f'SELECT COUNT(*) FROM src.{table}').fetchone()[0]
     if total == 0:
         print(f'  {table}: source empty, skipping')
@@ -82,10 +122,7 @@ def _copy_table_with_progress(conn, table) -> int:
         last_rowid = rows[-1][0]
         before = conn.total_changes
         conn.execute('BEGIN')
-        conn.executemany(
-            f'INSERT OR IGNORE INTO main.{table} ({col_list}) '
-            f'VALUES ({placeholders})',
-            [tuple(r[1:]) for r in rows])
+        conn.executemany(insert_sql, [tuple(r[1:]) for r in rows])
         conn.execute('COMMIT')
         inserted += conn.total_changes - before
         scanned += len(rows)
@@ -146,7 +183,23 @@ def main():
                 else:
                     n = conn.execute(
                         f'SELECT COUNT(*) FROM src.{table}').fetchone()[0]
-                print(f'  {table}: {n:,} rows would be inserted')
+                msg = f'  {table}: {n:,} rows would be inserted'
+                # Account for the tainted->untainted upgrades INSERT OR IGNORE
+                # would silently miss (and the real merge now performs).
+                if (table == 'subgroup_best_by_policy'
+                        and 'solve_budget' in _all_cols(conn, table)):
+                    up = conn.execute(f"""
+                        SELECT COUNT(*) FROM src.{table} s
+                        JOIN main.{table} m
+                          ON m.subset_key  = s.subset_key
+                         AND m.policy      = s.policy
+                         AND m.universe_id = s.universe_id
+                        WHERE m.solve_budget IS NOT NULL
+                          AND s.solve_budget IS NULL
+                    """).fetchone()[0]
+                    if up:
+                        msg += f' (+{up:,} tainted->untainted upgrades)'
+                print(msg)
             else:
                 n = _copy_table_with_progress(conn, table)
 

@@ -1,0 +1,24 @@
+# Coverage configuration for the Wordle solver core.
+#
+# Scope: the application core only (wordle.py, wordle_engine.py,
+# cache_sqlite.py). The parallel ERD precache infrastructure
+# (erd_search/erd_queue/erd_swarm), the cache merge/backfill utilities, and
+# the one-off diagnostic and dataset scripts are intentionally out of scope.
+[run]
+branch = True
+source =
+    wordle
+    wordle_engine
+    cache_sqlite
+
+[report]
+# Schema migrations are deliberately uncovered: they run once against legacy
+# databases and are guarded so they are skipped on every subsequent open.
+exclude_lines =
+    pragma: no cover
+    pragma: migration
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    def __repr__
+show_missing = True
+precision = 1

@@ -160,7 +160,7 @@ class ScoreCache:
         # old column name.
         cols = {row["name"] for row in
                 self._conn.execute("PRAGMA table_info(subgroup_best_by_policy)")}
-        if cols and "subset_key" not in cols and "subset_blob" in cols:
+        if cols and "subset_key" not in cols and "subset_blob" in cols:  # pragma: migration
             self._conn.execute(
                 "ALTER TABLE subgroup_best_by_policy "
                 "RENAME COLUMN subset_blob TO subset_key")
@@ -200,7 +200,7 @@ class ScoreCache:
         #   erd_answers -> erd_answers_compliant  (answer list, clue-compliant)
         # 'erd_constrained' has no persisted rows: hard-mode ERD is
         # path-dependent and lives only in a transient MemoryScoreCache.
-        if not self._is_migration_done('rename_erd_policies'):
+        if not self._is_migration_done('rename_erd_policies'):  # pragma: migration
             for old, new in (('erd_all', 'erd_words_unfiltered'),
                              ('erd_answers', 'erd_answers_compliant')):
                 exists = self._conn.execute(
@@ -219,7 +219,7 @@ class ScoreCache:
         # that recurs gets its scores cached, not just the opening one.
         old_cols = {row["name"] for row in
                     self._conn.execute("PRAGMA table_info(word_scores)")}
-        if old_cols and "subset_hash" not in old_cols:
+        if old_cols and "subset_hash" not in old_cols:  # pragma: migration
             self._conn.execute("DROP TABLE word_scores")
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS word_scores (
@@ -282,7 +282,7 @@ class ScoreCache:
         if exists is not None:
             self._conn.execute(
                 f"DELETE FROM subgroup_best_by_policy WHERE {where}", params)
-        if migration_name:
+        if migration_name:  # pragma: migration
             self._mark_migration_done(migration_name)
 
     def _ensure_universe(self):
