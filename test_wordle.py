@@ -726,7 +726,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
                 self._real = real
 
             def execute(self, sql, *a, **k):
-                if sql.lstrip().startswith("INSERT OR REPLACE INTO subgroup_best_by_policy"):
+                if sql.lstrip().startswith("INSERT OR REPLACE INTO branch_best_by_policy"):
                     raise sqlite3.OperationalError("disk I/O error")
                 return self._real.execute(sql, *a, **k)
 
@@ -858,14 +858,15 @@ class TestScoreCacheSQLite(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        # Opening ScoreCache should rename the table/columns to
-        # subgroup_best_by_policy/best_word/best_score AND delete the
-        # old-format row
+        # Opening ScoreCache should migrate through the full rename chain
+        # (lookahead_result -> subgroup_best_by_policy -> branch_best_by_policy,
+        # subset_key -> branch_key, best_word -> best_guess) AND delete the
+        # old null-separated-key row.
         ScoreCache(self.db, ANSWERS)
         conn2 = _sqlite3.connect(self.db)
         rows = conn2.execute(
-            "SELECT COUNT(*) FROM subgroup_best_by_policy "
-            "WHERE instr(subset_key, char(0)) > 0"
+            "SELECT COUNT(*) FROM branch_best_by_policy "
+            "WHERE instr(branch_key, char(0)) > 0"
         ).fetchone()[0]
         conn2.close()
         self.assertEqual(rows, 0)
@@ -875,7 +876,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
         # names, WITHOUT the legacy key encoding — i.e. data written between
         # the subset-key-encoding migration and the table/column rename.
         # Built entirely without a ScoreCache so neither subgroup_pick nor
-        # subgroup_best_by_policy exists yet — otherwise the rename-in-place
+        # branch_best_by_policy exists yet — otherwise the rename-in-place
         # path wouldn't trigger.
         import hashlib as _hashlib
         import sqlite3 as _sqlite3
@@ -935,11 +936,11 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_old_minimax_method_key_is_migrated(self):
         # Simulate rows persisted under the pre-rename method key.
-        # Compute universe_id directly (same formula as ScoreCache._ensure_universe)
+        # Compute answer_list_id directly (same formula as ScoreCache._ensure_answer_list)
         # so no ScoreCache open marks the migration done before we insert legacy data.
         import sqlite3 as _sqlite3
         import hashlib as _hashlib
-        universe_id = _hashlib.sha256(
+        answer_list_id = _hashlib.sha256(
             "\n".join(ANSWERS).encode()
         ).hexdigest()
         conn = _sqlite3.connect(self.db)
@@ -947,15 +948,15 @@ class TestScoreCacheSQLite(unittest.TestCase):
             CREATE TABLE IF NOT EXISTS word_scores (
                 subset_hash TEXT NOT NULL, word TEXT NOT NULL,
                 method TEXT NOT NULL, score REAL NOT NULL,
-                universe_id TEXT NOT NULL, updated_at INTEGER NOT NULL,
-                PRIMARY KEY (subset_hash, method, universe_id, word)
+                answer_list_id TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_hash, method, answer_list_id, word)
             )
         """)
         subset_key = ScoreCache.encode_subset(["crane", "slate"])
         subset_hash = ScoreCache._subset_hash(subset_key)
         conn.execute(
             "INSERT OR REPLACE INTO word_scores VALUES (?,?,?,?,?,?)",
-            (subset_hash, "crane", "minimax", 4.0, universe_id, 0),
+            (subset_hash, "crane", "minimax", 4.0, answer_list_id, 0),
         )
         conn.commit()
         conn.close()
@@ -1446,7 +1447,7 @@ class TestComputeLookaheadCache(unittest.TestCase):
             best_word, _best_score = hit
 
             # Every method besides the ranking criterion (entropy, already
-            # captured in subgroup_best_by_policy) should be persisted too — they
+            # captured in branch_best_by_policy) should be persisted too — they
             # all come from the same group-count partition, so there's no
             # principled reason to single any of them out.
             for method in ScoringMethod:
@@ -1643,7 +1644,7 @@ class TestMinExpectedGuesses(unittest.TestCase):
                     self._real = real
 
                 def execute(self, sql, *a, **k):
-                    if sql.lstrip().startswith("INSERT OR REPLACE INTO subgroup_best_by_policy"):
+                    if sql.lstrip().startswith("INSERT OR REPLACE INTO branch_best_by_policy"):
                         raise sqlite3.OperationalError("disk I/O error")
                     return self._real.execute(sql, *a, **k)
 

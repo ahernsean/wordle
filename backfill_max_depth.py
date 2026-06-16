@@ -1,9 +1,9 @@
 """backfill_max_depth.py — one-time migration for depth-limited ERD.
 
-The legacy ERD_ALL cache holds correct *unlimited-optimal* (best_word, ERD)
+The legacy ERD_ALL cache holds correct *unlimited-optimal* (best_guess, ERD)
 rows but no max_depth, so budget-aware reads reject them (depth unknown) and
 recompute from scratch — intractable.  But a legacy entry's worst-case line
-length can be recovered cheaply by walking its already-cached best_word
+length can be recovered cheaply by walking its already-cached best_guess
 subtree (1 + max of children's depths), with NO re-search.
 
 Legacy rows were computed with no depth cap, so the cap never excluded any
@@ -36,12 +36,12 @@ def main():
     answers = load_word_list(ANSWER_FILE)
     sc = ScoreCache(CACHE, answers, checkpoint_on_close=False)
     rc = ResponseCache(answers, sc)
-    uid = sc.universe_id
+    uid = sc.answer_list_id
 
     def subset_words(key):
         return [key[i:i + 5].decode() for i in range(0, len(key), 5)]
 
-    memo = {}   # subset_key bytes -> max_depth int (or INCOMPLETE)
+    memo = {}   # branch_key bytes -> max_depth int (or INCOMPLETE)
 
     def max_depth(key):
         cached = memo.get(key)
@@ -56,18 +56,18 @@ def main():
         if ent is None:
             memo[key] = INCOMPLETE
             return INCOMPLETE
-        best_word, _score, md, _sb = ent
+        best_guess, _score, md, _sb = ent
         if md is not None:           # already known (pre-set or prior run)
             memo[key] = md
             return md
-        groups = rc.group_words(best_word, words)
+        groups = rc.group_words(best_guess, words)
         result = 1
         for sub in groups.values():
             k = len(sub)
-            if k == 1 and sub[0] == best_word:
-                continue             # self: solved by best_word, line length 1
+            if k == 1 and sub[0] == best_guess:
+                continue             # self: solved by best_guess, line length 1
             if k == 1:
-                result = max(result, 2)   # best_word wrong -> play the one word
+                result = max(result, 2)   # best_guess wrong -> play the one word
                 continue
             sub_md = max_depth(ScoreCache.encode_subset(sub))
             if sub_md == INCOMPLETE:
@@ -78,21 +78,21 @@ def main():
         return result
 
     total = sc._conn.execute(
-        "SELECT COUNT(*) FROM subgroup_best_by_policy "
-        "WHERE policy=? AND universe_id=? AND max_depth IS NULL",
+        "SELECT COUNT(*) FROM branch_best_by_policy "
+        "WHERE policy=? AND answer_list_id=? AND max_depth IS NULL",
         (ERD_ALL, uid)).fetchone()[0]
     print(f'legacy entries to backfill: {total:,}', flush=True)
 
     # Snapshot the keys up front (we mutate max_depth as we go).
     keys = [r[0] for r in sc._conn.execute(
-        "SELECT subset_key FROM subgroup_best_by_policy "
-        "WHERE policy=? AND universe_id=? AND max_depth IS NULL",
+        "SELECT branch_key FROM branch_best_by_policy "
+        "WHERE policy=? AND answer_list_id=? AND max_depth IS NULL",
         (ERD_ALL, uid))]
     print(f'snapshotted {len(keys):,} keys', flush=True)
 
     hist = Counter()
     incomplete = 0
-    pending = []   # (max_depth, subset_key)
+    pending = []   # (max_depth, branch_key)
     t0 = time.time()
 
     def flush():
@@ -107,8 +107,8 @@ def main():
         # no-op on any row a worker has already filled in, so it is safe to run
         # concurrently and is naturally idempotent.
         sc._conn.executemany(
-            "UPDATE subgroup_best_by_policy SET max_depth=?, solve_budget=NULL "
-            "WHERE subset_key=? AND policy=? AND universe_id=? "
+            "UPDATE branch_best_by_policy SET max_depth=?, solve_budget=NULL "
+            "WHERE branch_key=? AND policy=? AND answer_list_id=? "
             "AND max_depth IS NULL",
             [(md, k, ERD_ALL, uid) for md, k in pending])
         sc._conn.execute('COMMIT')

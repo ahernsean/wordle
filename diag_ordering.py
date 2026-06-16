@@ -36,11 +36,11 @@ vocab = load_word_list('wordle.txt')
 q = sqlite3.connect('erd_queue.sqlite3', timeout=10); q.row_factory = sqlite3.Row
 branches = []
 for sz in SIZES:
-    row = q.execute("""SELECT subset_key, n_words FROM pending_subgroups
+    row = q.execute("""SELECT branch_key, n_words FROM pending_subgroups
                        WHERE source_word='salet' AND n_words>=? AND n_words<>238
                        ORDER BY n_words ASC LIMIT 1""", (sz,)).fetchone()
-    if row and row['subset_key'] not in [b[0] for b in branches]:
-        branches.append((row['subset_key'], row['n_words']))
+    if row and row['branch_key'] not in [b[0] for b in branches]:
+        branches.append((row['branch_key'], row['n_words']))
 q.close()
 print(f'branches: {[n for _, n in branches]}  budget={BUDGET} deadline={DEADLINE_S}s',
       flush=True)
@@ -61,7 +61,7 @@ def clear_results():
     # Clear BOTH layers: the in-memory mirror AND the SQLite rows, via SC's own
     # (autocommit) connection — else the 2nd config hits results the 1st wrote.
     SC._mem_cache.clear()
-    SC._conn.execute("DELETE FROM subgroup_best_by_policy")
+    SC._conn.execute("DELETE FROM branch_best_by_policy")
 
 
 def solve(words, gate):

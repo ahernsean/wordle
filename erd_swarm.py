@@ -124,13 +124,13 @@ class _BranchWorker:
 
     # -- candidate ranking (deterministic, so every worker agrees) ----------
 
-    def _ranked_for(self, subset_key, words):
-        if self._ranked_key == subset_key:
+    def _ranked_for(self, branch_key, words):
+        if self._ranked_key == branch_key:
             return self._ranked
         ranked = rank_guesses_by_group_then_entropy(
             words, self.all_words, self.rcache, self.score_cache,
             cancel_check=self.cancel)
-        self._ranked_key = subset_key
+        self._ranked_key = branch_key
         self._ranked = ranked
         return ranked
 
@@ -184,8 +184,8 @@ class _BranchWorker:
 
     # -- heartbeat ----------------------------------------------------------
 
-    def _heartbeat(self, subset_key, n_words, chunk_idx, chunk_started_at,
-                   cand_rate, best_word, best_erd, force=False,
+    def _heartbeat(self, branch_key, n_words, chunk_idx, chunk_started_at,
+                   cand_rate, best_guess, best_erd, force=False,
                    cur_candidate=None, cand_n_seen=None, cand_chunk_size=None):
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
@@ -198,13 +198,13 @@ class _BranchWorker:
         self._last_hb = now
         self._nodes_at_last_hb = self._nodes
         self.queue.heartbeat(
-            self.name, os.getpid(), subset_key, n_words, self.started,
+            self.name, os.getpid(), branch_key, n_words, self.started,
             self.chunks_done, chunk_idx=chunk_idx,
             chunk_started_at=chunk_started_at, cand_rate=cand_rate,
             cache_hits=self.score_cache.read_hits,
             cache_misses=self.score_cache.read_misses,
             n_pruned=self.n_pruned, n_ok=self.n_ok,
-            best_word=best_word, best_erd=best_erd,
+            best_guess=best_guess, best_erd=best_erd,
             cur_candidate=cur_candidate, cand_n_seen=cand_n_seen,
             cand_chunk_size=cand_chunk_size,
             cur_max_depth=self._cand_max_depth,
@@ -213,7 +213,7 @@ class _BranchWorker:
 
     # -- evaluate one chunk -------------------------------------------------
 
-    def evaluate_chunk(self, subset_key, words, n_words, ranked, idx,
+    def evaluate_chunk(self, branch_key, words, n_words, ranked, idx,
                        chunk_size, budget=None):
         """Evaluate one chunk's candidate slice, folding results into the
         branch's shared best.  Returns True if the chunk completed, False if
@@ -225,14 +225,14 @@ class _BranchWorker:
         """
         lo, hi = ErdQueue.chunk_range(idx, chunk_size, self.n_candidates)
         chunk_total = hi - lo
-        local_word, local_best = self.queue.read_branch_best(subset_key)
+        local_word, local_best = self.queue.read_branch_best(branch_key)
         local_md = None
         shared_best = local_best
         last_refresh = time.time()
         last_log = 0.0
         chunk_started = int(time.time())
         t0 = time.time()
-        self._heartbeat(subset_key, n_words, idx, chunk_started, None,
+        self._heartbeat(branch_key, n_words, idx, chunk_started, None,
                         local_word, local_best, force=True,
                         cand_chunk_size=chunk_total)
 
@@ -241,7 +241,7 @@ class _BranchWorker:
                 return False
             now = time.time()
             if now - last_refresh > BEST_REFRESH_SECONDS:
-                _, shared_best = self.queue.read_branch_best(subset_key)
+                _, shared_best = self.queue.read_branch_best(branch_key)
                 last_refresh = now
             if now - last_log > 30:
                 logger.info('%s chunk %d: evaluating %s (%d/%d)  best=%s  '
@@ -262,7 +262,7 @@ class _BranchWorker:
                 depth=0, depth_observer=self._note_depth, budget=budget,
                 subbranch_solver=self._subbranch_solver,
                 heartbeat=lambda: self._heartbeat(
-                    subset_key, n_words, idx, chunk_started, None,
+                    branch_key, n_words, idx, chunk_started, None,
                     local_word, local_best,
                     cur_candidate=ranked[ci], cand_n_seen=n_seen,
                     cand_chunk_size=chunk_total))
@@ -278,12 +278,12 @@ class _BranchWorker:
             # taints the branch: its ERD is only valid at this budget.  Marked
             # for any candidate, winner or not — see the taint rule.
             if floor_hit:
-                self.queue.mark_branch_tainted(subset_key)
+                self.queue.mark_branch_tainted(branch_key)
             if status == 'ok':
                 self.n_ok += 1
                 if local_best is None or cost < local_best:
                     local_best, local_word, local_md = cost, ranked[ci], cand_md
-                    self.queue.update_branch_best(subset_key, local_word,
+                    self.queue.update_branch_best(branch_key, local_word,
                                                   local_best, local_md)
                     shared_best = local_best
             elif status in ('pruned', 'cutoff'):
@@ -292,12 +292,12 @@ class _BranchWorker:
                 self.n_useless += 1
 
             rate = n_seen / max(1e-6, now - t0)
-            self._heartbeat(subset_key, n_words, idx, chunk_started, rate,
+            self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
                             local_word, local_best,
                             cur_candidate=ranked[ci], cand_n_seen=n_seen,
                             cand_chunk_size=chunk_total)
 
-        self.queue.complete_chunk(subset_key, idx)
+        self.queue.complete_chunk(branch_key, idx)
         self.chunks_done += 1
         elapsed = time.time() - t0
         rate = chunk_total / max(1e-6, elapsed)
@@ -306,44 +306,44 @@ class _BranchWorker:
                     self.name, idx, chunk_total, elapsed, rate,
                     self.n_ok, self.n_pruned, self.n_useless,
                     local_word or '-', local_best if local_best else 0)
-        self._heartbeat(subset_key, n_words, idx, chunk_started, rate,
+        self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
                         local_word, local_best, force=True)
         return True
 
     # -- finalize -----------------------------------------------------------
 
-    def maybe_finalize(self, subset_key, words, n_chunks):
+    def maybe_finalize(self, branch_key, words, n_chunks):
         """If every chunk is done, finalize the branch exactly once."""
-        if self.queue.branch_done_chunks(subset_key) < n_chunks:
+        if self.queue.branch_done_chunks(branch_key) < n_chunks:
             return
-        if not self.queue.try_finalize_branch(subset_key):
+        if not self.queue.try_finalize_branch(branch_key):
             return  # another worker won the finalize
-        meta = self.queue.read_branch_meta(subset_key)
-        best_word, best_erd, max_depth, tainted, budget = meta
-        if best_word is not None:
+        meta = self.queue.read_branch_meta(branch_key)
+        best_guess, best_erd, max_depth, tainted, budget = meta
+        if best_guess is not None:
             # Untainted => unconstrained optimum, reusable at any budget >=
             # max_depth (solve_budget NULL).  Tainted => valid only at this
             # budget (solve_budget = budget).  See cache_sqlite reuse rule.
             solve_budget = budget if tainted else None
-            self.score_cache.write(subset_key, ERD_ALL, best_word, best_erd,
+            self.score_cache.write(branch_key, ERD_ALL, best_guess, best_erd,
                                    max_depth=max_depth, solve_budget=solve_budget)
-            cache_all_scores(best_word, words, self.score_cache, subset_key,
+            cache_all_scores(best_guess, words, self.score_cache, branch_key,
                              cache=self.rcache)
             # NB: no per-finalize checkpoint — with recursive promotion a worker
             # finalizes thousands of sub-branches; checkpointing each one is
             # ruinous.  WAL is drained by the periodic _maybe_checkpoint instead.
             logger.info('%s finalized branch (%d words) -> %s erd=%.4f '
                         'max_depth=%s budget=%s%s', self.name, len(words),
-                        best_word, best_erd, max_depth, budget,
+                        best_guess, best_erd, max_depth, budget,
                         ' TAINTED' if tainted else '')
         else:
             # No feasible guess within budget: this branch is a loss.  Don't
             # write an ERD entry (there is no winning strategy to cache).
             logger.warning('%s branch (%d words) UNSOLVABLE within budget %s '
                            '(loss) src=%s', self.name, len(words), budget,
-                           subset_key[:25])
-        self.queue.mark_done(subset_key)        # pending_subgroups row -> done
-        self.queue.delete_branch(subset_key)    # drop transient coordination
+                           branch_key[:25])
+        self.queue.mark_done(branch_key)        # pending_subgroups row -> done
+        self.queue.delete_branch(branch_key)    # drop transient coordination
 
     # -- recursive cooperative solving --------------------------------------
 
@@ -371,10 +371,10 @@ class _BranchWorker:
         from cache.  Never idle-blocks (the worker that needs it drives it),
         and deadlock-free (a waiting worker holds no chunk).
         """
-        subset_key = encode_subset(words)
+        branch_key = encode_subset(words)
         # Already solved by someone? reuse without re-promoting.
         reuse = _cache_reuse(
-            self.score_cache.read_with_depth(subset_key, ERD_ALL), budget)
+            self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
         if reuse is not None:
             return (*reuse, False)
 
@@ -382,29 +382,29 @@ class _BranchWorker:
         chunk_size = ErdQueue.chunk_size_for(
             n_words, self.n_candidates, self.divisor, self.max_chunks)
         self.queue.create_branch(
-            subset_key, n_words, self.n_candidates, chunk_size,
+            branch_key, n_words, self.n_candidates, chunk_size,
             priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
             source_pattern=self._top_source_pattern, budget=budget)
         n_chunks = ErdQueue.n_chunks_for(self.n_candidates, chunk_size)
-        ranked = self._ranked_for(subset_key, words)
+        ranked = self._ranked_for(branch_key, words)
 
         while not self.cancel():
             # Finished?  Check before claiming so we never touch a branch that
             # another worker just finalized and deleted.
             reuse = _cache_reuse(
-                self.score_cache.read_with_depth(subset_key, ERD_ALL), budget)
+                self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
             if reuse is not None:
                 return (*reuse, False)
-            if self.queue.get_branch(subset_key) is None:
+            if self.queue.get_branch(branch_key) is None:
                 break                       # finalized as a loss + deleted
-            idx = self.queue.claim_chunk(subset_key, self.name, n_chunks)
+            idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
             if idx is not None:
-                if self.evaluate_chunk(subset_key, words, n_words, ranked, idx,
+                if self.evaluate_chunk(branch_key, words, n_words, ranked, idx,
                                        chunk_size, budget=budget):
-                    self.maybe_finalize(subset_key, words, n_chunks)
+                    self.maybe_finalize(branch_key, words, n_chunks)
                 self._maybe_checkpoint()    # drain WAL during deep solving
-            elif self.queue.branch_done_chunks(subset_key) >= n_chunks:
-                self.maybe_finalize(subset_key, words, n_chunks)
+            elif self.queue.branch_done_chunks(branch_key) >= n_chunks:
+                self.maybe_finalize(branch_key, words, n_chunks)
             else:
                 # Every chunk is claimed but coverage isn't complete: some are
                 # held by other workers.  Heartbeat first (so THIS worker, which
@@ -412,7 +412,7 @@ class _BranchWorker:
                 # presumed dead while it waits), then free any sub-chunk whose
                 # holder has died so we can re-claim it rather than wait forever
                 # — there may be no supervisor in the standalone solve path.
-                self._heartbeat(subset_key, n_words, None, None, None,
+                self._heartbeat(branch_key, n_words, None, None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
                 time.sleep(0.05)            # chunks in flight elsewhere; let them land
@@ -435,7 +435,7 @@ class _BranchWorker:
         """
         for b in self.queue.branches_in_progress():
             n_chunks = ErdQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
-            idx = self.queue.claim_chunk(b['subset_key'], self.name, n_chunks)
+            idx = self.queue.claim_chunk(b['branch_key'], self.name, n_chunks)
             if idx is not None:
                 return dict(b), idx
 
@@ -446,13 +446,13 @@ class _BranchWorker:
         chunk_size = ErdQueue.chunk_size_for(
             n_words, self.n_candidates, self.divisor, self.max_chunks)
         self.queue.create_branch(
-            claimed['subset_key'], n_words, self.n_candidates, chunk_size,
+            claimed['branch_key'], n_words, self.n_candidates, chunk_size,
             priority=claimed['priority'], source_word=claimed['source_word'],
             source_pattern=claimed['source_pattern'], budget=self.budget)
         n_chunks = ErdQueue.n_chunks_for(self.n_candidates, chunk_size)
-        idx = self.queue.claim_chunk(claimed['subset_key'], self.name, n_chunks)
+        idx = self.queue.claim_chunk(claimed['branch_key'], self.name, n_chunks)
         branch = {
-            'subset_key': claimed['subset_key'], 'n_words': n_words,
+            'branch_key': claimed['branch_key'], 'n_words': n_words,
             'n_candidates': self.n_candidates, 'chunk_size': chunk_size,
             'source_word': claimed['source_word'],
             'source_pattern': claimed['source_pattern'],
@@ -478,36 +478,36 @@ class _BranchWorker:
                 continue
             idle_since = None
             branch, idx = work
-            subset_key = branch['subset_key']
+            branch_key = branch['branch_key']
             # Attribute any sub-branches this worker promotes to the tree it is
             # descending (best-effort; for status display).
             self._top_source_word = branch.get('source_word')
             self._top_source_pattern = branch.get('source_pattern')
-            words = decode_subset(subset_key)
+            words = decode_subset(branch_key)
             n_chunks = ErdQueue.n_chunks_for(branch['n_candidates'],
                                              branch['chunk_size'])
-            ranked = self._ranked_for(subset_key, words)
+            ranked = self._ranked_for(branch_key, words)
             if self.cancel():
                 break
             completed = self.evaluate_chunk(
-                subset_key, words, branch['n_words'], ranked, idx,
+                branch_key, words, branch['n_words'], ranked, idx,
                 branch['chunk_size'], budget=branch.get('budget') or self.budget)
             if completed:
-                self.maybe_finalize(subset_key, words, n_chunks)
+                self.maybe_finalize(branch_key, words, n_chunks)
             self._maybe_checkpoint()
             self._check_ram()
 
     # -- focused single-branch loop (standalone solve-branch) ---------------
 
-    def solve_branch_focused(self, subset_key):
+    def solve_branch_focused(self, branch_key):
         """Help solve one already-registered branch to completion: claim and
         evaluate its chunks alongside any sibling workers, finalizing it once
         every chunk is done.  The body of _focused_worker, factored out so it
         can be driven directly (signal setup stays in the process wrapper)."""
-        branch = self.queue.get_branch(subset_key)
+        branch = self.queue.get_branch(branch_key)
         if branch is None or branch['status'] != 'open':
             return
-        words = decode_subset(subset_key)
+        words = decode_subset(branch_key)
         budget = branch['budget'] or ROOT_BUDGET
         n_chunks = ErdQueue.n_chunks_for(branch['n_candidates'],
                                          branch['chunk_size'])
@@ -516,28 +516,28 @@ class _BranchWorker:
             # any worker: otherwise claim_chunk, seeing no chunk rows for the
             # now-deleted branch, would re-create them and redo the whole branch
             # from scratch — doubling (or worse) the work for a large branch.
-            if self.queue.get_branch(subset_key) is None:
+            if self.queue.get_branch(branch_key) is None:
                 break
-            idx = self.queue.claim_chunk(subset_key, self.name, n_chunks)
+            idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
             if idx is None:
                 # Every chunk is claimed.  If coverage is complete, finalize and
                 # stop.  Otherwise some chunks are held by siblings — there is NO
                 # supervisor in this path, so free any whose holder has died and
                 # retry, rather than abandoning the branch one chunk short of
                 # finalizing (which would strand it forever).
-                if self.queue.branch_done_chunks(subset_key) >= n_chunks:
-                    self.maybe_finalize(subset_key, words, n_chunks)
+                if self.queue.branch_done_chunks(branch_key) >= n_chunks:
+                    self.maybe_finalize(branch_key, words, n_chunks)
                     break
-                self._heartbeat(subset_key, branch['n_words'], None, None, None,
+                self._heartbeat(branch_key, branch['n_words'], None, None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
                 time.sleep(0.1)
                 continue
-            if self.evaluate_chunk(subset_key, words, branch['n_words'],
-                                   self._ranked_for(subset_key, words), idx,
+            if self.evaluate_chunk(branch_key, words, branch['n_words'],
+                                   self._ranked_for(branch_key, words), idx,
                                    branch['chunk_size'], budget=budget):
-                if self.queue.branch_done_chunks(subset_key) >= n_chunks:
-                    self.maybe_finalize(subset_key, words, n_chunks)
+                if self.queue.branch_done_chunks(branch_key) >= n_chunks:
+                    self.maybe_finalize(branch_key, words, n_chunks)
                     break
 
 
@@ -575,19 +575,19 @@ def _setup_logging(worker_id):
 # machinery: register one branch directly, then point N focused workers at it.
 # ---------------------------------------------------------------------------
 
-def _focused_worker(subset_key, worker_id, cache_path, queue_path,
+def _focused_worker(branch_key, worker_id, cache_path, queue_path,
                     divisor, max_chunks):
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     w = _BranchWorker(worker_id, cache_path, queue_path, None,
                       divisor, max_chunks)
     try:
-        w.solve_branch_focused(subset_key)
+        w.solve_branch_focused(branch_key)
     finally:
         w.close()
 
 
-def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
+def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
                      divisor=3, max_chunks=256, priority=1,
                      source_word=None, source_pattern=None, budget=ROOT_BUDGET,
                      timeout=None):
@@ -596,7 +596,7 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
     n_workers is capped at the number of chunks so we never spawn a process
     that will immediately find no work and exit.
 
-    Returns (best_word, best_erd) or None.  If timeout is given (seconds),
+    Returns (best_guess, best_erd) or None.  If timeout is given (seconds),
     any worker still running after that long is killed and the result will be
     None (branch unfinished).
     """
@@ -605,7 +605,7 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
     score_cache = ScoreCache(cache_path, all_answers)
     queue = ErdQueue(queue_path)
 
-    existing = score_cache.read(subset_key, ERD_ALL)
+    existing = score_cache.read(branch_key, ERD_ALL)
     if existing is not None:
         queue.close()
         score_cache.close()
@@ -615,14 +615,14 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
         len(words), len(all_words), divisor, max_chunks)
     n_chunks = ErdQueue.n_chunks_for(len(all_words), chunk_size)
     actual_workers = min(n_workers, n_chunks)
-    queue.create_branch(subset_key, len(words), len(all_words), chunk_size,
+    queue.create_branch(branch_key, len(words), len(all_words), chunk_size,
                         priority=priority, source_word=source_word,
                         source_pattern=source_pattern, budget=budget)
     queue.close()
     score_cache.close()
 
     procs = [mp.Process(target=_focused_worker,
-                        args=(subset_key, w, cache_path, queue_path,
+                        args=(branch_key, w, cache_path, queue_path,
                               divisor, max_chunks))
              for w in range(actual_workers)]
     for p in procs:
@@ -636,6 +636,6 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
 
     score_cache = ScoreCache(cache_path, all_answers)
     try:
-        return score_cache.read(subset_key, ERD_ALL)
+        return score_cache.read(branch_key, ERD_ALL)
     finally:
         score_cache.close()

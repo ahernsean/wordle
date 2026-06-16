@@ -471,8 +471,8 @@ def score_word_multi(word, remaining_words, methods,
     return score_groups_multi(groups, methods)
 
 
-def cache_all_scores(word, subgroup, score_cache, subset_key, cache=None):
-    """Derive and persist every ScoringMethod's view of `word` against `subgroup`.
+def cache_all_scores(word, branch_words, score_cache, branch_key, cache=None):
+    """Derive and persist every ScoringMethod's view of `word` against `branch_words`.
 
     score_groups' methods all read off the same group-count partition, so
     once that partition is in hand for one method, the rest are nearly free
@@ -481,7 +481,7 @@ def cache_all_scores(word, subgroup, score_cache, subset_key, cache=None):
 
     This is the ONE place that enumerates ScoringMethod for caching purposes.
     Callers (compute_lookahead, min_expected_guesses, ...) just say "this
-    word, for this subgroup, is worth remembering comprehensively" — they
+    word, for this branch, is worth remembering comprehensively" — they
     don't need to know what the full roster is, or to change when it grows.
 
     Hard-mode searches pass a MemoryScoreCache, whose minimal read/write
@@ -491,9 +491,9 @@ def cache_all_scores(word, subgroup, score_cache, subset_key, cache=None):
     """
     if not score_cache or not hasattr(score_cache, 'write_scores'):
         return
-    for method, value in score_word_multi(word, subgroup, list(ScoringMethod),
+    for method, value in score_word_multi(word, branch_words, list(ScoringMethod),
                                            cache=cache).items():
-        score_cache.write_scores(subset_key, [(word, value)], method.name.lower())
+        score_cache.write_scores(branch_key, [(word, value)], method.name.lower())
 
 
 def rank_guesses_by_group_then_entropy(words, candidates, rcache, score_cache,
@@ -513,9 +513,9 @@ def rank_guesses_by_group_then_entropy(words, candidates, rcache, score_cache,
     has_write = score_cache and hasattr(score_cache, 'write_scores')
     word_scores = {}
     if has_read:
-        subset_key = ScoreCache.encode_subset(words)
+        branch_key = ScoreCache.encode_subset(words)
         for method in methods:
-            cached = score_cache.read_scores(subset_key, method.name.lower())
+            cached = score_cache.read_scores(branch_key, method.name.lower())
             if cached:
                 for w, s in cached:
                     word_scores.setdefault(w, {})[method] = s
@@ -538,10 +538,10 @@ def rank_guesses_by_group_then_entropy(words, candidates, rcache, score_cache,
                        -scores[ScoringMethod.ENTROPY_GAIN], word))
 
     if has_write:
-        subset_key = ScoreCache.encode_subset(words)
+        branch_key = ScoreCache.encode_subset(words)
         for method, rows in to_write.items():
             if rows:
-                score_cache.write_scores(subset_key, rows, method.name.lower())
+                score_cache.write_scores(branch_key, rows, method.name.lower())
 
     scored.sort()
     return [w for _, _, w in scored]
@@ -610,8 +610,8 @@ class Solution:
         if method in self._db_loaded_methods:
             return
         self._db_loaded_methods.add(method)
-        subset_key = ScoreCache.encode_subset(self.current_words)
-        cached = self.score_cache.read_scores(subset_key, method.name.lower())
+        branch_key = ScoreCache.encode_subset(self.current_words)
+        cached = self.score_cache.read_scores(branch_key, method.name.lower())
         if cached:
             for w, s in cached:
                 self.word_scores.setdefault(w, {})[method] = s
@@ -623,8 +623,8 @@ class Solution:
         scores = [(w, s[method]) for w, s in self.word_scores.items()
                   if method in s]
         if scores:
-            subset_key = ScoreCache.encode_subset(self.current_words)
-            self.score_cache.write_scores(subset_key, scores, method.name.lower())
+            branch_key = ScoreCache.encode_subset(self.current_words)
+            self.score_cache.write_scores(branch_key, scores, method.name.lower())
 
     @property
     def answer_set(self):
@@ -841,8 +841,8 @@ class Solution:
         for word, first_ent, grouped in word_data:
             weighted_second = 0.0
 
-            for _pat, subgroup in grouped.items():
-                cnt = len(subgroup)
+            for _pat, branch_words in grouped.items():
+                cnt = len(branch_words)
                 if cnt <= 1:
                     continue
 
@@ -853,30 +853,30 @@ class Solution:
                 # Check SQLite cache first
                 best = None
                 if lc:
-                    subset_key = ScoreCache.encode_subset(subgroup)
-                    hit = lc.read(subset_key, policy)
+                    branch_key = ScoreCache.encode_subset(branch_words)
+                    hit = lc.read(branch_key, policy)
                     if hit is not None:
-                        _best_word, best = hit
+                        _best_guess, best = hit
 
                 if best is None:
-                    subset_key = ScoreCache.encode_subset(subgroup) if lc else None
+                    branch_key = ScoreCache.encode_subset(branch_words) if lc else None
                     candidates = (second_step_words
-                                  if full_mode else subgroup)
+                                  if full_mode else branch_words)
                     best = 0.0
-                    best_word = None
+                    best_guess = None
                     for candidate in candidates:
                         if progress_callback:
                             progress_callback()
                         s = score_word(
-                            candidate, subgroup, method,
+                            candidate, branch_words, method,
                             cache=cache
                         )
                         if s > best:
                             best = s
-                            best_word = candidate
-                    if lc and best_word is not None and subset_key is not None:
-                        lc.write(subset_key, policy, best_word, best)
-                        cache_all_scores(best_word, subgroup, lc, subset_key,
+                            best_guess = candidate
+                    if lc and best_guess is not None and branch_key is not None:
+                        lc.write(branch_key, policy, best_guess, best)
+                        cache_all_scores(best_guess, branch_words, lc, branch_key,
                                          cache=cache)
 
                 weighted_second += (cnt / n) * best
@@ -891,7 +891,7 @@ class Solution:
 def _cache_reuse(entry, budget):
     """Decide whether a cached entry is valid at `budget` (None = unlimited).
 
-    entry is (best_word, best_score, max_depth, solve_budget) or None.
+    entry is (best_guess, best_score, max_depth, solve_budget) or None.
     Returns (cost, max_depth, tainted) to reuse, or None to recompute.
 
     Reuse rules (see cache_sqlite schema):
@@ -916,21 +916,21 @@ def _cache_reuse(entry, budget):
     return (score, md, True) if sb == budget else None
 
 
-def evaluate_guess(remaining, guess, cache, score_cache, *,
+def evaluate_guess(branch_words, guess, cache, score_cache, *,
                    n=None, best_erd=float('inf'),
                    deadline=None, guesses=None, policy=ERD_ALL,
                    cancel_check=None, heartbeat=None,
                    depth=0, depth_observer=None, budget=None,
                    subbranch_solver=None):
-    """Evaluate one candidate `guess`'s exact ERD for solving `remaining`.
+    """Evaluate one candidate `guess`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
-    coordinator can distribute candidates of the SAME `remaining` across
+    coordinator can distribute candidates of the SAME `branch_words` across
     workers while sharing one running `best_erd` as the branch-and-bound bound.
     Recursion stays single-threaded and writes each sub-result to score_cache.
 
-    budget: guesses available to solve `remaining` from this point (None =
-    unlimited).  A subgroup that can't be solved within budget-1 makes this
+    budget: guesses available to solve `branch_words` from this point (None =
+    unlimited).  A sub-branch that can't be solved within budget-1 makes this
     candidate infeasible (cost inf) and marks floor_hit — the depth cap fired.
 
     Returns (status, cost, max_depth, floor_hit):
@@ -938,24 +938,24 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
                                strategy's worst-case line length (None when
                                unlimited — not tracked).
       ('pruned', None, md, floor)   can't beat best_erd, OR infeasible within
-                               budget (a subgroup hit the floor).
-      ('useless', None, None, floor) a response group is all of `remaining`.
+                               budget (a sub-branch hit the floor).
+      ('useless', None, None, floor) a response group is all of `branch_words`.
       ('abort', None, None, floor)  deadline/cancel fired; caller must stop.
     floor_hit is always returned (even on early returns) so the caller can
     aggregate taint across all candidates it tries, including discarded ones.
     """
     if n is None:
-        n = len(remaining)
+        n = len(branch_words)
     # Liveness tick: fire once per candidate evaluation (the dominant work
     # unit).  Guarantees a progress signal even through a long run of guesses
     # that all prune below without recursing.  Observation only.
     if heartbeat is not None:
         heartbeat()
     if cache:
-        groups = cache.group_words(guess, remaining)
+        groups = cache.group_words(guess, branch_words)
     else:
         groups = defaultdict(list)
-        for answer in remaining:
+        for answer in branch_words:
             pat = _encode_response(calculate_response(guess, answer))
             groups[pat].append(answer)
 
@@ -971,14 +971,14 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
     cand_md = 1 if budget is not None else None
     floor = False
     sub_budget = None if budget is None else budget - 1
-    # Largest subgroups first: highest weight (k/n), pushes cost up fastest so
-    # the branch-and-bound check fires after as few sub-evaluations as possible.
+    # Largest sub-branches first: highest weight (k/n), pushes cost up fastest
+    # so the branch-and-bound check fires after as few sub-evaluations as possible.
     ordered = sorted(groups.values(), key=len, reverse=True)
 
-    # Alpha-beta: solve each subgroup under a derived ceiling so a deep node
+    # Alpha-beta: solve each sub-branch under a derived ceiling so a deep node
     # prunes from a tight bound instead of inf.  rest_lb[i] is an admissible
-    # lower bound on the weighted cost of the subgroups *after* position i
-    # (each subgroup of size k costs >= lb(k); the all-singletons split attains
+    # lower bound on the weighted cost of the sub-branches *after* position i
+    # (each sub-branch of size k costs >= lb(k); the all-singletons split attains
     # it, so it never over-counts).  The self singleton contributes 0.
     def _sub_lb(sg):
         if len(sg) == 1:
@@ -989,33 +989,33 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
     for i in range(len(ordered) - 1, -1, -1):
         rest_lb[i] = rest_lb[i + 1] + (len(ordered[i]) / n) * _sub_lb(ordered[i])
 
-    for i, subgroup in enumerate(ordered):
-        k = len(subgroup)
-        if k == 1 and subgroup[0] == guess:
+    for i, sub_branch in enumerate(ordered):
+        k = len(sub_branch)
+        if k == 1 and sub_branch[0] == guess:
             continue  # self: solved by this guess, 0 further guesses
         if k >= n:
             return ('useless', None, None, floor)  # zero information
-        # Max ERD this subgroup may have for the candidate to still beat the
+        # Max ERD this sub-branch may have for the candidate to still beat the
         # bound, assuming the remaining siblings achieve only their lower bound.
         if best_erd == float('inf'):
             sub_ceiling = float('inf')
         else:
             sub_ceiling = (best_erd - cost - rest_lb[i + 1]) * (n / k) + _CEIL_EPS
         sub = _solve_subset(
-            subgroup, cache, score_cache, sub_budget, deadline, guesses,
+            sub_branch, cache, score_cache, sub_budget, deadline, guesses,
             policy, cancel_check, heartbeat, depth + 1, depth_observer, None,
             subbranch_solver, ceiling=sub_ceiling)
         if sub is None:
             return ('abort', None, None, floor)
         sub_cost, sub_md, sub_floor, sub_cutoff = sub
         if sub_cutoff:
-            # Subgroup search stopped at >= its ceiling: this candidate's cost
+            # Sub-branch search stopped at >= its ceiling: this candidate's cost
             # is therefore >= best_erd.  Discard it (sub_cost is only a lower
             # bound) WITHOUT marking taint — we never proved infeasibility.
             return ('cutoff', None, cand_md, floor)
         floor = floor or sub_floor
         if sub_cost == float('inf'):
-            # Subgroup unsolvable within budget — this candidate is infeasible.
+            # Sub-branch unsolvable within budget — this candidate is infeasible.
             return ('pruned', None, None, True)
         cost += (k / n) * sub_cost
         if budget is not None:
@@ -1025,7 +1025,7 @@ def evaluate_guess(remaining, guess, cache, score_cache, *,
     return ('ok', cost, cand_md, floor)
 
 
-def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
+def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, depth, depth_observer,
                   progress_callback, subbranch_solver=None,
                   ceiling=float('inf')):
@@ -1037,7 +1037,7 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
     cutoff distinguishes the two ways a search can fail to return an exact
     optimum, which the cache MUST treat differently:
       cutoff=False  cost is exact (the true optimum), OR a definite budget
-                    floor: cost == inf with floor_hit means `remaining` was
+                    floor: cost == inf with floor_hit means `branch_words` was
                     *proven* unsolvable within `budget`.  Either way reusable.
       cutoff=True   alpha-beta gave up early — every candidate priced out at
                     >= `ceiling`, so all we know is cost >= ceiling SO FAR;
@@ -1051,7 +1051,7 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
     budget None = unlimited (legacy: floor never fires, max_depth None,
     results cached as unconstrained).
     """
-    n = len(remaining)
+    n = len(branch_words)
     if heartbeat is not None:
         heartbeat()
     if depth_observer is not None:
@@ -1071,12 +1071,12 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
             f"Unknown ERD policy {policy!r}; expected one of "
             f"{sorted(VALID_ERD_POLICIES)}"
         )
-    guess_list = guesses if guesses is not None else remaining
+    guess_list = guesses if guesses is not None else branch_words
 
-    subset_key = ScoreCache.encode_subset(remaining)
+    branch_key = ScoreCache.encode_subset(branch_words)
     if score_cache:
         reuse = _cache_reuse(
-            score_cache.read_with_depth(subset_key, policy), budget)
+            score_cache.read_with_depth(branch_key, policy), budget)
         if reuse is not None:
             return (*reuse, False)   # cached values are exact optima
 
@@ -1090,7 +1090,7 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
     # across workers (returns a result) or decline (None) so we solve inline.
     # Correctness-neutral: a solver that inlines yields the identical ERD.
     if subbranch_solver is not None:
-        delegated = subbranch_solver(remaining, budget)
+        delegated = subbranch_solver(branch_words, budget)
         if delegated is not None:
             return delegated
 
@@ -1103,21 +1103,21 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
         guess_list = sorted(
             guess_list,
             key=lambda g: sum(
-                c * c for c in cache.group_counts(g, remaining).values()),
+                c * c for c in cache.group_counts(g, branch_words).values()),
         )
 
     # Seed the bound with the alpha-beta ceiling: any candidate that can't beat
     # it is a cutoff, and if none can we report a cutoff (lower bound) rather
     # than a spurious optimum.
     best_erd = ceiling
-    best_word = None
+    best_guess = None
     best_md = None
     node_floor = False
     cutoff_occurred = False
 
     for i, guess in enumerate(guess_list):
         status, cost, md, floor = evaluate_guess(
-            remaining, guess, cache, score_cache,
+            branch_words, guess, cache, score_cache,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
             depth=depth, depth_observer=depth_observer, budget=budget,
@@ -1134,13 +1134,13 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
 
         if cost < best_erd:
             best_erd = cost
-            best_word = guess
+            best_guess = guess
             best_md = md
 
         if progress_callback is not None:
-            progress_callback(i + 1, len(guess_list), best_word, best_erd)
+            progress_callback(i + 1, len(guess_list), best_guess, best_erd)
 
-    if best_word is None:
+    if best_guess is None:
         if cutoff_occurred:
             # Every candidate priced out at >= ceiling but none was proven
             # infeasible: a lower bound only (= ceiling), solvability unknown.
@@ -1156,21 +1156,21 @@ def _solve_subset(remaining, cache, score_cache, budget, deadline, guesses,
         # optimum: finding a candidate below the ceiling means the ceiling only
         # pruned provably-worse candidates, so the value is universally valid.
         solve_budget = None if (budget is None or not node_floor) else budget
-        score_cache.write(subset_key, policy, best_word, best_erd,
+        score_cache.write(branch_key, policy, best_guess, best_erd,
                           max_depth=best_md, solve_budget=solve_budget)
-        cache_all_scores(best_word, remaining, score_cache, subset_key, cache=cache)
+        cache_all_scores(best_guess, branch_words, score_cache, branch_key, cache=cache)
 
     return (best_erd, best_md, node_floor, False)
 
 
-def min_expected_guesses(remaining, cache, score_cache,
+def min_expected_guesses(branch_words, cache, score_cache,
                           deadline=None, guesses=None,
                           policy=None, progress_callback=None,
                           cancel_check=None, heartbeat=None,
                           depth=0, depth_observer=None, budget=None,
                           subbranch_solver=None):
     """
-    Exact expected guesses to solve remaining words, playing optimally.
+    Exact expected guesses to solve branch_words, playing optimally.
 
     With budget=None this is the classic unlimited-depth ERD.  With an integer
     budget it is depth-limited: the minimum expected guesses among strategies
@@ -1180,16 +1180,16 @@ def min_expected_guesses(remaining, cache, score_cache,
     guesses: vocabulary of allowed guess words. None means answers-only.
     policy:  cache namespace (see VALID_ERD_POLICIES).  Defaults to ERD_ALL
              when guesses is supplied, ERD_ANSWERS otherwise.
-    progress_callback: progress_callback(done, total, best_word, best_erd),
+    progress_callback: progress_callback(done, total, best_guess, best_erd),
              once per fully-evaluated top-level candidate (top level only).
     cancel_check / heartbeat / depth_observer: threaded into every recursive
              call (see _solve_subset / evaluate_guess).
 
     Returns the expected-guesses cost, or None if the deadline/cancel fired or
-    (when budgeted) `remaining` is unsolvable within budget.  Partial results
+    (when budgeted) `branch_words` is unsolvable within budget.  Partial results
     already written to score_cache are kept and valid either way.
     """
-    res = _solve_subset(remaining, cache, score_cache, budget, deadline,
+    res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat, depth,
                         depth_observer, progress_callback, subbranch_solver)
     if res is None:
@@ -1203,12 +1203,12 @@ def min_expected_guesses(remaining, cache, score_cache,
 def verify_erd_cache(words, cache, score_cache, policy, max_nodes=2000):
     """Spot-check a cached ERD entry against its own cached subtree.
 
-    For `words` and (recursively) every cached subgroup reachable through
-    best_word's response partition, recompute
+    For `words` and (recursively) every cached branch reachable through
+    best_guess's response partition, recompute
     1 + sum_i (k_i/n) * sub_best_score_i
-    from whatever subgroup entries are themselves cached, and compare it to
+    from whatever branch entries are themselves cached, and compare it to
     the entry's own best_score. Every cached sub_best_score is >= 1, so a
-    partial sum (some subgroups uncached) can only be <= the true total —
+    partial sum (some branches uncached) can only be <= the true total —
     if it already exceeds best_score, best_score itself must be wrong.
 
     This catches a cached entry that is internally inconsistent with its
@@ -1218,12 +1218,12 @@ def verify_erd_cache(words, cache, score_cache, policy, max_nodes=2000):
     it is *wrong*.
 
     Returns a list of dicts (BFS order, root first), each with keys
-    n, best_word, best_score, reconstructed, complete, status, subset_key.
+    n, best_guess, best_score, reconstructed, complete, status, branch_key.
     status is one of:
-      'uncached'   - no entry for this subset (only possible for the root)
+      'uncached'   - no entry for this branch (only possible for the root)
       'match'      - reconstruction matches best_score and every k>=2
-                     subgroup was cached
-      'incomplete' - some k>=2 subgroup is uncached, but the partial
+                     sub-branch was cached
+      'incomplete' - some k>=2 sub-branch is uncached, but the partial
                      reconstruction is still consistent (<= best_score)
       'mismatch'   - reconstruction (partial or complete) contradicts
                      best_score
@@ -1232,7 +1232,7 @@ def verify_erd_cache(words, cache, score_cache, policy, max_nodes=2000):
     root_key = ScoreCache.encode_subset(words)
     hit = score_cache.read(root_key, policy)
     if hit is None:
-        return [{'n': len(words), 'subset_key': root_key, 'status': 'uncached'}]
+        return [{'n': len(words), 'branch_key': root_key, 'status': 'uncached'}]
 
     visited = {root_key}
     queue = [(words, root_key, hit[0], hit[1])]
@@ -1268,8 +1268,8 @@ def verify_erd_cache(words, cache, score_cache, policy, max_nodes=2000):
             status = 'mismatch' if reconstructed > cur_score + 1e-9 else 'incomplete'
 
         report.append({
-            'n': n, 'best_word': cur_word, 'best_score': cur_score,
+            'n': n, 'best_guess': cur_word, 'best_score': cur_score,
             'reconstructed': reconstructed, 'complete': complete,
-            'status': status, 'subset_key': cur_key,
+            'status': status, 'branch_key': cur_key,
         })
     return report

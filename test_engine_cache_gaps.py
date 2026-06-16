@@ -282,7 +282,7 @@ class TestRankGuessesPartialMethodCache(unittest.TestCase):
         the `m not in cached` guard is False for the cached method)."""
         cache, sc = make_cache(self.db)
         words = ["crane", "slate", "trace"]
-        subset_key = ScoreCache.encode_subset(words)
+        branch_key = ScoreCache.encode_subset(words)
 
         # Pre-seed ONLY MAX_GROUP_SIZE for "crane"; ENTROPY_GAIN missing.
         from wordle_engine import score_word_multi
@@ -291,7 +291,7 @@ class TestRankGuessesPartialMethodCache(unittest.TestCase):
             [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN],
             cache=cache)
         sc.write_scores(
-            subset_key,
+            branch_key,
             [("crane", scores[ScoringMethod.MAX_GROUP_SIZE])],
             ScoringMethod.MAX_GROUP_SIZE.name.lower())
 
@@ -300,7 +300,7 @@ class TestRankGuessesPartialMethodCache(unittest.TestCase):
         self.assertEqual(ranked, ["crane"])
         # ENTROPY_GAIN (the previously-missing method) was now written.
         eg = dict(sc.read_scores(
-            subset_key, ScoringMethod.ENTROPY_GAIN.name.lower()))
+            branch_key, ScoringMethod.ENTROPY_GAIN.name.lower()))
         self.assertIn("crane", eg)
 
 

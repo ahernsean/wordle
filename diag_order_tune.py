@@ -28,11 +28,11 @@ vocab = load_word_list('wordle.txt')
 q = sqlite3.connect('erd_queue.sqlite3', timeout=10); q.row_factory = sqlite3.Row
 branches = []
 for sz in BRANCH_SIZES:
-    row = q.execute("""SELECT subset_key, n_words FROM pending_subgroups
+    row = q.execute("""SELECT branch_key, n_words FROM pending_subgroups
                        WHERE source_word='salet' AND n_words>=? AND n_words<>238
                        ORDER BY n_words ASC LIMIT 1""", (sz,)).fetchone()
     if row:
-        branches.append((row['subset_key'], row['n_words']))
+        branches.append((row['branch_key'], row['n_words']))
 q.close()
 
 cache_tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False); cache_tmp.close()
@@ -49,7 +49,7 @@ RC = ResponseCache(answers, SC)
 def solve(words, gate):
     wordle_engine.ORDER_MIN_N = gate
     SC._mem_cache.clear()
-    SC._conn.execute("DELETE FROM subgroup_best_by_policy")
+    SC._conn.execute("DELETE FROM branch_best_by_policy")
     t0 = time.time()
     erd = min_expected_guesses(words, RC, SC, guesses=vocab, budget=BUDGET,
                                deadline=t0 + DEADLINE_S)

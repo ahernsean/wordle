@@ -19,8 +19,8 @@ reset-stale Reset any 'in_progress' queue rows to 'pending'.  Done
             recovery without restarting workers.
 
 export      Create a trimmed snapshot of the cache containing only the
-            tables needed on iPhone (universe, response_decomposition,
-            subgroup_best_by_policy).  Safe to run while workers are
+            tables needed on iPhone (answer_list, response_decomposition,
+            branch_best_by_policy).  Safe to run while workers are
             active.  Re-running is incremental (INSERT OR IGNORE).
 """
 
@@ -70,8 +70,8 @@ def cmd_bootstrap(args):
     if stale:
         print(f'Reset {stale} stale in_progress rows to pending.')
 
-    # Print universe_id so the user can verify it matches their iPhone.
-    print(f'Universe ID : {score_cache.universe_id[:16]}...'
+    # Print answer_list_id so the user can verify it matches their iPhone.
+    print(f'Universe ID : {score_cache.answer_list_id[:16]}...'
           f'  ({len(all_answers)} answers)')
     print(f'Root words  : {len(root_words):,}  '
           f'({len(priority_words)} priority)')
@@ -323,7 +323,7 @@ def _print_status(args):
         worker_counts = queue.worker_counts_by_branch()
         bootstrap_status = queue.get_meta('bootstrap_status')
         # Per-branch done-chunk counts for the in-progress branches.
-        done_chunks = {bytes(b['subset_key']): queue.branch_done_chunks(b['subset_key'])
+        done_chunks = {bytes(b['branch_key']): queue.branch_done_chunks(b['branch_key'])
                        for b in branches}
         queue.close()
         queue_ok = True
@@ -342,13 +342,13 @@ def _print_status(args):
         all_answers = load_word_list(ANSWER_FILE)
         sc = ScoreCache(args.cache, all_answers, checkpoint_on_close=False)
         total_erd = sc._conn.execute(
-            "SELECT COUNT(*) FROM subgroup_best_by_policy "
-            "WHERE policy=? AND universe_id=?",
-            (ERD_ALL, sc.universe_id)).fetchone()[0]
+            "SELECT COUNT(*) FROM branch_best_by_policy "
+            "WHERE policy=? AND answer_list_id=?",
+            (ERD_ALL, sc.answer_list_id)).fetchone()[0]
         recent = sc._conn.execute(
-            "SELECT COUNT(*) FROM subgroup_best_by_policy "
-            "WHERE policy=? AND universe_id=? AND updated_at>?",
-            (ERD_ALL, sc.universe_id, now_ts - 300)).fetchone()[0]
+            "SELECT COUNT(*) FROM branch_best_by_policy "
+            "WHERE policy=? AND answer_list_id=? AND updated_at>?",
+            (ERD_ALL, sc.answer_list_id, now_ts - 300)).fetchone()[0]
         sc.close()
         cache_ok = True
     except Exception as e:
@@ -387,14 +387,14 @@ def _print_status(args):
     if not branches:
         print('  (none)')
     for b in branches:
-        key = bytes(b['subset_key'])
+        key = bytes(b['branch_key'])
         n_chunks = ErdQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
         done = done_chunks.get(key, 0)
         pct = 100.0 * done / n_chunks if n_chunks else 0.0
         src = (f'{b["source_word"].upper()} {fmt_pattern(b["source_pattern"])}'
                if b['source_word'] and b['source_pattern'] is not None
                else '-----')
-        bw = (b['best_word'] or '-----').upper()
+        bw = (b['best_guess'] or '-----').upper()
         be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '  ---'
         nw = b['n_words'] or 0
         wk = worker_counts.get(key, 0)
@@ -415,7 +415,7 @@ def _print_status(args):
     for h in sorted(hbs, key=lambda r: r['worker_id']):
         age = now_ts - h['updated_at']
         flag = '  !!STALE' if age > 120 else ''
-        key = h['current_subset_key']
+        key = h['current_branch_key']
         if key is None:
             print(f'  {h["worker_id"]:<10s} idle{"":40s}hb={age}s{flag}')
             continue
@@ -458,7 +458,7 @@ def _fmt_duration(seconds: int) -> str:
 # export
 # ---------------------------------------------------------------------------
 
-EXPORT_TABLES = ['universe', 'response_decomposition', 'subgroup_best_by_policy']
+EXPORT_TABLES = ['answer_list', 'response_decomposition', 'branch_best_by_policy']
 DEFAULT_EXPORT = 'wordle_erd_export.sqlite3'
 
 
@@ -589,8 +589,8 @@ def cmd_solve_branch(args):
         sc.close()
         return
 
-    subset_key = encode_subset(branch)
-    existing = sc.read(subset_key, ERD_ALL)
+    branch_key = encode_subset(branch)
+    existing = sc.read(branch_key, ERD_ALL)
     sc.close()
 
     print(f'{word.upper()} {pat}  —  {len(branch)} words')
@@ -607,12 +607,12 @@ def cmd_solve_branch(args):
         while not stop.is_set():
             try:
                 q = ErdQueue(args.queue)
-                row = q.get_branch(subset_key)
+                row = q.get_branch(branch_key)
                 if row is not None:
                     n_chunks = ErdQueue.n_chunks_for(
                         row['n_candidates'], row['chunk_size'])
-                    done = q.branch_done_chunks(subset_key)
-                    bw, be = q.read_branch_best(subset_key)
+                    done = q.branch_done_chunks(branch_key)
+                    bw, be = q.read_branch_best(branch_key)
                     el = int(time.time() - started)
                     pct = 100.0 * done / n_chunks if n_chunks else 0.0
                     best = (f'{bw.upper()} {be:.4f}'
@@ -632,14 +632,14 @@ def cmd_solve_branch(args):
 
     if args.force:
         sc2 = ScoreCache(args.cache, all_answers)
-        sc2.delete(subset_key, ERD_ALL)
+        sc2.delete(branch_key, ERD_ALL)
         sc2.close()
 
     mon = threading.Thread(target=monitor, daemon=True)
     mon.start()
     t0 = time.time()
     result = run_branch_solve(
-        subset_key, branch, n_workers=args.workers,
+        branch_key, branch, n_workers=args.workers,
         cache_path=args.cache, queue_path=args.queue,
         divisor=args.divisor, max_chunks=args.max_chunks,
         priority=args.priority, source_word=word, source_pattern=code)

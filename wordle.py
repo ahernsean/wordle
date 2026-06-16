@@ -706,7 +706,7 @@ class GameState:
         self.columns = 1
         self.universe = GuessUniverse.ALL_WORDS
         self.compliance = ComplianceFilter.UNFILTERED
-        self.last_erd_root_progress = (0, 0, None)  # (done, total, (best_word, best_erd))
+        self.last_erd_root_progress = (0, 0, None)  # (done, total, (best_guess, best_erd))
         self.solver = None  # live reference to the current ERDSolver, for cmd_help
         # constrained_erd_cache is intentionally NOT reset here — it is
         # long-lived and self-scoping (see __init__ and MemoryScoreCache).
@@ -1433,8 +1433,8 @@ def cmd_lookahead(gs):
             if cnt <= 2:
                 continue
             if soln.score_cache:
-                subset_key = ScoreCache.encode_subset(subgroup)
-                if soln.score_cache.read(subset_key, policy) is not None:
+                branch_key = ScoreCache.encode_subset(subgroup)
+                if soln.score_cache.read(branch_key, policy) is not None:
                     continue
             total_work += (len(second_step_words)
                            if second_step_words else cnt)
@@ -1611,8 +1611,8 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
             cands2 = subgroup
 
         # Check SQLite subgroup cache (shares entries with compute_lookahead)
-        subset_key = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
-        cache_hit = lc.read(subset_key, policy) if subset_key else None
+        branch_key = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
+        cache_hit = lc.read(branch_key, policy) if branch_key else None
 
         if cache_hit is not None:
             best2_word, best2_ent = cache_hit
@@ -1651,8 +1651,8 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
                     best2_word = c2
                     best2_grps = sg
 
-            if subset_key and best2_word:
-                lc.write(subset_key, policy, best2_word, best2_ent)
+            if branch_key and best2_word:
+                lc.write(branch_key, policy, best2_word, best2_ent)
 
         step2 += (k / n) * best2_ent
 
@@ -2096,7 +2096,7 @@ def cmd_verify_erd(gs):
         print("  Not cached yet.")
         return
 
-    print(f"  root: best={root['best_word'].upper()} {root['best_score']:.4f}  "
+    print(f"  root: best={root['best_guess'].upper()} {root['best_score']:.4f}  "
           f"reconstructed={root['reconstructed']:.4f}  [{root['status'].upper()}]")
 
     if isinstance(erd_sc, ScoreCache):
@@ -2113,7 +2113,7 @@ def cmd_verify_erd(gs):
 
     mismatches = [r for r in report if r['status'] == 'mismatch']
     for r in mismatches[:5]:  # pragma: no cover - integrity report; only on a corrupted cache
-        print(f"    MISMATCH: {r['n']}-word subset, best={r['best_word'].upper()} "
+        print(f"    MISMATCH: {r['n']}-word subset, best={r['best_guess'].upper()} "
               f"{r['best_score']:.4f} vs reconstructed {r['reconstructed']:.4f}")
 
     if root['status'] == 'mismatch' and isinstance(erd_sc, ScoreCache):  # pragma: no cover - only on a corrupted cache
@@ -2454,13 +2454,13 @@ def print_status(gs, solver=None):
                             solver.current_word_tag(), suffix=' cands')
             # Scoring method cache status: one LIMIT 1 probe per method.
             if soln.score_cache is not None:
-                subset_key = ScoreCache.encode_subset(words)
+                branch_key = ScoreCache.encode_subset(words)
                 cached_methods = [
                     label for m in ScoringMethod
                     for label in (_METHOD_SHORT.get(m),)
                     if label is not None
                     and soln.score_cache.has_scores(
-                        subset_key, m.name.lower())
+                        branch_key, m.name.lower())
                 ]
                 if cached_methods:
                     scan_lines.append(f'Scores ready: {" ".join(cached_methods)}')
@@ -2788,7 +2788,7 @@ class ERDSolver(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class BranchPrecacheSolver(threading.Thread):
-    """Daemon thread: fills subgroup_best_by_policy (ERD_ALL) for every
+    """Daemon thread: fills branch_best_by_policy (ERD_ALL) for every
     not-yet-cached branch of `guess_word`, one at a time, in `branches`
     order. Always persist=True (SQLite) — precaching only makes sense for
     the persisted, universe-scoped ERD_ALL cache.
