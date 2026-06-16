@@ -13,7 +13,10 @@ Two checks across 1, 2, and 4 workers:
    one branch and confirm they all produce the correct result.  A 30-second
    per-run timeout catches deadlocks and livelocks.  No wall-clock comparison
    is made: on a branch this small, process spawn overhead (~100 ms/fork)
-   dominates solver time (~10 ms), making timing comparisons meaningless.
+   dominates solver time (~10 ms), making timing comparisons meaningful; and
+   with SQLite chunk claims serializing writers, even 4 workers cooperating
+   over many branches shows only modest wall-clock speedup.  The work-count
+   invariant in test 1 is the reliable regression guard for parallelism.
 """
 import multiprocessing as mp
 import os
