@@ -29,7 +29,7 @@ from wordle_engine import (
     decode_response, _ALL_GREEN_PATTERN,
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
-    enumerate_branches, rank_guesses_by_group_then_entropy, _cache_reuse,
+    enumerate_branches, rank_candidates_by_max_group_size_then_entropy_gain, _cache_reuse,
     _solve_subset,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
@@ -1308,7 +1308,7 @@ class TestCacheAllScores(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# rank_guesses_by_group_then_entropy — shared word_scores cache with cmd_solve
+# rank_candidates_by_max_group_size_then_entropy_gain — shared word_scores cache with cmd_solve
 # ---------------------------------------------------------------------------
 
 class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
@@ -1355,7 +1355,7 @@ class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
                     raise AssertionError(
                         "ranking should use cached word_scores, not recompute")
 
-            ranked = rank_guesses_by_group_then_entropy(
+            ranked = rank_candidates_by_max_group_size_then_entropy_gain(
                 words, candidates, ExplodingResponseCache(), sc)
             self.assertEqual(ranked, expected_order)
         finally:
@@ -1373,7 +1373,7 @@ class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
         try:
             cache = ResponseCache(ANSWERS, score_cache=sc)
 
-            rank_guesses_by_group_then_entropy(words, candidates, cache, sc)
+            rank_candidates_by_max_group_size_then_entropy_gain(words, candidates, cache, sc)
 
             soln = Solution(ANSWERS, GUESSES, cache=cache, score_cache=sc)
             soln.current_words = words
@@ -1392,7 +1392,7 @@ class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
         sc = ScoreCache(self.db, ANSWERS)
         try:
             cache = ResponseCache(ANSWERS, score_cache=sc)
-            ranked = rank_guesses_by_group_then_entropy(
+            ranked = rank_candidates_by_max_group_size_then_entropy_gain(
                 words, candidates, cache, sc, cancel_check=lambda: True)
             self.assertEqual(ranked, candidates)
 
@@ -1411,7 +1411,7 @@ class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
         mc = MemoryScoreCache()
         mc.set_scope('test-scope')
 
-        ranked = rank_guesses_by_group_then_entropy(words, candidates, cache, mc)
+        ranked = rank_candidates_by_max_group_size_then_entropy_gain(words, candidates, cache, mc)
         self.assertEqual(ranked, self._expected_order(words, candidates, cache))
 
 
@@ -1895,28 +1895,28 @@ class TestCacheReuseRule(unittest.TestCase):
 # min_expected_guesses: cost_lb admissible-bound pruning
 # ---------------------------------------------------------------------------
 
-def _brute_force_erd(remaining, cache, guess_list):
-    """Reference ERD computation with NO pruning of any kind: every guess
-    and every subgroup is evaluated, with no cost_lb check and no
+def _brute_force_erd(branch_words, cache, candidate_list):
+    """Reference ERD computation with NO pruning of any kind: every candidate
+    and every sub-branch is evaluated, with no cost_lb check and no
     cost >= best_erd branch-and-bound break. Mirrors the base-case and
-    skip-guess handling of min_expected_guesses exactly so the two can be
+    skip-candidate handling of min_expected_guesses exactly so the two can be
     compared directly."""
-    n = len(remaining)
+    n = len(branch_words)
     if n == 1:
         return 1.0
     best = float('inf')
-    for guess in guess_list:
-        groups = cache.group_words(guess, remaining)
+    for candidate in candidate_list:
+        groups = cache.group_words(candidate, branch_words)
         cost = 1.0
         skip = False
-        for subgroup in groups.values():
-            k = len(subgroup)
-            if k == 1 and subgroup[0] == guess:
+        for sub_branch in groups.values():
+            k = len(sub_branch)
+            if k == 1 and sub_branch[0] == candidate:
                 continue
             if k >= n:
                 skip = True
                 break
-            cost += (k / n) * _brute_force_erd(subgroup, cache, guess_list)
+            cost += (k / n) * _brute_force_erd(sub_branch, cache, candidate_list)
         if skip:
             continue
         best = min(best, cost)

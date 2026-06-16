@@ -31,7 +31,7 @@ from wordle_engine import (
     calculate_group_counts, score_groups, score_groups_multi,
     decode_response, max_entropy,
     answer_to_restriction, enumerate_branches,
-    min_expected_guesses, verify_erd_cache, rank_guesses_by_group_then_entropy,
+    min_expected_guesses, verify_erd_cache, rank_candidates_by_max_group_size_then_entropy_gain,
     ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
 )
 
@@ -2613,7 +2613,7 @@ class ERDSolver(threading.Thread):
 
         if self._cancel.is_set():
             return self._effective_guesses
-        return rank_guesses_by_group_then_entropy(
+        return rank_candidates_by_max_group_size_then_entropy_gain(
             self._words, self._effective_guesses, self._rcache, score_cache,
             cancel_check=_cancel_check,
         )
@@ -2917,7 +2917,7 @@ class BranchPrecacheSolver(threading.Thread):
                 def _cancel_or_paused():
                     return self._cancel.is_set() or not self._paused.is_set()
 
-                ranked = rank_guesses_by_group_then_entropy(
+                ranked = rank_candidates_by_max_group_size_then_entropy_gain(
                     words, self._all_words, rcache, score_cache,
                     cancel_check=_ranking_cancel_check)
                 if self._cancel.is_set():

@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS run_meta (
 -- as a branch-and-bound bound.  status open -> finalized exactly once, by the
 -- worker that observes full chunk coverage; that worker writes the branch's
 -- ERD entry to the persistent cache, then the row (and its chunks) is deleted.
--- Candidate order is NOT stored: rank_guesses_by_group_then_entropy is
+-- Candidate order is NOT stored: rank_candidates_by_max_group_size_then_entropy_gain is
 -- deterministic, so every worker re-ranks locally and agrees on which
 -- candidates chunk i covers, sharing the work through the candidate_scores cache.
 CREATE TABLE IF NOT EXISTS active_branches (

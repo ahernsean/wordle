@@ -206,7 +206,7 @@ class TestBranchPrecacheSolverEdges(unittest.TestCase):
         def cancel_then_raise(*a, **k):
             s.stop()
             return []
-        with mock.patch("wordle.rank_guesses_by_group_then_entropy",
+        with mock.patch("wordle.rank_candidates_by_max_group_size_then_entropy_gain",
                         side_effect=cancel_then_raise):
             s.run()
 
@@ -216,7 +216,7 @@ class TestBranchPrecacheSolverEdges(unittest.TestCase):
         tmp.close()
         self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
         s = self._solver(tmp.name)
-        with mock.patch("wordle.rank_guesses_by_group_then_entropy",
+        with mock.patch("wordle.rank_candidates_by_max_group_size_then_entropy_gain",
                         return_value=list(self.words)), \
              mock.patch("wordle.min_expected_guesses",
                         side_effect=sqlite3.OperationalError("disk I/O error")):

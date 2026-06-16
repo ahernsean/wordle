@@ -5,7 +5,7 @@ PERFORMANCE on real SALET branches, ordering OFF vs ON, cold each time.
 
 Per (branch, config) we record:
   - wall   : the headline speedup
-  - evals  : heartbeat fires (evaluate_guess + _solve_subset visits) = work proxy
+  - evals  : heartbeat fires (evaluate_candidate + _solve_subset visits) = work proxy
              -> confirms the *mechanism* (ordering should cut explored subtrees)
   - erd    : must be identical OFF vs ON (correctness at real scale)
 

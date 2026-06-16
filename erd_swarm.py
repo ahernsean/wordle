@@ -32,9 +32,9 @@ from wordle_engine import (
     ERD_ALL,
     ResponseCache,
     cache_all_scores,
-    evaluate_guess,
+    evaluate_candidate,
     load_word_list,
-    rank_guesses_by_group_then_entropy,
+    rank_candidates_by_max_group_size_then_entropy_gain,
     _cache_reuse,
 )
 from erd_queue import ErdQueue, decode_subset, encode_subset
@@ -127,7 +127,7 @@ class _BranchWorker:
     def _ranked_for(self, branch_key, words):
         if self._ranked_key == branch_key:
             return self._ranked
-        ranked = rank_guesses_by_group_then_entropy(
+        ranked = rank_candidates_by_max_group_size_then_entropy_gain(
             words, self.all_words, self.rcache, self.score_cache,
             cancel_check=self.cancel)
         self._ranked_key = branch_key
@@ -225,7 +225,7 @@ class _BranchWorker:
         """
         lo, hi = ErdQueue.chunk_range(idx, chunk_size, self.n_candidates)
         chunk_total = hi - lo
-        local_word, local_best = self.queue.read_branch_best(branch_key)
+        local_candidate, local_best = self.queue.read_branch_best(branch_key)
         local_md = None
         shared_best = local_best
         last_refresh = time.time()
@@ -233,7 +233,7 @@ class _BranchWorker:
         chunk_started = int(time.time())
         t0 = time.time()
         self._heartbeat(branch_key, n_words, idx, chunk_started, None,
-                        local_word, local_best, force=True,
+                        local_candidate, local_best, force=True,
                         cand_chunk_size=chunk_total)
 
         for n_seen, ci in enumerate(range(lo, hi), start=1):
@@ -246,7 +246,7 @@ class _BranchWorker:
             if now - last_log > 30:
                 logger.info('%s chunk %d: evaluating %s (%d/%d)  best=%s  '
                             'max_depth=%d', self.name, idx, ranked[ci], n_seen,
-                            chunk_total, local_word or '-', self._cand_max_depth)
+                            chunk_total, local_candidate or '-', self._cand_max_depth)
                 last_log = now
             bound = float('inf')
             for b in (local_best, shared_best):
@@ -255,7 +255,7 @@ class _BranchWorker:
 
             self._cand_max_depth = 0
             cand_t0 = time.time()
-            status, cost, cand_md, floor_hit = evaluate_guess(
+            status, cost, cand_md, floor_hit = evaluate_candidate(
                 words, ranked[ci], self.rcache, self.score_cache,
                 n=n_words, best_erd=bound, guesses=self.all_words,
                 policy=ERD_ALL, cancel_check=self.cancel,
@@ -263,7 +263,7 @@ class _BranchWorker:
                 subbranch_solver=self._subbranch_solver,
                 heartbeat=lambda: self._heartbeat(
                     branch_key, n_words, idx, chunk_started, None,
-                    local_word, local_best,
+                    local_candidate, local_best,
                     cur_candidate=ranked[ci], cand_n_seen=n_seen,
                     cand_chunk_size=chunk_total))
             cand_elapsed = time.time() - cand_t0
@@ -282,8 +282,8 @@ class _BranchWorker:
             if status == 'ok':
                 self.n_ok += 1
                 if local_best is None or cost < local_best:
-                    local_best, local_word, local_md = cost, ranked[ci], cand_md
-                    self.queue.update_branch_best(branch_key, local_word,
+                    local_best, local_candidate, local_md = cost, ranked[ci], cand_md
+                    self.queue.update_branch_best(branch_key, local_candidate,
                                                   local_best, local_md)
                     shared_best = local_best
             elif status in ('pruned', 'cutoff'):
@@ -293,7 +293,7 @@ class _BranchWorker:
 
             rate = n_seen / max(1e-6, now - t0)
             self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                            local_word, local_best,
+                            local_candidate, local_best,
                             cur_candidate=ranked[ci], cand_n_seen=n_seen,
                             cand_chunk_size=chunk_total)
 
@@ -305,9 +305,9 @@ class _BranchWorker:
                     'ok=%d pruned=%d useless=%d  best=%s %.4f',
                     self.name, idx, chunk_total, elapsed, rate,
                     self.n_ok, self.n_pruned, self.n_useless,
-                    local_word or '-', local_best if local_best else 0)
+                    local_candidate or '-', local_best if local_best else 0)
         self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                        local_word, local_best, force=True)
+                        local_candidate, local_best, force=True)
         return True
 
     # -- finalize -----------------------------------------------------------

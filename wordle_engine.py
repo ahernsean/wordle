@@ -471,8 +471,8 @@ def score_word_multi(word, remaining_words, methods,
     return score_groups_multi(groups, methods)
 
 
-def cache_all_scores(word, branch_words, score_cache, branch_key, cache=None):
-    """Derive and persist every ScoringMethod's view of `word` against `branch_words`.
+def cache_all_scores(candidate, branch_words, score_cache, branch_key, cache=None):
+    """Derive and persist every ScoringMethod's view of `candidate` against `branch_words`.
 
     score_groups' methods all read off the same group-count partition, so
     once that partition is in hand for one method, the rest are nearly free
@@ -481,7 +481,7 @@ def cache_all_scores(word, branch_words, score_cache, branch_key, cache=None):
 
     This is the ONE place that enumerates ScoringMethod for caching purposes.
     Callers (compute_lookahead, min_expected_guesses, ...) just say "this
-    word, for this branch, is worth remembering comprehensively" — they
+    candidate, for this branch, is worth remembering comprehensively" — they
     don't need to know what the full roster is, or to change when it grows.
 
     Hard-mode searches pass a MemoryScoreCache, whose minimal read/write
@@ -491,12 +491,12 @@ def cache_all_scores(word, branch_words, score_cache, branch_key, cache=None):
     """
     if not score_cache or not hasattr(score_cache, 'write_scores'):
         return
-    for method, value in score_word_multi(word, branch_words, list(ScoringMethod),
+    for method, value in score_word_multi(candidate, branch_words, list(ScoringMethod),
                                            cache=cache).items():
-        score_cache.write_scores(branch_key, [(word, value)], method.name.lower())
+        score_cache.write_scores(branch_key, [(candidate, value)], method.name.lower())
 
 
-def rank_guesses_by_group_then_entropy(words, candidates, rcache, score_cache,
+def rank_candidates_by_max_group_size_then_entropy_gain(words, candidates, rcache, score_cache,
                                         cancel_check=None):
     """Order `candidates` by 1-level max-group-size (asc) then entropy gain
     (desc) for the position `words` — reads/writes the SAME word_scores
@@ -916,13 +916,13 @@ def _cache_reuse(entry, budget):
     return (score, md, True) if sb == budget else None
 
 
-def evaluate_guess(branch_words, guess, cache, score_cache, *,
+def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    n=None, best_erd=float('inf'),
                    deadline=None, guesses=None, policy=ERD_ALL,
                    cancel_check=None, heartbeat=None,
                    depth=0, depth_observer=None, budget=None,
                    subbranch_solver=None):
-    """Evaluate one candidate `guess`'s exact ERD for solving `branch_words`.
+    """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
     coordinator can distribute candidates of the SAME `branch_words` across
@@ -952,14 +952,14 @@ def evaluate_guess(branch_words, guess, cache, score_cache, *,
     if heartbeat is not None:
         heartbeat()
     if cache:
-        groups = cache.group_words(guess, branch_words)
+        groups = cache.group_words(candidate, branch_words)
     else:
         groups = defaultdict(list)
         for answer in branch_words:
-            pat = _encode_response(calculate_response(guess, answer))
+            pat = _encode_response(calculate_response(candidate, answer))
             groups[pat].append(answer)
 
-    # Admissible lower bound on this guess's cost — cost >= 3 - (G + has_self)/n.
+    # Admissible lower bound on this candidate's cost — cost >= 3 - (G + has_self)/n.
     has_self = _ALL_GREEN_PATTERN in groups
     cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
     if cost_lb >= best_erd:
@@ -982,7 +982,7 @@ def evaluate_guess(branch_words, guess, cache, score_cache, *,
     # it, so it never over-counts).  The self singleton contributes 0.
     def _sub_lb(sg):
         if len(sg) == 1:
-            return 0.0 if sg[0] == guess else 1.0
+            return 0.0 if sg[0] == candidate else 1.0
         return 2.0 - 1.0 / len(sg)
 
     rest_lb = [0.0] * (len(ordered) + 1)
@@ -991,8 +991,8 @@ def evaluate_guess(branch_words, guess, cache, score_cache, *,
 
     for i, sub_branch in enumerate(ordered):
         k = len(sub_branch)
-        if k == 1 and sub_branch[0] == guess:
-            continue  # self: solved by this guess, 0 further guesses
+        if k == 1 and sub_branch[0] == candidate:
+            continue  # self: solved by playing this candidate, 0 further guesses
         if k >= n:
             return ('useless', None, None, floor)  # zero information
         # Max ERD this sub-branch may have for the candidate to still beat the
@@ -1071,7 +1071,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             f"Unknown ERD policy {policy!r}; expected one of "
             f"{sorted(VALID_ERD_POLICIES)}"
         )
-    guess_list = guesses if guesses is not None else branch_words
+    candidate_list = guesses if guesses is not None else branch_words
 
     branch_key = ScoreCache.encode_subset(branch_words)
     if score_cache:
@@ -1096,14 +1096,14 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
 
     # Best-first ordering: evaluate the strongest splitter first (key = expected
     # remaining set size, Σ k²; smaller is better) so the branch-and-bound bound
-    # (best_erd) is tight from the 2nd candidate on, letting evaluate_guess's
+    # (best_erd) is tight from the 2nd candidate on, letting evaluate_candidate's
     # partial-sum cutoff prune the rest before they recurse.  Order-only — the
     # minimum, and therefore every cached result, is unchanged.
-    if cache and n >= ORDER_MIN_N and len(guess_list) > 1:
-        guess_list = sorted(
-            guess_list,
-            key=lambda g: sum(
-                c * c for c in cache.group_counts(g, branch_words).values()),
+    if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
+        candidate_list = sorted(
+            candidate_list,
+            key=lambda c: sum(
+                k * k for k in cache.group_counts(c, branch_words).values()),
         )
 
     # Seed the bound with the alpha-beta ceiling: any candidate that can't beat
@@ -1115,9 +1115,9 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     node_floor = False
     cutoff_occurred = False
 
-    for i, guess in enumerate(guess_list):
-        status, cost, md, floor = evaluate_guess(
-            branch_words, guess, cache, score_cache,
+    for i, candidate in enumerate(candidate_list):
+        status, cost, md, floor = evaluate_candidate(
+            branch_words, candidate, cache, score_cache,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
             depth=depth, depth_observer=depth_observer, budget=budget,
@@ -1134,11 +1134,11 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
 
         if cost < best_erd:
             best_erd = cost
-            best_guess = guess
+            best_guess = candidate
             best_md = md
 
         if progress_callback is not None:
-            progress_callback(i + 1, len(guess_list), best_guess, best_erd)
+            progress_callback(i + 1, len(candidate_list), best_guess, best_erd)
 
     if best_guess is None:
         if cutoff_occurred:
@@ -1183,7 +1183,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
     progress_callback: progress_callback(done, total, best_guess, best_erd),
              once per fully-evaluated top-level candidate (top level only).
     cancel_check / heartbeat / depth_observer: threaded into every recursive
-             call (see _solve_subset / evaluate_guess).
+             call (see _solve_subset / evaluate_candidate).
 
     Returns the expected-guesses cost, or None if the deadline/cancel fired or
     (when budgeted) `branch_words` is unsolvable within budget.  Partial results
