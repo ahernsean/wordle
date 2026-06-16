@@ -20,7 +20,7 @@ Anchored vocabulary:
    tables.
 2. `wordle_engine.min_expected_guesses` uses `remaining` / "subgroup" /
    `best_word` pervasively, and is the most-tested code in the repo. Renaming
-   it mid-feature would churn the engine and the 229-test suite at the same
+   it mid-feature would churn the engine and the 499-test suite at the same
    time as the swarm work.
 3. The swarm layer already reads cleanly in the new vocabulary; the internal
    names are below the waterline and don't block anything.
@@ -57,8 +57,8 @@ data values, already migrated once, and not identifiers.
    idempotent and run on open, so each side upgrades its own copy on first
    start with the new code.
 
-Do it as one dedicated PR with the full test suite green, not folded into a
-feature change.
+Do it as one dedicated PR with the full test suite green (499 tests across 14
+files as of Jun 2026), not folded into a feature change.
 
 ---
 
