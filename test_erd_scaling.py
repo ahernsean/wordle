@@ -1,22 +1,24 @@
 """Scaling guard for the parallel ERD swarm.
 
-Two checks across 1, 2, and 4 workers:
+Three checks:
 
 1. Work amplification (deterministic, thread-driven): the TOTAL number of
    candidate evaluations across all workers must stay equal to the candidate
    count regardless of how many workers run.  If coordination regressed and
    workers redid each other's chunks, total work would balloon — this catches
    that without depending on wall-clock timing.  Each run must also still
-   produce the correct ERD.  This is the primary performance regression guard.
+   produce the correct ERD.
 
 2. Real multi-process run (fork only): actually spawn 1/2/4 worker processes on
    one branch and confirm they all produce the correct result.  A 30-second
    per-run timeout catches deadlocks and livelocks.  No wall-clock comparison
    is made: on a branch this small, process spawn overhead (~100 ms/fork)
-   dominates solver time (~10 ms), making timing comparisons meaningful; and
-   with SQLite chunk claims serializing writers, even 4 workers cooperating
-   over many branches shows only modest wall-clock speedup.  The work-count
-   invariant in test 1 is the reliable regression guard for parallelism.
+   dominates solver time (~10 ms), making timing comparisons meaningless.
+
+3. Cooperative drain timing (fork only): spawn 1 vs 4 swarm_workers, drain 80
+   disjoint branches from a shared queue, and assert 4 workers finish in < 80%
+   of 1-worker time.  Key design constraints that make the comparison
+   meaningful are documented on TestCooperativeDrainSmoke.
 """
 import multiprocessing as mp
 import os
@@ -171,6 +173,117 @@ class TestProcessScalingSmoke(_Base):
         self.assertEqual(len(erds), 1, f"worker counts disagreed: {results}")
         sys.stderr.write(f"\n[scaling] wall times by workers: "
                          f"{ {k: round(v, 3) for k, v in times.items()} }\n")
+
+
+@unittest.skipUnless(
+    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
+    "needs fork start method and >=2 CPUs")
+class TestCooperativeDrainSmoke(unittest.TestCase):
+    """Timing guard: 4 cooperative workers must drain N_DRAIN_BRANCHES faster
+    than 1 worker.
+
+    Architecture:
+    * swarm_worker (queue-draining loop) is used so spawn cost is paid once
+      per worker, amortized across all N_DRAIN_BRANCHES branches.
+    * Branches are built from disjoint 12-word slices of NYT_wordlist: no two
+      branches share any answer word, so their sub-branch ERD results cannot
+      be reused across branches via the shared ScoreCache.  Without disjoint
+      branches, the first branch populates the sub-branch cache and subsequent
+      branches become instant cache hits, collapsing N branches to 1 branch
+      of actual compute.
+    * DRAIN_DIVISOR > BRANCH_SIZE → n_chunks=1 per branch.  Workers pipeline:
+      while one worker holds the SQLite claim lock (~1 ms), the others are
+      computing (~20 ms/branch).  At 80 branches, the compute/lock ratio is
+      high enough that 4-worker wall time is consistently < 60% of 1-worker
+      wall time on this hardware, and estimated < 75% on 2-vCPU CI runners.
+    * Threshold: 4 workers must finish in < 80% of 1-worker time.  On
+      observed runs the margin is 9 standard deviations from the threshold,
+      so timing noise from OS scheduling does not cause false failures.
+    """
+
+    _BRANCH_SIZE = 12
+    _N_BRANCHES = 80         # 80 × 12 = 960 unique answer words
+    _DRAIN_DIVISOR = 100     # ceil(12/100)=1 → 1 chunk per branch
+    _N_CANDIDATES = 100
+    _SPEEDUP_RATIO = 0.80    # 4 workers must complete in < 80% of 1-worker time
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        with open("NYT_wordlist.txt") as f:
+            nyt = [l.strip() for l in f if l.strip()]
+        with open("wordle.txt") as f:
+            wl = [l.strip() for l in f if l.strip()]
+        self._pool = nyt[:self._N_BRANCHES * self._BRANCH_SIZE]
+        self._branches = [self._pool[i * self._BRANCH_SIZE:(i + 1) * self._BRANCH_SIZE]
+                          for i in range(self._N_BRANCHES)]
+        self._candidates = wl[:self._N_CANDIDATES]
+        af = os.path.join(self._tmp.name, "answers.txt")
+        wf = os.path.join(self._tmp.name, "words.txt")
+        with open(af, "w") as f:
+            f.write("\n".join(self._pool) + "\n")
+        with open(wf, "w") as f:
+            f.write("\n".join(self._candidates) + "\n")
+        for attr, path in [("ANSWER_FILE", af), ("WORDS_FILE", wf)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self._af = af
+        self._wf = wf
+
+    def _drain(self, n_workers, tag, timeout=120):
+        from erd_swarm import swarm_worker
+        cache_path = os.path.join(self._tmp.name, f"cache_{tag}.sqlite3")
+        queue_path = os.path.join(self._tmp.name, f"queue_{tag}.sqlite3")
+        ScoreCache(cache_path, self._pool).close()
+        chunk_size = ErdQueue.chunk_size_for(
+            self._BRANCH_SIZE, len(self._candidates),
+            self._DRAIN_DIVISOR, MAX_CHUNKS)
+        q = ErdQueue(queue_path)
+        for bw in self._branches:
+            q.create_branch(encode_subset(bw), self._BRANCH_SIZE,
+                            len(self._candidates), chunk_size,
+                            budget=ROOT_BUDGET)
+        q.close()
+        stop_event = mp.Event()
+        # Suppress erd_worker_N.log creation: mock is inherited by forked children.
+        with mock.patch("erd_swarm._setup_logging", lambda *_: None):
+            procs = [mp.Process(target=swarm_worker,
+                                args=(w, cache_path, queue_path, stop_event,
+                                      self._DRAIN_DIVISOR, MAX_CHUNKS))
+                     for w in range(n_workers)]
+            t0 = time.time()
+            for p in procs:
+                p.start()
+        deadline = time.time() + timeout
+        q = ErdQueue(queue_path)
+        try:
+            while time.time() < deadline:
+                if not q.branches_in_progress():
+                    break
+                time.sleep(0.05)
+            elapsed = time.time() - t0
+        finally:
+            q.close()
+        stop_event.set()
+        for p in procs:
+            p.join(timeout=15)
+        for p in procs:
+            if p.is_alive():
+                p.kill()
+                p.join()
+        return elapsed
+
+    def test_4workers_faster_than_1worker(self):
+        t1 = self._drain(1, "w1")
+        t4 = self._drain(4, "w4")
+        sys.stderr.write(
+            f"\n[drain] 1-worker: {t1:.3f}s, 4-worker: {t4:.3f}s "
+            f"({t1 / t4:.2f}x speedup)\n")
+        self.assertLess(
+            t4, t1 * self._SPEEDUP_RATIO,
+            f"4 workers ({t4:.3f}s) not faster enough vs "
+            f"1 worker ({t1:.3f}s); expected < {t1 * self._SPEEDUP_RATIO:.3f}s")
 
 
 if __name__ == "__main__":
