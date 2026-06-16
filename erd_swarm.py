@@ -589,10 +589,16 @@ def _focused_worker(subset_key, worker_id, cache_path, queue_path,
 
 def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
                      divisor=3, max_chunks=256, priority=1,
-                     source_word=None, source_pattern=None, budget=ROOT_BUDGET):
+                     source_word=None, source_pattern=None, budget=ROOT_BUDGET,
+                     timeout=None):
     """Solve one branch by swarming N workers across its candidates.
 
-    Returns (best_word, best_erd) or None.
+    n_workers is capped at the number of chunks so we never spawn a process
+    that will immediately find no work and exit.
+
+    Returns (best_word, best_erd) or None.  If timeout is given (seconds),
+    any worker still running after that long is killed and the result will be
+    None (branch unfinished).
     """
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)
@@ -607,6 +613,8 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
 
     chunk_size = ErdQueue.chunk_size_for(
         len(words), len(all_words), divisor, max_chunks)
+    n_chunks = ErdQueue.n_chunks_for(len(all_words), chunk_size)
+    actual_workers = min(n_workers, n_chunks)
     queue.create_branch(subset_key, len(words), len(all_words), chunk_size,
                         priority=priority, source_word=source_word,
                         source_pattern=source_pattern, budget=budget)
@@ -616,11 +624,15 @@ def run_branch_solve(subset_key, words, n_workers, cache_path, queue_path,
     procs = [mp.Process(target=_focused_worker,
                         args=(subset_key, w, cache_path, queue_path,
                               divisor, max_chunks))
-             for w in range(n_workers)]
+             for w in range(actual_workers)]
     for p in procs:
         p.start()
     for p in procs:
-        p.join()
+        p.join(timeout=timeout)
+    for p in procs:
+        if p.is_alive():
+            p.kill()
+            p.join()
 
     score_cache = ScoreCache(cache_path, all_answers)
     try:
