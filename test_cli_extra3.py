@@ -28,7 +28,7 @@ class TestBucketBranchesDefault(CliTestCase):
     def test_ten_word_group_bucket(self):
         # 'zzzzz' vs the 10-word fixture → one all-gray group of 10 (10-49 bucket).
         out = self.run_cmd(lambda gs: cmd_test(gs, "zzzzz"))
-        self.assertIn("Subgroup sizes", out)
+        self.assertIn("Response group sizes", out)
 
 
 class TestBucketBranchesLarge(CliTestCase):
@@ -37,7 +37,7 @@ class TestBucketBranchesLarge(CliTestCase):
 
     def test_fifty_plus_group_bucket(self):
         out = self.run_cmd(lambda gs: cmd_test(gs, "zzzzz"))
-        self.assertIn("Subgroup sizes", out)
+        self.assertIn("Response group sizes", out)
 
 
 class TestRemainingMultiBoard(CliTestCase):

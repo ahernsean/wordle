@@ -631,7 +631,7 @@ def _fmt_size(n):
 # Short labels for scoring methods used in status lines.
 _METHOD_SHORT = {
     ScoringMethod.ENTROPY_GAIN:   'ent',
-    ScoringMethod.MAX_GROUP_SIZE: 'g-max',
+    ScoringMethod.MAX_GROUP_SIZE: 'max-grp',
     ScoringMethod.WEIGHTED_AVG:   'g-wt',
     ScoringMethod.PROB_FINISH:    'p%',
 }
@@ -1524,7 +1524,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
                      all_words=None, erd_cache=None):
     """
     Compute 3-step expected entropy and group stats for a single word.
-    Returns a dict with keys: step1, step2, step3, max_grp, max_grp2,
+    Returns a dict with keys: step1, step2, step3, max_group_size,
     wt_avg, prob_finish, buckets.
 
     step2_pool: candidate pool for step 2. If None and not constraint_compliant,
@@ -1563,17 +1563,17 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     _cached = soln.word_scores.get(word, {})
     if all(m in _cached for m in _step1_methods):
         step1    = _cached[ScoringMethod.ENTROPY_GAIN]
-        max_grp  = int(_cached[ScoringMethod.MAX_GROUP_SIZE])
+        max_group_size  = int(_cached[ScoringMethod.MAX_GROUP_SIZE])
         wt_avg   = _cached[ScoringMethod.WEIGHTED_AVG]
         prob_fin = _cached[ScoringMethod.PROB_FINISH]
     else:
         group_counts = {p: len(g) for p, g in s1_groups.items()}
         step1    = score_groups(group_counts, ScoringMethod.ENTROPY_GAIN)
         wt_avg   = score_groups(group_counts, ScoringMethod.WEIGHTED_AVG)
-        max_grp  = int(score_groups(group_counts, ScoringMethod.MAX_GROUP_SIZE))
+        max_group_size  = int(score_groups(group_counts, ScoringMethod.MAX_GROUP_SIZE))
         prob_fin = score_groups(group_counts, ScoringMethod.PROB_FINISH)
         soln.word_scores.setdefault(word, {})[ScoringMethod.ENTROPY_GAIN] = step1
-        soln.word_scores[word][ScoringMethod.MAX_GROUP_SIZE]      = float(max_grp)
+        soln.word_scores[word][ScoringMethod.MAX_GROUP_SIZE]      = float(max_group_size)
         soln.word_scores[word][ScoringMethod.WEIGHTED_AVG] = wt_avg
         soln.word_scores[word][ScoringMethod.PROB_FINISH]  = prob_fin
 
@@ -1735,7 +1735,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
 
     return {
         'step1': step1, 'step2': step2, 'step3': step3,
-        'max_grp': max_grp,
+        'max_group_size': max_group_size,
         'wt_avg': wt_avg, 'prob_finish': prob_fin,
         'buckets': buckets,
         'erd': erd,
@@ -1762,7 +1762,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
     erd_vals = [s.get('erd') for s in all_stats]
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
-        ('Max grp',   [s['max_grp']     for s in all_stats], '{:d}',   False),
+        ('Max group size', [s['max_group_size']     for s in all_stats], '{:d}',   False),
         ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.2%}', True),
     ]
     if any(v is not None for v in erd_vals):
@@ -1969,7 +1969,7 @@ def cmd_test(gs, inline=''):
                 b[4] += 1
         labels = ['1', '2-4', '5-9', '10-49', '50+']
         pairs = [f'{lbl}:{n}' for lbl, n in zip(labels, b) if n]
-        prefix = '  Subgroup sizes: '
+        prefix = '  Response group sizes: '
         width = get_display_width()
         print()
         cur = prefix
@@ -2322,7 +2322,7 @@ def cmd_help(gs):
     print(f"""
   g = Guess a word
   s = Solve (find best guess)
-  b = Board (Pareto entropy vs max group)
+  b = Board (entropy vs max group size)
   l = Lookahead (two-step entropy)
   d = Display remaining words
   t = Test a word (all methods + lookahead)

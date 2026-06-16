@@ -3857,7 +3857,7 @@ class TestCompareWordsDisplay(unittest.TestCase):
     @staticmethod
     def _fake_stats(word, *args, **kwargs):
         return dict(step1=4.0, step2=2.0, step3=1.0,
-                    wt_avg=2.5, max_grp=10, prob_finish=0.5,
+                    wt_avg=2.5, max_group_size=10, prob_finish=0.5,
                     buckets=[1, 2, 3, 0, 0], erd=None)
 
     def _render(self, words):

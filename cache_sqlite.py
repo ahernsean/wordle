@@ -245,10 +245,11 @@ class ScoreCache:
                 PRIMARY KEY (subset_hash, method, answer_list_id, word)
             )
         """)
-        # ScoringMethod.MINIMAX (named for the optimization strategy applied
-        # to the metric) was renamed to MAX_GROUP_SIZE (named for the metric
-        # itself, consistent with ENTROPY_GAIN/WEIGHTED_AVG/PROB_FINISH) —
-        # carry forward any rows persisted under the old method key. Checked
+        # The persisted method key 'minimax' was renamed to 'max_group_size'.
+        # 'minimax' named the optimization strategy (minimize the maximum) but
+        # omitted the essential context: *what* is being maximized (group size).
+        # 'max_group_size' names the metric itself, consistent with
+        # ENTROPY_GAIN / WEIGHTED_AVG / PROB_FINISH. Migrate any persisted rows. Checked
         # via existence-first LIMIT 1 (see _purge_legacy_rows) so a table with
         # no such rows — the steady state once this has run once — costs only
         # a single indexed-or-not probe, not a full scan, on every connection.
