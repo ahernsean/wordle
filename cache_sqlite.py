@@ -97,26 +97,13 @@ class ScoreCache:
                 PRIMARY KEY (guess, answer_list_id)
             )
         """)
-        # The branch-result table and its columns have been renamed twice:
-        #   lookahead_result(best_word, best_entropy)
-        #     -> subgroup_pick(picked_word, picked_score): "best" wrongly
-        #        implied one policy's choice is objectively superior to
-        #        another's, and "entropy" is flatly wrong for ERD-policy
-        #        rows, which store an expected-remaining-guesses *cost*
-        #        (lower is better — the opposite sense of entropy).
-        #   subgroup_pick(picked_word, picked_score)
-        #     -> subgroup_best_by_policy(best_word, best_score): "picked"
-        #        solved the superiority problem but read awkwardly on its
-        #        own ("the picked word for a branch" — picked by what?).
-        #        Moving the missing context ("by policy") into the *table*
-        #        name lets the column names stay short and natural —
-        #        "best_word"/"best_score" — since any reader of the columns
-        #        already has the table's name, and therefore the policy
-        #        column, in view.
-        #   subgroup_best_by_policy(best_word, subset_key)
-        #     -> branch_best_by_policy(best_guess, branch_key): align with
-        #        the vocabulary settled on at the swarm layer.
-        # Migrate in place from any prior state so existing rows survive.
+        # Old databases may have either of two predecessor table structures:
+        #   lookahead_result(subset_key, policy, universe_id,
+        #                    best_word, best_entropy, updated_at)
+        #   subgroup_pick(subset_key, policy, universe_id,
+        #                 picked_word, picked_score, updated_at)
+        # Both are intermediate schemas on the way to branch_best_by_policy.
+        # Upgrade them in place so their rows survive as valid cache entries.
         tables = {row["name"] for row in self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if "lookahead_result" in tables and "subgroup_pick" not in tables \
@@ -245,11 +232,11 @@ class ScoreCache:
                 PRIMARY KEY (subset_hash, method, answer_list_id, word)
             )
         """)
-        # The persisted method key 'minimax' was renamed to 'max_group_size'.
-        # 'minimax' named the optimization strategy (minimize the maximum) but
-        # omitted the essential context: *what* is being maximized (group size).
-        # 'max_group_size' names the metric itself, consistent with
-        # ENTROPY_GAIN / WEIGHTED_AVG / PROB_FINISH. Migrate any persisted rows. Checked
+        # Legacy rows may carry the method key 'minimax' — an earlier name for
+        # the MAX_GROUP_SIZE scoring method that named the search strategy
+        # rather than the metric, making rows uninterpretable without external
+        # context.  Rewrite them to 'max_group_size' so the database is
+        # self-describing. Checked
         # via existence-first LIMIT 1 (see _purge_legacy_rows) so a table with
         # no such rows — the steady state once this has run once — costs only
         # a single indexed-or-not probe, not a full scan, on every connection.
