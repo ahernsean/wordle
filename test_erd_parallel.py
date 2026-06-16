@@ -57,7 +57,7 @@ class TestParallelSwarmSolve(unittest.TestCase):
 
     def _swarm_solve(self, tag, n_workers):
         """Register the branch and run n_workers cooperating threads; return
-        the finalized (best_word, best_erd) the swarm wrote to the cache."""
+        the finalized (best_guess, best_erd) the swarm wrote to the cache."""
         cache_path, queue_path = self._fresh_db(tag)
         # Apply schema migrations once before the worker threads open the cache
         # concurrently (production always has a single pre-open first).

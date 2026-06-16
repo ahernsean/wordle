@@ -395,7 +395,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
     def test_solve_subset_subgroup_cutoff(self):
         """A tight ceiling forces a subgroup-level cutoff so evaluate_guess
         returns ('cutoff', ...) from the sub_cutoff branch (1015), and
-        _solve_subset reports cutoff with best_word None (1148)."""
+        _solve_subset reports cutoff with best_guess None (1148)."""
         remaining = ["crane", "slate", "trace", "stale", "tales",
                      "least", "heart", "earth"]
         cache, _ = make_cache(None)

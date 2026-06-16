@@ -1079,9 +1079,9 @@ def _format_branch_header(words_count):
 
 def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     """
-    Rank candidates by ERD using only cached subgroup values.
+    Rank candidates by ERD using only cached branch values.
     Returns sorted (word, erd_cost) list, lowest first, for every candidate
-    whose subgroups are all cached. Candidates with an uncached subgroup
+    whose branches are all cached. Candidates with an uncached branch
     (e.g. pruned by cost_lb in min_expected_guesses, so never recursed into)
     are skipped rather than failing the whole ranking — the chosen ERD
     winner is always fully cached, since it can't have been pruned. Returns
@@ -1124,7 +1124,7 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
                 break
             cost += (k / n) * hit[1]
         if not ok:
-            continue  # uncached subgroup — skip this candidate, try others
+            continue  # uncached branch — skip this candidate, try others
         results.append((word, cost))
     if not results:
         return None
@@ -1402,11 +1402,11 @@ def cmd_lookahead(gs):
 
     top_n = soln.scores[:count]
 
-    # Possible-answers mode: restrict step-2 candidates to the subgroup
+    # Possible-answers mode: restrict step-2 candidates to the branch
     is_possible_answers = _is_possible_answers_mode(gs)
     if is_possible_answers:
         second_step_words = None
-        mode_label = "possible answers (subgroup)"
+        mode_label = "possible answers (branch)"
     else:
         step2_count = max(count * count, 100)
         second_step_words = [w for w, _s in soln.scores[:step2_count]]
@@ -1428,12 +1428,12 @@ def cmd_lookahead(gs):
                 pat = _encode_response(calculate_response(word, answer))
                 grouped[pat].append(answer)
         policy = 'full' if second_step_words else 'hard'
-        for subgroup in grouped.values():
-            cnt = len(subgroup)
+        for branch_words in grouped.values():
+            cnt = len(branch_words)
             if cnt <= 2:
                 continue
             if soln.score_cache:
-                branch_key = ScoreCache.encode_subset(subgroup)
+                branch_key = ScoreCache.encode_subset(branch_words)
                 if soln.score_cache.read(branch_key, policy) is not None:
                     continue
             total_work += (len(second_step_words)
@@ -1528,8 +1528,8 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     wt_avg, prob_finish, buckets.
 
     step2_pool: candidate pool for step 2. If None and not constraint_compliant,
-        uses only the subgroup (answers-only mode).
-    constraint_compliant: if True, compute valid step-2 candidates per subgroup
+        uses only the branch (answers-only mode).
+    constraint_compliant: if True, compute valid step-2 candidates per branch
         by applying the step-1 response constraints to all_words.  Also
         switches the ERD computation to the hard-mode guess vocabulary,
         cached under ERD_CONSTRAINED.  Those values are path-dependent and
@@ -1537,7 +1537,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
         persisted cross-game SQLite cache — erd_cache must be a
         MemoryScoreCache (the caller's long-lived, vocabulary-scoped
         gs.constrained_erd_cache when available, else a throwaway one).
-    Step 3 always uses subgroup candidates — sub-subgroups are tiny.
+    Step 3 always uses branch candidates — sub-branches are tiny.
     """
     cache = soln.cache
     remaining = soln.current_words
@@ -1586,7 +1586,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
         elif k <= 49: buckets[3] += 1
         else:         buckets[4] += 1
 
-    # For step-2 SQLite caching, hard mode can't be keyed by subgroup key alone
+    # For step-2 SQLite caching, hard mode can't be keyed by branch key alone
     # because cands2 depends on the specific (word, pattern) constraint set.
     lc = soln.score_cache
     policy = None if constraint_compliant else ('full' if step2_pool is not None else 'hard')
@@ -1597,8 +1597,8 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     t0 = time.time()
     _prog = {'on': False, 'step3': False}
 
-    for pat, subgroup in s1_groups.items():
-        k = len(subgroup)
+    for pat, branch_words in s1_groups.items():
+        k = len(branch_words)
         if k <= 1:
             continue
 
@@ -1608,20 +1608,20 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
         elif step2_pool is not None:
             cands2 = step2_pool
         else:
-            cands2 = subgroup
+            cands2 = branch_words
 
-        # Check SQLite subgroup cache (shares entries with compute_lookahead)
-        branch_key = ScoreCache.encode_subset(subgroup) if (lc and policy) else None
+        # Check SQLite branch cache (shares entries with compute_lookahead)
+        branch_key = ScoreCache.encode_subset(branch_words) if (lc and policy) else None
         cache_hit = lc.read(branch_key, policy) if branch_key else None
 
         if cache_hit is not None:
             best2_word, best2_ent = cache_hit
-            # One group computation to get sub-subgroups for step 3
+            # One group computation to get sub-branches for step 3
             if cache:
-                best2_grps = cache.group_words(best2_word, subgroup)
+                best2_grps = cache.group_words(best2_word, branch_words)
             else:  # pragma: no cover - defensive: callers always supply a ResponseCache
                 best2_grps = defaultdict(list)
-                for ans in subgroup:
+                for ans in branch_words:
                     p2 = tuple(calculate_response(best2_word, ans))
                     best2_grps[p2].append(ans)
         else:
@@ -1636,10 +1636,10 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
             best2_grps = None
             for c2 in cands2:
                 if cache:
-                    sg = cache.group_words(c2, subgroup)
+                    sg = cache.group_words(c2, branch_words)
                 else:
                     sg = defaultdict(list)
-                    for ans in subgroup:
+                    for ans in branch_words:
                         p2 = tuple(calculate_response(c2, ans))
                         sg[p2].append(ans)
                 ent = score_groups(
@@ -1684,11 +1684,11 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
 
     # ERD: exact expected guesses for the current candidates mode, surfaced
     # purely from cache — never computed here. Exact ERD search over a large
-    # guess vocabulary is combinatorially expensive (a single subgroup can
+    # guess vocabulary is combinatorially expensive (a single branch can
     # take tens of seconds), and that cost belongs solely to the background
     # ERDSolver, which uses its own short deadlines to detect when it has
     # bitten off more than it can chew. The foreground must never block on
-    # it: each subgroup is an instant cache read, exactly mirroring how
+    # it: each branch is an instant cache read, exactly mirroring how
     # print_status's ERD tag already works. A miss means "not cached yet" —
     # reported as unavailable (None) — not a cue to compute it live. As the
     # solver keeps populating the cache in the background, more of these
@@ -1715,16 +1715,16 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
             erd_score_cache = soln.score_cache
         erd_cost = 1.0
         erd_ok = True
-        for subgroup in s1_groups.values():
-            k = len(subgroup)
+        for branch_words in s1_groups.values():
+            k = len(branch_words)
             if k == 0:
                 continue
-            if k == 1 and subgroup[0] == word:
+            if k == 1 and branch_words[0] == word:
                 continue  # all-green branch: already solved, 0 more guesses
             if k == 1:
                 sub_erd = 1.0  # singleton: exactly one more guess, always cached-equivalent
             else:
-                hit = erd_score_cache.read(ScoreCache.encode_subset(subgroup), erd_policy)
+                hit = erd_score_cache.read(ScoreCache.encode_subset(branch_words), erd_policy)
                 sub_erd = hit[1] if hit is not None else None
             if sub_erd is None:
                 erd_ok = False
@@ -2338,7 +2338,7 @@ def cmd_help(gs):
   ? = This help
 
   Cache: {gs.score_cache_path}
-    {la_rows:,} subgroup picks, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
+    {la_rows:,} branch picks, {ws_rows:,} word scores, {rd_rows:,} decompositions, last write {cache_ts}
 """)
     solver = gs.solver
     if solver is not None and solver.word_stats:
@@ -2543,7 +2543,7 @@ class ERDSolver(threading.Thread):
         self.word_stats = []      # [(rank, word, wall_s, cpu_s, hits, misses), ...]
         # Live mid-word progress: a single root word can take far longer than
         # the gap between progress_callback firings (it recurses through its
-        # whole subgroup tree before reporting). These let the status line
+        # whole branch tree before reporting). These let the status line
         # and the periodic report show that work is happening *during* that
         # word, not just between words. Read from the main thread; written
         # only by this thread, so plain attributes are safe under the GIL.
@@ -2618,12 +2618,12 @@ class ERDSolver(threading.Thread):
             cancel_check=_cancel_check,
         )
 
-    def _on_root_progress(self, done, total, best_word, best_erd):
+    def _on_root_progress(self, done, total, best_guess, best_erd):
         if self._cancel.is_set():
             return
         self.root_done = done
         self.root_total = total
-        self.root_best = (best_word, best_erd)
+        self.root_best = (best_guess, best_erd)
 
     def _start_word(self, score_cache, ranked_guesses, done):
         """Mark the start of root-word ranked_guesses[done] for live progress
@@ -2712,7 +2712,7 @@ class ERDSolver(threading.Thread):
                     self.culled, self.current_word_tag(), indent=2))
                 print('\n'.join(lines), flush=True)
 
-            def _progress(done, total, best_word, best_erd):
+            def _progress(done, total, best_guess, best_erd):
                 wall_elapsed = time.time() - word_wall[0]
                 cpu_t = _cpu_now()
                 cpu_elapsed = (cpu_t - word_cpu[0]
@@ -2724,7 +2724,7 @@ class ERDSolver(threading.Thread):
                 hits   = score_cache.read_hits
                 misses = score_cache.read_misses
                 # ranked_guesses[done-1] is the word just evaluated;
-                # best_word is the running best across all words so far.
+                # best_guess is the running best across all words so far.
                 evaluated = ranked_guesses[done - 1]
                 self.word_stats.append(
                     (done, evaluated, wall_elapsed, cpu_elapsed, hits, misses))
@@ -2735,7 +2735,7 @@ class ERDSolver(threading.Thread):
                 self.culled = done - len(self.word_stats)
                 word_wall[0] = time.time()
                 word_cpu[0]  = _cpu_now()
-                self._on_root_progress(done, total, best_word, best_erd)
+                self._on_root_progress(done, total, best_guess, best_erd)
                 self._start_word(score_cache, ranked_guesses, done)
                 _maybe_print()
 
@@ -2953,10 +2953,10 @@ class BranchPrecacheSolver(threading.Thread):
                         self.culled, self.current_word_tag(), indent=2)),
                         flush=True)
 
-                def _progress(done, total, best_word, best_erd):
+                def _progress(done, total, best_guess, best_erd):
                     self.root_done = done
                     self.root_total = total
-                    self.root_best = (best_word, best_erd)
+                    self.root_best = (best_guess, best_erd)
                     progress_calls[0] += 1
                     # done counts every top-level candidate considered,
                     # including ones cost_lb-pruned with no recursion at
@@ -2994,9 +2994,9 @@ class BranchPrecacheSolver(threading.Thread):
                         return
 
                 self.branches_done += 1
-                best_word, _ = score_cache.read(root_key, ERD_ALL)
+                best_guess, _ = score_cache.read(root_key, ERD_ALL)
                 logger.info("Branch %s done: %.3f %s (%d/%d branches, %d culled)",
-                             format_response(response_pat), result, best_word.upper(),
+                             format_response(response_pat), result, best_guess.upper(),
                              self.branches_done, self.branches_total, self.culled)
                 print()
                 print(_title())
@@ -3004,7 +3004,7 @@ class BranchPrecacheSolver(threading.Thread):
                 print_line_with_pattern(
                     '  Branch ', response_pat,
                     f' | {self.current_branch_size:,} words | '
-                    f'done: {result:.3f} {best_word.upper()}')
+                    f'done: {result:.3f} {best_guess.upper()}')
                 print(f'  {self.culled:,}/{self.root_total:,} culled',
                       flush=True)
 

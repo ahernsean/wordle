@@ -568,10 +568,10 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_word_scores_round_trip(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
-        sc.write_scores(subset_key, [("crane", 3.14159), ("slate", 2.71828)],
+        branch_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write_scores(branch_key, [("crane", 3.14159), ("slate", 2.71828)],
                         "entropy_gain")
-        result = dict(sc.read_scores(subset_key, "entropy_gain"))
+        result = dict(sc.read_scores(branch_key, "entropy_gain"))
         self.assertAlmostEqual(result["crane"], 3.14159)
         self.assertAlmostEqual(result["slate"], 2.71828)
 
@@ -586,68 +586,68 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_subgroup_round_trip(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
-        sc.write(subset_key, "full", "heart", 2.5)
-        word, ent = sc.read(subset_key, "full")
+        branch_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(branch_key, "full", "heart", 2.5)
+        word, ent = sc.read(branch_key, "full")
         self.assertEqual(word, "heart")
         self.assertAlmostEqual(ent, 2.5)
 
     def test_write_populates_mem_cache(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
-        sc.write(subset_key, "full", "heart", 2.5)
-        self.assertEqual(sc._mem_cache[(subset_key, "full")],
+        branch_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(branch_key, "full", "heart", 2.5)
+        self.assertEqual(sc._mem_cache[(branch_key, "full")],
                          ("heart", 2.5, None, None))
 
         # Closing the connection proves this read is served from memory,
         # not a fresh SQLite round trip.
         sc._conn.close()
-        self.assertEqual(sc.read(subset_key, "full"), ("heart", 2.5))
+        self.assertEqual(sc.read(branch_key, "full"), ("heart", 2.5))
 
     def test_read_hit_populates_mem_cache(self):
         sc1 = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
-        sc1.write(subset_key, "hard", "earth", 1.8)
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc1.write(branch_key, "hard", "earth", 1.8)
         sc1.close()
 
         sc2 = ScoreCache(self.db, ANSWERS)
-        first = sc2.read(subset_key, "hard")
+        first = sc2.read(branch_key, "hard")
         self.assertEqual(first, ("earth", 1.8))
-        self.assertEqual(sc2._mem_cache[(subset_key, "hard")],
+        self.assertEqual(sc2._mem_cache[(branch_key, "hard")],
                          ("earth", 1.8, None, None))
 
         # A second read must not touch SQLite at all.
         sc2._conn.close()
-        self.assertEqual(sc2.read(subset_key, "hard"), ("earth", 1.8))
+        self.assertEqual(sc2.read(branch_key, "hard"), ("earth", 1.8))
 
     def test_read_miss_returns_none(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
-        self.assertIsNone(sc.read(subset_key, "full"))
-        self.assertIsNone(sc.read_scores(subset_key, "entropy_gain"))
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        self.assertIsNone(sc.read(branch_key, "full"))
+        self.assertIsNone(sc.read_scores(branch_key, "entropy_gain"))
 
     def test_policy_separation(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
-        sc.write(subset_key, "full", "heart", 2.5)
-        sc.write(subset_key, "hard", "earth", 1.8)
-        self.assertEqual(sc.read(subset_key, "full")[0], "heart")
-        self.assertEqual(sc.read(subset_key, "hard")[0], "earth")
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write(branch_key, "full", "heart", 2.5)
+        sc.write(branch_key, "hard", "earth", 1.8)
+        self.assertEqual(sc.read(branch_key, "full")[0], "heart")
+        self.assertEqual(sc.read(branch_key, "hard")[0], "earth")
 
     def test_different_universe_no_cross_contamination(self):
         alt_answers = ["brain", "stove", "cloud"]
         sc1 = ScoreCache(self.db, ANSWERS)
         sc2 = ScoreCache(self.db, alt_answers)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
-        sc1.write_scores(subset_key, [("crane", 3.14)], "entropy_gain")
-        self.assertIsNone(sc2.read_scores(subset_key, "entropy_gain"))
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc1.write_scores(branch_key, [("crane", 3.14)], "entropy_gain")
+        self.assertIsNone(sc2.read_scores(branch_key, "entropy_gain"))
 
     def test_overwrite_replaces_value(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
-        sc.write_scores(subset_key, [("crane", 1.0)], "entropy_gain")
-        sc.write_scores(subset_key, [("crane", 9.9)], "entropy_gain")
-        result = dict(sc.read_scores(subset_key, "entropy_gain"))
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write_scores(branch_key, [("crane", 1.0)], "entropy_gain")
+        sc.write_scores(branch_key, [("crane", 9.9)], "entropy_gain")
+        result = dict(sc.read_scores(branch_key, "entropy_gain"))
         self.assertAlmostEqual(result["crane"], 9.9)
 
     def test_encode_subset_is_compact(self):
@@ -659,8 +659,8 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
     def test_checkpoint_truncates_wal_and_persists_writes(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
-        sc.write(subset_key, "full", "heart", 2.5)
+        branch_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(branch_key, "full", "heart", 2.5)
         sc.checkpoint()
 
         wal_path = self.db + "-wal"
@@ -672,15 +672,15 @@ class TestScoreCacheSQLite(unittest.TestCase):
         # must see the checkpointed write.
         sc2 = ScoreCache(self.db, ANSWERS)
         try:
-            self.assertEqual(sc2.read(subset_key, "full"), ("heart", 2.5))
+            self.assertEqual(sc2.read(branch_key, "full"), ("heart", 2.5))
         finally:
             sc2.close()
         sc.close()
 
     def test_close_checkpoints(self):
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
-        sc.write(subset_key, "full", "heart", 2.5)
+        branch_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        sc.write(branch_key, "full", "heart", 2.5)
         sc.close()
 
         wal_path = self.db + "-wal"
@@ -719,7 +719,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
         it would unwind every enclosing min_expected_guesses recursion and
         abort the calling background-solver thread (see ScoreCache.write)."""
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
+        branch_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
 
         class FailingWrite:
             def __init__(self, real):
@@ -736,13 +736,13 @@ class TestScoreCacheSQLite(unittest.TestCase):
         real_conn = sc._conn
         sc._conn = FailingWrite(real_conn)
         try:
-            sc.write(subset_key, "full", "heart", 2.5)  # must not raise
+            sc.write(branch_key, "full", "heart", 2.5)  # must not raise
         finally:
             sc._conn = real_conn
 
-        self.assertIsNone(sc.read_detail(subset_key, "full"),
+        self.assertIsNone(sc.read_detail(branch_key, "full"),
                           "failed write must not be persisted")
-        self.assertEqual(sc._mem_cache[(subset_key, "full")],
+        self.assertEqual(sc._mem_cache[(branch_key, "full")],
                           ("heart", 2.5, None, None),
                           "result must still be memoized for this run")
         sc.close()
@@ -780,7 +780,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
         cache populated by cache_all_scores inside min_expected_guesses
         recursion."""
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
 
         class FailingExecuteMany:
             def __init__(self, real):
@@ -795,11 +795,11 @@ class TestScoreCacheSQLite(unittest.TestCase):
         real_conn = sc._conn
         sc._conn = FailingExecuteMany(real_conn)
         try:
-            sc.write_scores(subset_key, [("crane", 1.0)], "entropy_gain")  # must not raise
+            sc.write_scores(branch_key, [("crane", 1.0)], "entropy_gain")  # must not raise
         finally:
             sc._conn = real_conn
 
-        self.assertIsNone(sc.read_scores(subset_key, "entropy_gain"))
+        self.assertIsNone(sc.read_scores(branch_key, "entropy_gain"))
         sc.close()
 
     def test_close_releases_connection_when_checkpoint_fails(self):
@@ -860,7 +860,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
         # Opening ScoreCache should migrate through the full rename chain
         # (lookahead_result -> subgroup_best_by_policy -> branch_best_by_policy,
-        # subset_key -> branch_key, best_word -> best_guess) AND delete the
+        # branch_key -> branch_key, best_word -> best_guess) AND delete the
         # old null-separated-key row.
         ScoreCache(self.db, ANSWERS)
         conn2 = _sqlite3.connect(self.db)
@@ -890,16 +890,16 @@ class TestScoreCacheSQLite(unittest.TestCase):
             )
         """)
         universe_id = _hashlib.sha256("\n".join(ANSWERS).encode()).hexdigest()
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
         conn.execute(
             "INSERT OR REPLACE INTO lookahead_result VALUES (?,?,?,?,?,?)",
-            (subset_key, "hard", universe_id, "heart", 2.5, 0),
+            (branch_key, "hard", universe_id, "heart", 2.5, 0),
         )
         conn.commit()
         conn.close()
 
         sc = ScoreCache(self.db, ANSWERS)
-        hit = sc.read(subset_key, "hard")
+        hit = sc.read(branch_key, "hard")
         self.assertIsNotNone(hit)
         self.assertEqual(hit, ("heart", 2.5))
 
@@ -921,16 +921,16 @@ class TestScoreCacheSQLite(unittest.TestCase):
             )
         """)
         universe_id = _hashlib.sha256("\n".join(ANSWERS).encode()).hexdigest()
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
         conn.execute(
             "INSERT OR REPLACE INTO subgroup_pick VALUES (?,?,?,?,?,?)",
-            (subset_key, "hard", universe_id, "heart", 2.5, 0),
+            (branch_key, "hard", universe_id, "heart", 2.5, 0),
         )
         conn.commit()
         conn.close()
 
         sc = ScoreCache(self.db, ANSWERS)
-        hit = sc.read(subset_key, "hard")
+        hit = sc.read(branch_key, "hard")
         self.assertIsNotNone(hit)
         self.assertEqual(hit, ("heart", 2.5))
 
@@ -952,8 +952,8 @@ class TestScoreCacheSQLite(unittest.TestCase):
                 PRIMARY KEY (subset_hash, method, answer_list_id, word)
             )
         """)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
-        subset_hash = ScoreCache._subset_hash(subset_key)
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        subset_hash = ScoreCache._subset_hash(branch_key)
         conn.execute(
             "INSERT OR REPLACE INTO word_scores VALUES (?,?,?,?,?,?)",
             (subset_hash, "crane", "minimax", 4.0, answer_list_id, 0),
@@ -964,8 +964,8 @@ class TestScoreCacheSQLite(unittest.TestCase):
         # Re-opening ScoreCache should migrate the old method key forward —
         # the data must remain reachable under its new name.
         sc = ScoreCache(self.db, ANSWERS)
-        self.assertIsNone(sc.read_scores(subset_key, "minimax"))
-        migrated = sc.read_scores(subset_key, "max_group_size")
+        self.assertIsNone(sc.read_scores(branch_key, "minimax"))
+        migrated = sc.read_scores(branch_key, "max_group_size")
         self.assertIsNotNone(migrated)
         self.assertEqual(dict(migrated)["crane"], 4.0)
 
@@ -1037,8 +1037,8 @@ class TestScoreCacheSQLite(unittest.TestCase):
         """A failure mid-write must not leave a partial commit — the
         transaction is rolled back and the exception re-raised."""
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(["crane", "slate"])
-        sc.write_scores(subset_key, [("crane", 1.0)], "entropy_gain")
+        branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write_scores(branch_key, [("crane", 1.0)], "entropy_gain")
 
         class FailingExecuteMany:
             """sqlite3.Connection.executemany is a read-only slot — wrap the
@@ -1056,13 +1056,13 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc._conn = FailingExecuteMany(real_conn)
         try:
             with self.assertRaises(sqlite3.OperationalError):
-                sc.write_scores(subset_key, [("slate", 2.0)], "entropy_gain")
+                sc.write_scores(branch_key, [("slate", 2.0)], "entropy_gain")
         finally:
             sc._conn = real_conn
 
         # The pre-existing row must survive untouched, and no partial
         # row from the failed write should have leaked in.
-        result = dict(sc.read_scores(subset_key, "entropy_gain"))
+        result = dict(sc.read_scores(branch_key, "entropy_gain"))
         self.assertEqual(result, {"crane": 1.0})
 
     def test_read_detail_returns_word_score_and_timestamp(self):
@@ -1150,8 +1150,8 @@ class TestTransparentPersistence(unittest.TestCase):
 
         # Scores for this position are written, keyed by its remaining-word subset.
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(s.current_words)
-        cached = sc.read_scores(subset_key, "entropy_gain")
+        branch_key = ScoreCache.encode_subset(s.current_words)
+        cached = sc.read_scores(branch_key, "entropy_gain")
         self.assertIsNotNone(cached)
         self.assertIn(s.current_words[0], dict(cached))
 
@@ -1276,12 +1276,12 @@ class TestCacheAllScores(unittest.TestCase):
         sc = ScoreCache(self.db, ANSWERS)
         cache = ResponseCache(ANSWERS, score_cache=sc)
         subgroup = ANSWERS[:6]
-        subset_key = ScoreCache.encode_subset(subgroup)
+        branch_key = ScoreCache.encode_subset(subgroup)
 
-        cache_all_scores("heart", subgroup, sc, subset_key, cache=cache)
+        cache_all_scores("heart", subgroup, sc, branch_key, cache=cache)
 
         for method in ScoringMethod:
-            cached = sc.read_scores(subset_key, method.name.lower())
+            cached = sc.read_scores(branch_key, method.name.lower())
             self.assertIsNotNone(
                 cached, f"{method.name} should be persisted by cache_all_scores")
             expected = score_word("heart", subgroup, method, cache=cache)
@@ -1396,9 +1396,9 @@ class TestRankGuessesByGroupThenEntropy(unittest.TestCase):
                 words, candidates, cache, sc, cancel_check=lambda: True)
             self.assertEqual(ranked, candidates)
 
-            subset_key = ScoreCache.encode_subset(words)
-            self.assertIsNone(sc.read_scores(subset_key, 'max_group_size'))
-            self.assertIsNone(sc.read_scores(subset_key, 'entropy_gain'))
+            branch_key = ScoreCache.encode_subset(words)
+            self.assertIsNone(sc.read_scores(branch_key, 'max_group_size'))
+            self.assertIsNone(sc.read_scores(branch_key, 'entropy_gain'))
         finally:
             sc.close()
 
@@ -1441,8 +1441,8 @@ class TestComputeLookaheadCache(unittest.TestCase):
         self.assertTrue(scanned, "expected at least one subgroup big enough to scan")
 
         for subgroup in scanned:
-            subset_key = ScoreCache.encode_subset(subgroup)
-            hit = sc.read(subset_key, "hard")
+            branch_key = ScoreCache.encode_subset(subgroup)
+            hit = sc.read(branch_key, "hard")
             self.assertIsNotNone(hit)
             best_word, _best_score = hit
 
@@ -1453,7 +1453,7 @@ class TestComputeLookaheadCache(unittest.TestCase):
             for method in ScoringMethod:
                 if method == ScoringMethod.ENTROPY_GAIN:
                     continue
-                cached = sc.read_scores(subset_key, method.name.lower())
+                cached = sc.read_scores(branch_key, method.name.lower())
                 self.assertIsNotNone(
                     cached,
                     f"{method.name}'s score for the cached winner should be "
@@ -1507,13 +1507,13 @@ class TestComputeLookaheadCache(unittest.TestCase):
             scanned = [sg for sg in grouped.values() if len(sg) > 2]
             self.assertTrue(scanned, "expected at least one scannable subgroup")
             for subgroup in scanned:
-                subset_key = ScoreCache.encode_subset(subgroup)
-                hit = s.score_cache.read(subset_key, "full")
+                branch_key = ScoreCache.encode_subset(subgroup)
+                hit = s.score_cache.read(branch_key, "full")
                 self.assertIsNotNone(hit)
                 self.assertIn(hit[0], second_step_words,
                               "full-mode winner must come from second_step_words")
                 self.assertIsNone(
-                    s.score_cache.read(subset_key, "hard"),
+                    s.score_cache.read(branch_key, "hard"),
                     "full-mode results must not collide with hard mode's namespace")
         finally:
             os.unlink(tmp.name)
@@ -1617,9 +1617,9 @@ class TestMinExpectedGuesses(unittest.TestCase):
             self.assertIsNotNone(result)
             best_word, _best_score = sc.read(ScoreCache.encode_subset(subset), ERD_ANSWERS)
 
-            subset_key = ScoreCache.encode_subset(subset)
+            branch_key = ScoreCache.encode_subset(subset)
             for method in ScoringMethod:
-                cached = sc.read_scores(subset_key, method.name.lower())
+                cached = sc.read_scores(branch_key, method.name.lower())
                 self.assertIsNotNone(
                     cached, f"{method.name} should be persisted for the ERD winner")
                 expected = score_word(best_word, subset, method, cache=self.cache)
@@ -2185,8 +2185,8 @@ class TestMultistepStatsCache(unittest.TestCase):
         soln = make_solution(db_path=self.db)
         _multistep_stats("crane", soln)
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(soln.current_words)
-        rows = sc.read_scores(subset_key, "entropy_gain")
+        branch_key = ScoreCache.encode_subset(soln.current_words)
+        rows = sc.read_scores(branch_key, "entropy_gain")
         self.assertIsNotNone(rows)
         self.assertIn("crane", dict(rows))
 
@@ -2217,8 +2217,8 @@ class TestMultistepStatsCache(unittest.TestCase):
         _multistep_stats("slate", soln)
 
         sc = ScoreCache(self.db, ANSWERS)
-        subset_key = ScoreCache.encode_subset(soln.current_words)
-        cached = sc.read_scores(subset_key, "entropy_gain")
+        branch_key = ScoreCache.encode_subset(soln.current_words)
+        cached = sc.read_scores(branch_key, "entropy_gain")
         self.assertIsNotNone(cached)
         self.assertIn("slate", dict(cached))
 
@@ -2568,7 +2568,7 @@ class TestMemoryScoreCacheScoping(unittest.TestCase):
 
     def test_write_invisible_under_different_scope(self):
         """An entry written under one vocabulary scope is a miss under another,
-        even for the identical (subset_key, policy) — preventing false hits
+        even for the identical (branch_key, policy) — preventing false hits
         when the eligible-guess vocabulary changes but current_words coincides."""
         mc = MemoryScoreCache()
         key = ScoreCache.encode_subset(["crane", "slate"])
@@ -2845,7 +2845,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
                 self._cache = {}
 
         class ErrorScoreCache(MemoryScoreCache):
-            def read(self, subset_key, policy):
+            def read(self, branch_key, policy):
                 raise sqlite3.OperationalError("disk I/O error")
 
         score_cache = ErrorScoreCache()

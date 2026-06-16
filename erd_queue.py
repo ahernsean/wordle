@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS run_meta (
 -- ERD entry to the persistent cache, then the row (and its chunks) is deleted.
 -- Candidate order is NOT stored: rank_guesses_by_group_then_entropy is
 -- deterministic, so every worker re-ranks locally and agrees on which
--- candidates chunk i covers, sharing the work through the word_scores cache.
+-- candidates chunk i covers, sharing the work through the candidate_scores cache.
 CREATE TABLE IF NOT EXISTS active_branches (
     branch_key     BLOB    PRIMARY KEY,
     n_words        INTEGER NOT NULL,
