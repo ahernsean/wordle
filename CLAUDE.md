@@ -89,6 +89,12 @@ Write comments that describe current behaviour and non-obvious invariants:
 
 ---
 
+## Pull request style
+
+PR descriptions need a **Summary** section only. Do not include a "Test plan" section.
+
+---
+
 ## Schema coordination (Linux + phone)
 
 The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any schema change must:
@@ -96,4 +102,4 @@ The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any 
 2. Deploy new code to the phone **before** syncing a migrated Linux database to it
 3. Never require manual SQL — migrations run automatically on first open
 
-The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in `ErdQueue._migrate()`.
+The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in `ERDQueue._migrate()`.
