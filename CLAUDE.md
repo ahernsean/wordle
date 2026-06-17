@@ -40,11 +40,11 @@ for i, candidate in enumerate(candidate_list):
 - `entropy_gain`, not `ent`
 
 **Acronyms and initialisms keep uniform casing in identifiers.**
-An initialism is not a word. When embedding one in a PascalCase or UPPER_CASE identifier, preserve its casing as a unit — do not title-case it.
-- `ERDQueue`, `SQLCache`, `HTMLParser`, `MPIWorker` — correct
-- `ErdQueue`, `SqlCache`, `HtmlParser`, `MpiWorker` — wrong: these misrepresent the initialism as an ordinary word
-- `ScoreCache`, `BranchWorker` — correct: Score, Cache, Branch, Worker are ordinary words, not initialisms
-- snake_case variables and parameters are exempt: `erd_policy`, `sql_query` lowercase everything uniformly, which does not misrepresent anything
+Neither an acronym (NASA, POSIX) nor an initialism (ERD, SQL, HTML) is an ordinary word. When embedding one in a PascalCase or UPPER_CASE identifier, preserve its casing as a unit — do not title-case it.
+- `ERDQueue`, `SQLCache`, `HTMLParser`, `MPIWorker`, `NASAFeed`, `POSIXPath` — correct
+- `ErdQueue`, `SqlCache`, `HtmlParser`, `MpiWorker`, `NasaFeed`, `PosixPath` — wrong: these misrepresent the acronym/initialism as an ordinary word
+- `ScoreCache`, `BranchWorker` — correct: Score, Cache, Branch, Worker are ordinary words, not acronyms
+- snake_case variables and parameters are exempt: `erd_policy`, `sql_query`, `posix_path` lowercase everything uniformly, which does not misrepresent anything
 
 **Names must include all essential context.**
 The clearest violation of this rule in this codebase's history was `ScoringMethod.MINIMAX`. `MINIMAX` names an optimization strategy (minimize the maximum) but omits what is being minimized — the group size. Without that context the name is uninterpretable. The canonical name is `MAX_GROUP_SIZE`. The same principle applies everywhere: a name must be self-describing without external context.
