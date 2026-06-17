@@ -93,6 +93,8 @@ Write comments that describe current behaviour and non-obvious invariants:
 
 PR descriptions need a **Summary** section only. Do not include a "Test plan" section.
 
+PR descriptions describe *changes* — what is added, removed, or fixed, and why. This is distinct from the comment style rule ("describe what the code is, not how it got there"), which applies to inline code comments. A PR description is inherently a description of a diff; talking about what changed is the point.
+
 ---
 
 ## Schema coordination (Linux + phone)
