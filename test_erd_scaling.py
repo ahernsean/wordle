@@ -33,7 +33,7 @@ from cache_sqlite import ScoreCache
 from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET, run_branch_solve
-from erd_queue import ErdQueue, encode_subset
+from erd_queue import ERDQueue, encode_subset
 
 # 12-word branch -> ceil(12/3) = 4 chunks, so up to 4 workers each take a chunk.
 BRANCH = ["crane", "slate", "trace", "stale", "tales", "least",
@@ -70,13 +70,13 @@ class _Base(unittest.TestCase):
                 os.path.join(self._tmp.name, f"queue_{tag}.sqlite3"))
 
     def _register_branch(self, queue_path):
-        chunk_size = ErdQueue.chunk_size_for(
+        chunk_size = ERDQueue.chunk_size_for(
             len(BRANCH), len(CANDIDATES), DIVISOR, MAX_CHUNKS)
-        q = ErdQueue(queue_path)
+        q = ERDQueue(queue_path)
         q.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
                         chunk_size, budget=ROOT_BUDGET)
         q.close()
-        return ErdQueue.n_chunks_for(len(CANDIDATES), chunk_size)
+        return ERDQueue.n_chunks_for(len(CANDIDATES), chunk_size)
 
     def _ground_truth(self):
         cache_path, _ = self._db("truth")
@@ -236,10 +236,10 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         cache_path = os.path.join(self._tmp.name, f"cache_{tag}.sqlite3")
         queue_path = os.path.join(self._tmp.name, f"queue_{tag}.sqlite3")
         ScoreCache(cache_path, self._pool).close()
-        chunk_size = ErdQueue.chunk_size_for(
+        chunk_size = ERDQueue.chunk_size_for(
             self._BRANCH_SIZE, len(self._candidates),
             self._DRAIN_DIVISOR, MAX_CHUNKS)
-        q = ErdQueue(queue_path)
+        q = ERDQueue(queue_path)
         for bw in self._branches:
             q.create_branch(encode_subset(bw), self._BRANCH_SIZE,
                             len(self._candidates), chunk_size,
@@ -256,7 +256,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
             for p in procs:
                 p.start()
         deadline = time.time() + timeout
-        q = ErdQueue(queue_path)
+        q = ERDQueue(queue_path)
         try:
             while time.time() < deadline:
                 if not q.branches_in_progress():

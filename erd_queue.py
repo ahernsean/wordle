@@ -54,7 +54,7 @@ _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
-CREATE TABLE IF NOT EXISTS pending_subgroups (
+CREATE TABLE IF NOT EXISTS pending_branches (
     branch_key     BLOB    NOT NULL,
     n_words        INTEGER NOT NULL,
     priority       INTEGER NOT NULL DEFAULT 0,
@@ -67,10 +67,10 @@ CREATE TABLE IF NOT EXISTS pending_subgroups (
     PRIMARY KEY (branch_key)
 );
 
--- priority DESC first so VIP (priority=1) subgroups drain before priority=0,
+-- priority DESC first so VIP (priority=1) branches drain before priority=0,
 -- then n_words DESC within each priority tier for maximum recursive fill-in.
 CREATE INDEX IF NOT EXISTS idx_pending_status_pri_n
-    ON pending_subgroups(status, priority DESC, n_words DESC);
+    ON pending_branches(status, priority DESC, n_words DESC);
 
 -- One row per worker, overwritten each heartbeat.  In the swarm model a
 -- worker is a fungible contributor: it reports which branch and chunk it is
@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS branch_chunks (
 """
 
 
-class ErdQueue:
+class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
     def __init__(self, db_path: str, timeout: float = 30.0):
@@ -166,14 +166,24 @@ class ErdQueue:
         self._migrate()
 
     def _migrate(self):
-        """Add columns introduced after the initial schema, if missing."""
+        """Add columns and rename tables introduced after the initial schema."""
+        # Rename pending_subgroups -> pending_branches for databases predating
+        # this migration.  The schema creates pending_branches (empty) first;
+        # drop that shell before renaming so the old rows survive.
+        tables = {r['name'] for r in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'pending_subgroups' in tables:
+            self._conn.execute('DROP TABLE IF EXISTS pending_branches')
+            self._conn.execute(
+                'ALTER TABLE pending_subgroups RENAME TO pending_branches')
+
         existing = {r['name'] for r in
-                    self._conn.execute('PRAGMA table_info(pending_subgroups)')}
+                    self._conn.execute('PRAGMA table_info(pending_branches)')}
         for col, defn in [('source_word', 'TEXT'),
                           ('source_pattern', 'INTEGER')]:
             if col not in existing:
                 self._conn.execute(
-                    f'ALTER TABLE pending_subgroups ADD COLUMN {col} {defn}')
+                    f'ALTER TABLE pending_branches ADD COLUMN {col} {defn}')
 
         existing_hb = {r['name'] for r in
                        self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
@@ -210,14 +220,14 @@ class ErdQueue:
                 self._conn.execute(
                     f'ALTER TABLE active_branches ADD COLUMN {col} {defn}')
 
-        # Rename subset_key -> branch_key in pending_subgroups, active_branches,
-        # branch_chunks; current_subset_key -> current_branch_key in worker_heartbeat;
-        # best_word -> best_guess in worker_heartbeat and active_branches.
+        # Column renames from earlier terminology alignment: subset_key ->
+        # branch_key throughout; best_word -> best_guess; current_subset_key ->
+        # current_branch_key in worker_heartbeat.
         existing_ps = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(pending_subgroups)')}
+                       self._conn.execute('PRAGMA table_info(pending_branches)')}
         if 'subset_key' in existing_ps:
             self._conn.execute(
-                'ALTER TABLE pending_subgroups RENAME COLUMN subset_key TO branch_key')
+                'ALTER TABLE pending_branches RENAME COLUMN subset_key TO branch_key')
         existing_ab = {r['name'] for r in
                        self._conn.execute('PRAGMA table_info(active_branches)')}
         if 'subset_key' in existing_ab:
@@ -254,16 +264,16 @@ class ErdQueue:
         Uses an UPSERT so that:
         - A row inserted for the first time is added as 'pending'.
         - A row already present has its priority UPGRADED (never downgraded),
-          e.g. a subgroup first inserted at priority=0 by an earlier root word
+          e.g. a branch first inserted at priority=0 by an earlier root word
           is correctly promoted to priority=1 when a VIP word (SALET) is
           bootstrapped later.
         - source_word / source_pattern record the first root word whose branch
-          produced this subgroup (kept for display in `status`).
+          produced this entry (kept for display in `status`).
         """
         self._conn.execute("BEGIN")
         try:
             self._conn.executemany("""
-                INSERT INTO pending_subgroups
+                INSERT INTO pending_branches
                     (branch_key, n_words, priority, source_word, source_pattern, status)
                 VALUES (?, ?, ?, ?, ?, 'pending')
                 ON CONFLICT(branch_key) DO UPDATE SET
@@ -298,7 +308,7 @@ class ErdQueue:
         try:
             row = self._conn.execute("""
                 SELECT branch_key, n_words, priority, source_word, source_pattern
-                FROM pending_subgroups
+                FROM pending_branches
                 WHERE status = 'pending'
                 ORDER BY priority DESC, n_words DESC
                 LIMIT 1
@@ -308,7 +318,7 @@ class ErdQueue:
                 return None
             now = int(time.time())
             self._conn.execute("""
-                UPDATE pending_subgroups
+                UPDATE pending_branches
                 SET status = 'in_progress', claimed_by = ?, claimed_at = ?
                 WHERE branch_key = ?
             """, (worker_id, now, row["branch_key"]))
@@ -327,7 +337,7 @@ class ErdQueue:
     def mark_done(self, branch_key: bytes):
         now = int(time.time())
         self._conn.execute("""
-            UPDATE pending_subgroups
+            UPDATE pending_branches
             SET status = 'done', completed_at = ?
             WHERE branch_key = ?
         """, (now, branch_key))
@@ -339,7 +349,7 @@ class ErdQueue:
         re-queued rather than stuck forever.  Returns the number of rows reset.
         """
         self._conn.execute("""
-            UPDATE pending_subgroups
+            UPDATE pending_branches
             SET status = 'pending', claimed_by = NULL, claimed_at = NULL
             WHERE status = 'in_progress'
         """)
@@ -382,12 +392,12 @@ class ErdQueue:
 
     def counts_by_status(self) -> dict:
         return {r["status"]: r["c"] for r in self._conn.execute(
-            "SELECT status, COUNT(*) c FROM pending_subgroups GROUP BY status"
+            "SELECT status, COUNT(*) c FROM pending_branches GROUP BY status"
         )}
 
-    def total_subgroups(self) -> int:
+    def total_branches(self) -> int:
         return self._conn.execute(
-            "SELECT COUNT(*) FROM pending_subgroups"
+            "SELECT COUNT(*) FROM pending_branches"
         ).fetchone()[0]
 
     def heartbeats_with_branch(self):
@@ -642,8 +652,8 @@ class ErdQueue:
 
         Branch/chunk rows are pure transient coordination: any branch whose
         result didn't reach the persistent cache is still 'pending' (its
-        pending_subgroups row was set in_progress on promotion and reset to
-        pending by reset_stale_in_progress), so clearing these tables just
+        pending_branches row was set in_progress on promotion and reset to
+        pending by reset_stale_in_progress()), so clearing these tables just
         discards half-done coordination — the branch is simply re-promoted and
         redone.  Returns (n_branches, n_chunks) cleared.
         """

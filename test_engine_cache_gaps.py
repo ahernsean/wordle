@@ -422,7 +422,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         self.assertTrue(calls)
 
 
-class TestVerifyErdCacheZeroGroup(unittest.TestCase):
+class TestVerifyERDCacheZeroGroup(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
         self.tmp.close()

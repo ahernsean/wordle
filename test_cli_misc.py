@@ -39,7 +39,7 @@ def _capture(fn, *a, **k):
 # PART A
 # ---------------------------------------------------------------------------
 
-class VerifyErdTests(CliTestCase):
+class VerifyERDTests(CliTestCase):
     def test_fresh_root_no_entry(self):
         out = self.run_cmd(wordle.cmd_verify_erd)
         self.assertIn("No ERD entry to verify", out)

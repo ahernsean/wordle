@@ -39,6 +39,13 @@ for i, candidate in enumerate(candidate_list):
 - `branch_words`, not `branch_wds`
 - `entropy_gain`, not `ent`
 
+**Acronyms and initialisms keep uniform casing in identifiers.**
+Neither an acronym (NASA, POSIX) nor an initialism (ERD, SQL, HTML) is an ordinary word. When embedding one in a PascalCase or UPPER_CASE identifier, preserve its casing as a unit — do not title-case it.
+- `ERDQueue`, `SQLCache`, `HTMLParser`, `MPIWorker`, `NASAFeed`, `POSIXPath` — correct
+- `ErdQueue`, `SqlCache`, `HtmlParser`, `MpiWorker`, `NasaFeed`, `PosixPath` — wrong: these misrepresent the acronym/initialism as an ordinary word
+- `ScoreCache`, `BranchWorker` — correct: Score, Cache, Branch, Worker are ordinary words, not acronyms
+- snake_case variables and parameters are exempt: `erd_policy`, `sql_query`, `posix_path` lowercase everything uniformly, which does not misrepresent anything
+
 **Names must include all essential context.**
 The clearest violation of this rule in this codebase's history was `ScoringMethod.MINIMAX`. `MINIMAX` names an optimization strategy (minimize the maximum) but omits what is being minimized — the group size. Without that context the name is uninterpretable. The canonical name is `MAX_GROUP_SIZE`. The same principle applies everywhere: a name must be self-describing without external context.
 
@@ -82,9 +89,9 @@ Write comments that describe current behaviour and non-obvious invariants:
 
 ---
 
-## Known residual
+## Pull request style
 
-`pending_subgroups` — the queue coordination table in `erd_queue.sqlite3` still uses the old "subgroups" vocabulary. It was not in the rename plan and is a separate decision.
+PR descriptions need a **Summary** section only. Do not include a "Test plan" section.
 
 ---
 
@@ -95,4 +102,4 @@ The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any 
 2. Deploy new code to the phone **before** syncing a migrated Linux database to it
 3. Never require manual SQL — migrations run automatically on first open
 
-The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in `ErdQueue._migrate()`.
+The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in `ERDQueue._migrate()`.
