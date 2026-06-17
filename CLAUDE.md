@@ -39,6 +39,12 @@ for i, candidate in enumerate(candidate_list):
 - `branch_words`, not `branch_wds`
 - `entropy_gain`, not `ent`
 
+**Acronyms and initialisms keep uniform casing in identifiers.**
+An initialism is not a word, so do not title-case it when embedding it in a name.
+- Class names: `ERDQueue`, not `ErdQueue`; `ScoreCache` is correct (Score and Cache are words)
+- Local variables and parameters: `erd_score`, `erd_policy` (snake_case lowercases everything — that is correct and does not violate this rule)
+- The rule applies at identifier boundaries: `ERDQueue` is right; `Erdqueue` and `ErdQueue` are both wrong for the same reason
+
 **Names must include all essential context.**
 The clearest violation of this rule in this codebase's history was `ScoringMethod.MINIMAX`. `MINIMAX` names an optimization strategy (minimize the maximum) but omits what is being minimized — the group size. Without that context the name is uninterpretable. The canonical name is `MAX_GROUP_SIZE`. The same principle applies everywhere: a name must be self-describing without external context.
 

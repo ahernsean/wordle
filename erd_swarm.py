@@ -37,7 +37,7 @@ from wordle_engine import (
     rank_candidates_by_max_group_size_then_entropy_gain,
     _cache_reuse,
 )
-from erd_queue import ErdQueue, decode_subset, encode_subset
+from erd_queue import ERDQueue, decode_subset, encode_subset
 
 ANSWER_FILE = 'NYT_wordlist.txt'
 WORDS_FILE = 'wordle.txt'
@@ -86,7 +86,7 @@ class _BranchWorker:
         self.n_candidates = len(self.all_words)
         self.score_cache = ScoreCache(cache_path, self.all_answers)
         self.rcache = ResponseCache(self.all_answers, self.score_cache)
-        self.queue = ErdQueue(queue_path)
+        self.queue = ERDQueue(queue_path)
 
         self.started = int(time.time())
         self.chunks_done = 0
@@ -221,9 +221,9 @@ class _BranchWorker:
 
         budget is the branch's guess budget (depth-limited ERD): a candidate
         whose strategy can't win within budget is infeasible (and taints the
-        branch — see ErdQueue.mark_branch_tainted).
+        branch — see ERDQueue.mark_branch_tainted).
         """
-        lo, hi = ErdQueue.chunk_range(idx, chunk_size, self.n_candidates)
+        lo, hi = ERDQueue.chunk_range(idx, chunk_size, self.n_candidates)
         chunk_total = hi - lo
         local_candidate, local_best = self.queue.read_branch_best(branch_key)
         local_md = None
@@ -379,13 +379,13 @@ class _BranchWorker:
             return (*reuse, False)
 
         n_words = len(words)
-        chunk_size = ErdQueue.chunk_size_for(
+        chunk_size = ERDQueue.chunk_size_for(
             n_words, self.n_candidates, self.divisor, self.max_chunks)
         self.queue.create_branch(
             branch_key, n_words, self.n_candidates, chunk_size,
             priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
             source_pattern=self._top_source_pattern, budget=budget)
-        n_chunks = ErdQueue.n_chunks_for(self.n_candidates, chunk_size)
+        n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
         ranked = self._ranked_for(branch_key, words)
 
         while not self.cancel():
@@ -434,7 +434,7 @@ class _BranchWorker:
         can join.
         """
         for b in self.queue.branches_in_progress():
-            n_chunks = ErdQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
+            n_chunks = ERDQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
             idx = self.queue.claim_chunk(b['branch_key'], self.name, n_chunks)
             if idx is not None:
                 return dict(b), idx
@@ -443,13 +443,13 @@ class _BranchWorker:
         if claimed is None:
             return None
         n_words = claimed['n_words']
-        chunk_size = ErdQueue.chunk_size_for(
+        chunk_size = ERDQueue.chunk_size_for(
             n_words, self.n_candidates, self.divisor, self.max_chunks)
         self.queue.create_branch(
             claimed['branch_key'], n_words, self.n_candidates, chunk_size,
             priority=claimed['priority'], source_word=claimed['source_word'],
             source_pattern=claimed['source_pattern'], budget=self.budget)
-        n_chunks = ErdQueue.n_chunks_for(self.n_candidates, chunk_size)
+        n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
         idx = self.queue.claim_chunk(claimed['branch_key'], self.name, n_chunks)
         branch = {
             'branch_key': claimed['branch_key'], 'n_words': n_words,
@@ -484,7 +484,7 @@ class _BranchWorker:
             self._top_source_word = branch.get('source_word')
             self._top_source_pattern = branch.get('source_pattern')
             words = decode_subset(branch_key)
-            n_chunks = ErdQueue.n_chunks_for(branch['n_candidates'],
+            n_chunks = ERDQueue.n_chunks_for(branch['n_candidates'],
                                              branch['chunk_size'])
             ranked = self._ranked_for(branch_key, words)
             if self.cancel():
@@ -509,7 +509,7 @@ class _BranchWorker:
             return
         words = decode_subset(branch_key)
         budget = branch['budget'] or ROOT_BUDGET
-        n_chunks = ErdQueue.n_chunks_for(branch['n_candidates'],
+        n_chunks = ERDQueue.n_chunks_for(branch['n_candidates'],
                                          branch['chunk_size'])
         while not self.cancel():
             # Stop the moment the branch is finalized (and its rows deleted) by
@@ -603,7 +603,7 @@ def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)
     score_cache = ScoreCache(cache_path, all_answers)
-    queue = ErdQueue(queue_path)
+    queue = ERDQueue(queue_path)
 
     existing = score_cache.read(branch_key, ERD_ALL)
     if existing is not None:
@@ -611,9 +611,9 @@ def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
         score_cache.close()
         return existing
 
-    chunk_size = ErdQueue.chunk_size_for(
+    chunk_size = ERDQueue.chunk_size_for(
         len(words), len(all_words), divisor, max_chunks)
-    n_chunks = ErdQueue.n_chunks_for(len(all_words), chunk_size)
+    n_chunks = ERDQueue.n_chunks_for(len(all_words), chunk_size)
     actual_workers = min(n_workers, n_chunks)
     queue.create_branch(branch_key, len(words), len(all_words), chunk_size,
                         priority=priority, source_word=source_word,

@@ -22,7 +22,7 @@ from wordle_engine import (
 )
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET
-from erd_queue import ErdQueue, encode_subset
+from erd_queue import ERDQueue, encode_subset
 
 # A branch of 8 answers and 15 candidate guesses → 3 chunks (divisor 3), so two
 # workers genuinely split the candidate list and cooperate.
@@ -62,12 +62,12 @@ class TestParallelSwarmSolve(unittest.TestCase):
         # Apply schema migrations once before the worker threads open the cache
         # concurrently (production always has a single pre-open first).
         ScoreCache(cache_path, BRANCH).close()
-        chunk_size = ErdQueue.chunk_size_for(
+        chunk_size = ERDQueue.chunk_size_for(
             len(BRANCH), len(CANDIDATES), DIVISOR, MAX_CHUNKS)
-        q = ErdQueue(queue_path)
+        q = ERDQueue(queue_path)
         q.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
                         chunk_size, budget=ROOT_BUDGET)
-        n_chunks = ErdQueue.n_chunks_for(len(CANDIDATES), chunk_size)
+        n_chunks = ERDQueue.n_chunks_for(len(CANDIDATES), chunk_size)
         q.close()
         self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
 
@@ -88,7 +88,7 @@ class TestParallelSwarmSolve(unittest.TestCase):
         self.assertFalse(any(t.is_alive() for t in threads), "worker hung")
 
         # The branch must have finalized (its coordination rows are deleted).
-        q = ErdQueue(queue_path)
+        q = ERDQueue(queue_path)
         self.assertIsNone(q.get_branch(self.branch_key),
                           "branch was not finalized")
         q.close()

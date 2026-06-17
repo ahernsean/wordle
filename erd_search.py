@@ -37,7 +37,7 @@ from datetime import datetime
 
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
-from erd_queue import ErdQueue, encode_subset
+from erd_queue import ERDQueue, encode_subset
 import erd_swarm
 
 ANSWER_FILE = 'NYT_wordlist.txt'
@@ -63,7 +63,7 @@ def cmd_bootstrap(args):
 
     score_cache = ScoreCache(args.cache, all_answers)
     rcache = ResponseCache(all_answers, score_cache)
-    queue = ErdQueue(args.queue)
+    queue = ERDQueue(args.queue)
 
     # Reset any stale in_progress rows from a previous interrupted run.
     stale = queue.reset_stale_in_progress()
@@ -160,7 +160,7 @@ def cmd_run(args):
     # would race on ALTER TABLE ADD COLUMN ("duplicate column name").
     ScoreCache(args.cache, load_word_list(ANSWER_FILE),
                checkpoint_on_close=False).close()
-    queue = ErdQueue(args.queue)
+    queue = ERDQueue(args.queue)
     stale = queue.reset_stale_in_progress()
     nb, nc = queue.reset_active_branches()
     if stale or nb or nc:
@@ -201,7 +201,7 @@ def cmd_run(args):
     while not stop_event.is_set():
         time.sleep(5)
 
-        q = ErdQueue(args.queue)
+        q = ERDQueue(args.queue)
         for wid, (p, started_at) in list(procs.items()):
             age = time.time() - started_at
             if not p.is_alive():
@@ -316,7 +316,7 @@ def _print_status(args):
 
     # Queue + swarm state
     try:
-        queue = ErdQueue(args.queue)
+        queue = ERDQueue(args.queue)
         counts = queue.counts_by_status()
         branches = queue.branches_in_progress()
         hbs = queue.heartbeats_with_branch()
@@ -388,7 +388,7 @@ def _print_status(args):
         print('  (none)')
     for b in branches:
         key = bytes(b['branch_key'])
-        n_chunks = ErdQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
+        n_chunks = ERDQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
         done = done_chunks.get(key, 0)
         pct = 100.0 * done / n_chunks if n_chunks else 0.0
         src = (f'{b["source_word"].upper()} {fmt_pattern(b["source_pattern"])}'
@@ -606,10 +606,10 @@ def cmd_solve_branch(args):
         started = time.time()
         while not stop.is_set():
             try:
-                q = ErdQueue(args.queue)
+                q = ERDQueue(args.queue)
                 row = q.get_branch(branch_key)
                 if row is not None:
-                    n_chunks = ErdQueue.n_chunks_for(
+                    n_chunks = ERDQueue.n_chunks_for(
                         row['n_candidates'], row['chunk_size'])
                     done = q.branch_done_chunks(branch_key)
                     bw, be = q.read_branch_best(branch_key)
@@ -660,7 +660,7 @@ def cmd_solve_branch(args):
 # ---------------------------------------------------------------------------
 
 def cmd_reset_stale(args):
-    queue = ErdQueue(args.queue)
+    queue = ERDQueue(args.queue)
     n = queue.reset_stale_in_progress()
     queue.close()
     print(f'Reset {n} in_progress row(s) to pending.')

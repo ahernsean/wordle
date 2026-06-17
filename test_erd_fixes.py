@@ -15,7 +15,7 @@ import unittest
 
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle_engine import ResponseCache, ERD_ALL, Solution
-from erd_queue import ErdQueue
+from erd_queue import ERDQueue
 import merge_cache
 
 
@@ -34,7 +34,7 @@ class _TmpDB:
 class TestReclaimLiveness(_TmpDB, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        self.q = ErdQueue(self.path("q.sqlite3"))
+        self.q = ERDQueue(self.path("q.sqlite3"))
         self.addCleanup(self.q.close)
         self.key = ScoreCache.encode_subset(WORDS)
 

@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS branch_chunks (
 """
 
 
-class ErdQueue:
+class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
     def __init__(self, db_path: str, timeout: float = 30.0):
