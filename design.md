@@ -8,13 +8,38 @@ with a live Wordle game by tracking remaining possible answers and
 recommending guesses, and also supports multi-board variants
 (Quordle, Dordle, etc.).
 
-Three files hold essentially everything:
+Four layers:
 
 | File | Role |
 |------|------|
-| `wordle_engine.py` | All algorithms. No I/O. |
-| `wordle.py` | REPL, display, command handlers. |
-| `adaptive_cache_sqlite.py` | SQLite-backed lookahead result cache. |
+| `wordle_engine.py` | All algorithms: scoring, ERD search, response simulation. No I/O. |
+| `wordle.py` | REPL, display, all command handlers. |
+| `cache_sqlite.py` | SQLite-backed `ScoreCache`: ERD results, candidate scores, response decompositions. |
+| `erd_swarm.py` / `erd_queue.py` / `erd_search.py` | Parallel precache workers: branch assignment, chunk dispatch, cooperative ERD solving. |
+
+Support files: `merge_cache.py` (merge two `.sqlite3` files), `backfill_max_depth.py`
+(populate `max_depth` for legacy rows), diagnostic scripts (`diag_*.py`).
+
+---
+
+## Vocabulary
+
+These terms have precise meanings throughout the codebase:
+
+| Term | Meaning |
+|---|---|
+| **guess** | A word actually played as a turn in the game. |
+| **candidate** | A word under evaluation during search — not yet played. A candidate becomes the guess when it wins. |
+| **branch** | The remaining answer words after a guess + response. Identified by a (guess, pattern) pair at each level. |
+| **chunk** | A contiguous slice of a branch's ranked candidate list; the unit of work claimed by one swarm worker. |
+
+The phase boundary between candidate and guess is explicit:
+```python
+for i, candidate in enumerate(candidate_list):
+    status, cost, md, floor = evaluate_candidate(branch_words, candidate, ...)
+    if cost < best_erd:
+        best_guess = candidate   # ← candidate becomes the guess here
+```
 
 ---
 
@@ -25,10 +50,10 @@ Two files at startup:
 - **`NYT_wordlist.txt`** — ~3,200 answer words (the set the NYT Wordle draws from).
 - **`wordle.txt`** — ~12,972 valid guess words (superset including answers).
 
-Answers are the universe for "what is the answer?"; guesses are the
-universe for "what should I guess next?" The two are kept separate
-throughout. All scoring is done by partitioning the *answer set* into
-response groups; the guess being evaluated can come from either list.
+Answers are the universe for "what is the answer?"; the full word list is the
+universe for "what should I guess next?" The two are kept separate throughout.
+All scoring is done by partitioning the *answer set* into response groups; the
+candidate being evaluated can come from either list.
 
 ---
 
@@ -37,7 +62,7 @@ response groups; the guess being evaluated can come from either list.
 A response is a list of five colors: `'green'`, `'yellow'`, or `'gray'`.
 
 ```
-calculate_response(guess, answer) -> ['green', 'gray', 'yellow', ...]
+calculate_response(test_word, answer_word) -> ['green', 'gray', 'yellow', ...]
 ```
 
 Two-pass algorithm handles duplicate letters correctly:
@@ -51,26 +76,22 @@ reverses the encoding for display.
 
 ---
 
-## Group Analysis and Scoring
+## Scoring Methods
 
-The core operation: partition the remaining answer words by what response
-they would give to a candidate guess. Each partition bucket is a
-*response group*. The guess that creates the most informative partition is
-the best guess.
+The core operation: partition the remaining answer words (`branch_words`) by
+what response they would give to a candidate guess. Each partition bucket is a
+*response group*. Four scoring methods evaluate how informative the partition is:
 
-Four scoring methods:
+| Enum | SQLite key | Formula | Direction |
+|---|---|---|---|
+| `WEIGHTED_AVG` | `weighted_avg` | Σ(nᵢ²) / N | lower is better |
+| `ENTROPY_GAIN` | `entropy_gain` | −Σ(pᵢ log₂ pᵢ) | higher is better |
+| `MAX_GROUP_SIZE` | `max_group_size` | max(nᵢ) | lower is better |
+| `PROB_FINISH` | `prob_finish` | (# groups of size 1) / N | higher is better |
 
-| Method | Formula | Direction |
-|--------|---------|-----------|
-| `WEIGHTED_AVG` | Σ(nᵢ²) / N | lower is better |
-| `ENTROPY_GAIN` | −Σ(pᵢ log₂ pᵢ) | higher is better |
-| `MINIMAX` | max(nᵢ) | lower is better |
-| `PROB_FINISH` | (# groups of size 1) / N | higher is better |
-
-`ENTROPY_GAIN` (Shannon entropy in bits) is the primary method used by
-lookahead and most automated ranking. `MINIMAX` is useful for worst-case
-risk analysis. `PROB_FINISH` is the probability that a single guess solves
-the puzzle outright.
+`ENTROPY_GAIN` (Shannon entropy in bits) is the primary method for interactive
+scoring and lookahead. `MAX_GROUP_SIZE` (worst-case group size) is useful for
+risk analysis and is paired with entropy in the board (Pareto) view.
 
 `max_entropy(n)` returns log₂(n) — the theoretical ceiling for n remaining
 words. In practice, with only 243 possible responses (3⁵), no word can
@@ -78,22 +99,154 @@ achieve this ceiling unless very few words remain.
 
 ---
 
-## ResponseCache (in-memory)
+## ERD Search
+
+**Expected Remaining Depth (ERD)** is the minimum expected number of guesses
+to solve a branch, playing optimally. It replaces the older two-step entropy
+lookahead as the primary search algorithm.
+
+```
+min_expected_guesses(branch_words, cache, score_cache, ...) -> float | None
+```
+
+The search is depth-limited: the budget is the number of guesses remaining in
+the game (5, after the opener). A branch that cannot be solved within the
+budget is a loss; its cost is `inf`.
+
+### evaluate_candidate
+
+```
+evaluate_candidate(branch_words, candidate, cache, score_cache, *,
+                   best_erd, budget, ...) -> (status, cost, max_depth, floor_hit)
+```
+
+Evaluates one candidate's exact ERD for solving `branch_words`. Returns one of:
+- `('ok', cost, md, floor)` — fully evaluated; `cost < best_erd`
+- `('pruned', None, md, floor)` — can't beat `best_erd` or infeasible within budget
+- `('cutoff', None, None, floor)` — provably can't beat the bound (admissible lower bound >= best_erd)
+- `('useless', None, None, floor)` — a response group is all of `branch_words`
+- `('abort', None, None, floor)` — deadline/cancel fired
+
+**Branch-and-bound:** a running `best_erd` is shared across all candidate evaluations
+for the same branch. A candidate that provably can't beat `best_erd` is pruned immediately.
+
+**Alpha-beta per sub-branch:** within one candidate's evaluation, each sub-branch is
+solved under a derived ceiling so deep nodes prune from tight values rather than `inf`.
+`rest_lb[i]` is an admissible lower bound on the weighted cost of all sub-branches after
+position `i` (each sub-branch of k answers costs ≥ 2 − 1/k).
+
+### Candidate ordering
+
+Before the main search loop, `rank_candidates_by_max_group_size_then_entropy_gain`
+sorts candidates by ascending `MAX_GROUP_SIZE`, breaking ties by descending
+`ENTROPY_GAIN`. This front-loads strong candidates so `best_erd` tightens early,
+making subsequent pruning more aggressive.
+
+### ERD policies
+
+The cache namespace identifies which universe+compliance combination was used:
+
+| Policy constant | Meaning |
+|---|---|
+| `ERD_ALL` | ~12,972 words, no clue filter — the main precache target |
+| `ERD_ANSWERS` | ~3,200 answer words only, compliant with revealed clues |
+| `ERD_CONSTRAINED` | ~12,972 words, must satisfy all clues (Wordle hard mode; transient, never persisted) |
+| `ERD_ANSWERS_UNFILTERED` | ~3,200 words, no clue filter |
+
+---
+
+## ResponseCache
 
 ```python
 class ResponseCache:
-    def __init__(self, answer_words): ...
+    def __init__(self, answer_words, score_cache=None): ...
     def group_counts(self, guess, subset) -> {pattern_int: count}
     def group_words(self, guess, subset) -> {pattern_int: [words]}
 ```
 
-For each guess word encountered, caches the full `{answer → pattern_int}`
-mapping across all answer words. Built lazily on first access. Subsequent
-calls against any subset of answers are then pure dict lookups —
-no `calculate_response` calls needed.
+For each guess word encountered, caches the full `{answer → pattern_int}` mapping
+across all answer words. Built lazily on first access. Subsequent calls against any
+subset of answers are then pure dict lookups — no `calculate_response` calls needed.
 
-One `ResponseCache` instance is shared across all `Solution` objects for
-the session.
+If a `ScoreCache` is provided at construction, it is consulted first for a
+precomputed decomposition blob, avoiding even the initial scan.
+
+One `ResponseCache` instance is shared across all `Solution` objects for the session.
+
+---
+
+## ScoreCache (SQLite)
+
+Defined in `cache_sqlite.py`. Shared between Linux and the iOS app via iCloud sync.
+
+```python
+class ScoreCache:
+    def read(self, branch_key, policy) -> (best_guess, best_score) | None
+    def read_with_depth(self, branch_key, policy) -> (best_guess, best_score, max_depth, solve_budget) | None
+    def write(self, branch_key, policy, best_guess, best_score, max_depth, solve_budget)
+    def has_scores(self, branch_key, method) -> bool
+    def read_scores(self, branch_key, method) -> [(word, score)] | None
+    def write_scores(self, branch_key, scores, method)
+    @staticmethod
+    def encode_subset(words) -> bytes  # sorted words concatenated, 5 bytes each
+```
+
+### Schema
+
+```sql
+CREATE TABLE answer_list (
+    answer_list_id TEXT PRIMARY KEY,   -- SHA-256 of sorted newline-joined answer words
+    answer_hash    TEXT NOT NULL,
+    answer_count   INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL
+)
+
+CREATE TABLE branch_best_by_policy (
+    branch_key     BLOB NOT NULL,      -- encode_subset(branch_words)
+    policy         TEXT NOT NULL,      -- ERD policy string
+    answer_list_id TEXT NOT NULL,
+    best_guess     TEXT NOT NULL,
+    best_score     REAL NOT NULL,      -- policy-dependent: ERD cost or entropy
+    max_depth      INTEGER,            -- worst-case line length; NULL = unknown
+    solve_budget   INTEGER,            -- budget under which result was computed; NULL = unconstrained
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (branch_key, policy, answer_list_id)
+)
+
+CREATE TABLE candidate_scores (
+    branch_key     BLOB NOT NULL,
+    answer_list_id TEXT NOT NULL,
+    method         TEXT NOT NULL,      -- scoring method key (e.g. 'entropy_gain')
+    scores_blob    BLOB NOT NULL,      -- packed array of (word, score) pairs
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (branch_key, answer_list_id, method)
+)
+
+CREATE TABLE response_decomposition (
+    guess          TEXT NOT NULL,
+    answer_list_id TEXT NOT NULL,
+    patterns       BLOB NOT NULL,      -- packed {answer -> pattern_int} map
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (guess, answer_list_id)
+)
+```
+
+### Cache reuse contract
+
+A `branch_best_by_policy` row is reusable if:
+- `solve_budget IS NULL` — result is the unconstrained ERD optimum, valid at any budget
+- `solve_budget IS NOT NULL AND max_depth <= remaining_budget` — a depth-limited result is valid
+  only when the remaining budget is at least as large as the worst-case depth it was computed under
+
+Rows with `max_depth IS NULL` (legacy, pre-depth-tracking) are treated as unreusable for
+depth-limited queries and recomputed.
+
+### Schema coordination (Linux + phone)
+
+The cache file is synced via iCloud between Linux and the iOS Pythonista app. Any schema change must:
+1. Be implemented as an idempotent migration in `ScoreCache._ensure_schema`, guarded by `schema_migrations`
+2. Deploy new code to the phone **before** syncing a migrated Linux database to it
+3. Never require manual SQL — migrations run automatically on first open
 
 ---
 
@@ -103,250 +256,163 @@ the session.
 
 ```python
 class Solution:
-    current_words   # remaining candidate answers
-    guesses         # [(word, response), ...]
-    word_scores     # {word: {ScoringMethod: score}} — per-word score cache
-    answer_word     # set in simulation mode; None otherwise
-    fallback_active # True if current_words came from full guess vocab
+    current_words    # remaining candidate answers
+    guesses          # [(word, response), ...]
+    answer_word      # set in simulation mode; None otherwise
+    fallback_active  # True if current_words came from full guess vocab
 ```
-
-### Score Cache
-
-`word_scores` is a per-word, per-method cache. `compute_scores` and
-`compute_scores_multi` populate it incrementally — a word already scored
-under a method is not recomputed. This means the board command (which
-scores entropy + minimax together) and the solve command (entropy only)
-share computed entropy values with no redundant work.
-
-The cache is cleared whenever `current_words` changes: after `apply_guess`,
-`undo_guess`, `include_letters`, or `exclude_letters`.
 
 ### Undo
 
-`undo_guess()` pops the last entry from `self.guesses`, resets
-`current_words` to the full answer list, and replays all remaining guesses.
-Works in all modes (live game, simulation, multi-game).
+`undo_guess()` pops the last entry from `self.guesses`, resets `current_words`
+to the full answer list, and replays all remaining guesses. Works in all modes
+(live game, simulation, multi-game).
 
 ### Hard Mode Words
 
-`hard_mode_words(all_guesses)` filters the full 12K guess list to words
-consistent with all prior responses — green letters fixed in position,
-yellow letters present but not in that position. This is real Wordle hard
-mode: guesses must respect all revealed constraints, but are not limited
-to remaining answers.
+`hard_mode_words(all_words)` filters the full ~12K word list to words consistent
+with all prior responses — green letters fixed in position, yellow letters present
+but not in that position. This is real Wordle hard mode: guesses must respect all
+revealed constraints, but are not limited to remaining answers.
 
 ### Multi-Game Join
 
-`Solution.join(solutions)` merges the `current_words` from multiple
-active boards into a single Solution for computing a shared best guess
-(useful for Quordle-style play).
+`Solution.join(solutions)` merges the `current_words` from multiple active boards
+into a single Solution for computing a shared best guess (useful for Quordle-style play).
 
 ### Fallback
 
-If `apply_guess` would leave `current_words` empty (the guessed word is not
-in the answer list and its response pattern matches nothing), the engine
-replays all guesses against the full 12K guess vocabulary. `fallback_active`
-is set to True; the UI displays a warning.
+If `apply_guess` would leave `current_words` empty (the guessed word is not in the
+answer list and its response pattern matches nothing), the engine replays all guesses
+against the full ~12K word vocabulary. `fallback_active` is set to True; the UI
+displays a warning.
+
+---
+
+## Parallel ERD Precache (Swarm)
+
+The precache fills `branch_best_by_policy` for `ERD_ALL` across all branches
+reachable from the opener (typically SALET). Because evaluating ~12,972 candidates
+against a branch is slow, multiple workers cooperate:
+
+### Architecture
+
+- `erd_queue.sqlite3` — coordination-only database (separate from `wordle_cache.sqlite3`
+  to avoid contention). Contains the `pending_subgroups` table of branches to solve,
+  chunk claims, heartbeats, and done flags.
+- `_BranchWorker` (`erd_swarm.py`) — one per OS process. Claims one chunk at a time,
+  evaluates candidates in that slice, writes sub-branch results to `wordle_cache.sqlite3`,
+  and updates chunk state in `erd_queue.sqlite3`.
+- `ErdQueue` (`erd_queue.py`) — single writer to `erd_queue.sqlite3`. Used by workers to
+  claim chunks, record heartbeats, mark chunks done, and promote large sub-branches to the queue.
+
+### Branch lifecycle
+
+1. A branch is added to the queue with a chunk count proportional to its word count.
+2. Each worker calls `claim_one()` to atomically claim an unclaimed (or timed-out) chunk.
+3. The worker evaluates each candidate in its slice, writing sub-branch ERD results as it goes.
+4. On `done=1`, the worker calls `maybe_finalize`: if every chunk for this branch is done, it
+   writes the final `branch_best_by_policy` row and removes the branch from the queue.
+
+### Trust model
+
+A claimed chunk is advisory; only a `done=1` chunk is authoritative. A branch is finalized only
+once every chunk is done. A crashed worker's chunk times out (`HB_TIMEOUT_SECONDS = 120`) and is
+reclaimed — never skipped, never double-counted.
+
+### Sub-branch promotion
+
+When `evaluate_candidate` recurses into a sub-branch with ≥ 60 words, the worker promotes that
+sub-branch to the queue at elevated priority (`PROMOTED_PRIORITY = 1,000,000`) so freed workers
+prefer joining in-flight depth over starting fresh top-level branches.
+
+### Budget
+
+Workers solve branches under `ROOT_BUDGET = 5` (six total guesses minus the opener). A branch
+unsolvable in 5 guesses gets `cost = inf` — not a finite expected depth.
 
 ---
 
 ## Two-Step Entropy Lookahead
 
+The interactive `l` (lookahead) command uses a lighter-weight two-step search: for each
+candidate first guess, compute the weighted average best-entropy second guess across all
+response groups. This is faster than ERD for interactive use and works well for identifying
+strong openers without needing the full precache.
+
 ```python
 soln.compute_lookahead(
     top_words,           # [(word, first_entropy), ...]
     second_step_words,   # None = hard mode; list = full mode
-    total_callback,      # called once with total work units
-    progress_callback,   # called per work unit
+    total_callback,
+    progress_callback,
 ) -> [(word, step1, step2, combined), ...]
 ```
 
-**Algorithm:**
-
-For each candidate first guess:
-1. Partition `current_words` into response groups.
-2. For each group of size > 2, find the best second guess: the word in
-   `second_step_words` (or the subgroup itself in hard mode) that maximises
-   entropy against that subgroup.
-3. Compute the weighted average second-step entropy:
-   `step2 = Σ (|group| / N) × best_entropy(group)`
-4. `combined = step1 + step2`
-
-Groups of size 1 are already solved; groups of size 2 contribute exactly
-1.0 bit (any distinguishing word resolves them).
-
-**Hard mode vs full mode:**
-
-- **Hard mode** (`second_step_words=None`): the second guess must come from
-  the subgroup itself. Fast; realistic for hard-mode play.
-- **Full mode** (`second_step_words=[...]`): search a provided word list
-  (typically the top N² ranked guesses) for the best second step. Slower;
-  finds better second steps.
-
-The test command uses hard mode. The lookahead command uses full mode,
-searching the top N² candidates as second-step words.
-
-**SQLite subgroup cache:**
-
-Completed subgroup results are cached in `LookaheadCache` (see below).
-Before scanning candidates for a subgroup, the cache is checked. On a hit,
-the scan is skipped entirely. Cache hits are excluded from the work-unit
-count so the progress bar reflects only real computation.
+Groups of size 1 are already solved; groups of size 2 contribute exactly 1.0 bit.
 
 ---
 
-## LookaheadCache (SQLite)
-
-Defined in `adaptive_cache_sqlite.py`.
+## GuessUniverse and ComplianceFilter
 
 ```python
-class LookaheadCache:
-    def read(self, subset_blob, policy) -> (best_word, best_entropy) | None
-    def write(self, subset_blob, policy, best_word, best_entropy)
-    def stats() -> (row_count, last_updated_ts)
-    @staticmethod
-    def encode_subset(words) -> bytes  # b"\0".join(sorted(words).encode())
+class GuessUniverse(Enum):
+    ALL_WORDS    = 'words'    # ~12,972
+    ALL_ANSWERS  = 'answers'  # ~3,200
+
+class ComplianceFilter(Enum):
+    UNFILTERED = 'unfiltered'  # any word from the universe
+    COMPLIANT  = 'compliant'   # must satisfy all clues revealed so far
 ```
 
-**Schema:**
-
-```sql
-CREATE TABLE universe (
-    universe_id  TEXT PRIMARY KEY,  -- SHA-256 of sorted answer list
-    answer_hash  TEXT NOT NULL,
-    answer_count INTEGER NOT NULL,
-    created_at   INTEGER NOT NULL
-)
-
-CREATE TABLE lookahead_result (
-    subset_blob  BLOB    NOT NULL,  -- NUL-joined sorted subgroup words
-    policy       TEXT    NOT NULL,  -- 'hard' or 'full'
-    universe_id  TEXT    NOT NULL,
-    best_word    TEXT    NOT NULL,
-    best_entropy REAL    NOT NULL,
-    updated_at   INTEGER NOT NULL,
-    PRIMARY KEY (subset_blob, policy, universe_id)
-)
-```
-
-`universe_id` is the SHA-256 of the newline-joined sorted answer list.
-Results from a different answer set are silently ignored via the universe
-join.
-
-The cache is **exact**: only completed subgroup scans are stored. No
-partial or approximate values are written. Because small subgroups (≤ ~20
-words) recur frequently across sessions regardless of which first guess
-produced them, the cache grows incrementally and makes repeated lookahead
-runs progressively faster.
-
----
-
-## InputSet and Hard Mode Toggle
-
-The `InputSet` enum controls which words are eligible as guesses:
-
-| Value | Candidate pool |
-|-------|---------------|
-| `ALL_GUESSES` | All ~12,972 words |
-| `HARD_MODE` | Words from all_guesses satisfying all revealed constraints |
-| `CURRENT_WORDLIST` | Remaining possible answers only (strictest) |
-| `SOLVED_WORDS` | Multi-game only: the solved answer from each board |
-
-The `h` command cycles `ALL_GUESSES → HARD_MODE → CURRENT_WORDLIST → ALL_GUESSES`.
-The current setting applies to the `s`, `b`, and `l` commands.
+The interactive `h` command cycles through effective modes:
+`ALL_WORDS/UNFILTERED → ALL_WORDS/COMPLIANT → ALL_ANSWERS/COMPLIANT → ALL_WORDS/UNFILTERED`
 
 ---
 
 ## Interactive Commands
 
-The REPL loop reads a single character per command.
-
-| Key | Command | Description |
+| Key | Handler | Description |
 |-----|---------|-------------|
-| `g` | Guess | Enter a guess word and response pattern |
-| `s` | Solve | Score all candidates by chosen method |
-| `b` | Board | Pareto entropy vs max-group-size display |
-| `l` | Lookahead | Two-step entropy lookahead on top N words |
-| `d` | Display | Show remaining words (scored if available) |
-| `t` | Test | Analyse a specific word (all methods + lookahead) |
-| `i` | Include | Keep only words containing specified letters |
-| `x` | Exclude | Remove words containing specified letters |
-| `u` | Undo | Remove the last guess and restore prior word count |
-| `r` | Reset | Reset one or all boards |
-| `a` | Answer | Set a known answer for simulation mode |
-| `w` | Words | Set number of games (Quordle, Dordle, etc.) |
-| `h` | Hard mode | Cycle through input sets |
-| `c` | Cache info | Show SQLite cache statistics |
-| `?` | Help | Print command summary |
+| `g` | `cmd_guess` | Enter a guess word and response pattern |
+| `s` | `cmd_solve` | Score all candidates by chosen method |
+| `b` | `cmd_grid` | Pareto entropy vs max group size display |
+| `l` | `cmd_lookahead` | Two-step entropy lookahead on top N words |
+| `d` | `cmd_display` | Show remaining words (scored if available) |
+| `t` | `cmd_test` | Analyse a specific word (all methods + lookahead) |
+| `i` | `cmd_include` | Keep only words containing specified letters |
+| `x` | `cmd_exclude` | Remove words containing specified letters |
+| `u` | `cmd_undo` | Remove the last guess and restore prior word count |
+| `v` | `cmd_verify_erd` | Spot-check cached ERD entries against their subtrees |
+| `p` | `cmd_precache` | Show precache progress or trigger a focused branch solve |
+| `r` | `cmd_reset` | Reset one or all boards |
+| `a` | `cmd_answer` | Set a known answer for simulation mode |
+| `w` | `cmd_wordcount` | Set number of games (Quordle, Dordle, etc.) |
+| `c` | `cmd_candidates` | Show candidate pool size and active filters |
+| `h` | Hard mode | Cycle through guess universe / compliance filter |
+| `?` | `cmd_help` | Print command summary |
 
 ### Response entry format (`g`)
 
-The response to a guess is entered as a 5-character string:
-`g` = green, `y` = yellow, any other character (including `-`, `0`, `_`,
-em-dash) = gray. The parser accepts punctuation liberally because mobile
-keyboards sometimes substitute punctuation for hyphens.
-
-### Solve (`s`)
-
-Scores every word in the current input set against the remaining answers
-under one of the four methods. When run at the start of a full game
-(all answers remaining, all-guesses mode), results are saved to a `.p`
-pickle file and reloaded on subsequent runs if the engine has not changed.
+The response to a guess is entered as a 5-character string: `g` = green, `y` = yellow,
+any other character (including `-`, `0`, `_`, em-dash) = gray. The parser accepts
+punctuation liberally because mobile keyboards sometimes substitute punctuation for hyphens.
 
 ### Board (`b`) — Pareto View
 
-Scores all candidates simultaneously on entropy and max-group-size, then
-displays the **Pareto frontier**: the max-group-size levels where no other
-level has both higher entropy and lower max-group-size.
+Scores all candidates simultaneously on entropy and max group size, then displays the
+**Pareto frontier**: the max-group-size levels where no other level has both higher entropy
+and lower max group size.
 
 **Algorithm:**
 
-1. For each unique max-group-size value, find the best entropy among all
-   words at that size.
-2. Sort sizes ascending. Walk the list keeping a running maximum entropy
-   seen so far. A size is on the frontier if and only if its best entropy
-   exceeds the running maximum.
-3. For each frontier size, show the top 4 words by entropy.
+1. For each unique max group size, find the best entropy among all candidates at that size.
+2. Sort sizes ascending. Walk the list keeping a running maximum entropy seen so far.
+   A size is on the frontier if and only if its best entropy exceeds the running maximum.
+3. For each frontier level, show the top 4 words by entropy.
 
-Words in the answer set are marked `*`. Each frontier level shows how many
-total words share that max-group-size.
-
-### Lookahead (`l`)
-
-Ranks the top N first guesses by combined two-step entropy. Prompts for N
-(default 20). Uses full mode: searches the top N² ranked words as
-second-step candidates.
-
-A progress bar reflects only uncached work. After computing, displays a
-table of `word / step1 / step2 / combined`.
-
-### Test (`t`)
-
-Analyses a single word in detail:
-- If simulation mode is active, shows the response pattern against the
-  known answer.
-- Checks consistency with all prior guesses; explains each conflict.
-- Scores the word under all four methods and shows group count.
-- Runs a single-word two-step lookahead (hard mode): step1, step2, combined.
-- Shows the 5 largest response groups with up to 6 example words each.
-
----
-
-## Pickle Cache
-
-When `s` is run at game start on the full word list, results are saved to
-`weights-<n_guesses>-<method>.p`. On subsequent runs, the file is loaded if
-its mtime is newer than `wordle_engine.py`. This avoids the ~1-minute full
-scoring run each session.
-
----
-
-## Multi-Game Mode
-
-`w` sets the number of simultaneous games (e.g. 4 for Quordle). Each game
-gets its own `Solution`. The `g` command can target one board or all boards
-at once. `s`, `b`, and `l` can operate on a single board or a joined view
-of all unsolved boards.
+Words in the answer set are marked `*`. Each frontier level shows how many total words share
+that max group size.
 
 ---
 
@@ -354,31 +420,23 @@ of all unsolved boards.
 
 ### Color Output
 
-On Pythonista, `console.set_color(r, g, b)` is used. On Linux, ANSI escape
-codes are used when stdout is a TTY and `NO_COLOR` is not set.
+On Pythonista, `console.set_color(r, g, b)` is used. On Linux, ANSI escape codes are used
+when stdout is a TTY and `NO_COLOR` is not set.
 
 ### Display Width
 
 `get_display_width()` tries the following in order:
 
-1. `shutil.get_terminal_size()` — queries the OS via `TIOCGWINSZ`. Works
-   in standard terminals and may work in Pythonista if the console exposes
-   terminal size.
-2. Pythonista pixel-based estimation: reads the console view width in
-   points via `console.get_size()`, then tries several monospace fonts via
-   `ui.measure_string('M', font=...)` and picks the one whose column count
-   is closest to an integer (i.e. most likely to match the actual console
-   font). Font candidates: Menlo 12/13/14, DejaVuSansMono 16, Courier 12/14.
+1. `shutil.get_terminal_size()` — queries the OS via `TIOCGWINSZ`.
+2. Pythonista pixel-based estimation: reads the console view width in points via
+   `console.get_size()`, then tries several monospace fonts via `ui.measure_string`
+   and picks the one whose column count is closest to an integer.
 3. Falls back to 80 columns.
-
-The detected width is printed at startup: `Display width: N columns`.
 
 ### Progress Bar
 
-`ProgressTracker` prints a width-aware progress indicator during long
-computations:
+`ProgressTracker` prints a width-aware progress indicator during long computations:
 - One `.` per percentage point completed.
 - `25%` / `50%` / `75%` / `100%` milestone labels.
 - An ETA label (e.g. `1m30s`) every 10 seconds.
-- Lines wrap at `DISPLAY_WIDTH - 6` columns. Before each wrap, the current
-  line is padded to the margin with dots so all rows are the same width.
+- Lines wrap at `DISPLAY_WIDTH - 6` columns.
