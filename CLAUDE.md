@@ -82,12 +82,6 @@ Write comments that describe current behaviour and non-obvious invariants:
 
 ---
 
-## Known residual
-
-`pending_subgroups` — the queue coordination table in `erd_queue.sqlite3` still uses the old "subgroups" vocabulary. It was not in the rename plan and is a separate decision.
-
----
-
 ## Schema coordination (Linux + phone)
 
 The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any schema change must:

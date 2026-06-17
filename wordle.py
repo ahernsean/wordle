@@ -1189,8 +1189,8 @@ def cmd_solve(gs):
             return
         erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
         scores = _erd_solve_scores(soln, erd_sc, erd_policy, guesses=erd_guesses)
-        if scores is None:  # pragma: no cover - defensive: a cached root implies cached subgroups
-            print_error("ERD cache incomplete — some subgroups missing.")
+        if scores is None:  # pragma: no cover - defensive: a cached root implies cached branches
+            print_error("ERD cache incomplete — some branches missing.")
             return
         print("\nERD:")
         print("Best guesses:")
@@ -2580,7 +2580,7 @@ class ERDSolver(threading.Thread):
         # cannot be shared across threads. Replace it with one private to
         # this thread, backed by this thread's own connection (persist=True)
         # or none at all (persist=False — hard mode's eligible-guess
-        # subgroups are small enough that recomputing decompositions
+        # branches are small enough that recomputing decompositions
         # in-memory costs nothing noticeable).
         self._rcache = ResponseCache(self._all_answers,
                                      score_cache if self._persist else None)
@@ -2656,7 +2656,7 @@ class ERDSolver(threading.Thread):
             logger.info("ERDSolver scan started: %d words, policy=%s",
                          len(self._words), policy)
 
-            # Run the root scan directly.  Uncached subgroups are computed
+            # Run the root scan directly.  Uncached branches are computed
             # on-the-fly and written to the cache as a side effect (via
             # cache_all_scores), so the cache fills progressively during the
             # scan.  No pre-caching phase needed: the root scan is its own

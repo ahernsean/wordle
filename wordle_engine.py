@@ -181,7 +181,7 @@ _ALL_GREEN_PATTERN = _encode_response(['green'] * 5)
 # across the mix; the optimum genuinely varies by branch difficulty (see notes).
 ORDER_MIN_N = 8
 
-# Alpha-beta ceiling slack.  When a subgroup is solved with a derived ceiling we
+# Alpha-beta ceiling slack.  When a branch is solved with a derived ceiling we
 # add this tiny margin so floating-point rounding in the ceiling arithmetic can
 # never cut off a candidate that would in fact (just barely) beat the bound — a
 # false cutoff would only cost a missed cache write, never correctness, but the
@@ -812,10 +812,10 @@ class Solution:
         of the best second-step entropy across all response groups.
 
         second_step_words: word list to search for best second guess.
-            If None, uses hard mode (subgroup words only).
-            If provided, searches that list against each subgroup.
+            If None, uses hard mode (branch words only).
+            If provided, searches that list against each branch.
 
-        Completed subgroup results are cached in the SQLite lookahead
+        Completed branch results are cached in the SQLite lookahead
         cache and reused across sessions.
 
         progress_callback(): called per work unit.

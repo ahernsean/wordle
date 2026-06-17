@@ -342,7 +342,7 @@ class _BranchWorker:
             logger.warning('%s branch (%d words) UNSOLVABLE within budget %s '
                            '(loss) src=%s', self.name, len(words), budget,
                            branch_key[:25])
-        self.queue.mark_done(branch_key)        # pending_subgroups row -> done
+        self.queue.mark_done(branch_key)        # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
 
     # -- recursive cooperative solving --------------------------------------

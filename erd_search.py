@@ -4,7 +4,7 @@
 Subcommands
 -----------
 bootstrap   Walk root words, build response decompositions, and populate
-            erd_queue.sqlite3 with every branch subgroup (size >= 2).
+            erd_queue.sqlite3 with every branch (size >= 2).
             Idempotent / resumable.
 
 run         Start the supervisor: spawn N worker processes, monitor and
@@ -103,21 +103,21 @@ def cmd_bootstrap(args):
                 queue.set_meta('bootstrap_done_roots',
                                ','.join(sorted(done_roots)))
                 score_cache.checkpoint()
-                total = queue.total_subgroups()
+                total = queue.total_branches()
                 pct = (len(done_roots) / len(root_words)) * 100
                 print(f'\r  [{len(done_roots):5d}/{len(root_words)}]'
                       f' {word.upper():<10s}'
-                      f'  {total:,} subgroups queued'
+                      f'  {total:,} branches queued'
                       f'  ({pct:.1f}%)',
                       end='', flush=True)
 
         print()
         queue.set_meta('bootstrap_status', 'done')
         queue.set_meta('bootstrap_completed_at', str(int(time.time())))
-        total = queue.total_subgroups()
+        total = queue.total_branches()
         counts = queue.counts_by_status()
         print(f'\nBootstrap complete.')
-        print(f'  {total:,} distinct subgroups queued')
+        print(f'  {total:,} distinct branches queued')
         print(f'  {counts.get("done", 0):,} already done '
               f'(cached from iPhone)')
 
@@ -691,7 +691,7 @@ def main():
     p_boot.add_argument('--max-size', type=int, default=300, metavar='N',
                         help='Skip branches with more than N answer words '
                              '(default: 300; excludes computationally '
-                             'infeasible large subgroups from poor root words)')
+                             'infeasible large branches from poor root words)')
 
     # -- run --
     p_run = sub.add_parser('run', help='Start the parallel precache supervisor')

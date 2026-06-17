@@ -36,7 +36,7 @@ vocab = load_word_list('wordle.txt')
 q = sqlite3.connect('erd_queue.sqlite3', timeout=10); q.row_factory = sqlite3.Row
 branches = []
 for sz in SIZES:
-    row = q.execute("""SELECT branch_key, n_words FROM pending_subgroups
+    row = q.execute("""SELECT branch_key, n_words FROM pending_branches
                        WHERE source_word='salet' AND n_words>=? AND n_words<>238
                        ORDER BY n_words ASC LIMIT 1""", (sz,)).fetchone()
     if row and row['branch_key'] not in [b[0] for b in branches]:
