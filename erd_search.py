@@ -302,23 +302,23 @@ def cmd_queue_clear(args):
     Requires confirmation unless --yes is passed.
     """
     queue = ERDQueue(args.queue)
-    counts = queue.counts_by_status()
-    pending = counts.get('pending', 0)
-    done = counts.get('done', 0)
-    in_prog = len(queue.branches_in_progress())
-    queue.close()
+    try:
+        counts = queue.counts_by_status()
+        pending = counts.get('pending', 0)
+        done = counts.get('done', 0)
+        in_prog = len(queue.branches_in_progress())
 
-    print(f'Queue: {pending:,} pending   {done:,} done   {in_prog} in progress')
-    if not args.yes:
-        ans = input('Clear all queue state? [y/N] ').strip().lower()
-        if ans != 'y':
-            print('Aborted.')
-            return
+        print(f'Queue: {pending:,} pending   {done:,} done   {in_prog} in progress')
+        if not args.yes:
+            ans = input('Clear all queue state? [y/N] ').strip().lower()
+            if ans != 'y':
+                print('Aborted.')
+                return
 
-    queue = ERDQueue(args.queue)
-    queue.clear()
-    queue.close()
-    print('Queue cleared.')
+        queue.clear()
+        print('Queue cleared.')
+    finally:
+        queue.close()
 
 
 # ---------------------------------------------------------------------------
@@ -417,13 +417,15 @@ def cmd_queue_remove(args):
         return
 
     if active and args.force:
-        # Clear chunk claims and the active_branches row so the worker's next
-        # heartbeat can't claim more chunks for this branch.
-        queue._conn.execute(
-            "DELETE FROM branch_chunks WHERE branch_key = ?", (branch_key,))
-        queue._conn.execute(
-            "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
-        print(f'Cancelled in-progress work for {word.upper()} {pat}.')
+        # Atomically clear chunk claims, the active_branches row, and the
+        # pending_branches row.  All three DELETEs run in one transaction so a
+        # crash partway through cannot leave orphaned rows.  (remove_pending()
+        # alone would silently no-op here because the pending row still has
+        # status='in_progress' after the active state is cleared.)
+        queue.cancel_active_branch(branch_key, remove_from_queue=True)
+        queue.close()
+        print(f'Cancelled in-progress work and removed {word.upper()} {pat} from queue.')
+        return
 
     removed = queue.remove_pending(branch_key)
     queue.close()
@@ -553,7 +555,7 @@ def cmd_run(args):
         print(f'Recovery: {stale} pending rows reset, '
               f'{nb} in-progress branches / {nc} chunk claims cleared.')
 
-    bootstrap_status = queue.get_meta('bootstrap_status')
+    counts = queue.counts_by_status()
     if not counts.get('pending') and not counts.get('in_progress'):
         print('Warning: queue appears empty.  '
               'Run queue-add to load branches before starting workers.',
@@ -704,7 +706,6 @@ def _print_status(args):
         branches = queue.branches_in_progress()
         hbs = queue.heartbeats_with_branch()
         worker_counts = queue.worker_counts_by_branch()
-        bootstrap_status = queue.get_meta('bootstrap_status')
         # Per-branch done-chunk counts for the in-progress branches.
         done_chunks = {bytes(b['branch_key']): queue.branch_done_chunks(b['branch_key'])
                        for b in branches}
@@ -718,7 +719,6 @@ def _print_status(args):
         hbs = []
         worker_counts = {}
         done_chunks = {}
-        bootstrap_status = None
 
     # Cache throughput
     try:
@@ -749,9 +749,6 @@ def _print_status(args):
     prune_pct = (100.0 * n_pruned / (n_ok + n_pruned)) if (n_ok + n_pruned) else None
 
     print(f'ERD_ALL Precache — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-    if bootstrap_status != 'done':
-        print(f'  !! bootstrap: {bootstrap_status or "not started"} !!')
-
     if queue_ok:
         print(f'Queue:  pending {counts.get("pending", 0):,}   '
               f'done {counts.get("done", 0):,}   '

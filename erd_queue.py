@@ -395,11 +395,6 @@ class ERDQueue:
             "SELECT status, COUNT(*) c FROM pending_branches GROUP BY status"
         )}
 
-    def total_branches(self) -> int:
-        return self._conn.execute(
-            "SELECT COUNT(*) FROM pending_branches"
-        ).fetchone()[0]
-
     def heartbeats_with_branch(self):
         """Heartbeat rows joined to the branch each worker is contributing to.
 
@@ -674,9 +669,9 @@ class ERDQueue:
         self._conn.execute("DELETE FROM active_branches")
         return nb, nc
 
-    def worker_counts_by_branch(self) -> dict:
+    def worker_counts_by_branch(self, timeout_seconds: int = 30) -> dict:
         """{branch_key bytes: number of recent workers on it} for status."""
-        cutoff = int(time.time()) - 120
+        cutoff = int(time.time()) - timeout_seconds
         rows = self._conn.execute("""
             SELECT current_branch_key AS k, COUNT(*) AS c
             FROM worker_heartbeat
@@ -743,14 +738,43 @@ class ERDQueue:
             (branch_key,)
         ).fetchall()
 
-    def set_priority(self, branch_key: bytes, priority: int) -> bool:
-        """Update the priority of a pending (not yet in-progress) branch.
+    def cancel_active_branch(self, branch_key: bytes,
+                             remove_from_queue: bool = False):
+        """Atomically remove a branch's chunk claims and active_branches row.
 
-        Returns True if a row was updated, False if the branch was not found
-        in pending_branches (it may be active or done).
+        All DELETEs run in one transaction so a crash partway through cannot
+        leave orphaned branch_chunks rows or a dangling active_branches row.
+
+        With remove_from_queue=True, also deletes the pending_branches row
+        (regardless of its status), fully removing the branch from the queue in
+        the same transaction.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "DELETE FROM branch_chunks WHERE branch_key = ?", (branch_key,))
+            self._conn.execute(
+                "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
+            if remove_from_queue:
+                self._conn.execute(
+                    "DELETE FROM pending_branches WHERE branch_key = ?",
+                    (branch_key,))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def set_priority(self, branch_key: bytes, priority: int) -> bool:
+        """Update the priority of a pending branch.
+
+        Only updates rows with status='pending' — in-progress and done branches
+        are ignored (priority is only read at claim time).  Returns True if a
+        pending row was updated, False if the branch was not found or is not
+        pending.
         """
         self._conn.execute(
-            "UPDATE pending_branches SET priority = ? WHERE branch_key = ?",
+            "UPDATE pending_branches SET priority = ? "
+            "WHERE branch_key = ? AND status = 'pending'",
             (priority, branch_key))
         return self._conn.execute("SELECT changes()").fetchone()[0] > 0
 

@@ -584,11 +584,11 @@ def _setup_logging(worker_id):
 # ---------------------------------------------------------------------------
 
 def _focused_worker(branch_key, worker_id, cache_path, queue_path,
-                    min_words_per_chunk, max_chunk_count):
+                    min_words_per_chunk, max_chunk_count, n_workers=1):
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     w = _BranchWorker(worker_id, cache_path, queue_path, None,
-                      min_words_per_chunk, max_chunk_count)
+                      min_words_per_chunk, max_chunk_count, n_workers=n_workers)
     try:
         w.solve_branch_focused(branch_key)
     finally:
@@ -631,7 +631,7 @@ def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
 
     procs = [mp.Process(target=_focused_worker,
                         args=(branch_key, w, cache_path, queue_path,
-                              min_words_per_chunk, max_chunk_count))
+                              min_words_per_chunk, max_chunk_count, actual_workers))
              for w in range(actual_workers)]
     for p in procs:
         p.start()

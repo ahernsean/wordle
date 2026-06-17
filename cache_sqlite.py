@@ -60,7 +60,7 @@ def _available_ram_bytes() -> int:
             for line in f:
                 if line.startswith('MemAvailable:'):
                     return int(line.split()[1]) * 1024
-    except OSError:
+    except (OSError, ValueError, IndexError):
         pass
     return 0
 
