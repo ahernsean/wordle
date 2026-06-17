@@ -152,7 +152,7 @@ class TestProcessScalingSmoke(_Base):
         result = run_branch_solve(
             self.branch_key, BRANCH, n_workers=n_workers,
             cache_path=cache_path, queue_path=queue_path,
-            divisor=DIVISOR, max_chunks=MAX_CHUNKS,
+            min_words_per_chunk=DIVISOR, max_chunk_count=MAX_CHUNKS,
             source_word="crane", source_pattern=0,
             timeout=30)
         return result, time.time() - t0
