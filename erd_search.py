@@ -752,30 +752,30 @@ def _print_status(args):
     if queue_ok:
         print(f'Queue:  pending {counts.get("pending", 0):,}   '
               f'done {counts.get("done", 0):,}   '
-              f'branches in progress {len(branches)}')
+              f'in progress {len(branches)}')
     if cache_ok:
-        extra = ''
-        if hit_pct is not None:
-            extra += f'   hits {hit_pct:.0f}%'
-        if prune_pct is not None:
-            extra += f'   pruned {prune_pct:.0f}%'
-        print(f'Cache:  {total_erd:,} rows   +{recent:,}/5m{extra}')
+        print(f'Cache:  {total_erd:,} ERD entries   +{recent:,} in last 5m')
     print()
 
     # Branches in progress — the real progress unit.
     print('Branches in progress:')
     if not branches:
         print('  (none)')
+    else:
+        print(f'  {"Source":<13s}  {"Ans":>4s}  {"Cands":>6s}  '
+              f'{"Chunks":<12s}  {"Best guess":<12s}  {"ERD":>6s}  '
+              f'{"Wkrs":>4s}  ETA')
     for b in branches:
         key = bytes(b['branch_key'])
-        n_chunks = ERDQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
+        n_cands = b['n_candidates'] or 0
+        n_chunks = ERDQueue.n_chunks_for(n_cands, b['chunk_size'])
         done = done_chunks.get(key, 0)
         pct = 100.0 * done / n_chunks if n_chunks else 0.0
         src = (f'{b["source_word"].upper()} {fmt_pattern(b["source_pattern"])}'
                if b['source_word'] and b['source_pattern'] is not None
                else '-----')
         bw = (b['best_guess'] or '-----').upper()
-        be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '  ---'
+        be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '---'
         nw = b['n_words'] or 0
         wk = worker_counts.get(key, 0)
         created = b['created_at'] or now_ts
@@ -783,13 +783,24 @@ def _print_status(args):
         eta = ''
         if 0 < done < n_chunks and el > 0:
             rem = (n_chunks - done) / (done / el)
-            eta = f'  ~{_fmt_duration(int(rem))}'
-        print(f'  {src:<13s} {nw:4d}w  chunks {done:3d}/{n_chunks:<3d} '
-              f'({pct:3.0f}%)  {bw} {be:>5s}  {wk}w{eta}')
+            eta = _fmt_duration(int(rem))
+        print(f'  {src:<13s}  {nw:4d}  {n_cands:6,}  '
+              f'{done:3d}/{n_chunks:<3d} ({pct:3.0f}%)  '
+              f'{bw:<12s}  {be:>6s}  {wk:4d}  {eta}')
     print()
 
-    # Workers — liveness only (alive and moving, or stuck/idle).
-    print('Workers (health):')
+    # Workers — liveness and forward progress.
+    answer_set = set(load_word_list(ANSWER_FILE))
+    worker_hdr = 'Workers:'
+    if live:
+        parts = []
+        if hit_pct is not None:
+            parts.append(f'cache hits {hit_pct:.0f}%')
+        if prune_pct is not None:
+            parts.append(f'pruned {prune_pct:.0f}%')
+        if parts:
+            worker_hdr = f'Workers ({", ".join(parts)}):'
+    print(worker_hdr)
     if not hbs:
         print('  (none active)')
     for h in sorted(hbs, key=lambda r: r['worker_id']):
@@ -804,8 +815,6 @@ def _print_status(args):
                else '-----')
         chunk = h['chunk_idx'] if h['chunk_idx'] is not None else '-'
         held = now_ts - (h['chunk_started_at'] or now_ts)
-        rate = h['cand_rate']
-        rate_s = f'{rate/1000:.1f}k c/s' if rate else '  -  '
         done = h['chunks_done'] or 0
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
         n_seen = (h['cand_n_seen'] if 'cand_n_seen' in h.keys() else None) or 0
@@ -814,11 +823,20 @@ def _print_status(args):
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
         nrate = (h['node_rate'] if 'node_rate' in h.keys() else None) or 0.0
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
-        # Forward-progress flag: heartbeat fresh but no nodes moving == real hang.
+        # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
         moving = '  !!HANG' if (age <= 10 and nrate == 0 and nodes) else ''
-        cand_s = (f' [{cur} {n_seen}/{c_total} d{mdepth} '
-                  f'{nodes/1e6:.1f}M nodes {nrate/1000:.0f}k/s sp:{path}]'
-                  if cur else '')
+        if cur:
+            # "evals" = recursive candidate evaluations at any depth in the tree.
+            # "path" = sub-branch answer-word counts along the active recursion
+            #          spine, e.g. "54>21>8" means we're 3 levels deep with those
+            #          branch sizes at each level.
+            cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else '')
+            cand_s = (f' [{cur_disp} {n_seen}/{c_total} '
+                      f'depth {mdepth} '
+                      f'{nodes/1e6:.1f}M evals {nrate/1000:.0f}k/s '
+                      f'path:{path}]')
+        else:
+            cand_s = ''
         print(f'  {h["worker_id"]:<10s} {src:<13s} chunk {str(chunk):>3s} '
               f'held {_fmt_duration(held):>5s}  '
               f'done {done:<4d} hb={age}s{flag}{moving}{cand_s}')
