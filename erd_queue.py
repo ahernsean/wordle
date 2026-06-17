@@ -699,3 +699,70 @@ class ERDQueue:
             "SELECT value FROM run_meta WHERE key = ?", (key,)
         ).fetchone()
         return row["value"] if row else None
+
+    # ------------------------------------------------------------------
+    # Queue management
+    # ------------------------------------------------------------------
+
+    def clear(self):
+        """Wipe all queue state: pending/done branches, active branches,
+        chunk claims, heartbeats, and run_meta.
+
+        The persistent cache (wordle_cache.sqlite3) is not touched — only
+        the transient coordination tables in erd_queue.sqlite3.
+        """
+        self._conn.execute("DELETE FROM branch_chunks")
+        self._conn.execute("DELETE FROM active_branches")
+        self._conn.execute("DELETE FROM pending_branches")
+        self._conn.execute("DELETE FROM worker_heartbeat")
+        self._conn.execute("DELETE FROM run_meta")
+
+    def total_branches(self) -> int:
+        """Total rows in pending_branches (all statuses)."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM pending_branches").fetchone()[0]
+
+    def get_pending_branch(self, branch_key: bytes):
+        """Return the pending_branches row for branch_key, or None."""
+        return self._conn.execute(
+            "SELECT * FROM pending_branches WHERE branch_key = ?",
+            (branch_key,)
+        ).fetchone()
+
+    def get_active_branch(self, branch_key: bytes):
+        """Return the active_branches row for branch_key, or None."""
+        return self._conn.execute(
+            "SELECT * FROM active_branches WHERE branch_key = ?",
+            (branch_key,)
+        ).fetchone()
+
+    def chunks_for_branch(self, branch_key: bytes):
+        """Return all branch_chunks rows for branch_key."""
+        return self._conn.execute(
+            "SELECT * FROM branch_chunks WHERE branch_key = ? ORDER BY idx",
+            (branch_key,)
+        ).fetchall()
+
+    def set_priority(self, branch_key: bytes, priority: int) -> bool:
+        """Update the priority of a pending (not yet in-progress) branch.
+
+        Returns True if a row was updated, False if the branch was not found
+        in pending_branches (it may be active or done).
+        """
+        self._conn.execute(
+            "UPDATE pending_branches SET priority = ? WHERE branch_key = ?",
+            (priority, branch_key))
+        return self._conn.execute("SELECT changes()").fetchone()[0] > 0
+
+    def remove_pending(self, branch_key: bytes) -> bool:
+        """Delete a pending (status='pending') branch from the queue.
+
+        Returns True if a row was deleted.  Does not touch active_branches or
+        branch_chunks — call reset_active_branches() first if the branch is
+        currently in progress.
+        """
+        self._conn.execute(
+            "DELETE FROM pending_branches "
+            "WHERE branch_key = ? AND status = 'pending'",
+            (branch_key,))
+        return self._conn.execute("SELECT changes()").fetchone()[0] > 0
