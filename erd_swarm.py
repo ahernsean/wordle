@@ -27,7 +27,7 @@ import os
 import signal
 import time
 
-from cache_sqlite import ScoreCache
+from cache_sqlite import ScoreCache, mem_cache_limit
 from wordle_engine import (
     ERD_ALL,
     ResponseCache,
@@ -77,7 +77,8 @@ class _BranchWorker:
     """One worker process's state and operations on branches/chunks."""
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
-                 min_words_per_chunk, max_chunk_count, budget=ROOT_BUDGET):
+                 min_words_per_chunk, max_chunk_count, budget=ROOT_BUDGET,
+                 n_workers=1):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
         self.min_words_per_chunk = min_words_per_chunk
@@ -87,7 +88,11 @@ class _BranchWorker:
         self.all_answers = load_word_list(ANSWER_FILE)
         self.all_words = load_word_list(WORDS_FILE)
         self.n_candidates = len(self.all_words)
-        self.score_cache = ScoreCache(cache_path, self.all_answers)
+        max_entries = mem_cache_limit(n_workers)
+        logger.info('%s mem_cache cap: %d entries (~%.0f MB)',
+                    self.name, max_entries, max_entries * 250 / 1e6)
+        self.score_cache = ScoreCache(cache_path, self.all_answers,
+                                      max_mem_entries=max_entries)
         self.rcache = ResponseCache(self.all_answers, self.score_cache)
         self.queue = ERDQueue(queue_path)
 
@@ -545,14 +550,14 @@ class _BranchWorker:
 
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,
-                 min_words_per_chunk=3, max_chunk_count=256):
+                 min_words_per_chunk=3, max_chunk_count=256, n_workers=1):
     """Process entry point for a swarm worker (target= for mp.Process)."""
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     _setup_logging(worker_id)
     logger.info('worker-%d starting (pid=%d)', worker_id, os.getpid())
     w = _BranchWorker(worker_id, cache_path, queue_path, stop_event,
-                      min_words_per_chunk, max_chunk_count)
+                      min_words_per_chunk, max_chunk_count, n_workers=n_workers)
     try:
         w.run()
     finally:

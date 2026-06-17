@@ -584,7 +584,7 @@ def _spawn_worker(worker_id: int, args, stop_event):
     p = multiprocessing.Process(
         target=erd_swarm.swarm_worker,
         args=(worker_id, args.cache, args.queue, stop_event,
-              args.min_words_per_chunk, args.max_chunk_count),
+              args.min_words_per_chunk, args.max_chunk_count, args.workers),
         daemon=False,
         name=f'erd-worker-{worker_id}',
     )

@@ -6,9 +6,78 @@ import hashlib
 import logging
 import sqlite3
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 logger = logging.getLogger("wordle")
+
+
+class _LRUDict:
+    """Fixed-capacity LRU cache backed by an OrderedDict.
+
+    Evicts the least-recently-used entry when the capacity is reached.
+    All operations are O(1).  When max_size is None the cache is unbounded
+    (identical behaviour to a plain dict, but with the move-to-end overhead
+    on every access — callers that want truly unbounded should pass None to
+    opt out of the overhead).
+    """
+
+    def __init__(self, max_size=None):
+        self._max = max_size
+        self._data = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self._data:
+            return default
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+        if self._max is not None and len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def __getitem__(self, key):
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def pop(self, key, *args):
+        return self._data.pop(key, *args)
+
+    def __len__(self):
+        return len(self._data)
+
+
+def _available_ram_bytes() -> int:
+    """Return MemAvailable from /proc/meminfo, or 0 on any read error."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def mem_cache_limit(n_workers: int, ram_fraction: float = 0.4,
+                    bytes_per_entry: int = 250) -> int:
+    """Compute a per-worker _mem_cache entry cap from available RAM.
+
+    Divides (ram_fraction * available_ram) evenly across n_workers.  Falls
+    back to 500,000 entries if available RAM cannot be determined.
+    bytes_per_entry is an estimate of the Python memory cost per cache entry
+    (branch_key bytes blob + tuple + dict-node overhead).
+    """
+    available = _available_ram_bytes()
+    if available <= 0 or n_workers <= 0:
+        return 500_000
+    return max(10_000, int(available * ram_fraction / n_workers / bytes_per_entry))
 
 
 def _is_disk_io_error(exc):
@@ -38,7 +107,7 @@ class ScoreCache:
     """
 
     def __init__(self, db_path, answer_words, timeout=30.0,
-                 checkpoint_on_close=True):
+                 checkpoint_on_close=True, max_mem_entries=None):
         self.db_path = Path(db_path)
         self.answer_words = list(answer_words)
         self.checkpoint_on_close = checkpoint_on_close
@@ -57,7 +126,9 @@ class ScoreCache:
         # Branch results are write-once/exact, so a hit here is as good as
         # a SQLite hit but ~1000x cheaper — recursive ERD search re-reads the
         # same small branches millions of times across sibling branches.
-        self._mem_cache = {}
+        # max_mem_entries caps the cache size with LRU eviction so long-lived
+        # worker processes do not consume unbounded memory.  None = unbounded.
+        self._mem_cache = _LRUDict(max_size=max_mem_entries)
 
     def _is_migration_done(self, name):
         """Return True if migration `name` has been recorded as complete."""
