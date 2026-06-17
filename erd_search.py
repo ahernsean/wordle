@@ -130,6 +130,46 @@ def cmd_bootstrap(args):
 
 
 # ---------------------------------------------------------------------------
+# start / stop  (systemd delegation)
+# ---------------------------------------------------------------------------
+
+_SYSTEMD_SERVICE = 'wordle-erd'
+
+
+def _run_systemctl(action: str) -> int:
+    """Run `systemctl --user <action> <service>` and return the exit code."""
+    import subprocess
+    result = subprocess.run(
+        ['systemctl', '--user', action, _SYSTEMD_SERVICE],
+        capture_output=False)
+    return result.returncode
+
+
+def cmd_start(_args):
+    """Start the supervisor via systemd."""
+    rc = _run_systemctl('start')
+    if rc == 0:
+        _run_systemctl('status')
+    else:
+        print(f'systemctl start failed (exit {rc}).  '
+              f'Is the service installed?  '
+              f'Check: systemctl --user status {_SYSTEMD_SERVICE}',
+              file=sys.stderr)
+        sys.exit(rc)
+
+
+def cmd_stop(_args):
+    """Stop the supervisor via systemd."""
+    rc = _run_systemctl('stop')
+    if rc == 0:
+        print(f'Supervisor stopped.')
+    else:
+        print(f'systemctl stop failed (exit {rc}).',
+              file=sys.stderr)
+        sys.exit(rc)
+
+
+# ---------------------------------------------------------------------------
 # run (supervisor)
 # ---------------------------------------------------------------------------
 
@@ -193,9 +233,7 @@ def cmd_run(args):
     procs: dict[int, tuple] = {}
     for i in range(args.workers):
         procs[i] = _spawn_worker(i, args, stop_event)
-    print(f'Started {args.workers} swarm workers  (pid={os.getpid()}).')
-    print(f'Monitor: python3.13 erd_search.py status --watch')
-    print(f'Stop:    kill {os.getpid()}  or  Ctrl-C')
+    logger.info('Started %d workers (supervisor pid=%d).', args.workers, os.getpid())
 
     while not stop_event.is_set():
         time.sleep(5)
@@ -754,6 +792,16 @@ def main():
     p_sb.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_sb.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
 
+    # -- start --
+    sub.add_parser('start',
+                   help='Start the supervisor via systemd '
+                        '(systemctl --user start wordle-erd)')
+
+    # -- stop --
+    sub.add_parser('stop',
+                   help='Stop the supervisor via systemd '
+                        '(systemctl --user stop wordle-erd)')
+
     # -- reset-stale --
     p_rst = sub.add_parser('reset-stale',
                             help='Reset in_progress rows to pending')
@@ -770,6 +818,8 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
+        'start': cmd_start,
+        'stop': cmd_stop,
         'bootstrap': cmd_bootstrap,
         'run': cmd_run,
         'status': cmd_status,
