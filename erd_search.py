@@ -150,6 +150,77 @@ def cmd_bootstrap(args):
 
 
 # ---------------------------------------------------------------------------
+# cache-status
+# ---------------------------------------------------------------------------
+
+def cmd_cache_status(args):
+    """Show ERD cache coverage for a given word.
+
+    For each of the 242 possible response patterns for WORD, checks whether
+    the branch has a cached ERD value.  Reports the cached best guess and
+    score for hits, and flags misses so you can see what still needs work.
+    """
+    from erd_queue import fmt_pattern
+
+    all_answers = load_word_list(ANSWER_FILE)
+    word = args.word.strip().lower()
+
+    sc = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    groups = rcache.group_words(word, all_answers)
+    sc.close()
+
+    # Re-open with full ScoreCache to read branch entries.
+    sc = ScoreCache(args.cache, all_answers, checkpoint_on_close=False)
+
+    total = len(groups)
+    cached_count = 0
+    missing = []
+    hits = []
+
+    for code, branch in sorted(groups.items()):
+        pat = fmt_pattern(code)
+        n = len(branch)
+        if n < 2:
+            # Singleton or zero: no ERD needed (answer is identified immediately).
+            continue
+        branch_key = ScoreCache.encode_subset(branch)
+        entry = sc.read_detail(branch_key, ERD_ALL)
+        if entry is None:
+            missing.append((pat, n))
+        else:
+            best_guess, best_score, updated_at = entry
+            cached_count += 1
+            hits.append((pat, n, best_guess, best_score, updated_at))
+
+    sc.close()
+
+    n_trivial = sum(1 for branch in groups.values() if len(branch) < 2)
+    n_branches = total - n_trivial
+
+    print(f'{word.upper()}:  {n_branches} branches with ≥2 answers  '
+          f'({n_trivial} trivial patterns skipped)')
+    print(f'  Cached : {cached_count:4d}')
+    print(f'  Missing: {len(missing):4d}')
+    print()
+
+    if hits and not args.missing_only:
+        print(f'{"Pattern":<8}  {"Ans":>4}  {"Best guess":<12}  {"ERD":>7}  Updated')
+        for pat, n, best_guess, best_score, updated_at in hits:
+            from datetime import datetime
+            dt = datetime.fromtimestamp(updated_at).strftime('%Y-%m-%d %H:%M')
+            print(f'  {pat:<8}  {n:4d}  {best_guess.upper():<12}  '
+                  f'{best_score:7.4f}  {dt}')
+        if missing:
+            print()
+
+    if missing:
+        print(f'{"Pattern":<8}  {"Ans":>4}  (missing)')
+        for pat, n in missing:
+            print(f'  {pat:<8}  {n:4d}')
+
+
+# ---------------------------------------------------------------------------
 # queue-add  (replaces bootstrap for targeted loading)
 # ---------------------------------------------------------------------------
 
@@ -1067,6 +1138,15 @@ def main():
     p_sb.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_sb.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
 
+    # -- cache-status --
+    p_cs = sub.add_parser('cache-status',
+                           help='Show ERD cache coverage for a word')
+    p_cs.add_argument('--word', required=True, metavar='WORD',
+                      help='Guess word to inspect (e.g. salet)')
+    p_cs.add_argument('--missing-only', action='store_true',
+                      help='Only list patterns whose branches are not yet cached')
+    p_cs.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+
     # -- queue-add --
     p_qa = sub.add_parser('queue-add',
                           help='Add branches for a word (or word list) to the queue')
@@ -1154,6 +1234,7 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
+        'cache-status': cmd_cache_status,
         'queue-add': cmd_queue_add,
         'queue-clear': cmd_queue_clear,
         'queue-inspect': cmd_queue_inspect,
