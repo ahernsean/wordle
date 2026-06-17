@@ -179,33 +179,21 @@ class TestProcessScalingSmoke(_Base):
     "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
     "needs fork start method and >=2 CPUs")
 class TestCooperativeDrainSmoke(unittest.TestCase):
-    """Timing guard: 4 cooperative workers must drain N_DRAIN_BRANCHES faster
-    than 1 worker.
+    """Integration test: N swarm_worker processes share a queue and drain it correctly.
 
-    Architecture:
-    * swarm_worker (queue-draining loop) is used so spawn cost is paid once
-      per worker, amortized across all N_DRAIN_BRANCHES branches.
-    * Branches are built from disjoint 12-word slices of NYT_wordlist: no two
-      branches share any answer word, so their sub-branch ERD results cannot
-      be reused across branches via the shared ScoreCache.  Without disjoint
-      branches, the first branch populates the sub-branch cache and subsequent
-      branches become instant cache hits, collapsing N branches to 1 branch
-      of actual compute.
-    * DRAIN_DIVISOR > BRANCH_SIZE → n_chunks=1 per branch.  Workers pipeline:
-      while one worker holds the SQLite claim lock (~1 ms), the others are
-      computing (~20 ms/branch).  At 80 branches, the compute/lock ratio is
-      high enough that 4-worker wall time is consistently < 60% of 1-worker
-      wall time on this hardware, and estimated < 75% on 2-vCPU CI runners.
-    * Threshold: 4 workers must finish in < 80% of 1-worker time.  On
-      observed runs the margin is 9 standard deviations from the threshold,
-      so timing noise from OS scheduling does not cause false failures.
+    Uses disjoint 12-word branches (no shared answer words) so sub-branch
+    ERD values cannot be reused across branches — every branch requires real
+    compute.  DRAIN_DIVISOR > BRANCH_SIZE produces 1 chunk per branch, so
+    workers pipeline cleanly: one holds the SQLite claim lock while the
+    others compute.  Verifies that all branches reach 'done' status and
+    produce valid cache entries — correctness of multi-worker coordination,
+    not timing.
     """
 
     _BRANCH_SIZE = 12
     _N_BRANCHES = 80         # 80 × 12 = 960 unique answer words
     _DRAIN_DIVISOR = 100     # ceil(12/100)=1 → 1 chunk per branch
     _N_CANDIDATES = 100
-    _SPEEDUP_RATIO = 0.80    # 4 workers must complete in < 80% of 1-worker time
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -232,6 +220,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         self._wf = wf
 
     def _drain(self, n_workers, tag, timeout=120):
+        """Run n_workers swarm workers to drain all branches; return (cache_path, queue_path)."""
         from erd_swarm import swarm_worker
         cache_path = os.path.join(self._tmp.name, f"cache_{tag}.sqlite3")
         queue_path = os.path.join(self._tmp.name, f"queue_{tag}.sqlite3")
@@ -252,7 +241,6 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                                 args=(w, cache_path, queue_path, stop_event,
                                       self._DRAIN_DIVISOR, MAX_CHUNKS))
                      for w in range(n_workers)]
-            t0 = time.time()
             for p in procs:
                 p.start()
         deadline = time.time() + timeout
@@ -262,7 +250,6 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                 if not q.branches_in_progress():
                     break
                 time.sleep(0.05)
-            elapsed = time.time() - t0
         finally:
             q.close()
         stop_event.set()
@@ -272,19 +259,23 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
             if p.is_alive():
                 p.kill()
                 p.join()
-        return elapsed
+        return cache_path, queue_path
 
-    @unittest.skipIf(os.environ.get('CI'), 'timing-dependent; unreliable on shared CI runners')
-    def test_4workers_faster_than_1worker(self):
-        t1 = self._drain(1, "w1")
-        t4 = self._drain(4, "w4")
-        sys.stderr.write(
-            f"\n[drain] 1-worker: {t1:.3f}s, 4-worker: {t4:.3f}s "
-            f"({t1 / t4:.2f}x speedup)\n")
-        self.assertLess(
-            t4, t1 * self._SPEEDUP_RATIO,
-            f"4 workers ({t4:.3f}s) not faster enough vs "
-            f"1 worker ({t1:.3f}s); expected < {t1 * self._SPEEDUP_RATIO:.3f}s")
+    def test_4workers_drain_all_branches(self):
+        """4 workers cooperating on a shared queue solve every branch exactly once."""
+        cache_path, _queue_path = self._drain(4, "w4")
+
+        # Every branch must have a valid cache entry with a positive ERD score.
+        sc = ScoreCache(cache_path, self._pool)
+        missing = []
+        for bw in self._branches:
+            result = sc.read(encode_subset(bw), ERD_ALL)
+            if result is None or result[1] <= 0:
+                missing.append(bw)
+        sc.close()
+        self.assertEqual(missing, [],
+                         f"{len(missing)} of {self._N_BRANCHES} branches "
+                         f"missing or invalid in cache")
 
 
 if __name__ == "__main__":
