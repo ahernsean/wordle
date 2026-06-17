@@ -274,6 +274,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                 p.join()
         return elapsed
 
+    @unittest.skipIf(os.environ.get('CI'), 'timing-dependent; unreliable on shared CI runners')
     def test_4workers_faster_than_1worker(self):
         t1 = self._drain(1, "w1")
         t4 = self._drain(4, "w4")
