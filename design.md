@@ -303,7 +303,7 @@ against a branch is slow, multiple workers cooperate:
 - `_BranchWorker` (`erd_swarm.py`) — one per OS process. Claims one chunk at a time,
   evaluates candidates in that slice, writes sub-branch results to `wordle_cache.sqlite3`,
   and updates chunk state in `erd_queue.sqlite3`.
-- `ErdQueue` (`erd_queue.py`) — single writer to `erd_queue.sqlite3`. Used by workers to
+- `ERDQueue` (`erd_queue.py`) — single writer to `erd_queue.sqlite3`. Used by workers to
   claim chunks, record heartbeats, mark chunks done, and promote large sub-branches to the queue.
 
 ### Branch lifecycle

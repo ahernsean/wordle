@@ -56,7 +56,7 @@ def mock_width(w):
     return _MockWidth(w)
 
 
-class TestErdHelpers(unittest.TestCase):
+class TestERDHelpers(unittest.TestCase):
     def setUp(self):
         self.sc = MemoryScoreCache()
         self.sc.set_scope("s")
@@ -117,7 +117,7 @@ class TestCmdGuessMultiBoard(CliTestCase):
         self.assertIn("Invalid", out)
 
 
-class TestCmdSolveErdReady(CliTestCase):
+class TestCmdSolveERDReady(CliTestCase):
     def _build_erd_root(self):
         s = self.soln()
         s.apply_guess("piano", wordle.parse_response("00g00"))

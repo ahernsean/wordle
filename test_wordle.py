@@ -1963,7 +1963,7 @@ class _MultiPartitionCache:
         return self._partitions[word]
 
 
-class TestVerifyErdCache(unittest.TestCase):
+class TestVerifyERDCache(unittest.TestCase):
     """verify_erd_cache reconstructs 1 + sum (k_i/n)*sub_score from a cached
     entry's own subtree and compares it to the entry's stored best_score —
     without recomputing anything via min_expected_guesses."""
