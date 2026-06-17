@@ -423,7 +423,8 @@ class ERDQueue:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def chunk_size_for(n_words, n_candidates, divisor=3, max_chunks=256) -> int:
+    def chunk_size_for(n_words, n_candidates,
+                       min_words_per_chunk=3, max_chunk_count=256) -> int:
         """Candidates-per-chunk for a branch, from its difficulty (n_words).
 
         Candidates are ranked best-first, so the early chunks hold the
@@ -431,9 +432,17 @@ class ERDQueue:
         the shared bound).  Easy branches (few words) become a single chunk so
         one worker disposes of them without coordination overhead; hard
         branches are cut into many chunks so the expensive head spreads across
-        workers.  n_chunks = clamp(ceil(n_words/divisor), 1, max_chunks).
+        workers.
+
+        n_chunks = clamp(ceil(n_words / min_words_per_chunk), 1, max_chunk_count)
+        chunk_size = ceil(n_candidates / n_chunks)
+
+        min_words_per_chunk controls granularity: lower values produce more
+        chunks and more worker sharing on hard branches.  max_chunk_count caps
+        the total chunk count regardless of branch size.  When both are
+        supplied and conflict, max_chunk_count wins (chunks become larger).
         """
-        n_chunks = max(1, min(max_chunks, -(-n_words // divisor)))
+        n_chunks = max(1, min(max_chunk_count, -(-n_words // min_words_per_chunk)))
         return -(-n_candidates // n_chunks)
 
     @staticmethod

@@ -168,18 +168,17 @@ def cmd_run(args):
               f'{nb} in-progress branches / {nc} chunk claims cleared.')
 
     bootstrap_status = queue.get_meta('bootstrap_status')
-    if bootstrap_status != 'done' and not args.allow_partial_queue:
-        print('Error: bootstrap not marked complete.  '
-              'Run bootstrap first, or pass --allow-partial-queue to proceed anyway.',
+    if not counts.get('pending') and not counts.get('in_progress'):
+        print('Warning: queue appears empty.  '
+              'Run queue-add to load branches before starting workers.',
               file=sys.stderr)
-        queue.close()
-        sys.exit(1)
     queue.close()
 
     _setup_supervisor_logging()
-    logger.info('Supervisor starting: %d workers, divisor=%d, max_chunks=%d, '
-                'recycle_hours=%.1f', args.workers, args.divisor,
-                args.max_chunks, args.recycle_hours)
+    logger.info('Supervisor starting: %d workers, min_words_per_chunk=%d, '
+                'max_chunk_count=%d, recycle_hours=%.1f',
+                args.workers, args.min_words_per_chunk,
+                args.max_chunk_count, args.recycle_hours)
 
     stop_event = multiprocessing.Event()
 
@@ -224,7 +223,7 @@ def cmd_run(args):
         # Backstop: free chunks held by any worker that died WITHOUT being
         # reaped above (e.g. it crashed and we haven't noticed yet).  Gated on
         # heartbeat liveness, so a slow-but-alive worker is never reclaimed.
-        freed = q.reclaim_stale_chunks(args.stale_chunk_seconds)
+        freed = q.reclaim_stale_chunks(args.worker_timeout_seconds)
         if freed:
             logger.info('Reclaimed %d stale chunk claim(s).', freed)
         counts = q.counts_by_status()
@@ -272,7 +271,7 @@ def _spawn_worker(worker_id: int, args, stop_event):
     p = multiprocessing.Process(
         target=erd_swarm.swarm_worker,
         args=(worker_id, args.cache, args.queue, stop_event,
-              args.divisor, args.max_chunks),
+              args.min_words_per_chunk, args.max_chunk_count),
         daemon=False,
         name=f'erd-worker-{worker_id}',
     )
@@ -641,7 +640,8 @@ def cmd_solve_branch(args):
     result = run_branch_solve(
         branch_key, branch, n_workers=args.workers,
         cache_path=args.cache, queue_path=args.queue,
-        divisor=args.divisor, max_chunks=args.max_chunks,
+        min_words_per_chunk=args.min_words_per_chunk,
+        max_chunk_count=args.max_chunk_count,
         priority=args.priority, source_word=word, source_pattern=code)
 
     stop.set()
@@ -699,24 +699,28 @@ def main():
                        help='Number of swarm worker processes (default: 6)')
     p_run.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_run.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_run.add_argument('--divisor', type=int, default=3, metavar='D',
-                       help='Chunk-count divisor: a branch is cut into about '
-                            'n_words/D chunks (default: 3). Lower = finer '
-                            'chunks / more sharing on hard branches.')
-    p_run.add_argument('--max-chunks', type=int, default=256, metavar='N',
-                       help='Cap on chunks per branch (default: 256)')
+    p_run.add_argument('--min-words-per-chunk', type=int, default=3, metavar='N',
+                       help='Minimum answer-word count per chunk of work: '
+                            'a branch is split into ceil(n_words/N) chunks '
+                            '(default: 3).  Lower = more chunks = more '
+                            'worker sharing on hard branches.')
+    p_run.add_argument('--max-chunk-count', type=int, default=256, metavar='N',
+                       help='Cap on the number of chunks per branch (default: 256). '
+                            'When --min-words-per-chunk would produce more chunks '
+                            'than this cap, the cap wins and chunks become larger.')
     p_run.add_argument('--recycle-hours', type=float, default=3.0,
                        metavar='H',
-                       help='Respawn each worker after H hours wall time, to '
-                            'bound ScoreCache memory growth (default: 3)')
-    p_run.add_argument('--stale-chunk-seconds', type=int, default=600,
+                       help='Respawn each worker after H hours wall time '
+                            '(default: 3).  Bounds per-worker ScoreCache '
+                            'memory growth while in-progress work is preserved '
+                            'in the queue and resumed by the fresh worker.')
+    p_run.add_argument('--worker-timeout-seconds', type=int, default=30,
                        metavar='S',
-                       help='Backstop: reclaim a chunk whose worker has not '
-                            'heartbeat within S seconds (presumed crashed; '
-                            'live workers heartbeat every ~2s, so they are '
-                            'never reclaimed; default: 600)')
-    p_run.add_argument('--allow-partial-queue', action='store_true',
-                       help='Start workers even if bootstrap is not complete')
+                       help='Declare a worker dead and reclaim its chunk '
+                            'claims after S seconds of missed heartbeats '
+                            '(default: 30).  Live workers heartbeat every '
+                            '~2s regardless of how long a single candidate '
+                            'takes, so only a crashed process triggers this.')
 
     # -- status --
     p_stat = sub.add_parser('status', help='Show progress snapshot')
@@ -738,10 +742,11 @@ def main():
                            "all-gray, or --pattern=-y-g-)")
     p_sb.add_argument('--workers', type=int, default=6, metavar='N',
                       help='Worker processes to swarm the branch (default: 6)')
-    p_sb.add_argument('--divisor', type=int, default=3, metavar='D',
-                      help='Chunk-count divisor: ~n_words/D chunks (default: 3)')
-    p_sb.add_argument('--max-chunks', type=int, default=256, metavar='N',
-                      help='Cap on chunks for the branch (default: 256)')
+    p_sb.add_argument('--min-words-per-chunk', type=int, default=3, metavar='N',
+                      help='Minimum answer-word count per chunk (default: 3); '
+                           'see `run --min-words-per-chunk`')
+    p_sb.add_argument('--max-chunk-count', type=int, default=256, metavar='N',
+                      help='Cap on number of chunks for the branch (default: 256)')
     p_sb.add_argument('--priority', type=int, default=1, metavar='P',
                       help='Priority recorded on the branch (default: 1)')
     p_sb.add_argument('--force', action='store_true',

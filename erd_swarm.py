@@ -45,10 +45,13 @@ WORDS_FILE = 'wordle.txt'
 BEST_REFRESH_SECONDS = 0.25   # how often a worker re-reads the shared bound
 HB_SECONDS = 2.0              # liveness heartbeat cadence during a long chunk
 # A worker that hasn't heartbeat within this many seconds is presumed dead, and
-# only then are its in-flight chunks reclaimed.  Must be many multiples of
-# HB_SECONDS so a live-but-busy worker is never mistaken for dead (which would
-# let its slice be redone and finalized before it folds in a better candidate).
-HB_TIMEOUT_SECONDS = 120
+# only then are its in-flight chunk claims reclaimed.  Live workers heartbeat
+# every HB_SECONDS regardless of how long a single candidate takes (the
+# heartbeat fires on every recursive sub-branch call, not just between
+# candidates), so a slow-but-alive worker is never reclaimed — only a crashed
+# or OOM-killed process whose heartbeat truly stops.  30s = 15 missed
+# heartbeats, which is conservative enough for any real process death.
+HB_TIMEOUT_SECONDS = 30
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
@@ -74,11 +77,11 @@ class _BranchWorker:
     """One worker process's state and operations on branches/chunks."""
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
-                 divisor, max_chunks, budget=ROOT_BUDGET):
+                 min_words_per_chunk, max_chunk_count, budget=ROOT_BUDGET):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
-        self.divisor = divisor
-        self.max_chunks = max_chunks
+        self.min_words_per_chunk = min_words_per_chunk
+        self.max_chunk_count = max_chunk_count
         self.budget = budget
 
         self.all_answers = load_word_list(ANSWER_FILE)
@@ -380,7 +383,7 @@ class _BranchWorker:
 
         n_words = len(words)
         chunk_size = ERDQueue.chunk_size_for(
-            n_words, self.n_candidates, self.divisor, self.max_chunks)
+            n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
         self.queue.create_branch(
             branch_key, n_words, self.n_candidates, chunk_size,
             priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
@@ -444,7 +447,7 @@ class _BranchWorker:
             return None
         n_words = claimed['n_words']
         chunk_size = ERDQueue.chunk_size_for(
-            n_words, self.n_candidates, self.divisor, self.max_chunks)
+            n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
         self.queue.create_branch(
             claimed['branch_key'], n_words, self.n_candidates, chunk_size,
             priority=claimed['priority'], source_word=claimed['source_word'],
@@ -542,14 +545,14 @@ class _BranchWorker:
 
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,
-                 divisor=3, max_chunks=256):
+                 min_words_per_chunk=3, max_chunk_count=256):
     """Process entry point for a swarm worker (target= for mp.Process)."""
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     _setup_logging(worker_id)
     logger.info('worker-%d starting (pid=%d)', worker_id, os.getpid())
     w = _BranchWorker(worker_id, cache_path, queue_path, stop_event,
-                      divisor, max_chunks)
+                      min_words_per_chunk, max_chunk_count)
     try:
         w.run()
     finally:
@@ -576,11 +579,11 @@ def _setup_logging(worker_id):
 # ---------------------------------------------------------------------------
 
 def _focused_worker(branch_key, worker_id, cache_path, queue_path,
-                    divisor, max_chunks):
+                    min_words_per_chunk, max_chunk_count):
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     w = _BranchWorker(worker_id, cache_path, queue_path, None,
-                      divisor, max_chunks)
+                      min_words_per_chunk, max_chunk_count)
     try:
         w.solve_branch_focused(branch_key)
     finally:
@@ -588,7 +591,7 @@ def _focused_worker(branch_key, worker_id, cache_path, queue_path,
 
 
 def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
-                     divisor=3, max_chunks=256, priority=1,
+                     min_words_per_chunk=3, max_chunk_count=256, priority=1,
                      source_word=None, source_pattern=None, budget=ROOT_BUDGET,
                      timeout=None):
     """Solve one branch by swarming N workers across its candidates.
@@ -612,7 +615,7 @@ def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
         return existing
 
     chunk_size = ERDQueue.chunk_size_for(
-        len(words), len(all_words), divisor, max_chunks)
+        len(words), len(all_words), min_words_per_chunk, max_chunk_count)
     n_chunks = ERDQueue.n_chunks_for(len(all_words), chunk_size)
     actual_workers = min(n_workers, n_chunks)
     queue.create_branch(branch_key, len(words), len(all_words), chunk_size,
@@ -623,7 +626,7 @@ def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
 
     procs = [mp.Process(target=_focused_worker,
                         args=(branch_key, w, cache_path, queue_path,
-                              divisor, max_chunks))
+                              min_words_per_chunk, max_chunk_count))
              for w in range(actual_workers)]
     for p in procs:
         p.start()
