@@ -6,12 +6,12 @@ Usage
   python3.13 merge_cache.py <source_db> [--target PATH] [--dry-run]
 
 Adds rows from <source_db> not already present in --target across all four
-cache tables.  Three of them (universe, response_decomposition, word_scores)
+cache tables.  Three of them (answer_list, response_decomposition, candidate_scores)
 are deterministic given the same answer-word universe — matching keys imply
 identical values — so INSERT OR IGNORE is exact.
 
-subgroup_best_by_policy is the exception: its primary key
-(subset_key, policy, universe_id) does NOT include solve_budget, so two caches
+branch_best_by_policy is the exception: its primary key
+(branch_key, policy, answer_list_id) does NOT include solve_budget, so two caches
 can legitimately hold DIFFERENT entries for the same key — e.g. one solved
 unconstrained (solve_budget NULL, reusable at any budget) and one solved under
 a depth cap (solve_budget set, reusable only at that budget).  The unconstrained
@@ -34,23 +34,23 @@ import time
 BATCH = 20000   # rows per progress step / commit
 
 TABLES = [
-    'universe',
+    'answer_list',
     'response_decomposition',
-    'subgroup_best_by_policy',
-    'word_scores',
+    'branch_best_by_policy',
+    'candidate_scores',
 ]
 
 DEFAULT_TARGET = 'wordle_cache.sqlite3'
 
-# Columns the untainted-preference UPSERT for subgroup_best_by_policy needs.
-_ERD_UPSERT_COLS = {'subset_key', 'policy', 'universe_id', 'solve_budget',
-                    'best_word', 'best_score', 'updated_at', 'max_depth'}
+# Columns the untainted-preference UPSERT for branch_best_by_policy needs.
+_ERD_UPSERT_COLS = {'branch_key', 'policy', 'answer_list_id', 'solve_budget',
+                    'best_guess', 'best_score', 'updated_at', 'max_depth'}
 
 
 def _insert_sql(table: str, cols: list[str]) -> str:
     """INSERT statement for a merge batch.
 
-    For subgroup_best_by_policy, a key collision can pit a tainted entry against
+    For branch_best_by_policy, a key collision can pit a tainted entry against
     an untainted one (the PK omits solve_budget); the untainted entry is
     strictly more reusable, so an incoming untainted row replaces an existing
     tainted one.  Every other table — and any conflict that isn't
@@ -58,11 +58,11 @@ def _insert_sql(table: str, cols: list[str]) -> str:
     """
     col_list = ', '.join(cols)
     placeholders = ', '.join('?' * len(cols))
-    if table == 'subgroup_best_by_policy' and _ERD_UPSERT_COLS <= set(cols):
+    if table == 'branch_best_by_policy' and _ERD_UPSERT_COLS <= set(cols):
         return f"""
             INSERT INTO main.{table} ({col_list}) VALUES ({placeholders})
-            ON CONFLICT(subset_key, policy, universe_id) DO UPDATE SET
-                best_word    = excluded.best_word,
+            ON CONFLICT(branch_key, policy, answer_list_id) DO UPDATE SET
+                best_guess   = excluded.best_guess,
                 best_score   = excluded.best_score,
                 updated_at   = excluded.updated_at,
                 max_depth    = excluded.max_depth,
@@ -186,14 +186,14 @@ def main():
                 msg = f'  {table}: {n:,} rows would be inserted'
                 # Account for the tainted->untainted upgrades INSERT OR IGNORE
                 # would silently miss (and the real merge now performs).
-                if (table == 'subgroup_best_by_policy'
+                if (table == 'branch_best_by_policy'
                         and 'solve_budget' in _all_cols(conn, table)):
                     up = conn.execute(f"""
                         SELECT COUNT(*) FROM src.{table} s
                         JOIN main.{table} m
-                          ON m.subset_key  = s.subset_key
-                         AND m.policy      = s.policy
-                         AND m.universe_id = s.universe_id
+                          ON m.branch_key     = s.branch_key
+                         AND m.policy         = s.policy
+                         AND m.answer_list_id = s.answer_list_id
                         WHERE m.solve_budget IS NOT NULL
                           AND s.solve_budget IS NULL
                     """).fetchone()[0]

@@ -18,8 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
     calculate_response, score_groups, _encode_response, _ALL_GREEN_PATTERN,
-    _perform_restriction, rank_guesses_by_group_then_entropy,
-    evaluate_guess, _solve_subset, min_expected_guesses, verify_erd_cache,
+    _perform_restriction, rank_candidates_by_max_group_size_then_entropy_gain,
+    evaluate_candidate, _solve_subset, min_expected_guesses, verify_erd_cache,
     cache_all_scores, ERD_ANSWERS,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache, _is_disk_io_error
@@ -282,7 +282,7 @@ class TestRankGuessesPartialMethodCache(unittest.TestCase):
         the `m not in cached` guard is False for the cached method)."""
         cache, sc = make_cache(self.db)
         words = ["crane", "slate", "trace"]
-        subset_key = ScoreCache.encode_subset(words)
+        branch_key = ScoreCache.encode_subset(words)
 
         # Pre-seed ONLY MAX_GROUP_SIZE for "crane"; ENTROPY_GAIN missing.
         from wordle_engine import score_word_multi
@@ -291,16 +291,16 @@ class TestRankGuessesPartialMethodCache(unittest.TestCase):
             [ScoringMethod.MAX_GROUP_SIZE, ScoringMethod.ENTROPY_GAIN],
             cache=cache)
         sc.write_scores(
-            subset_key,
+            branch_key,
             [("crane", scores[ScoringMethod.MAX_GROUP_SIZE])],
             ScoringMethod.MAX_GROUP_SIZE.name.lower())
 
-        ranked = rank_guesses_by_group_then_entropy(
+        ranked = rank_candidates_by_max_group_size_then_entropy_gain(
             words, ["crane"], cache, sc)
         self.assertEqual(ranked, ["crane"])
         # ENTROPY_GAIN (the previously-missing method) was now written.
         eg = dict(sc.read_scores(
-            subset_key, ScoringMethod.ENTROPY_GAIN.name.lower()))
+            branch_key, ScoringMethod.ENTROPY_GAIN.name.lower()))
         self.assertIn("crane", eg)
 
 
@@ -345,13 +345,13 @@ class TestSolutionFallback(unittest.TestCase):
 
 
 class TestEvaluateGuessBranches(unittest.TestCase):
-    """Branches inside evaluate_guess / _solve_subset."""
+    """Branches inside evaluate_candidate / _solve_subset."""
 
     def test_evaluate_guess_n_none_and_no_cache(self):
         """n=None is derived from remaining (948) and cache=None walks the
         manual decomposition loop (957-960)."""
         remaining = ["crane", "slate", "trace", "stale"]
-        status, cost, md, floor = evaluate_guess(
+        status, cost, md, floor = evaluate_candidate(
             remaining, "crane", None, None,
             n=None, best_erd=float('inf'),
             guesses=remaining, policy=ERD_ANSWERS, budget=None)
@@ -361,9 +361,9 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         """cache=None path produces the same partition as the cache path."""
         remaining = ["crane", "slate", "trace", "stale", "tales"]
         cache, _ = make_cache(None)
-        s1 = evaluate_guess(remaining, "crane", cache, None,
+        s1 = evaluate_candidate(remaining, "crane", cache, None,
                             guesses=remaining, policy=ERD_ANSWERS)
-        s2 = evaluate_guess(remaining, "crane", None, None,
+        s2 = evaluate_candidate(remaining, "crane", None, None,
                             guesses=remaining, policy=ERD_ANSWERS)
         self.assertEqual(s1[0], s2[0])
         if s1[1] is not None and s2[1] is not None:
@@ -393,9 +393,9 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         self.assertFalse(cutoff)
 
     def test_solve_subset_subgroup_cutoff(self):
-        """A tight ceiling forces a subgroup-level cutoff so evaluate_guess
+        """A tight ceiling forces a subgroup-level cutoff so evaluate_candidate
         returns ('cutoff', ...) from the sub_cutoff branch (1015), and
-        _solve_subset reports cutoff with best_word None (1148)."""
+        _solve_subset reports cutoff with best_guess None (1148)."""
         remaining = ["crane", "slate", "trace", "stale", "tales",
                      "least", "heart", "earth"]
         cache, _ = make_cache(None)

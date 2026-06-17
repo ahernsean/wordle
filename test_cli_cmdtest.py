@@ -24,7 +24,7 @@ class TestCmdTestSingle(CliTestCase):
         self.assertIn("words", out)
         # Score lines and group/subgroup display are produced.
         self.assertIn("Groups:", out)
-        self.assertIn("Subgroup sizes:", out)
+        self.assertIn("Response group sizes:", out)
 
     def test_single_word_multistep_lookahead(self):
         # n = 10 (> 2) so the multi-step lookahead block runs.
@@ -68,7 +68,7 @@ class TestCmdTestCompare(CliTestCase):
         self.assertIn("Computing", out)
         self.assertIn("Entropy 1", out)
         self.assertIn("Wt avg", out)
-        self.assertIn("Max grp", out)
+        self.assertIn("Max group size", out)
         self.assertIn("Solve%", out)
         # n == 2 path: the "+ ent. 2/3"/"Total ent" rows are gated on n > 2,
         # which holds here (n = 10), so they should appear.

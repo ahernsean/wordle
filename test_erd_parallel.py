@@ -43,7 +43,7 @@ class TestParallelSwarmSolve(unittest.TestCase):
         p2 = mock.patch.object(erd_swarm, "WORDS_FILE", self.words_file)
         p1.start(); p2.start()
         self.addCleanup(p1.stop); self.addCleanup(p2.stop)
-        self.subset_key = encode_subset(BRANCH)
+        self.branch_key = encode_subset(BRANCH)
 
     def _path(self, name, words):
         p = os.path.join(self._tmp.name, name)
@@ -57,7 +57,7 @@ class TestParallelSwarmSolve(unittest.TestCase):
 
     def _swarm_solve(self, tag, n_workers):
         """Register the branch and run n_workers cooperating threads; return
-        the finalized (best_word, best_erd) the swarm wrote to the cache."""
+        the finalized (best_guess, best_erd) the swarm wrote to the cache."""
         cache_path, queue_path = self._fresh_db(tag)
         # Apply schema migrations once before the worker threads open the cache
         # concurrently (production always has a single pre-open first).
@@ -65,7 +65,7 @@ class TestParallelSwarmSolve(unittest.TestCase):
         chunk_size = ErdQueue.chunk_size_for(
             len(BRANCH), len(CANDIDATES), DIVISOR, MAX_CHUNKS)
         q = ErdQueue(queue_path)
-        q.create_branch(self.subset_key, len(BRANCH), len(CANDIDATES),
+        q.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
                         chunk_size, budget=ROOT_BUDGET)
         n_chunks = ErdQueue.n_chunks_for(len(CANDIDATES), chunk_size)
         q.close()
@@ -75,7 +75,7 @@ class TestParallelSwarmSolve(unittest.TestCase):
             w = _BranchWorker(wid, cache_path, queue_path, None,
                               DIVISOR, MAX_CHUNKS)
             try:
-                w.solve_branch_focused(self.subset_key)
+                w.solve_branch_focused(self.branch_key)
             finally:
                 w.close()
 
@@ -89,12 +89,12 @@ class TestParallelSwarmSolve(unittest.TestCase):
 
         # The branch must have finalized (its coordination rows are deleted).
         q = ErdQueue(queue_path)
-        self.assertIsNone(q.get_branch(self.subset_key),
+        self.assertIsNone(q.get_branch(self.branch_key),
                           "branch was not finalized")
         q.close()
 
         sc = ScoreCache(cache_path, BRANCH, checkpoint_on_close=False)
-        result = sc.read(self.subset_key, ERD_ALL)
+        result = sc.read(self.branch_key, ERD_ALL)
         sc.close()
         self.assertIsNotNone(result, "no ERD written to the cache")
         return result

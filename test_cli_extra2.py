@@ -140,7 +140,7 @@ class TestCmdGuessEndStates(CliTestCase):
 class TestCmdTestDisplayBranches(CliTestCase):
     def test_buckets_via_piano(self):
         out = self.run_cmd(lambda gs: cmd_test(gs, "piano"))
-        self.assertIn("Subgroup sizes", out)
+        self.assertIn("Response group sizes", out)
 
     def test_compare_three_words(self):
         out = self.run_cmd(lambda gs: cmd_test(gs, "crane slate heart"))

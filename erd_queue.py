@@ -55,7 +55,7 @@ PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS pending_subgroups (
-    subset_key     BLOB    NOT NULL,
+    branch_key     BLOB    NOT NULL,
     n_words        INTEGER NOT NULL,
     priority       INTEGER NOT NULL DEFAULT 0,
     source_word    TEXT,
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS pending_subgroups (
     claimed_by     TEXT,
     claimed_at     INTEGER,
     completed_at   INTEGER,
-    PRIMARY KEY (subset_key)
+    PRIMARY KEY (branch_key)
 );
 
 -- priority DESC first so VIP (priority=1) subgroups drain before priority=0,
@@ -81,7 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_status_pri_n
 CREATE TABLE IF NOT EXISTS worker_heartbeat (
     worker_id          TEXT    PRIMARY KEY,
     pid                INTEGER NOT NULL,
-    current_subset_key BLOB,        -- branch key this worker is contributing to
+    current_branch_key BLOB,        -- branch key this worker is contributing to
     n_words            INTEGER,
     started_at         INTEGER,
     updated_at         INTEGER NOT NULL,
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     cache_misses       INTEGER,
     n_pruned           INTEGER,     -- candidates eliminated by the shared bound
     n_ok               INTEGER,     -- candidates fully evaluated
-    best_word          TEXT,
+    best_guess          TEXT,
     best_erd           REAL,
     cur_candidate      TEXT,        -- candidate word currently under evaluation
     cand_n_seen        INTEGER,     -- candidates evaluated so far in this chunk
@@ -116,11 +116,11 @@ CREATE TABLE IF NOT EXISTS run_meta (
 -- as a branch-and-bound bound.  status open -> finalized exactly once, by the
 -- worker that observes full chunk coverage; that worker writes the branch's
 -- ERD entry to the persistent cache, then the row (and its chunks) is deleted.
--- Candidate order is NOT stored: rank_guesses_by_group_then_entropy is
+-- Candidate order is NOT stored: rank_candidates_by_max_group_size_then_entropy_gain is
 -- deterministic, so every worker re-ranks locally and agrees on which
--- candidates chunk i covers, sharing the work through the word_scores cache.
+-- candidates chunk i covers, sharing the work through the candidate_scores cache.
 CREATE TABLE IF NOT EXISTS active_branches (
-    subset_key     BLOB    PRIMARY KEY,
+    branch_key     BLOB    PRIMARY KEY,
     n_words        INTEGER NOT NULL,
     n_candidates   INTEGER NOT NULL,
     chunk_size     INTEGER NOT NULL,
@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS active_branches (
     source_word    TEXT,
     source_pattern INTEGER,
     best_erd       REAL,
-    best_word      TEXT,
+    best_guess      TEXT,
     status         TEXT    NOT NULL DEFAULT 'open',
     created_at     INTEGER,
     finalized_at   INTEGER
@@ -144,13 +144,13 @@ CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
 -- that stale-reclaim deletes, turning the slice back into an unclaimed gap to
 -- be redone — never skipped.
 CREATE TABLE IF NOT EXISTS branch_chunks (
-    subset_key BLOB    NOT NULL,
+    branch_key BLOB    NOT NULL,
     idx        INTEGER NOT NULL,
     claimed_by TEXT,
     claimed_at INTEGER,
     done       INTEGER NOT NULL DEFAULT 0,
     done_at    INTEGER,
-    PRIMARY KEY (subset_key, idx)
+    PRIMARY KEY (branch_key, idx)
 );
 """
 
@@ -185,7 +185,7 @@ class ErdQueue:
                           ('cache_misses',     'INTEGER'),
                           ('n_pruned',         'INTEGER'),
                           ('n_ok',             'INTEGER'),
-                          ('best_word',        'TEXT'),
+                          ('best_guess',        'TEXT'),
                           ('best_erd',         'REAL'),
                           ('cur_candidate',    'TEXT'),
                           ('cand_n_seen',      'INTEGER'),
@@ -210,6 +210,37 @@ class ErdQueue:
                 self._conn.execute(
                     f'ALTER TABLE active_branches ADD COLUMN {col} {defn}')
 
+        # Rename subset_key -> branch_key in pending_subgroups, active_branches,
+        # branch_chunks; current_subset_key -> current_branch_key in worker_heartbeat;
+        # best_word -> best_guess in worker_heartbeat and active_branches.
+        existing_ps = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(pending_subgroups)')}
+        if 'subset_key' in existing_ps:
+            self._conn.execute(
+                'ALTER TABLE pending_subgroups RENAME COLUMN subset_key TO branch_key')
+        existing_ab = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(active_branches)')}
+        if 'subset_key' in existing_ab:
+            self._conn.execute(
+                'ALTER TABLE active_branches RENAME COLUMN subset_key TO branch_key')
+        if 'best_word' in existing_ab:
+            self._conn.execute(
+                'ALTER TABLE active_branches RENAME COLUMN best_word TO best_guess')
+        existing_bc = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(branch_chunks)')}
+        if 'subset_key' in existing_bc:
+            self._conn.execute(
+                'ALTER TABLE branch_chunks RENAME COLUMN subset_key TO branch_key')
+        existing_hb = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
+        if 'current_subset_key' in existing_hb:
+            self._conn.execute(
+                'ALTER TABLE worker_heartbeat '
+                'RENAME COLUMN current_subset_key TO current_branch_key')
+        if 'best_word' in existing_hb:
+            self._conn.execute(
+                'ALTER TABLE worker_heartbeat RENAME COLUMN best_word TO best_guess')
+
     def close(self):
         self._conn.close()
 
@@ -218,7 +249,7 @@ class ErdQueue:
     # ------------------------------------------------------------------
 
     def add_pending_many(self, rows):
-        """Insert (subset_key, n_words, priority, source_word, source_pattern) rows.
+        """Insert (branch_key, n_words, priority, source_word, source_pattern) rows.
 
         Uses an UPSERT so that:
         - A row inserted for the first time is added as 'pending'.
@@ -233,9 +264,9 @@ class ErdQueue:
         try:
             self._conn.executemany("""
                 INSERT INTO pending_subgroups
-                    (subset_key, n_words, priority, source_word, source_pattern, status)
+                    (branch_key, n_words, priority, source_word, source_pattern, status)
                 VALUES (?, ?, ?, ?, ?, 'pending')
-                ON CONFLICT(subset_key) DO UPDATE SET
+                ON CONFLICT(branch_key) DO UPDATE SET
                     priority       = MAX(priority, excluded.priority),
                     source_word    = COALESCE(source_word, excluded.source_word),
                     source_pattern = COALESCE(source_pattern, excluded.source_pattern)
@@ -252,7 +283,7 @@ class ErdQueue:
     def claim_next(self, worker_id: str):
         """Atomically claim the highest-priority / largest pending branch.
 
-        Returns a dict {subset_key, n_words, priority, source_word,
+        Returns a dict {branch_key, n_words, priority, source_word,
         source_pattern} or None if the queue is empty.  In the swarm model the
         claiming worker uses this to PROMOTE a queued branch into an
         active_branches row that other workers can then join; the branch's
@@ -266,7 +297,7 @@ class ErdQueue:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute("""
-                SELECT subset_key, n_words, priority, source_word, source_pattern
+                SELECT branch_key, n_words, priority, source_word, source_pattern
                 FROM pending_subgroups
                 WHERE status = 'pending'
                 ORDER BY priority DESC, n_words DESC
@@ -279,11 +310,11 @@ class ErdQueue:
             self._conn.execute("""
                 UPDATE pending_subgroups
                 SET status = 'in_progress', claimed_by = ?, claimed_at = ?
-                WHERE subset_key = ?
-            """, (worker_id, now, row["subset_key"]))
+                WHERE branch_key = ?
+            """, (worker_id, now, row["branch_key"]))
             self._conn.execute("COMMIT")
             return {
-                'subset_key': bytes(row["subset_key"]),
+                'branch_key': bytes(row["branch_key"]),
                 'n_words': row["n_words"],
                 'priority': row["priority"],
                 'source_word': row["source_word"],
@@ -293,13 +324,13 @@ class ErdQueue:
             self._conn.execute("ROLLBACK")
             raise
 
-    def mark_done(self, subset_key: bytes):
+    def mark_done(self, branch_key: bytes):
         now = int(time.time())
         self._conn.execute("""
             UPDATE pending_subgroups
             SET status = 'done', completed_at = ?
-            WHERE subset_key = ?
-        """, (now, subset_key))
+            WHERE branch_key = ?
+        """, (now, branch_key))
 
     def reset_stale_in_progress(self) -> int:
         """Reset any 'in_progress' rows back to 'pending'.
@@ -319,26 +350,26 @@ class ErdQueue:
     # ------------------------------------------------------------------
 
     def heartbeat(self, worker_id: str, pid: int,
-                  current_subset_key, n_words, started_at: int,
+                  current_branch_key, n_words, started_at: int,
                   chunks_done: int, chunk_idx=None, chunk_started_at=None,
                   cand_rate=None, cache_hits=None, cache_misses=None,
-                  n_pruned=None, n_ok=None, best_word=None, best_erd=None,
+                  n_pruned=None, n_ok=None, best_guess=None, best_erd=None,
                   cur_candidate=None, cand_n_seen=None, cand_chunk_size=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
                   cur_path=None):
         now = int(time.time())
         self._conn.execute("""
             INSERT OR REPLACE INTO worker_heartbeat
-                (worker_id, pid, current_subset_key, n_words, started_at,
+                (worker_id, pid, current_branch_key, n_words, started_at,
                  updated_at, chunks_done, chunk_idx, chunk_started_at,
                  cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
-                 best_word, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+                 best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
                  cur_max_depth, cur_nodes, node_rate, cur_path)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (worker_id, pid, current_subset_key, n_words, started_at,
+        """, (worker_id, pid, current_branch_key, n_words, started_at,
               now, chunks_done, chunk_idx, chunk_started_at,
               cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
-              best_word, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+              best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
               cur_max_depth, cur_nodes, node_rate, cur_path))
 
     def clear_heartbeat(self, worker_id: str):
@@ -373,7 +404,7 @@ class ErdQueue:
                    b.source_pattern
             FROM worker_heartbeat h
             LEFT JOIN active_branches b
-                   ON h.current_subset_key = b.subset_key
+                   ON h.current_branch_key = b.branch_key
             ORDER BY h.worker_id
         """).fetchall()
 
@@ -405,7 +436,7 @@ class ErdQueue:
         hi = min(lo + chunk_size, n_candidates)
         return lo, hi
 
-    def create_branch(self, subset_key, n_words, n_candidates, chunk_size,
+    def create_branch(self, branch_key, n_words, n_candidates, chunk_size,
                       priority=0, source_word=None, source_pattern=None,
                       budget=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
@@ -418,19 +449,19 @@ class ErdQueue:
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
-                (subset_key, n_words, n_candidates, chunk_size,
+                (branch_key, n_words, n_candidates, chunk_size,
                  priority, source_word, source_pattern, status, created_at, budget)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-        """, (subset_key, n_words, n_candidates, chunk_size,
+        """, (branch_key, n_words, n_candidates, chunk_size,
               priority, source_word, source_pattern, now, budget))
         return cur.rowcount == 1
 
-    def get_branch(self, subset_key):
+    def get_branch(self, branch_key):
         return self._conn.execute(
-            "SELECT * FROM active_branches WHERE subset_key = ?",
-            (subset_key,)).fetchone()
+            "SELECT * FROM active_branches WHERE branch_key = ?",
+            (branch_key,)).fetchone()
 
-    def claim_chunk(self, subset_key, worker_id, n_chunks):
+    def claim_chunk(self, branch_key, worker_id, n_chunks):
         """Atomically claim the lowest-indexed chunk that has no row yet.
 
         A chunk with an existing row is either in-flight (done=0) or complete
@@ -447,14 +478,14 @@ class ErdQueue:
             # otherwise redo the whole branch from scratch.  Checked inside the
             # write transaction so it can't race the finalize+delete.
             br = self._conn.execute(
-                "SELECT status FROM active_branches WHERE subset_key = ?",
-                (subset_key,)).fetchone()
+                "SELECT status FROM active_branches WHERE branch_key = ?",
+                (branch_key,)).fetchone()
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
                 return None
             taken = {r["idx"] for r in self._conn.execute(
-                "SELECT idx FROM branch_chunks WHERE subset_key = ?",
-                (subset_key,))}
+                "SELECT idx FROM branch_chunks WHERE branch_key = ?",
+                (branch_key,))}
             idx = None
             for c in range(n_chunks):
                 if c not in taken:
@@ -466,71 +497,71 @@ class ErdQueue:
             now = int(time.time())
             self._conn.execute("""
                 INSERT INTO branch_chunks
-                    (subset_key, idx, claimed_by, claimed_at, done)
+                    (branch_key, idx, claimed_by, claimed_at, done)
                 VALUES (?, ?, ?, ?, 0)
-            """, (subset_key, idx, worker_id, now))
+            """, (branch_key, idx, worker_id, now))
             self._conn.execute("COMMIT")
             return idx
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
 
-    def complete_chunk(self, subset_key, idx):
+    def complete_chunk(self, branch_key, idx):
         """Mark a chunk authoritatively complete (done=1)."""
         now = int(time.time())
         self._conn.execute("""
             UPDATE branch_chunks SET done = 1, done_at = ?
-            WHERE subset_key = ? AND idx = ?
-        """, (now, subset_key, idx))
+            WHERE branch_key = ? AND idx = ?
+        """, (now, branch_key, idx))
 
-    def update_branch_best(self, subset_key, best_word, best_erd, max_depth=None):
+    def update_branch_best(self, branch_key, best_guess, best_erd, max_depth=None):
         """Lower the branch's running best (monotone — never raises it).
 
         max_depth is the winning candidate's worst-case line length; it is
         stored atomically with the best it belongs to, so best_max_depth always
-        describes the current best_word.
+        describes the current best_guess.
         """
         self._conn.execute("""
             UPDATE active_branches
-            SET best_erd = ?, best_word = ?, best_max_depth = ?
-            WHERE subset_key = ?
+            SET best_erd = ?, best_guess = ?, best_max_depth = ?
+            WHERE branch_key = ?
               AND (best_erd IS NULL OR ? < best_erd)
-        """, (best_erd, best_word, max_depth, subset_key, best_erd))
+        """, (best_erd, best_guess, max_depth, branch_key, best_erd))
 
-    def read_branch_best(self, subset_key):
-        """Return (best_word, best_erd) or (None, None)."""
+    def read_branch_best(self, branch_key):
+        """Return (best_guess, best_erd) or (None, None)."""
         row = self._conn.execute(
-            "SELECT best_word, best_erd FROM active_branches WHERE subset_key = ?",
-            (subset_key,)).fetchone()
+            "SELECT best_guess, best_erd FROM active_branches WHERE branch_key = ?",
+            (branch_key,)).fetchone()
         if row is None:
             return (None, None)
-        return (row["best_word"], row["best_erd"])
+        return (row["best_guess"], row["best_erd"])
 
-    def mark_branch_tainted(self, subset_key):
+    def mark_branch_tainted(self, branch_key):
         """Set the branch's taint flag (monotone OR): some candidate, in some
         worker, was excluded by the depth cap, so the branch's ERD is only
         valid at its solve budget."""
         self._conn.execute(
-            "UPDATE active_branches SET tainted = 1 WHERE subset_key = ?",
-            (subset_key,))
+            "UPDATE active_branches SET tainted = 1 WHERE branch_key = ?",
+            (branch_key,))
 
-    def read_branch_meta(self, subset_key):
-        """Return (best_word, best_erd, best_max_depth, tainted, budget) or
+    def read_branch_meta(self, branch_key):
+        """Return (best_guess, best_erd, best_max_depth, tainted, budget) or
         None — everything finalize needs to write a depth-limited cache entry."""
         row = self._conn.execute(
-            "SELECT best_word, best_erd, best_max_depth, tainted, budget "
-            "FROM active_branches WHERE subset_key = ?", (subset_key,)).fetchone()
+            "SELECT best_guess, best_erd, best_max_depth, tainted, budget "
+            "FROM active_branches WHERE branch_key = ?", (branch_key,)).fetchone()
         if row is None:
             return None
-        return (row["best_word"], row["best_erd"], row["best_max_depth"],
+        return (row["best_guess"], row["best_erd"], row["best_max_depth"],
                 bool(row["tainted"]), row["budget"])
 
-    def branch_done_chunks(self, subset_key) -> int:
+    def branch_done_chunks(self, branch_key) -> int:
         return self._conn.execute(
-            "SELECT COUNT(*) FROM branch_chunks WHERE subset_key = ? AND done = 1",
-            (subset_key,)).fetchone()[0]
+            "SELECT COUNT(*) FROM branch_chunks WHERE branch_key = ? AND done = 1",
+            (branch_key,)).fetchone()[0]
 
-    def try_finalize_branch(self, subset_key) -> bool:
+    def try_finalize_branch(self, branch_key) -> bool:
         """Atomically transition a branch open -> finalized, exactly once.
 
         Returns True only for the single caller that wins the transition; that
@@ -541,16 +572,16 @@ class ErdQueue:
         now = int(time.time())
         cur = self._conn.execute("""
             UPDATE active_branches SET status = 'finalized', finalized_at = ?
-            WHERE subset_key = ? AND status = 'open'
-        """, (now, subset_key))
+            WHERE branch_key = ? AND status = 'open'
+        """, (now, branch_key))
         return cur.rowcount == 1
 
-    def delete_branch(self, subset_key):
+    def delete_branch(self, branch_key):
         """Remove a finished branch and its chunk rows to bound the queue DB."""
         self._conn.execute(
-            "DELETE FROM branch_chunks WHERE subset_key = ?", (subset_key,))
+            "DELETE FROM branch_chunks WHERE branch_key = ?", (branch_key,))
         self._conn.execute(
-            "DELETE FROM active_branches WHERE subset_key = ?", (subset_key,))
+            "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
 
     def reclaim_stale_chunks(self, heartbeat_timeout_seconds: int,
                              min_claim_age_seconds: int = None) -> int:
@@ -625,13 +656,13 @@ class ErdQueue:
         return nb, nc
 
     def worker_counts_by_branch(self) -> dict:
-        """{subset_key bytes: number of recent workers on it} for status."""
+        """{branch_key bytes: number of recent workers on it} for status."""
         cutoff = int(time.time()) - 120
         rows = self._conn.execute("""
-            SELECT current_subset_key AS k, COUNT(*) AS c
+            SELECT current_branch_key AS k, COUNT(*) AS c
             FROM worker_heartbeat
-            WHERE current_subset_key IS NOT NULL AND updated_at > ?
-            GROUP BY current_subset_key
+            WHERE current_branch_key IS NOT NULL AND updated_at > ?
+            GROUP BY current_branch_key
         """, (cutoff,)).fetchall()
         return {bytes(r["k"]): r["c"] for r in rows}
 

@@ -57,7 +57,7 @@ class _Base(unittest.TestCase):
                 self.answer_file if attr == "ANSWER_FILE" else self.words_file)
             p.start()
             self.addCleanup(p.stop)
-        self.subset_key = encode_subset(BRANCH)
+        self.branch_key = encode_subset(BRANCH)
 
     def _write(self, name, words):
         p = os.path.join(self._tmp.name, name)
@@ -73,7 +73,7 @@ class _Base(unittest.TestCase):
         chunk_size = ErdQueue.chunk_size_for(
             len(BRANCH), len(CANDIDATES), DIVISOR, MAX_CHUNKS)
         q = ErdQueue(queue_path)
-        q.create_branch(self.subset_key, len(BRANCH), len(CANDIDATES),
+        q.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
                         chunk_size, budget=ROOT_BUDGET)
         q.close()
         return ErdQueue.n_chunks_for(len(CANDIDATES), chunk_size)
@@ -89,7 +89,7 @@ class _Base(unittest.TestCase):
 
     def _read(self, cache_path):
         sc = ScoreCache(cache_path, BRANCH, checkpoint_on_close=False)
-        res = sc.read(self.subset_key, ERD_ALL)
+        res = sc.read(self.branch_key, ERD_ALL)
         sc.close()
         return res
 
@@ -110,7 +110,7 @@ class TestWorkDoesNotAmplify(_Base):
             w = _BranchWorker(wid, cache_path, queue_path, None,
                               DIVISOR, MAX_CHUNKS)
             try:
-                w.solve_branch_focused(self.subset_key)
+                w.solve_branch_focused(self.branch_key)
                 with lock:
                     evaluated.append(w.n_ok + w.n_pruned + w.n_useless)
             finally:
@@ -150,7 +150,7 @@ class TestProcessScalingSmoke(_Base):
         cache_path, queue_path = self._db(f"proc{n_workers}")
         t0 = time.time()
         result = run_branch_solve(
-            self.subset_key, BRANCH, n_workers=n_workers,
+            self.branch_key, BRANCH, n_workers=n_workers,
             cache_path=cache_path, queue_path=queue_path,
             divisor=DIVISOR, max_chunks=MAX_CHUNKS,
             source_word="crane", source_pattern=0,

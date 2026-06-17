@@ -40,7 +40,7 @@ class TestReclaimLiveness(_TmpDB, unittest.TestCase):
 
     def _insert_chunk(self, worker, claimed_at, done=0):
         self.q._conn.execute(
-            "INSERT INTO branch_chunks (subset_key, idx, claimed_by, claimed_at, done) "
+            "INSERT INTO branch_chunks (branch_key, idx, claimed_by, claimed_at, done) "
             "VALUES (?, 0, ?, ?, ?)", (self.key, worker, claimed_at, done))
 
     def _n_chunks(self):
@@ -51,7 +51,7 @@ class TestReclaimLiveness(_TmpDB, unittest.TestCase):
         now = int(time.time())
         self._insert_chunk("worker-1", claimed_at=now - 1000)  # an old claim
         # ...but the worker is alive: it heartbeat just now.
-        self.q.heartbeat("worker-1", pid=1, current_subset_key=self.key,
+        self.q.heartbeat("worker-1", pid=1, current_branch_key=self.key,
                          n_words=5, started_at=now, chunks_done=0)
         freed = self.q.reclaim_stale_chunks(heartbeat_timeout_seconds=120)
         self.assertEqual(freed, 0)
@@ -61,7 +61,7 @@ class TestReclaimLiveness(_TmpDB, unittest.TestCase):
         now = int(time.time())
         self._insert_chunk("worker-2", claimed_at=now - 1000)
         # Worker heartbeat is stale (>120s old) → presumed dead.
-        self.q.heartbeat("worker-2", pid=1, current_subset_key=self.key,
+        self.q.heartbeat("worker-2", pid=1, current_branch_key=self.key,
                          n_words=5, started_at=now, chunks_done=0)
         self.q._conn.execute(
             "UPDATE worker_heartbeat SET updated_at = ? WHERE worker_id = 'worker-2'",
@@ -87,7 +87,7 @@ class TestReclaimLiveness(_TmpDB, unittest.TestCase):
         now = int(time.time())
         self._insert_chunk("worker-5", claimed_at=now, done=0)
         self.q._conn.execute(
-            "INSERT INTO branch_chunks (subset_key, idx, claimed_by, claimed_at, done) "
+            "INSERT INTO branch_chunks (branch_key, idx, claimed_by, claimed_at, done) "
             "VALUES (?, 1, 'worker-5', ?, 1)", (self.key, now))  # done=1, keep
         freed = self.q.reclaim_chunks_of_worker("worker-5")
         self.assertEqual(freed, 1)  # only the done=0 row
@@ -106,11 +106,11 @@ class TestMergeUntaintedWins(_TmpDB, unittest.TestCase):
     def _merge(self, target, source):
         conn = sqlite3.connect(self.path(target), isolation_level=None)
         conn.execute(f"ATTACH DATABASE '{self.path(source)}' AS src")
-        cols = merge_cache._all_cols(conn, "subgroup_best_by_policy")
+        cols = merge_cache._all_cols(conn, "branch_best_by_policy")
         col_list = ", ".join(cols)
-        insert_sql = merge_cache._insert_sql("subgroup_best_by_policy", cols)
+        insert_sql = merge_cache._insert_sql("branch_best_by_policy", cols)
         rows = conn.execute(
-            f"SELECT {col_list} FROM src.subgroup_best_by_policy").fetchall()
+            f"SELECT {col_list} FROM src.branch_best_by_policy").fetchall()
         conn.executemany(insert_sql, rows)
         conn.execute("DETACH DATABASE src")
         conn.close()
@@ -137,23 +137,23 @@ class TestMergeUntaintedWins(_TmpDB, unittest.TestCase):
 class TestBackfillGuard(_TmpDB, unittest.TestCase):
     """The backfill UPDATE must no-op on any row a worker already filled in."""
 
-    UPDATE = ("UPDATE subgroup_best_by_policy SET max_depth=?, solve_budget=NULL "
-              "WHERE subset_key=? AND policy=? AND universe_id=? "
+    UPDATE = ("UPDATE branch_best_by_policy SET max_depth=?, solve_budget=NULL "
+              "WHERE branch_key=? AND policy=? AND answer_list_id=? "
               "AND max_depth IS NULL")
 
     def setUp(self):
         super().setUp()
         self.sc = ScoreCache(self.path("c.sqlite3"), WORDS)
         self.addCleanup(self.sc.close)
-        self.uid = self.sc.universe_id
+        self.uid = self.sc.answer_list_id
         self.key = ScoreCache.encode_subset(WORDS)
 
     def _db_row(self):
         # Read straight from the DB (not the in-memory mirror) so we observe
         # exactly what the UPDATE did.
         return self.sc._conn.execute(
-            "SELECT max_depth, solve_budget FROM subgroup_best_by_policy "
-            "WHERE subset_key=? AND policy=? AND universe_id=?",
+            "SELECT max_depth, solve_budget FROM branch_best_by_policy "
+            "WHERE branch_key=? AND policy=? AND answer_list_id=?",
             (self.key, ERD_ALL, self.uid)).fetchone()
 
     def test_guard_skips_row_with_known_depth(self):
