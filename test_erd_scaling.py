@@ -226,10 +226,11 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         self._wf = wf
 
     def _drain(self, n_workers, tag, timeout=120):
-        """Run n_workers swarm workers to drain all branches; return (cache_path, queue_path)."""
         from erd_swarm import swarm_worker
         cache_path = os.path.join(self._tmp.name, f"cache_{tag}.sqlite3")
         queue_path = os.path.join(self._tmp.name, f"queue_{tag}.sqlite3")
+
+        t_setup0 = time.time()
         ScoreCache(cache_path, self._pool).close()
         chunk_size = ERDQueue.chunk_size_for(
             self._BRANCH_SIZE, len(self._candidates),
@@ -240,6 +241,8 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                             len(self._candidates), chunk_size,
                             budget=ROOT_BUDGET)
         q.close()
+        t_setup = time.time() - t_setup0
+
         stop_event = mp.Event()
         # Suppress erd_worker_N.log creation: mock is inherited by forked children.
         with mock.patch("erd_swarm._setup_logging", lambda *_: None):
@@ -250,6 +253,8 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
             t0 = time.time()
             for p in procs:
                 p.start()
+            t_spawn = time.time() - t0
+
         deadline = time.time() + timeout
         q = ERDQueue(queue_path)
         try:
@@ -257,7 +262,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                 if not q.branches_in_progress():
                     break
                 time.sleep(0.05)
-            elapsed = time.time() - t0
+            t_drain = time.time() - t0
         finally:
             q.close()
         stop_event.set()
@@ -267,21 +272,83 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
             if p.is_alive():
                 p.kill()
                 p.join()
-        return elapsed, cache_path
+        t_total = time.time() - t0
+
+        return {
+            'wall':    t_total,
+            'drain':   t_drain,
+            'spawn':   t_spawn,
+            'setup':   t_setup,
+            'workers': n_workers,
+            'cache':   cache_path,
+        }
+
+    @staticmethod
+    def _publish_summary(rows, n, t1, tN, passed):
+        """Write a markdown timing table to $GITHUB_STEP_SUMMARY if available."""
+        summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+        if not summary_path:
+            return
+        status = '✅ PASSED' if passed else '❌ FAILED'
+        lines = [
+            f'## Parallelism drain test — {status}',
+            '',
+            f'**{n} workers vs 1 worker** | '
+            f'speedup: **{t1/tN:.2f}x** | '
+            f'1-worker: {t1:.3f}s | {n}-worker: {tN:.3f}s',
+            '',
+            '| run | workers | setup (s) | spawn (s) | drain (s) | total (s) | ms/branch |',
+            '|-----|---------|-----------|-----------|-----------|-----------|-----------|',
+        ]
+        n_branches = rows[0].get('n_branches', 80)
+        for r in rows:
+            ms_b = r['drain'] * 1000 / n_branches
+            lines.append(
+                f'| {r["tag"]} | {r["workers"]} '
+                f'| {r["setup"]:.3f} | {r["spawn"]:.3f} '
+                f'| {r["drain"]:.3f} | {r["wall"]:.3f} '
+                f'| {ms_b:.1f} |'
+            )
+        lines += [
+            '',
+            f'**cpu_count:** {os.cpu_count()}  '
+            f'**branches:** {n_branches}  '
+            f'**candidates:** {rows[0].get("n_candidates", "?")}  '
+            f'**branch_size:** {rows[0].get("branch_size", "?")}',
+        ]
+        with open(summary_path, 'a') as f:
+            f.write('\n'.join(lines) + '\n')
 
     def test_Nworkers_faster_than_1worker(self):
         n = min(4, os.cpu_count() or 1)
-        t1, _         = self._drain(1, "w1")
-        tN, cache_path = self._drain(n, f"w{n}")
+        r1 = self._drain(1, "w1")
+        rN = self._drain(n, f"w{n}")
+        t1, tN = r1['drain'], rN['drain']
+
+        for r, tag in [(r1, '1-worker'), (rN, f'{n}-worker')]:
+            r['tag'] = tag
+            r['n_branches'] = self._N_BRANCHES
+            r['n_candidates'] = self._N_CANDIDATES
+            r['branch_size'] = self._BRANCH_SIZE
+
+        passed = tN < t1 * self._SPEEDUP_RATIO
+        self._publish_summary([r1, rN], n, t1, tN, passed)
+
         sys.stderr.write(
-            f"\n[drain] 1-worker: {t1:.3f}s, {n}-worker: {tN:.3f}s "
-            f"({t1 / tN:.2f}x speedup)\n")
+            f"\n[drain] cpu_count={os.cpu_count()}  "
+            f"branches={self._N_BRANCHES}  candidates={self._N_CANDIDATES}\n"
+            f"  1-worker : {t1:.3f}s drain  {r1['spawn']:.3f}s spawn  "
+            f"{t1*1000/self._N_BRANCHES:.1f}ms/branch\n"
+            f"  {n}-worker: {tN:.3f}s drain  {rN['spawn']:.3f}s spawn  "
+            f"{tN*1000/self._N_BRANCHES:.1f}ms/branch  "
+            f"({t1/tN:.2f}x speedup)\n"
+        )
         self.assertLess(
             tN, t1 * self._SPEEDUP_RATIO,
             f"{n} workers ({tN:.3f}s) not fast enough vs "
             f"1 worker ({t1:.3f}s); expected < {t1 * self._SPEEDUP_RATIO:.3f}s")
         # Sanity: every branch must also have produced a valid cache entry.
-        sc = ScoreCache(cache_path, self._pool)
+        sc = ScoreCache(rN['cache'], self._pool)
         missing = [bw for bw in self._branches
                    if sc.read(encode_subset(bw), ERD_ALL) is None]
         sc.close()
