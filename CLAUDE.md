@@ -89,6 +89,19 @@ Write comments that describe current behaviour and non-obvious invariants:
 
 ---
 
+## Dangerous operations — always ask first
+
+Never perform any of the following without explicit instruction from the user:
+
+- **Merging a PR** — "CI is green" or "looks good" is not a merge instruction.
+- **Deleting a branch**
+- **Rewriting git history** — including rebase, amend, or any operation that changes existing commits.
+- **Force push**
+
+These actions are hard or impossible to reverse and affect shared state. Always confirm before proceeding, no matter how obvious it seems.
+
+---
+
 ## Pull request style
 
 PR descriptions need a **Summary** section only. Do not include a "Test plan" section.
