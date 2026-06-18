@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 """verify_erd_cache.py — Re-verify all ERD_ALL cache entries against the true optimum.
 
 The reclaim-while-alive bug (fixed 2026-06-15, commit 774ac29) could produce

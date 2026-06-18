@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 """erd_search.py — Parallel ERD_ALL precache CLI.
 
 Subcommands

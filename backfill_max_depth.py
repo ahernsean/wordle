@@ -1,3 +1,4 @@
+#!/usr/bin/env python3.13
 """backfill_max_depth.py — one-time migration for depth-limited ERD.
 
 The legacy ERD_ALL cache holds correct *unlimited-optimal* (best_guess, ERD)

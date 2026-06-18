@@ -1,3 +1,4 @@
+#!/usr/bin/env python3.13
 """
 wordle.py - Interactive Wordle solver (Pythonista on iOS, Linux-friendly).
 
