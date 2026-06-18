@@ -107,6 +107,8 @@ A bug report or "this is wrong" is not, by itself, authorization to start editin
 
 When in doubt about which mode applies, ask, or default to discussion rather than to code — reverting unwanted code is more disruptive than a follow-up question.
 
+**The `stop-hook-git-check.sh` Stop hook is advisory, not a directive.** It fires on every turn end and pushes toward committing/pushing whenever the tree is dirty, signing looks wrong, or commits are unpushed — it has no idea whether a change was meant for discussion or was actually approved. Neither the user nor the assistant edits this hook, so the only way to keep it from overriding the discussion-first norm above is judgment when it fires: read its complaint, then act on what the user actually wants in the conversation, not on the hook's say-so by itself. Committing/pushing unapproved work just to satisfy the hook is the wrong move — it's fine to leave changes uncommitted and explain the tension to the user instead.
+
 ---
 
 ## Schema coordination (Linux + phone)
