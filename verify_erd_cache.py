@@ -198,9 +198,13 @@ def _is_tainted(branch_words, candidate, rcache, sc, n):
 # ---------------------------------------------------------------------------
 
 # Target entries per chunk; controls how often progress lines appear.
-# At ~25k entries/s across 6 workers (~4k/s each), a 50k-entry chunk takes
-# ~12s per worker, giving a progress line roughly every 2s.
-_PROGRESS_CHUNK_SIZE = 50_000
+# Small chunks matter on iOS where the GIL serialises CPU-bound threads —
+# a thread pool gives no parallel speedup there, so the first progress line
+# appears only after the first chunk completes.  1k entries keeps that delay
+# to a few seconds on any device.  A 5-second throttle on the main-thread
+# printer prevents spam on Linux where chunks complete in milliseconds.
+_PROGRESS_CHUNK_SIZE = 1_000
+_PROGRESS_MIN_INTERVAL = 5.0  # seconds between printed progress lines
 
 
 def _fmt_eta(seconds: int) -> str:
@@ -325,6 +329,7 @@ def main():
                 wave_done = 0
                 wave_corrected = 0
                 chunks_done = 0
+                last_progress = t0
 
                 for future in as_completed(futures):
                     chunk_results = future.result()
@@ -338,17 +343,21 @@ def main():
                             n_score_corrected += 1
                             wave_corrected += 1
 
-                    elapsed_total = time.time() - t0
-                    rate = n_checked / elapsed_total if elapsed_total > 0 else 0
-                    remaining = total_in_scope - n_checked
-                    eta_s = int(remaining / rate) if rate > 0 else 0
-                    wave_pct = 100.0 * wave_done / n_wave if n_wave else 100.0
-                    overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 100.0
-                    corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
-                    print(f'  [{chunks_done:3d}/{n_chunks}] '
-                          f'wave {wave_pct:3.0f}%  overall {overall_pct:.1f}%  '
-                          f'{rate:,.0f}/s  ETA {_fmt_eta(eta_s)}{corr_str}',
-                          flush=True)
+                    now = time.time()
+                    is_last = chunks_done == n_chunks
+                    if is_last or now - last_progress >= _PROGRESS_MIN_INTERVAL:
+                        last_progress = now
+                        elapsed_total = now - t0
+                        rate = n_checked / elapsed_total if elapsed_total > 0 else 0
+                        remaining = total_in_scope - n_checked
+                        eta_s = int(remaining / rate) if rate > 0 else 0
+                        wave_pct = 100.0 * wave_done / n_wave if n_wave else 100.0
+                        overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 100.0
+                        corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
+                        print(f'  [{chunks_done:3d}/{n_chunks}] '
+                              f'wave {wave_pct:3.0f}%  overall {overall_pct:.1f}%  '
+                              f'{rate:,.0f}/s  ETA {_fmt_eta(eta_s)}{corr_str}',
+                              flush=True)
 
                 logf.flush()
                 wave_elapsed = int(time.time() - wave_t0)
