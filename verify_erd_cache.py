@@ -26,7 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
 from collections import defaultdict
@@ -197,6 +197,22 @@ def _is_tainted(branch_words, candidate, rcache, sc, n):
 # Main
 # ---------------------------------------------------------------------------
 
+# Target entries per chunk; controls how often progress lines appear.
+# At ~25k entries/s across 6 workers (~4k/s each), a 50k-entry chunk takes
+# ~12s per worker, giving a progress line roughly every 2s.
+_PROGRESS_CHUNK_SIZE = 50_000
+
+
+def _fmt_eta(seconds: int) -> str:
+    if seconds <= 0:
+        return '0s'
+    if seconds < 3600:
+        return f'{seconds // 60}m{seconds % 60:02d}s'
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f'{h}h{m:02d}m'
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -285,31 +301,62 @@ def main():
                 ]
                 n_wave = len(wave_data)
 
-                chunk_size = max(1, (n_wave + args.workers - 1) // args.workers)
+                # At least args.workers chunks (keep all threads busy); at most
+                # one chunk per _PROGRESS_CHUNK_SIZE entries (progress granularity).
+                n_chunks = max(args.workers,
+                               (n_wave + _PROGRESS_CHUNK_SIZE - 1) // _PROGRESS_CHUNK_SIZE)
+                chunk_size = max(1, (n_wave + n_chunks - 1) // n_chunks)
                 chunks = [wave_data[i:i + chunk_size]
                           for i in range(0, n_wave, chunk_size)]
-                worker_args = [
-                    (chunk, args.cache, ANSWER_FILE, WORDS_FILE)
-                    for chunk in chunks
-                ]
+                n_chunks = len(chunks)  # actual after ceiling division
 
+                overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 0
+                print(f'n={wave_size}: {n_wave:,} entries  '
+                      f'({n_chunks} chunks, {chunk_size:,}/chunk)  '
+                      f'overall {overall_pct:.1f}% done so far',
+                      flush=True)
+
+                futures = {
+                    pool.submit(_verify_chunk,
+                                (chunk, args.cache, ANSWER_FILE, WORDS_FILE)): idx
+                    for idx, chunk in enumerate(chunks)
+                }
+
+                wave_done = 0
                 wave_corrected = 0
-                for chunk_results in pool.map(_verify_chunk, worker_args):
+                chunks_done = 0
+
+                for future in as_completed(futures):
+                    chunk_results = future.result()
+                    chunks_done += 1
                     for status, n, og, os_, ng, ns in chunk_results:
                         n_checked += 1
+                        wave_done += 1
                         logf.write(
                             f'{status}\t{n}\t{og}\t{os_:.6f}\t{ng}\t{ns:.6f}\n')
                         if status == 'SCORE_CORRECTED':
                             n_score_corrected += 1
                             wave_corrected += 1
 
+                    elapsed_total = time.time() - t0
+                    rate = n_checked / elapsed_total if elapsed_total > 0 else 0
+                    remaining = total_in_scope - n_checked
+                    eta_s = int(remaining / rate) if rate > 0 else 0
+                    wave_pct = 100.0 * wave_done / n_wave if n_wave else 100.0
+                    overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 100.0
+                    corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
+                    print(f'  [{chunks_done:3d}/{n_chunks}] '
+                          f'wave {wave_pct:3.0f}%  overall {overall_pct:.1f}%  '
+                          f'{rate:,.0f}/s  ETA {_fmt_eta(eta_s)}{corr_str}',
+                          flush=True)
+
                 logf.flush()
-                pct = 100.0 * n_checked / total_in_scope
-                wave_elapsed = time.time() - wave_t0
-                corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
-                print(f'  n={wave_size:4d}: {n_wave:7,}  {wave_elapsed:5.1f}s'
-                      f'{corr_str}  ({pct:.1f}% done)',
+                wave_elapsed = int(time.time() - wave_t0)
+                print(f'  wave done: {n_wave:,} checked  '
+                      f'{wave_corrected} corrected  '
+                      f'{_fmt_eta(wave_elapsed)}',
                       flush=True)
+                print(flush=True)
 
     elapsed = int(time.time() - t0)
     h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
