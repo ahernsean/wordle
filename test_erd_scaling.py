@@ -176,31 +176,30 @@ class TestProcessScalingSmoke(_Base):
 
 
 @unittest.skipUnless(
-    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 4,
-    "needs fork start method and >=4 CPUs — parallelism speedup is not "
-    "meaningful on fewer cores")
+    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
+    "needs fork start method and >=2 CPUs")
 class TestCooperativeDrainSmoke(unittest.TestCase):
     # -------------------------------------------------------------------------
-    # PURPOSE: verify that 4 cooperative swarm workers actually drain a shared
-    # queue faster than 1 worker.  This is a parallelism regression guard —
-    # if coordination overhead grows (lock contention, redundant work, etc.),
+    # PURPOSE: verify that N cooperative swarm workers drain a shared queue
+    # faster than 1 worker.  This is a PARALLELISM REGRESSION GUARD — if
+    # coordination overhead grows (lock contention, redundant work, etc.),
     # the speedup shrinks and the test catches it.
     #
     # DO NOT replace the timing assertion with a pure correctness check.
     # Correctness is covered by TestProcessScalingSmoke and TestWorkDoesNotAmplify.
     # This test's only job is to confirm that parallelism HELPS.
     #
-    # The skip condition requires >=4 CPUs: on a 2-CPU machine 4 processes can't
-    # run truly in parallel, so the speedup signal is too weak to be reliable
-    # regardless of threshold.  This is a hardware capability gate, not a CI
-    # bypass — the test runs wherever there are enough cores for it to be honest.
+    # Worker count is min(4, cpu_count) so the comparison is always honest:
+    # N workers on N CPUs should each get a full core, giving near-linear
+    # speedup.  On a 2-CPU CI runner this runs 2 workers vs 1; on Rocky it
+    # runs 4 workers vs 1.  The 80% threshold is achievable on any of these.
     # -------------------------------------------------------------------------
 
     _BRANCH_SIZE = 12
     _N_BRANCHES = 80         # 80 × 12 = 960 unique answer words
     _DRAIN_DIVISOR = 100     # ceil(12/100)=1 → 1 chunk per branch
     _N_CANDIDATES = 100
-    _SPEEDUP_RATIO = 0.80    # 4 workers must complete in < 80% of 1-worker time
+    _SPEEDUP_RATIO = 0.80    # N workers must complete in < 80% of 1-worker time
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -270,15 +269,16 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                 p.join()
         return elapsed, cache_path
 
-    def test_4workers_faster_than_1worker(self):
-        t1, _          = self._drain(1, "w1")
-        t4, cache_path = self._drain(4, "w4")
+    def test_Nworkers_faster_than_1worker(self):
+        n = min(4, os.cpu_count() or 1)
+        t1, _         = self._drain(1, "w1")
+        tN, cache_path = self._drain(n, f"w{n}")
         sys.stderr.write(
-            f"\n[drain] 1-worker: {t1:.3f}s, 4-worker: {t4:.3f}s "
-            f"({t1 / t4:.2f}x speedup)\n")
+            f"\n[drain] 1-worker: {t1:.3f}s, {n}-worker: {tN:.3f}s "
+            f"({t1 / tN:.2f}x speedup)\n")
         self.assertLess(
-            t4, t1 * self._SPEEDUP_RATIO,
-            f"4 workers ({t4:.3f}s) not faster enough vs "
+            tN, t1 * self._SPEEDUP_RATIO,
+            f"{n} workers ({tN:.3f}s) not fast enough vs "
             f"1 worker ({t1:.3f}s); expected < {t1 * self._SPEEDUP_RATIO:.3f}s")
         # Sanity: every branch must also have produced a valid cache entry.
         sc = ScoreCache(cache_path, self._pool)
