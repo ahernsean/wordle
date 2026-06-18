@@ -26,7 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 from collections import defaultdict
@@ -206,7 +206,7 @@ def main():
     parser.add_argument('--log', default=DEFAULT_LOG, metavar='PATH',
                         help=f'Output log file (default: {DEFAULT_LOG})')
     parser.add_argument('--workers', type=int, default=6, metavar='N',
-                        help='Parallel worker processes per wave (default: 6)')
+                        help='Parallel workers per wave (default: 6)')
     parser.add_argument('--start-size', type=int, default=2, metavar='N',
                         help='Skip branches with fewer than N words — for '
                              'resuming an interrupted run.  Assumes all '
@@ -263,7 +263,7 @@ def main():
         if log_mode == 'w':
             logf.write('status\tn\told_guess\told_score\tnew_guess\tnew_score\n')
 
-        with mp.Pool(args.workers) as pool:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
             for wave_size in wave_sizes:
                 wave_t0 = time.time()
 
