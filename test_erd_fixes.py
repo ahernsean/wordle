@@ -196,5 +196,196 @@ class TestLastWriteTs(_TmpDB, unittest.TestCase):
         self.assertIsNotNone(sc.last_write_ts())
 
 
+class TestLRUDict(unittest.TestCase):
+    """_LRUDict: eviction order, capacity boundary, interface contract."""
+
+    def _make(self, size):
+        from cache_sqlite import _LRUDict
+        return _LRUDict(max_size=size)
+
+    def test_get_on_miss_returns_default(self):
+        d = self._make(4)
+        self.assertIsNone(d.get("x"))
+        self.assertEqual(d.get("x", 99), 99)
+
+    def test_basic_set_and_get(self):
+        d = self._make(4)
+        d["a"] = 1
+        self.assertEqual(d.get("a"), 1)
+        self.assertIn("a", d)
+
+    def test_overwrite_updates_value(self):
+        d = self._make(4)
+        d["a"] = 1
+        d["a"] = 2
+        self.assertEqual(d.get("a"), 2)
+        self.assertEqual(len(d), 1)
+
+    def test_evicts_lru_on_capacity(self):
+        d = self._make(3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        # "a" is the LRU; inserting "d" should evict it.
+        d["d"] = 4
+        self.assertNotIn("a", d)
+        self.assertIn("b", d)
+        self.assertIn("c", d)
+        self.assertIn("d", d)
+
+    def test_access_updates_lru_order(self):
+        d = self._make(3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        # Access "a" so "b" becomes the LRU.
+        _ = d.get("a")
+        d["d"] = 4
+        self.assertNotIn("b", d)
+        self.assertIn("a", d)
+
+    def test_write_updates_lru_order(self):
+        d = self._make(3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        # Overwrite "a" so "b" becomes the LRU.
+        d["a"] = 10
+        d["d"] = 4
+        self.assertNotIn("b", d)
+        self.assertIn("a", d)
+
+    def test_pop_removes_entry(self):
+        d = self._make(4)
+        d["a"] = 1
+        d.pop("a", None)
+        self.assertNotIn("a", d)
+        self.assertEqual(len(d), 0)
+
+    def test_pop_with_default_on_miss(self):
+        d = self._make(4)
+        self.assertEqual(d.pop("missing", 99), 99)
+
+    def test_len_reflects_evictions(self):
+        d = self._make(2)
+        d["a"] = 1
+        d["b"] = 2
+        self.assertEqual(len(d), 2)
+        d["c"] = 3           # evicts "a"
+        self.assertEqual(len(d), 2)
+
+    def test_unbounded_when_max_size_none(self):
+        from cache_sqlite import _LRUDict
+        d = _LRUDict(max_size=None)
+        for i in range(1000):
+            d[i] = i
+        self.assertEqual(len(d), 1000)
+
+
+class TestScoreCacheLRU(_TmpDB, unittest.TestCase):
+    """ScoreCache._mem_cache evicts via LRU when max_mem_entries is set."""
+
+    def test_lru_eviction_limits_mem_cache_size(self):
+        sc = ScoreCache(self.path("cache.db"), WORDS, max_mem_entries=2)
+        self.addCleanup(sc.close)
+
+        k1 = ScoreCache.encode_subset(WORDS[:2])
+        k2 = ScoreCache.encode_subset(WORDS[1:3])
+        k3 = ScoreCache.encode_subset(WORDS[2:4])
+
+        sc.write(k1, ERD_ALL, "crane", 1.5, max_depth=2)
+        sc.write(k2, ERD_ALL, "slate", 2.0, max_depth=2)
+        # Cache has 2 entries; inserting k3 should evict k1.
+        sc.write(k3, ERD_ALL, "trace", 1.8, max_depth=2)
+
+        # k1 was evicted from _mem_cache; read should still hit SQLite.
+        result = sc.read(k1, ERD_ALL)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "crane")
+
+    def test_no_limit_when_max_mem_entries_none(self):
+        sc = ScoreCache(self.path("cache.db"), WORDS, max_mem_entries=None)
+        self.addCleanup(sc.close)
+        for i, w in enumerate(WORDS):
+            key = ScoreCache.encode_subset([w])
+            sc.write(key, ERD_ALL, w, float(i), max_depth=1)
+        self.assertEqual(len(sc._mem_cache), len(WORDS))
+
+
+class TestERDQueueManagement(_TmpDB, unittest.TestCase):
+    """queue-clear, set_priority, remove_pending."""
+
+    def _make_queue(self):
+        q = ERDQueue(self.path("queue.db"))
+        self.addCleanup(q.close)
+        return q
+
+    def _add_branch(self, q, words, priority=0):
+        key = ScoreCache.encode_subset(words)
+        q.add_pending_many([(key, len(words), priority, "crane", 0)])
+        return key
+
+    def test_clear_wipes_all_tables(self):
+        q = self._make_queue()
+        self._add_branch(q, WORDS[:2])
+        self._add_branch(q, WORDS[1:3])
+        counts_before = q.counts_by_status()
+        self.assertGreater(counts_before.get("pending", 0), 0)
+
+        q.clear()
+
+        counts_after = q.counts_by_status()
+        self.assertEqual(counts_after.get("pending", 0), 0)
+        self.assertEqual(counts_after.get("done", 0), 0)
+
+    def test_set_priority_updates_pending_branch(self):
+        q = self._make_queue()
+        key = self._add_branch(q, WORDS[:2], priority=0)
+        updated = q.set_priority(key, 5)
+        self.assertTrue(updated)
+        row = q.get_pending_branch(key)
+        self.assertEqual(row["priority"], 5)
+
+    def test_set_priority_returns_false_for_unknown_branch(self):
+        q = self._make_queue()
+        fake_key = ScoreCache.encode_subset(["zzzzz"])
+        self.assertFalse(q.set_priority(fake_key, 3))
+
+    def test_remove_pending_deletes_pending_branch(self):
+        q = self._make_queue()
+        key = self._add_branch(q, WORDS[:2])
+        removed = q.remove_pending(key)
+        self.assertTrue(removed)
+        self.assertIsNone(q.get_pending_branch(key))
+
+    def test_remove_pending_returns_false_for_unknown_branch(self):
+        q = self._make_queue()
+        fake_key = ScoreCache.encode_subset(["zzzzz"])
+        self.assertFalse(q.remove_pending(fake_key))
+
+    def test_get_pending_branch_returns_row(self):
+        q = self._make_queue()
+        key = self._add_branch(q, WORDS[:3], priority=2)
+        row = q.get_pending_branch(key)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["priority"], 2)
+        self.assertEqual(row["n_words"], 3)
+
+    def test_priority_upgrade_on_duplicate_add(self):
+        q = self._make_queue()
+        key = self._add_branch(q, WORDS[:2], priority=0)
+        # add_pending_many upgrades priority on conflict
+        q.add_pending_many([(key, len(WORDS[:2]), 5, "crane", 0)])
+        row = q.get_pending_branch(key)
+        self.assertEqual(row["priority"], 5)
+
+    def test_priority_not_downgraded_on_duplicate_add(self):
+        q = self._make_queue()
+        key = self._add_branch(q, WORDS[:2], priority=5)
+        q.add_pending_many([(key, len(WORDS[:2]), 1, "crane", 0)])
+        row = q.get_pending_branch(key)
+        self.assertEqual(row["priority"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

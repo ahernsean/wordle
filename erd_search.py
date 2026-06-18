@@ -3,25 +3,45 @@
 
 Subcommands
 -----------
-bootstrap   Walk root words, build response decompositions, and populate
-            erd_queue.sqlite3 with every branch (size >= 2).
-            Idempotent / resumable.
+start           Start the supervisor via systemd (systemctl --user start).
+stop            Stop the supervisor via systemd (systemctl --user stop).
 
-run         Start the supervisor: spawn N worker processes, monitor and
-            respawn on recycle/crash, until the queue is empty or the
-            process receives SIGTERM / Ctrl-C (graceful drain).
+status          Read-only progress snapshot: queue counts, cache throughput,
+                per-worker heartbeats.  --watch loops the display.
 
-status      Read-only progress snapshot: queue counts, cache throughput,
-            per-worker heartbeats.  --watch loops the display.
+run             Start the supervisor directly (without systemd), for
+                development or one-shot use.  All output goes to erd_search.log.
 
-reset-stale Reset any 'in_progress' queue rows to 'pending'.  Done
-            automatically by 'run' on startup; exposed here for manual
-            recovery without restarting workers.
+queue-add       Add branches for a word or word list to the work queue.
+                Replaces the old 'bootstrap' command.  Idempotent: existing
+                branches are never duplicated; priority is upgraded if the new
+                request is higher.
 
-export      Create a trimmed snapshot of the cache containing only the
-            tables needed on iPhone (answer_list, response_decomposition,
-            branch_best_by_policy).  Safe to run while workers are
-            active.  Re-running is incremental (INSERT OR IGNORE).
+queue-clear     Wipe all queue state (pending branches, active state, chunk
+                claims, heartbeats).  Does not touch the ERD cache.
+
+queue-inspect   Show queue and worker detail for a specific branch.
+
+queue-remove    Remove a pending branch from the queue.  Use --force to also
+                cancel an in-progress branch (workers move on after their
+                current chunk completes).
+
+queue-priority  Change the priority of a queued branch.  Higher numbers are
+                worked sooner; 0 is the default.
+
+solve-branch    Swarm N workers onto one specific branch to completion.
+                Useful for large branches that the regular queue would take
+                very long to reach.
+
+export          Create a trimmed snapshot of the cache for the iPhone
+                (answer_list, response_decomposition, branch_best_by_policy).
+                Safe while workers are active; re-running is incremental.
+
+cache-status    Show ERD cache coverage for a given word: which response
+                patterns are cached and which are missing.
+
+bootstrap       (Legacy) Walk a word list and populate the queue.  Use
+                queue-add instead.
 """
 
 from __future__ import annotations
@@ -130,6 +150,374 @@ def cmd_bootstrap(args):
 
 
 # ---------------------------------------------------------------------------
+# cache-status
+# ---------------------------------------------------------------------------
+
+def cmd_cache_status(args):
+    """Show ERD cache coverage for a given word.
+
+    For each of the 242 possible response patterns for WORD, checks whether
+    the branch has a cached ERD value.  Reports the cached best guess and
+    score for hits, and flags misses so you can see what still needs work.
+    """
+    from erd_queue import fmt_pattern
+
+    all_answers = load_word_list(ANSWER_FILE)
+    word = args.word.strip().lower()
+
+    sc = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    groups = rcache.group_words(word, all_answers)
+    sc.close()
+
+    # Re-open with full ScoreCache to read branch entries.
+    sc = ScoreCache(args.cache, all_answers, checkpoint_on_close=False)
+
+    total = len(groups)
+    cached_count = 0
+    missing = []
+    hits = []
+
+    for code, branch in sorted(groups.items()):
+        pat = fmt_pattern(code)
+        n = len(branch)
+        if n < 2:
+            # Singleton or zero: no ERD needed (answer is identified immediately).
+            continue
+        branch_key = ScoreCache.encode_subset(branch)
+        entry = sc.read_detail(branch_key, ERD_ALL)
+        if entry is None:
+            missing.append((pat, n))
+        else:
+            best_guess, best_score, updated_at = entry
+            cached_count += 1
+            hits.append((pat, n, best_guess, best_score, updated_at))
+
+    sc.close()
+
+    n_trivial = sum(1 for branch in groups.values() if len(branch) < 2)
+    n_branches = total - n_trivial
+
+    print(f'{word.upper()}:  {n_branches} branches with ≥2 answers  '
+          f'({n_trivial} trivial patterns skipped)')
+    print(f'  Cached : {cached_count:4d}')
+    print(f'  Missing: {len(missing):4d}')
+    print()
+
+    if hits and not args.missing_only:
+        print(f'{"Pattern":<8}  {"Ans":>4}  {"Best guess":<12}  {"ERD":>7}  Updated')
+        for pat, n, best_guess, best_score, updated_at in hits:
+            from datetime import datetime
+            dt = datetime.fromtimestamp(updated_at).strftime('%Y-%m-%d %H:%M')
+            print(f'  {pat:<8}  {n:4d}  {best_guess.upper():<12}  '
+                  f'{best_score:7.4f}  {dt}')
+        if missing:
+            print()
+
+    if missing:
+        print(f'{"Pattern":<8}  {"Ans":>4}  (missing)')
+        for pat, n in missing:
+            print(f'  {pat:<8}  {n:4d}')
+
+
+# ---------------------------------------------------------------------------
+# queue-add  (replaces bootstrap for targeted loading)
+# ---------------------------------------------------------------------------
+
+def cmd_queue_add(args):
+    """Add branches for one word (or a word-list file) to the queue.
+
+    With --word: adds all response branches for that word whose answer-word
+    count is between 2 and --max-branch-size.  With --pattern as well: adds
+    only that single branch.
+
+    With --word-list: walks every word in the file, same as --word repeated.
+    Equivalent to the old 'bootstrap' command.
+
+    Already-queued branches are never duplicated; their priority is upgraded
+    if the new request is higher.
+    """
+    from erd_queue import parse_pattern, fmt_pattern
+
+    all_answers = load_word_list(ANSWER_FILE)
+    priority = args.priority
+
+    score_cache = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, score_cache)
+    queue = ERDQueue(args.queue)
+
+    if args.word:
+        words_to_process = [args.word.strip().lower()]
+    else:
+        words_to_process = load_word_list(args.word_list)
+
+    n_added = 0
+    try:
+        for word in words_to_process:
+            if args.pattern:
+                code = parse_pattern(args.pattern)
+                groups = rcache.group_words(word, all_answers)
+                branch = groups.get(code, [])
+                if len(branch) < 2:
+                    print(f'{word.upper()} {fmt_pattern(code)}: '
+                          f'{len(branch)} answer word(s) — nothing to queue.')
+                    continue
+                if len(branch) > args.max_branch_size:
+                    print(f'{word.upper()} {fmt_pattern(code)}: '
+                          f'{len(branch)} words exceeds --max-branch-size '
+                          f'{args.max_branch_size}, skipping.')
+                    continue
+                rows = [(encode_subset(branch), len(branch), priority,
+                         word, code)]
+            else:
+                groups = rcache.group_words(word, all_answers)
+                rows = [
+                    (encode_subset(branch), len(branch), priority, word, code)
+                    for code, branch in groups.items()
+                    if 2 <= len(branch) <= args.max_branch_size
+                ]
+            if rows:
+                queue.add_pending_many(rows)
+                n_added += len(rows)
+
+        total = queue.total_branches()
+        print(f'Added {n_added:,} branch(es).  Queue total: {total:,}.')
+
+    except KeyboardInterrupt:
+        print('\nInterrupted.')
+    finally:
+        score_cache.checkpoint()
+        score_cache.close()
+        queue.close()
+
+
+# ---------------------------------------------------------------------------
+# queue-clear
+# ---------------------------------------------------------------------------
+
+def cmd_queue_clear(args):
+    """Wipe all queue state (pending branches, active branches, chunk claims,
+    heartbeats, and run metadata).  The ERD cache is not touched.
+
+    Requires confirmation unless --yes is passed.
+    """
+    queue = ERDQueue(args.queue)
+    try:
+        counts = queue.counts_by_status()
+        pending = counts.get('pending', 0)
+        done = counts.get('done', 0)
+        in_prog = len(queue.branches_in_progress())
+
+        print(f'Queue: {pending:,} pending   {done:,} done   {in_prog} in progress')
+        if not args.yes:
+            ans = input('Clear all queue state? [y/N] ').strip().lower()
+            if ans != 'y':
+                print('Aborted.')
+                return
+
+        queue.clear()
+        print('Queue cleared.')
+    finally:
+        queue.close()
+
+
+# ---------------------------------------------------------------------------
+# queue-inspect
+# ---------------------------------------------------------------------------
+
+def cmd_queue_inspect(args):
+    """Show the queue entry for a specific branch (word + pattern)."""
+    from erd_queue import parse_pattern, fmt_pattern
+
+    all_answers = load_word_list(ANSWER_FILE)
+    word = args.word.strip().lower()
+    code = parse_pattern(args.pattern)
+    pat = fmt_pattern(code)
+
+    sc = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    groups = rcache.group_words(word, all_answers)
+    branch = groups.get(code, [])
+    sc.close()
+
+    if not branch:
+        print(f'{word.upper()} {pat}: no branch (that pattern yields 0 answers).')
+        return
+
+    branch_key = encode_subset(branch)
+    queue = ERDQueue(args.queue)
+
+    pb = queue.get_pending_branch(branch_key)
+    ab = queue.get_active_branch(branch_key)
+    chunks = queue.chunks_for_branch(branch_key) if ab else []
+    queue.close()
+
+    print(f'{word.upper()} {pat}  ({len(branch)} answer words)')
+    print(f'  branch_key: {branch_key[:20].hex()}...')
+
+    if pb is None:
+        print('  Not in queue.')
+    else:
+        print(f'  Status   : {pb["status"]}')
+        print(f'  Priority : {pb["priority"]}  '
+              f'(higher number = worked sooner)')
+
+    if ab:
+        n_chunks = ERDQueue.n_chunks_for(ab['n_candidates'], ab['chunk_size'])
+        done_ct = sum(1 for c in chunks if c['done'])
+        best_g = ab['best_guess'] or '---'
+        best_e = f'{ab["best_erd"]:.4f}' if ab['best_erd'] is not None else '---'
+        print(f'  In-progress: chunks {done_ct}/{n_chunks}  '
+              f'best {best_g.upper()} {best_e}')
+        print(f'  Chunk detail:')
+        for c in chunks:
+            holder = c['claimed_by'] or '(unclaimed)'
+            status = 'done' if c['done'] else f'held by {holder}'
+            print(f'    chunk {c["idx"]:3d}: {status}')
+
+
+# ---------------------------------------------------------------------------
+# queue-remove
+# ---------------------------------------------------------------------------
+
+def cmd_queue_remove(args):
+    """Remove a branch from the pending queue.
+
+    Only removes branches with status='pending'.  If the branch is currently
+    in-progress (being worked by a worker), use --force to also cancel it by
+    clearing its active_branches and chunk rows so the worker's next heartbeat
+    yields no further claims.  The worker will eventually notice the branch
+    is gone and move on.
+    """
+    from erd_queue import parse_pattern, fmt_pattern
+
+    all_answers = load_word_list(ANSWER_FILE)
+    word = args.word.strip().lower()
+    code = parse_pattern(args.pattern)
+    pat = fmt_pattern(code)
+
+    sc = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    groups = rcache.group_words(word, all_answers)
+    branch = groups.get(code, [])
+    sc.close()
+
+    if not branch:
+        print(f'{word.upper()} {pat}: no branch.')
+        return
+
+    branch_key = encode_subset(branch)
+    queue = ERDQueue(args.queue)
+
+    active = queue.get_active_branch(branch_key)
+    if active and not args.force:
+        print(f'{word.upper()} {pat}: branch is in-progress.  '
+              f'Use --force to also cancel the active work.')
+        queue.close()
+        return
+
+    if active and args.force:
+        # Atomically clear chunk claims, the active_branches row, and the
+        # pending_branches row.  All three DELETEs run in one transaction so a
+        # crash partway through cannot leave orphaned rows.  (remove_pending()
+        # alone would silently no-op here because the pending row still has
+        # status='in_progress' after the active state is cleared.)
+        queue.cancel_active_branch(branch_key, remove_from_queue=True)
+        queue.close()
+        print(f'Cancelled in-progress work and removed {word.upper()} {pat} from queue.')
+        return
+
+    removed = queue.remove_pending(branch_key)
+    queue.close()
+
+    if removed:
+        print(f'Removed {word.upper()} {pat} from queue.')
+    else:
+        print(f'{word.upper()} {pat}: not found in pending queue '
+              f'(may already be done or not queued).')
+
+
+# ---------------------------------------------------------------------------
+# queue-priority
+# ---------------------------------------------------------------------------
+
+def cmd_queue_priority(args):
+    """Set the priority of a queued branch.
+
+    Priority is an integer; higher numbers are worked sooner.  The internal
+    swarm uses priority 1,000,000 for cooperative sub-branches so they always
+    drain before fresh top-level branches.  User-settable values in the range
+    0–999 are reserved for normal use: 0 = default, higher = sooner.
+    """
+    from erd_queue import parse_pattern, fmt_pattern
+
+    all_answers = load_word_list(ANSWER_FILE)
+    word = args.word.strip().lower()
+    code = parse_pattern(args.pattern)
+    pat = fmt_pattern(code)
+
+    sc = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    groups = rcache.group_words(word, all_answers)
+    branch = groups.get(code, [])
+    sc.close()
+
+    if not branch:
+        print(f'{word.upper()} {pat}: no branch.')
+        return
+
+    branch_key = encode_subset(branch)
+    queue = ERDQueue(args.queue)
+    updated = queue.set_priority(branch_key, args.priority)
+    queue.close()
+
+    if updated:
+        print(f'{word.upper()} {pat}: priority set to {args.priority}.')
+    else:
+        print(f'{word.upper()} {pat}: not found in pending queue.')
+
+
+# ---------------------------------------------------------------------------
+# start / stop  (systemd delegation)
+# ---------------------------------------------------------------------------
+
+_SYSTEMD_SERVICE = 'wordle-erd'
+
+
+def _run_systemctl(action: str) -> int:
+    """Run `systemctl --user <action> <service>` and return the exit code."""
+    import subprocess
+    result = subprocess.run(
+        ['systemctl', '--user', action, _SYSTEMD_SERVICE],
+        capture_output=False)
+    return result.returncode
+
+
+def cmd_start(_args):
+    """Start the supervisor via systemd."""
+    rc = _run_systemctl('start')
+    if rc == 0:
+        _run_systemctl('status')
+    else:
+        print(f'systemctl start failed (exit {rc}).  '
+              f'Is the service installed?  '
+              f'Check: systemctl --user status {_SYSTEMD_SERVICE}',
+              file=sys.stderr)
+        sys.exit(rc)
+
+
+def cmd_stop(_args):
+    """Stop the supervisor via systemd."""
+    rc = _run_systemctl('stop')
+    if rc == 0:
+        print(f'Supervisor stopped.')
+    else:
+        print(f'systemctl stop failed (exit {rc}).',
+              file=sys.stderr)
+        sys.exit(rc)
+
+
+# ---------------------------------------------------------------------------
 # run (supervisor)
 # ---------------------------------------------------------------------------
 
@@ -167,19 +555,18 @@ def cmd_run(args):
         print(f'Recovery: {stale} pending rows reset, '
               f'{nb} in-progress branches / {nc} chunk claims cleared.')
 
-    bootstrap_status = queue.get_meta('bootstrap_status')
-    if bootstrap_status != 'done' and not args.allow_partial_queue:
-        print('Error: bootstrap not marked complete.  '
-              'Run bootstrap first, or pass --allow-partial-queue to proceed anyway.',
+    counts = queue.counts_by_status()
+    if not counts.get('pending') and not counts.get('in_progress'):
+        print('Warning: queue appears empty.  '
+              'Run queue-add to load branches before starting workers.',
               file=sys.stderr)
-        queue.close()
-        sys.exit(1)
     queue.close()
 
     _setup_supervisor_logging()
-    logger.info('Supervisor starting: %d workers, divisor=%d, max_chunks=%d, '
-                'recycle_hours=%.1f', args.workers, args.divisor,
-                args.max_chunks, args.recycle_hours)
+    logger.info('Supervisor starting: %d workers, min_words_per_chunk=%d, '
+                'max_chunk_count=%d, recycle_hours=%.1f',
+                args.workers, args.min_words_per_chunk,
+                args.max_chunk_count, args.recycle_hours)
 
     stop_event = multiprocessing.Event()
 
@@ -194,9 +581,7 @@ def cmd_run(args):
     procs: dict[int, tuple] = {}
     for i in range(args.workers):
         procs[i] = _spawn_worker(i, args, stop_event)
-    print(f'Started {args.workers} swarm workers  (pid={os.getpid()}).')
-    print(f'Monitor: python3.13 erd_search.py status --watch')
-    print(f'Stop:    kill {os.getpid()}  or  Ctrl-C')
+    logger.info('Started %d workers (supervisor pid=%d).', args.workers, os.getpid())
 
     while not stop_event.is_set():
         time.sleep(5)
@@ -224,7 +609,7 @@ def cmd_run(args):
         # Backstop: free chunks held by any worker that died WITHOUT being
         # reaped above (e.g. it crashed and we haven't noticed yet).  Gated on
         # heartbeat liveness, so a slow-but-alive worker is never reclaimed.
-        freed = q.reclaim_stale_chunks(args.stale_chunk_seconds)
+        freed = q.reclaim_stale_chunks(args.worker_timeout_seconds)
         if freed:
             logger.info('Reclaimed %d stale chunk claim(s).', freed)
         counts = q.counts_by_status()
@@ -272,7 +657,7 @@ def _spawn_worker(worker_id: int, args, stop_event):
     p = multiprocessing.Process(
         target=erd_swarm.swarm_worker,
         args=(worker_id, args.cache, args.queue, stop_event,
-              args.divisor, args.max_chunks),
+              args.min_words_per_chunk, args.max_chunk_count, args.workers),
         daemon=False,
         name=f'erd-worker-{worker_id}',
     )
@@ -321,7 +706,6 @@ def _print_status(args):
         branches = queue.branches_in_progress()
         hbs = queue.heartbeats_with_branch()
         worker_counts = queue.worker_counts_by_branch()
-        bootstrap_status = queue.get_meta('bootstrap_status')
         # Per-branch done-chunk counts for the in-progress branches.
         done_chunks = {bytes(b['branch_key']): queue.branch_done_chunks(b['branch_key'])
                        for b in branches}
@@ -335,7 +719,6 @@ def _print_status(args):
         hbs = []
         worker_counts = {}
         done_chunks = {}
-        bootstrap_status = None
 
     # Cache throughput
     try:
@@ -366,9 +749,6 @@ def _print_status(args):
     prune_pct = (100.0 * n_pruned / (n_ok + n_pruned)) if (n_ok + n_pruned) else None
 
     print(f'ERD_ALL Precache — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-    if bootstrap_status != 'done':
-        print(f'  !! bootstrap: {bootstrap_status or "not started"} !!')
-
     if queue_ok:
         print(f'Queue:  pending {counts.get("pending", 0):,}   '
               f'done {counts.get("done", 0):,}   '
@@ -641,7 +1021,8 @@ def cmd_solve_branch(args):
     result = run_branch_solve(
         branch_key, branch, n_workers=args.workers,
         cache_path=args.cache, queue_path=args.queue,
-        divisor=args.divisor, max_chunks=args.max_chunks,
+        min_words_per_chunk=args.min_words_per_chunk,
+        max_chunk_count=args.max_chunk_count,
         priority=args.priority, source_word=word, source_pattern=code)
 
     stop.set()
@@ -699,24 +1080,28 @@ def main():
                        help='Number of swarm worker processes (default: 6)')
     p_run.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_run.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_run.add_argument('--divisor', type=int, default=3, metavar='D',
-                       help='Chunk-count divisor: a branch is cut into about '
-                            'n_words/D chunks (default: 3). Lower = finer '
-                            'chunks / more sharing on hard branches.')
-    p_run.add_argument('--max-chunks', type=int, default=256, metavar='N',
-                       help='Cap on chunks per branch (default: 256)')
+    p_run.add_argument('--min-words-per-chunk', type=int, default=3, metavar='N',
+                       help='Minimum answer-word count per chunk of work: '
+                            'a branch is split into ceil(n_words/N) chunks '
+                            '(default: 3).  Lower = more chunks = more '
+                            'worker sharing on hard branches.')
+    p_run.add_argument('--max-chunk-count', type=int, default=256, metavar='N',
+                       help='Cap on the number of chunks per branch (default: 256). '
+                            'When --min-words-per-chunk would produce more chunks '
+                            'than this cap, the cap wins and chunks become larger.')
     p_run.add_argument('--recycle-hours', type=float, default=3.0,
                        metavar='H',
-                       help='Respawn each worker after H hours wall time, to '
-                            'bound ScoreCache memory growth (default: 3)')
-    p_run.add_argument('--stale-chunk-seconds', type=int, default=600,
+                       help='Respawn each worker after H hours wall time '
+                            '(default: 3).  Bounds per-worker ScoreCache '
+                            'memory growth while in-progress work is preserved '
+                            'in the queue and resumed by the fresh worker.')
+    p_run.add_argument('--worker-timeout-seconds', type=int, default=30,
                        metavar='S',
-                       help='Backstop: reclaim a chunk whose worker has not '
-                            'heartbeat within S seconds (presumed crashed; '
-                            'live workers heartbeat every ~2s, so they are '
-                            'never reclaimed; default: 600)')
-    p_run.add_argument('--allow-partial-queue', action='store_true',
-                       help='Start workers even if bootstrap is not complete')
+                       help='Declare a worker dead and reclaim its chunk '
+                            'claims after S seconds of missed heartbeats '
+                            '(default: 30).  Live workers heartbeat every '
+                            '~2s regardless of how long a single candidate '
+                            'takes, so only a crashed process triggers this.')
 
     # -- status --
     p_stat = sub.add_parser('status', help='Show progress snapshot')
@@ -738,16 +1123,97 @@ def main():
                            "all-gray, or --pattern=-y-g-)")
     p_sb.add_argument('--workers', type=int, default=6, metavar='N',
                       help='Worker processes to swarm the branch (default: 6)')
-    p_sb.add_argument('--divisor', type=int, default=3, metavar='D',
-                      help='Chunk-count divisor: ~n_words/D chunks (default: 3)')
-    p_sb.add_argument('--max-chunks', type=int, default=256, metavar='N',
-                      help='Cap on chunks for the branch (default: 256)')
+    p_sb.add_argument('--min-words-per-chunk', type=int, default=3, metavar='N',
+                      help='Minimum answer-word count per chunk (default: 3); '
+                           'see `run --min-words-per-chunk`')
+    p_sb.add_argument('--max-chunk-count', type=int, default=256, metavar='N',
+                      help='Cap on number of chunks for the branch (default: 256)')
     p_sb.add_argument('--priority', type=int, default=1, metavar='P',
                       help='Priority recorded on the branch (default: 1)')
     p_sb.add_argument('--force', action='store_true',
                       help='Recompute even if the branch is already cached')
     p_sb.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_sb.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+
+    # -- cache-status --
+    p_cs = sub.add_parser('cache-status',
+                           help='Show ERD cache coverage for a word')
+    p_cs.add_argument('--word', required=True, metavar='WORD',
+                      help='Guess word to inspect (e.g. salet)')
+    p_cs.add_argument('--missing-only', action='store_true',
+                      help='Only list patterns whose branches are not yet cached')
+    p_cs.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+
+    # -- queue-add --
+    p_qa = sub.add_parser('queue-add',
+                          help='Add branches for a word (or word list) to the queue')
+    qa_word = p_qa.add_mutually_exclusive_group(required=True)
+    qa_word.add_argument('--word', metavar='WORD',
+                         help='Single guess word (e.g. salet)')
+    qa_word.add_argument('--word-list', metavar='FILE',
+                         help=f'File of words to add (default list: {WORDS_FILE})')
+    p_qa.add_argument('--pattern', metavar='PAT',
+                      help='Only add this specific response pattern for --word '
+                           '(5 chars: g=green y=yellow -=gray).  '
+                           'Omit to add all patterns for the word.')
+    p_qa.add_argument('--priority', type=int, default=0, metavar='N',
+                      help='Priority for queued branches (default: 0).  '
+                           'Higher numbers are worked sooner.')
+    p_qa.add_argument('--max-branch-size', type=int, default=300, metavar='N',
+                      help='Skip branches with more than N answer words '
+                           '(default: 300)')
+    p_qa.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_qa.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+
+    # -- queue-clear --
+    p_qc = sub.add_parser('queue-clear',
+                           help='Wipe all queue state (does not touch the ERD cache)')
+    p_qc.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qc.add_argument('--yes', action='store_true',
+                      help='Skip confirmation prompt')
+
+    # -- queue-inspect --
+    p_qi = sub.add_parser('queue-inspect',
+                           help='Show queue detail for a specific branch')
+    p_qi.add_argument('--word', required=True, metavar='WORD')
+    p_qi.add_argument('--pattern', required=True, metavar='PAT',
+                      help='Response pattern (5 chars: g=green y=yellow -=gray)')
+    p_qi.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_qi.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+
+    # -- queue-remove --
+    p_qr = sub.add_parser('queue-remove',
+                           help='Remove a pending branch from the queue')
+    p_qr.add_argument('--word', required=True, metavar='WORD')
+    p_qr.add_argument('--pattern', required=True, metavar='PAT',
+                      help='Response pattern (5 chars: g=green y=yellow -=gray)')
+    p_qr.add_argument('--force', action='store_true',
+                      help='Also cancel an in-progress branch (clears active '
+                           'state so the worker moves on after its current chunk)')
+    p_qr.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_qr.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+
+    # -- queue-priority --
+    p_qp = sub.add_parser('queue-priority',
+                           help='Set the priority of a queued branch')
+    p_qp.add_argument('--word', required=True, metavar='WORD')
+    p_qp.add_argument('--pattern', required=True, metavar='PAT',
+                      help='Response pattern (5 chars: g=green y=yellow -=gray)')
+    p_qp.add_argument('--priority', required=True, type=int, metavar='N',
+                      help='New priority (higher = worked sooner; '
+                           'use values 0–999 for normal work)')
+    p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_qp.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+
+    # -- start --
+    sub.add_parser('start',
+                   help='Start the supervisor via systemd '
+                        '(systemctl --user start wordle-erd)')
+
+    # -- stop --
+    sub.add_parser('stop',
+                   help='Stop the supervisor via systemd '
+                        '(systemctl --user stop wordle-erd)')
 
     # -- reset-stale --
     p_rst = sub.add_parser('reset-stale',
@@ -765,6 +1231,14 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
+        'cache-status': cmd_cache_status,
+        'queue-add': cmd_queue_add,
+        'queue-clear': cmd_queue_clear,
+        'queue-inspect': cmd_queue_inspect,
+        'queue-remove': cmd_queue_remove,
+        'queue-priority': cmd_queue_priority,
+        'start': cmd_start,
+        'stop': cmd_stop,
         'bootstrap': cmd_bootstrap,
         'run': cmd_run,
         'status': cmd_status,
