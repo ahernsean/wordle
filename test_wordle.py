@@ -3768,6 +3768,24 @@ class TestPrintStatusSingleBoard(unittest.TestCase):
         self.assertIn("Solved: tenor | 1 guess", text)
         self.assertNotIn("1 guesses", text)
 
+    def test_solved_by_deduction_counts_the_unplayed_final_guess(self):
+        # Narrowed to one candidate by a non-winning guess: the player
+        # still has to play that candidate as a real Wordle guess, so the
+        # reported count must include it even though it isn't in
+        # soln.guesses yet.
+        soln = make_solution()
+        soln.guesses = [["salet", ["yellow", "gray", "gray", "yellow", "yellow"]],
+                        ["trite", ["green", "green", "gray", "gray", "yellow"]],
+                        ["metro", ["gray", "yellow", "green", "green", "gray"]]]
+        soln.current_words = ["entry"]
+
+        gs = self._gs(soln)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(gs)
+        text = out.getvalue()
+        self.assertIn("Solved: entry | 4 guesses", text)
+
     def test_non_root_with_erd_hit(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
         tmp.close()
