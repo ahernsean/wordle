@@ -97,6 +97,18 @@ PR descriptions describe *changes* — what is added, removed, or fixed, and why
 
 ---
 
+## Respond to what's actually being asked
+
+Before acting, classify the request:
+- **"What should I do / what's your recommendation / what are your thoughts?"** → reason through the tradeoffs and give a recommendation in words. Do not write or push code. Stop there and wait for a decision.
+- **"Implement X" / explicit instruction to make a change** → code is appropriate.
+
+A bug report or "this is wrong" is not, by itself, authorization to start editing files. Diagnose and propose a fix in conversation first, unless the user's phrasing already asks for the fix to be made.
+
+When in doubt about which mode applies, ask, or default to discussion rather than to code — reverting unwanted code is more disruptive than a follow-up question.
+
+---
+
 ## Schema coordination (Linux + phone)
 
 The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any schema change must:
