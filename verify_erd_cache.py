@@ -26,7 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import os
 import time
 from collections import defaultdict
@@ -285,7 +285,12 @@ def main():
         if log_mode == 'w':
             logf.write('status\tn\told_guess\told_score\tnew_guess\tnew_score\n')
 
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        # Use processes on platforms that support fork (Linux) for true
+        # parallelism; fall back to threads on iOS where fork is unavailable.
+        Executor = ProcessPoolExecutor if hasattr(os, 'fork') else ThreadPoolExecutor
+        print(f'Executor: {"processes" if Executor is ProcessPoolExecutor else "threads"}',
+              flush=True)
+        with Executor(max_workers=args.workers) as pool:
             for wave_size in wave_sizes:
                 wave_t0 = time.time()
 
