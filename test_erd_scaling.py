@@ -198,11 +198,16 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
     _BRANCH_SIZE = 12
     _N_BRANCHES = 80         # 80 × 12 = 960 unique answer words
     _DRAIN_DIVISOR = 100     # ceil(12/100)=1 → 1 chunk per branch
-    _N_CANDIDATES = 800      # must dominate SQLite overhead so parallelism shows
+    _N_CANDIDATES = 100
     _SPEEDUP_RATIO = 0.80    # N workers must complete in < 80% of 1-worker time
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        # Use /dev/shm (RAM-backed tmpfs) when available so SQLite I/O doesn't
+        # serialize workers and mask the parallelism signal.  Falls back to a
+        # normal tempdir on macOS or systems without /dev/shm.
+        shm = '/dev/shm'
+        tmp_dir = shm if (os.path.isdir(shm) and os.access(shm, os.W_OK)) else None
+        self._tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(self._tmp.cleanup)
         with open("NYT_wordlist.txt") as f:
             nyt = [l.strip() for l in f if l.strip()]
