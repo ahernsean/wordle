@@ -633,6 +633,16 @@ class Solution:
             self._answer_set = set(self.current_words)
         return self._answer_set
 
+    @property
+    def solved(self):
+        """True once the most recently played guess was itself the answer.
+
+        Narrowing to one remaining candidate by deduction is not the same
+        thing: that candidate still has to be played as a real Wordle guess
+        before the game is actually won.
+        """
+        return bool(self.guesses) and self.guesses[-1][1] == ['green'] * 5
+
     def apply_guess(self, try_word, response):
         """
         Apply a guess and its response, filtering the word list.

@@ -2432,6 +2432,10 @@ def print_status(gs, solver=None):
                 print("No words remaining!")
         elif n == 1:
             nguesses = len(soln.guesses)
+            if not soln.solved:
+                # Down to one candidate by deduction: it still takes one
+                # more real Wordle guess to play it and see the win.
+                nguesses += 1
             label = "guess" if nguesses == 1 else "guesses"
             print_success(f"Solved: {words[0]} | {nguesses} {label}")
         else:
