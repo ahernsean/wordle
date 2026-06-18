@@ -198,7 +198,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
     _BRANCH_SIZE = 12
     _N_BRANCHES = 80         # 80 × 12 = 960 unique answer words
     _DRAIN_DIVISOR = 100     # ceil(12/100)=1 → 1 chunk per branch
-    _N_CANDIDATES = 400      # must dominate SQLite overhead so parallelism shows
+    _N_CANDIDATES = 800      # must dominate SQLite overhead so parallelism shows
     _SPEEDUP_RATIO = 0.80    # N workers must complete in < 80% of 1-worker time
 
     def setUp(self):
