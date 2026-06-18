@@ -317,7 +317,8 @@ def main():
                 n_chunks = len(chunks)  # actual after ceiling division
 
                 overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 0
-                print(f'n={wave_size}: {n_wave:,} entries  '
+                print(f'{time.strftime("%H:%M:%S")}  '
+                      f'n={wave_size}: {n_wave:,} entries  '
                       f'({n_chunks} chunks, {chunk_size:,}/chunk)  '
                       f'overall {overall_pct:.1f}% done so far',
                       flush=True)
@@ -360,7 +361,8 @@ def main():
                         wave_pct = 100.0 * wave_done / n_wave if n_wave else 100.0
                         overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 100.0
                         corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
-                        print(f'  [{chunks_done:3d}/{n_chunks}] '
+                        print(f'{time.strftime("%H:%M:%S")}  '
+                              f'[{chunks_done:3d}/{n_chunks}] '
                               f'wave {wave_pct:3.0f}%  overall {overall_pct:.1f}%  '
                               f'chunk: {chunk_elapsed:.1f}s/{n_chunk}ent/{chunk_rate:,.0f}s⁻¹  '
                               f'overall: {rate:,.0f}/s  ETA {_fmt_eta(eta_s)}{corr_str}',
@@ -369,7 +371,8 @@ def main():
                 logf.flush()
                 wave_wall = time.time() - wave_t0
                 parallelism = total_chunk_cpu / wave_wall if wave_wall > 0 else 1.0
-                print(f'  wave done: {n_wave:,} checked  {wave_corrected} corrected  '
+                print(f'{time.strftime("%H:%M:%S")}  '
+                      f'wave done: {n_wave:,} checked  {wave_corrected} corrected  '
                       f'wall {_fmt_eta(int(wave_wall))}  '
                       f'CPU {total_chunk_cpu:.1f}s  '
                       f'thread efficiency {parallelism:.2f}x '
