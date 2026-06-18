@@ -103,9 +103,11 @@ def _verify_chunk(args):
     For each entry: delete it, evaluate every candidate with old_score as a
     strict ceiling (only accept a strictly lower ERD), then restore or correct.
 
-    Returns a list of (status, n_words, old_guess, old_score, new_guess, new_score)
-    where status is CONFIRMED or SCORE_CORRECTED.
+    Returns (results, elapsed_seconds) where results is a list of
+    (status, n_words, old_guess, old_score, new_guess, new_score) and
+    elapsed_seconds is the wall time this chunk spent in the worker thread.
     """
+    chunk_t0 = time.time()
     rows, cache_path, answer_file, words_file = args
 
     all_answers = load_word_list(answer_file)
@@ -159,7 +161,7 @@ def _verify_chunk(args):
 
     sc.checkpoint()
     sc.close()
-    return results
+    return results, time.time() - chunk_t0
 
 
 def _max_depth_from_cache(branch_words, candidate, rcache, sc, n):
@@ -330,10 +332,14 @@ def main():
                 wave_corrected = 0
                 chunks_done = 0
                 last_progress = t0
+                total_chunk_cpu = 0.0  # sum of worker wall times across all chunks
 
                 for future in as_completed(futures):
-                    chunk_results = future.result()
+                    chunk_results, chunk_elapsed = future.result()
                     chunks_done += 1
+                    n_chunk = len(chunk_results)
+                    total_chunk_cpu += chunk_elapsed
+                    chunk_rate = n_chunk / chunk_elapsed if chunk_elapsed > 0 else 0
                     for status, n, og, os_, ng, ns in chunk_results:
                         n_checked += 1
                         wave_done += 1
@@ -356,14 +362,18 @@ def main():
                         corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
                         print(f'  [{chunks_done:3d}/{n_chunks}] '
                               f'wave {wave_pct:3.0f}%  overall {overall_pct:.1f}%  '
-                              f'{rate:,.0f}/s  ETA {_fmt_eta(eta_s)}{corr_str}',
+                              f'chunk: {chunk_elapsed:.1f}s/{n_chunk}ent/{chunk_rate:,.0f}s⁻¹  '
+                              f'overall: {rate:,.0f}/s  ETA {_fmt_eta(eta_s)}{corr_str}',
                               flush=True)
 
                 logf.flush()
-                wave_elapsed = int(time.time() - wave_t0)
-                print(f'  wave done: {n_wave:,} checked  '
-                      f'{wave_corrected} corrected  '
-                      f'{_fmt_eta(wave_elapsed)}',
+                wave_wall = time.time() - wave_t0
+                parallelism = total_chunk_cpu / wave_wall if wave_wall > 0 else 1.0
+                print(f'  wave done: {n_wave:,} checked  {wave_corrected} corrected  '
+                      f'wall {_fmt_eta(int(wave_wall))}  '
+                      f'CPU {total_chunk_cpu:.1f}s  '
+                      f'thread efficiency {parallelism:.2f}x '
+                      f'(1.00=serial  {args.workers}.00=fully parallel)',
                       flush=True)
                 print(flush=True)
 
