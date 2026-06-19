@@ -439,7 +439,9 @@ class _BranchWorker:
         Prefers JOINING an in-progress branch (to finish branches already
         underway, concentrating workers) over PROMOTING a new one from the
         queue.  Promotion claims a pending branch and registers it so others
-        can join.
+        can join.  A claimed branch already solved at this budget (e.g.
+        synced in from elsewhere) is marked done without being promoted —
+        no chunk work is needed.
         """
         for b in self.queue.branches_in_progress():
             n_chunks = ERDQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
@@ -447,9 +449,17 @@ class _BranchWorker:
             if idx is not None:
                 return dict(b), idx
 
-        claimed = self.queue.claim_next(self.name)
-        if claimed is None:
-            return None
+        while True:
+            claimed = self.queue.claim_next(self.name)
+            if claimed is None:
+                return None
+            reuse = _cache_reuse(
+                self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
+                self.budget)
+            if reuse is None:
+                break
+            self.queue.mark_done(claimed['branch_key'])
+
         n_words = claimed['n_words']
         chunk_size = ERDQueue.chunk_size_for(
             n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
