@@ -11,9 +11,13 @@ deterministic and fast (small word lists make ERD cheap); any background
 precache solver a test starts is stopped/joined so nothing outlives its temp
 dir or hangs the run.
 """
+import contextlib
 import io
+import logging
 import os
 import sys
+import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -316,6 +320,68 @@ class PlatformLabelTests(unittest.TestCase):
         with mock.patch("platform.uname",
                         return_value=self._uname("Linux", "x86_64")):
             self.assertTrue(wordle._platform_label().startswith("Linux"))
+
+
+class ResilientFileHandlerTests(unittest.TestCase):
+    class _BrokenStream:
+        def write(self, msg):
+            raise PermissionError("simulated transient failure")
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    def setUp(self):
+        self._path = tempfile.mktemp()
+        self.addCleanup(lambda: os.path.exists(self._path) and os.remove(self._path))
+        self.handler = wordle.ResilientFileHandler(self._path)
+        self.handler.setFormatter(logging.Formatter("%(message)s"))
+        self.addCleanup(self.handler.close)
+
+    def _record(self, msg):
+        return logging.LogRecord("test", logging.INFO, __file__, 0, msg, None, None)
+
+    def test_successful_write_drains_immediately(self):
+        self.handler.emit(self._record("msg1"))
+        self.assertEqual(self.handler._queue, [])
+        with open(self._path) as f:
+            self.assertEqual(f.read(), "msg1\n")
+
+    def test_failed_write_queues_and_does_not_lose_record(self):
+        real_open = self.handler._open
+        self.handler.stream.close()
+        self.handler._open = lambda: self._BrokenStream()
+        self.handler.stream = self._BrokenStream()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.handler.emit(self._record("msg1"))
+            self.handler.emit(self._record("msg2"))
+        self.assertEqual(len(self.handler._queue), 2)
+
+        self.handler._open = real_open
+        self.handler.stream = real_open()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.handler.emit(self._record("msg3"))
+        self.assertEqual(self.handler._queue, [])
+        with open(self._path) as f:
+            self.assertEqual(f.read(), "msg1\nmsg2\nmsg3\n")
+
+    def test_failure_surfaces_only_past_grace_period(self):
+        self.handler.GRACE_SECONDS = 0.05
+        self.handler.stream.close()
+        self.handler._open = lambda: self._BrokenStream()
+        self.handler.stream = self._BrokenStream()
+
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            self.handler.emit(self._record("msg1"))
+        self.assertEqual(captured.getvalue(), "")
+
+        time.sleep(0.1)
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            self.handler.emit(self._record("msg2"))
+        self.assertIn("Logging error", captured.getvalue())
+        self.assertEqual(len(self.handler._queue), 2)
 
 
 class ProgressTrackerTests(unittest.TestCase):
