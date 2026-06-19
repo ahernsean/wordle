@@ -925,7 +925,7 @@ def _print_status(args):
         print('  (none active)')
     else:
         print(f'  {"W":>2}  {"Branch":<13} {"Chk":>3}  {"Held":>6}  '
-              f'{"Best":<5}  {"ERD":>5}  HB')
+              f'{"Best":<5}  {"ERD":>5}  {"Bound":>5}  HB')
     for h in sorted(hbs, key=lambda r: r['worker_id']):
         age = now_ts - h['updated_at']
         wnum = h['worker_id'].split('-')[-1] if '-' in h['worker_id'] else h['worker_id']
@@ -962,13 +962,15 @@ def _print_status(args):
         _print_status.max_paths = max_paths
         best_g = (h['best_guess'] if 'best_guess' in h.keys() else None) or ''
         best_e = (h['best_erd'] if 'best_erd' in h.keys() else None)
+        bound_e = (h['bound_erd'] if 'bound_erd' in h.keys() else None)
         # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
         if age <= 10 and nrate == 0 and nodes:
             flag = ' ~?'
         best_g_disp = best_g.upper() if best_g else '-----'
         best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
+        bound_e_disp = f'{bound_e:.3f}' if bound_e is not None else '-----'
         print(f'  {wnum:>2}  {src:<13}  {chunk:>2}  {_fmt_duration(held):>6}  '
-              f'{best_g_disp:<5}  {best_e_disp:>5}  {age}s{flag}')
+              f'{best_g_disp:<5}  {best_e_disp:>5}  {bound_e_disp:>5}  {age}s{flag}')
         if cur:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
             krate = f'{int(nrate / 1000)}kN/s'

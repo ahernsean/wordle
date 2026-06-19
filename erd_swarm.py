@@ -199,6 +199,7 @@ class _BranchWorker:
 
     def _heartbeat(self, branch_key, n_words, chunk_idx, chunk_started_at,
                    cand_rate, best_guess, best_erd, force=False,
+                   bound_erd=None,
                    cur_candidate=None, cand_n_seen=None, cand_chunk_size=None):
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
@@ -217,7 +218,7 @@ class _BranchWorker:
             cache_hits=self.score_cache.read_hits,
             cache_misses=self.score_cache.read_misses,
             n_cutoff=self.n_cutoff, n_pruned=self.n_pruned, n_ok=self.n_ok,
-            best_guess=best_guess, best_erd=best_erd,
+            best_guess=best_guess, best_erd=best_erd, bound_erd=bound_erd,
             cur_candidate=cur_candidate, cand_n_seen=cand_n_seen,
             cand_chunk_size=cand_chunk_size,
             cur_max_depth=self._cand_max_depth,
@@ -264,7 +265,8 @@ class _BranchWorker:
             return min(bests) if bests else None
 
         self._heartbeat(branch_key, n_words, idx, chunk_started, None,
-                        local_candidate, _eff_bound(), force=True,
+                        local_candidate, local_best, force=True,
+                        bound_erd=_eff_bound(),
                         cand_chunk_size=chunk_total)
 
         for n_seen, ci in enumerate(range(lo, hi), start=1):
@@ -294,7 +296,7 @@ class _BranchWorker:
                 subbranch_solver=self._subbranch_solver,
                 heartbeat=lambda: self._heartbeat(
                     branch_key, n_words, idx, chunk_started, None,
-                    local_candidate, _eff_bound(),
+                    local_candidate, local_best, bound_erd=_eff_bound(),
                     cur_candidate=ranked[ci], cand_n_seen=n_seen,
                     cand_chunk_size=chunk_total))
             cand_elapsed = time.time() - cand_t0
@@ -326,7 +328,7 @@ class _BranchWorker:
 
             rate = n_seen / max(1e-6, now - t0)
             self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                            local_candidate, _eff_bound(),
+                            local_candidate, local_best, bound_erd=_eff_bound(),
                             cur_candidate=ranked[ci], cand_n_seen=n_seen,
                             cand_chunk_size=chunk_total)
 
@@ -340,7 +342,8 @@ class _BranchWorker:
                     self.n_ok, self.n_cutoff, self.n_pruned, self.n_useless,
                     local_candidate or '-', local_best if local_best else 0)
         self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                        local_candidate, _eff_bound(), force=True)
+                        local_candidate, local_best, bound_erd=_eff_bound(),
+                        force=True)
         return True
 
     # -- finalize -----------------------------------------------------------

@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     n_pruned           INTEGER,     -- infeasible within budget (depth floor hit)
     n_ok               INTEGER,     -- candidates fully evaluated
     best_guess          TEXT,
-    best_erd           REAL,
+    best_erd           REAL,        -- ERD of the locally-found best candidate
+    bound_erd          REAL,        -- effective pruning bound: min(local, shared)
     cur_candidate      TEXT,        -- candidate word currently under evaluation
     cand_n_seen        INTEGER,     -- candidates evaluated so far in this chunk
     cand_chunk_size    INTEGER,     -- total candidates in this chunk
@@ -171,6 +172,7 @@ class ERDQueue:
                           ('n_ok',             'INTEGER'),
                           ('best_guess',        'TEXT'),
                           ('best_erd',         'REAL'),
+                          ('bound_erd',        'REAL'),
                           ('cur_candidate',    'TEXT'),
                           ('cand_n_seen',      'INTEGER'),
                           ('cand_chunk_size',  'INTEGER'),
@@ -338,7 +340,7 @@ class ERDQueue:
                   chunks_done: int, chunk_idx=None, chunk_started_at=None,
                   cand_rate=None, cache_hits=None, cache_misses=None,
                   n_cutoff=None, n_pruned=None, n_ok=None,
-                  best_guess=None, best_erd=None,
+                  best_guess=None, best_erd=None, bound_erd=None,
                   cur_candidate=None, cand_n_seen=None, cand_chunk_size=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
                   cur_path=None):
@@ -348,13 +350,13 @@ class ERDQueue:
                 (worker_id, pid, current_branch_key, n_words, started_at,
                  updated_at, chunks_done, chunk_idx, chunk_started_at,
                  cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
-                 best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+                 best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, cand_chunk_size,
                  cur_max_depth, cur_nodes, node_rate, cur_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_key, n_words, started_at,
               now, chunks_done, chunk_idx, chunk_started_at,
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
-              best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+              best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, cand_chunk_size,
               cur_max_depth, cur_nodes, node_rate, cur_path))
 
     def clear_heartbeat(self, worker_id: str):
