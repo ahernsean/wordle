@@ -99,7 +99,8 @@ class _BranchWorker:
         self.started = int(time.time())
         self.chunks_done = 0
         self.n_ok = 0
-        self.n_pruned = 0
+        self.n_cutoff = 0    # cost >= best_erd before full eval (alpha-beta)
+        self.n_pruned = 0    # infeasible within budget (depth floor hit)
         self.n_useless = 0
         self._ranked_key = None      # cache last branch's ranked candidate list
         self._ranked = None
@@ -157,7 +158,7 @@ class _BranchWorker:
             del self._spine[d]
 
     def _spine_str(self):
-        return '>'.join(str(self._spine[d]) for d in sorted(self._spine))
+        return '→'.join(str(self._spine[d]) for d in sorted(self._spine))
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
@@ -212,7 +213,7 @@ class _BranchWorker:
             chunk_started_at=chunk_started_at, cand_rate=cand_rate,
             cache_hits=self.score_cache.read_hits,
             cache_misses=self.score_cache.read_misses,
-            n_pruned=self.n_pruned, n_ok=self.n_ok,
+            n_cutoff=self.n_cutoff, n_pruned=self.n_pruned, n_ok=self.n_ok,
             best_guess=best_guess, best_erd=best_erd,
             cur_candidate=cur_candidate, cand_n_seen=cand_n_seen,
             cand_chunk_size=cand_chunk_size,
@@ -306,7 +307,9 @@ class _BranchWorker:
                     self.queue.update_branch_best(branch_key, local_candidate,
                                                   local_best, local_md)
                     shared_best = local_best
-            elif status in ('pruned', 'cutoff'):
+            elif status == 'cutoff':
+                self.n_cutoff += 1
+            elif status == 'pruned':
                 self.n_pruned += 1
             else:
                 self.n_useless += 1
@@ -322,9 +325,9 @@ class _BranchWorker:
         elapsed = time.time() - t0
         rate = chunk_total / max(1e-6, elapsed)
         logger.info('%s chunk %d done: %d cands in %.1fs (%.1f/s)  '
-                    'ok=%d pruned=%d useless=%d  best=%s %.4f',
+                    'ok=%d cutoff=%d pruned=%d useless=%d  best=%s %.4f',
                     self.name, idx, chunk_total, elapsed, rate,
-                    self.n_ok, self.n_pruned, self.n_useless,
+                    self.n_ok, self.n_cutoff, self.n_pruned, self.n_useless,
                     local_candidate or '-', local_best if local_best else 0)
         self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
                         local_candidate, local_best, force=True)

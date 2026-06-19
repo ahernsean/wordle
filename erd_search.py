@@ -45,6 +45,7 @@ queue-status    Show swarm queue coverage for a given word: which response
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import multiprocessing
 import os
@@ -693,12 +694,17 @@ def cmd_status(args):
             _watch_with_keys(args, interval)
         else:
             try:
+                sys.stdout.write('\033[?25l\033[2J\033[H')
+                sys.stdout.flush()
+                _redraw_status.prev_lines = []
                 while True:
-                    print('\033[2J\033[H', end='')
-                    _print_status(args)
+                    _redraw_status(args)
                     time.sleep(interval)
             except KeyboardInterrupt:
                 pass
+            finally:
+                sys.stdout.write('\033[?25h')
+                sys.stdout.flush()
     else:
         _print_status(args)
 
@@ -712,10 +718,11 @@ def _watch_with_keys(args, interval):
     new_settings[3] &= ~(termios.ICANON | termios.ECHO)
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
+        sys.stdout.write('\033[?25l\033[2J\033[H')
+        sys.stdout.flush()
+        _redraw_status.prev_lines = []
         while True:
-            print('\033[2J\033[H', end='', flush=True)
-            _print_status(args)
-            sys.stdout.flush()
+            _redraw_status(args)
             deadline = time.monotonic() + interval
             while True:
                 remaining = deadline - time.monotonic()
@@ -729,7 +736,56 @@ def _watch_with_keys(args, interval):
                     if ch == ' ':
                         break  # force refresh now
     finally:
+        sys.stdout.write('\033[?25h')
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _highlight_changes(new_line, old_line):
+    """Return new_line with runs of changed characters highlighted in bold yellow."""
+    if new_line == old_line:
+        return new_line
+    result = []
+    in_change = False
+    for i, ch in enumerate(new_line):
+        changed = i >= len(old_line) or ch != old_line[i]
+        if changed and not in_change:
+            result.append('\033[1;33m')
+            in_change = True
+        elif not changed and in_change:
+            result.append('\033[0m')
+            in_change = False
+        result.append(ch)
+    if in_change:
+        result.append('\033[0m')
+    return ''.join(result)
+
+
+def _redraw_status(args):
+    buf = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = buf
+    try:
+        _print_status(args)
+    finally:
+        sys.stdout = old_stdout
+    new_lines = buf.getvalue().splitlines()
+    prev_lines = getattr(_redraw_status, 'prev_lines', [])
+    _redraw_status.prev_lines = new_lines
+
+    rendered = []
+    for i, line in enumerate(new_lines):
+        old_line = prev_lines[i] if i < len(prev_lines) else None
+        if old_line is not None and line != old_line:
+            rendered.append(_highlight_changes(line, old_line) + '\033[K')
+        else:
+            rendered.append(line + '\033[K')
+
+    # \033[H  — cursor to top-left (no screen erase, so no flash)
+    # \033[J  — erase from last line to end of screen (removes stale lines if output shrank)
+    out = '\033[H' + '\n'.join(rendered) + '\033[J'
+    sys.stdout.write(out)
+    sys.stdout.flush()
 
 
 def _print_status(args):
@@ -781,17 +837,31 @@ def _print_status(args):
     hits = sum(h['cache_hits'] or 0 for h in live)
     misses = sum(h['cache_misses'] or 0 for h in live)
     n_ok = sum(h['n_ok'] or 0 for h in live)
+    n_cutoff = sum(h['n_cutoff'] or 0 for h in live)
     n_pruned = sum(h['n_pruned'] or 0 for h in live)
-    hit_pct = (100.0 * hits / (hits + misses)) if (hits + misses) else None
-    prune_pct = (100.0 * n_pruned / (n_ok + n_pruned)) if (n_ok + n_pruned) else None
+    total_evals = n_ok + n_cutoff + n_pruned
+    hit_total = hits + misses
+    hit_pct = (100.0 * hits / hit_total) if hit_total else None
+    cutoff_pct = (100.0 * n_cutoff / total_evals) if total_evals else None
+    pruned_pct = (100.0 * n_pruned / total_evals) if total_evals else None
+
+    def _abbrev(n):
+        if n >= 1_000_000:
+            return f'{n/1_000_000:.1f}M'
+        if n >= 1_000:
+            return f'{n/1_000:.1f}k'
+        return str(n)
 
     print(f'ERD_ALL Precache — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     if queue_ok:
         print(f'Queue:  pending {counts.get("pending", 0):,}   '
               f'done {counts.get("done", 0):,}   '
               f'in progress {len(branches)}')
-    if cache_ok:
-        print(f'Cache:  {total_erd:,} ERD entries   +{recent:,} in last 5m')
+    cache_line = f'Cache:  {total_erd:,} ERD entries   +{recent:,} in last 5m' if cache_ok else None
+    if cache_line and hit_pct is not None:
+        cache_line += f'   hits {_abbrev(hits)}/{_abbrev(hit_total)} ({hit_pct:.0f}%)'
+    if cache_line:
+        print(cache_line)
     print()
 
     # Branches in progress — the real progress unit.
@@ -830,12 +900,12 @@ def _print_status(args):
     # Workers — liveness and forward progress.
     answer_set = set(load_word_list(ANSWER_FILE))
     worker_hdr = 'Workers:'
-    if live:
+    if live and total_evals:
         parts = []
-        if hit_pct is not None:
-            parts.append(f'cache hits {hit_pct:.0f}%')
-        if prune_pct is not None:
-            parts.append(f'pruned {prune_pct:.0f}%')
+        if cutoff_pct is not None:
+            parts.append(f'cutoff {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({cutoff_pct:.0f}%)')
+        if pruned_pct is not None:
+            parts.append(f'pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({pruned_pct:.0f}%)')
         if parts:
             worker_hdr = f'Workers ({", ".join(parts)}):'
     print(worker_hdr)

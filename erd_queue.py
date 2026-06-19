@@ -48,8 +48,8 @@ CREATE INDEX IF NOT EXISTS idx_pending_status_pri_n
 -- worker is a fungible contributor: it reports which branch and chunk it is
 -- on purely so the operator can see it is alive and moving (health), not as
 -- the unit of progress (that lives in active_branches).  The metric columns
--- (cache_hits/misses, n_pruned/n_ok, cand_rate) let `status` aggregate cache
--- effectiveness and branch-and-bound pruning across all workers.
+-- (cache_hits/misses, n_cutoff/n_pruned/n_ok, cand_rate) let `status` aggregate
+-- cache effectiveness and branch-and-bound pruning across all workers.
 CREATE TABLE IF NOT EXISTS worker_heartbeat (
     worker_id          TEXT    PRIMARY KEY,
     pid                INTEGER NOT NULL,
@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     cand_rate          REAL,        -- candidates/sec, recent
     cache_hits         INTEGER,
     cache_misses       INTEGER,
-    n_pruned           INTEGER,     -- candidates eliminated by the shared bound
+    n_cutoff           INTEGER,     -- alpha-beta: cost >= best_erd before full eval
+    n_pruned           INTEGER,     -- infeasible within budget (depth floor hit)
     n_ok               INTEGER,     -- candidates fully evaluated
     best_guess          TEXT,
     best_erd           REAL,
@@ -165,6 +166,7 @@ class ERDQueue:
                           ('cand_rate',        'REAL'),
                           ('cache_hits',       'INTEGER'),
                           ('cache_misses',     'INTEGER'),
+                          ('n_cutoff',         'INTEGER'),
                           ('n_pruned',         'INTEGER'),
                           ('n_ok',             'INTEGER'),
                           ('best_guess',        'TEXT'),
@@ -335,7 +337,8 @@ class ERDQueue:
                   current_branch_key, n_words, started_at: int,
                   chunks_done: int, chunk_idx=None, chunk_started_at=None,
                   cand_rate=None, cache_hits=None, cache_misses=None,
-                  n_pruned=None, n_ok=None, best_guess=None, best_erd=None,
+                  n_cutoff=None, n_pruned=None, n_ok=None,
+                  best_guess=None, best_erd=None,
                   cur_candidate=None, cand_n_seen=None, cand_chunk_size=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
                   cur_path=None):
@@ -344,13 +347,13 @@ class ERDQueue:
             INSERT OR REPLACE INTO worker_heartbeat
                 (worker_id, pid, current_branch_key, n_words, started_at,
                  updated_at, chunks_done, chunk_idx, chunk_started_at,
-                 cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
+                 cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
                  best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
                  cur_max_depth, cur_nodes, node_rate, cur_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_key, n_words, started_at,
               now, chunks_done, chunk_idx, chunk_started_at,
-              cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
+              cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
               best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
               cur_max_depth, cur_nodes, node_rate, cur_path))
 
