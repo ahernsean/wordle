@@ -259,17 +259,11 @@ class _BranchWorker:
         chunk_started = int(time.time())
         t0 = time.time()
 
-        def _eff_bound():
-            # Effective pruning bound: tightest of what this worker found and
-            # what other workers have shared via the queue.
-            bests = [b for b in (local_best, shared_best) if b is not None]
-            return min(bests) if bests else None
-
         def _bound_provider():
-            # Called by evaluate_candidate at each sub-branch to pick up
-            # inter-worker improvements mid-evaluation.  Refreshes shared_best
-            # from the queue at most every BEST_REFRESH_SECONDS; returns the
-            # tightest known bound as float (inf when nothing is known yet).
+            # Refreshes shared_best from the queue at most every
+            # BEST_REFRESH_SECONDS, then returns the tightest known bound as a
+            # float (inf when nothing is known yet).  Called by evaluate_candidate
+            # at each sub-branch level throughout the full recursion.
             nonlocal shared_best, last_refresh
             now = time.time()
             if now - last_refresh > BEST_REFRESH_SECONDS:
@@ -279,6 +273,12 @@ class _BranchWorker:
                 last_refresh = now
             bests = [b for b in (local_best, shared_best) if b is not None]
             return min(bests) if bests else float('inf')
+
+        def _eff_bound():
+            # For heartbeat display: delegates to _bound_provider so the
+            # reported bound reflects mid-evaluation DB refreshes.
+            v = _bound_provider()
+            return None if v == float('inf') else v
 
         self._heartbeat(branch_key, n_words, idx, chunk_started, None,
                         local_candidate, local_best, force=True,
@@ -294,13 +294,12 @@ class _BranchWorker:
                             'max_depth=%d', self.name, idx, ranked[ci], n_seen,
                             chunk_total, local_candidate or '-', self._cand_max_depth)
                 last_log = now
-            bound = _bound_provider()
 
             self._cand_max_depth = 0
             cand_t0 = time.time()
             status, cost, cand_md, floor_hit = evaluate_candidate(
                 words, ranked[ci], self.rcache, self.score_cache,
-                n=n_words, best_erd=bound, guesses=self.all_words,
+                n=n_words, best_erd=float('inf'), guesses=self.all_words,
                 policy=ERD_ALL, cancel_check=self.cancel,
                 depth=0, depth_observer=self._note_depth, budget=budget,
                 subbranch_solver=self._subbranch_solver,

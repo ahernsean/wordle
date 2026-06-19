@@ -1027,7 +1027,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         sub = _solve_subset(
             sub_branch, cache, score_cache, sub_budget, deadline, guesses,
             policy, cancel_check, heartbeat, depth + 1, depth_observer, None,
-            subbranch_solver, ceiling=sub_ceiling)
+            subbranch_solver, ceiling=sub_ceiling, bound_provider=bound_provider)
         if sub is None:
             return ('abort', None, None, floor)
         sub_cost, sub_md, sub_floor, sub_cutoff = sub
@@ -1051,7 +1051,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, depth, depth_observer,
                   progress_callback, subbranch_solver=None,
-                  ceiling=float('inf')):
+                  ceiling=float('inf'), bound_provider=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1144,7 +1144,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
             depth=depth, depth_observer=depth_observer, budget=budget,
-            subbranch_solver=subbranch_solver,
+            subbranch_solver=subbranch_solver, bound_provider=bound_provider,
         )
         if status == 'abort':
             return None
