@@ -247,7 +247,7 @@ class ERDQueue:
             self._conn.execute(
                 'ALTER TABLE worker_heartbeat '
                 'RENAME COLUMN current_subset_key TO current_branch_key')
-        if 'best_word' in existing_hb:
+        if 'best_word' in existing_hb and 'best_guess' not in existing_hb:
             self._conn.execute(
                 'ALTER TABLE worker_heartbeat RENAME COLUMN best_word TO best_guess')
 

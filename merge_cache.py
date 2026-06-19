@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 """merge_cache.py — Merge a source wordle_cache.sqlite3 into the local one.
 
 Usage

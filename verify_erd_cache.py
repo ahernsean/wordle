@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 """verify_erd_cache.py — Re-verify all ERD_ALL cache entries against the true optimum.
 
 The reclaim-while-alive bug (fixed 2026-06-15, commit 774ac29) could produce
@@ -26,7 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import os
 import time
 from collections import defaultdict
@@ -103,9 +103,11 @@ def _verify_chunk(args):
     For each entry: delete it, evaluate every candidate with old_score as a
     strict ceiling (only accept a strictly lower ERD), then restore or correct.
 
-    Returns a list of (status, n_words, old_guess, old_score, new_guess, new_score)
-    where status is CONFIRMED or SCORE_CORRECTED.
+    Returns (results, elapsed_seconds) where results is a list of
+    (status, n_words, old_guess, old_score, new_guess, new_score) and
+    elapsed_seconds is the wall time this chunk spent in the worker thread.
     """
+    chunk_t0 = time.time()
     rows, cache_path, answer_file, words_file = args
 
     all_answers = load_word_list(answer_file)
@@ -159,7 +161,7 @@ def _verify_chunk(args):
 
     sc.checkpoint()
     sc.close()
-    return results
+    return results, time.time() - chunk_t0
 
 
 def _max_depth_from_cache(branch_words, candidate, rcache, sc, n):
@@ -197,6 +199,26 @@ def _is_tainted(branch_words, candidate, rcache, sc, n):
 # Main
 # ---------------------------------------------------------------------------
 
+# Target entries per chunk; controls how often progress lines appear.
+# Small chunks matter on iOS where the GIL serialises CPU-bound threads —
+# a thread pool gives no parallel speedup there, so the first progress line
+# appears only after the first chunk completes.  1k entries keeps that delay
+# to a few seconds on any device.  A 5-second throttle on the main-thread
+# printer prevents spam on Linux where chunks complete in milliseconds.
+_PROGRESS_CHUNK_SIZE = 1_000
+_PROGRESS_MIN_INTERVAL = 5.0  # seconds between printed progress lines
+
+
+def _fmt_eta(seconds: int) -> str:
+    if seconds <= 0:
+        return '0s'
+    if seconds < 3600:
+        return f'{seconds // 60}m{seconds % 60:02d}s'
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f'{h}h{m:02d}m'
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -206,7 +228,7 @@ def main():
     parser.add_argument('--log', default=DEFAULT_LOG, metavar='PATH',
                         help=f'Output log file (default: {DEFAULT_LOG})')
     parser.add_argument('--workers', type=int, default=6, metavar='N',
-                        help='Parallel worker processes per wave (default: 6)')
+                        help='Parallel workers per wave (default: 6)')
     parser.add_argument('--start-size', type=int, default=2, metavar='N',
                         help='Skip branches with fewer than N words — for '
                              'resuming an interrupted run.  Assumes all '
@@ -263,7 +285,12 @@ def main():
         if log_mode == 'w':
             logf.write('status\tn\told_guess\told_score\tnew_guess\tnew_score\n')
 
-        with mp.Pool(args.workers) as pool:
+        # Use processes on platforms that support fork (Linux) for true
+        # parallelism; fall back to threads on iOS where fork is unavailable.
+        Executor = ProcessPoolExecutor if hasattr(os, 'fork') else ThreadPoolExecutor
+        print(f'Executor: {"processes" if Executor is ProcessPoolExecutor else "threads"}',
+              flush=True)
+        with Executor(max_workers=args.workers) as pool:
             for wave_size in wave_sizes:
                 wave_t0 = time.time()
 
@@ -285,31 +312,78 @@ def main():
                 ]
                 n_wave = len(wave_data)
 
-                chunk_size = max(1, (n_wave + args.workers - 1) // args.workers)
+                # At least args.workers chunks (keep all threads busy); at most
+                # one chunk per _PROGRESS_CHUNK_SIZE entries (progress granularity).
+                n_chunks = max(args.workers,
+                               (n_wave + _PROGRESS_CHUNK_SIZE - 1) // _PROGRESS_CHUNK_SIZE)
+                chunk_size = max(1, (n_wave + n_chunks - 1) // n_chunks)
                 chunks = [wave_data[i:i + chunk_size]
                           for i in range(0, n_wave, chunk_size)]
-                worker_args = [
-                    (chunk, args.cache, ANSWER_FILE, WORDS_FILE)
-                    for chunk in chunks
-                ]
+                n_chunks = len(chunks)  # actual after ceiling division
 
+                overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 0
+                print(f'{time.strftime("%H:%M:%S")}  '
+                      f'n={wave_size}: {n_wave:,} entries  '
+                      f'({n_chunks} chunks, {chunk_size:,}/chunk)  '
+                      f'overall {overall_pct:.1f}% done so far',
+                      flush=True)
+
+                futures = {
+                    pool.submit(_verify_chunk,
+                                (chunk, args.cache, ANSWER_FILE, WORDS_FILE)): idx
+                    for idx, chunk in enumerate(chunks)
+                }
+
+                wave_done = 0
                 wave_corrected = 0
-                for chunk_results in pool.map(_verify_chunk, worker_args):
+                chunks_done = 0
+                last_progress = t0
+                total_chunk_cpu = 0.0  # sum of worker wall times across all chunks
+
+                for future in as_completed(futures):
+                    chunk_results, chunk_elapsed = future.result()
+                    chunks_done += 1
+                    n_chunk = len(chunk_results)
+                    total_chunk_cpu += chunk_elapsed
+                    chunk_rate = n_chunk / chunk_elapsed if chunk_elapsed > 0 else 0
                     for status, n, og, os_, ng, ns in chunk_results:
                         n_checked += 1
+                        wave_done += 1
                         logf.write(
                             f'{status}\t{n}\t{og}\t{os_:.6f}\t{ng}\t{ns:.6f}\n')
                         if status == 'SCORE_CORRECTED':
                             n_score_corrected += 1
                             wave_corrected += 1
 
+                    now = time.time()
+                    is_last = chunks_done == n_chunks
+                    if is_last or now - last_progress >= _PROGRESS_MIN_INTERVAL:
+                        last_progress = now
+                        elapsed_total = now - t0
+                        rate = n_checked / elapsed_total if elapsed_total > 0 else 0
+                        remaining = total_in_scope - n_checked
+                        eta_s = int(remaining / rate) if rate > 0 else 0
+                        wave_pct = 100.0 * wave_done / n_wave if n_wave else 100.0
+                        overall_pct = 100.0 * n_checked / total_in_scope if total_in_scope else 100.0
+                        corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
+                        print(f'{time.strftime("%H:%M:%S")}  '
+                              f'[{chunks_done:3d}/{n_chunks}] '
+                              f'wave {wave_pct:3.0f}%  overall {overall_pct:.1f}%  '
+                              f'chunk: {chunk_elapsed:.1f}s/{n_chunk}ent/{chunk_rate:,.0f}s⁻¹  '
+                              f'overall: {rate:,.0f}/s  ETA {_fmt_eta(eta_s)}{corr_str}',
+                              flush=True)
+
                 logf.flush()
-                pct = 100.0 * n_checked / total_in_scope
-                wave_elapsed = time.time() - wave_t0
-                corr_str = f'  {wave_corrected} corrected' if wave_corrected else ''
-                print(f'  n={wave_size:4d}: {n_wave:7,}  {wave_elapsed:5.1f}s'
-                      f'{corr_str}  ({pct:.1f}% done)',
+                wave_wall = time.time() - wave_t0
+                parallelism = total_chunk_cpu / wave_wall if wave_wall > 0 else 1.0
+                print(f'{time.strftime("%H:%M:%S")}  '
+                      f'wave done: {n_wave:,} checked  {wave_corrected} corrected  '
+                      f'wall {_fmt_eta(int(wave_wall))}  '
+                      f'CPU {total_chunk_cpu:.1f}s  '
+                      f'thread efficiency {parallelism:.2f}x '
+                      f'(1.00=serial  {args.workers}.00=fully parallel)',
                       flush=True)
+                print(flush=True)
 
     elapsed = int(time.time() - t0)
     h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60

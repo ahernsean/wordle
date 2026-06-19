@@ -1,3 +1,4 @@
+#!/usr/bin/env python3.13
 from bs4 import BeautifulSoup
 import ssl
 import urllib.request
