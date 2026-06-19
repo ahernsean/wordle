@@ -3032,9 +3032,59 @@ class BranchPrecacheSolver(threading.Thread):
             score_cache.close()
 
 
+class ResilientFileHandler(logging.FileHandler):
+    """FileHandler that queues records instead of dropping them when the
+    underlying file is transiently unwritable (e.g. an iOS File Provider
+    revoking access to an already-open descriptor during iCloud sync).
+
+    Every record is appended to an in-memory queue and drained from the
+    front on each emit() call. A record is popped only after it is
+    actually written, so nothing is lost across an outage — delivery is
+    just delayed until the stream recovers. On write failure the stream
+    is closed and reopened to pick up a fresh descriptor, since a stale
+    descriptor is the usual cause of the revocation. Failures under
+    GRACE_SECONDS stay silent; failures that persist past it surface the
+    normal logging traceback (the queued record keeps retrying either
+    way).
+    """
+
+    GRACE_SECONDS = 30
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._queue = []
+        self._failing_since = None
+
+    def emit(self, record):
+        self._queue.append(record)
+        while self._queue:
+            record = self._queue[0]
+            try:
+                msg = self.format(record)
+                self.stream.write(msg + self.terminator)
+                self.flush()
+            except Exception:
+                self._on_write_failure(record)
+                return
+            else:
+                self._queue.pop(0)
+                self._failing_since = None
+
+    def _on_write_failure(self, record):
+        now = time.monotonic()
+        if self._failing_since is None:
+            self._failing_since = now
+        with contextlib.suppress(Exception):
+            self.close()
+        with contextlib.suppress(Exception):
+            self.stream = self._open()
+        if now - self._failing_since >= self.GRACE_SECONDS:
+            self.handleError(record)
+
+
 def main():  # pragma: no cover - interactive REPL loop, exercised manually
     log_path = os.path.abspath(LOG_FILE)
-    file_handler = logging.FileHandler(log_path)
+    file_handler = ResilientFileHandler(log_path)
     file_handler.setFormatter(logging.Formatter(
         "%(asctime)s %(threadName)-20s %(levelname)-7s %(message)s"))
     logger.addHandler(file_handler)
