@@ -584,10 +584,12 @@ def cmd_run(args):
         procs[i] = _spawn_worker(i, args, stop_event)
     logger.info('Started %d workers (supervisor pid=%d).', args.workers, os.getpid())
 
+    q = ERDQueue(args.queue)
     while not stop_event.is_set():
         time.sleep(5)
+        if stop_event.is_set():
+            break
 
-        q = ERDQueue(args.queue)
         for wid, (p, started_at) in list(procs.items()):
             age = time.time() - started_at
             if not p.is_alive():
@@ -615,7 +617,6 @@ def cmd_run(args):
             logger.info('Reclaimed %d stale chunk claim(s).', freed)
         counts = q.counts_by_status()
         in_flight = len(q.branches_in_progress())
-        q.close()
 
         # Done when the queue holds no pending or in-progress branches and no
         # branch is still being swarmed.
@@ -627,6 +628,7 @@ def cmd_run(args):
             print('\nQueue empty — all branches done.')
             stop_event.set()
 
+    q.close()
     logger.info('Supervisor stopping all workers...')
     for wid, (p, _) in procs.items():
         if p.is_alive():
@@ -764,7 +766,7 @@ def _print_status(args):
         print('  (none)')
     else:
         print(f'  {"Source":<13s}  {"Ans":>4s}  '
-              f'{"Chunks":<12s}  {"Best guess":<12s}  {"ERD":>6s}  '
+              f'{"Chunks":<14s}  {"Best guess":<12s}  {"ERD":>6s}  '
               f'{"Pri":>3s}  {"Wkrs":>4s}  ETA')
     for b in branches:
         key = bytes(b['branch_key'])
