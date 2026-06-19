@@ -874,11 +874,7 @@ def _print_status(args):
         n_in_prog = counts.get('in_progress', 0)
         n_pending = counts.get('pending', 0)
         n_done = counts.get('done', 0)
-        parts = []
-        if n_done:
-            parts.append(f'done {n_done:,}')
-        parts.append(f'in progress {n_in_prog}')
-        parts.append(f'pending {n_pending:,}')
+        parts = [f'done {n_done:,}', f'in progress {n_in_prog}', f'pending {n_pending:,}']
         branch_hdr += '  ' + ',  '.join(parts)
     print(branch_hdr)
     if not branches:
@@ -919,9 +915,9 @@ def _print_status(args):
     if live and total_evals:
         parts = []
         if cutoff_pct is not None:
-            parts.append(f'bound {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({_fmt_pct(cutoff_pct)})')
+            parts.append(f'ERD-pruned {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({_fmt_pct(cutoff_pct)})')
         if pruned_pct is not None:
-            parts.append(f'floor {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({_fmt_pct(pruned_pct)})')
+            parts.append(f'depth-pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({_fmt_pct(pruned_pct)})')
         if parts:
             worker_hdr = f'Workers ({", ".join(parts)}):'
     print(worker_hdr)
