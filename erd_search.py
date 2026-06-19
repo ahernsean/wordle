@@ -742,7 +742,7 @@ def _watch_with_keys(args, interval):
 
 
 def _highlight_changes(new_line, old_line):
-    """Return new_line with runs of changed characters highlighted in bold yellow."""
+    """Return new_line with runs of changed characters highlighted in bold red."""
     if new_line == old_line:
         return new_line
     result = []
@@ -750,7 +750,7 @@ def _highlight_changes(new_line, old_line):
     for i, ch in enumerate(new_line):
         changed = i >= len(old_line) or ch != old_line[i]
         if changed and not in_change:
-            result.append('\033[1;33m')
+            result.append('\033[1;31m')
             in_change = True
         elif not changed and in_change:
             result.append('\033[0m')
@@ -852,27 +852,41 @@ def _print_status(args):
             return f'{n/1_000:.1f}k'
         return str(n)
 
+    def _fmt_pct(pct):
+        if pct >= 99.95:
+            return f'{pct:.3f}%'
+        if pct >= 99.5:
+            return f'{pct:.2f}%'
+        return f'{pct:.1f}%'
+
     print(f'ERD_ALL Precache — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     cache_line = f'Cache:  {total_erd:,} ERD entries   +{recent:,} in last 5m' if cache_ok else None
     if cache_line and hit_pct is not None:
-        cache_line += f'   hits {_abbrev(hits)}/{_abbrev(hit_total)} ({hit_pct:.1f}%)'
+        cache_line += f'   hits {_abbrev(hits)}/{_abbrev(hit_total)} ({_fmt_pct(hit_pct)})'
     if cache_line:
         print(cache_line)
     print()
 
     # Branches in progress — the real progress unit.
+    _COOP_PRIORITY = 1_000_000   # sentinel: cooperative sub-branch, not user-queued
     branch_hdr = 'Branches:'
     if queue_ok:
-        branch_hdr += (f'  done {counts.get("done", 0):,},'
-                       f'  in progress {len(branches)},'
-                       f'  pending {counts.get("pending", 0):,}')
+        n_in_prog = counts.get('in_progress', 0)
+        n_pending = counts.get('pending', 0)
+        n_done = counts.get('done', 0)
+        parts = []
+        if n_done:
+            parts.append(f'done {n_done:,}')
+        parts.append(f'in progress {n_in_prog}')
+        parts.append(f'pending {n_pending:,}')
+        branch_hdr += '  ' + ',  '.join(parts)
     print(branch_hdr)
     if not branches:
         print('  (none)')
     else:
         print(f'  {"Source":<13s}  {"Ans":>4s}  '
               f'{"Chunks":<14s}  {"Best guess":<12s}  {"ERD":>6s}  '
-              f'{"Pri":>3s}  {"Wkrs":>4s}  ETA')
+              f'{"Pri":>6s}  {"Wkrs":>4s}  ETA')
     for b in branches:
         key = bytes(b['branch_key'])
         n_cands = b['n_candidates'] or 0
@@ -886,7 +900,8 @@ def _print_status(args):
         be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '---'
         nw = b['n_words'] or 0
         wk = worker_counts.get(key, 0)
-        pri = b['priority'] or 0
+        raw_pri = b['priority'] or 0
+        pri_str = 'HELD' if raw_pri >= _COOP_PRIORITY else str(raw_pri)
         created = b['created_at'] or now_ts
         el = now_ts - created
         eta = ''
@@ -895,7 +910,7 @@ def _print_status(args):
             eta = _fmt_duration(int(rem))
         print(f'  {src:<13s}  {nw:4d}  '
               f'{done:3d}/{n_chunks:<3d} ({pct:5.1f}%)  '
-              f'{bw:<12s}  {be:>6s}  {pri:3d}  {wk:4d}  {eta}')
+              f'{bw:<12s}  {be:>6s}  {pri_str:>6s}  {wk:4d}  {eta}')
     print()
 
     # Workers — liveness and forward progress.
@@ -904,9 +919,9 @@ def _print_status(args):
     if live and total_evals:
         parts = []
         if cutoff_pct is not None:
-            parts.append(f'cutoff {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({cutoff_pct:.1f}%)')
+            parts.append(f'bound {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({_fmt_pct(cutoff_pct)})')
         if pruned_pct is not None:
-            parts.append(f'pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({pruned_pct:.1f}%)')
+            parts.append(f'floor {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({_fmt_pct(pruned_pct)})')
         if parts:
             worker_hdr = f'Workers ({", ".join(parts)}):'
     print(worker_hdr)
