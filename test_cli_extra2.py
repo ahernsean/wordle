@@ -25,7 +25,10 @@ def _second_board(gs):
 class TestParseResponse(unittest.TestCase):
     def test_invalid_char(self):
         with redirect_stdout(io.StringIO()):
-            self.assertIsNone(parse_response("xxxxx"))
+            self.assertIsNone(parse_response("qqqqq"))
+
+    def test_x_is_gray(self):
+        self.assertEqual(parse_response("xxxxx"), ["gray"] * 5)
 
     def test_space_separated_parts(self):
         self.assertEqual(parse_response("green gray gray gray gray")[0], "green")

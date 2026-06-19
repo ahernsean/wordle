@@ -5,18 +5,19 @@ Used by both the interactive game (wordle.py) and the swarm CLI (erd_search.py).
 
 
 def _is_gray_char(ch: str) -> bool:
-    """Accept 0, _, and any non-alphanumeric character as gray.
+    """Accept 0, _, x, and any non-alphanumeric character as gray.
 
     Accommodates mobile keyboards where -- becomes an em dash
-    and .. becomes a period-space.
+    and .. becomes a period-space.  x is accepted because leading '-'
+    characters are misread as flags by argparse on the CLI.
     """
-    return ch == '0' or ch == '_' or not ch.isalnum()
+    return ch == '0' or ch == '_' or ch.lower() == 'x' or not ch.isalnum()
 
 
 def parse_pattern(s: str) -> int:
     """Parse a 5-character response string to its integer code.
 
-    g = green, y = yellow, 0 / _ / any non-alphanumeric = gray.
+    g = green, y = yellow, 0 / _ / x / any non-alphanumeric = gray.
     Raises ValueError on unrecognised characters or wrong length.
     Leftmost character is the most significant trit.
     """
