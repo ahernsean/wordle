@@ -696,6 +696,21 @@ class ERDQueue:
             (branch_key,)
         ).fetchone()
 
+    def status_by_branch_keys(self, branch_keys) -> dict:
+        """Return {branch_key: pending_branches row} for the given keys.
+
+        A branch_key with no row was never queued; it is simply absent from
+        the returned dict.
+        """
+        if not branch_keys:
+            return {}
+        placeholders = ','.join('?' for _ in branch_keys)
+        rows = self._conn.execute(
+            f"SELECT * FROM pending_branches WHERE branch_key IN ({placeholders})",
+            list(branch_keys)
+        ).fetchall()
+        return {bytes(r["branch_key"]): r for r in rows}
+
     def get_active_branch(self, branch_key: bytes):
         """Return the active_branches row for branch_key, or None."""
         return self._conn.execute(

@@ -37,6 +37,9 @@ export          Create a trimmed snapshot of the cache for the iPhone
 
 cache-status    Show ERD cache coverage for a given word: which response
                 patterns are cached and which are missing.
+
+queue-status    Show swarm queue coverage for a given word: which response
+                patterns are pending, in progress, done, or not yet queued.
 """
 
 from __future__ import annotations
@@ -131,6 +134,76 @@ def cmd_cache_status(args):
     if missing:
         print(f'{"Pattern":<8}  {"Ans":>4}  (missing)')
         for pat, n in missing:
+            print(f'  {pat:<8}  {n:4d}')
+
+
+# ---------------------------------------------------------------------------
+# queue-status
+# ---------------------------------------------------------------------------
+
+def cmd_queue_status(args):
+    """Show swarm queue coverage for a given word.
+
+    For each of the 242 possible response patterns for WORD, reports the
+    branch's status in the queue (pending_branches): pending, in_progress,
+    done, or not yet queued at all.
+    """
+    from wordle_ui import fmt_pattern
+
+    all_answers = load_word_list(ANSWER_FILE)
+    word = args.word.strip().lower()
+
+    sc = ScoreCache(args.cache, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    groups = rcache.group_words(word, all_answers)
+    sc.close()
+
+    branches = {code: branch for code, branch in groups.items() if len(branch) >= 2}
+    branch_keys = {code: encode_subset(branch) for code, branch in branches.items()}
+
+    queue = ERDQueue(args.queue)
+    rows = queue.status_by_branch_keys(list(branch_keys.values()))
+    queue.close()
+
+    pending, in_progress, done, unqueued = [], [], [], []
+    for code, branch in sorted(branches.items()):
+        pat = fmt_pattern(code)
+        n = len(branch)
+        row = rows.get(branch_keys[code])
+        if row is None:
+            unqueued.append((pat, n))
+        elif row['status'] == 'pending':
+            pending.append((pat, n, row['priority']))
+        elif row['status'] == 'in_progress':
+            in_progress.append((pat, n, row['priority'], row['claimed_by']))
+        else:
+            done.append((pat, n))
+
+    n_trivial = len(groups) - len(branches)
+
+    print(f'{word.upper()}:  {len(branches)} branches with ≥2 answers  '
+          f'({n_trivial} trivial patterns skipped)')
+    print(f'  Pending    : {len(pending):4d}')
+    print(f'  In progress: {len(in_progress):4d}')
+    print(f'  Done       : {len(done):4d}')
+    print(f'  Not queued : {len(unqueued):4d}')
+    print()
+
+    if in_progress:
+        print(f'{"Pattern":<8}  {"Ans":>4}  {"Pri":>4}  Claimed by')
+        for pat, n, priority, claimed_by in in_progress:
+            print(f'  {pat:<8}  {n:4d}  {priority:4d}  {claimed_by or "---"}')
+        print()
+
+    if pending:
+        print(f'{"Pattern":<8}  {"Ans":>4}  {"Pri":>4}')
+        for pat, n, priority in pending:
+            print(f'  {pat:<8}  {n:4d}  {priority:4d}')
+        print()
+
+    if unqueued and not args.queued_only:
+        print(f'{"Pattern":<8}  {"Ans":>4}  (not queued)')
+        for pat, n in unqueued:
             print(f'  {pat:<8}  {n:4d}')
 
 
@@ -949,6 +1022,16 @@ def main():
                       help='Only list patterns whose branches are not yet cached')
     p_cs.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
 
+    # -- queue-status --
+    p_qs = sub.add_parser('queue-status',
+                           help='Show swarm queue coverage for a word')
+    p_qs.add_argument('--word', required=True, metavar='WORD',
+                      help='Guess word to inspect (e.g. salet)')
+    p_qs.add_argument('--queued-only', action='store_true',
+                      help='Only list patterns that are pending or in progress')
+    p_qs.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_qs.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+
     # -- queue-add --
     p_qa = sub.add_parser('queue-add',
                           help='Add branches for a word (or word list) to the queue')
@@ -1045,6 +1128,7 @@ def main():
 
     dispatch = {
         'cache-status': cmd_cache_status,
+        'queue-status': cmd_queue_status,
         'queue-add': cmd_queue_add,
         'queue-clear': cmd_queue_clear,
         'queue-inspect': cmd_queue_inspect,
