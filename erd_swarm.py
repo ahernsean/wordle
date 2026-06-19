@@ -52,6 +52,7 @@ HB_SECONDS = 2.0              # liveness heartbeat cadence during a long chunk
 # heartbeats, which is conservative enough for any real process death.
 HB_TIMEOUT_SECONDS = 30
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
+PROGRESS_LOG_SECONDS = 120   # log a mid-candidate progress line this often
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
 
@@ -113,6 +114,7 @@ class _BranchWorker:
         self._nodes_at_last_hb = 0
         self._cur_depth = 0
         self._spine = {}             # depth -> subset size on the active descent
+        self._last_progress_log = 0.0
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
         self._top_source_word = None
@@ -217,6 +219,17 @@ class _BranchWorker:
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._spine_str())
+        if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:
+            self._last_progress_log = now
+            be = f'{best_erd:.4f}' if best_erd is not None else '-'
+            bg = (best_guess or '-').upper()
+            logger.info('%s chunk %d: %s %d/%d in progress  '
+                        'depth=%d path=%s  %.1fM nodes %.0fk/s  best=%s %s',
+                        self.name, chunk_idx,
+                        cur_candidate.upper(), cand_n_seen or 0,
+                        cand_chunk_size or 0,
+                        self._cand_max_depth, self._spine_str(),
+                        self._nodes / 1e6, node_rate / 1e3, bg, be)
 
     # -- evaluate one chunk -------------------------------------------------
 

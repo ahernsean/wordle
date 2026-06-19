@@ -805,19 +805,29 @@ def _print_status(args):
     print(worker_hdr)
     if not hbs:
         print('  (none active)')
+    else:
+        print(f'  {"W":>2}  {"Source":<13}  {"Ck":>2}  {"Held":>6}  '
+              f'{"Eval":>4}  {"Prn":>4}  {"Candidate":<15}  '
+              f'{"D":>2}  {"kN/s":>4}  {"Best":<5}  {"ERD":>5}  '
+              f'{"Path":<9}  HB')
     for h in sorted(hbs, key=lambda r: r['worker_id']):
         age = now_ts - h['updated_at']
-        flag = '  !!STALE' if age > 120 else ''
+        wnum = h['worker_id'].split('-')[-1] if '-' in h['worker_id'] else h['worker_id']
+        flag = ' !!' if age > 120 else ''
         key = h['current_branch_key']
         if key is None:
-            print(f'  {h["worker_id"]:<10s} idle{"":40s}hb={age}s{flag}')
+            print(f'  {wnum:>2}  {"(idle)":<13}  {"":>2}  {"":>6}  '
+                  f'{"":>4}  {"":>4}  {"":15}  '
+                  f'{"":>2}  {"":>4}  {"":5}  {"":>5}  '
+                  f'{"":9}  {age}s{flag}')
             continue
         src = (f'{h["source_word"].upper()} {fmt_pattern(h["source_pattern"])}'
                if h['source_word'] and h['source_pattern'] is not None
                else '-----')
-        chunk = h['chunk_idx'] if h['chunk_idx'] is not None else '-'
+        chunk = str(h['chunk_idx']) if h['chunk_idx'] is not None else '-'
         held = now_ts - (h['chunk_started_at'] or now_ts)
-        done = h['chunks_done'] or 0
+        n_ok = h['n_ok'] or 0
+        n_pruned = h['n_pruned'] or 0
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
         n_seen = (h['cand_n_seen'] if 'cand_n_seen' in h.keys() else None) or 0
         c_total = (h['cand_chunk_size'] if 'cand_chunk_size' in h.keys() else None) or 0
@@ -825,23 +835,22 @@ def _print_status(args):
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
         nrate = (h['node_rate'] if 'node_rate' in h.keys() else None) or 0.0
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
+        best_g = (h['best_guess'] if 'best_guess' in h.keys() else None) or ''
+        best_e = (h['best_erd'] if 'best_erd' in h.keys() else None)
         # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
-        moving = '  !!HANG' if (age <= 10 and nrate == 0 and nodes) else ''
+        if age <= 10 and nrate == 0 and nodes:
+            flag = ' ~?'
+        best_g_disp = best_g.upper() if best_g else '-----'
+        best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
         if cur:
-            # "evals" = recursive candidate evaluations at any depth in the tree.
-            # "path" = sub-branch answer-word counts along the active recursion
-            #          spine, e.g. "54>21>8" means we're 3 levels deep with those
-            #          branch sizes at each level.
-            cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else '')
-            cand_s = (f' [{cur_disp} {n_seen}/{c_total} '
-                      f'depth {mdepth} '
-                      f'{nodes/1e6:.1f}M evals {nrate/1000:.0f}k/s '
-                      f'path:{path}]')
+            cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
+            cand_col = f'{cur_disp:<6} {n_seen:>3}/{c_total}'
         else:
-            cand_s = ''
-        print(f'  {h["worker_id"]:<10s} {src:<13s} chunk {str(chunk):>3s} '
-              f'held {_fmt_duration(held):>5s}  '
-              f'done {done:<4d} hb={age}s{flag}{moving}{cand_s}')
+            cand_col = ''
+        print(f'  {wnum:>2}  {src:<13}  {chunk:>2}  {_fmt_duration(held):>6}  '
+              f'{n_ok:>4}  {n_pruned:>4}  {cand_col:<15}  '
+              f'{mdepth:>2}  {int(nrate/1000):>4}  {best_g_disp:<5}  {best_e_disp:>5}  '
+              f'{path:<9}  {age}s{flag}')
 
 
 def _fmt_duration(seconds: int) -> str:
