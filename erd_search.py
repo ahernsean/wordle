@@ -48,8 +48,10 @@ import argparse
 import logging
 import multiprocessing
 import os
+import select
 import signal
 import sys
+import termios
 import time
 from datetime import datetime
 
@@ -687,15 +689,47 @@ def _setup_supervisor_logging():
 def cmd_status(args):
     if args.watch is not None:
         interval = args.watch if args.watch > 0 else 30
-        try:
-            while True:
-                print('\033[2J\033[H', end='')  # clear screen
-                _print_status(args)
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            pass
+        if sys.stdin.isatty():
+            _watch_with_keys(args, interval)
+        else:
+            try:
+                while True:
+                    print('\033[2J\033[H', end='')
+                    _print_status(args)
+                    time.sleep(interval)
+            except KeyboardInterrupt:
+                pass
     else:
         _print_status(args)
+
+
+def _watch_with_keys(args, interval):
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    new_settings = termios.tcgetattr(fd)
+    # Disable canonical mode and echo without touching output processing (OPOST).
+    # tty.setraw() also clears OPOST, which breaks \n → \r\n translation.
+    new_settings[3] &= ~(termios.ICANON | termios.ECHO)
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
+        while True:
+            print('\033[2J\033[H', end='', flush=True)
+            _print_status(args)
+            sys.stdout.flush()
+            deadline = time.monotonic() + interval
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([sys.stdin], [], [], min(remaining, 0.2))
+                if ready:
+                    ch = sys.stdin.read(1)
+                    if ch in ('q', 'Q', '\x03', '\x04'):  # q, Ctrl-C, Ctrl-D
+                        return
+                    if ch == ' ':
+                        break  # force refresh now
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def _print_status(args):
@@ -808,10 +842,8 @@ def _print_status(args):
     if not hbs:
         print('  (none active)')
     else:
-        print(f'  {"W":>2}  {"Source":<13}  {"Ck":>2}  {"Held":>6}  '
-              f'{"Eval":>4}  {"Prn":>4}  {"Candidate":<15}  '
-              f'{"D":>2}  {"kN/s":>4}  {"Best":<5}  {"ERD":>5}  '
-              f'{"Path":<9}  HB')
+        print(f'  {"W":>2}  {"Branch":<13} {"Chk":>3}  {"Held":>6}  '
+              f'{"Best":<5}  {"ERD":>5}  HB')
     for h in sorted(hbs, key=lambda r: r['worker_id']):
         age = now_ts - h['updated_at']
         wnum = h['worker_id'].split('-')[-1] if '-' in h['worker_id'] else h['worker_id']
@@ -819,17 +851,13 @@ def _print_status(args):
         key = h['current_branch_key']
         if key is None:
             print(f'  {wnum:>2}  {"(idle)":<13}  {"":>2}  {"":>6}  '
-                  f'{"":>4}  {"":>4}  {"":15}  '
-                  f'{"":>2}  {"":>4}  {"":5}  {"":>5}  '
-                  f'{"":9}  {age}s{flag}')
+                  f'{"":5}  {"":>5}  {age}s{flag}')
             continue
         src = (f'{h["source_word"].upper()} {fmt_pattern(h["source_pattern"])}'
                if h['source_word'] and h['source_pattern'] is not None
                else '-----')
         chunk = str(h['chunk_idx']) if h['chunk_idx'] is not None else '-'
         held = now_ts - (h['chunk_started_at'] or now_ts)
-        n_ok = h['n_ok'] or 0
-        n_pruned = h['n_pruned'] or 0
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
         n_seen = (h['cand_n_seen'] if 'cand_n_seen' in h.keys() else None) or 0
         c_total = (h['cand_chunk_size'] if 'cand_chunk_size' in h.keys() else None) or 0
@@ -837,6 +865,8 @@ def _print_status(args):
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
         nrate = (h['node_rate'] if 'node_rate' in h.keys() else None) or 0.0
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
+        if '>' in path:
+            path = path.replace('>', '→')
         best_g = (h['best_guess'] if 'best_guess' in h.keys() else None) or ''
         best_e = (h['best_erd'] if 'best_erd' in h.keys() else None)
         # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
@@ -844,15 +874,14 @@ def _print_status(args):
             flag = ' ~?'
         best_g_disp = best_g.upper() if best_g else '-----'
         best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
+        print(f'  {wnum:>2}  {src:<13}  {chunk:>2}  {_fmt_duration(held):>6}  '
+              f'{best_g_disp:<5}  {best_e_disp:>5}  {age}s{flag}')
         if cur:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
-            cand_col = f'{cur_disp:<6} {n_seen:>3}/{c_total}'
+            krate = f'{int(nrate / 1000)}kN/s'
+            print(f'       {cur_disp}  {n_seen:>4}/{c_total:<4}  MaxD:{mdepth}  {krate:>7}  {path}')
         else:
-            cand_col = ''
-        print(f'  {wnum:>2}  {src:<13}  {chunk:>2}  {_fmt_duration(held):>6}  '
-              f'{n_ok:>4}  {n_pruned:>4}  {cand_col:<15}  '
-              f'{mdepth:>2}  {int(nrate/1000):>4}  {best_g_disp:<5}  {best_e_disp:>5}  '
-              f'{path:<9}  {age}s{flag}')
+            print()
 
 
 def _fmt_duration(seconds: int) -> str:
