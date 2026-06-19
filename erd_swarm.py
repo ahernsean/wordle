@@ -22,7 +22,6 @@ full coverage.  So a crashed worker's chunk is redone, never skipped.
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import os
 import signal
 import time
@@ -515,13 +514,12 @@ class _BranchWorker:
             self._maybe_checkpoint()
             self._check_ram()
 
-    # -- focused single-branch loop (standalone solve-branch) ---------------
+    # -- focused single-branch loop ------------------------------------------
 
     def solve_branch_focused(self, branch_key):
         """Help solve one already-registered branch to completion: claim and
         evaluate its chunks alongside any sibling workers, finalizing it once
-        every chunk is done.  The body of _focused_worker, factored out so it
-        can be driven directly (signal setup stays in the process wrapper)."""
+        every chunk is done."""
         branch = self.queue.get_branch(branch_key)
         if branch is None or branch['status'] != 'open':
             return
@@ -586,74 +584,3 @@ def _setup_logging(worker_id):
     h.setFormatter(logging.Formatter('%(asctime)s %(levelname)-7s %(message)s'))
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
-
-
-# ---------------------------------------------------------------------------
-# Standalone single-branch solve (the `solve-branch` CLI), reusing the swarm
-# machinery: register one branch directly, then point N focused workers at it.
-# ---------------------------------------------------------------------------
-
-def _focused_worker(branch_key, worker_id, cache_path, queue_path,
-                    min_words_per_chunk, max_chunk_count, n_workers=1):
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    w = _BranchWorker(worker_id, cache_path, queue_path, None,
-                      min_words_per_chunk, max_chunk_count, n_workers=n_workers)
-    try:
-        w.solve_branch_focused(branch_key)
-    finally:
-        w.close()
-
-
-def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
-                     min_words_per_chunk=3, max_chunk_count=256, priority=1,
-                     source_word=None, source_pattern=None, budget=ROOT_BUDGET,
-                     timeout=None):
-    """Solve one branch by swarming N workers across its candidates.
-
-    n_workers is capped at the number of chunks so we never spawn a process
-    that will immediately find no work and exit.
-
-    Returns (best_guess, best_erd) or None.  If timeout is given (seconds),
-    any worker still running after that long is killed and the result will be
-    None (branch unfinished).
-    """
-    all_answers = load_word_list(ANSWER_FILE)
-    all_words = load_word_list(WORDS_FILE)
-    score_cache = ScoreCache(cache_path, all_answers)
-    queue = ERDQueue(queue_path)
-
-    existing = score_cache.read(branch_key, ERD_ALL)
-    if existing is not None:
-        queue.close()
-        score_cache.close()
-        return existing
-
-    chunk_size = ERDQueue.chunk_size_for(
-        len(words), len(all_words), min_words_per_chunk, max_chunk_count)
-    n_chunks = ERDQueue.n_chunks_for(len(all_words), chunk_size)
-    actual_workers = min(n_workers, n_chunks)
-    queue.create_branch(branch_key, len(words), len(all_words), chunk_size,
-                        priority=priority, source_word=source_word,
-                        source_pattern=source_pattern, budget=budget)
-    queue.close()
-    score_cache.close()
-
-    procs = [mp.Process(target=_focused_worker,
-                        args=(branch_key, w, cache_path, queue_path,
-                              min_words_per_chunk, max_chunk_count, actual_workers))
-             for w in range(actual_workers)]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(timeout=timeout)
-    for p in procs:
-        if p.is_alive():
-            p.kill()
-            p.join()
-
-    score_cache = ScoreCache(cache_path, all_answers)
-    try:
-        return score_cache.read(branch_key, ERD_ALL)
-    finally:
-        score_cache.close()

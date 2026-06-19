@@ -16,7 +16,8 @@ queue-add       Add branches for a word or word list to the work queue.
                 Idempotent: existing branches are never duplicated; priority
                 is upgraded if the new request is higher.  With --word-list,
                 --priority-words marks a subset of the list's words as
-                higher priority.
+                higher priority.  --delete-erd-cache forces a recompute of
+                branches that are already cached.
 
 queue-clear     Wipe all queue state (pending branches, active state, chunk
                 claims, heartbeats).  Does not touch the ERD cache.
@@ -29,10 +30,6 @@ queue-remove    Remove a pending branch from the queue.  Use --force to also
 
 queue-priority  Change the priority of a queued branch.  Higher numbers are
                 worked sooner; 0 is the default.
-
-solve-branch    Swarm N workers onto one specific branch to completion.
-                Useful for large branches that the regular queue would take
-                very long to reach.
 
 export          Create a trimmed snapshot of the cache for the iPhone
                 (answer_list, response_decomposition, branch_best_by_policy).
@@ -153,7 +150,9 @@ def cmd_queue_add(args):
     are queued at --priority while the rest are queued at 0.
 
     Already-queued branches are never duplicated; their priority is upgraded
-    if the new request is higher.
+    if the new request is higher.  --delete-erd-cache deletes each queued
+    branch's existing ERD cache entry first, so it gets recomputed instead of
+    being claimed and immediately marked done as already-cached.
     """
     from wordle_ui import parse_pattern, fmt_pattern
 
@@ -203,6 +202,9 @@ def cmd_queue_add(args):
                     if 2 <= len(branch) <= args.max_branch_size
                 ]
             if rows:
+                if args.delete_erd_cache:
+                    for branch_key, *_rest in rows:
+                        score_cache.delete(branch_key, ERD_ALL)
                 queue.add_pending_many(rows)
                 n_added += len(rows)
 
@@ -881,106 +883,6 @@ def cmd_export(args):
 
 
 # ---------------------------------------------------------------------------
-# solve-branch (swarm N workers on one branch's candidate guesses)
-# ---------------------------------------------------------------------------
-
-def cmd_solve_branch(args):
-    """Solve one branch by swarming N workers across its candidate guesses.
-
-    For a branch too large for a single worker to finish (e.g. an opener's
-    all-gray response), this fans the ~12,972 candidate guesses out across
-    workers sharing one running best ERD, instead of grinding them serially.
-    Writes the result (and every sub-branch, as a recursion side effect) to
-    the persistent cache.
-    """
-    import threading
-    from wordle_ui import parse_pattern, fmt_pattern
-    from erd_swarm import run_branch_solve
-
-    all_answers = load_word_list(ANSWER_FILE)
-    word = args.word.strip().lower()
-    code = parse_pattern(args.pattern)
-
-    sc = ScoreCache(args.cache, all_answers)
-    rcache = ResponseCache(all_answers, sc)
-    groups = rcache.group_words(word, all_answers)
-    branch = groups.get(code, [])
-    pat = fmt_pattern(code)
-
-    if len(branch) < 2:
-        print(f'{word.upper()} {pat}: branch has {len(branch)} word(s) — '
-              f'nothing to solve (singletons resolve on the next guess).')
-        sc.close()
-        return
-
-    branch_key = encode_subset(branch)
-    existing = sc.read(branch_key, ERD_ALL)
-    sc.close()
-
-    print(f'{word.upper()} {pat}  —  {len(branch)} words')
-    if existing is not None and not args.force:
-        print(f'Already cached: {existing[0].upper()} ERD={existing[1]:.4f}  '
-              f'(pass --force to recompute)')
-        return
-
-    stop = threading.Event()
-
-    def monitor():
-        """Poll the branch row and print live progress until it finishes."""
-        started = time.time()
-        while not stop.is_set():
-            try:
-                q = ERDQueue(args.queue)
-                row = q.get_branch(branch_key)
-                if row is not None:
-                    n_chunks = ERDQueue.n_chunks_for(
-                        row['n_candidates'], row['chunk_size'])
-                    done = q.branch_done_chunks(branch_key)
-                    bw, be = q.read_branch_best(branch_key)
-                    el = int(time.time() - started)
-                    pct = 100.0 * done / n_chunks if n_chunks else 0.0
-                    best = (f'{bw.upper()} {be:.4f}'
-                            if bw is not None else 'searching...')
-                    eta = ''
-                    if done > 0 and done < n_chunks:
-                        rate = done / max(1, el)            # chunks/sec
-                        rem = (n_chunks - done) / rate if rate else 0
-                        eta = f'  ETA {_fmt_duration(int(rem))}'
-                    print(f'\r  chunks {done:4d}/{n_chunks:<4d} ({pct:4.0f}%)  '
-                          f'best={best:<18s}  {_fmt_duration(el)}{eta}   ',
-                          end='', flush=True)
-                q.close()
-            except Exception:
-                pass
-            stop.wait(3.0)
-
-    if args.force:
-        sc2 = ScoreCache(args.cache, all_answers)
-        sc2.delete(branch_key, ERD_ALL)
-        sc2.close()
-
-    mon = threading.Thread(target=monitor, daemon=True)
-    mon.start()
-    t0 = time.time()
-    result = run_branch_solve(
-        branch_key, branch, n_workers=args.workers,
-        cache_path=args.cache, queue_path=args.queue,
-        min_words_per_chunk=args.min_words_per_chunk,
-        max_chunk_count=args.max_chunk_count,
-        priority=args.priority, source_word=word, source_pattern=code)
-
-    stop.set()
-    mon.join(timeout=4)
-    print()
-    elapsed = _fmt_duration(int(time.time() - t0))
-    if result is not None:
-        print(f'Done in {elapsed}:  {word.upper()} {pat}  ->  '
-              f'{result[0].upper()}  ERD={result[1]:.4f}')
-    else:
-        print(f'No result after {elapsed} — check workers / rerun to resume.')
-
-
-# ---------------------------------------------------------------------------
 # reset-stale
 # ---------------------------------------------------------------------------
 
@@ -1038,30 +940,6 @@ def main():
                         metavar='SECONDS',
                         help='Repeat every SECONDS (default 30)')
 
-    # -- solve-branch --
-    p_sb = sub.add_parser('solve-branch',
-                          help='Swarm N workers to solve one large branch')
-    p_sb.add_argument('--word', required=True, metavar='WORD',
-                      help='Opening guess word (e.g. salet)')
-    p_sb.add_argument('--pattern', required=True, metavar='PAT',
-                      help="Response pattern, 5 chars: g=green y=yellow, gray "
-                           "as . or - (use dots to avoid the shell/argparse "
-                           "leading-dash trap, e.g. --pattern ..... for "
-                           "all-gray, or --pattern=-y-g-)")
-    p_sb.add_argument('--workers', type=int, default=6, metavar='N',
-                      help='Worker processes to swarm the branch (default: 6)')
-    p_sb.add_argument('--min-words-per-chunk', type=int, default=3, metavar='N',
-                      help='Minimum answer-word count per chunk (default: 3); '
-                           'see `run --min-words-per-chunk`')
-    p_sb.add_argument('--max-chunk-count', type=int, default=256, metavar='N',
-                      help='Cap on number of chunks for the branch (default: 256)')
-    p_sb.add_argument('--priority', type=int, default=1, metavar='P',
-                      help='Priority recorded on the branch (default: 1)')
-    p_sb.add_argument('--force', action='store_true',
-                      help='Recompute even if the branch is already cached')
-    p_sb.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_sb.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-
     # -- cache-status --
     p_cs = sub.add_parser('cache-status',
                            help='Show ERD cache coverage for a word')
@@ -1093,6 +971,10 @@ def main():
     p_qa.add_argument('--max-branch-size', type=int, default=300, metavar='N',
                       help='Skip branches with more than N answer words '
                            '(default: 300)')
+    p_qa.add_argument('--delete-erd-cache', action='store_true',
+                      help='Delete any existing ERD cache entry for each '
+                           'queued branch first, so it is recomputed instead '
+                           'of being skipped as already-cached')
     p_qa.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qa.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
 
@@ -1174,7 +1056,6 @@ def main():
         'status': cmd_status,
         'reset-stale': cmd_reset_stale,
         'export': cmd_export,
-        'solve-branch': cmd_solve_branch,
     }
     dispatch[args.cmd](args)
 
