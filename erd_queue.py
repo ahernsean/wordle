@@ -227,7 +227,7 @@ class ERDQueue:
         self._conn.close()
 
     # ------------------------------------------------------------------
-    # Bootstrap / populate-queue
+    # Populate queue
     # ------------------------------------------------------------------
 
     def add_pending_many(self, rows):
@@ -238,7 +238,7 @@ class ERDQueue:
         - A row already present has its priority UPGRADED (never downgraded),
           e.g. a branch first inserted at priority=0 by an earlier root word
           is correctly promoted to priority=1 when a VIP word (SALET) is
-          bootstrapped later.
+          queued later.
         - source_word / source_pattern record the first root word whose branch
           produced this entry (kept for display in `status`).
         """

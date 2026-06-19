@@ -116,8 +116,12 @@ python3.13 erd_search.py queue-add --word salet
 # One specific branch (word + response pattern):
 python3.13 erd_search.py queue-add --word salet --pattern .....
 
-# All words in a file (equivalent to the old bootstrap command):
+# All words in a file:
 python3.13 erd_search.py queue-add --word-list wordle.txt
+
+# All words in a file, with a subset prioritized (others queued at 0):
+python3.13 erd_search.py queue-add --word-list wordle.txt \
+    --priority-words salet crane --priority 1
 ```
 
 `queue-add` is idempotent: already-queued branches are never duplicated, and

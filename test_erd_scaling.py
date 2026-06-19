@@ -98,7 +98,7 @@ class TestWorkDoesNotAmplify(_Base):
     def _solve_counting_work(self, n_workers):
         cache_path, queue_path = self._db(f"work{n_workers}")
         # Apply schema migrations once before the worker threads open the cache
-        # concurrently (production always has a single pre-open: bootstrap, or
+        # concurrently (production always has a single pre-open: queue-add, or
         # run_branch_solve's parent).
         ScoreCache(cache_path, BRANCH).close()
         n_chunks = self._register_branch(queue_path)

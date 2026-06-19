@@ -13,9 +13,10 @@ run             Start the supervisor directly (without systemd), for
                 development or one-shot use.  All output goes to erd_search.log.
 
 queue-add       Add branches for a word or word list to the work queue.
-                Replaces the old 'bootstrap' command.  Idempotent: existing
-                branches are never duplicated; priority is upgraded if the new
-                request is higher.
+                Idempotent: existing branches are never duplicated; priority
+                is upgraded if the new request is higher.  With --word-list,
+                --priority-words marks a subset of the list's words as
+                higher priority.
 
 queue-clear     Wipe all queue state (pending branches, active state, chunk
                 claims, heartbeats).  Does not touch the ERD cache.
@@ -39,9 +40,6 @@ export          Create a trimmed snapshot of the cache for the iPhone
 
 cache-status    Show ERD cache coverage for a given word: which response
                 patterns are cached and which are missing.
-
-bootstrap       (Legacy) Walk a word list and populate the queue.  Use
-                queue-add instead.
 """
 
 from __future__ import annotations
@@ -66,87 +64,6 @@ DEFAULT_CACHE = 'wordle_cache.sqlite3'
 DEFAULT_QUEUE = 'erd_queue.sqlite3'
 
 logger = logging.getLogger('wordle')
-
-
-# ---------------------------------------------------------------------------
-# bootstrap
-# ---------------------------------------------------------------------------
-
-def cmd_bootstrap(args):
-    all_answers = load_word_list(ANSWER_FILE)
-    root_words = load_word_list(args.root_words or WORDS_FILE)
-    priority_words = {w.strip().lower() for w in (args.priority_words or [])}
-    unknown = priority_words - set(root_words)
-    if unknown:
-        print(f'Warning: priority words not in root-word list: '
-              f'{", ".join(sorted(unknown))}')
-
-    score_cache = ScoreCache(args.cache, all_answers)
-    rcache = ResponseCache(all_answers, score_cache)
-    queue = ERDQueue(args.queue)
-
-    # Reset any stale in_progress rows from a previous interrupted run.
-    stale = queue.reset_stale_in_progress()
-    if stale:
-        print(f'Reset {stale} stale in_progress rows to pending.')
-
-    # Print answer_list_id so the user can verify it matches their iPhone.
-    print(f'Universe ID : {score_cache.answer_list_id[:16]}...'
-          f'  ({len(all_answers)} answers)')
-    print(f'Root words  : {len(root_words):,}  '
-          f'({len(priority_words)} priority)')
-    print(f'Cache       : {os.path.abspath(args.cache)}')
-    print(f'Queue       : {os.path.abspath(args.queue)}')
-    print()
-
-    # Resumability: track which root words we've already enqueued.
-    raw = queue.get_meta('bootstrap_done_roots') or ''
-    done_roots: set[str] = set(raw.split(',')) if raw else set()
-    remaining = [w for w in root_words if w not in done_roots]
-    print(f'{len(done_roots):,} already done, '
-          f'{len(remaining):,} to process.')
-
-    try:
-        for i, word in enumerate(remaining):
-            groups = rcache.group_words(word, all_answers)
-            priority = 1 if word in priority_words else 0
-            rows = [
-                (encode_subset(branch), len(branch), priority, word, code)
-                for code, branch in groups.items()
-                if 2 <= len(branch) <= args.max_size
-            ]
-            if rows:
-                queue.add_pending_many(rows)
-            done_roots.add(word)
-
-            if (i + 1) % 100 == 0 or i == len(remaining) - 1:
-                queue.set_meta('bootstrap_done_roots',
-                               ','.join(sorted(done_roots)))
-                score_cache.checkpoint()
-                total = queue.total_branches()
-                pct = (len(done_roots) / len(root_words)) * 100
-                print(f'\r  [{len(done_roots):5d}/{len(root_words)}]'
-                      f' {word.upper():<10s}'
-                      f'  {total:,} branches queued'
-                      f'  ({pct:.1f}%)',
-                      end='', flush=True)
-
-        print()
-        queue.set_meta('bootstrap_status', 'done')
-        queue.set_meta('bootstrap_completed_at', str(int(time.time())))
-        total = queue.total_branches()
-        counts = queue.counts_by_status()
-        print(f'\nBootstrap complete.')
-        print(f'  {total:,} distinct branches queued')
-        print(f'  {counts.get("done", 0):,} already done '
-              f'(cached from iPhone)')
-
-    except KeyboardInterrupt:
-        print('\n\nBootstrap interrupted — progress saved, resumable.')
-    finally:
-        score_cache.checkpoint()
-        score_cache.close()
-        queue.close()
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +138,7 @@ def cmd_cache_status(args):
 
 
 # ---------------------------------------------------------------------------
-# queue-add  (replaces bootstrap for targeted loading)
+# queue-add
 # ---------------------------------------------------------------------------
 
 def cmd_queue_add(args):
@@ -232,7 +149,8 @@ def cmd_queue_add(args):
     only that single branch.
 
     With --word-list: walks every word in the file, same as --word repeated.
-    Equivalent to the old 'bootstrap' command.
+    --priority-words marks a subset of those words as higher priority: they
+    are queued at --priority while the rest are queued at 0.
 
     Already-queued branches are never duplicated; their priority is upgraded
     if the new request is higher.
@@ -240,7 +158,7 @@ def cmd_queue_add(args):
     from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
-    priority = args.priority
+    priority_words = {w.strip().lower() for w in (args.priority_words or [])}
 
     score_cache = ScoreCache(args.cache, all_answers)
     rcache = ResponseCache(all_answers, score_cache)
@@ -251,9 +169,17 @@ def cmd_queue_add(args):
     else:
         words_to_process = load_word_list(args.word_list)
 
+    unknown = priority_words - set(words_to_process)
+    if unknown:
+        print(f'Warning: priority words not in the word list: '
+              f'{", ".join(sorted(unknown))}')
+
     n_added = 0
     try:
         for word in words_to_process:
+            priority = (args.priority if (not priority_words
+                                           or word in priority_words)
+                        else 0)
             if args.pattern:
                 code = parse_pattern(args.pattern)
                 groups = rcache.group_words(word, all_answers)
@@ -1075,23 +1001,6 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='cmd', required=True)
 
-    # -- bootstrap --
-    p_boot = sub.add_parser('bootstrap',
-                             help='Populate the work queue from root words')
-    p_boot.add_argument('--root-words', metavar='FILE',
-                        help=f'Root-word list (default: {WORDS_FILE})')
-    p_boot.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH',
-                        help=f'Main cache DB (default: {DEFAULT_CACHE})')
-    p_boot.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH',
-                        help=f'Queue DB (default: {DEFAULT_QUEUE})')
-    p_boot.add_argument('--priority-words', nargs='+', metavar='WORD',
-                        help='Root words whose branches are worked first '
-                             '(e.g. --priority-words salet crane)')
-    p_boot.add_argument('--max-size', type=int, default=300, metavar='N',
-                        help='Skip branches with more than N answer words '
-                             '(default: 300; excludes computationally '
-                             'infeasible large branches from poor root words)')
-
     # -- run --
     p_run = sub.add_parser('run', help='Start the parallel precache supervisor')
     p_run.add_argument('--workers', type=int, default=6, metavar='N',
@@ -1177,6 +1086,10 @@ def main():
     p_qa.add_argument('--priority', type=int, default=0, metavar='N',
                       help='Priority for queued branches (default: 0).  '
                            'Higher numbers are worked sooner.')
+    p_qa.add_argument('--priority-words', nargs='+', metavar='WORD',
+                      help='With --word-list: only these words are queued at '
+                           '--priority, the rest at 0 (e.g. '
+                           '--priority-words salet crane)')
     p_qa.add_argument('--max-branch-size', type=int, default=300, metavar='N',
                       help='Skip branches with more than N answer words '
                            '(default: 300)')
@@ -1257,7 +1170,6 @@ def main():
         'queue-priority': cmd_queue_priority,
         'start': cmd_start,
         'stop': cmd_stop,
-        'bootstrap': cmd_bootstrap,
         'run': cmd_run,
         'status': cmd_status,
         'reset-stale': cmd_reset_stale,
