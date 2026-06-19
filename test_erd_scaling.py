@@ -105,7 +105,7 @@ class TestWorkDoesNotAmplify(_Base):
             try:
                 w.solve_branch_focused(self.branch_key)
                 with lock:
-                    evaluated.append(w.n_ok + w.n_pruned + w.n_useless)
+                    evaluated.append(w.n_ok + w.n_cutoff + w.n_pruned + w.n_useless)
             finally:
                 w.close()
 
