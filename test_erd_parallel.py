@@ -125,5 +125,78 @@ class TestParallelSwarmSolve(unittest.TestCase):
         self.assertIn(serial_word, CANDIDATES)
 
 
+class TestClaimSkipsCachedBranch(unittest.TestCase):
+    """claim_one() must not re-chunk a pending branch whose ERD is already
+    reusable in ScoreCache at the worker's budget: it should mark the
+    pending row done directly instead of promoting it for real work."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._path("answers.txt", BRANCH)
+        self.words_file = self._path("words.txt", CANDIDATES)
+        p1 = mock.patch.object(erd_swarm, "ANSWER_FILE", self.answer_file)
+        p2 = mock.patch.object(erd_swarm, "WORDS_FILE", self.words_file)
+        p1.start(); p2.start()
+        self.addCleanup(p1.stop); self.addCleanup(p2.stop)
+        self.branch_key = encode_subset(BRANCH)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _path(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def _queue_branch(self):
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(self.branch_key, len(BRANCH), 0, "salet", 0)])
+        q.close()
+
+    def _worker(self):
+        return _BranchWorker(0, self.cache_path, self.queue_path, None,
+                             DIVISOR, MAX_CHUNKS, budget=ROOT_BUDGET)
+
+    def test_skips_branch_with_reusable_cache_entry(self):
+        sc = ScoreCache(self.cache_path, BRANCH)
+        # Untainted entry, reusable at any budget >= max_depth.
+        sc.write(self.branch_key, ERD_ALL, "crane", 1.5,
+                 max_depth=2, solve_budget=None)
+        sc.close()
+        self._queue_branch()
+
+        w = self._worker()
+        try:
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        self.assertEqual(q.counts_by_status().get("done"), 1)
+        self.assertIsNone(q.get_branch(self.branch_key),
+                          "no active_branches row should have been created")
+        q.close()
+
+    def test_promotes_branch_with_unreusable_cache_entry(self):
+        # A legacy entry (max_depth=None) isn't reusable at a finite budget.
+        sc = ScoreCache(self.cache_path, BRANCH)
+        sc.write(self.branch_key, ERD_ALL, "crane", 1.5)
+        sc.close()
+        self._queue_branch()
+
+        w = self._worker()
+        try:
+            result = w.claim_one()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result,
+                             "branch should have been promoted for real work")
+        branch, idx = result
+        self.assertEqual(branch["branch_key"], self.branch_key)
+        self.assertIsNotNone(idx)
+
+
 if __name__ == "__main__":
     unittest.main()
