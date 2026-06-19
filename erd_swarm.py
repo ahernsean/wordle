@@ -115,6 +115,7 @@ class _BranchWorker:
         self._nodes_at_last_hb = 0
         self._cur_depth = 0
         self._spine = {}             # depth -> subset size on the active descent
+        self._max_spine = {}         # deepest spine seen since last heartbeat
         self._last_progress_log = 0.0
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
@@ -156,9 +157,11 @@ class _BranchWorker:
         deeper = [d for d in self._spine if d > depth]
         for d in deeper:
             del self._spine[d]
+        if len(self._spine) > len(self._max_spine):
+            self._max_spine = dict(self._spine)
 
     def _spine_str(self):
-        return '→'.join(str(self._spine[d]) for d in sorted(self._spine))
+        return '→'.join(str(self._max_spine[d]) for d in sorted(self._max_spine))
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
@@ -220,6 +223,7 @@ class _BranchWorker:
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._spine_str())
+        self._max_spine = dict(self._spine)
         if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:
             self._last_progress_log = now
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
@@ -253,8 +257,14 @@ class _BranchWorker:
         last_log = 0.0
         chunk_started = int(time.time())
         t0 = time.time()
+        def _eff_bound():
+            # Effective pruning bound: tightest of what this worker found and
+            # what other workers have shared via the queue.
+            bests = [b for b in (local_best, shared_best) if b is not None]
+            return min(bests) if bests else None
+
         self._heartbeat(branch_key, n_words, idx, chunk_started, None,
-                        local_candidate, local_best, force=True,
+                        local_candidate, _eff_bound(), force=True,
                         cand_chunk_size=chunk_total)
 
         for n_seen, ci in enumerate(range(lo, hi), start=1):
@@ -284,7 +294,7 @@ class _BranchWorker:
                 subbranch_solver=self._subbranch_solver,
                 heartbeat=lambda: self._heartbeat(
                     branch_key, n_words, idx, chunk_started, None,
-                    local_candidate, local_best,
+                    local_candidate, _eff_bound(),
                     cur_candidate=ranked[ci], cand_n_seen=n_seen,
                     cand_chunk_size=chunk_total))
             cand_elapsed = time.time() - cand_t0
@@ -316,7 +326,7 @@ class _BranchWorker:
 
             rate = n_seen / max(1e-6, now - t0)
             self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                            local_candidate, local_best,
+                            local_candidate, _eff_bound(),
                             cur_candidate=ranked[ci], cand_n_seen=n_seen,
                             cand_chunk_size=chunk_total)
 
@@ -330,7 +340,7 @@ class _BranchWorker:
                     self.n_ok, self.n_cutoff, self.n_pruned, self.n_useless,
                     local_candidate or '-', local_best if local_best else 0)
         self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                        local_candidate, local_best, force=True)
+                        local_candidate, _eff_bound(), force=True)
         return True
 
     # -- finalize -----------------------------------------------------------

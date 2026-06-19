@@ -949,6 +949,17 @@ def _print_status(args):
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
         if '>' in path:
             path = path.replace('>', '→')
+        # Accumulate the longest spine seen for this worker on this branch
+        # across display cycles; keyed by (worker_id, branch_key) so it resets
+        # automatically when the worker moves to a different branch.
+        max_paths = getattr(_print_status, 'max_paths', {})
+        path_key = (h['worker_id'], bytes(key) if key else None)
+        prev_max = max_paths.get(path_key, '')
+        if path.count('→') >= prev_max.count('→'):
+            max_paths[path_key] = path
+        else:
+            path = prev_max
+        _print_status.max_paths = max_paths
         best_g = (h['best_guess'] if 'best_guess' in h.keys() else None) or ''
         best_e = (h['best_erd'] if 'best_erd' in h.keys() else None)
         # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
