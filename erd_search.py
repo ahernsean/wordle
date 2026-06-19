@@ -763,9 +763,9 @@ def _print_status(args):
     if not branches:
         print('  (none)')
     else:
-        print(f'  {"Source":<13s}  {"Ans":>4s}  {"Cands":>6s}  '
+        print(f'  {"Source":<13s}  {"Ans":>4s}  '
               f'{"Chunks":<12s}  {"Best guess":<12s}  {"ERD":>6s}  '
-              f'{"Wkrs":>4s}  ETA')
+              f'{"Pri":>3s}  {"Wkrs":>4s}  ETA')
     for b in branches:
         key = bytes(b['branch_key'])
         n_cands = b['n_candidates'] or 0
@@ -779,15 +779,16 @@ def _print_status(args):
         be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '---'
         nw = b['n_words'] or 0
         wk = worker_counts.get(key, 0)
+        pri = b['priority'] or 0
         created = b['created_at'] or now_ts
         el = now_ts - created
         eta = ''
-        if 0 < done < n_chunks and el > 0:
+        if wk > 0 and 0 < done < n_chunks and el > 0:
             rem = (n_chunks - done) / (done / el)
             eta = _fmt_duration(int(rem))
-        print(f'  {src:<13s}  {nw:4d}  {n_cands:6,}  '
+        print(f'  {src:<13s}  {nw:4d}  '
               f'{done:3d}/{n_chunks:<3d} ({pct:3.0f}%)  '
-              f'{bw:<12s}  {be:>6s}  {wk:4d}  {eta}')
+              f'{bw:<12s}  {be:>6s}  {pri:3d}  {wk:4d}  {eta}')
     print()
 
     # Workers — liveness and forward progress.
