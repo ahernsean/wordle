@@ -853,19 +853,20 @@ def _print_status(args):
         return str(n)
 
     print(f'ERD_ALL Precache — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-    if queue_ok:
-        print(f'Queue:  pending {counts.get("pending", 0):,}   '
-              f'done {counts.get("done", 0):,}   '
-              f'in progress {len(branches)}')
     cache_line = f'Cache:  {total_erd:,} ERD entries   +{recent:,} in last 5m' if cache_ok else None
     if cache_line and hit_pct is not None:
-        cache_line += f'   hits {_abbrev(hits)}/{_abbrev(hit_total)} ({hit_pct:.0f}%)'
+        cache_line += f'   hits {_abbrev(hits)}/{_abbrev(hit_total)} ({hit_pct:.1f}%)'
     if cache_line:
         print(cache_line)
     print()
 
     # Branches in progress — the real progress unit.
-    print('Branches in progress:')
+    branch_hdr = 'Branches:'
+    if queue_ok:
+        branch_hdr += (f'  done {counts.get("done", 0):,},'
+                       f'  in progress {len(branches)},'
+                       f'  pending {counts.get("pending", 0):,}')
+    print(branch_hdr)
     if not branches:
         print('  (none)')
     else:
@@ -893,7 +894,7 @@ def _print_status(args):
             rem = (n_chunks - done) / (done / el)
             eta = _fmt_duration(int(rem))
         print(f'  {src:<13s}  {nw:4d}  '
-              f'{done:3d}/{n_chunks:<3d} ({pct:3.0f}%)  '
+              f'{done:3d}/{n_chunks:<3d} ({pct:5.1f}%)  '
               f'{bw:<12s}  {be:>6s}  {pri:3d}  {wk:4d}  {eta}')
     print()
 
@@ -903,9 +904,9 @@ def _print_status(args):
     if live and total_evals:
         parts = []
         if cutoff_pct is not None:
-            parts.append(f'cutoff {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({cutoff_pct:.0f}%)')
+            parts.append(f'cutoff {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({cutoff_pct:.1f}%)')
         if pruned_pct is not None:
-            parts.append(f'pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({pruned_pct:.0f}%)')
+            parts.append(f'pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({pruned_pct:.1f}%)')
         if parts:
             worker_hdr = f'Workers ({", ".join(parts)}):'
     print(worker_hdr)
