@@ -157,7 +157,7 @@ class _BranchWorker:
         deeper = [d for d in self._spine if d > depth]
         for d in deeper:
             del self._spine[d]
-        if len(self._spine) > len(self._max_spine):
+        if len(self._spine) >= len(self._max_spine):
             self._max_spine = dict(self._spine)
 
     def _spine_str(self):

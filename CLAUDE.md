@@ -108,6 +108,20 @@ PR descriptions need a **Summary** section only. Do not include a "Test plan" se
 
 PR descriptions describe *changes* — what is added, removed, or fixed, and why. This is distinct from the comment style rule ("describe what the code is, not how it got there"), which applies to inline code comments. A PR description is inherently a description of a diff; talking about what changed is the point.
 
+Always update the PR title and description when pushing new commits.
+
+---
+
+## Before committing and pushing
+
+Always run the test suite before committing and pushing:
+
+```
+python -m unittest discover -s . -p 'test_*.py'
+```
+
+Commits with failing tests must not be pushed.
+
 ---
 
 ## Respond to what's actually being asked
