@@ -26,6 +26,7 @@ except ImportError:
 
 import wordle_engine
 from cache_sqlite import ScoreCache, MemoryScoreCache
+from wordle_ui import _is_gray_char
 from wordle_engine import (
     Solution, ScoringMethod, GuessUniverse, ComplianceFilter, ResponseCache,
     load_word_list, calculate_response,
@@ -410,14 +411,6 @@ def print_colored_word(word, response):
                 for letter, color in zip(word, response)),
         end='')
 
-
-def _is_gray_char(ch):
-    """
-    Accept 0, _, and any non-alphanumeric character as gray.
-    Accommodates mobile keyboards where -- becomes an em dash
-    and .. becomes a period-space.
-    """
-    return ch == '0' or ch == '_' or not ch.isalnum()
 
 
 def parse_response(response_str):

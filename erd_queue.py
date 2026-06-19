@@ -21,34 +21,6 @@ def decode_subset(blob: bytes) -> list[str]:
     return [blob[i:i + 5].decode() for i in range(0, len(blob), 5)]
 
 
-def fmt_pattern(code: int) -> str:
-    """Format a response code as a 5-char string: g=green, y=yellow, -=gray."""
-    chars = {0: '-', 1: 'y', 2: 'g'}
-    digits = []
-    for _ in range(5):
-        digits.append(code % 3)
-        code //= 3
-    return ''.join(chars[d] for d in reversed(digits))
-
-
-def parse_pattern(s: str) -> int:
-    """Inverse of fmt_pattern: a 5-char response string to its int code.
-
-    Accepts g/green, y/yellow, and -/./gray (any of '-' '.' 'x' for gray).
-    Matches _encode_response: leftmost char is the most significant trit.
-    """
-    vals = {'g': 2, 'green': 2, 'y': 1, 'yellow': 1,
-            '-': 0, '.': 0, 'x': 0, 'gray': 0, 'grey': 0}
-    s = s.strip().lower()
-    if len(s) != 5:
-        raise ValueError(f'pattern must be 5 characters, got {s!r}')
-    code = 0
-    for ch in s:
-        if ch not in vals:
-            raise ValueError(f'bad pattern char {ch!r} in {s!r}')
-        code = code * 3 + vals[ch]
-    return code
-
 
 _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;

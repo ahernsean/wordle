@@ -160,7 +160,7 @@ def cmd_cache_status(args):
     the branch has a cached ERD value.  Reports the cached best guess and
     score for hits, and flags misses so you can see what still needs work.
     """
-    from erd_queue import fmt_pattern
+    from wordle_ui import fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
     word = args.word.strip().lower()
@@ -237,7 +237,7 @@ def cmd_queue_add(args):
     Already-queued branches are never duplicated; their priority is upgraded
     if the new request is higher.
     """
-    from erd_queue import parse_pattern, fmt_pattern
+    from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
     priority = args.priority
@@ -327,7 +327,7 @@ def cmd_queue_clear(args):
 
 def cmd_queue_inspect(args):
     """Show the queue entry for a specific branch (word + pattern)."""
-    from erd_queue import parse_pattern, fmt_pattern
+    from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
     word = args.word.strip().lower()
@@ -389,7 +389,7 @@ def cmd_queue_remove(args):
     yields no further claims.  The worker will eventually notice the branch
     is gone and move on.
     """
-    from erd_queue import parse_pattern, fmt_pattern
+    from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
     word = args.word.strip().lower()
@@ -449,7 +449,7 @@ def cmd_queue_priority(args):
     drain before fresh top-level branches.  User-settable values in the range
     0–999 are reserved for normal use: 0 = default, higher = sooner.
     """
-    from erd_queue import parse_pattern, fmt_pattern
+    from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
     word = args.word.strip().lower()
@@ -697,7 +697,7 @@ def cmd_status(args):
 
 def _print_status(args):
     now_ts = int(time.time())
-    from erd_queue import fmt_pattern
+    from wordle_ui import fmt_pattern
 
     # Queue + swarm state
     try:
@@ -968,7 +968,7 @@ def cmd_solve_branch(args):
     the persistent cache.
     """
     import threading
-    from erd_queue import parse_pattern, fmt_pattern
+    from wordle_ui import parse_pattern, fmt_pattern
     from erd_swarm import run_branch_solve
 
     all_answers = load_word_list(ANSWER_FILE)
