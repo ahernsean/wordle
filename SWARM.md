@@ -116,12 +116,28 @@ python3.13 erd_search.py queue-add --word salet
 # One specific branch (word + response pattern):
 python3.13 erd_search.py queue-add --word salet --pattern .....
 
-# All words in a file (equivalent to the old bootstrap command):
+# All words in a file:
 python3.13 erd_search.py queue-add --word-list wordle.txt
+
+# All words in a file, with a subset prioritized (others queued at 0):
+python3.13 erd_search.py queue-add --word-list wordle.txt \
+    --priority-words salet crane --priority 1
+
+# A branch too large for the default cap, pushed to the front of the queue:
+python3.13 erd_search.py queue-add --word salet --pattern ..... \
+    --max-branch-size 999 --priority 1000
+
+# Force a recompute of an already-cached branch:
+python3.13 erd_search.py queue-add --word salet --pattern ..... \
+    --delete-erd-cache --priority 1000
 ```
 
 `queue-add` is idempotent: already-queued branches are never duplicated, and
-priority is upgraded (never downgraded) if the new request is higher.
+priority is upgraded (never downgraded) if the new request is higher.  Setting
+a high priority on a large branch makes every idle worker in the running
+swarm converge on it: `claim_one` prefers joining any in-progress branch
+before promoting a new one, and both the pending and in-progress branch lists
+are ordered by priority — there is no separate "dedicated worker" mechanism.
 
 Pattern syntax: `g`=green, `y`=yellow, `-` or `.`=gray.  Use dots (not
 dashes) for patterns that start with a gray position to avoid the shell/argparse
@@ -197,22 +213,6 @@ For each of the (up to 242) response patterns for WORD, reports whether the
 branch has a cached ERD entry, along with the best guess, score, and timestamp
 for hits.  Trivial patterns (0 or 1 answer word) are skipped — they need no
 ERD.
-
-### Solve one large branch directly
-
-```bash
-python3.13 erd_search.py solve-branch --word salet --pattern ..... --workers 6
-```
-
-Fans N workers across the ~12,972 candidate guesses for one specific branch,
-sharing a running-best ERD bound.  Useful for branches too large for the
-regular queue to reach quickly (e.g. an opener's all-gray response, which has
-~315 answer words).
-
-```bash
-# Recompute even if already cached:
-python3.13 erd_search.py solve-branch --word salet --pattern ..... --force
-```
 
 ### Export for the iPhone
 

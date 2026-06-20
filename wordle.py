@@ -418,7 +418,7 @@ def parse_response(response_str):
     Parse a 5-character response string.
 
     g = green, y = yellow,
-    0 / _ / any punctuation = gray.
+    0 / _ / x / any punctuation = gray.
     """
     if len(response_str) == 5:
         result = []
@@ -432,7 +432,7 @@ def parse_response(response_str):
             else:
                 print_error(
                     f"Invalid '{ch}'. "
-                    "g=green, y=yellow, 0=gray."
+                    "g=green, y=yellow, 0/x=gray."
                 )
                 return None
         return result

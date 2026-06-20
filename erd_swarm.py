@@ -22,7 +22,6 @@ full coverage.  So a crashed worker's chunk is redone, never skipped.
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import os
 import signal
 import time
@@ -53,6 +52,7 @@ HB_SECONDS = 2.0              # liveness heartbeat cadence during a long chunk
 # heartbeats, which is conservative enough for any real process death.
 HB_TIMEOUT_SECONDS = 30
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
+PROGRESS_LOG_SECONDS = 120   # log a mid-candidate progress line this often
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
 
@@ -99,7 +99,8 @@ class _BranchWorker:
         self.started = int(time.time())
         self.chunks_done = 0
         self.n_ok = 0
-        self.n_pruned = 0
+        self.n_cutoff = 0    # cost >= best_erd before full eval (alpha-beta)
+        self.n_pruned = 0    # infeasible within budget (depth floor hit)
         self.n_useless = 0
         self._ranked_key = None      # cache last branch's ranked candidate list
         self._ranked = None
@@ -114,6 +115,8 @@ class _BranchWorker:
         self._nodes_at_last_hb = 0
         self._cur_depth = 0
         self._spine = {}             # depth -> subset size on the active descent
+        self._max_spine = {}         # deepest spine seen since last heartbeat
+        self._last_progress_log = 0.0
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
         self._top_source_word = None
@@ -154,9 +157,11 @@ class _BranchWorker:
         deeper = [d for d in self._spine if d > depth]
         for d in deeper:
             del self._spine[d]
+        if len(self._spine) >= len(self._max_spine):
+            self._max_spine = dict(self._spine)
 
     def _spine_str(self):
-        return '>'.join(str(self._spine[d]) for d in sorted(self._spine))
+        return '→'.join(str(self._max_spine[d]) for d in sorted(self._max_spine))
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
@@ -194,6 +199,7 @@ class _BranchWorker:
 
     def _heartbeat(self, branch_key, n_words, chunk_idx, chunk_started_at,
                    cand_rate, best_guess, best_erd, force=False,
+                   bound_erd=None,
                    cur_candidate=None, cand_n_seen=None, cand_chunk_size=None):
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
@@ -211,13 +217,25 @@ class _BranchWorker:
             chunk_started_at=chunk_started_at, cand_rate=cand_rate,
             cache_hits=self.score_cache.read_hits,
             cache_misses=self.score_cache.read_misses,
-            n_pruned=self.n_pruned, n_ok=self.n_ok,
-            best_guess=best_guess, best_erd=best_erd,
+            n_cutoff=self.n_cutoff, n_pruned=self.n_pruned, n_ok=self.n_ok,
+            best_guess=best_guess, best_erd=best_erd, bound_erd=bound_erd,
             cur_candidate=cur_candidate, cand_n_seen=cand_n_seen,
             cand_chunk_size=cand_chunk_size,
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._spine_str())
+        self._max_spine = dict(self._spine)
+        if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:
+            self._last_progress_log = now
+            be = f'{best_erd:.4f}' if best_erd is not None else '-'
+            bg = (best_guess or '-').upper()
+            logger.info('%s chunk %d: %s %d/%d in progress  '
+                        'depth=%d path=%s  %.1fM nodes %.0fk/s  best=%s %s',
+                        self.name, chunk_idx,
+                        cur_candidate.upper(), cand_n_seen or 0,
+                        cand_chunk_size or 0,
+                        self._cand_max_depth, self._spine_str(),
+                        self._nodes / 1e6, node_rate / 1e3, bg, be)
 
     # -- evaluate one chunk -------------------------------------------------
 
@@ -240,8 +258,15 @@ class _BranchWorker:
         last_log = 0.0
         chunk_started = int(time.time())
         t0 = time.time()
+        def _eff_bound():
+            # Effective pruning bound: tightest of what this worker found and
+            # what other workers have shared via the queue.
+            bests = [b for b in (local_best, shared_best) if b is not None]
+            return min(bests) if bests else None
+
         self._heartbeat(branch_key, n_words, idx, chunk_started, None,
                         local_candidate, local_best, force=True,
+                        bound_erd=_eff_bound(),
                         cand_chunk_size=chunk_total)
 
         for n_seen, ci in enumerate(range(lo, hi), start=1):
@@ -271,7 +296,7 @@ class _BranchWorker:
                 subbranch_solver=self._subbranch_solver,
                 heartbeat=lambda: self._heartbeat(
                     branch_key, n_words, idx, chunk_started, None,
-                    local_candidate, local_best,
+                    local_candidate, local_best, bound_erd=_eff_bound(),
                     cur_candidate=ranked[ci], cand_n_seen=n_seen,
                     cand_chunk_size=chunk_total))
             cand_elapsed = time.time() - cand_t0
@@ -294,14 +319,16 @@ class _BranchWorker:
                     self.queue.update_branch_best(branch_key, local_candidate,
                                                   local_best, local_md)
                     shared_best = local_best
-            elif status in ('pruned', 'cutoff'):
+            elif status == 'cutoff':
+                self.n_cutoff += 1
+            elif status == 'pruned':
                 self.n_pruned += 1
             else:
                 self.n_useless += 1
 
             rate = n_seen / max(1e-6, now - t0)
             self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                            local_candidate, local_best,
+                            local_candidate, local_best, bound_erd=_eff_bound(),
                             cur_candidate=ranked[ci], cand_n_seen=n_seen,
                             cand_chunk_size=chunk_total)
 
@@ -310,12 +337,13 @@ class _BranchWorker:
         elapsed = time.time() - t0
         rate = chunk_total / max(1e-6, elapsed)
         logger.info('%s chunk %d done: %d cands in %.1fs (%.1f/s)  '
-                    'ok=%d pruned=%d useless=%d  best=%s %.4f',
+                    'ok=%d cutoff=%d pruned=%d useless=%d  best=%s %.4f',
                     self.name, idx, chunk_total, elapsed, rate,
-                    self.n_ok, self.n_pruned, self.n_useless,
+                    self.n_ok, self.n_cutoff, self.n_pruned, self.n_useless,
                     local_candidate or '-', local_best if local_best else 0)
         self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                        local_candidate, local_best, force=True)
+                        local_candidate, local_best, bound_erd=_eff_bound(),
+                        force=True)
         return True
 
     # -- finalize -----------------------------------------------------------
@@ -439,7 +467,9 @@ class _BranchWorker:
         Prefers JOINING an in-progress branch (to finish branches already
         underway, concentrating workers) over PROMOTING a new one from the
         queue.  Promotion claims a pending branch and registers it so others
-        can join.
+        can join.  A claimed branch already solved at this budget (e.g.
+        synced in from elsewhere) is marked done without being promoted —
+        no chunk work is needed.
         """
         for b in self.queue.branches_in_progress():
             n_chunks = ERDQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
@@ -447,9 +477,17 @@ class _BranchWorker:
             if idx is not None:
                 return dict(b), idx
 
-        claimed = self.queue.claim_next(self.name)
-        if claimed is None:
-            return None
+        while True:
+            claimed = self.queue.claim_next(self.name)
+            if claimed is None:
+                return None
+            reuse = _cache_reuse(
+                self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
+                self.budget)
+            if reuse is None:
+                break
+            self.queue.mark_done(claimed['branch_key'])
+
         n_words = claimed['n_words']
         chunk_size = ERDQueue.chunk_size_for(
             n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
@@ -505,13 +543,12 @@ class _BranchWorker:
             self._maybe_checkpoint()
             self._check_ram()
 
-    # -- focused single-branch loop (standalone solve-branch) ---------------
+    # -- focused single-branch loop ------------------------------------------
 
     def solve_branch_focused(self, branch_key):
         """Help solve one already-registered branch to completion: claim and
         evaluate its chunks alongside any sibling workers, finalizing it once
-        every chunk is done.  The body of _focused_worker, factored out so it
-        can be driven directly (signal setup stays in the process wrapper)."""
+        every chunk is done."""
         branch = self.queue.get_branch(branch_key)
         if branch is None or branch['status'] != 'open':
             return
@@ -576,74 +613,3 @@ def _setup_logging(worker_id):
     h.setFormatter(logging.Formatter('%(asctime)s %(levelname)-7s %(message)s'))
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
-
-
-# ---------------------------------------------------------------------------
-# Standalone single-branch solve (the `solve-branch` CLI), reusing the swarm
-# machinery: register one branch directly, then point N focused workers at it.
-# ---------------------------------------------------------------------------
-
-def _focused_worker(branch_key, worker_id, cache_path, queue_path,
-                    min_words_per_chunk, max_chunk_count, n_workers=1):
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    w = _BranchWorker(worker_id, cache_path, queue_path, None,
-                      min_words_per_chunk, max_chunk_count, n_workers=n_workers)
-    try:
-        w.solve_branch_focused(branch_key)
-    finally:
-        w.close()
-
-
-def run_branch_solve(branch_key, words, n_workers, cache_path, queue_path,
-                     min_words_per_chunk=3, max_chunk_count=256, priority=1,
-                     source_word=None, source_pattern=None, budget=ROOT_BUDGET,
-                     timeout=None):
-    """Solve one branch by swarming N workers across its candidates.
-
-    n_workers is capped at the number of chunks so we never spawn a process
-    that will immediately find no work and exit.
-
-    Returns (best_guess, best_erd) or None.  If timeout is given (seconds),
-    any worker still running after that long is killed and the result will be
-    None (branch unfinished).
-    """
-    all_answers = load_word_list(ANSWER_FILE)
-    all_words = load_word_list(WORDS_FILE)
-    score_cache = ScoreCache(cache_path, all_answers)
-    queue = ERDQueue(queue_path)
-
-    existing = score_cache.read(branch_key, ERD_ALL)
-    if existing is not None:
-        queue.close()
-        score_cache.close()
-        return existing
-
-    chunk_size = ERDQueue.chunk_size_for(
-        len(words), len(all_words), min_words_per_chunk, max_chunk_count)
-    n_chunks = ERDQueue.n_chunks_for(len(all_words), chunk_size)
-    actual_workers = min(n_workers, n_chunks)
-    queue.create_branch(branch_key, len(words), len(all_words), chunk_size,
-                        priority=priority, source_word=source_word,
-                        source_pattern=source_pattern, budget=budget)
-    queue.close()
-    score_cache.close()
-
-    procs = [mp.Process(target=_focused_worker,
-                        args=(branch_key, w, cache_path, queue_path,
-                              min_words_per_chunk, max_chunk_count, actual_workers))
-             for w in range(actual_workers)]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(timeout=timeout)
-    for p in procs:
-        if p.is_alive():
-            p.kill()
-            p.join()
-
-    score_cache = ScoreCache(cache_path, all_answers)
-    try:
-        return score_cache.read(branch_key, ERD_ALL)
-    finally:
-        score_cache.close()
