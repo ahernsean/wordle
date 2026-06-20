@@ -1115,6 +1115,8 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     if subbranch_solver is not None:
         delegated = subbranch_solver(branch_words, budget)
         if delegated is not None:
+            if depth_observer is not None:
+                depth_observer(depth, -n)  # sentinel: this level was promoted
             return delegated
 
     # Best-first ordering: evaluate the strongest splitter first (key = expected

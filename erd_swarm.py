@@ -152,8 +152,15 @@ class _BranchWorker:
     # -- depth instrumentation ----------------------------------------------
 
     def _note_depth(self, depth, n):
-        # Per-position observer: track max depth and the live recursion spine
-        # (subset size at each depth on the active descent).  Observation only.
+        # Per-position observer: track max depth and the live recursion spine.
+        # n < 0 is the cooperative-promotion sentinel: the sub-branch at this
+        # depth was handed off to the swarm; overwrite its size with '•' and
+        # leave deeper entries intact (there are none after a promotion).
+        if n < 0:
+            self._spine[depth] = '•'
+            if len(self._spine) >= len(self._max_spine):
+                self._max_spine = dict(self._spine)
+            return
         if depth > self._cand_max_depth:
             self._cand_max_depth = depth
         self._cur_depth = depth

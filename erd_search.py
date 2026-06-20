@@ -182,7 +182,7 @@ def cmd_queue_status(args):
         if row is None and active is None:
             unqueued.append((pat, n))
         elif row is None:
-            in_progress.append((pat, n, active['priority'] or 0, 'coop'))
+            in_progress.append((pat, n, active['priority'] or 0, None))
         elif row['status'] == 'pending':
             pending.append((pat, n, row['priority']))
         elif row['status'] == 'in_progress':
