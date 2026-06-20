@@ -234,6 +234,10 @@ def cmd_queue_add(args):
 
     all_answers = load_word_list(ANSWER_FILE)
     priority_words = {w.strip().lower() for w in (args.priority_words or [])}
+    if priority_words and not args.word_list:
+        print('Warning: --priority-words only applies with --word-list; '
+              'ignoring it.  Use --priority directly for a single --word.')
+        priority_words = set()
 
     score_cache = ScoreCache(args.cache, all_answers)
     rcache = ResponseCache(all_answers, score_cache)
@@ -731,10 +735,14 @@ def _watch_with_keys(args, interval):
                 ready, _, _ = select.select([sys.stdin], [], [], min(remaining, 0.2))
                 if ready:
                     ch = sys.stdin.read(1)
-                    if ch in ('q', 'Q', '\x03', '\x04'):  # q, Ctrl-C, Ctrl-D
+                    if ch in ('q', 'Q', '\x04'):  # q, Ctrl-D
                         return
                     if ch == ' ':
                         break  # force refresh now
+    except KeyboardInterrupt:
+        # ISIG stays enabled (only ICANON/ECHO are off), so Ctrl-C raises here
+        # rather than arriving as a '\x03' byte from stdin.read().
+        pass
     finally:
         sys.stdout.write('\033[?25h')
         sys.stdout.flush()
@@ -965,7 +973,7 @@ def _print_status(args):
         bound_e = (h['bound_erd'] if 'bound_erd' in h.keys() else None)
         # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
         if age <= 10 and nrate == 0 and nodes:
-            flag = ' ~?'
+            flag += ' ~?'
         best_g_disp = best_g.upper() if best_g else '-----'
         best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
         bound_e_disp = f'{bound_e:.3f}' if bound_e is not None else '-----'
