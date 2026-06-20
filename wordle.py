@@ -15,7 +15,7 @@ import logging
 import platform
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 import contextlib
 
@@ -3063,14 +3063,15 @@ class ResilientFileHandler(logging.FileHandler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._queue = []
+        self._queue = deque()
         self._failing_since = None
         self._last_surfaced = None
         self._last_reopen_attempt = None
 
     def emit(self, record):
         self._queue.append(record)
-        del self._queue[:-self.MAX_QUEUE_SIZE]
+        while len(self._queue) > self.MAX_QUEUE_SIZE:
+            self._queue.popleft()
         self._drain()
 
     def _drain(self):
@@ -3081,7 +3082,7 @@ class ResilientFileHandler(logging.FileHandler):
             except RecursionError:
                 raise
             except Exception:
-                self._queue.pop(0)
+                self._queue.popleft()
                 self.handleError(record)
                 continue
             try:
@@ -3094,8 +3095,12 @@ class ResilientFileHandler(logging.FileHandler):
             except OSError:
                 self._on_write_failure(record)
                 return
+            except Exception:
+                self._queue.popleft()
+                self.handleError(record)
+                continue
             else:
-                self._queue.pop(0)
+                self._queue.popleft()
                 self._failing_since = None
                 self._last_surfaced = None
 
@@ -3127,9 +3132,9 @@ class ResilientFileHandler(logging.FileHandler):
         self.acquire()
         try:
             self._drain()
+            super().close()
         finally:
             self.release()
-        super().close()
 
 
 def main():  # pragma: no cover - interactive REPL loop, exercised manually

@@ -361,7 +361,7 @@ class ResilientFileHandlerTests(unittest.TestCase):
 
     def test_successful_write_drains_immediately(self):
         self.handler.emit(self._record("msg1"))
-        self.assertEqual(self.handler._queue, [])
+        self.assertEqual(list(self.handler._queue), [])
         with open(self._path) as f:
             self.assertEqual(f.read(), "msg1\n")
 
@@ -379,7 +379,7 @@ class ResilientFileHandlerTests(unittest.TestCase):
         self.handler.stream = real_open()
         with contextlib.redirect_stderr(io.StringIO()):
             self.handler.emit(self._record("msg3"))
-        self.assertEqual(self.handler._queue, [])
+        self.assertEqual(list(self.handler._queue), [])
         with open(self._path) as f:
             self.assertEqual(f.read(), "msg1\nmsg2\nmsg3\n")
 
@@ -423,7 +423,7 @@ class ResilientFileHandlerTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as captured:
             self.handler.emit(bad_record)
         self.assertIn("Logging error", captured.getvalue())
-        self.assertEqual(self.handler._queue, [])
+        self.assertEqual(list(self.handler._queue), [])
 
         self.handler.emit(self._record("msg2"))
         with open(self._path) as f:
@@ -437,6 +437,23 @@ class ResilientFileHandlerTests(unittest.TestCase):
         with self.assertRaises(RecursionError):
             self.handler.emit(self._record("msg1"))
         self.handler.stream.write.side_effect = None
+
+    def test_non_os_write_error_is_dropped_and_reported_not_retried(self):
+        real_open = self.handler._open
+        self.handler.stream.close()
+        self.handler.stream = mock.Mock()
+        self.handler.stream.write.side_effect = UnicodeEncodeError(
+            "ascii", "x", 0, 1, "simulated")
+
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            self.handler.emit(self._record("msg1"))
+        self.assertIn("Logging error", captured.getvalue())
+        self.assertEqual(list(self.handler._queue), [])
+
+        self.handler.stream = real_open()
+        self.handler.emit(self._record("msg2"))
+        with open(self._path) as f:
+            self.assertEqual(f.read(), "msg2\n")
 
     def test_queue_is_capped_at_max_queue_size(self):
         self.handler.stream.close()
