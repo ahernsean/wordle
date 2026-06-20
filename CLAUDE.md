@@ -124,6 +124,12 @@ When in doubt about which mode applies, ask, or default to discussion rather tha
 
 ---
 
+## Presenting review results
+
+When relaying findings from `code-review`, `security-review`, or any other tool that returns structured/JSON output, never paste the raw JSON into the response. Translate it into prose: a short ranked list with the file/line as a pointer, a plain-language statement of the bug, and the concrete scenario that triggers it. The structured format is an intermediate representation for the tool pipeline, not something to show the user.
+
+---
+
 ## Schema coordination (Linux + phone)
 
 The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any schema change must:
