@@ -115,7 +115,8 @@ class _BranchWorker:
         self._nodes_at_last_hb = 0
         self._cur_depth = 0
         self._spine = {}             # depth -> subset size on the active descent
-        self._max_spine = {}         # deepest spine seen since last heartbeat
+        self._hb_max_spine = {}      # deepest spine since last heartbeat (→ DB)
+        self._log_max_spine = {}     # deepest spine since last progress log (→ log file)
         self._last_progress_log = 0.0
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
@@ -158,8 +159,10 @@ class _BranchWorker:
         # leave deeper entries intact (there are none after a promotion).
         if n < 0:
             self._spine[depth] = '•'
-            if len(self._spine) >= len(self._max_spine):
-                self._max_spine = dict(self._spine)
+            if len(self._spine) >= len(self._hb_max_spine):
+                self._hb_max_spine = dict(self._spine)
+            if len(self._spine) >= len(self._log_max_spine):
+                self._log_max_spine = dict(self._spine)
             return
         if depth > self._cand_max_depth:
             self._cand_max_depth = depth
@@ -168,11 +171,16 @@ class _BranchWorker:
         deeper = [d for d in self._spine if d > depth]
         for d in deeper:
             del self._spine[d]
-        if len(self._spine) >= len(self._max_spine):
-            self._max_spine = dict(self._spine)
+        if len(self._spine) >= len(self._hb_max_spine):
+            self._hb_max_spine = dict(self._spine)
+        if len(self._spine) >= len(self._log_max_spine):
+            self._log_max_spine = dict(self._spine)
 
-    def _spine_str(self):
-        return '→'.join(str(self._max_spine[d]) for d in sorted(self._max_spine))
+    def _hb_spine_str(self):
+        return '→'.join(str(self._hb_max_spine[d]) for d in sorted(self._hb_max_spine))
+
+    def _log_spine_str(self):
+        return '→'.join(str(self._log_max_spine[d]) for d in sorted(self._log_max_spine))
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
@@ -234,7 +242,8 @@ class _BranchWorker:
             cand_chunk_size=cand_chunk_size,
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
-            cur_path=self._spine_str())
+            cur_path=self._hb_spine_str())
+        self._hb_max_spine = {}
         if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:
             self._last_progress_log = now
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
@@ -244,8 +253,10 @@ class _BranchWorker:
                         self.name, chunk_idx,
                         cur_candidate.upper(), cand_n_seen or 0,
                         cand_chunk_size or 0,
-                        self._cand_max_depth, self._spine_str(),
+                        self._cand_max_depth, self._log_spine_str(),
                         self._nodes / 1e6, node_rate / 1e3, bg, be)
+            self._log_max_spine = {}
+            self._cand_max_depth = 0
 
     # -- evaluate one chunk -------------------------------------------------
 
@@ -261,7 +272,8 @@ class _BranchWorker:
         """
         lo, hi = ERDQueue.chunk_range(idx, chunk_size, self.n_candidates)
         chunk_total = hi - lo
-        self._max_spine = {}
+        self._hb_max_spine = {}
+        self._log_max_spine = {}
         local_candidate, local_best = self.queue.read_branch_best(branch_key)
         local_md = None
         shared_best = local_best

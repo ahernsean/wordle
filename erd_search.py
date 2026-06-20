@@ -913,18 +913,18 @@ def _print_status(args):
         if n_coop:
             in_prog_str += f' ({n_coop} cooperative)'
         parts = [f'done {n_done:,}', in_prog_str, f'pending {n_pending:,}']
-        branch_hdr += '  ' + ',  '.join(parts)
+        branch_hdr += ' ' + ', '.join(parts)
     print(branch_hdr)
     denom_w = 2
-    chunks_col_w = 2 * denom_w + 8   # num/denom + ' (' + 3-digit int pct + '%)'
     if branches:
         max_nc = max(ERDQueue.n_chunks_for(b['n_candidates'] or 1, b['chunk_size'])
                      for b in branches)
         denom_w = len(str(max_nc))
-        chunks_col_w = 2 * denom_w + 8
-        print(f'  {"Root":<11s}  {"D":>1s} {"Ans":>4s}  '
+    chunks_col_w = 2 * denom_w + 5   # num/denom + ' ' + 2-digit int pct + '%'
+    if branches:
+        print(f'  {"Root":<11s} {"D":>1s} {"Ans":>4s} '
               f'{"Chunks":<{chunks_col_w}s} '
-              f'{"Best":<5s}  {"ERD":>5s}  {"Pri":>3s}  {"Wk":>2s}  ETA')
+              f'{"Best":<5s} {"ERD":>5s} {"Pri":>3s} {"Wk":>2s} ETA')
     else:
         print('  (none)')
     for b in branches:
@@ -949,10 +949,10 @@ def _print_status(args):
         if wk > 0 and 0 < done < n_chunks and el > 0:
             rem = (n_chunks - done) / (done / el)
             eta = _fmt_duration(int(rem))
-        chunks_str = f'{done:>{denom_w}d}/{n_chunks:<{denom_w}d} ({int(pct):2d}%)'
-        print(f'  {src:<11s}  {depth_val:1d} {nw:4d}  '
-              f'{chunks_str}  '
-              f'{bw:<5s}  {be:>5s}  {pri_str:>3s}  {wk:2d}  {eta}')
+        chunks_str = f'{done:>{denom_w}d}/{n_chunks:<{denom_w}d} {int(pct):2d}%'
+        print(f'  {src:<11s} {depth_val:1d} {nw:4d} '
+              f'{chunks_str} '
+              f'{bw:<5s} {be:>5s} {pri_str:>3s} {wk:2d} {eta}')
     print()
 
     # Workers — liveness and forward progress.
@@ -1004,10 +1004,11 @@ def _print_status(args):
         if '>' in path:
             path = path.replace('>', '→')
         # Show the deepest path seen across this watch cycle.  Each heartbeat
-        # writes the max spine from its own 2-second window (see _max_spine in
-        # erd_swarm.py); max_paths accumulates across successive heartbeat reads
-        # so the display shows the maximum over the full watch interval.  Tied
-        # depth overwrites so the displayed path is the most recent at that depth.
+        # writes the max spine from its own 2-second window (_hb_max_spine in
+        # erd_swarm.py, reset after each write); max_paths accumulates across
+        # successive heartbeat reads so the display shows the maximum over the
+        # full watch interval.  Tied depth overwrites so the displayed path is
+        # the most recent at that depth.
         path_key = (h['worker_id'], bytes(key) if key else None)
         prev_max = max_paths.get(path_key, '')
         if path.count('→') >= prev_max.count('→'):

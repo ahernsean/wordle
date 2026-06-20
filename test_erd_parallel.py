@@ -205,7 +205,8 @@ class TestReportingInvariants(unittest.TestCase):
     def _bare_worker(self):
         w = _BranchWorker.__new__(_BranchWorker)
         w._spine = {}
-        w._max_spine = {}
+        w._hb_max_spine = {}
+        w._log_max_spine = {}
         w._cand_max_depth = 0
         w._cur_depth = 0
         return w
@@ -226,31 +227,38 @@ class TestReportingInvariants(unittest.TestCase):
         w._note_depth(1, 30)
         self.assertEqual(w._cand_max_depth, 1)  # not 3 from candidate 1
 
-    def test_max_spine_accumulates_within_chunk_not_per_heartbeat(self):
-        """_max_spine holds the deepest spine seen since chunk start.
-        Heartbeat reads do not reset it; only starting a new chunk does."""
+    def test_spine_windows(self):
+        """_hb_max_spine resets after each heartbeat write (2s window for the
+        status display); _log_max_spine resets after each 120s progress log
+        write.  Both reset when a new chunk starts."""
         w = self._bare_worker()
 
         w._note_depth(1, 50)
         w._note_depth(2, 12)
         w._note_depth(3, 4)
 
-        # Back out between candidates.
-        w._note_depth(1, 48)
-        self.assertEqual(sorted(w._spine.keys()), [1])
+        # Both accumulators capture the depth-3 path.
+        self.assertEqual(w._hb_spine_str().count('→'), 2)
+        self.assertEqual(w._log_spine_str().count('→'), 2)
 
-        # Heartbeat reads _spine_str() — must still report the depth-3 max.
-        self.assertEqual(w._spine_str().count('→'), 2)
-
-        # Several more shallow candidates don't reduce the reported max.
+        # Heartbeat fires: hb resets, log accumulator is untouched.
+        w._hb_max_spine = {}
         w._note_depth(1, 20)
+        self.assertEqual(w._hb_spine_str().count('→'), 0)   # fresh 2s window
+        self.assertEqual(w._log_spine_str().count('→'), 2)  # still has depth-3
+
+        # Progress log fires: log resets.
+        w._log_max_spine = {}
         w._note_depth(1, 15)
-        self.assertEqual(w._spine_str().count('→'), 2)
+        self.assertEqual(w._log_spine_str().count('→'), 0)  # fresh 120s window
 
-        # New chunk: evaluate_chunk resets _max_spine.
-        w._max_spine = {}
-        w._note_depth(1, 20)
-        self.assertEqual(w._spine_str().count('→'), 0)  # fresh start
+        # New chunk: both reset.
+        w._note_depth(2, 8)
+        w._hb_max_spine = {}
+        w._log_max_spine = {}
+        w._note_depth(1, 10)
+        self.assertEqual(w._hb_spine_str().count('→'), 0)
+        self.assertEqual(w._log_spine_str().count('→'), 0)
 
     def test_display_path_resets_each_screen_refresh(self):
         """max_paths in _print_status is rebuilt from scratch on each call so
