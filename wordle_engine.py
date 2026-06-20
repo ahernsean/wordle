@@ -931,7 +931,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    deadline=None, guesses=None, policy=ERD_ALL,
                    cancel_check=None, heartbeat=None,
                    depth=0, depth_observer=None, budget=None,
-                   subbranch_solver=None):
+                   subbranch_solver=None, bound_provider=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -942,6 +942,11 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     budget: guesses available to solve `branch_words` from this point (None =
     unlimited).  A sub-branch that can't be solved within budget-1 makes this
     candidate infeasible (cost inf) and marks floor_hit — the depth cap fired.
+
+    bound_provider: optional callable returning the current global best ERD.
+    Called once before evaluation starts and once per sub-branch to tighten
+    the alpha-beta bound dynamically, so a worker mid-evaluation benefits from
+    improvements found by other workers without waiting for the next candidate.
 
     Returns (status, cost, max_depth, floor_hit):
       ('ok', cost, md, floor)  fully evaluated; cost < best_erd; md is this
@@ -968,6 +973,10 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         for answer in branch_words:
             pat = _encode_response(calculate_response(candidate, answer))
             groups[pat].append(answer)
+
+    # Tighten the bound from any external update before starting evaluation.
+    if bound_provider is not None:
+        best_erd = min(best_erd, bound_provider())
 
     # Admissible lower bound on this candidate's cost — cost >= 3 - (G + has_self)/n.
     has_self = _ALL_GREEN_PATTERN in groups
@@ -1000,6 +1009,10 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         rest_lb[i] = rest_lb[i + 1] + (len(ordered[i]) / n) * _sub_lb(ordered[i])
 
     for i, sub_branch in enumerate(ordered):
+        # Tighten the bound from any inter-worker improvement before computing
+        # this sub-branch's ceiling and the accumulated-cost cutoff check.
+        if bound_provider is not None:
+            best_erd = min(best_erd, bound_provider())
         k = len(sub_branch)
         if k == 1 and sub_branch[0] == candidate:
             continue  # self: solved by playing this candidate, 0 further guesses

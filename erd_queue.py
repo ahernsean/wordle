@@ -48,8 +48,8 @@ CREATE INDEX IF NOT EXISTS idx_pending_status_pri_n
 -- worker is a fungible contributor: it reports which branch and chunk it is
 -- on purely so the operator can see it is alive and moving (health), not as
 -- the unit of progress (that lives in active_branches).  The metric columns
--- (cache_hits/misses, n_pruned/n_ok, cand_rate) let `status` aggregate cache
--- effectiveness and branch-and-bound pruning across all workers.
+-- (cache_hits/misses, n_cutoff/n_pruned/n_ok, cand_rate) let `status` aggregate
+-- cache effectiveness and branch-and-bound pruning across all workers.
 CREATE TABLE IF NOT EXISTS worker_heartbeat (
     worker_id          TEXT    PRIMARY KEY,
     pid                INTEGER NOT NULL,
@@ -63,10 +63,12 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     cand_rate          REAL,        -- candidates/sec, recent
     cache_hits         INTEGER,
     cache_misses       INTEGER,
-    n_pruned           INTEGER,     -- candidates eliminated by the shared bound
+    n_cutoff           INTEGER,     -- alpha-beta: cost >= best_erd before full eval
+    n_pruned           INTEGER,     -- infeasible within budget (depth floor hit)
     n_ok               INTEGER,     -- candidates fully evaluated
     best_guess          TEXT,
-    best_erd           REAL,
+    best_erd           REAL,        -- ERD of the locally-found best candidate
+    bound_erd          REAL,        -- effective pruning bound: min(local, shared)
     cur_candidate      TEXT,        -- candidate word currently under evaluation
     cand_n_seen        INTEGER,     -- candidates evaluated so far in this chunk
     cand_chunk_size    INTEGER,     -- total candidates in this chunk
@@ -165,10 +167,12 @@ class ERDQueue:
                           ('cand_rate',        'REAL'),
                           ('cache_hits',       'INTEGER'),
                           ('cache_misses',     'INTEGER'),
+                          ('n_cutoff',         'INTEGER'),
                           ('n_pruned',         'INTEGER'),
                           ('n_ok',             'INTEGER'),
                           ('best_guess',        'TEXT'),
                           ('best_erd',         'REAL'),
+                          ('bound_erd',        'REAL'),
                           ('cur_candidate',    'TEXT'),
                           ('cand_n_seen',      'INTEGER'),
                           ('cand_chunk_size',  'INTEGER'),
@@ -227,7 +231,7 @@ class ERDQueue:
         self._conn.close()
 
     # ------------------------------------------------------------------
-    # Bootstrap / populate-queue
+    # Populate queue
     # ------------------------------------------------------------------
 
     def add_pending_many(self, rows):
@@ -238,7 +242,7 @@ class ERDQueue:
         - A row already present has its priority UPGRADED (never downgraded),
           e.g. a branch first inserted at priority=0 by an earlier root word
           is correctly promoted to priority=1 when a VIP word (SALET) is
-          bootstrapped later.
+          queued later.
         - source_word / source_pattern record the first root word whose branch
           produced this entry (kept for display in `status`).
         """
@@ -335,7 +339,8 @@ class ERDQueue:
                   current_branch_key, n_words, started_at: int,
                   chunks_done: int, chunk_idx=None, chunk_started_at=None,
                   cand_rate=None, cache_hits=None, cache_misses=None,
-                  n_pruned=None, n_ok=None, best_guess=None, best_erd=None,
+                  n_cutoff=None, n_pruned=None, n_ok=None,
+                  best_guess=None, best_erd=None, bound_erd=None,
                   cur_candidate=None, cand_n_seen=None, cand_chunk_size=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
                   cur_path=None):
@@ -344,14 +349,14 @@ class ERDQueue:
             INSERT OR REPLACE INTO worker_heartbeat
                 (worker_id, pid, current_branch_key, n_words, started_at,
                  updated_at, chunks_done, chunk_idx, chunk_started_at,
-                 cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
-                 best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+                 cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
+                 best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, cand_chunk_size,
                  cur_max_depth, cur_nodes, node_rate, cur_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_key, n_words, started_at,
               now, chunks_done, chunk_idx, chunk_started_at,
-              cand_rate, cache_hits, cache_misses, n_pruned, n_ok,
-              best_guess, best_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+              cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
+              best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, cand_chunk_size,
               cur_max_depth, cur_nodes, node_rate, cur_path))
 
     def clear_heartbeat(self, worker_id: str):
@@ -695,6 +700,21 @@ class ERDQueue:
             "SELECT * FROM pending_branches WHERE branch_key = ?",
             (branch_key,)
         ).fetchone()
+
+    def status_by_branch_keys(self, branch_keys) -> dict:
+        """Return {branch_key: pending_branches row} for the given keys.
+
+        A branch_key with no row was never queued; it is simply absent from
+        the returned dict.
+        """
+        if not branch_keys:
+            return {}
+        placeholders = ','.join('?' for _ in branch_keys)
+        rows = self._conn.execute(
+            f"SELECT * FROM pending_branches WHERE branch_key IN ({placeholders})",
+            list(branch_keys)
+        ).fetchall()
+        return {bytes(r["branch_key"]): r for r in rows}
 
     def get_active_branch(self, branch_key: bytes):
         """Return the active_branches row for branch_key, or None."""

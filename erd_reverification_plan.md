@@ -43,7 +43,7 @@ little for correct entries and automatically self-limits.
 2. **Parallelism:** the existing swarm machinery (`erd_queue` + workers) can be
    reused.  Each branch is a unit of work; the ceiling is passed as the
    `solve_budget` / alpha-beta parameter already threaded through
-   `run_branch_solve`.
+   `ERDQueue.create_branch`.
 
 3. **Idempotency:** the pass can be interrupted and resumed.  A branch that was
    already verified (and not updated) is simply re-verified cheaply on the next

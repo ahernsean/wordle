@@ -1,6 +1,6 @@
 """Scaling guard for the parallel ERD swarm.
 
-Three checks:
+Two checks:
 
 1. Work amplification (deterministic, thread-driven): the TOTAL number of
    candidate evaluations across all workers must stay equal to the candidate
@@ -9,13 +9,7 @@ Three checks:
    that without depending on wall-clock timing.  Each run must also still
    produce the correct ERD.
 
-2. Real multi-process run (fork only): actually spawn 1/2/4 worker processes on
-   one branch and confirm they all produce the correct result.  A 30-second
-   per-run timeout catches deadlocks and livelocks.  No wall-clock comparison
-   is made: on a branch this small, process spawn overhead (~100 ms/fork)
-   dominates solver time (~10 ms), making timing comparisons meaningless.
-
-3. Cooperative drain timing (fork only): spawn 1 vs 4 swarm_workers, drain 80
+2. Cooperative drain timing (fork only): spawn 1 vs 4 swarm_workers, drain 80
    disjoint branches from a shared queue, and assert 4 workers finish in < 80%
    of 1-worker time.  Key design constraints that make the comparison
    meaningful are documented on TestCooperativeDrainSmoke.
@@ -32,7 +26,7 @@ from unittest import mock
 from cache_sqlite import ScoreCache
 from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
 import erd_swarm
-from erd_swarm import _BranchWorker, ROOT_BUDGET, run_branch_solve
+from erd_swarm import _BranchWorker, ROOT_BUDGET
 from erd_queue import ERDQueue, encode_subset
 
 # 12-word branch -> ceil(12/3) = 4 chunks, so up to 4 workers each take a chunk.
@@ -98,8 +92,7 @@ class TestWorkDoesNotAmplify(_Base):
     def _solve_counting_work(self, n_workers):
         cache_path, queue_path = self._db(f"work{n_workers}")
         # Apply schema migrations once before the worker threads open the cache
-        # concurrently (production always has a single pre-open: bootstrap, or
-        # run_branch_solve's parent).
+        # concurrently (production always has a single pre-open: queue-add).
         ScoreCache(cache_path, BRANCH).close()
         n_chunks = self._register_branch(queue_path)
         self.assertGreaterEqual(n_chunks, 2, "need a multi-chunk branch")
@@ -112,7 +105,7 @@ class TestWorkDoesNotAmplify(_Base):
             try:
                 w.solve_branch_focused(self.branch_key)
                 with lock:
-                    evaluated.append(w.n_ok + w.n_pruned + w.n_useless)
+                    evaluated.append(w.n_ok + w.n_cutoff + w.n_pruned + w.n_useless)
             finally:
                 w.close()
 
@@ -140,39 +133,6 @@ class TestWorkDoesNotAmplify(_Base):
                     total_evaluated, len(CANDIDATES),
                     f"{nw} workers evaluated {total_evaluated} candidates, "
                     f"expected {len(CANDIDATES)} (work amplification!)")
-
-
-@unittest.skipUnless(
-    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
-    "needs fork start method and >=2 CPUs")
-class TestProcessScalingSmoke(_Base):
-    def _solve_processes(self, n_workers):
-        cache_path, queue_path = self._db(f"proc{n_workers}")
-        t0 = time.time()
-        result = run_branch_solve(
-            self.branch_key, BRANCH, n_workers=n_workers,
-            cache_path=cache_path, queue_path=queue_path,
-            min_words_per_chunk=DIVISOR, max_chunk_count=MAX_CHUNKS,
-            source_word="crane", source_pattern=0,
-            timeout=30)
-        return result, time.time() - t0
-
-    def test_runs_and_agrees_at_1_2_4_workers(self):
-        truth = self._ground_truth()
-        results, times = {}, {}
-        for nw in WORKER_COUNTS:
-            with self.subTest(workers=nw):
-                res, elapsed = self._solve_processes(nw)
-                # timeout=30 in run_branch_solve means a deadlock/livelock
-                # manifests as None rather than a hung test.
-                self.assertIsNotNone(res, f"{nw}-worker run timed out or produced no result")
-                self.assertAlmostEqual(res[1], truth, places=6)
-                results[nw] = res
-                times[nw] = elapsed
-        erds = {round(r[1], 6) for r in results.values()}
-        self.assertEqual(len(erds), 1, f"worker counts disagreed: {results}")
-        sys.stderr.write(f"\n[scaling] wall times by workers: "
-                         f"{ {k: round(v, 3) for k, v in times.items()} }\n")
 
 
 @unittest.skipUnless(
