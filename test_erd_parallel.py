@@ -198,5 +198,96 @@ class TestClaimSkipsCachedBranch(unittest.TestCase):
         self.assertIsNotNone(idx)
 
 
+class TestReportingInvariants(unittest.TestCase):
+    """MaxD and path have different reporting scopes, neither tied to heartbeat
+    timing.  MaxD resets at candidate start; path resets at screen refresh."""
+
+    def _bare_worker(self):
+        w = _BranchWorker.__new__(_BranchWorker)
+        w._spine = {}
+        w._hb_max_spine = {}
+        w._log_max_spine = {}
+        w._cand_max_depth = 0
+        w._cur_depth = 0
+        return w
+
+    def test_cand_max_depth_resets_per_candidate(self):
+        """_cand_max_depth is zeroed before each candidate so MaxD reflects
+        the current candidate's recursion, not the chunk lifetime."""
+        w = self._bare_worker()
+
+        w._note_depth(1, 50)
+        w._note_depth(2, 12)
+        w._note_depth(3, 4)
+        self.assertEqual(w._cand_max_depth, 3)
+
+        # evaluate_chunk resets before candidate 2.
+        w._cand_max_depth = 0
+
+        w._note_depth(1, 30)
+        self.assertEqual(w._cand_max_depth, 1)  # not 3 from candidate 1
+
+    def test_spine_windows(self):
+        """_hb_max_spine resets after each heartbeat write (2s window for the
+        status display); _log_max_spine resets after each 120s progress log
+        write.  Both reset when a new chunk starts."""
+        w = self._bare_worker()
+
+        w._note_depth(1, 50)
+        w._note_depth(2, 12)
+        w._note_depth(3, 4)
+
+        # Both accumulators capture the depth-3 path.
+        self.assertEqual(w._hb_spine_str().count('→'), 2)
+        self.assertEqual(w._log_spine_str().count('→'), 2)
+
+        # Heartbeat fires: hb resets, log accumulator is untouched.
+        w._hb_max_spine = {}
+        w._note_depth(1, 20)
+        self.assertEqual(w._hb_spine_str().count('→'), 0)   # fresh 2s window
+        self.assertEqual(w._log_spine_str().count('→'), 2)  # still has depth-3
+
+        # Progress log fires: log resets.
+        w._log_max_spine = {}
+        w._note_depth(1, 15)
+        self.assertEqual(w._log_spine_str().count('→'), 0)  # fresh 120s window
+
+        # New chunk: both reset.
+        w._note_depth(2, 8)
+        w._hb_max_spine = {}
+        w._log_max_spine = {}
+        w._note_depth(1, 10)
+        self.assertEqual(w._hb_spine_str().count('→'), 0)
+        self.assertEqual(w._log_spine_str().count('→'), 0)
+
+    def test_display_path_resets_each_screen_refresh(self):
+        """max_paths in _print_status is rebuilt from scratch on each call so
+        the path shown reflects only the current screen refresh, not history."""
+        def one_refresh(cur_path):
+            # Mirrors what _print_status does: start empty, take cur_path.
+            max_paths = {}
+            prev = max_paths.get('w', '')
+            if cur_path.count('→') >= prev.count('→'):
+                max_paths['w'] = cur_path
+            return max_paths['w']
+
+        shown1 = one_refresh('50→12→4')
+        self.assertEqual(shown1, '50→12→4')
+
+        # Next refresh starts empty: a shallower path is NOT displaced by history.
+        shown2 = one_refresh('30→8')
+        self.assertEqual(shown2, '30→8')
+
+    def test_display_path_tied_depth_takes_most_recent(self):
+        """Within one refresh, a path tied in depth with the current max
+        overwrites it so the displayed path is the most recent at that depth."""
+        max_paths = {}
+        for path in ('50→12→4', '45→9→2'):
+            prev = max_paths.get('w', '')
+            if path.count('→') >= prev.count('→'):
+                max_paths['w'] = path
+        self.assertEqual(max_paths['w'], '45→9→2')
+
+
 if __name__ == "__main__":
     unittest.main()

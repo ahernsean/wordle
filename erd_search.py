@@ -167,16 +167,24 @@ def cmd_queue_status(args):
     branch_keys = {code: encode_subset(branch) for code, branch in branches.items()}
 
     queue = ERDQueue(args.queue)
-    rows = queue.status_by_branch_keys(list(branch_keys.values()))
+    pending_rows = queue.status_by_branch_keys(list(branch_keys.values()))
+    # Cooperative sub-branches exist only in active_branches (no pending_branches
+    # row): check for any keys not found in pending_branches.
+    missing = [bk for bk in branch_keys.values() if bk not in pending_rows]
+    active_rows = queue.active_branches_by_keys(missing)
     queue.close()
 
     pending, in_progress, done, unqueued = [], [], [], []
     for code, branch in sorted(branches.items()):
         pat = fmt_pattern(code)
         n = len(branch)
-        row = rows.get(branch_keys[code])
-        if row is None:
+        bk = branch_keys[code]
+        row = pending_rows.get(bk)
+        active = active_rows.get(bk)
+        if row is None and active is None:
             unqueued.append((pat, n))
+        elif row is None:
+            in_progress.append((pat, n, active['priority'] or 0, None))
         elif row['status'] == 'pending':
             pending.append((pat, n, row['priority']))
         elif row['status'] == 'in_progress':
@@ -195,9 +203,11 @@ def cmd_queue_status(args):
     print()
 
     if in_progress:
+        _COOP_PRI = 1_000_000
         print(f'{"Pattern":<8}  {"Ans":>4}  {"Pri":>4}  Claimed by')
         for pat, n, priority, claimed_by in in_progress:
-            print(f'  {pat:<8}  {n:4d}  {priority:4d}  {claimed_by or "---"}')
+            pri_str = 'COOP' if priority >= _COOP_PRI else str(priority)
+            print(f'  {pat:<8}  {n:4d}  {pri_str:>4}  {claimed_by or "---"}')
         print()
 
     if pending:
@@ -898,15 +908,25 @@ def _print_status(args):
         n_in_prog = counts.get('in_progress', 0)
         n_pending = counts.get('pending', 0)
         n_done = counts.get('done', 0)
-        parts = [f'done {n_done:,}', f'in progress {n_in_prog}', f'pending {n_pending:,}']
-        branch_hdr += '  ' + ',  '.join(parts)
+        n_coop = sum(1 for b in branches if (b['priority'] or 0) >= _COOP_PRIORITY)
+        in_prog_str = f'in progress {n_in_prog}'
+        if n_coop:
+            in_prog_str += f' ({n_coop} cooperative)'
+        parts = [f'done {n_done:,}', in_prog_str, f'pending {n_pending:,}']
+        branch_hdr += ' ' + ', '.join(parts)
     print(branch_hdr)
-    if not branches:
-        print('  (none)')
+    denom_w = 2
+    if branches:
+        max_nc = max(ERDQueue.n_chunks_for(b['n_candidates'] or 1, b['chunk_size'])
+                     for b in branches)
+        denom_w = len(str(max_nc))
+    chunks_col_w = 2 * denom_w + 5   # num/denom + ' ' + 2-digit int pct + '%'
+    if branches:
+        print(f'  {"Root":<11s} {"D":>1s} {"Ans":>4s} '
+              f'{"Chunks":<{chunks_col_w}s} '
+              f'{"Best":<5s} {"ERD":>5s} {"Pri":>3s} {"Wk":>2s} ETA')
     else:
-        print(f'  {"Source":<13s}  {"Ans":>4s}  '
-              f'{"Chunks":<14s}  {"Best guess":<12s}  {"ERD":>6s}  '
-              f'{"Pri":>6s}  {"Wkrs":>4s}  ETA')
+        print('  (none)')
     for b in branches:
         key = bytes(b['branch_key'])
         n_cands = b['n_candidates'] or 0
@@ -921,20 +941,24 @@ def _print_status(args):
         nw = b['n_words'] or 0
         wk = worker_counts.get(key, 0)
         raw_pri = b['priority'] or 0
-        pri_str = 'HELD' if raw_pri >= _COOP_PRIORITY else str(raw_pri)
+        pri_str = 'COOP' if raw_pri >= _COOP_PRIORITY else str(raw_pri)
+        depth_val = b['depth'] if 'depth' in b.keys() else 0
         created = b['created_at'] or now_ts
         el = now_ts - created
         eta = ''
         if wk > 0 and 0 < done < n_chunks and el > 0:
             rem = (n_chunks - done) / (done / el)
             eta = _fmt_duration(int(rem))
-        print(f'  {src:<13s}  {nw:4d}  '
-              f'{done:3d}/{n_chunks:<3d} ({pct:5.1f}%)  '
-              f'{bw:<12s}  {be:>6s}  {pri_str:>6s}  {wk:4d}  {eta}')
+        chunks_str = f'{done:>{denom_w}d}/{n_chunks:<{denom_w}d} {int(pct):2d}%'
+        print(f'  {src:<11s} {depth_val:1d} {nw:4d} '
+              f'{chunks_str} '
+              f'{bw:<5s} {be:>5s} {pri_str:>3s} {wk:2d} {eta}')
     print()
 
     # Workers — liveness and forward progress.
-    answer_set = set(load_word_list(ANSWER_FILE))
+    if not hasattr(_print_status, '_answer_set'):
+        _print_status._answer_set = set(load_word_list(ANSWER_FILE))
+    answer_set = _print_status._answer_set
     worker_hdr = 'Workers:'
     if live and total_evals:
         parts = []
@@ -943,12 +967,17 @@ def _print_status(args):
         if pruned_pct is not None:
             parts.append(f'depth-pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({_fmt_pct(pruned_pct)})')
         if parts:
-            worker_hdr = f'Workers ({", ".join(parts)}):'
+            # Replace the worker header
+            worker_hdr = f'Workers: {", ".join(parts)}:'
     print(worker_hdr)
+    branch_depth_map = {bytes(b['branch_key']): (b['depth'] if 'depth' in b.keys() else 0)
+                        for b in branches}
+    # Fresh accumulator each cycle: path shown reflects this refresh only.
+    max_paths = {}
     if not hbs:
         print('  (none active)')
     else:
-        print(f'  {"W":>2}  {"Branch":<13} {"Chk":>3}  {"Held":>6}  '
+        print(f'  {"W":>2}  {"Root":<11}  {"D":>1}  {"Chk":>3}  {"Held":>6}  '
               f'{"Best":<5}  {"ERD":>5}  {"Bound":>5}  HB')
     for h in sorted(hbs, key=lambda r: r['worker_id']):
         age = now_ts - h['updated_at']
@@ -956,12 +985,13 @@ def _print_status(args):
         flag = ' !!' if age > 120 else ''
         key = h['current_branch_key']
         if key is None:
-            print(f'  {wnum:>2}  {"(idle)":<13}  {"":>2}  {"":>6}  '
-                  f'{"":5}  {"":>5}  {age}s{flag}')
+            print(f'  {wnum:>2}  {"(idle)":<11}  {0:1d}  {"":>3}  {"":>6}  '
+                  f'{"":5}  {"":>5}  {"":>5}  {age}s{flag}')
             continue
         src = (f'{h["source_word"].upper()} {fmt_pattern(h["source_pattern"])}'
                if h['source_word'] and h['source_pattern'] is not None
                else '-----')
+        w_depth = branch_depth_map.get(bytes(key), 0)
         chunk = str(h['chunk_idx']) if h['chunk_idx'] is not None else '-'
         held = now_ts - (h['chunk_started_at'] or now_ts)
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
@@ -973,17 +1003,18 @@ def _print_status(args):
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
         if '>' in path:
             path = path.replace('>', '→')
-        # Accumulate the longest spine seen for this worker on this branch
-        # across display cycles; keyed by (worker_id, branch_key) so it resets
-        # automatically when the worker moves to a different branch.
-        max_paths = getattr(_print_status, 'max_paths', {})
+        # Show the deepest path seen across this watch cycle.  Each heartbeat
+        # writes the max spine from its own 2-second window (_hb_max_spine in
+        # erd_swarm.py, reset after each write); max_paths accumulates across
+        # successive heartbeat reads so the display shows the maximum over the
+        # full watch interval.  Tied depth overwrites so the displayed path is
+        # the most recent at that depth.
         path_key = (h['worker_id'], bytes(key) if key else None)
         prev_max = max_paths.get(path_key, '')
         if path.count('→') >= prev_max.count('→'):
             max_paths[path_key] = path
         else:
             path = prev_max
-        _print_status.max_paths = max_paths
         best_g = (h['best_guess'] if 'best_guess' in h.keys() else None) or ''
         best_e = (h['best_erd'] if 'best_erd' in h.keys() else None)
         bound_e = (h['bound_erd'] if 'bound_erd' in h.keys() else None)
@@ -993,7 +1024,7 @@ def _print_status(args):
         best_g_disp = best_g.upper() if best_g else '-----'
         best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
         bound_e_disp = f'{bound_e:.3f}' if bound_e is not None else '-----'
-        print(f'  {wnum:>2}  {src:<13}  {chunk:>2}  {_fmt_duration(held):>6}  '
+        print(f'  {wnum:>2}  {src:<11}  {w_depth:1d}  {chunk:>3}  {_fmt_duration(held):>6}  '
               f'{best_g_disp:<5}  {best_e_disp:>5}  {bound_e_disp:>5}  {age}s{flag}')
         if cur:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')

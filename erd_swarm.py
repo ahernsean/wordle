@@ -115,12 +115,17 @@ class _BranchWorker:
         self._nodes_at_last_hb = 0
         self._cur_depth = 0
         self._spine = {}             # depth -> subset size on the active descent
-        self._max_spine = {}         # deepest spine seen since last heartbeat
+        self._hb_max_spine = {}      # deepest spine since last heartbeat (→ DB)
+        self._log_max_spine = {}     # deepest spine since last progress log (→ log file)
         self._last_progress_log = 0.0
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
+        # Cooperative nesting depth: incremented on entry to cooperative_solve,
+        # decremented on exit.  Passed to create_branch so the status display
+        # can distinguish user-queued branches (depth 0) from sub-branches.
+        self._coop_depth = 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -148,8 +153,17 @@ class _BranchWorker:
     # -- depth instrumentation ----------------------------------------------
 
     def _note_depth(self, depth, n):
-        # Per-position observer: track max depth and the live recursion spine
-        # (subset size at each depth on the active descent).  Observation only.
+        # Per-position observer: track max depth and the live recursion spine.
+        # n < 0 is the cooperative-promotion sentinel: the sub-branch at this
+        # depth was handed off to the swarm; overwrite its size with '•' and
+        # leave deeper entries intact (there are none after a promotion).
+        if n < 0:
+            self._spine[depth] = '•'
+            if len(self._spine) >= len(self._hb_max_spine):
+                self._hb_max_spine = dict(self._spine)
+            if len(self._spine) >= len(self._log_max_spine):
+                self._log_max_spine = dict(self._spine)
+            return
         if depth > self._cand_max_depth:
             self._cand_max_depth = depth
         self._cur_depth = depth
@@ -157,11 +171,16 @@ class _BranchWorker:
         deeper = [d for d in self._spine if d > depth]
         for d in deeper:
             del self._spine[d]
-        if len(self._spine) >= len(self._max_spine):
-            self._max_spine = dict(self._spine)
+        if len(self._spine) >= len(self._hb_max_spine):
+            self._hb_max_spine = dict(self._spine)
+        if len(self._spine) >= len(self._log_max_spine):
+            self._log_max_spine = dict(self._spine)
 
-    def _spine_str(self):
-        return '→'.join(str(self._max_spine[d]) for d in sorted(self._max_spine))
+    def _hb_spine_str(self):
+        return '→'.join(str(self._hb_max_spine[d]) for d in sorted(self._hb_max_spine))
+
+    def _log_spine_str(self):
+        return '→'.join(str(self._log_max_spine[d]) for d in sorted(self._log_max_spine))
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
@@ -223,8 +242,8 @@ class _BranchWorker:
             cand_chunk_size=cand_chunk_size,
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
-            cur_path=self._spine_str())
-        self._max_spine = dict(self._spine)
+            cur_path=self._hb_spine_str())
+        self._hb_max_spine = {}
         if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:
             self._last_progress_log = now
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
@@ -234,8 +253,10 @@ class _BranchWorker:
                         self.name, chunk_idx,
                         cur_candidate.upper(), cand_n_seen or 0,
                         cand_chunk_size or 0,
-                        self._cand_max_depth, self._spine_str(),
+                        self._cand_max_depth, self._log_spine_str(),
                         self._nodes / 1e6, node_rate / 1e3, bg, be)
+            self._log_max_spine = {}
+            self._cand_max_depth = 0
 
     # -- evaluate one chunk -------------------------------------------------
 
@@ -251,6 +272,8 @@ class _BranchWorker:
         """
         lo, hi = ERDQueue.chunk_range(idx, chunk_size, self.n_candidates)
         chunk_total = hi - lo
+        self._hb_max_spine = {}
+        self._log_max_spine = {}
         local_candidate, local_best = self.queue.read_branch_best(branch_key)
         local_md = None
         shared_best = local_best
@@ -301,7 +324,7 @@ class _BranchWorker:
                 words, ranked[ci], self.rcache, self.score_cache,
                 n=n_words, best_erd=float('inf'), guesses=self.all_words,
                 policy=ERD_ALL, cancel_check=self.cancel,
-                depth=0, depth_observer=self._note_depth, budget=budget,
+                depth=0, note_depth=self._note_depth, budget=budget,
                 subbranch_solver=self._subbranch_solver,
                 bound_provider=_bound_provider,
                 heartbeat=lambda: self._heartbeat(
@@ -417,56 +440,61 @@ class _BranchWorker:
         from cache.  Never idle-blocks (the worker that needs it drives it),
         and deadlock-free (a waiting worker holds no chunk).
         """
-        branch_key = encode_subset(words)
-        # Already solved by someone? reuse without re-promoting.
-        reuse = _cache_reuse(
-            self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
-        if reuse is not None:
-            return (*reuse, False)
-
-        n_words = len(words)
-        chunk_size = ERDQueue.chunk_size_for(
-            n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
-        self.queue.create_branch(
-            branch_key, n_words, self.n_candidates, chunk_size,
-            priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
-            source_pattern=self._top_source_pattern, budget=budget)
-        n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
-        ranked = self._ranked_for(branch_key, words)
-
-        while not self.cancel():
-            # Finished?  Check before claiming so we never touch a branch that
-            # another worker just finalized and deleted.
+        self._coop_depth += 1
+        try:
+            branch_key = encode_subset(words)
+            # Already solved by someone? reuse without re-promoting.
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
             if reuse is not None:
                 return (*reuse, False)
-            if self.queue.get_branch(branch_key) is None:
-                break                       # finalized as a loss + deleted
-            idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
-            if idx is not None:
-                if self.evaluate_chunk(branch_key, words, n_words, ranked, idx,
-                                       chunk_size, budget=budget):
-                    self.maybe_finalize(branch_key, words, n_chunks)
-                self._maybe_checkpoint()    # drain WAL during deep solving
-            elif self.queue.branch_done_chunks(branch_key) >= n_chunks:
-                self.maybe_finalize(branch_key, words, n_chunks)
-            else:
-                # Every chunk is claimed but coverage isn't complete: some are
-                # held by other workers.  Heartbeat first (so THIS worker, which
-                # still holds its own parent chunk up the stack, isn't itself
-                # presumed dead while it waits), then free any sub-chunk whose
-                # holder has died so we can re-claim it rather than wait forever
-                # — there may be no supervisor in the standalone solve path.
-                self._heartbeat(branch_key, n_words, None, None, None,
-                                None, None, force=True)
-                self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
-                time.sleep(0.05)            # chunks in flight elsewhere; let them land
 
-        if self.cancel():
-            return None
-        # Finalized as a loss: proven unsolvable (not a cutoff).
-        return (float('inf'), None, True, False)
+            n_words = len(words)
+            chunk_size = ERDQueue.chunk_size_for(
+                n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
+            self.queue.create_branch(
+                branch_key, n_words, self.n_candidates, chunk_size,
+                priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
+                source_pattern=self._top_source_pattern, budget=budget,
+                depth=self._coop_depth)
+            n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
+            ranked = self._ranked_for(branch_key, words)
+
+            while not self.cancel():
+                # Finished?  Check before claiming so we never touch a branch that
+                # another worker just finalized and deleted.
+                reuse = _cache_reuse(
+                    self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
+                if reuse is not None:
+                    return (*reuse, False)
+                if self.queue.get_branch(branch_key) is None:
+                    break                       # finalized as a loss + deleted
+                idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
+                if idx is not None:
+                    if self.evaluate_chunk(branch_key, words, n_words, ranked, idx,
+                                           chunk_size, budget=budget):
+                        self.maybe_finalize(branch_key, words, n_chunks)
+                    self._maybe_checkpoint()    # drain WAL during deep solving
+                elif self.queue.branch_done_chunks(branch_key) >= n_chunks:
+                    self.maybe_finalize(branch_key, words, n_chunks)
+                else:
+                    # Every chunk is claimed but coverage isn't complete: some are
+                    # held by other workers.  Heartbeat first (so THIS worker, which
+                    # still holds its own parent chunk up the stack, isn't itself
+                    # presumed dead while it waits), then free any sub-chunk whose
+                    # holder has died so we can re-claim it rather than wait forever
+                    # — there may be no supervisor in the standalone solve path.
+                    self._heartbeat(branch_key, n_words, None, None, None,
+                                    None, None, force=True)
+                    self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
+                    time.sleep(0.05)            # chunks in flight elsewhere; let them land
+
+            if self.cancel():
+                return None
+            # Finalized as a loss: proven unsolvable (not a cutoff).
+            return (float('inf'), None, True, False)
+        finally:
+            self._coop_depth -= 1
 
     # -- scheduling: claim one chunk of the best available branch -----------
 

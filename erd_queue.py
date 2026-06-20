@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS active_branches (
     best_guess      TEXT,
     status         TEXT    NOT NULL DEFAULT 'open',
     created_at     INTEGER,
-    finalized_at   INTEGER
+    finalized_at   INTEGER,
+    depth          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
@@ -191,7 +192,8 @@ class ERDQueue:
                        self._conn.execute('PRAGMA table_info(active_branches)')}
         for col, defn in [('budget',         'INTEGER'),
                           ('best_max_depth', 'INTEGER'),
-                          ('tainted',        'INTEGER NOT NULL DEFAULT 0')]:
+                          ('tainted',        'INTEGER NOT NULL DEFAULT 0'),
+                          ('depth',          'INTEGER NOT NULL DEFAULT 0')]:
             if col not in existing_ab:
                 self._conn.execute(
                     f'ALTER TABLE active_branches ADD COLUMN {col} {defn}')
@@ -429,22 +431,24 @@ class ERDQueue:
 
     def create_branch(self, branch_key, n_words, n_candidates, chunk_size,
                       priority=0, source_word=None, source_pattern=None,
-                      budget=None) -> bool:
+                      budget=None, depth=0) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
         from the queue creates it; others that race simply see it exists and
         join.  Returns True if this call created the row.  budget is the guess
-        budget the branch is solved under (depth-limited ERD).
+        budget the branch is solved under (depth-limited ERD).  depth is the
+        cooperative nesting level: 0 for user-queued branches, 1 for branches
+        promoted inside cooperative_solve, 2 for their sub-branches, etc.
         """
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
                 (branch_key, n_words, n_candidates, chunk_size,
-                 priority, source_word, source_pattern, status, created_at, budget)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+                 priority, source_word, source_pattern, status, created_at, budget, depth)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
         """, (branch_key, n_words, n_candidates, chunk_size,
-              priority, source_word, source_pattern, now, budget))
+              priority, source_word, source_pattern, now, budget, depth))
         return cur.rowcount == 1
 
     def get_branch(self, branch_key):
@@ -712,6 +716,21 @@ class ERDQueue:
         placeholders = ','.join('?' for _ in branch_keys)
         rows = self._conn.execute(
             f"SELECT * FROM pending_branches WHERE branch_key IN ({placeholders})",
+            list(branch_keys)
+        ).fetchall()
+        return {bytes(r["branch_key"]): r for r in rows}
+
+    def active_branches_by_keys(self, branch_keys) -> dict:
+        """Return {branch_key: active_branches row} for the given keys.
+
+        Only open branches appear; finalized branches are deleted from this
+        table and will be absent from the returned dict.
+        """
+        if not branch_keys:
+            return {}
+        placeholders = ','.join('?' for _ in branch_keys)
+        rows = self._conn.execute(
+            f"SELECT * FROM active_branches WHERE branch_key IN ({placeholders})",
             list(branch_keys)
         ).fetchall()
         return {bytes(r["branch_key"]): r for r in rows}

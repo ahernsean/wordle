@@ -930,7 +930,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    n=None, best_erd=float('inf'),
                    deadline=None, guesses=None, policy=ERD_ALL,
                    cancel_check=None, heartbeat=None,
-                   depth=0, depth_observer=None, budget=None,
+                   depth=0, note_depth=None, budget=None,
                    subbranch_solver=None, bound_provider=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
@@ -1026,7 +1026,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             sub_ceiling = (best_erd - cost - rest_lb[i + 1]) * (n / k) + _CEIL_EPS
         sub = _solve_subset(
             sub_branch, cache, score_cache, sub_budget, deadline, guesses,
-            policy, cancel_check, heartbeat, depth + 1, depth_observer, None,
+            policy, cancel_check, heartbeat, depth + 1, note_depth, None,
             subbranch_solver, ceiling=sub_ceiling)
         if sub is None:
             return ('abort', None, None, floor)
@@ -1049,7 +1049,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 
 
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
-                  policy, cancel_check, heartbeat, depth, depth_observer,
+                  policy, cancel_check, heartbeat, depth, note_depth,
                   progress_callback, subbranch_solver=None,
                   ceiling=float('inf')):
     """Budget-aware core of min_expected_guesses.
@@ -1077,8 +1077,8 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     n = len(branch_words)
     if heartbeat is not None:
         heartbeat()
-    if depth_observer is not None:
-        depth_observer(depth, n)
+    if note_depth is not None:
+        note_depth(depth, n)
     if budget is not None and budget < 1:
         return (float('inf'), None, True, False)   # no guess available at all
     if n == 1:
@@ -1115,6 +1115,8 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     if subbranch_solver is not None:
         delegated = subbranch_solver(branch_words, budget)
         if delegated is not None:
+            if note_depth is not None:
+                note_depth(depth, -n)  # sentinel: this level was promoted
             return delegated
 
     # Best-first ordering: evaluate the strongest splitter first (key = expected
@@ -1143,7 +1145,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             branch_words, candidate, cache, score_cache,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
-            depth=depth, depth_observer=depth_observer, budget=budget,
+            depth=depth, note_depth=note_depth, budget=budget,
             subbranch_solver=subbranch_solver,
         )
         if status == 'abort':
@@ -1190,7 +1192,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
                           deadline=None, guesses=None,
                           policy=None, progress_callback=None,
                           cancel_check=None, heartbeat=None,
-                          depth=0, depth_observer=None, budget=None,
+                          depth=0, note_depth=None, budget=None,
                           subbranch_solver=None):
     """
     Exact expected guesses to solve branch_words, playing optimally.
@@ -1205,7 +1207,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
              when guesses is supplied, ERD_ANSWERS otherwise.
     progress_callback: progress_callback(done, total, best_guess, best_erd),
              once per fully-evaluated top-level candidate (top level only).
-    cancel_check / heartbeat / depth_observer: threaded into every recursive
+    cancel_check / heartbeat / note_depth: threaded into every recursive
              call (see _solve_subset / evaluate_candidate).
 
     Returns the expected-guesses cost, or None if the deadline/cancel fired or
@@ -1214,7 +1216,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
     """
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat, depth,
-                        depth_observer, progress_callback, subbranch_solver)
+                        note_depth, progress_callback, subbranch_solver)
     if res is None:
         return None
     cost, _md, _floor, _cutoff = res
