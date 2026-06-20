@@ -3037,49 +3037,99 @@ class ResilientFileHandler(logging.FileHandler):
     underlying file is transiently unwritable (e.g. an iOS File Provider
     revoking access to an already-open descriptor during iCloud sync).
 
-    Every record is appended to an in-memory queue and drained from the
-    front on each emit() call. A record is popped only after it is
-    actually written, so nothing is lost across an outage — delivery is
-    just delayed until the stream recovers. On write failure the stream
-    is closed and reopened to pick up a fresh descriptor, since a stale
+    A record is popped from the queue only once it is actually written, so
+    a transient outage delays delivery instead of losing it; the queue is
+    capped at MAX_QUEUE_SIZE, dropping the oldest records first, so an
+    extended outage bounds memory instead of growing forever. A record
+    that can never succeed — a formatting error, or any write failure that
+    isn't an OSError — is reported via handleError and dropped immediately
+    rather than retried, since retrying an unfixable record would wedge
+    every record behind it forever. RecursionError always propagates,
+    matching the stdlib StreamHandler/FileHandler contract.
+
+    On an OSError the stream is closed and reopened (at most once per
+    REOPEN_COOLDOWN_SECONDS) to pick up a fresh descriptor, since a stale
     descriptor is the usual cause of the revocation. Failures under
     GRACE_SECONDS stay silent; failures that persist past it surface the
-    normal logging traceback (the queued record keeps retrying either
-    way).
+    normal logging traceback at most once per GRACE_SECONDS for as long as
+    the outage continues. close() makes one final drain attempt before
+    shutting down, so a clean exit still delivers whatever the stream will
+    accept.
     """
 
     GRACE_SECONDS = 30
+    MAX_QUEUE_SIZE = 1000
+    REOPEN_COOLDOWN_SECONDS = 1
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._queue = []
         self._failing_since = None
+        self._last_surfaced = None
+        self._last_reopen_attempt = None
 
     def emit(self, record):
         self._queue.append(record)
+        del self._queue[:-self.MAX_QUEUE_SIZE]
+        self._drain()
+
+    def _drain(self):
         while self._queue:
             record = self._queue[0]
             try:
                 msg = self.format(record)
+            except RecursionError:
+                raise
+            except Exception:
+                self._queue.pop(0)
+                self.handleError(record)
+                continue
+            try:
+                if self.stream is None:
+                    raise OSError("log stream unavailable")
                 self.stream.write(msg + self.terminator)
                 self.flush()
-            except Exception:
+            except RecursionError:
+                raise
+            except OSError:
                 self._on_write_failure(record)
                 return
             else:
                 self._queue.pop(0)
                 self._failing_since = None
+                self._last_surfaced = None
 
     def _on_write_failure(self, record):
         now = time.monotonic()
         if self._failing_since is None:
             self._failing_since = now
-        with contextlib.suppress(Exception):
-            self.close()
-        with contextlib.suppress(Exception):
-            self.stream = self._open()
-        if now - self._failing_since >= self.GRACE_SECONDS:
+        self._maybe_reopen_stream(now)
+        persistent = now - self._failing_since >= self.GRACE_SECONDS
+        due_to_surface = (self._last_surfaced is None
+                           or now - self._last_surfaced >= self.GRACE_SECONDS)
+        if persistent and due_to_surface:
+            self._last_surfaced = now
             self.handleError(record)
+
+    def _maybe_reopen_stream(self, now):
+        if (self._last_reopen_attempt is not None
+                and now - self._last_reopen_attempt < self.REOPEN_COOLDOWN_SECONDS):
+            return
+        self._last_reopen_attempt = now
+        if self.stream is not None:
+            with contextlib.suppress(OSError):
+                self.stream.close()
+            self.stream = None
+        with contextlib.suppress(OSError):
+            self.stream = self._open()
+
+    def close(self):
+        self.acquire()
+        try:
+            self._drain()
+        finally:
+            self.release()
+        super().close()
 
 
 def main():  # pragma: no cover - interactive REPL loop, exercised manually
