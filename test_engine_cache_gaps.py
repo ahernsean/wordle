@@ -369,14 +369,14 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         if s1[1] is not None and s2[1] is not None:
             self.assertAlmostEqual(s1[1], s2[1])
 
-    def test_solve_subset_depth_observer_called(self):
-        """depth_observer is invoked (1058)."""
+    def test_solve_subset_note_depth_called(self):
+        """note_depth is invoked (1058)."""
         remaining = ["crane", "slate", "trace"]
         cache, _ = make_cache(None)
         seen = []
         _solve_subset(remaining, cache, None, None, None, remaining,
                       ERD_ANSWERS, None, None, 0,
-                      depth_observer=lambda d, n: seen.append((d, n)),
+                      note_depth=lambda d, n: seen.append((d, n)),
                       progress_callback=None)
         self.assertTrue(seen)
         self.assertEqual(seen[0], (0, len(remaining)))

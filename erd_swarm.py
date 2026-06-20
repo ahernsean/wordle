@@ -312,7 +312,7 @@ class _BranchWorker:
                 words, ranked[ci], self.rcache, self.score_cache,
                 n=n_words, best_erd=float('inf'), guesses=self.all_words,
                 policy=ERD_ALL, cancel_check=self.cancel,
-                depth=0, depth_observer=self._note_depth, budget=budget,
+                depth=0, note_depth=self._note_depth, budget=budget,
                 subbranch_solver=self._subbranch_solver,
                 bound_provider=_bound_provider,
                 heartbeat=lambda: self._heartbeat(
