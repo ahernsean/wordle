@@ -121,6 +121,10 @@ class _BranchWorker:
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
+        # Cooperative nesting depth: incremented on entry to cooperative_solve,
+        # decremented on exit.  Passed to create_branch so the status display
+        # can distinguish user-queued branches (depth 0) from sub-branches.
+        self._coop_depth = 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -417,56 +421,61 @@ class _BranchWorker:
         from cache.  Never idle-blocks (the worker that needs it drives it),
         and deadlock-free (a waiting worker holds no chunk).
         """
-        branch_key = encode_subset(words)
-        # Already solved by someone? reuse without re-promoting.
-        reuse = _cache_reuse(
-            self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
-        if reuse is not None:
-            return (*reuse, False)
-
-        n_words = len(words)
-        chunk_size = ERDQueue.chunk_size_for(
-            n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
-        self.queue.create_branch(
-            branch_key, n_words, self.n_candidates, chunk_size,
-            priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
-            source_pattern=self._top_source_pattern, budget=budget)
-        n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
-        ranked = self._ranked_for(branch_key, words)
-
-        while not self.cancel():
-            # Finished?  Check before claiming so we never touch a branch that
-            # another worker just finalized and deleted.
+        self._coop_depth += 1
+        try:
+            branch_key = encode_subset(words)
+            # Already solved by someone? reuse without re-promoting.
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
             if reuse is not None:
                 return (*reuse, False)
-            if self.queue.get_branch(branch_key) is None:
-                break                       # finalized as a loss + deleted
-            idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
-            if idx is not None:
-                if self.evaluate_chunk(branch_key, words, n_words, ranked, idx,
-                                       chunk_size, budget=budget):
-                    self.maybe_finalize(branch_key, words, n_chunks)
-                self._maybe_checkpoint()    # drain WAL during deep solving
-            elif self.queue.branch_done_chunks(branch_key) >= n_chunks:
-                self.maybe_finalize(branch_key, words, n_chunks)
-            else:
-                # Every chunk is claimed but coverage isn't complete: some are
-                # held by other workers.  Heartbeat first (so THIS worker, which
-                # still holds its own parent chunk up the stack, isn't itself
-                # presumed dead while it waits), then free any sub-chunk whose
-                # holder has died so we can re-claim it rather than wait forever
-                # — there may be no supervisor in the standalone solve path.
-                self._heartbeat(branch_key, n_words, None, None, None,
-                                None, None, force=True)
-                self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
-                time.sleep(0.05)            # chunks in flight elsewhere; let them land
 
-        if self.cancel():
-            return None
-        # Finalized as a loss: proven unsolvable (not a cutoff).
-        return (float('inf'), None, True, False)
+            n_words = len(words)
+            chunk_size = ERDQueue.chunk_size_for(
+                n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
+            self.queue.create_branch(
+                branch_key, n_words, self.n_candidates, chunk_size,
+                priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
+                source_pattern=self._top_source_pattern, budget=budget,
+                depth=self._coop_depth)
+            n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
+            ranked = self._ranked_for(branch_key, words)
+
+            while not self.cancel():
+                # Finished?  Check before claiming so we never touch a branch that
+                # another worker just finalized and deleted.
+                reuse = _cache_reuse(
+                    self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
+                if reuse is not None:
+                    return (*reuse, False)
+                if self.queue.get_branch(branch_key) is None:
+                    break                       # finalized as a loss + deleted
+                idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
+                if idx is not None:
+                    if self.evaluate_chunk(branch_key, words, n_words, ranked, idx,
+                                           chunk_size, budget=budget):
+                        self.maybe_finalize(branch_key, words, n_chunks)
+                    self._maybe_checkpoint()    # drain WAL during deep solving
+                elif self.queue.branch_done_chunks(branch_key) >= n_chunks:
+                    self.maybe_finalize(branch_key, words, n_chunks)
+                else:
+                    # Every chunk is claimed but coverage isn't complete: some are
+                    # held by other workers.  Heartbeat first (so THIS worker, which
+                    # still holds its own parent chunk up the stack, isn't itself
+                    # presumed dead while it waits), then free any sub-chunk whose
+                    # holder has died so we can re-claim it rather than wait forever
+                    # — there may be no supervisor in the standalone solve path.
+                    self._heartbeat(branch_key, n_words, None, None, None,
+                                    None, None, force=True)
+                    self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
+                    time.sleep(0.05)            # chunks in flight elsewhere; let them land
+
+            if self.cancel():
+                return None
+            # Finalized as a loss: proven unsolvable (not a cutoff).
+            return (float('inf'), None, True, False)
+        finally:
+            self._coop_depth -= 1
 
     # -- scheduling: claim one chunk of the best available branch -----------
 
