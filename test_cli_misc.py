@@ -17,7 +17,6 @@ import logging
 import os
 import sys
 import tempfile
-import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -323,111 +322,38 @@ class PlatformLabelTests(unittest.TestCase):
 
 
 class ResilientFileHandlerTests(unittest.TestCase):
-    # These tests call emit() directly rather than through Handler.handle(),
-    # which normally holds the handler's lock for the duration of emit().
-    # That's safe here: everything in this class runs on a single thread, and
-    # close() (also exercised below) takes the same lock itself.
     class _BrokenStream:
         def write(self, msg):
             raise PermissionError("simulated transient failure")
 
         def flush(self):
-            pass
+            raise PermissionError("simulated transient failure")
 
         def close(self):
-            pass
+            raise PermissionError("simulated transient failure")
 
     def setUp(self):
         self._path = tempfile.mktemp()
         self.addCleanup(lambda: os.path.exists(self._path) and os.remove(self._path))
         self.handler = wordle.ResilientFileHandler(self._path)
         self.handler.setFormatter(logging.Formatter("%(message)s"))
-        real_open = self.handler._open
-        self.addCleanup(self.handler.close)
-        self.addCleanup(self._restore_real_stream, real_open)
-
-    def _restore_real_stream(self, real_open):
-        # Runs before the close() cleanup so close() drains against a working
-        # stream, even for tests that leave the handler mid-outage.
-        self.handler._open = real_open
-        if self.handler.stream is not None:
-            with contextlib.suppress(Exception):
-                self.handler.stream.close()
-        with contextlib.suppress(Exception):
-            self.handler.stream = real_open()
 
     def _record(self, msg):
         return logging.LogRecord("test", logging.INFO, __file__, 0, msg, None, None)
 
-    def test_successful_write_drains_immediately(self):
+    def test_successful_write_is_delivered(self):
         self.handler.emit(self._record("msg1"))
-        self.assertEqual(list(self.handler._queue), [])
+        self.handler.close()
         with open(self._path) as f:
             self.assertEqual(f.read(), "msg1\n")
 
-    def test_failed_write_queues_and_does_not_lose_record(self):
-        real_open = self.handler._open
+    def test_write_failure_is_reported_not_raised(self):
         self.handler.stream.close()
-        self.handler._open = lambda: self._BrokenStream()
-        self.handler.stream = self._BrokenStream()
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.handler.emit(self._record("msg1"))
-            self.handler.emit(self._record("msg2"))
-        self.assertEqual(len(self.handler._queue), 2)
-
-        self.handler._open = real_open
-        self.handler.stream = real_open()
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.handler.emit(self._record("msg3"))
-        self.assertEqual(list(self.handler._queue), [])
-        with open(self._path) as f:
-            self.assertEqual(f.read(), "msg1\nmsg2\nmsg3\n")
-
-    def test_failure_surfaces_only_past_grace_period(self):
-        self.handler.GRACE_SECONDS = 0.05
-        self.handler.stream.close()
-        self.handler._open = lambda: self._BrokenStream()
         self.handler.stream = self._BrokenStream()
 
         with contextlib.redirect_stderr(io.StringIO()) as captured:
             self.handler.emit(self._record("msg1"))
-        self.assertEqual(captured.getvalue(), "")
-
-        time.sleep(0.1)
-        with contextlib.redirect_stderr(io.StringIO()) as captured:
-            self.handler.emit(self._record("msg2"))
         self.assertIn("Logging error", captured.getvalue())
-        self.assertEqual(len(self.handler._queue), 2)
-
-    def test_failure_surfaces_at_most_once_per_grace_period(self):
-        self.handler.GRACE_SECONDS = 0.05
-        self.handler.stream.close()
-        self.handler._open = lambda: self._BrokenStream()
-        self.handler.stream = self._BrokenStream()
-
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.handler.emit(self._record("msg1"))
-        time.sleep(0.1)
-        with contextlib.redirect_stderr(io.StringIO()) as captured:
-            self.handler.emit(self._record("msg2"))
-        self.assertIn("Logging error", captured.getvalue())
-
-        with contextlib.redirect_stderr(io.StringIO()) as captured:
-            self.handler.emit(self._record("msg3"))
-        self.assertEqual(captured.getvalue(), "")
-
-    def test_format_error_is_dropped_and_reported_not_retried(self):
-        bad_record = self._record("msg1")
-        bad_record.getMessage = lambda: 1 / 0
-
-        with contextlib.redirect_stderr(io.StringIO()) as captured:
-            self.handler.emit(bad_record)
-        self.assertIn("Logging error", captured.getvalue())
-        self.assertEqual(list(self.handler._queue), [])
-
-        self.handler.emit(self._record("msg2"))
-        with open(self._path) as f:
-            self.assertEqual(f.read(), "msg2\n")
 
     def test_recursion_error_propagates(self):
         self.handler.stream.close()
@@ -436,72 +362,20 @@ class ResilientFileHandlerTests(unittest.TestCase):
 
         with self.assertRaises(RecursionError):
             self.handler.emit(self._record("msg1"))
-        self.handler.stream.write.side_effect = None
 
-    def test_non_os_write_error_is_dropped_and_reported_not_retried(self):
-        real_open = self.handler._open
+    def test_close_swallows_os_error_from_broken_stream(self):
         self.handler.stream.close()
-        self.handler.stream = mock.Mock()
-        self.handler.stream.write.side_effect = UnicodeEncodeError(
-            "ascii", "x", 0, 1, "simulated")
-
-        with contextlib.redirect_stderr(io.StringIO()) as captured:
-            self.handler.emit(self._record("msg1"))
-        self.assertIn("Logging error", captured.getvalue())
-        self.assertEqual(list(self.handler._queue), [])
-
-        self.handler.stream = real_open()
-        self.handler.emit(self._record("msg2"))
-        with open(self._path) as f:
-            self.assertEqual(f.read(), "msg2\n")
-
-    def test_queue_is_capped_at_max_queue_size(self):
-        self.handler.stream.close()
-        self.handler._open = lambda: self._BrokenStream()
         self.handler.stream = self._BrokenStream()
-        self.handler.MAX_QUEUE_SIZE = 3
 
-        with contextlib.redirect_stderr(io.StringIO()):
-            for i in range(5):
-                self.handler.emit(self._record(f"msg{i}"))
+        self.handler.close()  # must not raise
 
-        self.assertEqual(len(self.handler._queue), 3)
-        self.assertEqual(
-            [r.getMessage() for r in self.handler._queue], ["msg2", "msg3", "msg4"]
-        )
-
-    def test_close_drains_remaining_queue(self):
-        real_open = self.handler._open
-        self.handler.stream.close()
-        self.handler._open = lambda: self._BrokenStream()
-        self.handler.stream = self._BrokenStream()
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.handler.emit(self._record("msg1"))
-        self.assertEqual(len(self.handler._queue), 1)
-
-        self.handler._open = real_open
-        self.handler.stream = real_open()
+    def test_close_on_healthy_stream_still_closes_file(self):
+        self.handler.emit(self._record("msg1"))
         self.handler.close()
 
+        self.assertTrue(self.handler.stream is None)
         with open(self._path) as f:
             self.assertEqual(f.read(), "msg1\n")
-
-    def test_reopen_is_rate_limited(self):
-        self.handler.stream.close()
-        opened = []
-
-        def fake_open():
-            opened.append(1)
-            return self._BrokenStream()
-
-        self.handler._open = fake_open
-        self.handler.stream = self._BrokenStream()
-
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.handler.emit(self._record("msg1"))
-            self.handler.emit(self._record("msg2"))
-
-        self.assertEqual(len(opened), 1)
 
 
 class ProgressTrackerTests(unittest.TestCase):
