@@ -165,16 +165,24 @@ def cmd_queue_status(args):
     branch_keys = {code: encode_subset(branch) for code, branch in branches.items()}
 
     queue = ERDQueue(args.queue)
-    rows = queue.status_by_branch_keys(list(branch_keys.values()))
+    pending_rows = queue.status_by_branch_keys(list(branch_keys.values()))
+    # Cooperative sub-branches exist only in active_branches (no pending_branches
+    # row): check for any keys not found in pending_branches.
+    missing = [bk for bk in branch_keys.values() if bk not in pending_rows]
+    active_rows = queue.active_branches_by_keys(missing)
     queue.close()
 
     pending, in_progress, done, unqueued = [], [], [], []
     for code, branch in sorted(branches.items()):
         pat = fmt_pattern(code)
         n = len(branch)
-        row = rows.get(branch_keys[code])
-        if row is None:
+        bk = branch_keys[code]
+        row = pending_rows.get(bk)
+        active = active_rows.get(bk)
+        if row is None and active is None:
             unqueued.append((pat, n))
+        elif row is None:
+            in_progress.append((pat, n, active['priority'] or 0, 'coop'))
         elif row['status'] == 'pending':
             pending.append((pat, n, row['priority']))
         elif row['status'] == 'in_progress':
@@ -193,9 +201,11 @@ def cmd_queue_status(args):
     print()
 
     if in_progress:
+        _COOP_PRI = 1_000_000
         print(f'{"Pattern":<8}  {"Ans":>4}  {"Pri":>4}  Claimed by')
         for pat, n, priority, claimed_by in in_progress:
-            print(f'  {pat:<8}  {n:4d}  {priority:4d}  {claimed_by or "---"}')
+            pri_str = 'COOP' if priority >= _COOP_PRI else str(priority)
+            print(f'  {pat:<8}  {n:4d}  {pri_str:>4}  {claimed_by or "---"}')
         print()
 
     if pending:
@@ -930,7 +940,9 @@ def _print_status(args):
     print()
 
     # Workers — liveness and forward progress.
-    answer_set = set(load_word_list(ANSWER_FILE))
+    if not hasattr(_print_status, '_answer_set'):
+        _print_status._answer_set = set(load_word_list(ANSWER_FILE))
+    answer_set = _print_status._answer_set
     worker_hdr = 'Workers:'
     if live and total_evals:
         parts = []
@@ -944,6 +956,12 @@ def _print_status(args):
     print(worker_hdr)
     branch_depth_map = {bytes(b['branch_key']): (b['depth'] if 'depth' in b.keys() else 0)
                         for b in branches}
+    # Load and prune the cross-cycle spine history, dropping entries for
+    # branches that are no longer active so the dict doesn't grow forever.
+    max_paths = getattr(_print_status, 'max_paths', {})
+    active_branch_keys = set(branch_depth_map.keys())
+    max_paths = {k: v for k, v in max_paths.items()
+                 if k[1] is not None and k[1] in active_branch_keys}
     if not hbs:
         print('  (none active)')
     else:
@@ -973,17 +991,12 @@ def _print_status(args):
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
         if '>' in path:
             path = path.replace('>', '→')
-        # Accumulate the longest spine seen for this worker on this branch
-        # across display cycles; keyed by (worker_id, branch_key) so it resets
-        # automatically when the worker moves to a different branch.
-        max_paths = getattr(_print_status, 'max_paths', {})
         path_key = (h['worker_id'], bytes(key) if key else None)
         prev_max = max_paths.get(path_key, '')
         if path.count('→') >= prev_max.count('→'):
             max_paths[path_key] = path
         else:
             path = prev_max
-        _print_status.max_paths = max_paths
         best_g = (h['best_guess'] if 'best_guess' in h.keys() else None) or ''
         best_e = (h['best_erd'] if 'best_erd' in h.keys() else None)
         bound_e = (h['bound_erd'] if 'bound_erd' in h.keys() else None)
@@ -1001,6 +1014,7 @@ def _print_status(args):
             print(f'       {cur_disp}  {n_seen:>4}/{c_total:<4}  MaxD:{mdepth}  {krate:>7}  {path}')
         else:
             print()
+    _print_status.max_paths = max_paths
 
 
 def _fmt_duration(seconds: int) -> str:

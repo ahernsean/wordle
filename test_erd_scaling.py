@@ -1,6 +1,6 @@
 """Scaling guard for the parallel ERD swarm.
 
-Two checks:
+Three checks:
 
 1. Work amplification (deterministic, thread-driven): the TOTAL number of
    candidate evaluations across all workers must stay equal to the candidate
@@ -9,7 +9,12 @@ Two checks:
    that without depending on wall-clock timing.  Each run must also still
    produce the correct ERD.
 
-2. Cooperative drain timing (fork only): spawn 1 vs 4 swarm_workers, drain 80
+2. Multi-process correctness (fork only): spawn 1, 2, and 4 real swarm_worker
+   processes on one branch and confirm they all produce the same ERD as the
+   serial result.  Catches races in inter-process coordination (update_branch_best,
+   complete_chunk) that thread-based tests cannot exercise.
+
+3. Cooperative drain timing (fork only): spawn 1 vs 4 swarm_workers, drain 80
    disjoint branches from a shared queue, and assert 4 workers finish in < 80%
    of 1-worker time.  Key design constraints that make the comparison
    meaningful are documented on TestCooperativeDrainSmoke.
@@ -138,6 +143,66 @@ class TestWorkDoesNotAmplify(_Base):
 @unittest.skipUnless(
     "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
     "needs fork start method and >=2 CPUs")
+class TestProcessScalingSmoke(_Base):
+    """Verify that ERD results from real forked swarm_worker processes agree.
+
+    Spawns 1, 2, and 4 processes via swarm_worker (the same entry point as
+    production workers) and confirms each produces the same ERD as the serial
+    ground truth.  This is the multi-process correctness guard: it catches
+    races in update_branch_best, complete_chunk, and chunk claim/release that
+    thread-based tests cannot exercise.
+    """
+
+    def _solve_processes(self, n_workers, timeout=30):
+        from erd_swarm import swarm_worker
+        cache_path, queue_path = self._db(f"proc{n_workers}")
+        ScoreCache(cache_path, BRANCH).close()
+        q = ERDQueue(queue_path)
+        q.add_pending_many([(self.branch_key, len(BRANCH), 0, "crane", 0)])
+        q.close()
+
+        stop_event = mp.Event()
+        with mock.patch("erd_swarm._setup_logging", lambda *_: None):
+            procs = [mp.Process(target=swarm_worker,
+                                args=(w, cache_path, queue_path, stop_event,
+                                      DIVISOR, MAX_CHUNKS))
+                     for w in range(n_workers)]
+            for p in procs:
+                p.start()
+
+        deadline = time.time() + timeout
+        q = ERDQueue(queue_path)
+        try:
+            while time.time() < deadline:
+                if q.counts_by_status().get('done', 0) >= 1:
+                    break
+                time.sleep(0.1)
+        finally:
+            stop_event.set()
+            for p in procs:
+                p.join(timeout=5)
+                if p.is_alive():
+                    p.kill()
+                    p.join()
+            q.close()
+
+        return self._read(cache_path)
+
+    def test_erd_agrees_across_worker_counts(self):
+        truth = self._ground_truth()
+        self.assertIsNotNone(truth)
+        n_cpu = os.cpu_count() or 1
+        for nw in [w for w in WORKER_COUNTS if w <= n_cpu]:
+            with self.subTest(workers=nw):
+                result = self._solve_processes(nw)
+                self.assertIsNotNone(result,
+                                     f"{nw}-worker run timed out or produced no result")
+                self.assertAlmostEqual(result[1], truth, places=6)
+
+
+@unittest.skipUnless(
+    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
+    "needs fork start method and >=2 CPUs")
 class TestCooperativeDrainSmoke(unittest.TestCase):
     # -------------------------------------------------------------------------
     # PURPOSE: verify that N cooperative swarm workers drain a shared queue
@@ -146,7 +211,8 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
     # the speedup shrinks and the test catches it.
     #
     # DO NOT replace the timing assertion with a pure correctness check.
-    # Correctness is covered by TestProcessScalingSmoke and TestWorkDoesNotAmplify.
+    # Correctness is covered by TestProcessScalingSmoke (multi-process ERD
+    # agreement) and TestWorkDoesNotAmplify (no chunk duplication).
     # This test's only job is to confirm that parallelism HELPS.
     #
     # Worker count is min(4, cpu_count) so the comparison is always honest:

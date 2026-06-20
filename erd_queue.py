@@ -720,6 +720,21 @@ class ERDQueue:
         ).fetchall()
         return {bytes(r["branch_key"]): r for r in rows}
 
+    def active_branches_by_keys(self, branch_keys) -> dict:
+        """Return {branch_key: active_branches row} for the given keys.
+
+        Only open branches appear; finalized branches are deleted from this
+        table and will be absent from the returned dict.
+        """
+        if not branch_keys:
+            return {}
+        placeholders = ','.join('?' for _ in branch_keys)
+        rows = self._conn.execute(
+            f"SELECT * FROM active_branches WHERE branch_key IN ({placeholders})",
+            list(branch_keys)
+        ).fetchall()
+        return {bytes(r["branch_key"]): r for r in rows}
+
     def get_active_branch(self, branch_key: bytes):
         """Return the active_branches row for branch_key, or None."""
         return self._conn.execute(
