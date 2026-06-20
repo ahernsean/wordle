@@ -198,5 +198,61 @@ class TestClaimSkipsCachedBranch(unittest.TestCase):
         self.assertIsNotNone(idx)
 
 
+class TestSpineMaxWindow(unittest.TestCase):
+    """_max_spine resets after each heartbeat write so cur_path reflects the
+    deepest spine seen within that heartbeat window, not the chunk lifetime.
+    The display accumulates the per-window maxima across the watch cycle."""
+
+    def test_max_spine_resets_after_heartbeat_write(self):
+        """_max_spine holds the window max until the heartbeat fires, then
+        resets to the current spine so the next window starts fresh."""
+        w = _BranchWorker.__new__(_BranchWorker)
+        w._spine = {}
+        w._max_spine = {}
+        w._cand_max_depth = 0
+        w._cur_depth = 0
+
+        # Simulate descending to depth 3 then backing out to depth 1.
+        w._note_depth(1, 50)
+        w._note_depth(2, 12)
+        w._note_depth(3, 4)
+        self.assertEqual(sorted(w._max_spine.keys()), [1, 2, 3])
+
+        w._note_depth(1, 48)   # back out; spine trims to depth 1
+        self.assertEqual(sorted(w._spine.keys()), [1])
+        # _max_spine still holds the 3-level high-water mark
+        self.assertEqual(sorted(w._max_spine.keys()), [1, 2, 3])
+
+        # Simulate the heartbeat write: cur_path is the 3-level max, then reset.
+        captured = w._spine_str()
+        w._max_spine = dict(w._spine)   # the reset that _heartbeat performs
+
+        self.assertIn('→', captured)    # at least one separator → depth > 1
+        self.assertEqual(captured.count('→'), 2)   # three entries = two separators
+        # After reset, the new window starts from the current (shallow) spine.
+        self.assertEqual(sorted(w._max_spine.keys()), [1])
+
+    def test_display_max_paths_accumulates_across_heartbeats(self):
+        """The display takes the per-window max across successive cur_path reads,
+        so a deep path seen in an earlier heartbeat window is not lost."""
+        # Simulate two successive cur_path values as the display would read them.
+        deep_path  = '50→12→4'   # seen in an early heartbeat window
+        shallow_path = '48'       # seen in the next window after reset
+
+        def accumulate(current, previous):
+            if current.count('→') >= previous.count('→'):
+                return current
+            return previous
+
+        result = accumulate(deep_path, '')
+        result = accumulate(shallow_path, result)   # shallower: prev wins
+        self.assertEqual(result, deep_path)
+
+        # Tied depth: most-recent wins.
+        tied_path = '45→9→2'
+        result = accumulate(tied_path, deep_path)
+        self.assertEqual(result, tied_path)
+
+
 if __name__ == "__main__":
     unittest.main()

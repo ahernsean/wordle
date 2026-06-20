@@ -991,6 +991,11 @@ def _print_status(args):
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
         if '>' in path:
             path = path.replace('>', '→')
+        # Show the deepest path seen across this watch cycle.  Each heartbeat
+        # writes the max spine from its own 2-second window (see _max_spine in
+        # erd_swarm.py); max_paths accumulates across successive heartbeat reads
+        # so the display shows the maximum over the full watch interval.  Tied
+        # depth overwrites so the displayed path is the most recent at that depth.
         path_key = (h['worker_id'], bytes(key) if key else None)
         prev_max = max_paths.get(path_key, '')
         if path.count('→') >= prev_max.count('→'):
