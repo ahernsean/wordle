@@ -31,11 +31,16 @@ systemctl --user enable wordle-erd   # start automatically on login
 ### Start and stop
 
 ```bash
-python3.13 erd_search.py start   # systemctl --user start wordle-erd
-python3.13 erd_search.py stop    # systemctl --user stop wordle-erd
+python3.13 erd_search.py start    # systemctl --user start wordle-erd
+python3.13 erd_search.py stop     # systemctl --user stop wordle-erd
+python3.13 erd_search.py restart  # systemctl --user restart wordle-erd
 
 systemctl --user status wordle-erd   # raw systemd status
 ```
+
+`restart` is a stop followed by a start in one step.  Like `start`, it prints
+the post-action service status (with `--no-pager`, so it does not drop into a
+pager).
 
 Stopping sends SIGTERM to the supervisor, which sets the stop event.  Workers
 finish their current candidate evaluation (a few seconds at most) and exit

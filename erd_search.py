@@ -5,6 +5,8 @@ Subcommands
 -----------
 start           Start the supervisor via systemd (systemctl --user start).
 stop            Stop the supervisor via systemd (systemctl --user stop).
+restart         Restart the supervisor via systemd (systemctl --user restart):
+                a stop followed by a start in one step.
 
 status          Read-only progress snapshot: queue counts, cache throughput,
                 per-worker heartbeats.  --watch loops the display.
@@ -492,11 +494,12 @@ def cmd_queue_priority(args):
 _SYSTEMD_SERVICE = 'wordle-erd'
 
 
-def _run_systemctl(action: str) -> int:
-    """Run `systemctl --user <action> <service>` and return the exit code."""
+def _run_systemctl(action: str, *extra: str) -> int:
+    """Run `systemctl --user <action> <service> [extra...]` and return the
+    exit code."""
     import subprocess
     result = subprocess.run(
-        ['systemctl', '--user', action, _SYSTEMD_SERVICE],
+        ['systemctl', '--user', action, _SYSTEMD_SERVICE, *extra],
         capture_output=False)
     return result.returncode
 
@@ -505,7 +508,7 @@ def cmd_start(_args):
     """Start the supervisor via systemd."""
     rc = _run_systemctl('start')
     if rc == 0:
-        _run_systemctl('status')
+        _run_systemctl('status', '--no-pager')
     else:
         print(f'systemctl start failed (exit {rc}).  '
               f'Is the service installed?  '
@@ -521,6 +524,19 @@ def cmd_stop(_args):
         print(f'Supervisor stopped.')
     else:
         print(f'systemctl stop failed (exit {rc}).',
+              file=sys.stderr)
+        sys.exit(rc)
+
+
+def cmd_restart(_args):
+    """Restart the supervisor via systemd (stop + start in one step)."""
+    rc = _run_systemctl('restart')
+    if rc == 0:
+        _run_systemctl('status', '--no-pager')
+    else:
+        print(f'systemctl restart failed (exit {rc}).  '
+              f'Is the service installed?  '
+              f'Check: systemctl --user status {_SYSTEMD_SERVICE}',
               file=sys.stderr)
         sys.exit(rc)
 
@@ -1255,6 +1271,11 @@ def main():
                    help='Stop the supervisor via systemd '
                         '(systemctl --user stop wordle-erd)')
 
+    # -- restart --
+    sub.add_parser('restart',
+                   help='Restart the supervisor via systemd '
+                        '(systemctl --user restart wordle-erd)')
+
     # -- reset-stale --
     p_rst = sub.add_parser('reset-stale',
                             help='Reset in_progress rows to pending')
@@ -1280,6 +1301,7 @@ def main():
         'queue-priority': cmd_queue_priority,
         'start': cmd_start,
         'stop': cmd_stop,
+        'restart': cmd_restart,
         'run': cmd_run,
         'status': cmd_status,
         'reset-stale': cmd_reset_stale,
