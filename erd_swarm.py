@@ -235,11 +235,6 @@ class _BranchWorker:
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._spine_str())
-        # Reset so the next heartbeat window starts fresh.  _max_spine captures
-        # the deepest spine seen since the LAST heartbeat write, not the chunk
-        # lifetime.  The status display's max_paths dict accumulates across the
-        # 30-second watch cycle by taking the max of successive cur_path values.
-        self._max_spine = dict(self._spine)
         if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:
             self._last_progress_log = now
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
@@ -266,6 +261,7 @@ class _BranchWorker:
         """
         lo, hi = ERDQueue.chunk_range(idx, chunk_size, self.n_candidates)
         chunk_total = hi - lo
+        self._max_spine = {}
         local_candidate, local_best = self.queue.read_branch_best(branch_key)
         local_md = None
         shared_best = local_best

@@ -956,12 +956,8 @@ def _print_status(args):
     print(worker_hdr)
     branch_depth_map = {bytes(b['branch_key']): (b['depth'] if 'depth' in b.keys() else 0)
                         for b in branches}
-    # Load and prune the cross-cycle spine history, dropping entries for
-    # branches that are no longer active so the dict doesn't grow forever.
-    max_paths = getattr(_print_status, 'max_paths', {})
-    active_branch_keys = set(branch_depth_map.keys())
-    max_paths = {k: v for k, v in max_paths.items()
-                 if k[1] is not None and k[1] in active_branch_keys}
+    # Fresh accumulator each cycle: path shown reflects this refresh only.
+    max_paths = {}
     if not hbs:
         print('  (none active)')
     else:
@@ -1019,7 +1015,6 @@ def _print_status(args):
             print(f'       {cur_disp}  {n_seen:>4}/{c_total:<4}  MaxD:{mdepth}  {krate:>7}  {path}')
         else:
             print()
-    _print_status.max_paths = max_paths
 
 
 def _fmt_duration(seconds: int) -> str:

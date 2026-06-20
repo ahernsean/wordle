@@ -198,60 +198,87 @@ class TestClaimSkipsCachedBranch(unittest.TestCase):
         self.assertIsNotNone(idx)
 
 
-class TestSpineMaxWindow(unittest.TestCase):
-    """_max_spine resets after each heartbeat write so cur_path reflects the
-    deepest spine seen within that heartbeat window, not the chunk lifetime.
-    The display accumulates the per-window maxima across the watch cycle."""
+class TestReportingInvariants(unittest.TestCase):
+    """MaxD and path have different reporting scopes, neither tied to heartbeat
+    timing.  MaxD resets at candidate start; path resets at screen refresh."""
 
-    def test_max_spine_resets_after_heartbeat_write(self):
-        """_max_spine holds the window max until the heartbeat fires, then
-        resets to the current spine so the next window starts fresh."""
+    def _bare_worker(self):
         w = _BranchWorker.__new__(_BranchWorker)
         w._spine = {}
         w._max_spine = {}
         w._cand_max_depth = 0
         w._cur_depth = 0
+        return w
 
-        # Simulate descending to depth 3 then backing out to depth 1.
+    def test_cand_max_depth_resets_per_candidate(self):
+        """_cand_max_depth is zeroed before each candidate so MaxD reflects
+        the current candidate's recursion, not the chunk lifetime."""
+        w = self._bare_worker()
+
         w._note_depth(1, 50)
         w._note_depth(2, 12)
         w._note_depth(3, 4)
-        self.assertEqual(sorted(w._max_spine.keys()), [1, 2, 3])
+        self.assertEqual(w._cand_max_depth, 3)
 
-        w._note_depth(1, 48)   # back out; spine trims to depth 1
+        # evaluate_chunk resets before candidate 2.
+        w._cand_max_depth = 0
+
+        w._note_depth(1, 30)
+        self.assertEqual(w._cand_max_depth, 1)  # not 3 from candidate 1
+
+    def test_max_spine_accumulates_within_chunk_not_per_heartbeat(self):
+        """_max_spine holds the deepest spine seen since chunk start.
+        Heartbeat reads do not reset it; only starting a new chunk does."""
+        w = self._bare_worker()
+
+        w._note_depth(1, 50)
+        w._note_depth(2, 12)
+        w._note_depth(3, 4)
+
+        # Back out between candidates.
+        w._note_depth(1, 48)
         self.assertEqual(sorted(w._spine.keys()), [1])
-        # _max_spine still holds the 3-level high-water mark
-        self.assertEqual(sorted(w._max_spine.keys()), [1, 2, 3])
 
-        # Simulate the heartbeat write: cur_path is the 3-level max, then reset.
-        captured = w._spine_str()
-        w._max_spine = dict(w._spine)   # the reset that _heartbeat performs
+        # Heartbeat reads _spine_str() — must still report the depth-3 max.
+        self.assertEqual(w._spine_str().count('→'), 2)
 
-        self.assertIn('→', captured)    # at least one separator → depth > 1
-        self.assertEqual(captured.count('→'), 2)   # three entries = two separators
-        # After reset, the new window starts from the current (shallow) spine.
-        self.assertEqual(sorted(w._max_spine.keys()), [1])
+        # Several more shallow candidates don't reduce the reported max.
+        w._note_depth(1, 20)
+        w._note_depth(1, 15)
+        self.assertEqual(w._spine_str().count('→'), 2)
 
-    def test_display_max_paths_accumulates_across_heartbeats(self):
-        """The display takes the per-window max across successive cur_path reads,
-        so a deep path seen in an earlier heartbeat window is not lost."""
-        # Simulate two successive cur_path values as the display would read them.
-        deep_path  = '50→12→4'   # seen in an early heartbeat window
-        shallow_path = '48'       # seen in the next window after reset
+        # New chunk: evaluate_chunk resets _max_spine.
+        w._max_spine = {}
+        w._note_depth(1, 20)
+        self.assertEqual(w._spine_str().count('→'), 0)  # fresh start
 
-        def accumulate(current, previous):
-            if current.count('→') >= previous.count('→'):
-                return current
-            return previous
+    def test_display_path_resets_each_screen_refresh(self):
+        """max_paths in _print_status is rebuilt from scratch on each call so
+        the path shown reflects only the current screen refresh, not history."""
+        def one_refresh(cur_path):
+            # Mirrors what _print_status does: start empty, take cur_path.
+            max_paths = {}
+            prev = max_paths.get('w', '')
+            if cur_path.count('→') >= prev.count('→'):
+                max_paths['w'] = cur_path
+            return max_paths['w']
 
-        result = accumulate(deep_path, '')
-        result = accumulate(shallow_path, result)   # shallower: prev wins
-        self.assertEqual(result, deep_path)
+        shown1 = one_refresh('50→12→4')
+        self.assertEqual(shown1, '50→12→4')
 
-        # Tied depth: most-recent wins.
-        tied_path = '45→9→2'
-        result = accumulate(tied_path, deep_path)
-        self.assertEqual(result, tied_path)
+        # Next refresh starts empty: a shallower path is NOT displaced by history.
+        shown2 = one_refresh('30→8')
+        self.assertEqual(shown2, '30→8')
+
+    def test_display_path_tied_depth_takes_most_recent(self):
+        """Within one refresh, a path tied in depth with the current max
+        overwrites it so the displayed path is the most recent at that depth."""
+        max_paths = {}
+        for path in ('50→12→4', '45→9→2'):
+            prev = max_paths.get('w', '')
+            if path.count('→') >= prev.count('→'):
+                max_paths['w'] = path
+        self.assertEqual(max_paths['w'], '45→9→2')
 
 
 if __name__ == "__main__":
