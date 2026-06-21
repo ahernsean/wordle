@@ -436,6 +436,32 @@ class _BranchWorker:
 
     # -- recursive cooperative solving --------------------------------------
 
+    def _help_other_branch(self, exclude_branch_key: bytes) -> bool:
+        """Evaluate one chunk from any open branch other than exclude_branch_key.
+
+        Called when the worker is waiting on a dependency branch whose remaining
+        chunks are all held by other workers.  Instead of sleeping, the worker
+        drains useful work from the queue.  Returns True if a chunk was
+        evaluated, False if there was nothing to claim.
+        """
+        for branch in self.queue.open_branches():
+            other_key = bytes(branch['branch_key'])
+            if other_key == bytes(exclude_branch_key):
+                continue
+            n_chunks = ERDQueue.n_chunks_for(branch['n_candidates'], branch['chunk_size'])
+            idx = self.queue.claim_chunk(other_key, self.name, n_chunks)
+            if idx is None:
+                continue
+            words = decode_subset(other_key)
+            ranked = self._ranked_for(other_key, words)
+            budget = branch['budget'] or self.budget
+            if self.evaluate_chunk(other_key, words, branch['n_words'], ranked, idx,
+                                   branch['chunk_size'], budget=budget):
+                self.maybe_finalize(other_key, words, n_chunks)
+            self._maybe_checkpoint()
+            return True
+        return False
+
     def _subbranch_solver(self, words, budget):
         """Engine hook: decide whether to solve a sub-branch cooperatively.
 
@@ -507,7 +533,8 @@ class _BranchWorker:
                     self._heartbeat(branch_key, n_words, None, None, None,
                                     None, None, force=True)
                     self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
-                    time.sleep(0.05)            # chunks in flight elsewhere; let them land
+                    if not self._help_other_branch(branch_key):
+                        time.sleep(0.05)        # nothing to claim anywhere; let chunks land
 
             if self.cancel():  # pragma: no cover
                 return None
