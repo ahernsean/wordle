@@ -1029,7 +1029,8 @@ def _print_status(args):
         if cur:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
             krate = f'{int(nrate / 1000)}kN/s'
-            print(f'       {cur_disp}  {n_seen:>4}/{c_total:<4}  MaxD:{mdepth}  {krate:>7}  {path}')
+            cperc = int(float((n_seen)/c_total)*100)
+            print(f'       {cur_disp}  {n_seen:>3}/{c_total:<3} {cperc:2d}%  MaxD:{mdepth}  {krate:>7}  {path}')
         else:
             print()
 
