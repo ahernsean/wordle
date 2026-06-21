@@ -924,7 +924,7 @@ def _print_status(args):
     if branches:
         print(f'  {"Root":<11s} {"D":>1s} {"Ans":>4s} '
               f'{"Chunks":<{chunks_col_w}s} '
-              f'{"Best":<5s} {"ERD":>5s} {"Pri":>3s} {"Wk":>2s} ETA')
+              f'{"Best":<5s} {"ERD":>5s}  {"Pri":>3s} {"Wk":>2s} ETA')
     else:
         print('  (none)')
     for b in branches:
@@ -952,7 +952,7 @@ def _print_status(args):
         chunks_str = f'{done:>{denom_w}d}/{n_chunks:<{denom_w}d} {int(pct):2d}%'
         print(f'  {src:<11s} {depth_val:1d} {nw:4d} '
               f'{chunks_str} '
-              f'{bw:<5s} {be:>5s} {pri_str:>3s} {wk:2d} {eta}')
+              f'{bw:<5s} {be:>5s} {pri_str:>4s} {wk:2d} {eta}')
     print()
 
     # Workers — liveness and forward progress.
