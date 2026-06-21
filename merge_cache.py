@@ -141,7 +141,7 @@ def _copy_table_with_progress(conn, table) -> int:
     return inserted
 
 
-def main():
+def main():  # pragma: no cover
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)

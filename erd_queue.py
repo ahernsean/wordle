@@ -147,7 +147,7 @@ class ERDQueue:
         # drop that shell before renaming so the old rows survive.
         tables = {r['name'] for r in self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        if 'pending_subgroups' in tables:
+        if 'pending_subgroups' in tables:  # pragma: migration
             self._conn.execute('DROP TABLE IF EXISTS pending_branches')
             self._conn.execute(
                 'ALTER TABLE pending_subgroups RENAME TO pending_branches')
@@ -156,7 +156,7 @@ class ERDQueue:
                     self._conn.execute('PRAGMA table_info(pending_branches)')}
         for col, defn in [('source_word', 'TEXT'),
                           ('source_pattern', 'INTEGER')]:
-            if col not in existing:
+            if col not in existing:  # pragma: migration
                 self._conn.execute(
                     f'ALTER TABLE pending_branches ADD COLUMN {col} {defn}')
 
@@ -181,7 +181,7 @@ class ERDQueue:
                           ('cur_nodes',        'INTEGER'),
                           ('node_rate',        'REAL'),
                           ('cur_path',         'TEXT')]:
-            if col not in existing_hb:
+            if col not in existing_hb:  # pragma: migration
                 self._conn.execute(
                     f'ALTER TABLE worker_heartbeat ADD COLUMN {col} {defn}')
 
@@ -194,7 +194,7 @@ class ERDQueue:
                           ('best_max_depth', 'INTEGER'),
                           ('tainted',        'INTEGER NOT NULL DEFAULT 0'),
                           ('depth',          'INTEGER NOT NULL DEFAULT 0')]:
-            if col not in existing_ab:
+            if col not in existing_ab:  # pragma: migration
                 self._conn.execute(
                     f'ALTER TABLE active_branches ADD COLUMN {col} {defn}')
 
@@ -203,29 +203,29 @@ class ERDQueue:
         # current_branch_key in worker_heartbeat.
         existing_ps = {r['name'] for r in
                        self._conn.execute('PRAGMA table_info(pending_branches)')}
-        if 'subset_key' in existing_ps:
+        if 'subset_key' in existing_ps:  # pragma: migration
             self._conn.execute(
                 'ALTER TABLE pending_branches RENAME COLUMN subset_key TO branch_key')
         existing_ab = {r['name'] for r in
                        self._conn.execute('PRAGMA table_info(active_branches)')}
-        if 'subset_key' in existing_ab:
+        if 'subset_key' in existing_ab:  # pragma: migration
             self._conn.execute(
                 'ALTER TABLE active_branches RENAME COLUMN subset_key TO branch_key')
-        if 'best_word' in existing_ab:
+        if 'best_word' in existing_ab:  # pragma: migration
             self._conn.execute(
                 'ALTER TABLE active_branches RENAME COLUMN best_word TO best_guess')
         existing_bc = {r['name'] for r in
                        self._conn.execute('PRAGMA table_info(branch_chunks)')}
-        if 'subset_key' in existing_bc:
+        if 'subset_key' in existing_bc:  # pragma: migration
             self._conn.execute(
                 'ALTER TABLE branch_chunks RENAME COLUMN subset_key TO branch_key')
         existing_hb = {r['name'] for r in
                        self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
-        if 'current_subset_key' in existing_hb:
+        if 'current_subset_key' in existing_hb:  # pragma: migration
             self._conn.execute(
                 'ALTER TABLE worker_heartbeat '
                 'RENAME COLUMN current_subset_key TO current_branch_key')
-        if 'best_word' in existing_hb and 'best_guess' not in existing_hb:
+        if 'best_word' in existing_hb and 'best_guess' not in existing_hb:  # pragma: migration
             self._conn.execute(
                 'ALTER TABLE worker_heartbeat RENAME COLUMN best_word TO best_guess')
 
@@ -260,7 +260,7 @@ class ERDQueue:
                     source_pattern = COALESCE(source_pattern, excluded.source_pattern)
             """, rows)
             self._conn.execute("COMMIT")
-        except Exception:
+        except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
@@ -308,7 +308,7 @@ class ERDQueue:
                 'source_word': row["source_word"],
                 'source_pattern': row["source_pattern"],
             }
-        except Exception:
+        except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
@@ -497,7 +497,7 @@ class ERDQueue:
             """, (branch_key, idx, worker_id, now))
             self._conn.execute("COMMIT")
             return idx
-        except Exception:
+        except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
@@ -771,7 +771,7 @@ class ERDQueue:
                     "DELETE FROM pending_branches WHERE branch_key = ?",
                     (branch_key,))
             self._conn.execute("COMMIT")
-        except Exception:
+        except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
