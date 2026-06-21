@@ -477,5 +477,117 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         self.assertAlmostEqual(cached[1], cost, places=6)
 
 
+class TestHelpOtherBranch(unittest.TestCase):
+    """_help_other_branch claims and evaluates one chunk from a branch other
+    than the excluded branch, returning True if work was found, False if not."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def test_help_other_branch_returns_true_when_chunk_evaluated(self):
+        """When a chunk is available in another branch, help_other_branch
+        claims and evaluates it, then returns True."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
+        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
+
+        # Create branch A (the one being excluded).
+        key_a = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+                        budget=ROOT_BUDGET, priority=0)
+
+        # Create branch B with a free chunk.
+        words_b = BRANCH[:4]
+        key_b = ScoreCache.encode_subset(words_b)
+        q.create_branch(key_b, len(words_b), n_candidates, chunk_size,
+                        budget=ROOT_BUDGET, priority=1)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
+                          DIVISOR, MAX_CHUNKS)
+        try:
+            result = w._help_other_branch(key_a)
+        finally:
+            w.close()
+
+        # Should have evaluated a chunk and returned True.
+        self.assertTrue(result)
+
+    def test_help_other_branch_returns_false_when_no_chunks_available(self):
+        """When no other branches have available chunks, help_other_branch
+        returns False without claiming anything."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
+        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
+
+        # Create only one branch and fully claim all its chunks.
+        key_a = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+                        budget=ROOT_BUDGET, priority=0)
+        for i in range(n_chunks):
+            q.claim_chunk(key_a, "other-worker", n_chunks)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
+                          DIVISOR, MAX_CHUNKS)
+        try:
+            # Exclude a different branch key (none exist, so effectively no branches to help).
+            fake_exclude_key = ScoreCache.encode_subset(BRANCH[:3])
+            result = w._help_other_branch(fake_exclude_key)
+        finally:
+            w.close()
+
+        # Should return False (no chunks to claim).
+        self.assertFalse(result)
+
+    def test_help_other_branch_skips_excluded_branch(self):
+        """When the only available branch matches exclude_branch_key,
+        help_other_branch skips it and returns False."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
+
+        # Create one branch with free chunks.
+        key_a = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+                        budget=ROOT_BUDGET, priority=0)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
+                          DIVISOR, MAX_CHUNKS)
+        try:
+            # Exclude the only branch — nothing else to help.
+            result = w._help_other_branch(key_a)
+        finally:
+            w.close()
+
+        # Should return False (the only branch was excluded).
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()
