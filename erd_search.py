@@ -736,7 +736,7 @@ def cmd_status(args):
                 sys.stdout.write('\033[?25h')
                 sys.stdout.flush()
     else:
-        _print_status(args)
+        _print_status(args, selected_worker=args.worker)
 
 
 def _watch_with_keys(args, interval):
@@ -746,13 +746,14 @@ def _watch_with_keys(args, interval):
     # Disable canonical mode and echo without touching output processing (OPOST).
     # tty.setraw() also clears OPOST, which breaks \n → \r\n translation.
     new_settings[3] &= ~(termios.ICANON | termios.ECHO)
+    selected_worker = None
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
         sys.stdout.write('\033[?25l\033[2J\033[H')
         sys.stdout.flush()
         _redraw_status.prev_lines = []
         while True:
-            _redraw_status(args)
+            _redraw_status(args, selected_worker=selected_worker)
             deadline = time.monotonic() + interval
             while True:
                 remaining = deadline - time.monotonic()
@@ -765,6 +766,11 @@ def _watch_with_keys(args, interval):
                         return
                     if ch == ' ':
                         break  # force refresh now
+                    if ch.isdigit():
+                        w = int(ch)
+                        selected_worker = None if selected_worker == w else w
+                        _redraw_status.prev_lines = []  # force full redraw
+                        break
     except KeyboardInterrupt:
         # ISIG stays enabled (only ICANON/ECHO are off), so Ctrl-C raises here
         # rather than arriving as a '\x03' byte from stdin.read().
@@ -773,6 +779,46 @@ def _watch_with_keys(args, interval):
         sys.stdout.write('\033[?25h')
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _spine_sizes(path):
+    """Extract the branch-size portion from each level of a rich spine string.
+
+    Rich format: 'GUESS:pattern/size→GUESS:pattern/size'.  Returns the size-
+    only string ('size→size') used in the compact status row.
+    """
+    if not path:
+        return ''
+    parts = []
+    for tok in path.split('→'):
+        if '/' in tok:
+            parts.append(tok.rsplit('/', 1)[1])
+        else:
+            parts.append(tok)
+    return '→'.join(parts)
+
+
+def _parse_spine(path):
+    """Parse a rich spine string into a list of (guess, pattern, size) tuples.
+
+    Each token in the '→'-separated path is either a bare size (root level,
+    no guess/pattern yet) or 'GUESS:pattern/size'.  Returns one tuple per
+    level in depth order.
+    """
+    if not path:
+        return []
+    result = []
+    for tok in path.split('→'):
+        if '/' in tok:
+            gp, size_str = tok.rsplit('/', 1)
+            if ':' in gp:
+                guess, pattern = gp.split(':', 1)
+            else:
+                guess, pattern = None, gp
+            result.append((guess, pattern, size_str))
+        elif tok:
+            result.append((None, None, tok))
+    return result
 
 
 def _highlight_changes(new_line, old_line):
@@ -795,12 +841,12 @@ def _highlight_changes(new_line, old_line):
     return ''.join(result)
 
 
-def _redraw_status(args):
+def _redraw_status(args, selected_worker=None):
     buf = io.StringIO()
     old_stdout = sys.stdout
     sys.stdout = buf
     try:
-        _print_status(args)
+        _print_status(args, selected_worker=selected_worker, interactive=True)
     finally:
         sys.stdout = old_stdout
     new_lines = buf.getvalue().splitlines()
@@ -822,7 +868,7 @@ def _redraw_status(args):
     sys.stdout.flush()
 
 
-def _print_status(args):
+def _print_status(args, selected_worker=None, interactive=False):
     now_ts = int(time.time())
     from wordle_ui import fmt_pattern
 
@@ -1026,13 +1072,75 @@ def _print_status(args):
         bound_e_disp = f'{bound_e:.3f}' if bound_e is not None else '-----'
         print(f'  {wnum:>2}  {src:<11}  {w_depth:1d}  {chunk:>3}  {_fmt_duration(held):>6}  '
               f'{best_g_disp:<5}  {best_e_disp:>5}  {bound_e_disp:>5}  {age}s{flag}')
-        if cur:
+        if cur and c_total:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
             krate = f'{int(nrate / 1000)}kN/s'
-            cperc = int(float((n_seen)/c_total)*100)
-            print(f'       {cur_disp}  {n_seen:>3}/{c_total:<3} {cperc:2d}%  MaxD:{mdepth}  {krate:>7}  {path}')
+            cperc = int(n_seen / c_total * 100)
+            print(f'       {cur_disp}  {n_seen:>3}/{c_total:<3} {cperc:2d}%  MaxD:{mdepth}  {krate:>7}  {_spine_sizes(path)}')
         else:
             print()
+
+    if selected_worker is not None:
+        target = str(selected_worker)
+        detail_hb = next(
+            (h for h in hbs
+             if (h['worker_id'].split('-')[-1]
+                 if '-' in h['worker_id'] else h['worker_id']) == target),
+            None)
+        print()
+        if detail_hb is None:
+            print(f'── Worker {selected_worker} not found ──────────────────')
+        else:
+            print(f'── Worker {selected_worker} spine ─────────────────────')
+            src_word = detail_hb['source_word'].upper() if detail_hb['source_word'] else '?????'
+            src_pat = (fmt_pattern(detail_hb['source_pattern'])
+                       if detail_hb['source_pattern'] is not None else '-----')
+            n_words = detail_hb['n_words'] or 0
+            src_star = '*' if detail_hb['source_word'] and detail_hb['source_word'].lower() in answer_set else ' '
+            print(f'  d0  {src_word}{src_star}  {src_pat}  {n_words:4d} words')
+            rich_path = (detail_hb['cur_path'] if 'cur_path' in detail_hb.keys() else None) or ''
+            cur_cand = (detail_hb['cur_candidate'] if 'cur_candidate' in detail_hb.keys() else None) or ''
+            chunk_held = (detail_hb['chunk_idx'] if 'chunk_idx' in detail_hb.keys() else None) is not None
+            spine = _parse_spine(rich_path)
+            if spine:
+                for di, (guess, pattern, size) in enumerate(spine, start=1):
+                    if guess and pattern:
+                        star = '*' if guess.lower() in answer_set else ' '
+                        print(f'  d{di}  {guess.upper()}{star}  {pattern}  {size:>4} words')
+                    else:
+                        print(f'  d{di}  {"":7}  {"":5}  {size:>4} words')
+            elif cur_cand:
+                cand_disp = cur_cand.upper() + ('*' if cur_cand.lower() in answer_set else ' ')
+                print(f'  (no spine yet — evaluating {cand_disp})')
+            elif not chunk_held:
+                bkey = bytes(detail_hb['current_branch_key']) if detail_hb['current_branch_key'] else None
+                w_depth = branch_depth_map.get(bkey, 0) if bkey else 0
+                if w_depth > 0 and bkey:
+                    branch_info = next((b for b in branches
+                                        if bytes(b['branch_key']) == bkey), None)
+                    if branch_info:
+                        n_cands = branch_info['n_candidates'] or 0
+                        total_chunks = ERDQueue.n_chunks_for(n_cands, branch_info['chunk_size'])
+                        done_ct = done_chunks.get(bkey, 0)
+                        co_workers = [
+                            h['worker_id'].split('-')[-1]
+                            if '-' in h['worker_id'] else h['worker_id']
+                            for h in hbs
+                            if h['current_branch_key']
+                            and bytes(h['current_branch_key']) == bkey
+                            and h['worker_id'] != detail_hb['worker_id']
+                        ]
+                        co_str = (f', W{",".join(co_workers)} also active'
+                                  if co_workers else '')
+                        print(f'  (cooperating — {done_ct}/{total_chunks} chunks done{co_str})')
+                    else:
+                        print('  (cooperating — sub-branch finalizing)')
+                else:
+                    print('  (between chunks)')
+            else:
+                print('  (no spine data yet)')
+            if interactive:
+                print(f'  [press {selected_worker} to dismiss]')
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -1201,6 +1309,8 @@ def main():
     p_stat = sub.add_parser('status', help='Show progress snapshot')
     p_stat.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
     p_stat.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_stat.add_argument('--worker', type=int, default=None, metavar='N',
+                        help='Print spine detail for worker N (one-shot, no --watch needed)')
     p_stat.add_argument('--watch', nargs='?', const=30, type=int,
                         metavar='SECONDS',
                         help='Repeat every SECONDS (default 30)')

@@ -633,21 +633,36 @@ class ERDQueue:
         """).fetchall()
 
     def reset_active_branches(self):
-        """Drop all in-progress branch + chunk state (supervisor startup).
+        """Drop in-progress D-0 branch state; reclaim stale cooperative chunks.
 
-        Branch/chunk rows are pure transient coordination: any branch whose
-        result didn't reach the persistent cache is still 'pending' (its
-        pending_branches row was set in_progress on promotion and reset to
-        pending by reset_stale_in_progress()), so clearing these tables just
-        discards half-done coordination — the branch is simply re-promoted and
-        redone.  Returns (n_branches, n_chunks) cleared.
+        D-0 branches have pending_branches rows that reset_stale_in_progress()
+        already flipped back to 'pending', so wiping their active_branches and
+        chunk rows just discards half-done coordination — they re-promote and
+        redo cleanly.
+
+        Cooperative branches (depth>0) have NO pending_branches row — they are
+        inserted directly into active_branches by cooperative_solve.  Wiping
+        them throws away all partial-chunk progress with no recovery path.
+        Instead, only free their stale in-flight claims (done=0 chunk rows);
+        done=1 rows (completed chunks) and the branch row itself survive, so
+        the next worker to join picks up exactly where the killed worker left
+        off.
+
+        Returns (n_branches, n_chunks) cleared for D-0 branches only.
         """
         nb = self._conn.execute(
-            "SELECT COUNT(*) FROM active_branches").fetchone()[0]
+            "SELECT COUNT(*) FROM active_branches WHERE depth = 0").fetchone()[0]
         nc = self._conn.execute(
-            "SELECT COUNT(*) FROM branch_chunks").fetchone()[0]
-        self._conn.execute("DELETE FROM branch_chunks")
-        self._conn.execute("DELETE FROM active_branches")
+            "SELECT COUNT(*) FROM branch_chunks WHERE branch_key IN "
+            "(SELECT branch_key FROM active_branches WHERE depth = 0)").fetchone()[0]
+        self._conn.execute(
+            "DELETE FROM branch_chunks WHERE branch_key IN "
+            "(SELECT branch_key FROM active_branches WHERE depth = 0)")
+        self._conn.execute("DELETE FROM active_branches WHERE depth = 0")
+        # Free stale in-flight claims on cooperative branches so their
+        # remaining chunks are reclaimable as gaps.
+        self._conn.execute(
+            "DELETE FROM branch_chunks WHERE done = 0")
         return nb, nc
 
     def worker_counts_by_branch(self, timeout_seconds: int = 30) -> dict:

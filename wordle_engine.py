@@ -926,6 +926,10 @@ def _cache_reuse(entry, budget):
     return (score, md, True) if sb == budget else None
 
 
+def _by_group_size(item):
+    return len(item[1])
+
+
 def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    n=None, best_erd=float('inf'),
                    deadline=None, guesses=None, policy=ERD_ALL,
@@ -992,7 +996,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     sub_budget = None if budget is None else budget - 1
     # Largest sub-branches first: highest weight (k/n), pushes cost up fastest
     # so the branch-and-bound check fires after as few sub-evaluations as possible.
-    ordered = sorted(groups.values(), key=len, reverse=True)
+    ordered = sorted(groups.items(), key=_by_group_size, reverse=True)
 
     # Alpha-beta: solve each sub-branch under a derived ceiling so a deep node
     # prunes from a tight bound instead of inf.  rest_lb[i] is an admissible
@@ -1006,9 +1010,10 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 
     rest_lb = [0.0] * (len(ordered) + 1)
     for i in range(len(ordered) - 1, -1, -1):
-        rest_lb[i] = rest_lb[i + 1] + (len(ordered[i]) / n) * _sub_lb(ordered[i])
+        sub_i = ordered[i][1]
+        rest_lb[i] = rest_lb[i + 1] + (len(sub_i) / n) * _sub_lb(sub_i)
 
-    for i, sub_branch in enumerate(ordered):
+    for i, (pattern_code, sub_branch) in enumerate(ordered):
         # Tighten the bound from any inter-worker improvement before computing
         # this sub-branch's ceiling and the accumulated-cost cutoff check.
         if bound_provider is not None:
@@ -1027,7 +1032,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         sub = _solve_subset(
             sub_branch, cache, score_cache, sub_budget, deadline, guesses,
             policy, cancel_check, heartbeat, depth + 1, note_depth, None,
-            subbranch_solver, ceiling=sub_ceiling)
+            subbranch_solver, ceiling=sub_ceiling,
+            entry_guess=candidate, entry_pattern=pattern_code)
         if sub is None:
             return ('abort', None, None, floor)
         sub_cost, sub_md, sub_floor, sub_cutoff = sub
@@ -1051,7 +1057,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, depth, note_depth,
                   progress_callback, subbranch_solver=None,
-                  ceiling=float('inf')):
+                  ceiling=float('inf'), entry_guess=None, entry_pattern=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1078,7 +1084,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     if heartbeat is not None:
         heartbeat()
     if note_depth is not None:
-        note_depth(depth, n)
+        note_depth(depth, n, entry_guess, entry_pattern)
     if budget is not None and budget < 1:
         return (float('inf'), None, True, False)   # no guess available at all
     if n == 1:
@@ -1116,7 +1122,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         delegated = subbranch_solver(branch_words, budget)
         if delegated is not None:
             if note_depth is not None:
-                note_depth(depth, -n)  # sentinel: this level was promoted
+                note_depth(depth, -n, None, None)  # sentinel: this level was promoted
             return delegated
 
     # Best-first ordering: evaluate the strongest splitter first (key = expected

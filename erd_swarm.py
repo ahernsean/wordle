@@ -37,6 +37,7 @@ from wordle_engine import (
     _cache_reuse,
 )
 from erd_queue import ERDQueue, decode_subset, encode_subset
+from wordle_ui import fmt_pattern
 
 ANSWER_FILE = 'NYT_wordlist.txt'
 WORDS_FILE = 'wordle.txt'
@@ -152,13 +153,18 @@ class _BranchWorker:
 
     # -- depth instrumentation ----------------------------------------------
 
-    def _note_depth(self, depth, n):
+    def _note_depth(self, depth, n, guess=None, pattern=None):
         # Per-position observer: track max depth and the live recursion spine.
-        # n < 0 is the cooperative-promotion sentinel: the sub-branch at this
-        # depth was handed off to the swarm; overwrite its size with '•' and
-        # leave deeper entries intact (there are none after a promotion).
+        # Each entry stores (size, guess, pattern): the sub-branch size and the
+        # candidate+response that produced it.  n < 0 is the cooperative-
+        # promotion sentinel: preserve the stored guess/pattern, replace size
+        # with '•' to mark that the sub-branch was handed to the swarm.
         if n < 0:
-            self._spine[depth] = '•'
+            prev = self._spine.get(depth, (None, None, None))
+            self._spine[depth] = ('•', prev[1], prev[2])
+            deeper = [d for d in self._spine if d > depth]
+            for d in deeper:
+                del self._spine[d]
             if len(self._spine) >= len(self._hb_max_spine):
                 self._hb_max_spine = dict(self._spine)
             if len(self._spine) >= len(self._log_max_spine):
@@ -167,7 +173,8 @@ class _BranchWorker:
         if depth > self._cand_max_depth:
             self._cand_max_depth = depth
         self._cur_depth = depth
-        self._spine[depth] = n
+        pattern_str = fmt_pattern(pattern) if isinstance(pattern, int) else pattern
+        self._spine[depth] = (n, guess, pattern_str)
         deeper = [d for d in self._spine if d > depth]
         for d in deeper:
             del self._spine[d]
@@ -176,11 +183,24 @@ class _BranchWorker:
         if len(self._spine) >= len(self._log_max_spine):
             self._log_max_spine = dict(self._spine)
 
+    @staticmethod
+    def _fmt_spine_entry(entry):
+        if not isinstance(entry, tuple):
+            return str(entry)
+        size, guess, pattern = entry
+        if guess and pattern:
+            return f'{guess.upper()}:{pattern}/{size}'
+        return str(size)
+
     def _hb_spine_str(self):
-        return '→'.join(str(self._hb_max_spine[d]) for d in sorted(self._hb_max_spine))
+        return '→'.join(
+            self._fmt_spine_entry(self._hb_max_spine[d])
+            for d in sorted(self._hb_max_spine))
 
     def _log_spine_str(self):
-        return '→'.join(str(self._log_max_spine[d]) for d in sorted(self._log_max_spine))
+        return '→'.join(
+            self._fmt_spine_entry(self._log_max_spine[d])
+            for d in sorted(self._log_max_spine))
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
