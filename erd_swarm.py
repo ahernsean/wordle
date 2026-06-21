@@ -444,7 +444,7 @@ class _BranchWorker:
         drains useful work from the queue.  Returns True if a chunk was
         evaluated, False if there was nothing to claim.
         """
-        for branch in self.queue.open_branches():
+        for branch in self.queue.branches_in_progress():
             other_key = bytes(branch['branch_key'])
             if other_key == bytes(exclude_branch_key):
                 continue
