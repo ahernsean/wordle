@@ -1075,7 +1075,7 @@ def _print_status(args, selected_worker=None, interactive=False):
         if cur and c_total:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
             krate = f'{int(nrate / 1000)}kN/s'
-            cperc = int(float(n_seen)/c_total*100)
+            cperc = int(n_seen / c_total * 100)
             print(f'       {cur_disp}  {n_seen:>3}/{c_total:<3} {cperc:2d}%  MaxD:{mdepth}  {krate:>7}  {_spine_sizes(path)}')
         else:
             print()
