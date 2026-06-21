@@ -376,7 +376,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         seen = []
         _solve_subset(remaining, cache, None, None, None, remaining,
                       ERD_ANSWERS, None, None, 0,
-                      note_depth=lambda d, n: seen.append((d, n)),
+                      note_depth=lambda d, n, *_: seen.append((d, n)),
                       progress_callback=None)
         self.assertTrue(seen)
         self.assertEqual(seen[0], (0, len(remaining)))

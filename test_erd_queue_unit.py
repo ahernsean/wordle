@@ -202,7 +202,7 @@ class TestStartupRecovery(_TmpQueue):
         self.q.add_pending_many([(self.key, len(WORDS), 0, "salet", 0)])
         self.assertEqual(self.q.reset_stale_in_progress(), 0)
 
-    def test_reset_active_branches_clears_branches_and_chunks(self):
+    def test_reset_active_branches_clears_d0_branches_and_chunks(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, 5)
         self.q.claim_chunk(self.key, "worker-0",
                            ERDQueue.n_chunks_for(N_CANDIDATES, 5))
@@ -211,6 +211,46 @@ class TestStartupRecovery(_TmpQueue):
         self.assertGreaterEqual(n_c, 1)
         self.assertIsNone(self.q.get_branch(self.key))
         self.assertEqual(self.q.chunks_for_branch(self.key), [])
+
+    def test_reset_active_branches_preserves_cooperative_branch_progress(self):
+        # D=0 branch (has pending_branches backup — wiped on reset).
+        d0_key = self.key
+        self.q.create_branch(d0_key, len(WORDS), N_CANDIDATES, 5, depth=0)
+
+        # D=1 cooperative branch (no pending_branches row — must survive reset).
+        coop_words = WORDS[:3]
+        coop_key = ScoreCache.encode_subset(coop_words)
+        n_chunks = ERDQueue.n_chunks_for(N_CANDIDATES, 5)
+        self.q.create_branch(coop_key, len(coop_words), N_CANDIDATES, 5, depth=1)
+        # Simulate two chunks: idx 0 completed, idx 1 stale in-flight.
+        idx0 = self.q.claim_chunk(coop_key, "worker-0", n_chunks)
+        self.q.complete_chunk(coop_key, idx0)
+        idx1 = self.q.claim_chunk(coop_key, "worker-0", n_chunks)
+        self.assertIsNotNone(idx1)
+
+        n_b, n_c = self.q.reset_active_branches()
+
+        # D=0 branch is gone.
+        self.assertEqual(n_b, 1)
+        self.assertIsNone(self.q.get_branch(d0_key))
+
+        # Cooperative branch row survives.
+        self.assertIsNotNone(self.q.get_branch(coop_key))
+
+        chunks = self.q.chunks_for_branch(coop_key)
+        # Completed chunk (done=1) is preserved so its progress isn't lost.
+        done_chunks = [c for c in chunks if c["done"] == 1]
+        self.assertEqual(len(done_chunks), 1)
+        self.assertEqual(done_chunks[0]["idx"], idx0)
+
+        # Stale in-flight claim (done=0) is freed so the chunk becomes a
+        # re-claimable gap for the next worker.
+        inflight_chunks = [c for c in chunks if c["done"] == 0]
+        self.assertEqual(inflight_chunks, [])
+
+        # The freed gap is claimable again.
+        reclaimed = self.q.claim_chunk(coop_key, "worker-1", n_chunks)
+        self.assertEqual(reclaimed, idx1)
 
 
 class TestCancelAndInspection(_TmpQueue):

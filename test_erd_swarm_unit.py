@@ -154,7 +154,8 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
         w._note_depth(2, 12)
         # n=-1 is the cooperative-promotion sentinel.
         w._note_depth(2, -1)
-        self.assertEqual(w._spine[2], '•')
+        size, guess, pattern = w._spine[2]
+        self.assertEqual(size, '•')
         self.assertIn(1, w._spine)  # parent depth untouched
 
     def test_sentinel_updates_hb_and_log_max_spine(self):
@@ -178,7 +179,7 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
         # be < len(hb_max_spine=3) depending on prior history, so this exercises
         # the False branch of the len comparison.
         pre_hb = dict(w._hb_max_spine)
-        w._note_depth(2, -1)  # spine becomes {1:100, 2:'•'}, len=2 < 3
+        w._note_depth(2, -1)  # spine becomes {1:100, 2:('•',…)}, len=2 < 3
         # If hb_max_spine was already size 3, it should NOT be overwritten.
         if len(pre_hb) > len(w._spine):
             self.assertEqual(w._hb_max_spine, pre_hb)
