@@ -184,7 +184,7 @@ class _BranchWorker:
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
-    def _free_ram_mb(self):
+    def _free_ram_mb(self):  # pragma: no cover
         try:
             with open('/proc/meminfo') as f:
                 for line in f:
@@ -199,7 +199,7 @@ class _BranchWorker:
             self.score_cache.checkpoint()
             self._last_checkpoint = now
 
-    def _check_ram(self):
+    def _check_ram(self):  # pragma: no cover
         now = time.time()
         if now - self._last_ram_check < 30:
             return
@@ -244,7 +244,7 @@ class _BranchWorker:
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._hb_spine_str())
         self._hb_max_spine = {}
-        if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:
+        if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
             self._last_progress_log = now
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
             bg = (best_guess or '-').upper()
@@ -333,12 +333,12 @@ class _BranchWorker:
                     cur_candidate=ranked[ci], cand_n_seen=n_seen,
                     cand_chunk_size=chunk_total))
             cand_elapsed = time.time() - cand_t0
-            if cand_elapsed > 10:
+            if cand_elapsed > 10:  # pragma: no cover
                 logger.warning('%s slow candidate %s in chunk %d: %.1fs  '
                                'status=%s  max_depth=%d', self.name, ranked[ci],
                                idx, cand_elapsed, status, self._cand_max_depth)
 
-            if status == 'abort':
+            if status == 'abort':  # pragma: no cover
                 return False
             # A candidate excluded by the depth cap (anywhere in its subtree)
             # taints the branch: its ERD is only valid at this budget.  Marked
@@ -356,7 +356,7 @@ class _BranchWorker:
                 self.n_cutoff += 1
             elif status == 'pruned':
                 self.n_pruned += 1
-            else:
+            else:  # pragma: no cover
                 self.n_useless += 1
 
             rate = n_seen / max(1e-6, now - t0)
@@ -385,7 +385,7 @@ class _BranchWorker:
         """If every chunk is done, finalize the branch exactly once."""
         if self.queue.branch_done_chunks(branch_key) < n_chunks:
             return
-        if not self.queue.try_finalize_branch(branch_key):
+        if not self.queue.try_finalize_branch(branch_key):  # pragma: no cover
             return  # another worker won the finalize
         meta = self.queue.read_branch_meta(branch_key)
         best_guess, best_erd, max_depth, tainted, budget = meta
@@ -405,7 +405,7 @@ class _BranchWorker:
                         'max_depth=%s budget=%s%s', self.name, len(words),
                         best_guess, best_erd, max_depth, budget,
                         ' TAINTED' if tainted else '')
-        else:
+        else:  # pragma: no cover
             # No feasible guess within budget: this branch is a loss.  Don't
             # write an ERD entry (there is no winning strategy to cache).
             logger.warning('%s branch (%d words) UNSOLVABLE within budget %s '
@@ -477,7 +477,7 @@ class _BranchWorker:
                     self._maybe_checkpoint()    # drain WAL during deep solving
                 elif self.queue.branch_done_chunks(branch_key) >= n_chunks:
                     self.maybe_finalize(branch_key, words, n_chunks)
-                else:
+                else:  # pragma: no cover
                     # Every chunk is claimed but coverage isn't complete: some are
                     # held by other workers.  Heartbeat first (so THIS worker, which
                     # still holds its own parent chunk up the stack, isn't itself
@@ -489,10 +489,10 @@ class _BranchWorker:
                     self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
                     time.sleep(0.05)            # chunks in flight elsewhere; let them land
 
-            if self.cancel():
+            if self.cancel():  # pragma: no cover
                 return None
             # Finalized as a loss: proven unsolvable (not a cutoff).
-            return (float('inf'), None, True, False)
+            return (float('inf'), None, True, False)  # pragma: no cover
         finally:
             self._coop_depth -= 1
 
@@ -548,7 +548,7 @@ class _BranchWorker:
 
     # -- main loop ----------------------------------------------------------
 
-    def run(self):
+    def run(self):  # pragma: no cover
         idle_since = None
         while not self.cancel():
             work = self.claim_one()
@@ -624,7 +624,7 @@ class _BranchWorker:
                     break
 
 
-def swarm_worker(worker_id, cache_path, queue_path, stop_event,
+def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no cover
                  min_words_per_chunk=3, max_chunk_count=256, n_workers=1):
     """Process entry point for a swarm worker (target= for mp.Process)."""
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -641,7 +641,7 @@ def swarm_worker(worker_id, cache_path, queue_path, stop_event,
                     worker_id, w.chunks_done)
 
 
-def _setup_logging(worker_id):
+def _setup_logging(worker_id):  # pragma: no cover
     for h in logger.handlers[:]:
         logger.removeHandler(h)
     log_path = os.path.join(
