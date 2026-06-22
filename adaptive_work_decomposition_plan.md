@@ -7,6 +7,21 @@
 > Linux-only; all its migrations are idempotent and need no phone coordination
 > (unlike `wordle_cache.sqlite3`).
 
+## Working method
+
+- **Branch.** Do the work on a new branch off `main`.
+- **Granular commits.** Commit each logical step on its own — a single migration, a
+  rename pass, the cost-model read/update, the engine seam, etc. — rather than
+  batching many into one. Small commits give a readable timeline (and per-step
+  timestamps) and a cheap rollback point when a step regresses or turns into a
+  rabbit hole.
+- **Test often, never commit on red.** Run the full suite (`python -m unittest
+  discover -s . -p 'test_*.py'`) at regular intervals — at minimum before every
+  commit — so a regression surfaces at the step that caused it, not many steps
+  later.
+- **PR early, keep it current.** Open a pull request as soon as the branch has its
+  first commit, and push after each step so it always reflects the latest state.
+
 ## Context
 
 The ERD precache swarm decomposes work with two static, count-based guesses:
