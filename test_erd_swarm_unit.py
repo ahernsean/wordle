@@ -54,11 +54,16 @@ def _bare_worker():
     w._hb_max_spine = {}
     w._log_max_spine = {}
     w.started = 0
+    w._coop_depth = 0
+    w._top_source_word = None
+    w._top_source_pattern = None
+    w._typical_cache = {}
     w.score_cache = mock.MagicMock()
     w.score_cache.read_hits = 0
     w.score_cache.read_misses = 0
     w.queue = mock.MagicMock()
     w.queue.read_branch_best.return_value = (None, None)
+    w.queue.get_cost_typical.return_value = None  # cold model by default
     return w
 
 

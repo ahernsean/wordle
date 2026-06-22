@@ -58,13 +58,17 @@ PROGRESS_LOG_SECONDS = 120   # log a mid-candidate progress line this often
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
 
-PROMOTE_MIN_SIZE = 60   # a sub-branch with >= this many words is promoted to the
-                        # queue and solved cooperatively; smaller ones are solved
-                        # inline (cheap, and visible — the engine heartbeat is
-                        # already threaded through the recursion).  Pure
-                        # granularity knob; any reasonable value is correct.
+PROMOTE_MIN_SIZE = 60   # cold-model fallback: sub-branches with >= this many
+                        # words are promoted cooperatively when the cost model
+                        # has no data for their size bucket.
 PROMOTED_PRIORITY = 1_000_000  # promoted sub-branches outrank fresh top branches
                                # so freed workers prefer joining in-flight depth.
+
+OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publication
+MIN_HANDOFF_CANDIDATES = 4   # minimum remaining candidates to bother handing off
+# Cold-model entry-gate bootstrap: promote when the model is warm and predicts
+# > this many nodes, or fall back to PROMOTE_MIN_SIZE when the model is cold.
+PUBLISH_THRESHOLD_BOOTSTRAP = 5000
 
 GAME_GUESSES = 6              # a Wordle game allows 6 guesses total
 # Queue branches are positions AFTER the opener (guess 1), so they are solved
@@ -73,6 +77,93 @@ GAME_GUESSES = 6              # a Wordle game allows 6 guesses total
 ROOT_BUDGET = GAME_GUESSES - 1
 
 logger = logging.getLogger('wordle')
+
+
+class _MidLoopPublisher:
+    """Engine-seam object that detects mid-loop overrun and publishes the remainder.
+
+    An instance is created per evaluate_claim call and passed down through
+    evaluate_candidate / _solve_subset exactly like subbranch_solver.  Each
+    active DFS frame creates an independent frame-local token via enter(); the
+    publisher never shares mutable state between frames.
+
+    When check() fires at frame F:
+    - The prefix candidates (evaluated inline in Σk² order) are marked done
+      in the candidate_claims table by their all_words index so cooperative
+      workers do not redo them.
+    - The remainder is driven by cooperative_solve, which claims unclaimed
+      slots in natural all_words order.
+    - The finished result is returned directly; the engine short-circuits the
+      rest of frame F (no re-cache, because cooperative_solve already wrote it).
+    """
+
+    def __init__(self, worker):
+        self._worker = worker
+        # Reverse map word → all_words index, for prefix-marking done.
+        self._word_idx = {w: i for i, w in enumerate(worker.all_words)}
+
+    def enter(self, branch_words, depth):
+        """Called just before the candidate loop of each _solve_subset frame.
+
+        Returns an opaque token (nodes_at_entry, predicted, branch_words, depth)
+        if the cost model has a warm prediction for this size and the branch is
+        large enough to be worth handing off; None otherwise (no overrun check
+        for this frame).
+        """
+        n = len(branch_words)
+        if n < MIN_HANDOFF_CANDIDATES:
+            return None
+        predicted = self._worker._typical(n)
+        if predicted is None:
+            return None
+        return (self._worker._nodes, predicted, branch_words, depth)
+
+    def check(self, token, evaluated_words, remaining_count,
+              best_guess, best_erd, budget):
+        """Called every loop iteration (before status-continue checks).
+
+        Tests whether this frame has spent > OVERRUN_K * predicted nodes since
+        enter() and enough candidates remain to be worth handing off.  If so,
+        emits the promotion sentinel, publishes the remainder as a cooperative
+        branch, and returns the cooperative result so the engine can short-
+        circuit.  Returns None to continue inline.
+        """
+        if token is None:
+            return None
+        nodes_at_entry, predicted, branch_words, depth = token
+        delta = self._worker._nodes - nodes_at_entry
+        if delta <= OVERRUN_K * predicted:
+            return None
+        if remaining_count < MIN_HANDOFF_CANDIDATES:
+            return None
+
+        n = len(branch_words)
+        branch_key = encode_subset(branch_words)
+
+        # Spine sentinel: mark this frame as handed off in the heartbeat display.
+        self._worker._note_depth(depth, -n, None, None)
+
+        # Create the cooperative branch; idempotent if another worker raced us.
+        self._worker.queue.create_branch(
+            branch_key, n, self._worker.n_candidates,
+            priority=PROMOTED_PRIORITY,
+            source_word=self._worker._top_source_word,
+            source_pattern=self._worker._top_source_pattern,
+            budget=budget, depth=self._worker._coop_depth + 1)
+
+        # Mark the already-evaluated candidates done by their all_words index so
+        # cooperative workers claim only the unevaluated remainder.
+        done_indices = [self._word_idx[w] for w in evaluated_words
+                        if w in self._word_idx]
+        if done_indices:
+            self._worker.queue.mark_claims_done(branch_key, done_indices)
+
+        # Seed the cooperative branch's bound only when we have an achieved cost —
+        # a None best_guess means no feasible candidate yet; seeding inf is a no-op.
+        if best_guess is not None:
+            self._worker.queue.update_branch_best(branch_key, best_guess, best_erd)
+
+        return self._worker.cooperative_solve(branch_words, budget)
 
 
 class _BranchWorker:
@@ -123,6 +214,9 @@ class _BranchWorker:
         # decremented on exit.  Passed to create_branch so the status display
         # can distinguish user-queued branches (depth 0) from sub-branches.
         self._coop_depth = 0
+        # In-memory cache of cost-model predictions keyed by sub-branch size.
+        # Invalidated on cooperative finalize so new samples take effect.
+        self._typical_cache = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -185,6 +279,28 @@ class _BranchWorker:
         return '→'.join(
             self._fmt_spine_entry(self._log_max_spine[d])
             for d in sorted(self._log_max_spine))
+
+    # -- cost model ---------------------------------------------------------
+
+    def _typical(self, n):
+        """Return the cost model's geometric-mean node count for sub-branches of
+        size n, or None when the model is cold for this size bucket.
+
+        Results are cached in-memory for the life of the worker; the cache entry
+        for a given size is invalidated on cooperative finalize so new samples
+        take effect without re-querying on every enter() call.
+        """
+        if n in self._typical_cache:
+            return self._typical_cache[n]
+        result = self.queue.get_cost_typical(ERD_ALL, n)
+        self._typical_cache[n] = result
+        return result
+
+    def _update_cost_model(self, n_words, nodes):
+        """Update the cost model with a finalized cooperative branch's node count."""
+        self.queue.update_cost_model(ERD_ALL, n_words, nodes)
+        self.queue.add_cost_sample(ERD_ALL, n_words, nodes, 'finalize')
+        self._typical_cache.pop(n_words, None)   # invalidate stale cache entry
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
@@ -309,6 +425,7 @@ class _BranchWorker:
             return False
 
         self._cand_max_depth = 0
+        nodes_before = self._nodes
         cand_t0 = time.time()
         status, cost, cand_md, budget_tainted = evaluate_candidate(
             words, candidate, self.rcache, self.score_cache,
@@ -317,6 +434,7 @@ class _BranchWorker:
             depth=0, note_depth=self._note_depth, budget=budget,
             subbranch_solver=self._subbranch_solver,
             bound_provider=_bound_provider,
+            mid_loop_publisher=_MidLoopPublisher(self),
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started, None,
                 local_candidate, local_best, bound_erd=_eff_bound(),
@@ -326,6 +444,10 @@ class _BranchWorker:
             logger.warning('%s slow candidate %s (idx=%d): %.1fs  '
                            'status=%s  max_depth=%d', self.name, candidate,
                            idx, cand_elapsed, status, self._cand_max_depth)
+
+        nodes_delta = self._nodes - nodes_before
+        if nodes_delta > 0:
+            self.queue.add_nodes_spent(branch_key, nodes_delta)
 
         if status in _ABORT_STATUSES:  # pragma: no cover
             return False
@@ -368,6 +490,8 @@ class _BranchWorker:
             return  # another worker won the finalize
         meta = self.queue.read_branch_meta(branch_key)
         best_guess, best_erd, max_depth, tainted, budget = meta
+        branch_row = self.queue.get_branch(branch_key)
+        nodes_spent = branch_row['nodes_spent'] if branch_row else 0
         if best_guess is not None:
             # Untainted => unconstrained optimum, reusable at any budget >=
             # max_depth (solve_budget NULL).  Tainted => valid only at this
@@ -377,6 +501,8 @@ class _BranchWorker:
                                    max_depth=max_depth, solve_budget=solve_budget)
             cache_all_scores(best_guess, words, self.score_cache, branch_key,
                              cache=self.rcache)
+            if nodes_spent > 0:
+                self._update_cost_model(len(words), nodes_spent)
             # NB: no per-finalize checkpoint — with recursive promotion a worker
             # finalizes thousands of sub-branches; checkpointing each one is
             # ruinous.  WAL is drained by the periodic _maybe_checkpoint instead.
@@ -423,13 +549,20 @@ class _BranchWorker:
     def _subbranch_solver(self, words, budget):
         """Engine hook: decide whether to solve a sub-branch cooperatively.
 
-        Large sub-branches are promoted to the swarm and solved across workers;
-        small ones return None so the engine solves them inline (cheap, and
-        still visible — the heartbeat is threaded through that recursion).
-        Returns the engine's (cost, max_depth, floor, cutoff) tuple, or None to
-        inline.  Cooperative results are always exact, so cutoff is False.
+        When the cost model is warm, promotes sub-branches whose predicted node
+        cost exceeds PUBLISH_THRESHOLD_BOOTSTRAP; when cold, falls back to the
+        PROMOTE_MIN_SIZE size threshold.  Returns the engine's (status, cost,
+        max_depth, floor) tuple, or None to inline.  Cooperative results are
+        always exact (no cutoff).
         """
-        if budget is None or len(words) < PROMOTE_MIN_SIZE:
+        if budget is None:
+            return None
+        n = len(words)
+        predicted = self._typical(n)
+        if predicted is None:
+            if n < PROMOTE_MIN_SIZE:
+                return None
+        elif predicted < PUBLISH_THRESHOLD_BOOTSTRAP:
             return None
         return self.cooperative_solve(words, budget)
 
