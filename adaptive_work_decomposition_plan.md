@@ -112,8 +112,16 @@ not inferred. The cache-reuse logic (`_cache_reuse`, `ScoreCache` reuse rule,
 
 **Constraints.**
 - **Behavior-preserving.** No ERD value, cache entry, or pruning decision changes.
-  The existing suite (`test_*.py`) is the oracle — it must stay green with no
-  test logic changes beyond mechanical status renames.
+  The existing suite (`test_*.py`) is the oracle — it must stay green.
+- **Blast radius — update every site that unpacks the engine's return; this is not a
+  one-line rename.** `_solve_subset` returning status+payload instead of
+  `(cost, md, floor, cutoff)` / `None` ripples to every destructuring caller. At
+  minimum: `evaluate_candidate` (`sub_cost, sub_md, sub_floor, sub_cutoff = sub`, and
+  its own `('status', …)` returns), `min_expected_guesses`, `_cache_reuse` and the
+  `(*reuse, False)` spreads, and on the swarm side `cooperative_solve` (returns the
+  4-tuple, `(*reuse, False)`) and `evaluate_chunk`/`evaluate_claim`. Grep for the
+  tuple destructure and for `, False)` spreads before declaring Phase 0 done. The
+  test changes are correspondingly more than renames.
 - **Hot path.** `_solve_subset` is called millions of times. Use a lightweight
   status representation (an `IntEnum` / module-level int constants plus the payload),
   **not** a per-node object allocation. Do not regress node throughput.
@@ -167,8 +175,20 @@ A unit of work is a `_solve_subset(X)` call. At every such call:
 
     ```
     self._nodes - nodes_at_entry  >  OVERRUN_K * typical(len(X))   # abnormal for its size
-      AND  typical(remaining)      >= PUBLISH_THRESHOLD             # the handoff is worth swarming
+      AND  (n_candidates - (i + 1))  >=  MIN_HANDOFF_CANDIDATES     # enough left to be worth swarming
     ```
+
+    The handoff floor is a **candidate count**, not `typical(remaining)`. `typical`
+    is a function of branch *size* (word count), and the published remainder is the
+    *same* branch X with the *same* `len(X)` — only its candidate list is being
+    partitioned — so `typical` cannot be evaluated on "the remainder." Nor can the
+    floor be a predicted-remaining-nodes figure: overrun only fires *after*
+    `nodes_spent > OVERRUN_K * predicted`, so any `predicted - nodes_spent` estimate
+    is already deeply negative exactly when overrun trips, and would suppress the
+    publication it is meant to gate. We are by definition in a tarpit, so each
+    unevaluated candidate is likely expensive; the only thing worth checking is that
+    a non-trivial number remain unclaimed (`MIN_HANDOFF_CANDIDATES`, a small count,
+    e.g. ≥ `2 × worker_count`).
 
 - Once published, this worker keeps participating: it drives X to finalize
   cooperatively (reusing the claim/help/finalize loop); the result is
@@ -333,12 +353,25 @@ it stops being entry-promoted.
 - **Cold-start stochastic probing (start converging immediately).** When a bucket
   is cold and a branch of that size is about to be solved, take a stochastic sample
   of ~`2 × worker_count` candidates from the branch's `all_words` list (uniform
-  random indices), evaluate just those, and seed the bucket. This is a *starting*
-  estimate that the model refines over time; `2 × worker_count` gets a usable read
-  cheaply and scales the probe to available parallelism (the probes are independent
-  and can be claimed by the swarm). Bias toward over-promotion here is fine and
-  intended (decision 3) — it errs on the safe side and washes out as organic
-  samples accumulate.
+  random indices) and evaluate just those. **Mind the unit.** The bucket stores
+  *full-branch-solve* node costs (the inline-return delta and the finalize
+  `nodes_spent` are both whole-branch figures); a probe yields *per-candidate* node
+  costs, which are not the same quantity — a real solve prunes most of the tail once
+  the bound is tight, so the naive `per_candidate_mean × n_candidates` extrapolation
+  **systematically overestimates** the full-solve cost. Two acceptable ways to
+  reconcile, executor's choice:
+  - **(preferred) Don't fabricate a full-solve sample.** Seed the bucket with the
+    over-estimate `per_candidate_mean × n_candidates` and **mark it provisional**
+    (low weight, e.g. `weight_sum = 1`), so the first real inline-return / finalize
+    sample dominates it. This is intentionally biased high → leans over-promote
+    (decision 3) and washes out fast as organic full-solve samples arrive.
+  - **(alternative) Keep probe samples in a separate per-candidate estimator** used
+    only to *gate cold entry* (publish if the probe says the branch is expensive),
+    never written into the full-solve `cost_model` bucket.
+
+  Either way: the probe is a *starting* signal, the over-estimate is the safe
+  direction, and the provisional/low weight or separate store keeps it from
+  poisoning the full-solve buckets the runtime estimate reads.
 - **In-memory cache on the worker.** Reading the model per frame would be thousands
   of DB reads. Load all buckets into a dict on the worker, refresh on a timer
   (reuse the `BEST_REFRESH_SECONDS` cadence pattern). `typical(size)` reads the
@@ -476,13 +509,14 @@ Purge **all** "chunk" vocabulary; the work unit is a candidate claim.
     frame token carrying `(nodes_at_entry, predicted = typical(n))`, or `None` (cold
     model / below floor → no overrun check this frame).
   - In the candidate loop, after the best update: if `token` is set, call
-    `mid_loop_publisher.check(token, evaluated_words, best_guess, best_erd, budget)`
-    where `evaluated_words = candidate_list[:i+1]`. `check` reads `self._nodes`,
-    tests `delta > OVERRUN_K * predicted` and `typical(remaining) >=
-    PUBLISH_THRESHOLD`; if tripped it registers X as a cooperative branch (prefix
-    marked done; bound seeded **only if `best_guess is not None`**), drives it, and
-    returns the finished result (Phase-0 status + payload) — the engine returns it
-    immediately. Else returns `None`.
+    `mid_loop_publisher.check(token, evaluated_words, remaining_count, best_guess,
+    best_erd, budget)` where `evaluated_words = candidate_list[:i+1]` and
+    `remaining_count = len(candidate_list) - (i + 1)`. `check` reads `self._nodes`,
+    tests `delta > OVERRUN_K * predicted` and `remaining_count >=
+    MIN_HANDOFF_CANDIDATES`; if tripped it registers X as a cooperative branch
+    (prefix marked done; bound seeded **only if `best_guess is not None`**), drives
+    it, and returns the finished result (Phase-0 status + payload) — the engine
+    returns it immediately. Else returns `None`.
 - Frame-local `token` is a plain local, so each active DFS frame checks its own
   overrun independently ("get help at my level"). Nodes spent driving an inner
   publication inflate outer frames' deltas — benign (the outer frame is also
@@ -501,18 +535,30 @@ Purge **all** "chunk" vocabulary; the work unit is a candidate claim.
   evaluated words → `all_words` indices via the prebuilt `{word: idx}` map, marks
   those done, seeds the crowdsourced best (only if achieved), then runs the
   claim/help/finalize loop on the remainder.
-- `cooperative_solve` and the renamed `evaluate_chunk` (→ `evaluate_claim`) operate
-  over `self.all_words` in natural order, one candidate per claim, dropping
-  `_ranked_for` / `rank_candidates_…` from the swarm claim path.
-- **`_help_other_branch` must move to natural order too — it is NOT reusable
-  unchanged.** Today it calls `n_chunks_for` / `claim_chunk` / `_ranked_for` /
-  `evaluate_chunk(..., ranked, idx, chunk_size)`. If it kept indexing `ranked[idx]`
+- **Convert EVERY claim site to natural order — not just the obvious ones.** The
+  renamed `evaluate_chunk` (→ `evaluate_claim`) and **all four** of its callers must
+  claim/evaluate over `self.all_words` in natural order, one candidate per claim,
+  dropping `_ranked_for` / `rank_candidates_…` from the swarm claim path. The claim
+  sites are:
+  - `cooperative_solve` (builds `ranked`, loops `claim_chunk` + `evaluate_chunk`).
+  - `claim_one` — the main scheduler. It calls `chunk_size_for` / `n_chunks_for` /
+    `claim_chunk` and `create_branch(..., chunk_size, ...)`. Because `chunk_size_for`
+    / `n_chunks_for` are being **deleted**, `claim_one` does not merely need
+    re-pointing — it will not even run until rewritten. **Easy to miss; it is not in
+    the engine seam.**
+  - the `run()` main loop — claims via `claim_one` then evaluates (its own
+    `_ranked_for` + `evaluate_chunk` usage).
+  - `_help_other_branch` — the idle/waiting recruiter. Today it calls `n_chunks_for`
+    / `claim_chunk` / `_ranked_for` / `evaluate_chunk(..., ranked, idx, chunk_size)`.
+
+  **Why all of them, not just one.** If any single site keeps indexing `ranked[idx]`
   while published branches mark-done and claim by `all_words` index, the two index
-  spaces would disagree → candidates skipped or double-evaluated and a **false
-  "full coverage" at finalize → a wrong ERD written to the persistent cache.**
-  Re-point it at `claim_candidate` over `self.all_words` natural order, exactly like
-  `cooperative_solve`. Keep its role (idle/waiting recruiter) and `PROMOTED_PRIORITY`
-  so freed workers join published branches first.
+  spaces disagree → candidates skipped or double-evaluated and a **false "full
+  coverage" at finalize → a wrong ERD written to the persistent cache.** A helper
+  joining a published branch through *any* path must evaluate the same word the
+  publisher marked at that index. Keep each site's role (`_help_other_branch` stays
+  the recruiter; published branches keep `PROMOTED_PRIORITY` so freed workers join
+  them first) — only the claim *indexing* changes.
 - `maybe_finalize`: record the cooperative-branch cost sample `(n_words,
   nodes_spent)` and the raw `cost_samples` row.
 - Constructor / `swarm_worker` signature: drop `min_words_per_chunk` /
@@ -555,7 +601,7 @@ flowchart TD
     subgraph engine["_solve_subset(X)  (wordle_engine.py)"]
         E0["entry: token = enter(n)\nnodes_at_entry, predicted = typical(n)"]
         E1["inline best-first loop\n(Σk² order, builds local best)"]
-        E2{"check(token):\ndelta > K*predicted\nAND typical(remaining) >= PUBLISH_THRESHOLD?"}
+        E2{"check(token):\ndelta > K*predicted\nAND remaining_count >= MIN_HANDOFF_CANDIDATES?"}
         E0 --> E1 --> E2
         E2 -- no --> E1
     end
@@ -591,6 +637,8 @@ a meta-parameter** — it governs *how* we adapt, not the value being adapted.
 Constants (meta-parameters / cold bootstraps; named, with starting values):
 
 - `OVERRUN_K` ≈ 4 — dimensionless overrun ratio (`delta > K · typical(size)`).
+- `MIN_HANDOFF_CANDIDATES` ≈ `2 × worker_count` — unclaimed-candidate count below
+  which an overrun does not bother publishing (the handoff would be too small).
 - `SAFETY_FACTOR` ≈ 8 — dimensionless margin on the coordination break-even.
 - `OVER_PROMOTE_Z` = 0 — log-quantile shade for the over-promotion lean (raise only
   if the smoke test under-promotes).
@@ -627,10 +675,12 @@ Constants (meta-parameters / cold bootstraps; named, with starting values):
 
 ## Verification
 
-- **Phase 0:** full suite green with only mechanical status renames in tests; no ERD
-  / cache / pruning change. Add a focused test that each reason-named status is
-  returned in its situation (abort, exact, unsolvable-within-budget,
-  pruned-by-bound) and that `budget_tainted` rides an `ok`-at-budget result.
+- **Phase 0:** full suite green; no ERD / cache / pruning change. Test logic is
+  unchanged in spirit but is **not** a one-line rename — every site that unpacks the
+  engine's return must be updated (see the engine-seam note on unpack sites). Add a
+  focused test that each reason-named status is returned in its situation
+  (`DEADLINE_EXCEEDED`, `CANCEL_RECVD`, `SOLVED`, `OVER_DEPTH_BUDGET`,
+  `OVER_ERD_LIMIT`) and that `budget_tainted` rides a `SOLVED`-at-budget result.
 - **Unit** (`test_erd_queue_unit.py`, `test_erd_swarm_unit.py`,
   `test_erd_parallel.py`, `test_erd_scaling.py`): cost-model update + time-decay
   with synthetic timestamps (an old sample's weight decays toward zero; a changed
@@ -639,13 +689,16 @@ Constants (meta-parameters / cold bootstraps; named, with starting values):
   cold vs warm read; cold-start probe takes ~`2 × worker_count` samples and seeds
   the bucket; entry gate promotes/inlines correctly for a seeded model; overrun
   `check` fires per frame on a forced node delta **and** respects the
-  `typical(remaining) >= PUBLISH_THRESHOLD` floor; publish-with-no-bound path when
+  `remaining_count >= MIN_HANDOFF_CANDIDATES` floor; publish-with-no-bound path when
   `best_guess is None`; single `candidate_claims` claim/reclaim/finalize;
-  prefix-marked-done leaves only the remainder claimable; **`_help_other_branch`
-  claims and evaluates over natural `all_words` order** (regression guard against the
-  index-space mismatch); samples recorded from inline returns and cooperative
-  finalize; a throttled `claim_telemetry` row has sane `coordination_nanos` /
-  `work_nodes`. Update/remove the `chunk_size_for` and `PROMOTE_MIN_SIZE` tests.
+  prefix-marked-done leaves only the remainder claimable; **every claim path
+  (`cooperative_solve`, `claim_one`, the `run()` loop, `_help_other_branch`) claims
+  and evaluates over natural `all_words` order** (regression guard against the
+  index-space mismatch — assert a helper joining via any path evaluates the same
+  word the publisher marked at that index); samples recorded from inline returns and
+  cooperative finalize; a throttled `claim_telemetry` row has sane
+  `coordination_nanos` / `work_nodes`. Update/remove the `chunk_size_for` and
+  `PROMOTE_MIN_SIZE` tests.
 - **Pruning-safety regression:** assert sibling response groups stay sequential;
   solve a small fixed branch both the old (`PROMOTE_MIN_SIZE`) and new path and
   confirm **identical finalized ERD** and total nodes not worse; assert
