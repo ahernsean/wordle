@@ -89,7 +89,7 @@ spellings (executor may refine, but each must name the **reason**):
 | Today (inferred) | Reason | Recommended status |
 |---|---|---|
 | `return None` (deadline check) | the wall-clock deadline passed | `DEADLINE_EXCEEDED` |
-| `return None` (`cancel_check` fired) | an external stop was requested — in the swarm this is `stop_event` (worker shutdown/recycle) | `CANCELED` |
+| `return None` (`cancel_check` fired) | an **external** stop signal was received — in the swarm this is the `stop_event` (worker shutdown/recycle) | `CANCEL_RECVD` |
 | exact optimum tuple | the true minimum was found | `SOLVED` |
 | `(inf, None, True, False)` | depth budget too small — *proven* no winning strategy | `OVER_DEPTH_BUDGET` |
 | `(ceiling, None, _, True)` (`cutoff=True`) | every candidate priced ≥ the known ERD bound — *lower bound only, do not cache* | `OVER_ERD_LIMIT` |
@@ -102,7 +102,7 @@ not one lumped "aborted" — each names its own cause.
 `'abort'`) get the same treatment: `'cutoff'` → `OVER_ERD_LIMIT`, `'pruned'` →
 `OVER_DEPTH_BUDGET`, `'useless'` → a reason-named constant (e.g. `NO_INFORMATION`
 — the split is `k >= n`, zero information gain), `'abort'` → propagate whichever of
-`DEADLINE_EXCEEDED` / `CANCELED` the inner frame reported, `'ok'` → `SOLVED`.
+`DEADLINE_EXCEEDED` / `CANCEL_RECVD` the inner frame reported, `'ok'` → `SOLVED`.
 
 The depth-floor **taint** (the property that makes a `SOLVED` result valid only at
 *this* budget, currently the `floor` boolean threaded everywhere) becomes a
@@ -181,26 +181,30 @@ cannot say "fine inline" while overrun immediately says "too big" for the same
 size). The gate asks "is this size *typically* big enough to swarm up front?"; the
 overrun asks "is *this instance* running much hotter than typical for its size?"
 
-**One absolute scale only.** `PUBLISH_THRESHOLD` (in node-equivalents) is the sole
-absolute number — it answers "is the swarm worth it at all," which is inherent.
-Everything else is *relative* to the adaptive `typical(size)`; `OVERRUN_K` is a
-dimensionless ratio (~3–5), not a hardcoded node count. `PUBLISH_THRESHOLD` is a
-tunable, refined **offline** later from the logged data (below) — not by any
-runtime loop.
+**`PUBLISH_THRESHOLD` is adaptive too — the DB-coordination break-even, measured
+online.** It is *not* a hardcoded node count. It answers "is the swarm worth it at
+all": publishing pays only when the work handed off exceeds the cost of
+coordinating the handoff. Both halves are measurable, so compute it the same way as
+`typical(size)` — a time-weighted (same `TAU`) estimate, refreshed live:
 
-`PUBLISH_THRESHOLD` will most likely be set from the **DB-coordination break-even**:
-publishing pays only when the work handed off exceeds the time spent coordinating
-the handoff. To make that question answerable later, the data collection below must
-capture both halves of the ratio in compatible units:
+- `coordination_nanos` — wall time of a claim transaction (`BEGIN IMMEDIATE` →
+  commit), collapsed with the **same** log-domain EMA (robust median).
+- `node_nanos` — wall time per recursion node (node throughput), same EMA.
 
-- `claim_telemetry.coordination_nanos` — wall time per claim transaction (the
-  coordination cost).
-- `cost_samples.wall_nanos` alongside `nodes` — so node-count converts to wall time
-  (node throughput), letting the coordination cost be expressed in **node-
-  equivalents**, the same unit as `PUBLISH_THRESHOLD` and `typical(size)`.
+Then `PUBLISH_THRESHOLD = SAFETY_FACTOR × coordination_nanos / node_nanos`
+(node-equivalents — same unit as `typical(size)`). `SAFETY_FACTOR` (≈ 8) is a
+dimensionless knob; `OVERRUN_K` (~3–5) likewise. Those two ratios and `TAU` are the
+only constants — meta-parameters governing *how* we adapt, never the adapted
+quantities. Until the coordination/throughput estimators warm, fall back to a cold
+bootstrap `PUBLISH_THRESHOLD_BOOTSTRAP` (≈ 5 000 nodes), exactly as `typical(size)`
+falls back to `PROMOTE_MIN_SIZE`.
 
-With both logged, the break-even `PUBLISH_THRESHOLD` is computable after a
-representative run without any guessing.
+> **Keep telemetry outbound-only.** The coordination/throughput measurements that
+> feed this live threshold are taken into small **in-memory** online estimators on
+> the worker — *not* read back out of the `claim_telemetry` table. `claim_telemetry`
+> stays a pure outbound record (one measurement, two independent consumers: the
+> in-memory estimator for control, a throttled telemetry row for the monitor). No
+> control path ever queries the telemetry table.
 
 **Same-level, not one deeper.** Overrun is a *horizontal* deficit ("X's candidate
 list is more work than one worker can carry"), so the response is horizontal help
@@ -287,24 +291,41 @@ it stops being entry-promoted.
   valid; a parent frame's delta legitimately includes its children's nodes.
 - **Storage: `erd_queue.sqlite3` (Linux-only).** New table via the stateless
   check-then-add pattern in `ERDQueue._migrate` (no `schema_migrations` table here).
-- **Robust collapse, not the mean.** Node costs per size are heavy-tailed
-  (near log-normal); the arithmetic mean lets one tarpit poison a bucket
-  ("one bad apple ruins it for everyone"). `typical(size)` must be a robust central
-  estimate — a **median / low-percentile**, computed in **log space** (the
-  geometric mean / log-domain quantile is the natural collapse for a log-normal).
-  Store enough state to recover a robust statistic, not just a running mean:
-  - Time-weighted accumulators in **log space** (track `Σ w·ln(x)` and `Σ w` for a
-    geometric-mean baseline), **plus** the second moment (`Σ w·ln(x)²`) so a spread
-    is recoverable. A streaming low-quantile estimator (e.g. P²) is an acceptable
-    alternative if cleaner. The exact estimator is a tunable choice; what is **not**
-    optional is that it be robust and log-aware.
+- **The estimator to implement today: time-weighted geometric mean (log-domain
+  EMA).** Node costs per size are heavy-tailed (near log-normal); the arithmetic
+  mean lets one tarpit poison a bucket ("one bad apple ruins it for everyone").
+  The pick is deliberately the simplest estimator that is *both* robust *and*
+  exactly right for the assumed distribution: under a log-normal, the geometric
+  mean equals the median (`exp(μ)`), so a log-domain EMA **is** a streaming,
+  time-decayable median — no separate quantile machinery needed to start.
+  Per `size_bucket`, store time-weighted accumulators:
+  - `weighted_log_sum`  = `Σ wᵢ · ln(nodesᵢ)`
+  - `weight_sum`        = `Σ wᵢ`
+  - `weighted_log_sq`   = `Σ wᵢ · ln(nodesᵢ)²`  (second log-moment — for a spread,
+    used by the over-promotion shade below and by later analysis; not needed for
+    the point estimate)
+
+  Then `typical(size) = exp(weighted_log_sum / weight_sum)`. A single huge sample
+  enters as `ln(nodes)`, so it shifts the estimate far less than it would the
+  arithmetic mean — that is the robustness we want. **This is what gets coded.**
+  The `cost_samples` raw log (below) lets us check the log-normal assumption after
+  a few days and, only if the data demands it, swap in an explicit quantile (P²);
+  the stored second log-moment means that swap needs no new sampling.
+- **Over-promotion shade (optional, decision 3).** To lean over-promote, gate/
+  overrun may compare against a *low* log-quantile instead of the median —
+  `exp(μ − Z·σ)` using the recoverable `σ` from `weighted_log_sq`, with a small
+  fixed `Z` (e.g. 0.5). Start with `Z = 0` (the plain median) and only raise it if
+  the smoke test shows under-promotion.
 - **Exponential time-weighting (the model must adapt as the engine changes).** Each
   sample's influence decays with age so the model tracks the *current* cost
   structure. On update with sample `x` at `now`:
-  `decay = exp(-(now - last_updated)/TAU)`; multiply every stored accumulator by
-  `decay`, add the new sample's contribution, set `last_updated = now`. `TAU` ≈ one
-  day of seconds sets the half-life (tunable). Continuous-time EMA — old samples
-  fade smoothly; a changed algorithm re-converges within ~`TAU`.
+  `decay = exp(-(now - last_updated)/TAU)`; multiply every stored accumulator
+  (`weighted_log_sum`, `weight_sum`, `weighted_log_sq`) by `decay`, add the new
+  sample's contribution (`ln(x)`, `1`, `ln(x)²`), set `last_updated = now`. `TAU` ≈
+  one day of seconds sets the half-life. Continuous-time EMA — old samples fade
+  smoothly; a changed algorithm re-converges within ~`TAU`. (`TAU` is a meta-
+  parameter — the *adaptation rate*, not the adapted quantity — so it stays a
+  constant; the estimate itself is fully online.)
 - **Size bucketing.** Bucket `n_words` geometrically (e.g. `floor(log(n)/log(1.3))`)
   so samples stay dense in the heavy small-size region; interpolate across
   neighbouring buckets for unseen sizes. Return "cold" below a minimum effective
@@ -349,11 +370,14 @@ empirically:
   recorded_at)`, where `source` distinguishes inline-return / cooperative-finalize
   / cold-probe. Written throttled via the heartbeat batch path (sampled every Nth
   if volume demands).
-- Purpose: after a few days, fit the per-size distribution (confirm/adjust the
-  log-normal assumption), choose the robust collapse (median vs p-quantile vs
-  log-mean), and set `PUBLISH_THRESHOLD` / `OVERRUN_K` / `TAU` from data instead of
-  guesses. This is **offline analysis**, performed by a human/script — never a
-  runtime feedback loop.
+- Purpose: after a few days, **validate the starting choices**, not invent them.
+  The estimator already shipped is the log-domain geometric mean (median under
+  log-normal); this data confirms or refutes the log-normal assumption and tells us
+  whether to swap in an explicit quantile (P²) or re-tune the meta-parameters
+  (`OVERRUN_K`, `SAFETY_FACTOR`, `OVER_PROMOTE_Z`, `TAU`). `PUBLISH_THRESHOLD` and
+  `typical(size)` themselves already adapt at runtime; this is **offline analysis**
+  that adjusts the *shape/knobs*, performed by a human/script — never a runtime
+  feedback loop.
 
 ---
 
@@ -552,15 +576,29 @@ flowchart TD
 
 ---
 
-## Constants (tunable; named, with starting values)
+## Adaptive quantities vs. constants
 
-- `PUBLISH_THRESHOLD` — node-equivalent "worth-swarming" floor; the only absolute
-  scale. Drives the entry gate and the overrun handoff floor. Start conservative,
-  retune offline from `cost_samples`.
-- `OVERRUN_K` ≈ 3–5 — dimensionless overrun ratio (`delta > K * typical(size)`).
-- `TAU` ≈ 1 day of seconds — cost-model EMA half-life.
+Two things adapt online (log-domain EMA, half-life `TAU`); **everything else here is
+a meta-parameter** — it governs *how* we adapt, not the value being adapted.
+
+- **Adaptive — `typical(size)`** = `exp(weighted_log_sum / weight_sum)` per size
+  bucket (time-weighted geometric mean = median under log-normal). Drives the entry
+  gate and the overrun baseline.
+- **Adaptive — `PUBLISH_THRESHOLD`** = `SAFETY_FACTOR × coordination_nanos /
+  node_nanos`, both terms online log-domain EMAs. The "worth-swarming" break-even,
+  in node-equivalents.
+
+Constants (meta-parameters / cold bootstraps; named, with starting values):
+
+- `OVERRUN_K` ≈ 4 — dimensionless overrun ratio (`delta > K · typical(size)`).
+- `SAFETY_FACTOR` ≈ 8 — dimensionless margin on the coordination break-even.
+- `OVER_PROMOTE_Z` = 0 — log-quantile shade for the over-promotion lean (raise only
+  if the smoke test under-promotes).
+- `TAU` ≈ 1 day of seconds — EMA half-life (adaptation rate).
 - `COST_MODEL_MIN_WEIGHT` — effective-weight below which a bucket reads cold.
-- `PROMOTE_MIN_SIZE = 60` — retained only as the cold-start entry bootstrap prior.
+- `PROMOTE_MIN_SIZE = 60` — cold-start entry bootstrap prior for `typical(size)`.
+- `PUBLISH_THRESHOLD_BOOTSTRAP` ≈ 5 000 nodes — cold-start prior for the break-even
+  until the coordination/throughput estimators warm.
 
 ## Files
 
