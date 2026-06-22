@@ -254,13 +254,54 @@ sub-branch S, which overruns at *S's* level and publishes S's remainder.
 
 ### Why remainder-over-natural-order is correct and cheap
 
-- The swarm is always `ERD_ALL`, so a branch's candidate list is always the full
-  `all_words` (12,972). Natural file order is shared identically by every worker —
-  no ranking, no re-rank-and-agree requirement. (This **replaces** the existing
-  `active_branches` invariant comment that workers re-rank locally and agree on
-  coverage.)
+- The claim index space is the branch's **policy-canonical candidate list** — the
+  shared, deterministic candidate ordering every worker can reconstruct from
+  `(policy, branch_key)` with no agreement protocol. Under the current swarm policy
+  `ERD_ALL` that list is the full `all_words` (12,972, in `wordle.txt` file order);
+  a worker maps a candidate word → its index in that list. This **replaces** the
+  existing `active_branches` invariant that workers re-rank locally and agree on
+  coverage.
+- **Do not hardcode `all_words` as a correctness assumption.** Build the publisher's
+  `{word: idx}` map and the helpers' `claim_candidate` indexing from *the frame's
+  actual canonical candidate list for the active policy*, not from `self.all_words`
+  unconditionally. For `ERD_ALL` that list *is* `self.all_words`, so the
+  implementation is identical today — but writing it against "the policy-canonical
+  list" (rather than "`all_words`") is what makes the response-compliant precache
+  below work without a rewrite, and what keeps it from silently mis-mapping if the
+  policy ever differs. **Note: this canonical list is the shared claim ordering, not
+  the frame's local Σk²-sorted `candidate_list` — the prefix is evaluated in Σk²
+  order but mapped back to canonical indices.**
 - Already-computed prefix work, and the tight bound it produced, is never
   recomputed.
+
+### Policy generality (forward-compat for a response-compliant precache)
+
+A future ERD precache over **response-compliant candidates only** (`ERD_ANSWERS`:
+the candidate list is the branch's answer words `branch_words`, reconstructable via
+`decode_subset(branch_key)`, not the full guess vocabulary) must work with this
+mechanism and **must not pollute the cache**. Two requirements, stated now so it is
+a small extension later rather than a redesign:
+
+- **Index space follows policy.** Because the claim indexing is defined against the
+  policy-canonical list (above), `ERD_ANSWERS` works for free: the shared list is
+  `branch_words` instead of `all_words`; every worker decodes the same `branch_key`
+  to the same ordering, so publisher/helper indices still agree.
+- **Keep policies from colliding — no pollution.** The persistent score cache is
+  already namespaced by `policy` (`score_cache.write(branch_key, policy, …)`), so
+  exact results never cross. But the new state added by this plan must become
+  policy-aware before a second policy is ever run:
+  - The **`cost_model` bucket key includes `policy`** (`(policy, size_bucket)`) — the
+    cost to solve an N-word branch differs sharply between an `all_words` candidate
+    set and an `answers-only` one; mixing them corrupts `typical(size)`.
+  - The **queue coordination** (`active_branches` / `candidate_claims`, keyed today
+    by `branch_key` alone) must include `policy` in its key before both policies run
+    concurrently, or the same `branch_key` under two policies would alias to one
+    coordination row and one would overwrite the other's claims.
+
+  Implement `ERD_ALL` now; do **not** add the `policy` column to the coordination
+  tables yet (YAGNI) — but record this as the explicit precondition for enabling
+  `ERD_ANSWERS`, and key `cost_model` by `policy` from the start (it is cheap and
+  prevents a silent retrain when the second policy lands).
 
 ### Over-promotion is the safe direction
 
@@ -382,14 +423,27 @@ it stops being entry-promoted.
 
 ### Sampling (the model trains itself)
 
-- **Inline frame returns (primary, dense):** on every inline `_solve_subset(X)`
-  return, record `(len(X), self._nodes - nodes_at_entry)`. Accurate (one worker did
-  all the nodes); covers small/medium sizes abundantly. Batch in memory, flush on
-  the heartbeat path.
+- **Inline frame returns (primary, dense):** record `(policy, len(X), self._nodes -
+  nodes_at_entry)` — but **only on the exact-optimum return** (the `SOLVED` path that
+  runs after the full candidate loop, engine ~1194). **Do NOT sample these returns:**
+  - **cache-reuse** (the frame returned a cached optimum having spent ≈0 nodes) —
+    cache hits are common, and `(len, ≈0)` samples would drag `typical(len)` toward
+    zero, the most damaging possible bias;
+  - **base cases** (`n == 1`, trivial budget returns) — ≈0 nodes;
+  - **cutoff** (`OVER_ERD_LIMIT`) — alpha-beta stopped early, so the node count
+    undercounts a true full solve and biases the model low;
+  - **abort** (`DEADLINE_EXCEEDED` / `CANCEL_RECVD`) — incomplete;
+  - **published frames** (entry or mid-loop) — the work is spread across workers'
+    `self._nodes`, so the local delta misattributes; the cooperative-finalize sample
+    below is the correct source for those sizes.
+
+  In short: only frames that actually solved the branch inline to its exact optimum
+  feed the model. Batch in memory, flush on the heartbeat path.
 - **Cooperative finalize (large sizes):** add `nodes_spent` to `active_branches`,
   accumulate per-claim node deltas into it via the heartbeat path, and record
-  `(n_words, nodes_spent)` in `maybe_finalize`. Covers sizes solved across multiple
-  workers, where a single frame's local delta undercounts.
+  `(policy, n_words, nodes_spent)` in `maybe_finalize`. Covers sizes solved across
+  multiple workers, where a single frame's local delta undercounts. This is the
+  correct sample source for *published* branches (entry or mid-loop).
 
 ### Raw sample logging for offline tuning (data collection)
 
@@ -399,7 +453,7 @@ per-sample rows** — not just the collapsed statistic — so the distribution c
 reconstructed after a multi-day run and the estimator/thresholds chosen
 empirically:
 
-- A Linux-only `cost_samples` table: `(n_words, nodes, wall_nanos, source,
+- A Linux-only `cost_samples` table: `(policy, n_words, nodes, wall_nanos, source,
   recorded_at)`, where `source` distinguishes inline-return / cooperative-finalize
   / cold-probe. Written throttled via the heartbeat batch path (sampled every Nth
   if volume demands).
@@ -481,8 +535,10 @@ Purge **all** "chunk" vocabulary; the work unit is a candidate claim.
   `claim_total` (or drop — always 1 now) via `RENAME COLUMN` migrations; thread the
   new names through `heartbeat()` and `heartbeats_with_branch()`.
 - **New tables (Linux-only, idempotent):**
-  - `cost_model` — the live robust estimator state per `size_bucket` (log-space
-    time-weighted accumulators + `last_updated`).
+  - `cost_model` — the live robust estimator state, keyed `(policy, size_bucket)`
+    (log-space time-weighted accumulators + `last_updated`). Keying by `policy` from
+    the start keeps a future `ERD_ANSWERS` precache from retraining/corrupting the
+    `ERD_ALL` model.
   - `cost_samples` — raw per-sample rows for offline tuning (above).
   - `claim_telemetry` — outbound-only coordination/work rows (above).
 - **Lazy registration.** Branches are NOT pre-registered. A branch becomes a
@@ -505,18 +561,35 @@ Purge **all** "chunk" vocabulary; the work unit is a candidate claim.
   `progress_callback`, which is deliberately top-level-only — passed as `None` into
   recursion). It is a worker-bound object (the engine has no `self`; `self._nodes`
   lives on the worker):
-  - At `_solve_subset` entry: `token = mid_loop_publisher.enter(n)` → returns a
-    frame token carrying `(nodes_at_entry, predicted = typical(n))`, or `None` (cold
-    model / below floor → no overrun check this frame).
-  - In the candidate loop, after the best update: if `token` is set, call
-    `mid_loop_publisher.check(token, evaluated_words, remaining_count, best_guess,
-    best_erd, budget)` where `evaluated_words = candidate_list[:i+1]` and
-    `remaining_count = len(candidate_list) - (i + 1)`. `check` reads `self._nodes`,
-    tests `delta > OVERRUN_K * predicted` and `remaining_count >=
-    MIN_HANDOFF_CANDIDATES`; if tripped it registers X as a cooperative branch
-    (prefix marked done; bound seeded **only if `best_guess is not None`**), drives
-    it, and returns the finished result (Phase-0 status + payload) — the engine
-    returns it immediately. Else returns `None`.
+  - **`enter` goes just before the candidate loop**, *after* the cache-reuse,
+    deadline/cancel, and `subbranch_solver` early returns — not at the literal top of
+    `_solve_subset`. A frame that hits the score cache or is entry-delegated never
+    runs the loop, so creating a token for it is wasted work. `token =
+    mid_loop_publisher.enter(n)` → `(nodes_at_entry, predicted = typical(n))`, or
+    `None` (cold model / below floor → no overrun check this frame).
+  - **The check runs every iteration — before the status `continue`s, not after the
+    best update.** Place it immediately after the `abort` check / `node_floor`
+    update and *before* `if status == 'cutoff': … continue` and `if status != 'ok':
+    continue`. **This matters:** in best-first order the bound tightens after the
+    first `ok`, so the tail of the candidate list is mostly `cutoff` candidates — and
+    a `cutoff` candidate still recurses and spends real nodes. If the check sat after
+    the best update (only reached on the `ok` path), a tarpit living in the cutoff
+    tail would burn unbounded nodes and **never trip overrun**. Running it every
+    iteration is what makes the mechanism actually catch tarpits.
+  - When `token` is set, call `mid_loop_publisher.check(token, evaluated_words,
+    remaining_count, best_guess, best_erd, budget)` where `evaluated_words =
+    candidate_list[:i+1]` and `remaining_count = len(candidate_list) - (i + 1)`.
+    `check` reads `self._nodes`, tests `delta > OVERRUN_K * predicted` and
+    `remaining_count >= MIN_HANDOFF_CANDIDATES`; if tripped it **emits the
+    cooperative-promotion sentinel** `note_depth(depth, -n, None, None)` (same as the
+    entry hook — so the heartbeat spine marks this frame handed-off, erd_swarm.py
+    `_note_depth` `n < 0` path), registers X as a cooperative branch (prefix marked
+    done; bound seeded **only if `best_guess is not None`**), drives it, and returns
+    the finished result (Phase-0 status + payload). The engine **returns it
+    immediately, short-circuiting the rest of the frame including the bottom-of-
+    function `score_cache.write`** — the cooperative finalize already wrote the cache
+    entry, exactly like the entry-hook short-circuit; the frame must not re-cache.
+    Else `check` returns `None` and the loop continues to the status `continue`s.
 - Frame-local `token` is a plain local, so each active DFS frame checks its own
   overrun independently ("get help at my level"). Nodes spent driving an inner
   publication inflate outer frames' deltas — benign (the outer frame is also
@@ -531,10 +604,13 @@ Purge **all** "chunk" vocabulary; the work unit is a candidate claim.
 - `_subbranch_solver`: `typical(size) >= PUBLISH_THRESHOLD` entry gate + cold
   `PROMOTE_MIN_SIZE` fallback.
 - New `mid_loop_publisher` (object passed to the engine) implementing
-  `enter`/`check`; on trip it builds the published branch over `all_words`, maps
-  evaluated words → `all_words` indices via the prebuilt `{word: idx}` map, marks
-  those done, seeds the crowdsourced best (only if achieved), then runs the
-  claim/help/finalize loop on the remainder.
+  `enter`/`check`; on trip it emits the promotion sentinel (`note_depth(depth, -n,
+  …)`), builds the published branch over the **policy-canonical candidate list**
+  (`self.all_words` under `ERD_ALL`), maps evaluated words → that list's indices via
+  a prebuilt `{word: idx}` map, marks those done, seeds the crowdsourced best (only
+  if achieved), then runs the claim/help/finalize loop on the remainder. The map is
+  built from the canonical list, **not** hardcoded to `all_words` (see Policy
+  generality) and **not** from the frame's Σk²-sorted `candidate_list`.
 - **Convert EVERY claim site to natural order — not just the obvious ones.** The
   renamed `evaluate_chunk` (→ `evaluate_claim`) and **all four** of its callers must
   claim/evaluate over `self.all_words` in natural order, one candidate per claim,
@@ -559,7 +635,7 @@ Purge **all** "chunk" vocabulary; the work unit is a candidate claim.
   publisher marked at that index. Keep each site's role (`_help_other_branch` stays
   the recruiter; published branches keep `PROMOTED_PRIORITY` so freed workers join
   them first) — only the claim *indexing* changes.
-- `maybe_finalize`: record the cooperative-branch cost sample `(n_words,
+- `maybe_finalize`: record the cooperative-branch cost sample `(policy, n_words,
   nodes_spent)` and the raw `cost_samples` row.
 - Constructor / `swarm_worker` signature: drop `min_words_per_chunk` /
   `max_chunk_count`.
@@ -591,10 +667,13 @@ Purge **all** "chunk" vocabulary; the work unit is a candidate claim.
   publication via `typical(size)` replacing `PROMOTE_MIN_SIZE`. Delivers: no chunk-0
   monopoly, cost-driven promotion, and the data to later decide clustering.
 - **Phase 2 — overrun escape hatch.** The `mid_loop_publisher` engine seam:
-  same-level lazy publication on overrun, prefix-marked-done so the expensive head
-  is never recomputed, bound seeded only when achieved, publish-and-keep-going when
-  no feasible candidate yet. The heart of the inline-tarpit fix; sequenced last
-  because it carries the engine-core change.
+  same-level lazy publication on overrun, the check running **every iteration**
+  (before the status `continue`s, so cutoff-tail tarpits are caught), the promotion
+  sentinel emitted on publish, prefix-marked-done so the expensive head is never
+  recomputed, bound seeded only when achieved, publish-and-keep-going when no
+  feasible candidate yet, and an immediate short-circuit return (no re-cache). The
+  heart of the inline-tarpit fix; sequenced last because it carries the engine-core
+  change.
 
 ```mermaid
 flowchart TD
@@ -606,7 +685,7 @@ flowchart TD
         E2 -- no --> E1
     end
     subgraph swarm["worker publisher (erd_swarm.py)"]
-        P1["map evaluated words -> all_words idx\ncreate_branch (PROMOTED_PRIORITY)\nseed crowdsourced best IF achieved\nmark prefix done"]
+        P1["note_depth promotion sentinel\nmap evaluated words -> canonical idx\ncreate_branch (PROMOTED_PRIORITY)\nseed crowdsourced best IF achieved\nmark prefix done"]
         P2["drive remainder + keep participating:\nclaim_candidate (natural order)\n+ _help_other_branch + maybe_finalize"]
         P1 --> P2
     end
@@ -689,7 +768,14 @@ Constants (meta-parameters / cold bootstraps; named, with starting values):
   cold vs warm read; cold-start probe takes ~`2 × worker_count` samples and seeds
   the bucket; entry gate promotes/inlines correctly for a seeded model; overrun
   `check` fires per frame on a forced node delta **and** respects the
-  `remaining_count >= MIN_HANDOFF_CANDIDATES` floor; publish-with-no-bound path when
+  `remaining_count >= MIN_HANDOFF_CANDIDATES` floor; **overrun fires on a frame whose
+  expensive nodes are spent in `cutoff`-status candidates, not just `ok` ones**
+  (regression for the check-placement bug); **the cost model is NOT sampled from
+  cache-reuse / base-case / cutoff / abort / published returns** (assert a cache-hit
+  frame contributes no sample and does not pull `typical(size)` down); **the
+  promotion sentinel is emitted on mid-loop publish** (heartbeat spine shows the
+  frame handed off); `cost_model` keyed by `(policy, size_bucket)` (an `ERD_ANSWERS`
+  sample does not move the `ERD_ALL` estimate); publish-with-no-bound path when
   `best_guess is None`; single `candidate_claims` claim/reclaim/finalize;
   prefix-marked-done leaves only the remainder claimable; **every claim path
   (`cooperative_solve`, `claim_one`, the `run()` loop, `_help_other_branch`) claims
