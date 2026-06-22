@@ -1222,6 +1222,9 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                           max_depth=best_md, solve_budget=solve_budget)
         cache_all_scores(best_guess, branch_words, score_cache, branch_key, cache=cache)
 
+    if mid_loop_publisher is not None and token is not None:
+        mid_loop_publisher.record_inline(token)
+
     return (SOLVED, best_erd, best_md, node_floor)
 
 

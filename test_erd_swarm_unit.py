@@ -58,6 +58,8 @@ def _bare_worker():
     w._top_source_word = None
     w._top_source_pattern = None
     w._typical_cache = {}
+    w._cost_model_buffer = {}
+    w.n_workers = 1
     w.score_cache = mock.MagicMock()
     w.score_cache.read_hits = 0
     w.score_cache.read_misses = 0
@@ -75,12 +77,12 @@ class TestHeartbeatThrottling(unittest.TestCase):
         branch_key = ScoreCache.encode_subset(BRANCH)
 
         # First call: force=True bypasses the time gate — DB write happens.
-        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, None, force=True)
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
         self.assertEqual(w._nodes, 1)
         self.assertEqual(w.queue.heartbeat.call_count, 1)
 
         # Second call: force=False, but _last_hb was just set so the gate fires.
-        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, None)
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None)
         self.assertEqual(w._nodes, 2)          # counter still incremented
         self.assertEqual(w.queue.heartbeat.call_count, 1)  # still only one DB write
 
@@ -91,7 +93,7 @@ class TestHeartbeatThrottling(unittest.TestCase):
         w._note_depth(1, 50)
         w._note_depth(2, 12)
         branch_key = ScoreCache.encode_subset(BRANCH)
-        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, None, force=True)
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
         self.assertEqual(w._hb_max_spine, {})
 
 
@@ -560,6 +562,141 @@ class TestHelpOtherBranch(unittest.TestCase):
 
         # Should return False (the only available branch was excluded).
         self.assertFalse(result)
+
+
+class TestMidLoopPublisher(unittest.TestCase):
+    """_MidLoopPublisher.enter() / check() / record_inline() unit tests."""
+
+    def _pub(self, predicted=None):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = predicted
+        pub = erd_swarm._MidLoopPublisher(w)
+        return pub, w
+
+    def test_enter_returns_none_below_min_handoff(self):
+        pub, _ = self._pub()
+        # MIN_HANDOFF_CANDIDATES is 4; 3 words is below threshold.
+        self.assertIsNone(pub.enter(BRANCH[:3], depth=0))
+
+    def test_enter_returns_token_at_min_handoff(self):
+        pub, _ = self._pub(predicted=1000)
+        words = BRANCH[:4]  # exactly MIN_HANDOFF_CANDIDATES
+        token = pub.enter(words, depth=0)
+        self.assertIsNotNone(token)
+        nodes_at_entry, predicted, bw, depth = token
+        self.assertEqual(bw, words)
+        self.assertEqual(predicted, 1000)
+
+    def test_enter_cold_model_still_returns_token(self):
+        pub, _ = self._pub(predicted=None)  # cold model
+        token = pub.enter(BRANCH[:6], depth=1)
+        self.assertIsNotNone(token)
+        _, predicted, _, _ = token
+        self.assertIsNone(predicted)  # token carries None when model is cold
+
+    def test_check_returns_none_for_none_token(self):
+        pub, _ = self._pub()
+        self.assertIsNone(pub.check(None, [], 5, None, None, 5))
+
+    def test_check_returns_none_cold_model(self):
+        pub, _ = self._pub(predicted=None)
+        token = pub.enter(BRANCH[:6], depth=0)
+        self.assertIsNone(pub.check(token, BRANCH[:1], 5, None, None, 5))
+
+    def test_check_returns_none_when_under_overrun_threshold(self):
+        pub, w = self._pub(predicted=100)
+        token = pub.enter(BRANCH[:6], depth=0)
+        # _nodes hasn't changed: delta = 0 <= OVERRUN_K * 100
+        self.assertIsNone(pub.check(token, BRANCH[:1], 5, None, None, 5))
+
+    def test_check_fires_on_overrun(self):
+        pub, w = self._pub(predicted=10)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        # Simulate spending > OVERRUN_K * predicted nodes
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        result = pub.check(token, BRANCH[:1], 5, None, None, 5)
+        self.assertIsNotNone(result)
+        w.cooperative_solve.assert_called_once()
+
+    def test_check_returns_none_when_remaining_count_below_threshold(self):
+        pub, w = self._pub(predicted=10)
+        token = pub.enter(BRANCH[:6], depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        # Only 3 remaining candidates — below MIN_HANDOFF_CANDIDATES (4)
+        self.assertIsNone(pub.check(token, BRANCH[:3], 3, None, None, 5))
+
+    def test_check_marks_prefix_done(self):
+        pub, w = self._pub(predicted=10)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        evaluated = [CANDIDATES[0], CANDIDATES[1]]
+        pub.check(token, evaluated, 5, None, None, 5)
+        call_args = w.queue.mark_claims_done.call_args
+        self.assertIsNotNone(call_args)
+        marked_indices = call_args[0][1]  # second positional arg is the indices list
+        # Each evaluated word should appear in the done list at its all_words index
+        for word in evaluated:
+            if word in w.all_words:
+                self.assertIn(w.all_words.index(word), marked_indices)
+
+    def test_record_inline_accumulates_buffer(self):
+        import math
+        pub, w = self._pub(predicted=100)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = 200   # 200 - 0 = 200 nodes for this frame
+        pub.record_inline(token)
+        self.assertIn(len(words), w._cost_model_buffer)
+        s, c = w._cost_model_buffer[len(words)]
+        self.assertEqual(c, 1)
+        self.assertAlmostEqual(s, math.log(200), places=6)
+
+    def test_record_inline_is_noop_for_none_token(self):
+        pub, w = self._pub()
+        pub.record_inline(None)
+        self.assertEqual(w._cost_model_buffer, {})
+
+
+class TestSubbranchSolverCostModel(unittest.TestCase):
+    """_subbranch_solver respects cost model: warm model gates on predicted
+    nodes; cold model falls back to PROMOTE_MIN_SIZE size threshold."""
+
+    def test_warm_model_below_threshold_inlines(self):
+        w = _bare_worker()
+        # Warm model predicts < PUBLISH_THRESHOLD_BOOTSTRAP nodes.
+        w.queue.get_cost_typical.return_value = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP - 1
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        self.assertIsNone(w._subbranch_solver(words, budget=5))
+
+    def test_warm_model_above_threshold_promotes(self):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        expected = (erd_swarm.SOLVED, 2.0, 3, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertEqual(result, expected)
+        w.cooperative_solve.assert_called_once()
+
+    def test_cold_model_uses_size_threshold(self):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = None  # cold model
+        # Below PROMOTE_MIN_SIZE → inline (cold fallback)
+        words_small = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE - 1)
+        self.assertIsNone(w._subbranch_solver(words_small, budget=5))
+
+    def test_cold_model_above_size_threshold_promotes(self):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = None  # cold model
+        expected = (erd_swarm.SOLVED, 2.5, 4, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertEqual(result, expected)
 
 
 if __name__ == "__main__":

@@ -106,16 +106,14 @@ class _MidLoopPublisher:
         """Called just before the candidate loop of each _solve_subset frame.
 
         Returns an opaque token (nodes_at_entry, predicted, branch_words, depth)
-        if the cost model has a warm prediction for this size and the branch is
-        large enough to be worth handing off; None otherwise (no overrun check
-        for this frame).
+        for any frame with n >= MIN_HANDOFF_CANDIDATES.  predicted may be None
+        (cold model) — in that case check() never fires, but record_inline()
+        still fires on frame completion so the model warms for future claims.
         """
         n = len(branch_words)
         if n < MIN_HANDOFF_CANDIDATES:
             return None
         predicted = self._worker._typical(n)
-        if predicted is None:
-            return None
         return (self._worker._nodes, predicted, branch_words, depth)
 
     def check(self, token, evaluated_words, remaining_count,
@@ -131,6 +129,8 @@ class _MidLoopPublisher:
         if token is None:
             return None
         nodes_at_entry, predicted, branch_words, depth = token
+        if predicted is None:
+            return None  # cold model: no overrun check this frame
         delta = self._worker._nodes - nodes_at_entry
         if delta <= OVERRUN_K * predicted:
             return None
@@ -165,6 +165,28 @@ class _MidLoopPublisher:
 
         return self._worker.cooperative_solve(branch_words, budget)
 
+    def record_inline(self, token):
+        """Called on the SOLVED return of each completed _solve_subset frame.
+
+        Accumulates node-cost samples in the worker's in-memory buffer keyed by
+        sub-branch size.  The buffer is flushed to the DB at each checkpoint so
+        this never touches SQLite mid-candidate-loop.
+        """
+        if token is None:
+            return
+        import math
+        nodes_at_entry, _predicted, branch_words, _depth = token
+        n = len(branch_words)
+        nodes = self._worker._nodes - nodes_at_entry
+        if nodes <= 0:
+            return
+        buf = self._worker._cost_model_buffer
+        if n in buf:
+            s, c = buf[n]
+            buf[n] = (s + math.log(nodes), c + 1)
+        else:
+            buf[n] = (math.log(nodes), 1)
+
 
 class _BranchWorker:
     """One worker process's state and operations on branches/chunks."""
@@ -174,6 +196,7 @@ class _BranchWorker:
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
         self.budget = budget
+        self.n_workers = n_workers
 
         self.all_answers = load_word_list(ANSWER_FILE)
         self.all_words = load_word_list(WORDS_FILE)
@@ -217,6 +240,9 @@ class _BranchWorker:
         # In-memory cache of cost-model predictions keyed by sub-branch size.
         # Invalidated on cooperative finalize so new samples take effect.
         self._typical_cache = {}
+        # In-memory buffer for inline node-cost samples: {n: (sum_log, count)}.
+        # Flushed to the DB at each checkpoint to avoid per-frame SQLite writes.
+        self._cost_model_buffer: dict[int, tuple[float, int]] = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -302,6 +328,16 @@ class _BranchWorker:
         self.queue.add_cost_sample(ERD_ALL, n_words, nodes, 'finalize')
         self._typical_cache.pop(n_words, None)   # invalidate stale cache entry
 
+    def _flush_cost_model_buffer(self):
+        """Flush the in-memory inline-sample buffer to the DB and clear it."""
+        import math
+        for n, (sum_log, count) in self._cost_model_buffer.items():
+            avg_log = sum_log / count
+            nodes = int(math.exp(avg_log))
+            self.queue.update_cost_model(ERD_ALL, n, nodes, weight=float(count))
+            self._typical_cache.pop(n, None)
+        self._cost_model_buffer.clear()
+
     # -- RAM check and WAL checkpoint ---------------------------------------
 
     def _free_ram_mb(self):  # pragma: no cover
@@ -316,6 +352,7 @@ class _BranchWorker:
     def _maybe_checkpoint(self, force=False):
         now = time.time()
         if force or now - self._last_checkpoint > CHECKPOINT_SECONDS:
+            self._flush_cost_model_buffer()
             self.score_cache.checkpoint()
             self._last_checkpoint = now
 
@@ -337,7 +374,7 @@ class _BranchWorker:
     # -- heartbeat ----------------------------------------------------------
 
     def _heartbeat(self, branch_key, n_words, claim_idx, claim_started_at,
-                   cand_rate, best_guess, best_erd, force=False,
+                   best_guess, best_erd, force=False,
                    bound_erd=None, cur_candidate=None):
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
@@ -352,7 +389,7 @@ class _BranchWorker:
         self.queue.heartbeat(
             self.name, os.getpid(), branch_key, n_words, self.started,
             self.claims_done, claim_idx=claim_idx,
-            claim_started_at=claim_started_at, cand_rate=cand_rate,
+            claim_started_at=claim_started_at,
             cache_hits=self.score_cache.read_hits,
             cache_misses=self.score_cache.read_misses,
             n_cutoff=self.n_cutoff, n_pruned=self.n_pruned, n_ok=self.n_ok,
@@ -417,7 +454,7 @@ class _BranchWorker:
             v = _bound_provider()
             return None if v == float('inf') else v
 
-        self._heartbeat(branch_key, n_words, idx, claim_started, None,
+        self._heartbeat(branch_key, n_words, idx, claim_started,
                         local_candidate, local_best, force=True,
                         bound_erd=_eff_bound(), cur_candidate=candidate)
 
@@ -436,7 +473,7 @@ class _BranchWorker:
             bound_provider=_bound_provider,
             mid_loop_publisher=_MidLoopPublisher(self),
             heartbeat=lambda: self._heartbeat(
-                branch_key, n_words, idx, claim_started, None,
+                branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound(),
                 cur_candidate=candidate))
         cand_elapsed = time.time() - cand_t0
@@ -472,10 +509,12 @@ class _BranchWorker:
             self.n_useless += 1
 
         elapsed = time.time() - t0
+        coordination_nanos = int(max(0.0, elapsed - cand_elapsed) * 1e9)
         self.queue.complete_candidate(branch_key, idx)
+        self.queue.add_claim_telemetry(
+            n_words, coordination_nanos, nodes_delta, self.n_workers)
         self.claims_done += 1
         self._heartbeat(branch_key, n_words, idx, claim_started,
-                        1.0 / max(1e-6, elapsed),
                         local_candidate, local_best, bound_erd=_eff_bound(),
                         force=True)
         return True
@@ -618,7 +657,7 @@ class _BranchWorker:
                     # itself presumed dead while it waits), then free any claim whose
                     # holder has died so we can re-claim it rather than wait forever
                     # — there may be no supervisor in the standalone solve path.
-                    self._heartbeat(branch_key, n_words, None, None, None,
+                    self._heartbeat(branch_key, n_words, None, None,
                                     None, None, force=True)
                     self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                     if not self._help_other_branch(branch_key):
@@ -689,8 +728,8 @@ class _BranchWorker:
                 # Nothing claimable: queue empty or all chunks in flight.
                 if idle_since is None:
                     idle_since = time.time()
-                self._heartbeat(None, None, None, None, None, None, None,
-                                force=True)
+                self._heartbeat(None, None, None, None,
+                                None, None, force=True)
                 time.sleep(0.5)
                 continue
             idle_since = None
@@ -741,7 +780,7 @@ class _BranchWorker:
                 if self.queue.branch_done_candidates(branch_key) >= n_candidates:
                     self.maybe_finalize(branch_key, words, n_candidates)
                     break
-                self._heartbeat(branch_key, branch['n_words'], None, None, None,
+                self._heartbeat(branch_key, branch['n_words'], None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                 time.sleep(0.1)

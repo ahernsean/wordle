@@ -333,5 +333,78 @@ class TestClaimNext(_TmpQueue):
         self.assertIsNone(self.q.claim_next("worker-1"))  # nothing left
 
 
+class TestCostModel(_TmpQueue):
+    """Cost model: cold read, warm read, geometric mean, policy isolation,
+    mark_claims_done, add_nodes_spent, add_claim_telemetry."""
+
+    def test_cold_read_returns_none(self):
+        self.assertIsNone(self.q.get_cost_typical("erd_all", 10))
+
+    def test_single_sample_round_trips(self):
+        import math
+        self.q.update_cost_model("erd_all", 10, 1000)
+        result = self.q.get_cost_typical("erd_all", 10)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 1000.0, delta=1.0)
+
+    def test_geometric_mean_not_arithmetic(self):
+        import math
+        # Two samples: 100 and 10000.  Geometric mean = 1000; arithmetic = 5050.
+        self.q.update_cost_model("erd_all", 5, 100)
+        self.q.update_cost_model("erd_all", 5, 10000)
+        result = self.q.get_cost_typical("erd_all", 5)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 1000.0, delta=50.0)
+
+    def test_weighted_batch_update(self):
+        # weight=3 is equivalent to adding the sample 3 times.
+        import math
+        self.q.update_cost_model("erd_all", 8, 500, weight=3.0)
+        result = self.q.get_cost_typical("erd_all", 8)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 500.0, delta=5.0)
+
+    def test_policy_isolation(self):
+        self.q.update_cost_model("erd_all", 12, 200)
+        self.q.update_cost_model("max_group_size", 12, 9999)
+        erd = self.q.get_cost_typical("erd_all", 12)
+        mgs = self.q.get_cost_typical("max_group_size", 12)
+        self.assertAlmostEqual(erd, 200.0, delta=5.0)
+        self.assertAlmostEqual(mgs, 9999.0, delta=5.0)
+
+    def test_size_bucket_isolation(self):
+        self.q.update_cost_model("erd_all", 10, 100)
+        self.q.update_cost_model("erd_all", 20, 999)
+        r10 = self.q.get_cost_typical("erd_all", 10)
+        r20 = self.q.get_cost_typical("erd_all", 20)
+        self.assertAlmostEqual(r10, 100.0, delta=5.0)
+        self.assertAlmostEqual(r20, 999.0, delta=5.0)
+
+    def test_mark_claims_done_inserts_done_rows(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.q.mark_claims_done(self.key, [0, 2, 4])
+        rows = self.q.claims_for_branch(self.key)
+        done = {r['idx'] for r in rows if r['done'] == 1}
+        self.assertEqual(done, {0, 2, 4})
+
+    def test_add_nodes_spent_accumulates(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.q.add_nodes_spent(self.key, 100)
+        self.q.add_nodes_spent(self.key, 50)
+        row = self.q.get_branch(self.key)
+        self.assertEqual(row['nodes_spent'], 150)
+
+    def test_add_claim_telemetry_inserts_row(self):
+        self.q.add_claim_telemetry(10, 5000, 300, 4)
+        row = self.q._conn.execute(
+            "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['n_words'], 10)
+        self.assertEqual(row['coordination_nanos'], 5000)
+        self.assertEqual(row['work_nodes'], 300)
+        self.assertEqual(row['worker_count'], 4)
+
+
 if __name__ == "__main__":
     unittest.main()

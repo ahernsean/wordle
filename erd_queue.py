@@ -787,14 +787,18 @@ class ERDQueue:
             return None
         return math.exp(row['weighted_log_sum'] / row['weight_sum'])
 
-    def update_cost_model(self, policy: str, size_bucket: int, nodes: int):
+    def update_cost_model(self, policy: str, size_bucket: int, nodes: int,
+                          weight: float = 1.0):
         """Add a new sample to the time-weighted geometric mean for size_bucket.
 
-        Each sample contributes log(nodes) with weight 1.0; the existing
+        Each call contributes log(nodes) with the given weight; the existing
         accumulated weight decays by exp(-elapsed / TAU) before the new sample
         is folded in, implementing a continuous-time EMA with half-life TAU.
+        weight > 1 lets a caller fold in a batch of samples in one call (e.g.
+        a worker flushing an in-memory buffer of N buffered inline-return samples
+        passes weight=N so the batch contributes correctly to the running average).
         """
-        if nodes <= 0:
+        if nodes <= 0 or weight <= 0:
             return
         now = int(time.time())
         log_n = math.log(nodes)
@@ -806,16 +810,16 @@ class ERDQueue:
             self._conn.execute("""
                 INSERT INTO cost_model
                     (policy, size_bucket, weighted_log_sum, weight_sum, last_updated)
-                VALUES (?, ?, ?, 1.0, ?)
-            """, (policy, size_bucket, log_n, now))
+                VALUES (?, ?, ?, ?, ?)
+            """, (policy, size_bucket, log_n * weight, weight, now))
         else:
             decay = math.exp(-(now - row['last_updated']) / _COST_MODEL_TAU)
             self._conn.execute("""
                 UPDATE cost_model
                 SET weighted_log_sum = ?, weight_sum = ?, last_updated = ?
                 WHERE policy = ? AND size_bucket = ?
-            """, (decay * row['weighted_log_sum'] + log_n,
-                  decay * row['weight_sum'] + 1.0,
+            """, (decay * row['weighted_log_sum'] + log_n * weight,
+                  decay * row['weight_sum'] + weight,
                   now, policy, size_bucket))
 
     def add_cost_sample(self, policy: str, n_words: int, nodes: int, source: str):
@@ -825,3 +829,13 @@ class ERDQueue:
             INSERT INTO cost_samples (policy, n_words, nodes, source, recorded_at)
             VALUES (?, ?, ?, ?, ?)
         """, (policy, n_words, nodes, source, now))
+
+    def add_claim_telemetry(self, n_words: int, coordination_nanos: int,
+                            work_nodes: int, worker_count: int):
+        """Append a claim coordination record to claim_telemetry for offline analysis."""
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO claim_telemetry
+                (n_words, coordination_nanos, work_nodes, worker_count, recorded_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (n_words, coordination_nanos, work_nodes, worker_count, now))
