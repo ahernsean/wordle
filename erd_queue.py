@@ -7,10 +7,16 @@ the high-volume ERD result writes in the main cache.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 
 from cache_sqlite import ScoreCache
+
+# Time-weighted geometric mean EMA: half-life for the cost model.
+_COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
+# Effective-weight below which a cost-model bucket reads cold (no prediction).
+_COST_MODEL_MIN_WEIGHT = 1.0
 
 # Re-export so callers don't need to import cache_sqlite directly.
 encode_subset = ScoreCache.encode_subset
@@ -734,3 +740,88 @@ class ERDQueue:
             "WHERE branch_key = ? AND status = 'pending'",
             (branch_key,))
         return self._conn.execute("SELECT changes()").fetchone()[0] > 0
+
+    # ------------------------------------------------------------------
+    # Mid-loop publisher support
+    # ------------------------------------------------------------------
+
+    def mark_claims_done(self, branch_key: bytes, indices):
+        """Insert already-evaluated candidates as authoritative done=1 claims.
+
+        Called by the mid-loop publisher to record the candidates evaluated
+        inline before overrun fired.  Uses INSERT OR REPLACE so a racing
+        in-flight (done=0) claim from another worker is superseded by the
+        authoritative done=1 record — the evaluation already happened.
+        """
+        now = int(time.time())
+        self._conn.executemany("""
+            INSERT OR REPLACE INTO candidate_claims
+                (branch_key, idx, claimed_by, claimed_at, done, done_at)
+            VALUES (?, ?, 'publisher', ?, 1, ?)
+        """, [(branch_key, idx, now, now) for idx in indices])
+
+    def add_nodes_spent(self, branch_key: bytes, delta: int):
+        """Increment nodes_spent on an active branch for cost-model sampling."""
+        if delta <= 0:
+            return
+        self._conn.execute(
+            "UPDATE active_branches SET nodes_spent = nodes_spent + ? "
+            "WHERE branch_key = ?", (delta, branch_key))
+
+    # ------------------------------------------------------------------
+    # Cost model (online time-weighted geometric mean per size bucket)
+    # ------------------------------------------------------------------
+
+    def get_cost_typical(self, policy: str, size_bucket: int):
+        """Return the geometric-mean node count for size_bucket, or None if cold.
+
+        The estimate is exp(weighted_log_sum / weight_sum).  When weight_sum
+        is below _COST_MODEL_MIN_WEIGHT the bucket is considered cold and None
+        is returned — the caller should fall back to a size-based heuristic.
+        """
+        row = self._conn.execute(
+            "SELECT weighted_log_sum, weight_sum FROM cost_model "
+            "WHERE policy = ? AND size_bucket = ?",
+            (policy, size_bucket)).fetchone()
+        if row is None or row['weight_sum'] < _COST_MODEL_MIN_WEIGHT:
+            return None
+        return math.exp(row['weighted_log_sum'] / row['weight_sum'])
+
+    def update_cost_model(self, policy: str, size_bucket: int, nodes: int):
+        """Add a new sample to the time-weighted geometric mean for size_bucket.
+
+        Each sample contributes log(nodes) with weight 1.0; the existing
+        accumulated weight decays by exp(-elapsed / TAU) before the new sample
+        is folded in, implementing a continuous-time EMA with half-life TAU.
+        """
+        if nodes <= 0:
+            return
+        now = int(time.time())
+        log_n = math.log(nodes)
+        row = self._conn.execute(
+            "SELECT weighted_log_sum, weight_sum, last_updated FROM cost_model "
+            "WHERE policy = ? AND size_bucket = ?",
+            (policy, size_bucket)).fetchone()
+        if row is None:
+            self._conn.execute("""
+                INSERT INTO cost_model
+                    (policy, size_bucket, weighted_log_sum, weight_sum, last_updated)
+                VALUES (?, ?, ?, 1.0, ?)
+            """, (policy, size_bucket, log_n, now))
+        else:
+            decay = math.exp(-(now - row['last_updated']) / _COST_MODEL_TAU)
+            self._conn.execute("""
+                UPDATE cost_model
+                SET weighted_log_sum = ?, weight_sum = ?, last_updated = ?
+                WHERE policy = ? AND size_bucket = ?
+            """, (decay * row['weighted_log_sum'] + log_n,
+                  decay * row['weight_sum'] + 1.0,
+                  now, policy, size_bucket))
+
+    def add_cost_sample(self, policy: str, n_words: int, nodes: int, source: str):
+        """Append a raw sample to cost_samples for offline analysis."""
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO cost_samples (policy, n_words, nodes, source, recorded_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (policy, n_words, nodes, source, now))
