@@ -23,7 +23,7 @@ from unittest import mock
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET, PROMOTE_MIN_SIZE
 from cache_sqlite import ScoreCache
-from wordle_engine import ERD_ALL
+from wordle_engine import ERD_ALL, SOLVED, OVER_ERD_LIMIT
 from erd_queue import ERDQueue
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
@@ -244,10 +244,10 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
             w.close()
 
         self.assertIsNotNone(result)
-        cost, max_depth, floor_hit, cutoff = result
+        status, cost, max_depth, budget_tainted = result
+        self.assertEqual(status, SOLVED)
         self.assertAlmostEqual(cost, 1.5)
         self.assertEqual(max_depth, 2)
-        self.assertFalse(cutoff)   # cooperative results are never cutoffs
 
         # No chunks should have been created — the cache hit short-circuited.
         q = ERDQueue(self.queue_path)
@@ -458,8 +458,8 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
             w.close()
 
         self.assertIsNotNone(result)
-        cost, max_depth, floor_hit, cutoff = result
-        self.assertFalse(cutoff)   # cooperative results are never cutoffs
+        status, cost, max_depth, budget_tainted = result
+        self.assertEqual(status, SOLVED)
         self.assertGreater(cost, 0)
 
         # The branch must be finalized — rows deleted from the queue.

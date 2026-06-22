@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
+    SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT, NO_INFORMATION,
+    DEADLINE_EXCEEDED, CANCEL_RECVD,
     calculate_response, score_groups, _encode_response, _ALL_GREEN_PATTERN,
     _perform_restriction, rank_candidates_by_max_group_size_then_entropy_gain,
     evaluate_candidate, _solve_subset, min_expected_guesses, verify_erd_cache,
@@ -355,7 +357,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
             remaining, "crane", None, None,
             n=None, best_erd=float('inf'),
             guesses=remaining, policy=ERD_ANSWERS, budget=None)
-        self.assertIn(status, ('ok', 'useless', 'cutoff', 'pruned'))
+        self.assertIn(status, (SOLVED, NO_INFORMATION, OVER_ERD_LIMIT, OVER_DEPTH_BUDGET))
 
     def test_evaluate_guess_matches_cached_decomposition(self):
         """cache=None path produces the same partition as the cache path."""
@@ -382,29 +384,29 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         self.assertEqual(seen[0], (0, len(remaining)))
 
     def test_solve_subset_budget_below_one(self):
-        """budget < 1 returns infinite cost immediately (1060)."""
+        """budget < 1 returns OVER_DEPTH_BUDGET immediately."""
         remaining = ["crane", "slate", "trace"]
         cache, _ = make_cache(None)
-        cost, md, floor, cutoff = _solve_subset(
+        status, cost, md, budget_tainted = _solve_subset(
             remaining, cache, None, 0, None, remaining,
             ERD_ANSWERS, None, None, 0, None, None)
+        self.assertEqual(status, OVER_DEPTH_BUDGET)
         self.assertEqual(cost, float('inf'))
-        self.assertTrue(floor)
-        self.assertFalse(cutoff)
+        self.assertTrue(budget_tainted)
 
     def test_solve_subset_subgroup_cutoff(self):
         """A tight ceiling forces a subgroup-level cutoff so evaluate_candidate
-        returns ('cutoff', ...) from the sub_cutoff branch (1015), and
-        _solve_subset reports cutoff with best_guess None (1148)."""
+        returns OVER_ERD_LIMIT, and _solve_subset reports OVER_ERD_LIMIT with
+        best_guess None — a lower bound only, do not cache."""
         remaining = ["crane", "slate", "trace", "stale", "tales",
                      "least", "heart", "earth"]
         cache, _ = make_cache(None)
         # A ceiling well below any achievable ERD: every candidate prices out
-        # at >= ceiling, so the search reports a cutoff lower bound.
-        cost, md, floor, cutoff = _solve_subset(
+        # at >= ceiling, so the search reports a lower bound (OVER_ERD_LIMIT).
+        status, cost, md, budget_tainted = _solve_subset(
             remaining, cache, None, None, None, remaining,
             ERD_ANSWERS, None, None, 0, None, None, ceiling=0.5)
-        self.assertTrue(cutoff)
+        self.assertEqual(status, OVER_ERD_LIMIT)
         self.assertEqual(cost, 0.5)
 
     def test_solve_subset_tie_not_below_best(self):

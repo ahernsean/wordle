@@ -30,6 +30,12 @@ from cache_sqlite import ScoreCache, mem_cache_limit
 from wordle_engine import (
     ERD_ALL,
     ResponseCache,
+    CANCEL_RECVD,
+    SOLVED,
+    OVER_DEPTH_BUDGET,
+    OVER_ERD_LIMIT,
+    NO_INFORMATION,
+    _ABORT_STATUSES,
     cache_all_scores,
     evaluate_candidate,
     load_word_list,
@@ -340,7 +346,7 @@ class _BranchWorker:
 
             self._cand_max_depth = 0
             cand_t0 = time.time()
-            status, cost, cand_md, floor_hit = evaluate_candidate(
+            status, cost, cand_md, budget_tainted = evaluate_candidate(
                 words, ranked[ci], self.rcache, self.score_cache,
                 n=n_words, best_erd=float('inf'), guesses=self.all_words,
                 policy=ERD_ALL, cancel_check=self.cancel,
@@ -358,23 +364,23 @@ class _BranchWorker:
                                'status=%s  max_depth=%d', self.name, ranked[ci],
                                idx, cand_elapsed, status, self._cand_max_depth)
 
-            if status == 'abort':  # pragma: no cover
+            if status in _ABORT_STATUSES:  # pragma: no cover
                 return False
             # A candidate excluded by the depth cap (anywhere in its subtree)
             # taints the branch: its ERD is only valid at this budget.  Marked
             # for any candidate, winner or not — see the taint rule.
-            if floor_hit:
+            if budget_tainted:
                 self.queue.mark_branch_tainted(branch_key)
-            if status == 'ok':
+            if status == SOLVED:
                 self.n_ok += 1
                 if local_best is None or cost < local_best:
                     local_best, local_candidate, local_md = cost, ranked[ci], cand_md
                     self.queue.update_branch_best(branch_key, local_candidate,
                                                   local_best, local_md)
                     shared_best = local_best
-            elif status == 'cutoff':
+            elif status == OVER_ERD_LIMIT:
                 self.n_cutoff += 1
-            elif status == 'pruned':
+            elif status == OVER_DEPTH_BUDGET:
                 self.n_pruned += 1
             else:  # pragma: no cover
                 self.n_useless += 1
@@ -493,7 +499,7 @@ class _BranchWorker:
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
             if reuse is not None:
-                return (*reuse, False)
+                return (SOLVED, *reuse)
 
             n_words = len(words)
             chunk_size = ERDQueue.chunk_size_for(
@@ -512,7 +518,7 @@ class _BranchWorker:
                 reuse = _cache_reuse(
                     self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
                 if reuse is not None:
-                    return (*reuse, False)
+                    return (SOLVED, *reuse)
                 if self.queue.get_branch(branch_key) is None:
                     break                       # finalized as a loss + deleted
                 idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
@@ -537,9 +543,9 @@ class _BranchWorker:
                         time.sleep(0.05)        # nothing to claim anywhere; let chunks land
 
             if self.cancel():  # pragma: no cover
-                return None
-            # Finalized as a loss: proven unsolvable (not a cutoff).
-            return (float('inf'), None, True, False)  # pragma: no cover
+                return CANCEL_RECVD
+            # Finalized as a loss: proven unsolvable within budget (not a cutoff).
+            return (OVER_DEPTH_BUDGET, float('inf'), None, True)  # pragma: no cover
         finally:
             self._coop_depth -= 1
 

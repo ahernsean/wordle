@@ -102,6 +102,23 @@ VALID_ERD_POLICIES = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Result status codes for _solve_subset and evaluate_candidate
+#
+# Module-level int constants (not IntEnum) avoid dict-lookup overhead on the
+# hot path, where these are compared millions of times per solve.
+# ---------------------------------------------------------------------------
+
+DEADLINE_EXCEEDED = 0   # wall-clock deadline passed
+CANCEL_RECVD      = 1   # external stop signal received
+SOLVED            = 2   # exact optimum found
+OVER_DEPTH_BUDGET = 3   # depth budget too small — proven no winning strategy
+OVER_ERD_LIMIT    = 4   # every candidate >= ERD bound — lower bound only, do not cache
+NO_INFORMATION    = 5   # candidate split yields k >= n (zero information gain)
+
+_ABORT_STATUSES = frozenset({DEADLINE_EXCEEDED, CANCEL_RECVD})
+
+
+# ---------------------------------------------------------------------------
 # Word list loading
 # ---------------------------------------------------------------------------
 
@@ -987,8 +1004,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
     if cost_lb >= best_erd:
         # Provably can't beat the bound (but may well be feasible) — a cutoff,
-        # not infeasibility.  See the 'cutoff' contract in _solve_subset.
-        return ('cutoff', None, None, False)
+        # not infeasibility.  See OVER_ERD_LIMIT in _solve_subset.
+        return (OVER_ERD_LIMIT, None, None, False)
 
     cost = 1.0
     cand_md = 1 if budget is not None else None
@@ -1022,7 +1039,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         if k == 1 and sub_branch[0] == candidate:
             continue  # self: solved by playing this candidate, 0 further guesses
         if k >= n:
-            return ('useless', None, None, floor)  # zero information
+            return (NO_INFORMATION, None, None, floor)  # zero information
         # Max ERD this sub-branch may have for the candidate to still beat the
         # bound, assuming the remaining siblings achieve only their lower bound.
         if best_erd == float('inf'):
@@ -1034,24 +1051,24 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             policy, cancel_check, heartbeat, depth + 1, note_depth, None,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code)
-        if sub is None:
-            return ('abort', None, None, floor)
-        sub_cost, sub_md, sub_floor, sub_cutoff = sub
-        if sub_cutoff:
+        if sub in _ABORT_STATUSES:
+            return (sub, None, None, False)
+        sub_status, sub_cost, sub_md, sub_budget_tainted = sub
+        if sub_status == OVER_ERD_LIMIT:
             # Sub-branch search stopped at >= its ceiling: this candidate's cost
             # is therefore >= best_erd.  Discard it (sub_cost is only a lower
             # bound) WITHOUT marking taint — we never proved infeasibility.
-            return ('cutoff', None, cand_md, floor)
-        floor = floor or sub_floor
-        if sub_cost == float('inf'):
+            return (OVER_ERD_LIMIT, None, cand_md, floor)
+        floor = floor or sub_budget_tainted
+        if sub_status == OVER_DEPTH_BUDGET:
             # Sub-branch unsolvable within budget — this candidate is infeasible.
-            return ('pruned', None, None, True)
+            return (OVER_DEPTH_BUDGET, None, None, True)
         cost += (k / n) * sub_cost
         if budget is not None:
             cand_md = max(cand_md, 1 + sub_md)
         if cost >= best_erd:
-            return ('cutoff', None, cand_md, floor)
-    return ('ok', cost, cand_md, floor)
+            return (OVER_ERD_LIMIT, None, cand_md, floor)
+    return (SOLVED, cost, cand_md, floor)
 
 
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
@@ -1086,12 +1103,12 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     if note_depth is not None:
         note_depth(depth, n, entry_guess, entry_pattern)
     if budget is not None and budget < 1:
-        return (float('inf'), None, True, False)   # no guess available at all
+        return (OVER_DEPTH_BUDGET, float('inf'), None, True)   # no guess available at all
     if n == 1:
-        return (1.0, 1, False, False)
+        return (SOLVED, 1.0, 1, False)
     if budget is not None and budget < 2:
         # >=2 words need >=2 guesses (guess one; if wrong, play the other).
-        return (float('inf'), None, True, False)
+        return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
     if policy is None:
         policy = ERD_ALL if guesses is not None else ERD_ANSWERS
@@ -1107,12 +1124,12 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         reuse = _cache_reuse(
             score_cache.read_with_depth(branch_key, policy), budget)
         if reuse is not None:
-            return (*reuse, False)   # cached values are exact optima
+            return (SOLVED, *reuse)   # cached values are exact optima
 
     if deadline is not None and time.time() > deadline:
-        return None
+        return DEADLINE_EXCEEDED
     if cancel_check is not None and cancel_check():
-        return None
+        return CANCEL_RECVD
 
     # Recursive parallelism: on a cache miss, offer this sub-branch to the
     # swarm.  The solver decides (by size) whether to solve it cooperatively
@@ -1147,20 +1164,20 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     cutoff_occurred = False
 
     for i, candidate in enumerate(candidate_list):
-        status, cost, md, floor = evaluate_candidate(
+        status, cost, md, budget_tainted = evaluate_candidate(
             branch_words, candidate, cache, score_cache,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
             depth=depth, note_depth=note_depth, budget=budget,
             subbranch_solver=subbranch_solver,
         )
-        if status == 'abort':
-            return None
-        node_floor = node_floor or floor
-        if status == 'cutoff':
+        if status in _ABORT_STATUSES:
+            return status
+        node_floor = node_floor or budget_tainted
+        if status == OVER_ERD_LIMIT:
             cutoff_occurred = True
             continue
-        if status != 'ok':
+        if status != SOLVED:
             continue
 
         if cost < best_erd:
@@ -1175,10 +1192,10 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         if cutoff_occurred:
             # Every candidate priced out at >= ceiling but none was proven
             # infeasible: a lower bound only (= ceiling), solvability unknown.
-            # Do NOT cache — return a cutoff so the caller discards it.
-            return (ceiling, None, node_floor, True)
+            # Do NOT cache — OVER_ERD_LIMIT so the caller discards it.
+            return (OVER_ERD_LIMIT, ceiling, None, node_floor)
         # No feasible guess and no cutoff: proven unsolvable within budget.
-        return (float('inf'), None, True, False)
+        return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
     if score_cache:
         # Untainted (floor never fired) => unconstrained optimum, reusable at
@@ -1191,7 +1208,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                           max_depth=best_md, solve_budget=solve_budget)
         cache_all_scores(best_guess, branch_words, score_cache, branch_key, cache=cache)
 
-    return (best_erd, best_md, node_floor, False)
+    return (SOLVED, best_erd, best_md, node_floor)
 
 
 def min_expected_guesses(branch_words, cache, score_cache,
@@ -1223,10 +1240,10 @@ def min_expected_guesses(branch_words, cache, score_cache,
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat, depth,
                         note_depth, progress_callback, subbranch_solver)
-    if res is None:
+    if res in _ABORT_STATUSES:
         return None
-    cost, _md, _floor, _cutoff = res
-    if budget is not None and cost == float('inf'):
+    status, cost, _md, _budget_tainted = res
+    if status == OVER_DEPTH_BUDGET or (budget is not None and cost == float('inf')):
         return None   # unsolvable within budget
     return cost
 
