@@ -1183,8 +1183,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         # expensive cutoff-tail candidates are caught, not just 'ok' ones.
         if token is not None:
             pub_result = mid_loop_publisher.check(
-                token, candidate_list[:i + 1],
-                len(candidate_list) - (i + 1),
+                token, candidate_list, i,
                 best_guess, best_erd, budget)
             if pub_result is not None:
                 return pub_result

@@ -18,6 +18,21 @@ _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
 _COST_MODEL_MIN_WEIGHT = 1.0
 
+# Geometric size bucketing.  Sub-branch sizes are sparse and heavy-tailed, so a
+# bucket per exact word-count would almost never accumulate enough samples to
+# leave "cold".  Bucketing by floor(log(n)/log(BASE)) groups nearby sizes into
+# one accumulator, keeping samples dense in the heavy small-size region while
+# still separating sizes that differ by more than a ~30% step.
+_COST_MODEL_BUCKET_BASE = 1.3
+_LOG_BUCKET_BASE = math.log(_COST_MODEL_BUCKET_BASE)
+
+
+def cost_size_bucket(n_words: int) -> int:
+    """Map a branch word-count to its geometric cost-model bucket index."""
+    if n_words < 1:
+        return 0
+    return int(math.log(n_words) / _LOG_BUCKET_BASE)
+
 # Re-export so callers don't need to import cache_sqlite directly.
 encode_subset = ScoreCache.encode_subset
 
@@ -156,8 +171,8 @@ CREATE TABLE IF NOT EXISTS cost_samples (
     policy      TEXT    NOT NULL,
     n_words     INTEGER NOT NULL,
     nodes       INTEGER NOT NULL,
-    wall_nanos  INTEGER,
-    source      TEXT,        -- 'inline', 'finalize', or 'probe'
+    wall_millis INTEGER,
+    source      TEXT,        -- 'inline' or 'finalize'
     recorded_at INTEGER NOT NULL
 );
 
@@ -165,12 +180,29 @@ CREATE TABLE IF NOT EXISTS cost_samples (
 -- Never read by any runtime control path; freely droppable.
 CREATE TABLE IF NOT EXISTS claim_telemetry (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    n_words            INTEGER NOT NULL,
-    coordination_nanos INTEGER NOT NULL,
-    work_nodes         INTEGER NOT NULL,
+    n_words             INTEGER NOT NULL,
+    coordination_millis INTEGER NOT NULL,
+    work_nodes          INTEGER NOT NULL,
     claim_retries      INTEGER,
     worker_count       INTEGER,
     recorded_at        INTEGER NOT NULL
+);
+
+-- One row per wall-clock backstop firing: a frame handed off its remainder
+-- because it ran longer than COLD_BACKSTOP_SECONDS rather than because the
+-- node-proportionate overrun check tripped.  Exists to tune COLD_BACKSTOP_SECONDS
+-- offline: how often the time cap (not the node check) drives a handoff, at what
+-- frame sizes, and whether the cost model was cold (predicted_nodes NULL) or warm
+-- at the time.  Outbound-only; never read by any runtime control path.
+CREATE TABLE IF NOT EXISTS backstop_telemetry (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    n_words              INTEGER NOT NULL,
+    depth                INTEGER,
+    elapsed_millis       INTEGER NOT NULL,   -- wall time in frame at fire
+    nodes                INTEGER NOT NULL,   -- nodes spent in frame at fire
+    predicted_nodes      REAL,               -- typical(n) at entry; NULL = cold model
+    remaining_candidates INTEGER NOT NULL,   -- candidates handed off
+    recorded_at          INTEGER NOT NULL
 );
 """
 
@@ -772,55 +804,97 @@ class ERDQueue:
     # Cost model (online time-weighted geometric mean per size bucket)
     # ------------------------------------------------------------------
 
-    def get_cost_typical(self, policy: str, size_bucket: int):
-        """Return the geometric-mean node count for size_bucket, or None if cold.
+    def _cost_bucket_row(self, policy: str, n_words: int):
+        return self._conn.execute(
+            "SELECT weighted_log_sum, weight_sum, weighted_log_sq, last_updated "
+            "FROM cost_model WHERE policy = ? AND size_bucket = ?",
+            (policy, cost_size_bucket(n_words))).fetchone()
 
-        The estimate is exp(weighted_log_sum / weight_sum).  When weight_sum
-        is below _COST_MODEL_MIN_WEIGHT the bucket is considered cold and None
-        is returned — the caller should fall back to a size-based heuristic.
+    def get_cost_typical(self, policy: str, n_words: int):
+        """Return the geometric-mean node count for n_words' size bucket, or None.
+
+        The estimate is exp(weighted_log_sum / weight_sum).  When weight_sum is
+        below _COST_MODEL_MIN_WEIGHT the bucket reads cold and None is returned —
+        the caller should fall back to a size-based heuristic.
         """
-        row = self._conn.execute(
-            "SELECT weighted_log_sum, weight_sum FROM cost_model "
-            "WHERE policy = ? AND size_bucket = ?",
-            (policy, size_bucket)).fetchone()
+        row = self._cost_bucket_row(policy, n_words)
         if row is None or row['weight_sum'] < _COST_MODEL_MIN_WEIGHT:
             return None
         return math.exp(row['weighted_log_sum'] / row['weight_sum'])
 
-    def update_cost_model(self, policy: str, size_bucket: int, nodes: int,
-                          weight: float = 1.0):
-        """Add a new sample to the time-weighted geometric mean for size_bucket.
+    def get_cost_spread(self, policy: str, n_words: int):
+        """Std-dev of ln(nodes) for n_words' bucket (the log-normal sigma), or None.
 
-        Each call contributes log(nodes) with the given weight; the existing
-        accumulated weight decays by exp(-elapsed / TAU) before the new sample
-        is folded in, implementing a continuous-time EMA with half-life TAU.
-        weight > 1 lets a caller fold in a batch of samples in one call (e.g.
-        a worker flushing an in-memory buffer of N buffered inline-return samples
-        passes weight=N so the batch contributes correctly to the running average).
+        Recovered from the stored second log-moment:
+            sigma^2 = weighted_log_sq/weight_sum - mu^2
+        Round-off can make this marginally negative when every sample is equal;
+        clamp to 0.  Used for the over-promotion shade exp(mu - Z*sigma) and for
+        offline distribution analysis.
+        """
+        row = self._cost_bucket_row(policy, n_words)
+        if row is None or row['weight_sum'] < _COST_MODEL_MIN_WEIGHT:
+            return None
+        mu = row['weighted_log_sum'] / row['weight_sum']
+        var = row['weighted_log_sq'] / row['weight_sum'] - mu * mu
+        return math.sqrt(var) if var > 0 else 0.0
+
+    def update_cost_model(self, policy: str, n_words: int, nodes: int,
+                          weight: float = 1.0, now: int = None):
+        """Fold one node-cost sample (value `nodes`, multiplicity `weight`).
+
+        weight > 1 records `weight` identical samples of `nodes` in one call.
+        For a batch of *distinct* samples whose individual magnitudes matter to
+        the spread, use update_cost_model_logsums so each sample reaches the
+        second log-moment without a lossy pre-averaging collapse.
         """
         if nodes <= 0 or weight <= 0:
             return
-        now = int(time.time())
         log_n = math.log(nodes)
+        self._fold_cost_sample(policy, n_words,
+                               log_n * weight, log_n * log_n * weight, weight, now)
+
+    def update_cost_model_logsums(self, policy: str, n_words: int,
+                                  log_sum: float, log_sq_sum: float,
+                                  weight: float, now: int = None):
+        """Fold a pre-summed batch of log samples: (Σ ln x, Σ ln²x, count).
+
+        The worker's inline-sample buffer accumulates these sums directly, so the
+        batch contributes to weighted_log_sum and weighted_log_sq exactly as if
+        each sample had been folded individually — no exp/int/log round-trip.
+        """
+        if weight <= 0:
+            return
+        self._fold_cost_sample(policy, n_words, log_sum, log_sq_sum, weight, now)
+
+    def _fold_cost_sample(self, policy, n_words, d_log_sum, d_log_sq, d_weight, now):
+        bucket = cost_size_bucket(n_words)
+        if now is None:
+            now = int(time.time())
         row = self._conn.execute(
-            "SELECT weighted_log_sum, weight_sum, last_updated FROM cost_model "
-            "WHERE policy = ? AND size_bucket = ?",
-            (policy, size_bucket)).fetchone()
+            "SELECT weighted_log_sum, weight_sum, weighted_log_sq, last_updated "
+            "FROM cost_model WHERE policy = ? AND size_bucket = ?",
+            (policy, bucket)).fetchone()
         if row is None:
             self._conn.execute("""
                 INSERT INTO cost_model
-                    (policy, size_bucket, weighted_log_sum, weight_sum, last_updated)
-                VALUES (?, ?, ?, ?, ?)
-            """, (policy, size_bucket, log_n * weight, weight, now))
+                    (policy, size_bucket, weighted_log_sum, weight_sum,
+                     weighted_log_sq, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (policy, bucket, d_log_sum, d_weight, d_log_sq, now))
         else:
-            decay = math.exp(-(now - row['last_updated']) / _COST_MODEL_TAU)
+            # Continuous-time EMA: decay every accumulator by the age of the
+            # bucket before folding the new contribution.  Clamp elapsed at 0 so
+            # an out-of-order timestamp can never amplify (decay > 1).
+            decay = math.exp(-max(0, now - row['last_updated']) / _COST_MODEL_TAU)
             self._conn.execute("""
                 UPDATE cost_model
-                SET weighted_log_sum = ?, weight_sum = ?, last_updated = ?
+                SET weighted_log_sum = ?, weight_sum = ?, weighted_log_sq = ?,
+                    last_updated = ?
                 WHERE policy = ? AND size_bucket = ?
-            """, (decay * row['weighted_log_sum'] + log_n * weight,
-                  decay * row['weight_sum'] + weight,
-                  now, policy, size_bucket))
+            """, (decay * row['weighted_log_sum'] + d_log_sum,
+                  decay * row['weight_sum'] + d_weight,
+                  decay * row['weighted_log_sq'] + d_log_sq,
+                  now, policy, bucket))
 
     def add_cost_sample(self, policy: str, n_words: int, nodes: int, source: str):
         """Append a raw sample to cost_samples for offline analysis."""
@@ -830,12 +904,26 @@ class ERDQueue:
             VALUES (?, ?, ?, ?, ?)
         """, (policy, n_words, nodes, source, now))
 
-    def add_claim_telemetry(self, n_words: int, coordination_nanos: int,
+    def add_claim_telemetry(self, n_words: int, coordination_millis: int,
                             work_nodes: int, worker_count: int):
         """Append a claim coordination record to claim_telemetry for offline analysis."""
         now = int(time.time())
         self._conn.execute("""
             INSERT INTO claim_telemetry
-                (n_words, coordination_nanos, work_nodes, worker_count, recorded_at)
+                (n_words, coordination_millis, work_nodes, worker_count, recorded_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (n_words, coordination_nanos, work_nodes, worker_count, now))
+        """, (n_words, coordination_millis, work_nodes, worker_count, now))
+
+    def add_backstop_telemetry(self, n_words: int, depth, elapsed_millis: int,
+                               nodes: int, predicted_nodes, remaining_candidates: int):
+        """Append a wall-clock backstop firing to backstop_telemetry for offline
+        tuning of COLD_BACKSTOP_SECONDS.  predicted_nodes is None when the cost
+        model was cold for this size at the time the backstop fired."""
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO backstop_telemetry
+                (n_words, depth, elapsed_millis, nodes, predicted_nodes,
+                 remaining_candidates, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (n_words, depth, elapsed_millis, nodes, predicted_nodes,
+              remaining_candidates, now))

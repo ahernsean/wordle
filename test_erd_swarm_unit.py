@@ -17,6 +17,7 @@ they miss:
 import multiprocessing
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -57,9 +58,15 @@ def _bare_worker():
     w._coop_depth = 0
     w._top_source_word = None
     w._top_source_pattern = None
+    w._adaptive = True
     w._typical_cache = {}
     w._cost_model_buffer = {}
+    w._word_idx = {word: i for i, word in enumerate(w.all_words)}
+    w._coord_ema = erd_swarm._LogEMA()
+    w._node_time_ema = erd_swarm._LogEMA()
+    w._mid_loop_publisher = erd_swarm._MidLoopPublisher(w)
     w.n_workers = 1
+    w.rcache = mock.MagicMock()
     w.score_cache = mock.MagicMock()
     w.score_cache.read_hits = 0
     w.score_cache.read_misses = 0
@@ -573,17 +580,17 @@ class TestMidLoopPublisher(unittest.TestCase):
         pub = erd_swarm._MidLoopPublisher(w)
         return pub, w
 
-    def test_enter_returns_none_below_min_handoff(self):
+    def test_enter_returns_none_below_min_words(self):
         pub, _ = self._pub()
-        # MIN_HANDOFF_CANDIDATES is 4; 3 words is below threshold.
-        self.assertIsNone(pub.enter(BRANCH[:3], depth=0))
+        # MIN_PUBLISH_BRANCH_WORDS is 2; a 1-word frame is a base case.
+        self.assertIsNone(pub.enter(BRANCH[:1], depth=0))
 
-    def test_enter_returns_token_at_min_handoff(self):
+    def test_enter_returns_token_at_min_words(self):
         pub, _ = self._pub(predicted=1000)
-        words = BRANCH[:4]  # exactly MIN_HANDOFF_CANDIDATES
+        words = BRANCH[:2]  # exactly MIN_PUBLISH_BRANCH_WORDS
         token = pub.enter(words, depth=0)
         self.assertIsNotNone(token)
-        nodes_at_entry, predicted, bw, depth = token
+        nodes_at_entry, predicted, entry_time, bw, depth = token
         self.assertEqual(bw, words)
         self.assertEqual(predicted, 1000)
 
@@ -591,23 +598,55 @@ class TestMidLoopPublisher(unittest.TestCase):
         pub, _ = self._pub(predicted=None)  # cold model
         token = pub.enter(BRANCH[:6], depth=1)
         self.assertIsNotNone(token)
-        _, predicted, _, _ = token
+        _, predicted, _, _, _ = token
         self.assertIsNone(predicted)  # token carries None when model is cold
 
     def test_check_returns_none_for_none_token(self):
         pub, _ = self._pub()
-        self.assertIsNone(pub.check(None, [], 5, None, None, 5))
+        self.assertIsNone(pub.check(None, CANDIDATES, 0, None, None, 5))
 
-    def test_check_returns_none_cold_model(self):
+    def test_check_cold_model_under_backstop_returns_none(self):
+        # Cold model: the node-proportionate check can't arm, and the wall-clock
+        # backstop hasn't elapsed on a fresh token, so the frame stays inline.
         pub, _ = self._pub(predicted=None)
         token = pub.enter(BRANCH[:6], depth=0)
-        self.assertIsNone(pub.check(token, BRANCH[:1], 5, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+
+    def test_check_fires_on_wall_clock_backstop_when_cold(self):
+        # Cold model, but the frame has run past COLD_BACKSTOP_SECONDS: the
+        # backstop hands off the remainder even with no cost-model prediction.
+        pub, w = self._pub(predicted=None)
+        nodes_at_entry, _, _, words, depth = pub.enter(BRANCH[:6], depth=0)
+        old_entry = time.time() - (erd_swarm.COLD_BACKSTOP_SECONDS + 1)
+        token = (nodes_at_entry, None, old_entry, words, depth)
+        w._nodes = nodes_at_entry + 50   # some work done, no prediction to compare
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        result = pub.check(token, CANDIDATES, 0, None, None, 5)
+        self.assertIsNotNone(result)
+        w.cooperative_solve.assert_called_once()
+        # The firing is recorded for offline tuning, with predicted=None (cold).
+        w.queue.add_backstop_telemetry.assert_called_once()
+        args = w.queue.add_backstop_telemetry.call_args[0]
+        self.assertEqual(args[0], len(words))   # n_words
+        self.assertIsNone(args[4])              # predicted_nodes is None when cold
+
+    def test_check_warm_overrun_does_not_record_backstop(self):
+        # The node-proportionate path is the model working as intended; only the
+        # wall-clock backstop is recorded for tuning.
+        pub, w = self._pub(predicted=10)
+        token = pub.enter(BRANCH[:6], depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        pub.check(token, CANDIDATES, 0, None, None, 5)
+        w.queue.add_backstop_telemetry.assert_not_called()
 
     def test_check_returns_none_when_under_overrun_threshold(self):
         pub, w = self._pub(predicted=100)
         token = pub.enter(BRANCH[:6], depth=0)
         # _nodes hasn't changed: delta = 0 <= OVERRUN_K * 100
-        self.assertIsNone(pub.check(token, BRANCH[:1], 5, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
 
     def test_check_fires_on_overrun(self):
         pub, w = self._pub(predicted=10)
@@ -616,7 +655,8 @@ class TestMidLoopPublisher(unittest.TestCase):
         # Simulate spending > OVERRUN_K * predicted nodes
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
-        result = pub.check(token, BRANCH[:1], 5, None, None, 5)
+        # last_index=0 of a 10-candidate list → 9 remaining (>= MIN_HANDOFF).
+        result = pub.check(token, CANDIDATES, 0, None, None, 5)
         self.assertIsNotNone(result)
         w.cooperative_solve.assert_called_once()
 
@@ -624,8 +664,8 @@ class TestMidLoopPublisher(unittest.TestCase):
         pub, w = self._pub(predicted=10)
         token = pub.enter(BRANCH[:6], depth=0)
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
-        # Only 3 remaining candidates — below MIN_HANDOFF_CANDIDATES (4)
-        self.assertIsNone(pub.check(token, BRANCH[:3], 3, None, None, 5))
+        # last_index=7 of a 10-candidate list → only 2 remaining (< MIN_HANDOFF=4)
+        self.assertIsNone(pub.check(token, CANDIDATES, 7, None, None, 5))
 
     def test_check_marks_prefix_done(self):
         pub, w = self._pub(predicted=10)
@@ -633,15 +673,14 @@ class TestMidLoopPublisher(unittest.TestCase):
         token = pub.enter(words, depth=0)
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
-        evaluated = [CANDIDATES[0], CANDIDATES[1]]
-        pub.check(token, evaluated, 5, None, None, 5)
+        # last_index=1 → the evaluated prefix is CANDIDATES[:2].
+        pub.check(token, CANDIDATES, 1, None, None, 5)
         call_args = w.queue.mark_claims_done.call_args
         self.assertIsNotNone(call_args)
         marked_indices = call_args[0][1]  # second positional arg is the indices list
-        # Each evaluated word should appear in the done list at its all_words index
-        for word in evaluated:
-            if word in w.all_words:
-                self.assertIn(w.all_words.index(word), marked_indices)
+        # Each evaluated prefix word appears in the done list at its all_words index.
+        for word in CANDIDATES[:2]:
+            self.assertIn(w.all_words.index(word), marked_indices)
 
     def test_record_inline_accumulates_buffer(self):
         import math
@@ -651,9 +690,10 @@ class TestMidLoopPublisher(unittest.TestCase):
         w._nodes = 200   # 200 - 0 = 200 nodes for this frame
         pub.record_inline(token)
         self.assertIn(len(words), w._cost_model_buffer)
-        s, c = w._cost_model_buffer[len(words)]
+        s, sq, c = w._cost_model_buffer[len(words)]
         self.assertEqual(c, 1)
         self.assertAlmostEqual(s, math.log(200), places=6)
+        self.assertAlmostEqual(sq, math.log(200) ** 2, places=6)
 
     def test_record_inline_is_noop_for_none_token(self):
         pub, w = self._pub()
@@ -682,12 +722,15 @@ class TestSubbranchSolverCostModel(unittest.TestCase):
         self.assertEqual(result, expected)
         w.cooperative_solve.assert_called_once()
 
-    def test_cold_model_uses_size_threshold(self):
+    def test_cold_model_small_branch_inlines(self):
         w = _bare_worker()
         w.queue.get_cost_typical.return_value = None  # cold model
-        # Below PROMOTE_MIN_SIZE → inline (cold fallback)
+        # A cold small branch inlines directly; the mid-loop publisher's
+        # wall-clock backstop bounds it if it turns out to be a tarpit.
+        w.cooperative_solve = mock.MagicMock()
         words_small = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE - 1)
         self.assertIsNone(w._subbranch_solver(words_small, budget=5))
+        w.cooperative_solve.assert_not_called()
 
     def test_cold_model_above_size_threshold_promotes(self):
         w = _bare_worker()

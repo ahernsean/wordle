@@ -99,7 +99,12 @@ class TestWorkDoesNotAmplify(_Base):
         lock = threading.Lock()
 
         def worker(wid):
-            w = _BranchWorker(wid, cache_path, queue_path, None)
+            # Pure-partition path: the "each candidate evaluated exactly once"
+            # invariant holds only with adaptive decomposition off, since
+            # publishing a frame's remainder re-routes candidates through
+            # cooperative claims rather than this worker's own loop.
+            w = _BranchWorker(wid, cache_path, queue_path, None,
+                              enable_adaptive_decomposition=False)
             try:
                 w.solve_branch_focused(self.branch_key)
                 with lock:
@@ -156,8 +161,13 @@ class TestProcessScalingSmoke(_Base):
 
         stop_event = mp.Event()
         with mock.patch("erd_swarm._setup_logging", lambda *_: None):
+            # Pure-partition path: this guard catches races in update_branch_best,
+            # complete_candidate, and claim/release — primitives that sit below the
+            # adaptive layer and are exercised identically without it.  Adaptive-on
+            # correctness is covered by test_erd_parallel.
             procs = [mp.Process(target=swarm_worker,
-                                args=(w, cache_path, queue_path, stop_event))
+                                args=(w, cache_path, queue_path, stop_event,
+                                      1, False))
                      for w in range(n_workers)]
             for p in procs:
                 p.start()
@@ -264,8 +274,11 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         stop_event = mp.Event()
         # Suppress erd_worker_N.log creation: mock is inherited by forked children.
         with mock.patch("erd_swarm._setup_logging", lambda *_: None):
+            # Disable the adaptive-decomposition layer (cost model, probing,
+            # overrun): this test measures pure candidate-partition scaling.
             procs = [mp.Process(target=swarm_worker,
-                                args=(w, cache_path, queue_path, stop_event))
+                                args=(w, cache_path, queue_path, stop_event,
+                                      1, False))
                      for w in range(n_workers)]
             t0 = time.time()
             for p in procs:

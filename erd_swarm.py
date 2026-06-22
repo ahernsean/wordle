@@ -18,6 +18,7 @@ skipped.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import signal
 import time
@@ -65,10 +66,31 @@ PROMOTED_PRIORITY = 1_000_000  # promoted sub-branches outrank fresh top branche
                                # so freed workers prefer joining in-flight depth.
 
 OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publication
+# Absolute wall-clock backstop on a single inline frame, independent of the cost
+# model.  When the model is cold (typical(n) is None) the node-proportionate
+# overrun check above can't arm, so without this a first-of-its-size tarpit would
+# grind on one worker unbounded.  A frame running longer than this hands off its
+# remainder regardless of model state.  This value is the *subdivision granularity*
+# of a cold fan-out, not just the first worker's wait: every level of the recursive
+# cascade fractures only after another full interval of solo grind, so a larger
+# value trades slower ramp-to-parallel for less coordination churn.  backstop_telemetry
+# records every firing for offline tuning.
+COLD_BACKSTOP_SECONDS = 600
 MIN_HANDOFF_CANDIDATES = 4   # minimum remaining candidates to bother handing off
-# Cold-model entry-gate bootstrap: promote when the model is warm and predicts
-# > this many nodes, or fall back to PROMOTE_MIN_SIZE when the model is cold.
-PUBLISH_THRESHOLD_BOOTSTRAP = 5000
+MIN_PUBLISH_BRANCH_WORDS = 2  # frames with fewer answer words are base cases, never
+                              # worth tracking for overrun (the candidate loop on a
+                              # 1-word branch never even runs)
+
+# Adaptive publish threshold (node-equivalents): SAFETY_FACTOR * coordination_time
+# / node_time.  Publishing pays only when the handed-off work exceeds the cost of
+# coordinating the handoff; both terms are measured live per worker (log-domain
+# EMAs, same TAU as the cost model).  The two are a ratio, so their unit cancels —
+# they're kept in seconds (what time.time() gives, no false nanosecond precision).
+# Until those estimators warm, fall back to PUBLISH_THRESHOLD_BOOTSTRAP.
+SAFETY_FACTOR = 8               # dimensionless margin on the coordination break-even
+_PUBLISH_EMA_TAU = 86400.0      # half-life (s) for the coordination/node-time EMAs
+_PUBLISH_EMA_MIN_WEIGHT = 5     # decayed samples before the adaptive threshold goes live
+PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 
 GAME_GUESSES = 6              # a Wordle game allows 6 guesses total
 # Queue branches are positions AFTER the opener (guess 1), so they are solved
@@ -79,13 +101,48 @@ ROOT_BUDGET = GAME_GUESSES - 1
 logger = logging.getLogger('wordle')
 
 
+class _LogEMA:
+    """Continuous-time log-domain EMA — a streaming geometric mean with half-life
+    TAU.  A sample enters as ln(value), so one heavy-tailed outlier shifts the
+    estimate far less than it would an arithmetic mean.  value() returns None
+    until at least min_weight of (time-decayed) samples have accumulated.
+    """
+
+    __slots__ = ('_tau', '_min_weight', '_log_sum', '_weight', '_last')
+
+    def __init__(self, tau=_PUBLISH_EMA_TAU, min_weight=_PUBLISH_EMA_MIN_WEIGHT):
+        self._tau = tau
+        self._min_weight = min_weight
+        self._log_sum = 0.0
+        self._weight = 0.0
+        self._last = None
+
+    def add(self, value, now=None):
+        if value <= 0:
+            return
+        if now is None:
+            now = time.time()
+        if self._last is not None:
+            decay = math.exp(-max(0.0, now - self._last) / self._tau)
+            self._log_sum *= decay
+            self._weight *= decay
+        self._log_sum += math.log(value)
+        self._weight += 1.0
+        self._last = now
+
+    def value(self):
+        if self._weight < self._min_weight:
+            return None
+        return math.exp(self._log_sum / self._weight)
+
+
 class _MidLoopPublisher:
     """Engine-seam object that detects mid-loop overrun and publishes the remainder.
 
-    An instance is created per evaluate_claim call and passed down through
-    evaluate_candidate / _solve_subset exactly like subbranch_solver.  Each
-    active DFS frame creates an independent frame-local token via enter(); the
-    publisher never shares mutable state between frames.
+    One instance lives on the worker for its lifetime and is passed down through
+    evaluate_candidate / _solve_subset exactly like subbranch_solver.  It holds
+    no per-frame mutable state — each active DFS frame creates an independent
+    frame-local token via enter() — so a single instance serves every claim.
 
     When check() fires at frame F:
     - The prefix candidates (evaluated inline in Σk² order) are marked done
@@ -99,45 +156,63 @@ class _MidLoopPublisher:
 
     def __init__(self, worker):
         self._worker = worker
-        # Reverse map word → all_words index, for prefix-marking done.
-        self._word_idx = {w: i for i, w in enumerate(worker.all_words)}
 
     def enter(self, branch_words, depth):
         """Called just before the candidate loop of each _solve_subset frame.
 
-        Returns an opaque token (nodes_at_entry, predicted, branch_words, depth)
-        for any frame with n >= MIN_HANDOFF_CANDIDATES.  predicted may be None
-        (cold model) — in that case check() never fires, but record_inline()
-        still fires on frame completion so the model warms for future claims.
+        Returns an opaque token
+        (nodes_at_entry, predicted, entry_time, branch_words, depth) for any
+        non-trivial frame (>= MIN_PUBLISH_BRANCH_WORDS answer words).  predicted
+        may be None (cold model) — the node-proportionate check then can't arm,
+        but the wall-clock backstop in check() still fires off entry_time, and
+        record_inline() still warms the model on frame completion.
         """
         n = len(branch_words)
-        if n < MIN_HANDOFF_CANDIDATES:
+        if n < MIN_PUBLISH_BRANCH_WORDS:
             return None
         predicted = self._worker._typical(n)
-        return (self._worker._nodes, predicted, branch_words, depth)
+        return (self._worker._nodes, predicted, time.time(), branch_words, depth)
 
-    def check(self, token, evaluated_words, remaining_count,
+    def check(self, token, candidate_list, last_index,
               best_guess, best_erd, budget):
         """Called every loop iteration (before status-continue checks).
 
-        Tests whether this frame has spent > OVERRUN_K * predicted nodes since
-        enter() and enough candidates remain to be worth handing off.  If so,
+        candidate_list is the frame's full ordered candidate list and last_index
+        is the index just evaluated, so remaining_count is derived cheaply and
+        the evaluated prefix is sliced only on the rare iteration the overrun
+        actually fires (avoiding an O(n²) per-iteration copy).
+
+        Fires on either of two triggers:
+        - node-proportionate: the frame has spent > OVERRUN_K * predicted nodes
+          since enter() (warm model only — disabled when predicted is None);
+        - wall-clock backstop: the frame has run longer than COLD_BACKSTOP_SECONDS
+          since enter() (always armed, the only guard while the model is cold).
+
+        When either fires and enough candidates remain to be worth handing off,
         emits the promotion sentinel, publishes the remainder as a cooperative
         branch, and returns the cooperative result so the engine can short-
         circuit.  Returns None to continue inline.
         """
         if token is None:
             return None
-        nodes_at_entry, predicted, branch_words, depth = token
-        if predicted is None:
-            return None  # cold model: no overrun check this frame
+        nodes_at_entry, predicted, entry_time, branch_words, depth = token
         delta = self._worker._nodes - nodes_at_entry
-        if delta <= OVERRUN_K * predicted:
+        node_overrun = predicted is not None and delta > OVERRUN_K * predicted
+        elapsed = time.time() - entry_time
+        time_overrun = elapsed > COLD_BACKSTOP_SECONDS
+        if not (node_overrun or time_overrun):
             return None
+        remaining_count = len(candidate_list) - (last_index + 1)
         if remaining_count < MIN_HANDOFF_CANDIDATES:
             return None
 
         n = len(branch_words)
+        # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
+        # tuned offline; the node-proportionate path is the model working as
+        # intended and isn't what we're tuning.
+        if time_overrun:
+            self._worker.queue.add_backstop_telemetry(
+                n, depth, int(elapsed * 1000), delta, predicted, remaining_count)
         branch_key = encode_subset(branch_words)
 
         # Spine sentinel: mark this frame as handed off in the heartbeat display.
@@ -152,9 +227,12 @@ class _MidLoopPublisher:
             budget=budget, depth=self._worker._coop_depth + 1)
 
         # Mark the already-evaluated candidates done by their all_words index so
-        # cooperative workers claim only the unevaluated remainder.
-        done_indices = [self._word_idx[w] for w in evaluated_words
-                        if w in self._word_idx]
+        # cooperative workers claim only the unevaluated remainder.  The prefix
+        # slice is built here — only when an overrun actually fires — not on
+        # every loop iteration.
+        word_idx = self._worker._word_idx
+        done_indices = [word_idx[w] for w in candidate_list[:last_index + 1]
+                        if w in word_idx]
         if done_indices:
             self._worker.queue.mark_claims_done(branch_key, done_indices)
 
@@ -169,34 +247,44 @@ class _MidLoopPublisher:
         """Called on the SOLVED return of each completed _solve_subset frame.
 
         Accumulates node-cost samples in the worker's in-memory buffer keyed by
-        sub-branch size.  The buffer is flushed to the DB at each checkpoint so
-        this never touches SQLite mid-candidate-loop.
+        sub-branch size, carrying both Σ ln(nodes) and Σ ln²(nodes) so the batch
+        flush reaches the cost model's second log-moment faithfully.  The buffer
+        is flushed to the DB at each checkpoint so this never touches SQLite
+        mid-candidate-loop.
         """
         if token is None:
             return
-        import math
-        nodes_at_entry, _predicted, branch_words, _depth = token
+        nodes_at_entry, _predicted, _entry_time, branch_words, _depth = token
         n = len(branch_words)
         nodes = self._worker._nodes - nodes_at_entry
         if nodes <= 0:
             return
+        log_n = math.log(nodes)
         buf = self._worker._cost_model_buffer
         if n in buf:
-            s, c = buf[n]
-            buf[n] = (s + math.log(nodes), c + 1)
+            s, sq, c = buf[n]
+            buf[n] = (s + log_n, sq + log_n * log_n, c + 1)
         else:
-            buf[n] = (math.log(nodes), 1)
+            buf[n] = (log_n, log_n * log_n, 1)
 
 
 class _BranchWorker:
     """One worker process's state and operations on branches/chunks."""
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
-                 budget=ROOT_BUDGET, n_workers=1):
+                 budget=ROOT_BUDGET, n_workers=1,
+                 enable_adaptive_decomposition=True):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
         self.budget = budget
         self.n_workers = n_workers
+        # The adaptive-decomposition layer — cost model, entry-gate publish
+        # threshold, and the mid-loop overrun escape hatch with its wall-clock
+        # backstop.
+        # When disabled the worker runs the bare claim/evaluate/finalize loop with
+        # plain size-based promotion: pure candidate-partition parallelism, which
+        # is what the strong-scaling test measures.
+        self._adaptive = enable_adaptive_decomposition
 
         self.all_answers = load_word_list(ANSWER_FILE)
         self.all_words = load_word_list(WORDS_FILE)
@@ -238,11 +326,27 @@ class _BranchWorker:
         # can distinguish user-queued branches (depth 0) from sub-branches.
         self._coop_depth = 0
         # In-memory cache of cost-model predictions keyed by sub-branch size.
-        # Invalidated on cooperative finalize so new samples take effect.
+        # Cleared on any cost-model write so new samples take effect.
         self._typical_cache = {}
-        # In-memory buffer for inline node-cost samples: {n: (sum_log, count)}.
-        # Flushed to the DB at each checkpoint to avoid per-frame SQLite writes.
-        self._cost_model_buffer: dict[int, tuple[float, int]] = {}
+        # In-memory buffer for inline node-cost samples:
+        # {n: (sum_log, sum_log_sq, count)}.  Flushed to the DB at each
+        # checkpoint to avoid per-frame SQLite writes.
+        self._cost_model_buffer: dict[int, tuple[float, float, int]] = {}
+        # Reverse map word → all_words index, built once: the publisher marks the
+        # evaluated prefix done by these indices.  Both are needed only by the
+        # adaptive layer, so they're skipped (and the publisher is None, which
+        # disarms the overrun check) when adaptive decomposition is off.
+        if self._adaptive:
+            self._word_idx = {w: i for i, w in enumerate(self.all_words)}
+            self._mid_loop_publisher = _MidLoopPublisher(self)
+        else:
+            self._word_idx = None
+            self._mid_loop_publisher = None
+        # Live coordination/throughput estimators feeding the adaptive publish
+        # threshold (node-equivalents); both are outbound telemetry's in-memory
+        # twins — the claim_telemetry table is never read back for control.
+        self._coord_ema = _LogEMA()
+        self._node_time_ema = _LogEMA()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -326,17 +430,33 @@ class _BranchWorker:
         """Update the cost model with a finalized cooperative branch's node count."""
         self.queue.update_cost_model(ERD_ALL, n_words, nodes)
         self.queue.add_cost_sample(ERD_ALL, n_words, nodes, 'finalize')
-        self._typical_cache.pop(n_words, None)   # invalidate stale cache entry
+        self._typical_cache.clear()   # bucket changed: drop cached predictions
 
     def _flush_cost_model_buffer(self):
-        """Flush the in-memory inline-sample buffer to the DB and clear it."""
-        import math
-        for n, (sum_log, count) in self._cost_model_buffer.items():
-            avg_log = sum_log / count
-            nodes = int(math.exp(avg_log))
-            self.queue.update_cost_model(ERD_ALL, n, nodes, weight=float(count))
-            self._typical_cache.pop(n, None)
+        """Flush the in-memory inline-sample buffer to the DB and clear it.
+
+        The buffered (Σ ln, Σ ln², count) accumulators are folded straight into
+        the cost model, so each sample's magnitude reaches the geometric mean and
+        the second log-moment without an exp/int/log round-trip.
+        """
+        for n, (sum_log, sum_log_sq, count) in self._cost_model_buffer.items():
+            self.queue.update_cost_model_logsums(
+                ERD_ALL, n, sum_log, sum_log_sq, float(count))
+        if self._cost_model_buffer:
+            self._typical_cache.clear()
         self._cost_model_buffer.clear()
+
+    def _publish_threshold(self):
+        """Adaptive 'worth-swarming' break-even in node-equivalents:
+        SAFETY_FACTOR * coordination_time / node_time (both in seconds, so the
+        unit cancels).  Falls back to PUBLISH_THRESHOLD_BOOTSTRAP until both live
+        estimators warm.
+        """
+        coord = self._coord_ema.value()
+        node_time = self._node_time_ema.value()
+        if coord is None or node_time is None or node_time <= 0:
+            return PUBLISH_THRESHOLD_BOOTSTRAP
+        return SAFETY_FACTOR * coord / node_time
 
     # -- RAM check and WAL checkpoint ---------------------------------------
 
@@ -471,7 +591,7 @@ class _BranchWorker:
             depth=0, note_depth=self._note_depth, budget=budget,
             subbranch_solver=self._subbranch_solver,
             bound_provider=_bound_provider,
-            mid_loop_publisher=_MidLoopPublisher(self),
+            mid_loop_publisher=self._mid_loop_publisher,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound(),
@@ -483,7 +603,7 @@ class _BranchWorker:
                            idx, cand_elapsed, status, self._cand_max_depth)
 
         nodes_delta = self._nodes - nodes_before
-        if nodes_delta > 0:
+        if self._adaptive and nodes_delta > 0:
             self.queue.add_nodes_spent(branch_key, nodes_delta)
 
         if status in _ABORT_STATUSES:  # pragma: no cover
@@ -509,10 +629,18 @@ class _BranchWorker:
             self.n_useless += 1
 
         elapsed = time.time() - t0
-        coordination_nanos = int(max(0.0, elapsed - cand_elapsed) * 1e9)
         self.queue.complete_candidate(branch_key, idx)
-        self.queue.add_claim_telemetry(
-            n_words, coordination_nanos, nodes_delta, self.n_workers)
+        if self._adaptive:
+            coord_seconds = max(0.0, elapsed - cand_elapsed)
+            # Feed the in-memory estimators behind the adaptive publish threshold
+            # in seconds (the ratio is unit-free).  These are the control-path
+            # twins of the outbound claim_telemetry row, which the table never
+            # feeds back; the table stores milliseconds for readable offline rows.
+            self._coord_ema.add(coord_seconds)
+            if nodes_delta > 0 and cand_elapsed > 0:
+                self._node_time_ema.add(cand_elapsed / nodes_delta)
+            self.queue.add_claim_telemetry(
+                n_words, int(coord_seconds * 1e3), nodes_delta, self.n_workers)
         self.claims_done += 1
         self._heartbeat(branch_key, n_words, idx, claim_started,
                         local_candidate, local_best, bound_erd=_eff_bound(),
@@ -540,7 +668,7 @@ class _BranchWorker:
                                    max_depth=max_depth, solve_budget=solve_budget)
             cache_all_scores(best_guess, words, self.score_cache, branch_key,
                              cache=self.rcache)
-            if nodes_spent > 0:
+            if self._adaptive and nodes_spent > 0:
                 self._update_cost_model(len(words), nodes_spent)
             # NB: no per-finalize checkpoint — with recursive promotion a worker
             # finalizes thousands of sub-branches; checkpointing each one is
@@ -589,19 +717,28 @@ class _BranchWorker:
         """Engine hook: decide whether to solve a sub-branch cooperatively.
 
         When the cost model is warm, promotes sub-branches whose predicted node
-        cost exceeds PUBLISH_THRESHOLD_BOOTSTRAP; when cold, falls back to the
-        PROMOTE_MIN_SIZE size threshold.  Returns the engine's (status, cost,
-        max_depth, floor) tuple, or None to inline.  Cooperative results are
-        always exact (no cutoff).
+        cost exceeds the adaptive publish threshold.  When cold, falls back to the
+        PROMOTE_MIN_SIZE size threshold: large cold branches promote up front,
+        small ones inline under the mid-loop publisher's wall-clock backstop —
+        so a mispredicted small tarpit is bounded by COLD_BACKSTOP_SECONDS rather
+        than by a size heuristic that can't see it.  Returns the engine's
+        (status, cost, max_depth, floor) tuple, or None to inline.  Cooperative
+        results are always exact (no cutoff).
         """
         if budget is None:
             return None
         n = len(words)
+        if not self._adaptive:
+            # Plain size-based promotion: no cost model, no overrun.
+            return self.cooperative_solve(words, budget) if n >= PROMOTE_MIN_SIZE \
+                else None
         predicted = self._typical(n)
         if predicted is None:
-            if n < PROMOTE_MIN_SIZE:
-                return None
-        elif predicted < PUBLISH_THRESHOLD_BOOTSTRAP:
+            # Cold model: promote large branches by size, inline small ones; the
+            # wall-clock backstop bounds a cold inline tarpit.
+            return self.cooperative_solve(words, budget) if n >= PROMOTE_MIN_SIZE \
+                else None
+        if predicted < self._publish_threshold():
             return None
         return self.cooperative_solve(words, budget)
 
@@ -793,14 +930,15 @@ class _BranchWorker:
 
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no cover
-                 n_workers=1):
+                 n_workers=1, enable_adaptive_decomposition=True):
     """Process entry point for a swarm worker (target= for mp.Process)."""
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     _setup_logging(worker_id)
     logger.info('worker-%d starting (pid=%d)', worker_id, os.getpid())
     w = _BranchWorker(worker_id, cache_path, queue_path, stop_event,
-                      n_workers=n_workers)
+                      n_workers=n_workers,
+                      enable_adaptive_decomposition=enable_adaptive_decomposition)
     try:
         w.run()
     finally:

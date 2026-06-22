@@ -401,7 +401,7 @@ class TestCostModel(_TmpQueue):
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row['n_words'], 10)
-        self.assertEqual(row['coordination_nanos'], 5000)
+        self.assertEqual(row['coordination_millis'], 5000)
         self.assertEqual(row['work_nodes'], 300)
         self.assertEqual(row['worker_count'], 4)
 
