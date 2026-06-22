@@ -88,16 +88,21 @@ spellings (executor may refine, but each must name the **reason**):
 
 | Today (inferred) | Reason | Recommended status |
 |---|---|---|
-| `return None` | deadline/cancel stopped the search | `ABORTED` |
+| `return None` (deadline check) | the wall-clock deadline passed | `DEADLINE_EXCEEDED` |
+| `return None` (`cancel_check` fired) | an external stop was requested — in the swarm this is `stop_event` (worker shutdown/recycle) | `CANCELED` |
 | exact optimum tuple | the true minimum was found | `SOLVED` |
-| `(inf, None, True, False)` | depth budget too small — *proven* no winning strategy | `UNSOLVABLE_WITHIN_BUDGET` |
-| `(ceiling, None, _, True)` (`cutoff=True`) | every candidate priced ≥ the known bound — *lower bound only, do not cache* | `PRUNED_BY_BOUND` |
+| `(inf, None, True, False)` | depth budget too small — *proven* no winning strategy | `OVER_DEPTH_BUDGET` |
+| `(ceiling, None, _, True)` (`cutoff=True`) | every candidate priced ≥ the known ERD bound — *lower bound only, do not cache* | `OVER_ERD_LIMIT` |
+
+The two `return None` cases are detected at **separate sites** (the deadline
+comparison vs. the `cancel_check()` call), so they become two distinct statuses,
+not one lumped "aborted" — each names its own cause.
 
 `evaluate_candidate`'s status strings (`'ok'`, `'cutoff'`, `'pruned'`, `'useless'`,
-`'abort'`) get the same treatment: `'cutoff'` → `PRUNED_BY_BOUND`, `'pruned'` →
-`UNSOLVABLE_WITHIN_BUDGET`, `'useless'` → a reason-named constant (e.g.
-`NO_INFORMATION` — the split is `k >= n`, zero information gain), `'abort'` →
-`ABORTED`, `'ok'` → `SOLVED`.
+`'abort'`) get the same treatment: `'cutoff'` → `OVER_ERD_LIMIT`, `'pruned'` →
+`OVER_DEPTH_BUDGET`, `'useless'` → a reason-named constant (e.g. `NO_INFORMATION`
+— the split is `k >= n`, zero information gain), `'abort'` → propagate whichever of
+`DEADLINE_EXCEEDED` / `CANCELED` the inner frame reported, `'ok'` → `SOLVED`.
 
 The depth-floor **taint** (the property that makes a `SOLVED` result valid only at
 *this* budget, currently the `floor` boolean threaded everywhere) becomes a
@@ -126,7 +131,7 @@ them causes either lost pruning or a corrupt cache.
 
 1. **Vertical alpha-beta `ceiling`** — passed *down* the recursion within one
    worker (`_solve_subset(..., ceiling=...)`, `sub_ceiling` in
-   `evaluate_candidate`). A result that bottoms out against it is `PRUNED_BY_BOUND`:
+   `evaluate_candidate`). A result that bottoms out against it is `OVER_ERD_LIMIT`:
    a **lower bound only**, solvability unknown, **never cached**.
 
 2. **Horizontal crowdsourced bound** — `bound_provider` in `evaluate_chunk` reads
@@ -180,8 +185,22 @@ overrun asks "is *this instance* running much hotter than typical for its size?"
 absolute number — it answers "is the swarm worth it at all," which is inherent.
 Everything else is *relative* to the adaptive `typical(size)`; `OVERRUN_K` is a
 dimensionless ratio (~3–5), not a hardcoded node count. `PUBLISH_THRESHOLD` is a
-tunable, refined **offline** later from the logged distribution data (below) — not
-by any runtime loop.
+tunable, refined **offline** later from the logged data (below) — not by any
+runtime loop.
+
+`PUBLISH_THRESHOLD` will most likely be set from the **DB-coordination break-even**:
+publishing pays only when the work handed off exceeds the time spent coordinating
+the handoff. To make that question answerable later, the data collection below must
+capture both halves of the ratio in compatible units:
+
+- `claim_telemetry.coordination_nanos` — wall time per claim transaction (the
+  coordination cost).
+- `cost_samples.wall_nanos` alongside `nodes` — so node-count converts to wall time
+  (node throughput), letting the coordination cost be expressed in **node-
+  equivalents**, the same unit as `PUBLISH_THRESHOLD` and `typical(size)`.
+
+With both logged, the break-even `PUBLISH_THRESHOLD` is computable after a
+representative run without any guessing.
 
 **Same-level, not one deeper.** Overrun is a *horizontal* deficit ("X's candidate
 list is more work than one worker can carry"), so the response is horizontal help
