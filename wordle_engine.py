@@ -952,7 +952,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    deadline=None, guesses=None, policy=ERD_ALL,
                    cancel_check=None, heartbeat=None,
                    depth=0, note_depth=None, budget=None,
-                   subbranch_solver=None, bound_provider=None):
+                   subbranch_solver=None, bound_provider=None,
+                   mid_loop_publisher=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1050,7 +1051,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             sub_branch, cache, score_cache, sub_budget, deadline, guesses,
             policy, cancel_check, heartbeat, depth + 1, note_depth, None,
             subbranch_solver, ceiling=sub_ceiling,
-            entry_guess=candidate, entry_pattern=pattern_code)
+            entry_guess=candidate, entry_pattern=pattern_code,
+            mid_loop_publisher=mid_loop_publisher)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_md, sub_budget_tainted = sub
@@ -1074,7 +1076,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, depth, note_depth,
                   progress_callback, subbranch_solver=None,
-                  ceiling=float('inf'), entry_guess=None, entry_pattern=None):
+                  ceiling=float('inf'), entry_guess=None, entry_pattern=None,
+                  mid_loop_publisher=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1162,6 +1165,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     best_md = None
     node_floor = False
     cutoff_occurred = False
+    token = mid_loop_publisher.enter(branch_words, depth) if mid_loop_publisher is not None else None
 
     for i, candidate in enumerate(candidate_list):
         status, cost, md, budget_tainted = evaluate_candidate(
@@ -1170,10 +1174,20 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
             depth=depth, note_depth=note_depth, budget=budget,
             subbranch_solver=subbranch_solver,
+            mid_loop_publisher=mid_loop_publisher,
         )
         if status in _ABORT_STATUSES:
             return status
         node_floor = node_floor or budget_tainted
+        # Overrun check: runs every iteration (before status continues) so
+        # expensive cutoff-tail candidates are caught, not just 'ok' ones.
+        if token is not None:
+            pub_result = mid_loop_publisher.check(
+                token, candidate_list[:i + 1],
+                len(candidate_list) - (i + 1),
+                best_guess, best_erd, budget)
+            if pub_result is not None:
+                return pub_result
         if status == OVER_ERD_LIMIT:
             cutoff_occurred = True
             continue
@@ -1216,7 +1230,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
                           policy=None, progress_callback=None,
                           cancel_check=None, heartbeat=None,
                           depth=0, note_depth=None, budget=None,
-                          subbranch_solver=None):
+                          subbranch_solver=None, mid_loop_publisher=None):
     """
     Exact expected guesses to solve branch_words, playing optimally.
 
@@ -1239,7 +1253,8 @@ def min_expected_guesses(branch_words, cache, score_cache,
     """
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat, depth,
-                        note_depth, progress_callback, subbranch_solver)
+                        note_depth, progress_callback, subbranch_solver,
+                        mid_loop_publisher=mid_loop_publisher)
     if res in _ABORT_STATUSES:
         return None
     status, cost, _md, _budget_tainted = res
