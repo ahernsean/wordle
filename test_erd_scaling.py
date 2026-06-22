@@ -34,13 +34,11 @@ import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET
 from erd_queue import ERDQueue, encode_subset
 
-# 12-word branch -> ceil(12/3) = 4 chunks, so up to 4 workers each take a chunk.
+# 12-word branch with 24 candidates: up to 24 workers each claim one candidate.
 BRANCH = ["crane", "slate", "trace", "stale", "tales", "least",
           "heart", "share", "rates", "earth", "brave", "cleat"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train", "grade",
                        "shine", "mount", "frost", "plumb", "dwarf", "gawky"]
-DIVISOR = 3
-MAX_CHUNKS = 256
 WORKER_COUNTS = (1, 2, 4)
 
 
@@ -69,13 +67,10 @@ class _Base(unittest.TestCase):
                 os.path.join(self._tmp.name, f"queue_{tag}.sqlite3"))
 
     def _register_branch(self, queue_path):
-        chunk_size = ERDQueue.chunk_size_for(
-            len(BRANCH), len(CANDIDATES), DIVISOR, MAX_CHUNKS)
         q = ERDQueue(queue_path)
         q.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
-                        chunk_size, budget=ROOT_BUDGET)
+                        budget=ROOT_BUDGET)
         q.close()
-        return ERDQueue.n_chunks_for(len(CANDIDATES), chunk_size)
 
     def _ground_truth(self):
         cache_path, _ = self._db("truth")
@@ -99,14 +94,12 @@ class TestWorkDoesNotAmplify(_Base):
         # Apply schema migrations once before the worker threads open the cache
         # concurrently (production always has a single pre-open: queue-add).
         ScoreCache(cache_path, BRANCH).close()
-        n_chunks = self._register_branch(queue_path)
-        self.assertGreaterEqual(n_chunks, 2, "need a multi-chunk branch")
+        self._register_branch(queue_path)
         evaluated = []
         lock = threading.Lock()
 
         def worker(wid):
-            w = _BranchWorker(wid, cache_path, queue_path, None,
-                              DIVISOR, MAX_CHUNKS)
+            w = _BranchWorker(wid, cache_path, queue_path, None)
             try:
                 w.solve_branch_focused(self.branch_key)
                 with lock:
@@ -132,8 +125,8 @@ class TestWorkDoesNotAmplify(_Base):
                 self.assertIsNotNone(result, "branch did not finalize")
                 self.assertAlmostEqual(result[1], truth, places=6)
                 # The whole point: each candidate is evaluated exactly once in
-                # total, no matter how many workers split the chunks.  More
-                # workers must not multiply the work.
+                # total, no matter how many workers cooperate.  More workers
+                # must not multiply the work.
                 self.assertEqual(
                     total_evaluated, len(CANDIDATES),
                     f"{nw} workers evaluated {total_evaluated} candidates, "
@@ -149,7 +142,7 @@ class TestProcessScalingSmoke(_Base):
     Spawns 1, 2, and 4 processes via swarm_worker (the same entry point as
     production workers) and confirms each produces the same ERD as the serial
     ground truth.  This is the multi-process correctness guard: it catches
-    races in update_branch_best, complete_chunk, and chunk claim/release that
+    races in update_branch_best, complete_candidate, and claim/release that
     thread-based tests cannot exercise.
     """
 
@@ -164,8 +157,7 @@ class TestProcessScalingSmoke(_Base):
         stop_event = mp.Event()
         with mock.patch("erd_swarm._setup_logging", lambda *_: None):
             procs = [mp.Process(target=swarm_worker,
-                                args=(w, cache_path, queue_path, stop_event,
-                                      DIVISOR, MAX_CHUNKS))
+                                args=(w, cache_path, queue_path, stop_event))
                      for w in range(n_workers)]
             for p in procs:
                 p.start()
@@ -212,7 +204,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
     #
     # DO NOT replace the timing assertion with a pure correctness check.
     # Correctness is covered by TestProcessScalingSmoke (multi-process ERD
-    # agreement) and TestWorkDoesNotAmplify (no chunk duplication).
+    # agreement) and TestWorkDoesNotAmplify (no candidate duplication).
     # This test's only job is to confirm that parallelism HELPS.
     #
     # Worker count is min(4, cpu_count) so the comparison is always honest:
@@ -223,7 +215,6 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
 
     _BRANCH_SIZE = 12
     _N_BRANCHES = 80         # 80 × 12 = 960 unique answer words
-    _DRAIN_DIVISOR = 100     # ceil(12/100)=1 → 1 chunk per branch
     _N_CANDIDATES = 100
     _SPEEDUP_RATIO = 0.80    # N workers must complete in < 80% of 1-worker time
 
@@ -263,14 +254,10 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
 
         t_setup0 = time.time()
         ScoreCache(cache_path, self._pool).close()
-        chunk_size = ERDQueue.chunk_size_for(
-            self._BRANCH_SIZE, len(self._candidates),
-            self._DRAIN_DIVISOR, MAX_CHUNKS)
         q = ERDQueue(queue_path)
         for bw in self._branches:
             q.create_branch(encode_subset(bw), self._BRANCH_SIZE,
-                            len(self._candidates), chunk_size,
-                            budget=ROOT_BUDGET)
+                            len(self._candidates), budget=ROOT_BUDGET)
         q.close()
         t_setup = time.time() - t_setup0
 
@@ -278,8 +265,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         # Suppress erd_worker_N.log creation: mock is inherited by forked children.
         with mock.patch("erd_swarm._setup_logging", lambda *_: None):
             procs = [mp.Process(target=swarm_worker,
-                                args=(w, cache_path, queue_path, stop_event,
-                                      self._DRAIN_DIVISOR, MAX_CHUNKS))
+                                args=(w, cache_path, queue_path, stop_event))
                      for w in range(n_workers)]
             t0 = time.time()
             for p in procs:

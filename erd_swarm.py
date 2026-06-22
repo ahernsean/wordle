@@ -3,20 +3,16 @@
 The precache is built by workers cooperating on one branch at a time.  A
 *branch* is a position to solve: the answer words left after a guess+response
 (e.g. SALET ----- = 315 words).  To solve a branch we evaluate ~12,972
-*candidate* guesses against it and keep the lowest-ERD one.  That candidate
-list is cut into *chunks* (contiguous slices); each worker claims one chunk at
-a time, so several workers pour into the same branch at once while sharing a
-single running-best ERD as a branch-and-bound bound.
+*candidate* guesses against it and keep the lowest-ERD one.  Each worker
+claims one candidate at a time (a *claim*) by index into the policy-canonical
+word list, so several workers pour into the same branch at once while sharing
+a single running-best ERD as a branch-and-bound bound.
 
-There is no separate algorithm for "big" vs "small" branches: an easy branch
-is a one-chunk branch a single worker disposes of; a hard branch is a
-many-chunk branch a crowd swarms.  Chunk count scales with branch difficulty
-(n_words) — granularity only, never a different code path.
-
-Trust model (see erd_queue.py): a claimed chunk is advisory; only a done=1
-chunk is authoritative.  A branch is finalized — its ERD written to the
-persistent cache — only once every chunk is done, by whichever worker observes
-full coverage.  So a crashed worker's chunk is redone, never skipped.
+Trust model (see erd_queue.py): a claimed candidate is advisory; only a
+done=1 claim is authoritative.  A branch is finalized — its ERD written to
+the persistent cache — only once every candidate is done, by whichever worker
+observes full coverage.  So a crashed worker's candidate is redone, never
+skipped.
 """
 
 from __future__ import annotations
@@ -39,7 +35,6 @@ from wordle_engine import (
     cache_all_scores,
     evaluate_candidate,
     load_word_list,
-    rank_candidates_by_max_group_size_then_entropy_gain,
     _cache_reuse,
 )
 from erd_queue import ERDQueue, decode_subset, encode_subset
@@ -84,12 +79,9 @@ class _BranchWorker:
     """One worker process's state and operations on branches/chunks."""
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
-                 min_words_per_chunk, max_chunk_count, budget=ROOT_BUDGET,
-                 n_workers=1):
+                 budget=ROOT_BUDGET, n_workers=1):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
-        self.min_words_per_chunk = min_words_per_chunk
-        self.max_chunk_count = max_chunk_count
         self.budget = budget
 
         self.all_answers = load_word_list(ANSWER_FILE)
@@ -104,13 +96,11 @@ class _BranchWorker:
         self.queue = ERDQueue(queue_path)
 
         self.started = int(time.time())
-        self.chunks_done = 0
+        self.claims_done = 0
         self.n_ok = 0
         self.n_cutoff = 0    # cost >= best_erd before full eval (alpha-beta)
         self.n_pruned = 0    # infeasible within budget (depth floor hit)
         self.n_useless = 0
-        self._ranked_key = None      # cache last branch's ranked candidate list
-        self._ranked = None
         self._last_hb = 0.0
         self._last_checkpoint = time.time()
         self._last_ram_check = time.time()
@@ -144,18 +134,6 @@ class _BranchWorker:
 
     def cancel(self):
         return self.stop_event is not None and self.stop_event.is_set()
-
-    # -- candidate ranking (deterministic, so every worker agrees) ----------
-
-    def _ranked_for(self, branch_key, words):
-        if self._ranked_key == branch_key:
-            return self._ranked
-        ranked = rank_candidates_by_max_group_size_then_entropy_gain(
-            words, self.all_words, self.rcache, self.score_cache,
-            cancel_check=self.cancel)
-        self._ranked_key = branch_key
-        self._ranked = ranked
-        return ranked
 
     # -- depth instrumentation ----------------------------------------------
 
@@ -242,10 +220,9 @@ class _BranchWorker:
 
     # -- heartbeat ----------------------------------------------------------
 
-    def _heartbeat(self, branch_key, n_words, chunk_idx, chunk_started_at,
+    def _heartbeat(self, branch_key, n_words, claim_idx, claim_started_at,
                    cand_rate, best_guess, best_erd, force=False,
-                   bound_erd=None,
-                   cur_candidate=None, cand_n_seen=None, cand_chunk_size=None):
+                   bound_erd=None, cur_candidate=None):
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
         self._nodes += 1
@@ -258,14 +235,13 @@ class _BranchWorker:
         self._nodes_at_last_hb = self._nodes
         self.queue.heartbeat(
             self.name, os.getpid(), branch_key, n_words, self.started,
-            self.chunks_done, chunk_idx=chunk_idx,
-            chunk_started_at=chunk_started_at, cand_rate=cand_rate,
+            self.claims_done, claim_idx=claim_idx,
+            claim_started_at=claim_started_at, cand_rate=cand_rate,
             cache_hits=self.score_cache.read_hits,
             cache_misses=self.score_cache.read_misses,
             n_cutoff=self.n_cutoff, n_pruned=self.n_pruned, n_ok=self.n_ok,
             best_guess=best_guess, best_erd=best_erd, bound_erd=bound_erd,
-            cur_candidate=cur_candidate, cand_n_seen=cand_n_seen,
-            cand_chunk_size=cand_chunk_size,
+            cur_candidate=cur_candidate,
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._hb_spine_str())
@@ -274,38 +250,36 @@ class _BranchWorker:
             self._last_progress_log = now
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
             bg = (best_guess or '-').upper()
-            logger.info('%s chunk %d: %s %d/%d in progress  '
+            logger.info('%s claim %d: %s in progress  '
                         'depth=%d path=%s  %.1fM nodes %.0fk/s  best=%s %s',
-                        self.name, chunk_idx,
-                        cur_candidate.upper(), cand_n_seen or 0,
-                        cand_chunk_size or 0,
+                        self.name, claim_idx,
+                        cur_candidate.upper(),
                         self._cand_max_depth, self._log_spine_str(),
                         self._nodes / 1e6, node_rate / 1e3, bg, be)
             self._log_max_spine = {}
             self._cand_max_depth = 0
 
-    # -- evaluate one chunk -------------------------------------------------
+    # -- evaluate one candidate claim ---------------------------------------
 
-    def evaluate_chunk(self, branch_key, words, n_words, ranked, idx,
-                       chunk_size, budget=None):
-        """Evaluate one chunk's candidate slice, folding results into the
-        branch's shared best.  Returns True if the chunk completed, False if
-        cancelled mid-way (the chunk is left done=0 for reclaim/redo).
+    def evaluate_claim(self, branch_key, words, n_words, idx, budget=None):
+        """Evaluate the single candidate self.all_words[idx] against branch_key.
+
+        Folds the result into the branch's shared best and marks the claim
+        done=1.  Returns True if the candidate was fully evaluated; False if
+        cancelled mid-evaluation (claim left done=0 for reclaim/redo).
 
         budget is the branch's guess budget (depth-limited ERD): a candidate
         whose strategy can't win within budget is infeasible (and taints the
         branch — see ERDQueue.mark_branch_tainted).
         """
-        lo, hi = ERDQueue.chunk_range(idx, chunk_size, self.n_candidates)
-        chunk_total = hi - lo
+        candidate = self.all_words[idx]
         self._hb_max_spine = {}
         self._log_max_spine = {}
         local_candidate, local_best = self.queue.read_branch_best(branch_key)
         local_md = None
         shared_best = local_best
         last_refresh = time.time()
-        last_log = 0.0
-        chunk_started = int(time.time())
+        claim_started = int(time.time())
         t0 = time.time()
 
         def _bound_provider():
@@ -324,92 +298,71 @@ class _BranchWorker:
             return min(bests) if bests else float('inf')
 
         def _eff_bound():
-            # For heartbeat display: delegates to _bound_provider so the
-            # reported bound reflects mid-evaluation DB refreshes.
             v = _bound_provider()
             return None if v == float('inf') else v
 
-        self._heartbeat(branch_key, n_words, idx, chunk_started, None,
+        self._heartbeat(branch_key, n_words, idx, claim_started, None,
                         local_candidate, local_best, force=True,
-                        bound_erd=_eff_bound(),
-                        cand_chunk_size=chunk_total)
+                        bound_erd=_eff_bound(), cur_candidate=candidate)
 
-        for n_seen, ci in enumerate(range(lo, hi), start=1):
-            if self.cancel():
-                return False
-            now = time.time()
-            if now - last_log > 30:
-                logger.info('%s chunk %d: evaluating %s (%d/%d)  best=%s  '
-                            'max_depth=%d', self.name, idx, ranked[ci], n_seen,
-                            chunk_total, local_candidate or '-', self._cand_max_depth)
-                last_log = now
+        if self.cancel():
+            return False
 
-            self._cand_max_depth = 0
-            cand_t0 = time.time()
-            status, cost, cand_md, budget_tainted = evaluate_candidate(
-                words, ranked[ci], self.rcache, self.score_cache,
-                n=n_words, best_erd=float('inf'), guesses=self.all_words,
-                policy=ERD_ALL, cancel_check=self.cancel,
-                depth=0, note_depth=self._note_depth, budget=budget,
-                subbranch_solver=self._subbranch_solver,
-                bound_provider=_bound_provider,
-                heartbeat=lambda: self._heartbeat(
-                    branch_key, n_words, idx, chunk_started, None,
-                    local_candidate, local_best, bound_erd=_eff_bound(),
-                    cur_candidate=ranked[ci], cand_n_seen=n_seen,
-                    cand_chunk_size=chunk_total))
-            cand_elapsed = time.time() - cand_t0
-            if cand_elapsed > 10:  # pragma: no cover
-                logger.warning('%s slow candidate %s in chunk %d: %.1fs  '
-                               'status=%s  max_depth=%d', self.name, ranked[ci],
-                               idx, cand_elapsed, status, self._cand_max_depth)
+        self._cand_max_depth = 0
+        cand_t0 = time.time()
+        status, cost, cand_md, budget_tainted = evaluate_candidate(
+            words, candidate, self.rcache, self.score_cache,
+            n=n_words, best_erd=float('inf'), guesses=self.all_words,
+            policy=ERD_ALL, cancel_check=self.cancel,
+            depth=0, note_depth=self._note_depth, budget=budget,
+            subbranch_solver=self._subbranch_solver,
+            bound_provider=_bound_provider,
+            heartbeat=lambda: self._heartbeat(
+                branch_key, n_words, idx, claim_started, None,
+                local_candidate, local_best, bound_erd=_eff_bound(),
+                cur_candidate=candidate))
+        cand_elapsed = time.time() - cand_t0
+        if cand_elapsed > 10:  # pragma: no cover
+            logger.warning('%s slow candidate %s (idx=%d): %.1fs  '
+                           'status=%s  max_depth=%d', self.name, candidate,
+                           idx, cand_elapsed, status, self._cand_max_depth)
 
-            if status in _ABORT_STATUSES:  # pragma: no cover
-                return False
-            # A candidate excluded by the depth cap (anywhere in its subtree)
-            # taints the branch: its ERD is only valid at this budget.  Marked
-            # for any candidate, winner or not — see the taint rule.
-            if budget_tainted:
-                self.queue.mark_branch_tainted(branch_key)
-            if status == SOLVED:
-                self.n_ok += 1
-                if local_best is None or cost < local_best:
-                    local_best, local_candidate, local_md = cost, ranked[ci], cand_md
-                    self.queue.update_branch_best(branch_key, local_candidate,
-                                                  local_best, local_md)
-                    shared_best = local_best
-            elif status == OVER_ERD_LIMIT:
-                self.n_cutoff += 1
-            elif status == OVER_DEPTH_BUDGET:
-                self.n_pruned += 1
-            else:  # pragma: no cover
-                self.n_useless += 1
+        if status in _ABORT_STATUSES:  # pragma: no cover
+            return False
 
-            rate = n_seen / max(1e-6, now - t0)
-            self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
-                            local_candidate, local_best, bound_erd=_eff_bound(),
-                            cur_candidate=ranked[ci], cand_n_seen=n_seen,
-                            cand_chunk_size=chunk_total)
+        # A candidate excluded by the depth cap (anywhere in its subtree)
+        # taints the branch: its ERD is only valid at this budget.  Marked
+        # for any candidate, winner or not — see the taint rule.
+        if budget_tainted:
+            self.queue.mark_branch_tainted(branch_key)
+        if status == SOLVED:
+            self.n_ok += 1
+            if local_best is None or cost < local_best:
+                local_best, local_candidate, local_md = cost, candidate, cand_md
+                self.queue.update_branch_best(branch_key, local_candidate,
+                                              local_best, local_md)
+                shared_best = local_best
+        elif status == OVER_ERD_LIMIT:
+            self.n_cutoff += 1
+        elif status == OVER_DEPTH_BUDGET:
+            self.n_pruned += 1
+        else:  # pragma: no cover
+            self.n_useless += 1
 
-        self.queue.complete_chunk(branch_key, idx)
-        self.chunks_done += 1
         elapsed = time.time() - t0
-        rate = chunk_total / max(1e-6, elapsed)
-        logger.info('%s chunk %d done: %d cands in %.1fs (%.1f/s)  '
-                    'ok=%d cutoff=%d pruned=%d useless=%d  best=%s %.4f',
-                    self.name, idx, chunk_total, elapsed, rate,
-                    self.n_ok, self.n_cutoff, self.n_pruned, self.n_useless,
-                    local_candidate or '-', local_best if local_best else 0)
-        self._heartbeat(branch_key, n_words, idx, chunk_started, rate,
+        self.queue.complete_candidate(branch_key, idx)
+        self.claims_done += 1
+        self._heartbeat(branch_key, n_words, idx, claim_started,
+                        1.0 / max(1e-6, elapsed),
                         local_candidate, local_best, bound_erd=_eff_bound(),
                         force=True)
         return True
 
     # -- finalize -----------------------------------------------------------
 
-    def maybe_finalize(self, branch_key, words, n_chunks):
-        """If every chunk is done, finalize the branch exactly once."""
-        if self.queue.branch_done_chunks(branch_key) < n_chunks:
+    def maybe_finalize(self, branch_key, words, n_candidates):
+        """If every candidate is done, finalize the branch exactly once."""
+        if self.queue.branch_done_candidates(branch_key) < n_candidates:
             return
         if not self.queue.try_finalize_branch(branch_key):  # pragma: no cover
             return  # another worker won the finalize
@@ -443,27 +396,26 @@ class _BranchWorker:
     # -- recursive cooperative solving --------------------------------------
 
     def _help_other_branch(self, exclude_branch_key: bytes) -> bool:
-        """Evaluate one chunk from any open branch other than exclude_branch_key.
+        """Evaluate one candidate claim from any open branch other than exclude_branch_key.
 
         Called when the worker is waiting on a dependency branch whose remaining
-        chunks are all held by other workers.  Instead of sleeping, the worker
-        drains useful work from the queue.  Returns True if a chunk was
-        evaluated, False if there was nothing to claim.
+        candidates are all held by other workers.  Instead of sleeping, the
+        worker drains useful work from the queue.  Returns True if a candidate
+        was evaluated, False if there was nothing to claim.
         """
         for branch in self.queue.branches_in_progress():
             other_key = bytes(branch['branch_key'])
             if other_key == bytes(exclude_branch_key):
                 continue
-            n_chunks = ERDQueue.n_chunks_for(branch['n_candidates'], branch['chunk_size'])
-            idx = self.queue.claim_chunk(other_key, self.name, n_chunks)
+            n_candidates = branch['n_candidates']
+            idx = self.queue.claim_candidate(other_key, self.name, n_candidates)
             if idx is None:
                 continue
             words = decode_subset(other_key)
-            ranked = self._ranked_for(other_key, words)
             budget = branch['budget'] or self.budget
-            if self.evaluate_chunk(other_key, words, branch['n_words'], ranked, idx,
-                                   branch['chunk_size'], budget=budget):
-                self.maybe_finalize(other_key, words, n_chunks)
+            if self.evaluate_claim(other_key, words, branch['n_words'], idx,
+                                   budget=budget):
+                self.maybe_finalize(other_key, words, n_candidates)
             self._maybe_checkpoint()
             return True
         return False
@@ -502,15 +454,11 @@ class _BranchWorker:
                 return (SOLVED, *reuse)
 
             n_words = len(words)
-            chunk_size = ERDQueue.chunk_size_for(
-                n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
             self.queue.create_branch(
-                branch_key, n_words, self.n_candidates, chunk_size,
+                branch_key, n_words, self.n_candidates,
                 priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
                 source_pattern=self._top_source_pattern, budget=budget,
                 depth=self._coop_depth)
-            n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
-            ranked = self._ranked_for(branch_key, words)
 
             while not self.cancel():
                 # Finished?  Check before claiming so we never touch a branch that
@@ -521,26 +469,27 @@ class _BranchWorker:
                     return (SOLVED, *reuse)
                 if self.queue.get_branch(branch_key) is None:
                     break                       # finalized as a loss + deleted
-                idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
+                idx = self.queue.claim_candidate(branch_key, self.name,
+                                                 self.n_candidates)
                 if idx is not None:
-                    if self.evaluate_chunk(branch_key, words, n_words, ranked, idx,
-                                           chunk_size, budget=budget):
-                        self.maybe_finalize(branch_key, words, n_chunks)
+                    if self.evaluate_claim(branch_key, words, n_words, idx,
+                                           budget=budget):
+                        self.maybe_finalize(branch_key, words, self.n_candidates)
                     self._maybe_checkpoint()    # drain WAL during deep solving
-                elif self.queue.branch_done_chunks(branch_key) >= n_chunks:
-                    self.maybe_finalize(branch_key, words, n_chunks)
+                elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
+                    self.maybe_finalize(branch_key, words, self.n_candidates)
                 else:  # pragma: no cover
-                    # Every chunk is claimed but coverage isn't complete: some are
-                    # held by other workers.  Heartbeat first (so THIS worker, which
-                    # still holds its own parent chunk up the stack, isn't itself
-                    # presumed dead while it waits), then free any sub-chunk whose
+                    # Every candidate is claimed but coverage isn't complete: some
+                    # are held by other workers.  Heartbeat first (so THIS worker,
+                    # which still holds its own parent claim up the stack, isn't
+                    # itself presumed dead while it waits), then free any claim whose
                     # holder has died so we can re-claim it rather than wait forever
                     # — there may be no supervisor in the standalone solve path.
                     self._heartbeat(branch_key, n_words, None, None, None,
                                     None, None, force=True)
-                    self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
+                    self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                     if not self._help_other_branch(branch_key):
-                        time.sleep(0.05)        # nothing to claim anywhere; let chunks land
+                        time.sleep(0.05)        # nothing to claim anywhere; let claims land
 
             if self.cancel():  # pragma: no cover
                 return CANCEL_RECVD
@@ -552,19 +501,19 @@ class _BranchWorker:
     # -- scheduling: claim one chunk of the best available branch -----------
 
     def claim_one(self):
-        """Return (branch_row_dict, chunk_idx) for the next chunk to work, or
-        None if there is nothing to do right now.
+        """Return (branch_row_dict, claim_idx) for the next candidate to work,
+        or None if there is nothing to do right now.
 
         Prefers JOINING an in-progress branch (to finish branches already
         underway, concentrating workers) over PROMOTING a new one from the
         queue.  Promotion claims a pending branch and registers it so others
         can join.  A claimed branch already solved at this budget (e.g.
         synced in from elsewhere) is marked done without being promoted —
-        no chunk work is needed.
+        no candidate work is needed.
         """
         for b in self.queue.branches_in_progress():
-            n_chunks = ERDQueue.n_chunks_for(b['n_candidates'], b['chunk_size'])
-            idx = self.queue.claim_chunk(b['branch_key'], self.name, n_chunks)
+            idx = self.queue.claim_candidate(b['branch_key'], self.name,
+                                             b['n_candidates'])
             if idx is not None:
                 return dict(b), idx
 
@@ -580,22 +529,20 @@ class _BranchWorker:
             self.queue.mark_done(claimed['branch_key'])
 
         n_words = claimed['n_words']
-        chunk_size = ERDQueue.chunk_size_for(
-            n_words, self.n_candidates, self.min_words_per_chunk, self.max_chunk_count)
         self.queue.create_branch(
-            claimed['branch_key'], n_words, self.n_candidates, chunk_size,
+            claimed['branch_key'], n_words, self.n_candidates,
             priority=claimed['priority'], source_word=claimed['source_word'],
             source_pattern=claimed['source_pattern'], budget=self.budget)
-        n_chunks = ERDQueue.n_chunks_for(self.n_candidates, chunk_size)
-        idx = self.queue.claim_chunk(claimed['branch_key'], self.name, n_chunks)
+        idx = self.queue.claim_candidate(claimed['branch_key'], self.name,
+                                         self.n_candidates)
         branch = {
             'branch_key': claimed['branch_key'], 'n_words': n_words,
-            'n_candidates': self.n_candidates, 'chunk_size': chunk_size,
+            'n_candidates': self.n_candidates,
             'source_word': claimed['source_word'],
             'source_pattern': claimed['source_pattern'],
             'budget': self.budget,
         }
-        # idx can be None only if another worker grabbed every chunk between
+        # idx can be None only if another worker grabbed every candidate between
         # create and claim — rare; treat as "nothing for me right now".
         return (branch, idx) if idx is not None else None
 
@@ -621,16 +568,14 @@ class _BranchWorker:
             self._top_source_word = branch.get('source_word')
             self._top_source_pattern = branch.get('source_pattern')
             words = decode_subset(branch_key)
-            n_chunks = ERDQueue.n_chunks_for(branch['n_candidates'],
-                                             branch['chunk_size'])
-            ranked = self._ranked_for(branch_key, words)
+            n_candidates = branch['n_candidates']
             if self.cancel():
                 break
-            completed = self.evaluate_chunk(
-                branch_key, words, branch['n_words'], ranked, idx,
-                branch['chunk_size'], budget=branch.get('budget') or self.budget)
+            completed = self.evaluate_claim(
+                branch_key, words, branch['n_words'], idx,
+                budget=branch.get('budget') or self.budget)
             if completed:
-                self.maybe_finalize(branch_key, words, n_chunks)
+                self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
             self._check_ram()
 
@@ -638,60 +583,58 @@ class _BranchWorker:
 
     def solve_branch_focused(self, branch_key):
         """Help solve one already-registered branch to completion: claim and
-        evaluate its chunks alongside any sibling workers, finalizing it once
-        every chunk is done."""
+        evaluate its candidates alongside any sibling workers, finalizing it
+        once every candidate is done."""
         branch = self.queue.get_branch(branch_key)
         if branch is None or branch['status'] != 'open':
             return
         words = decode_subset(branch_key)
         budget = branch['budget'] or ROOT_BUDGET
-        n_chunks = ERDQueue.n_chunks_for(branch['n_candidates'],
-                                         branch['chunk_size'])
+        n_candidates = branch['n_candidates']
         while not self.cancel():
             # Stop the moment the branch is finalized (and its rows deleted) by
-            # any worker: otherwise claim_chunk, seeing no chunk rows for the
+            # any worker: otherwise claim_candidate, seeing no claim rows for the
             # now-deleted branch, would re-create them and redo the whole branch
             # from scratch — doubling (or worse) the work for a large branch.
             if self.queue.get_branch(branch_key) is None:
                 break
-            idx = self.queue.claim_chunk(branch_key, self.name, n_chunks)
+            idx = self.queue.claim_candidate(branch_key, self.name, n_candidates)
             if idx is None:
-                # Every chunk is claimed.  If coverage is complete, finalize and
-                # stop.  Otherwise some chunks are held by siblings — there is NO
-                # supervisor in this path, so free any whose holder has died and
-                # retry, rather than abandoning the branch one chunk short of
+                # Every candidate is claimed.  If coverage is complete, finalize
+                # and stop.  Otherwise some claims are held by siblings — there is
+                # NO supervisor in this path, so free any whose holder has died and
+                # retry, rather than abandoning the branch one candidate short of
                 # finalizing (which would strand it forever).
-                if self.queue.branch_done_chunks(branch_key) >= n_chunks:
-                    self.maybe_finalize(branch_key, words, n_chunks)
+                if self.queue.branch_done_candidates(branch_key) >= n_candidates:
+                    self.maybe_finalize(branch_key, words, n_candidates)
                     break
                 self._heartbeat(branch_key, branch['n_words'], None, None, None,
                                 None, None, force=True)
-                self.queue.reclaim_stale_chunks(HB_TIMEOUT_SECONDS)
+                self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                 time.sleep(0.1)
                 continue
-            if self.evaluate_chunk(branch_key, words, branch['n_words'],
-                                   self._ranked_for(branch_key, words), idx,
-                                   branch['chunk_size'], budget=budget):
-                if self.queue.branch_done_chunks(branch_key) >= n_chunks:
-                    self.maybe_finalize(branch_key, words, n_chunks)
+            if self.evaluate_claim(branch_key, words, branch['n_words'], idx,
+                                   budget=budget):
+                if self.queue.branch_done_candidates(branch_key) >= n_candidates:
+                    self.maybe_finalize(branch_key, words, n_candidates)
                     break
 
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no cover
-                 min_words_per_chunk=3, max_chunk_count=256, n_workers=1):
+                 n_workers=1):
     """Process entry point for a swarm worker (target= for mp.Process)."""
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     _setup_logging(worker_id)
     logger.info('worker-%d starting (pid=%d)', worker_id, os.getpid())
     w = _BranchWorker(worker_id, cache_path, queue_path, stop_event,
-                      min_words_per_chunk, max_chunk_count, n_workers=n_workers)
+                      n_workers=n_workers)
     try:
         w.run()
     finally:
         w.close()
-        logger.info('worker-%d exiting (%d chunks done)',
-                    worker_id, w.chunks_done)
+        logger.info('worker-%d exiting (%d claims done)',
+                    worker_id, w.claims_done)
 
 
 def _setup_logging(worker_id):  # pragma: no cover

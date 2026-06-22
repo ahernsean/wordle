@@ -6,13 +6,13 @@ they miss:
 
 - _heartbeat(): node-counter throttling (counter increments on every call even
   when the 2-second DB-write gate suppresses the actual write).
-- evaluate_chunk(): cancellation path (stop_event set → returns False without
-  completing the chunk).
+- evaluate_claim(): cancellation path (stop_event set → returns False without
+  completing the claim).
 - _subbranch_solver(): the inline-vs-promote branching decision.
 - _maybe_checkpoint(): force=True always triggers checkpoint; force=False with a
   recently-set timestamp does not.
 - cooperative_solve(): the cached-result fast path (result already in cache →
-  returns immediately without evaluating any chunks).
+  returns immediately without evaluating any candidates).
 """
 import multiprocessing
 import os
@@ -28,8 +28,6 @@ from erd_queue import ERDQueue
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train"]
-DIVISOR = 3
-MAX_CHUNKS = 256
 
 
 def _bare_worker():
@@ -41,8 +39,9 @@ def _bare_worker():
     w = _BranchWorker.__new__(_BranchWorker)
     w.name = "worker-0"
     w.stop_event = None
+    w.all_words = CANDIDATES
     w.n_candidates = len(CANDIDATES)
-    w.chunks_done = 0
+    w.claims_done = 0
     w.n_ok = w.n_cutoff = w.n_pruned = w.n_useless = 0
     w._nodes = 0
     w._nodes_at_last_hb = 0
@@ -92,7 +91,7 @@ class TestHeartbeatThrottling(unittest.TestCase):
 
 
 class TestCancelPath(unittest.TestCase):
-    """evaluate_chunk returns False without completing the chunk when cancelled."""
+    """evaluate_claim returns False without completing the claim when cancelled."""
 
     def _make_cancel_worker(self):
         stop = multiprocessing.Event()
@@ -101,23 +100,18 @@ class TestCancelPath(unittest.TestCase):
         w.stop_event = stop
         return w
 
-    def test_evaluate_chunk_returns_false_when_stop_event_set(self):
+    def test_evaluate_claim_returns_false_when_stop_event_set(self):
         w = self._make_cancel_worker()
         branch_key = ScoreCache.encode_subset(BRANCH)
-        # ranked must be long enough that the range(lo, hi) loop is entered.
-        result = w.evaluate_chunk(
-            branch_key, BRANCH, len(BRANCH),
-            ranked=CANDIDATES, idx=0, chunk_size=5)
+        result = w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
         self.assertFalse(result)
 
-    def test_chunk_not_marked_complete_when_cancelled(self):
+    def test_claim_not_marked_complete_when_cancelled(self):
         w = self._make_cancel_worker()
         branch_key = ScoreCache.encode_subset(BRANCH)
-        w.evaluate_chunk(
-            branch_key, BRANCH, len(BRANCH),
-            ranked=CANDIDATES, idx=0, chunk_size=5)
-        # complete_chunk must NOT have been called (chunk left at done=0 for reclaim).
-        w.queue.complete_chunk.assert_not_called()
+        w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
+        # complete_candidate must NOT have been called (claim left done=0 for reclaim).
+        w.queue.complete_candidate.assert_not_called()
 
 
 class TestSubbranchSolver(unittest.TestCase):
@@ -236,8 +230,7 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
         sc.write(branch_key, ERD_ALL, "crane", 1.5, max_depth=2, solve_budget=None)
         sc.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.cooperative_solve(words, ROOT_BUDGET)
         finally:
@@ -255,10 +248,11 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
         q.close()
 
 
-class TestSolveBranchFocusedPrecompletedChunks(unittest.TestCase):
-    """solve_branch_focused finalizes correctly when all chunks are already done
-    by other workers: claim_chunk returns None, branch_done_chunks >= n_chunks,
-    so the worker finalizes from the idx-is-None path (not via evaluate_chunk)."""
+class TestSolveBranchFocusedPrecompletedCandidates(unittest.TestCase):
+    """solve_branch_focused finalizes correctly when all candidates are already
+    done by other workers: claim_candidate returns None,
+    branch_done_candidates >= n_candidates, so the worker finalizes from the
+    idx-is-None path (not via evaluate_claim)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -279,30 +273,25 @@ class TestSolveBranchFocusedPrecompletedChunks(unittest.TestCase):
             f.write("\n".join(words) + "\n")
         return p
 
-    def test_finalizes_when_all_chunks_pre_completed(self):
+    def test_finalizes_when_all_candidates_pre_completed(self):
         from erd_queue import ERDQueue
-        # Create a 2-chunk branch and pre-mark both chunks as done (simulating
-        # two other workers that have already evaluated them).
+        # Pre-mark all candidate claims as done (simulating other workers that
+        # have already evaluated every candidate).
         branch_key = ScoreCache.encode_subset(BRANCH)
         ScoreCache(self.cache_path, BRANCH).close()  # initialise schema
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
-        self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
-        q.create_branch(branch_key, len(BRANCH), n_candidates, chunk_size)
-        # Simulate two other workers each completing one chunk.
-        for chunk_idx in range(n_chunks):
-            q.claim_chunk(branch_key, f"other-{chunk_idx}", n_chunks)
-            q.complete_chunk(branch_key, chunk_idx)
+        q.create_branch(branch_key, len(BRANCH), n_candidates)
+        for cand_idx in range(n_candidates):
+            q.claim_candidate(branch_key, f"other-{cand_idx}", n_candidates)
+            q.complete_candidate(branch_key, cand_idx)
         q.close()
 
-        # Our worker enters solve_branch_focused: claim_chunk → None (all done),
-        # branch_done_chunks >= n_chunks → maybe_finalize.  Since no best_guess was
-        # set (no update_branch_best calls), maybe_finalize treats it as a loss and
-        # deletes the branch without writing a cache entry.
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        # Our worker enters solve_branch_focused: claim_candidate → None (all done),
+        # branch_done_candidates >= n_candidates → maybe_finalize.  Since no
+        # best_guess was set, maybe_finalize treats it as a loss and deletes the
+        # branch without writing a cache entry.
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             w.solve_branch_focused(branch_key)
         finally:
@@ -340,8 +329,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
     def test_solve_branch_focused_returns_early_for_missing_branch(self):
         ScoreCache(self.cache_path, BRANCH).close()
         branch_key = ScoreCache.encode_subset(BRANCH)
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             # Branch was never registered — should return without error.
             w.solve_branch_focused(branch_key)
@@ -349,33 +337,28 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
             w.close()
 
     def test_claim_one_skips_fully_claimed_in_progress_branch_and_joins_next(self):
-        """If the first in-progress branch has all chunks claimed, claim_one must
-        continue iterating and claim a chunk from the next in-progress branch."""
+        """If the first in-progress branch has all candidates claimed, claim_one
+        must continue iterating and claim a candidate from the next branch."""
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
-        self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
 
-        # Branch A: all chunks pre-claimed by another worker.
+        # Branch A: all candidates pre-claimed by another worker.
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
-        for i in range(n_chunks):
-            q.claim_chunk(key_a, "other-worker", n_chunks)
+        for i in range(n_candidates):
+            q.claim_candidate(key_a, "other-worker", n_candidates)
 
-        # Branch B: has a free chunk for our worker to claim (higher priority so
-        # branches_in_progress returns it second after A in priority order).
+        # Branch B: has a free candidate for our worker to claim.
         words_b = BRANCH[:4]
         key_b = ScoreCache.encode_subset(words_b)
-        q.create_branch(key_b, len(words_b), n_candidates, chunk_size,
+        q.create_branch(key_b, len(words_b), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.claim_one()
         finally:
@@ -393,23 +376,18 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
-        self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
         # Register branch as in-progress (created, not pending).
-        q.create_branch(branch_key, len(BRANCH), n_candidates, chunk_size,
-                        budget=ROOT_BUDGET)
+        q.create_branch(branch_key, len(BRANCH), n_candidates, budget=ROOT_BUDGET)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.claim_one()
         finally:
             w.close()
 
         # claim_one should have joined the in-progress branch via
-        # branches_in_progress() → claim_chunk() → return (branch, idx).
+        # branches_in_progress() → claim_candidate() → return (branch, idx).
         self.assertIsNotNone(result)
         branch, idx = result
         self.assertEqual(branch['branch_key'], branch_key)
@@ -417,11 +395,11 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
 
 class TestCooperativeSolveFullPath(unittest.TestCase):
-    """cooperative_solve evaluates all chunks and returns the correct result
+    """cooperative_solve evaluates all candidates and returns the correct result
     when the branch is NOT pre-cached.  This exercises the main cooperative
-    loop (create branch, evaluate chunks, finalize, read cache) and the
-    maybe_finalize early-return path (called after each chunk, returns early
-    until the last chunk makes all chunks done)."""
+    loop (create branch, evaluate candidates, finalize, read cache) and the
+    maybe_finalize early-return path (called after each candidate, returns early
+    until the last one makes all candidates done)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -443,15 +421,13 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         return p
 
     def test_solves_uncached_branch_and_returns_result(self):
-        # Use all 5 BRANCH words so the solver creates 2 chunks (DIVISOR=3:
-        # ceil(5/3)=2 chunks, each covering half of CANDIDATES).  This makes
-        # maybe_finalize() hit its early-return path on the first chunk and the
-        # finalize path on the second, exercising both branches.
+        # Use all 5 BRANCH words so cooperative_solve evaluates all 10 CANDIDATES
+        # one at a time.  maybe_finalize() returns early on each until the last
+        # candidate makes branch_done_candidates == n_candidates and finalizes.
         words = BRANCH
         branch_key = ScoreCache.encode_subset(words)
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.cooperative_solve(words, ROOT_BUDGET)
         finally:
@@ -478,7 +454,7 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
 
 
 class TestHelpOtherBranch(unittest.TestCase):
-    """_help_other_branch claims and evaluates one chunk from a branch other
+    """_help_other_branch claims and evaluates one candidate from a branch other
     than the excluded branch, returning True if work was found, False if not."""
 
     def setUp(self):
@@ -500,58 +476,52 @@ class TestHelpOtherBranch(unittest.TestCase):
             f.write("\n".join(words) + "\n")
         return p
 
-    def test_help_other_branch_returns_true_when_chunk_evaluated(self):
-        """When a chunk is available in another branch, help_other_branch
+    def test_help_other_branch_returns_true_when_candidate_evaluated(self):
+        """When a candidate is available in another branch, help_other_branch
         claims and evaluates it, then returns True."""
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
 
         # Create branch A (the one being excluded).
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
 
-        # Create branch B with a free chunk.
+        # Create branch B with a free candidate claim.
         words_b = BRANCH[:4]
         key_b = ScoreCache.encode_subset(words_b)
-        q.create_branch(key_b, len(words_b), n_candidates, chunk_size,
+        q.create_branch(key_b, len(words_b), n_candidates,
                         budget=ROOT_BUDGET, priority=1)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w._help_other_branch(key_a)
         finally:
             w.close()
 
-        # Should have evaluated a chunk and returned True.
+        # Should have evaluated a candidate and returned True.
         self.assertTrue(result)
 
-    def test_help_other_branch_returns_false_when_no_chunks_available(self):
-        """When no other branches have available chunks, help_other_branch
+    def test_help_other_branch_returns_false_when_no_candidates_available(self):
+        """When no other branches have available candidate claims, help_other_branch
         returns False without claiming anything."""
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
 
-        # Create only one branch and fully claim all its chunks.
+        # Create only one branch and fully claim all its candidates.
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
-        for i in range(n_chunks):
-            q.claim_chunk(key_a, "other-worker", n_chunks)
+        for i in range(n_candidates):
+            q.claim_candidate(key_a, "other-worker", n_candidates)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             # Exclude a different branch key (none exist, so effectively no branches to help).
             fake_exclude_key = ScoreCache.encode_subset(BRANCH[:3])
@@ -559,7 +529,7 @@ class TestHelpOtherBranch(unittest.TestCase):
         finally:
             w.close()
 
-        # Should return False (no chunks to claim).
+        # Should return False (no candidates to claim).
         self.assertFalse(result)
 
     def test_help_other_branch_skips_excluded_branch(self):
@@ -569,23 +539,21 @@ class TestHelpOtherBranch(unittest.TestCase):
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
 
-        # Create one branch with free chunks.
+        # Create one branch with free candidates.
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             # Exclude the only branch — nothing else to help.
             result = w._help_other_branch(key_a)
         finally:
             w.close()
 
-        # Should return False (the only branch was excluded).
+        # Should return False (the only available branch was excluded).
         self.assertFalse(result)
 
 

@@ -45,10 +45,10 @@ CREATE INDEX IF NOT EXISTS idx_pending_status_pri_n
     ON pending_branches(status, priority DESC, n_words DESC);
 
 -- One row per worker, overwritten each heartbeat.  In the swarm model a
--- worker is a fungible contributor: it reports which branch and chunk it is
+-- worker is a fungible contributor: it reports which branch and claim it is
 -- on purely so the operator can see it is alive and moving (health), not as
 -- the unit of progress (that lives in active_branches).  The metric columns
--- (cache_hits/misses, n_cutoff/n_pruned/n_ok, cand_rate) let `status` aggregate
+-- (cache_hits/misses, n_cutoff/n_pruned/n_ok) let `status` aggregate
 -- cache effectiveness and branch-and-bound pruning across all workers.
 CREATE TABLE IF NOT EXISTS worker_heartbeat (
     worker_id          TEXT    PRIMARY KEY,
@@ -57,10 +57,10 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     n_words            INTEGER,
     started_at         INTEGER,
     updated_at         INTEGER NOT NULL,
-    chunks_done        INTEGER NOT NULL DEFAULT 0,
-    chunk_idx          INTEGER,     -- chunk currently held
-    chunk_started_at   INTEGER,     -- when it was claimed (held-time = now - this)
-    cand_rate          REAL,        -- candidates/sec, recent
+    claims_done        INTEGER NOT NULL DEFAULT 0,
+    claim_idx          INTEGER,     -- candidate index currently held
+    claim_started_at   INTEGER,     -- when it was claimed (held-time = now - this)
+    cand_rate          REAL,        -- candidates/sec, recent (legacy; see node_rate)
     cache_hits         INTEGER,
     cache_misses       INTEGER,
     n_cutoff           INTEGER,     -- alpha-beta: cost >= best_erd before full eval
@@ -70,8 +70,8 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     best_erd           REAL,        -- ERD of the locally-found best candidate
     bound_erd          REAL,        -- effective pruning bound: min(local, shared)
     cur_candidate      TEXT,        -- candidate word currently under evaluation
-    cand_n_seen        INTEGER,     -- candidates evaluated so far in this chunk
-    cand_chunk_size    INTEGER,     -- total candidates in this chunk
+    cand_n_seen        INTEGER,     -- reserved (always 1 with single-candidate claims)
+    claim_total        INTEGER,     -- reserved (always 1 with single-candidate claims)
     cur_max_depth      INTEGER,     -- deepest recursion level in current candidate
     cur_nodes          INTEGER,     -- monotonic node counter (forward-progress)
     node_rate          REAL,        -- nodes/sec since last heartbeat
@@ -84,41 +84,42 @@ CREATE TABLE IF NOT EXISTS run_meta (
 );
 
 -- A branch currently being solved cooperatively by one or more workers, each
--- evaluating a disjoint chunk (slice) of the ranked candidate guesses.
+-- evaluating a disjoint set of candidates from the policy-canonical list.
 -- best_erd is the running-minimum cost across all candidates tried so far: it
 -- only ever decreases and is a real achieved value, so any worker may read it
 -- as a branch-and-bound bound.  status open -> finalized exactly once, by the
--- worker that observes full chunk coverage; that worker writes the branch's
--- ERD entry to the persistent cache, then the row (and its chunks) is deleted.
--- Candidate order is NOT stored: rank_candidates_by_max_group_size_then_entropy_gain is
--- deterministic, so every worker re-ranks locally and agrees on which
--- candidates chunk i covers, sharing the work through the candidate_scores cache.
+-- worker that observes full candidate coverage; that worker writes the branch's
+-- ERD entry to the persistent cache, then the row (and its claims) is deleted.
+-- Claim order is by all_words (file) index for ERD_ALL: each worker claims one
+-- candidate index at a time from {0..n_candidates-1}; no ranking required.
 CREATE TABLE IF NOT EXISTS active_branches (
     branch_key     BLOB    PRIMARY KEY,
     n_words        INTEGER NOT NULL,
     n_candidates   INTEGER NOT NULL,
-    chunk_size     INTEGER NOT NULL,
+    chunk_size     INTEGER NOT NULL DEFAULT 1,  -- always 1; retained for migration compat
     priority       INTEGER NOT NULL DEFAULT 0,
     source_word    TEXT,
     source_pattern INTEGER,
     best_erd       REAL,
-    best_guess      TEXT,
+    best_guess     TEXT,
     status         TEXT    NOT NULL DEFAULT 'open',
     created_at     INTEGER,
     finalized_at   INTEGER,
-    depth          INTEGER NOT NULL DEFAULT 0
+    depth          INTEGER NOT NULL DEFAULT 0,
+    nodes_spent    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
     ON active_branches(status, priority DESC, n_words DESC);
 
--- One row per claimed candidate chunk of a branch.  A row's existence is an
--- ADVISORY claim ("a worker is probably evaluating this slice"); only done=1
--- is AUTHORITATIVE ("this slice is fully evaluated and folded into best_erd").
--- Coverage = all chunks with done=1.  A crashed worker leaves a done=0 row
--- that stale-reclaim deletes, turning the slice back into an unclaimed gap to
--- be redone — never skipped.
-CREATE TABLE IF NOT EXISTS branch_chunks (
+-- One row per claimed candidate of a branch.  A row's existence is an
+-- ADVISORY claim ("a worker is probably evaluating this candidate"); only
+-- done=1 is AUTHORITATIVE ("fully evaluated and folded into best_erd").
+-- Coverage = all n_candidates slots with done=1.  A crashed worker leaves a
+-- done=0 row that stale-reclaim deletes, turning it back into an unclaimed
+-- gap to be redone — never skipped.
+-- idx = index into the policy-canonical candidate list (all_words for ERD_ALL).
+CREATE TABLE IF NOT EXISTS candidate_claims (
     branch_key BLOB    NOT NULL,
     idx        INTEGER NOT NULL,
     claimed_by TEXT,
@@ -126,6 +127,42 @@ CREATE TABLE IF NOT EXISTS branch_chunks (
     done       INTEGER NOT NULL DEFAULT 0,
     done_at    INTEGER,
     PRIMARY KEY (branch_key, idx)
+);
+
+-- Per-size-bucket online cost model (time-weighted geometric mean of
+-- recursion-node cost).  Keyed by (policy, size_bucket) so ERD_ALL and
+-- ERD_ANSWERS models never cross-contaminate.
+CREATE TABLE IF NOT EXISTS cost_model (
+    policy           TEXT    NOT NULL,
+    size_bucket      INTEGER NOT NULL,
+    weighted_log_sum REAL    NOT NULL DEFAULT 0,
+    weight_sum       REAL    NOT NULL DEFAULT 0,
+    weighted_log_sq  REAL    NOT NULL DEFAULT 0,
+    last_updated     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (policy, size_bucket)
+);
+
+-- Raw per-solve samples for offline distribution analysis and threshold tuning.
+CREATE TABLE IF NOT EXISTS cost_samples (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy      TEXT    NOT NULL,
+    n_words     INTEGER NOT NULL,
+    nodes       INTEGER NOT NULL,
+    wall_nanos  INTEGER,
+    source      TEXT,        -- 'inline', 'finalize', or 'probe'
+    recorded_at INTEGER NOT NULL
+);
+
+-- Outbound-only coordination telemetry for offline clustering-decision analysis.
+-- Never read by any runtime control path; freely droppable.
+CREATE TABLE IF NOT EXISTS claim_telemetry (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    n_words            INTEGER NOT NULL,
+    coordination_nanos INTEGER NOT NULL,
+    work_nodes         INTEGER NOT NULL,
+    claim_retries      INTEGER,
+    worker_count       INTEGER,
+    recorded_at        INTEGER NOT NULL
 );
 """
 
@@ -162,6 +199,11 @@ class ERDQueue:
 
         existing_hb = {r['name'] for r in
                        self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
+        # For columns that will be renamed below, skip adding the old name when
+        # the new name already exists (fresh schema already has the new name).
+        _hb_renamed = {'chunks_done': 'claims_done', 'chunk_idx': 'claim_idx',
+                       'chunk_started_at': 'claim_started_at',
+                       'cand_chunk_size': 'claim_total'}
         for col, defn in [('chunks_done',      'INTEGER'),
                           ('chunk_idx',        'INTEGER'),
                           ('chunk_started_at', 'INTEGER'),
@@ -181,7 +223,8 @@ class ERDQueue:
                           ('cur_nodes',        'INTEGER'),
                           ('node_rate',        'REAL'),
                           ('cur_path',         'TEXT')]:
-            if col not in existing_hb:  # pragma: migration
+            new_name = _hb_renamed.get(col)
+            if col not in existing_hb and (new_name is None or new_name not in existing_hb):  # pragma: migration
                 self._conn.execute(
                     f'ALTER TABLE worker_heartbeat ADD COLUMN {col} {defn}')
 
@@ -228,6 +271,34 @@ class ERDQueue:
         if 'best_word' in existing_hb and 'best_guess' not in existing_hb:  # pragma: migration
             self._conn.execute(
                 'ALTER TABLE worker_heartbeat RENAME COLUMN best_word TO best_guess')
+
+        # Rename branch_chunks -> candidate_claims.  The schema creates
+        # candidate_claims (empty) first; drop that shell before renaming so
+        # existing claim rows survive.
+        tables = {r['name'] for r in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'branch_chunks' in tables:  # pragma: migration
+            self._conn.execute('DROP TABLE IF EXISTS candidate_claims')
+            self._conn.execute(
+                'ALTER TABLE branch_chunks RENAME TO candidate_claims')
+
+        # Rename worker_heartbeat coordination columns to claim vocabulary.
+        existing_hb = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
+        for old, new in [('chunks_done',      'claims_done'),
+                         ('chunk_idx',        'claim_idx'),
+                         ('chunk_started_at', 'claim_started_at'),
+                         ('cand_chunk_size',  'claim_total')]:
+            if old in existing_hb:  # pragma: migration
+                self._conn.execute(
+                    f'ALTER TABLE worker_heartbeat RENAME COLUMN {old} TO {new}')
+
+        # Add nodes_spent to active_branches for cost-model sampling.
+        existing_ab = {r['name'] for r in
+                       self._conn.execute('PRAGMA table_info(active_branches)')}
+        if 'nodes_spent' not in existing_ab:  # pragma: migration
+            self._conn.execute(
+                'ALTER TABLE active_branches ADD COLUMN nodes_spent INTEGER NOT NULL DEFAULT 0')
 
     def close(self):
         self._conn.close()
@@ -339,26 +410,26 @@ class ERDQueue:
 
     def heartbeat(self, worker_id: str, pid: int,
                   current_branch_key, n_words, started_at: int,
-                  chunks_done: int, chunk_idx=None, chunk_started_at=None,
+                  claims_done: int, claim_idx=None, claim_started_at=None,
                   cand_rate=None, cache_hits=None, cache_misses=None,
                   n_cutoff=None, n_pruned=None, n_ok=None,
                   best_guess=None, best_erd=None, bound_erd=None,
-                  cur_candidate=None, cand_n_seen=None, cand_chunk_size=None,
+                  cur_candidate=None, cand_n_seen=None, claim_total=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
                   cur_path=None):
         now = int(time.time())
         self._conn.execute("""
             INSERT OR REPLACE INTO worker_heartbeat
                 (worker_id, pid, current_branch_key, n_words, started_at,
-                 updated_at, chunks_done, chunk_idx, chunk_started_at,
+                 updated_at, claims_done, claim_idx, claim_started_at,
                  cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
-                 best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+                 best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
                  cur_max_depth, cur_nodes, node_rate, cur_path)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_key, n_words, started_at,
-              now, chunks_done, chunk_idx, chunk_started_at,
+              now, claims_done, claim_idx, claim_started_at,
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
-              best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, cand_chunk_size,
+              best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
               cur_max_depth, cur_nodes, node_rate, cur_path))
 
     def clear_heartbeat(self, worker_id: str):
@@ -396,58 +467,26 @@ class ERDQueue:
     # Branch swarm: cooperative candidate-level solve of one branch
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def chunk_size_for(n_words, n_candidates,
-                       min_words_per_chunk=3, max_chunk_count=256) -> int:
-        """Candidates-per-chunk for a branch, from its difficulty (n_words).
-
-        Candidates are ranked best-first, so the early chunks hold the
-        expensive (fully-recursed) candidates and the tail is cheap (pruned by
-        the shared bound).  Easy branches (few words) become a single chunk so
-        one worker disposes of them without coordination overhead; hard
-        branches are cut into many chunks so the expensive head spreads across
-        workers.
-
-        n_chunks = clamp(ceil(n_words / min_words_per_chunk), 1, max_chunk_count)
-        chunk_size = ceil(n_candidates / n_chunks)
-
-        min_words_per_chunk controls granularity: lower values produce more
-        chunks and more worker sharing on hard branches.  max_chunk_count caps
-        the total chunk count regardless of branch size.  When both are
-        supplied and conflict, max_chunk_count wins (chunks become larger).
-        """
-        n_chunks = max(1, min(max_chunk_count, -(-n_words // min_words_per_chunk)))
-        return -(-n_candidates // n_chunks)
-
-    @staticmethod
-    def n_chunks_for(n_candidates: int, chunk_size: int) -> int:
-        return (n_candidates + chunk_size - 1) // chunk_size
-
-    @staticmethod
-    def chunk_range(idx: int, chunk_size: int, n_candidates: int):
-        lo = idx * chunk_size
-        hi = min(lo + chunk_size, n_candidates)
-        return lo, hi
-
-    def create_branch(self, branch_key, n_words, n_candidates, chunk_size,
+    def create_branch(self, branch_key, n_words, n_candidates,
                       priority=0, source_word=None, source_pattern=None,
                       budget=None, depth=0) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
         from the queue creates it; others that race simply see it exists and
-        join.  Returns True if this call created the row.  budget is the guess
-        budget the branch is solved under (depth-limited ERD).  depth is the
-        cooperative nesting level: 0 for user-queued branches, 1 for branches
-        promoted inside cooperative_solve, 2 for their sub-branches, etc.
+        join.  Returns True if this call created the row.  n_candidates is the
+        total claim slot count (one slot per candidate in the policy-canonical
+        list).  budget is the guess budget for depth-limited ERD.  depth is
+        the cooperative nesting level: 0 for user-queued branches, 1+ for
+        branches promoted inside cooperative_solve.
         """
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
                 (branch_key, n_words, n_candidates, chunk_size,
                  priority, source_word, source_pattern, status, created_at, budget, depth)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
-        """, (branch_key, n_words, n_candidates, chunk_size,
+            VALUES (?, ?, ?, 1, ?, ?, ?, 'open', ?, ?, ?)
+        """, (branch_key, n_words, n_candidates,
               priority, source_word, source_pattern, now, budget, depth))
         return cur.rowcount == 1
 
@@ -456,22 +495,21 @@ class ERDQueue:
             "SELECT * FROM active_branches WHERE branch_key = ?",
             (branch_key,)).fetchone()
 
-    def claim_chunk(self, branch_key, worker_id, n_chunks):
-        """Atomically claim the lowest-indexed chunk that has no row yet.
+    def claim_candidate(self, branch_key, worker_id, n_candidates):
+        """Atomically claim the lowest-indexed candidate slot that has no row yet.
 
-        A chunk with an existing row is either in-flight (done=0) or complete
+        A slot with an existing row is either in-flight (done=0) or complete
         (done=1); either way it isn't re-handed-out here.  Stale done=0 rows
-        are freed by reclaim_stale_chunks, which deletes them so they reappear
-        as gaps.  Returns the chunk idx, or None if every chunk already has a
-        row (this branch is fully claimed — the worker should look elsewhere,
-        NEVER block).
+        are freed by reclaim_stale_claims, which deletes them so they reappear
+        as gaps.  Returns the claimed idx (= index into the policy-canonical
+        candidate list), or None if every slot already has a row (fully claimed
+        — the worker should look elsewhere, NEVER block).
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            # Never hand out (and thereby re-create) a chunk for a branch that
-            # has been finalized and deleted: a worker still looping on it would
-            # otherwise redo the whole branch from scratch.  Checked inside the
-            # write transaction so it can't race the finalize+delete.
+            # Never hand out a claim for a branch that has been finalized and
+            # deleted: a worker still looping would otherwise redo it from scratch.
+            # Checked inside the write transaction so it can't race finalize+delete.
             br = self._conn.execute(
                 "SELECT status FROM active_branches WHERE branch_key = ?",
                 (branch_key,)).fetchone()
@@ -479,10 +517,10 @@ class ERDQueue:
                 self._conn.execute("COMMIT")
                 return None
             taken = {r["idx"] for r in self._conn.execute(
-                "SELECT idx FROM branch_chunks WHERE branch_key = ?",
+                "SELECT idx FROM candidate_claims WHERE branch_key = ?",
                 (branch_key,))}
             idx = None
-            for c in range(n_chunks):
+            for c in range(n_candidates):
                 if c not in taken:
                     idx = c
                     break
@@ -491,7 +529,7 @@ class ERDQueue:
                 return None
             now = int(time.time())
             self._conn.execute("""
-                INSERT INTO branch_chunks
+                INSERT INTO candidate_claims
                     (branch_key, idx, claimed_by, claimed_at, done)
                 VALUES (?, ?, ?, ?, 0)
             """, (branch_key, idx, worker_id, now))
@@ -501,11 +539,11 @@ class ERDQueue:
             self._conn.execute("ROLLBACK")
             raise
 
-    def complete_chunk(self, branch_key, idx):
-        """Mark a chunk authoritatively complete (done=1)."""
+    def complete_candidate(self, branch_key, idx):
+        """Mark a candidate claim authoritatively complete (done=1)."""
         now = int(time.time())
         self._conn.execute("""
-            UPDATE branch_chunks SET done = 1, done_at = ?
+            UPDATE candidate_claims SET done = 1, done_at = ?
             WHERE branch_key = ? AND idx = ?
         """, (now, branch_key, idx))
 
@@ -551,9 +589,9 @@ class ERDQueue:
         return (row["best_guess"], row["best_erd"], row["best_max_depth"],
                 bool(row["tainted"]), row["budget"])
 
-    def branch_done_chunks(self, branch_key) -> int:
+    def branch_done_candidates(self, branch_key) -> int:
         return self._conn.execute(
-            "SELECT COUNT(*) FROM branch_chunks WHERE branch_key = ? AND done = 1",
+            "SELECT COUNT(*) FROM candidate_claims WHERE branch_key = ? AND done = 1",
             (branch_key,)).fetchone()[0]
 
     def try_finalize_branch(self, branch_key) -> bool:
@@ -572,28 +610,27 @@ class ERDQueue:
         return cur.rowcount == 1
 
     def delete_branch(self, branch_key):
-        """Remove a finished branch and its chunk rows to bound the queue DB."""
+        """Remove a finished branch and its claim rows to bound the queue DB."""
         self._conn.execute(
-            "DELETE FROM branch_chunks WHERE branch_key = ?", (branch_key,))
+            "DELETE FROM candidate_claims WHERE branch_key = ?", (branch_key,))
         self._conn.execute(
             "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
 
-    def reclaim_stale_chunks(self, heartbeat_timeout_seconds: int,
+    def reclaim_stale_claims(self, heartbeat_timeout_seconds: int,
                              min_claim_age_seconds: int = None) -> int:
-        """Free in-flight (done=0) chunk claims whose worker is no longer alive.
+        """Free in-flight (done=0) candidate claims whose worker is no longer alive.
 
         Liveness is proved by the worker's heartbeat (worker_heartbeat.updated_at,
-        refreshed every couple of seconds while it works).  A done=0 chunk is
+        refreshed every couple of seconds while it works).  A done=0 claim is
         reclaimed only when its claiming worker has NOT heartbeat within
-        heartbeat_timeout_seconds — i.e. it has crashed or hung.  Crucially, a
-        slow-but-alive worker (one still heartbeating) is never reclaimed: doing
-        so would let a second worker re-evaluate the same slice and finalize the
-        branch BEFORE the original folds in a better candidate, writing a
-        suboptimal ERD to the permanent cache.
+        heartbeat_timeout_seconds — i.e. it has crashed or hung.  A slow-but-alive
+        worker (still heartbeating) is never reclaimed: doing so would let a
+        second worker re-evaluate the same candidate and finalize the branch BEFORE
+        the original folds in a better result, writing a suboptimal ERD to cache.
 
         min_claim_age_seconds (default: heartbeat_timeout_seconds) is a floor on
-        claim age, so a freshly claimed chunk isn't reclaimed in the brief window
-        before its worker's first heartbeat lands.  done=1 rows are never
+        claim age, so a freshly claimed candidate isn't reclaimed in the brief
+        window before its worker's first heartbeat lands.  done=1 rows are never
         touched.  Returns the number of claims freed.
         """
         now = int(time.time())
@@ -602,7 +639,7 @@ class ERDQueue:
                            if min_claim_age_seconds is not None
                            else heartbeat_timeout_seconds)
         self._conn.execute("""
-            DELETE FROM branch_chunks
+            DELETE FROM candidate_claims
             WHERE done = 0
               AND claimed_at < ?
               AND claimed_by NOT IN (
@@ -612,16 +649,16 @@ class ERDQueue:
         """, (age_floor, hb_cutoff))
         return self._conn.execute("SELECT changes()").fetchone()[0]
 
-    def reclaim_chunks_of_worker(self, worker_id: str) -> int:
-        """Free all in-flight (done=0) chunk claims held by a specific worker.
+    def reclaim_claims_of_worker(self, worker_id: str) -> int:
+        """Free all in-flight (done=0) candidate claims held by a specific worker.
 
         Called by the supervisor when it kills/respawns a worker, so that
-        instance's chunks are freed deterministically BEFORE a replacement of
+        instance's claims are freed deterministically BEFORE a replacement of
         the same name starts heartbeating (which would otherwise make the dead
         instance's claims look live again).  done=1 rows are never touched.
         """
         self._conn.execute(
-            "DELETE FROM branch_chunks WHERE done = 0 AND claimed_by = ?",
+            "DELETE FROM candidate_claims WHERE done = 0 AND claimed_by = ?",
             (worker_id,))
         return self._conn.execute("SELECT changes()").fetchone()[0]
 
@@ -653,16 +690,16 @@ class ERDQueue:
         nb = self._conn.execute(
             "SELECT COUNT(*) FROM active_branches WHERE depth = 0").fetchone()[0]
         nc = self._conn.execute(
-            "SELECT COUNT(*) FROM branch_chunks WHERE branch_key IN "
+            "SELECT COUNT(*) FROM candidate_claims WHERE branch_key IN "
             "(SELECT branch_key FROM active_branches WHERE depth = 0)").fetchone()[0]
         self._conn.execute(
-            "DELETE FROM branch_chunks WHERE branch_key IN "
+            "DELETE FROM candidate_claims WHERE branch_key IN "
             "(SELECT branch_key FROM active_branches WHERE depth = 0)")
         self._conn.execute("DELETE FROM active_branches WHERE depth = 0")
         # Free stale in-flight claims on cooperative branches so their
-        # remaining chunks are reclaimable as gaps.
+        # remaining candidates are reclaimable as gaps.
         self._conn.execute(
-            "DELETE FROM branch_chunks WHERE done = 0")
+            "DELETE FROM candidate_claims WHERE done = 0")
         return nb, nc
 
     def worker_counts_by_branch(self, timeout_seconds: int = 30) -> dict:
@@ -702,7 +739,7 @@ class ERDQueue:
         The persistent cache (wordle_cache.sqlite3) is not touched — only
         the transient coordination tables in erd_queue.sqlite3.
         """
-        self._conn.execute("DELETE FROM branch_chunks")
+        self._conn.execute("DELETE FROM candidate_claims")
         self._conn.execute("DELETE FROM active_branches")
         self._conn.execute("DELETE FROM pending_branches")
         self._conn.execute("DELETE FROM worker_heartbeat")
@@ -757,10 +794,10 @@ class ERDQueue:
             (branch_key,)
         ).fetchone()
 
-    def chunks_for_branch(self, branch_key: bytes):
-        """Return all branch_chunks rows for branch_key."""
+    def claims_for_branch(self, branch_key: bytes):
+        """Return all candidate_claims rows for branch_key."""
         return self._conn.execute(
-            "SELECT * FROM branch_chunks WHERE branch_key = ? ORDER BY idx",
+            "SELECT * FROM candidate_claims WHERE branch_key = ? ORDER BY idx",
             (branch_key,)
         ).fetchall()
 
@@ -778,7 +815,7 @@ class ERDQueue:
         self._conn.execute("BEGIN")
         try:
             self._conn.execute(
-                "DELETE FROM branch_chunks WHERE branch_key = ?", (branch_key,))
+                "DELETE FROM candidate_claims WHERE branch_key = ?", (branch_key,))
             self._conn.execute(
                 "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
             if remove_from_queue:

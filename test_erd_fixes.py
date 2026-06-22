@@ -1,8 +1,8 @@
 """Tests for the parallel-ERD-infra correctness fixes:
 
-- liveness-gated chunk reclaim (a slow-but-alive worker is never reclaimed;
-  a dead worker's chunk is freed),
-- per-worker chunk reclaim used by the supervisor on respawn,
+- liveness-gated candidate claim reclaim (a slow-but-alive worker is never
+  reclaimed; a dead worker's claim is freed),
+- per-worker claim reclaim used by the supervisor on respawn,
 - merge_cache preferring an untainted entry over a tainted one,
 - backfill_max_depth not clobbering a worker's fresh solve_budget,
 - _multistep_stats keying response groups consistently with/without a cache.
@@ -38,60 +38,58 @@ class TestReclaimLiveness(_TmpDB, unittest.TestCase):
         self.addCleanup(self.q.close)
         self.key = ScoreCache.encode_subset(WORDS)
 
-    def _insert_chunk(self, worker, claimed_at, done=0):
+    def _insert_claim(self, worker, claimed_at, done=0, idx=0):
         self.q._conn.execute(
-            "INSERT INTO branch_chunks (branch_key, idx, claimed_by, claimed_at, done) "
-            "VALUES (?, 0, ?, ?, ?)", (self.key, worker, claimed_at, done))
+            "INSERT INTO candidate_claims (branch_key, idx, claimed_by, claimed_at, done) "
+            "VALUES (?, ?, ?, ?, ?)", (self.key, idx, worker, claimed_at, done))
 
-    def _n_chunks(self):
+    def _n_claims(self):
         return self.q._conn.execute(
-            "SELECT COUNT(*) FROM branch_chunks").fetchone()[0]
+            "SELECT COUNT(*) FROM candidate_claims").fetchone()[0]
 
-    def test_live_worker_chunk_not_reclaimed(self):
+    def test_live_worker_claim_not_reclaimed(self):
         now = int(time.time())
-        self._insert_chunk("worker-1", claimed_at=now - 1000)  # an old claim
+        self._insert_claim("worker-1", claimed_at=now - 1000)  # an old claim
         # ...but the worker is alive: it heartbeat just now.
         self.q.heartbeat("worker-1", pid=1, current_branch_key=self.key,
-                         n_words=5, started_at=now, chunks_done=0)
-        freed = self.q.reclaim_stale_chunks(heartbeat_timeout_seconds=120)
+                         n_words=5, started_at=now, claims_done=0)
+        freed = self.q.reclaim_stale_claims(heartbeat_timeout_seconds=120)
         self.assertEqual(freed, 0)
-        self.assertEqual(self._n_chunks(), 1)
+        self.assertEqual(self._n_claims(), 1)
 
-    def test_dead_worker_chunk_reclaimed(self):
+    def test_dead_worker_claim_reclaimed(self):
         now = int(time.time())
-        self._insert_chunk("worker-2", claimed_at=now - 1000)
+        self._insert_claim("worker-2", claimed_at=now - 1000)
         # Worker heartbeat is stale (>120s old) → presumed dead.
         self.q.heartbeat("worker-2", pid=1, current_branch_key=self.key,
-                         n_words=5, started_at=now, chunks_done=0)
+                         n_words=5, started_at=now, claims_done=0)
         self.q._conn.execute(
             "UPDATE worker_heartbeat SET updated_at = ? WHERE worker_id = 'worker-2'",
             (now - 1000,))
-        freed = self.q.reclaim_stale_chunks(heartbeat_timeout_seconds=120)
+        freed = self.q.reclaim_stale_claims(heartbeat_timeout_seconds=120)
         self.assertEqual(freed, 1)
-        self.assertEqual(self._n_chunks(), 0)
+        self.assertEqual(self._n_claims(), 0)
 
-    def test_no_heartbeat_chunk_reclaimed(self):
+    def test_no_heartbeat_claim_reclaimed(self):
         now = int(time.time())
-        self._insert_chunk("worker-3", claimed_at=now - 1000)  # never heartbeat
-        freed = self.q.reclaim_stale_chunks(heartbeat_timeout_seconds=120)
+        self._insert_claim("worker-3", claimed_at=now - 1000)  # never heartbeat
+        freed = self.q.reclaim_stale_claims(heartbeat_timeout_seconds=120)
         self.assertEqual(freed, 1)
 
-    def test_done_chunk_never_reclaimed(self):
+    def test_done_claim_never_reclaimed(self):
         now = int(time.time())
-        self._insert_chunk("worker-4", claimed_at=now - 1000, done=1)
-        freed = self.q.reclaim_stale_chunks(heartbeat_timeout_seconds=120)
+        self._insert_claim("worker-4", claimed_at=now - 1000, done=1)
+        freed = self.q.reclaim_stale_claims(heartbeat_timeout_seconds=120)
         self.assertEqual(freed, 0)
-        self.assertEqual(self._n_chunks(), 1)
+        self.assertEqual(self._n_claims(), 1)
 
-    def test_reclaim_chunks_of_worker(self):
+    def test_reclaim_claims_of_worker(self):
         now = int(time.time())
-        self._insert_chunk("worker-5", claimed_at=now, done=0)
-        self.q._conn.execute(
-            "INSERT INTO branch_chunks (branch_key, idx, claimed_by, claimed_at, done) "
-            "VALUES (?, 1, 'worker-5', ?, 1)", (self.key, now))  # done=1, keep
-        freed = self.q.reclaim_chunks_of_worker("worker-5")
+        self._insert_claim("worker-5", claimed_at=now, done=0, idx=0)
+        self._insert_claim("worker-5", claimed_at=now, done=1, idx=1)  # done=1, keep
+        freed = self.q.reclaim_claims_of_worker("worker-5")
         self.assertEqual(freed, 1)  # only the done=0 row
-        self.assertEqual(self._n_chunks(), 1)
+        self.assertEqual(self._n_claims(), 1)
 
 
 class TestMergeUntaintedWins(_TmpDB, unittest.TestCase):
