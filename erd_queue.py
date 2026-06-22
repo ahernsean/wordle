@@ -96,7 +96,6 @@ CREATE TABLE IF NOT EXISTS active_branches (
     branch_key     BLOB    PRIMARY KEY,
     n_words        INTEGER NOT NULL,
     n_candidates   INTEGER NOT NULL,
-    chunk_size     INTEGER NOT NULL DEFAULT 1,  -- always 1; retained for migration compat
     priority       INTEGER NOT NULL DEFAULT 0,
     source_word    TEXT,
     source_pattern INTEGER,
@@ -105,6 +104,9 @@ CREATE TABLE IF NOT EXISTS active_branches (
     status         TEXT    NOT NULL DEFAULT 'open',
     created_at     INTEGER,
     finalized_at   INTEGER,
+    budget         INTEGER,
+    best_max_depth INTEGER,
+    tainted        INTEGER NOT NULL DEFAULT 0,
     depth          INTEGER NOT NULL DEFAULT 0,
     nodes_spent    INTEGER NOT NULL DEFAULT 0
 );
@@ -178,127 +180,7 @@ class ERDQueue:
         self._migrate()
 
     def _migrate(self):
-        """Add columns and rename tables introduced after the initial schema."""
-        # Rename pending_subgroups -> pending_branches for databases predating
-        # this migration.  The schema creates pending_branches (empty) first;
-        # drop that shell before renaming so the old rows survive.
-        tables = {r['name'] for r in self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-        if 'pending_subgroups' in tables:  # pragma: migration
-            self._conn.execute('DROP TABLE IF EXISTS pending_branches')
-            self._conn.execute(
-                'ALTER TABLE pending_subgroups RENAME TO pending_branches')
-
-        existing = {r['name'] for r in
-                    self._conn.execute('PRAGMA table_info(pending_branches)')}
-        for col, defn in [('source_word', 'TEXT'),
-                          ('source_pattern', 'INTEGER')]:
-            if col not in existing:  # pragma: migration
-                self._conn.execute(
-                    f'ALTER TABLE pending_branches ADD COLUMN {col} {defn}')
-
-        existing_hb = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
-        # For columns that will be renamed below, skip adding the old name when
-        # the new name already exists (fresh schema already has the new name).
-        _hb_renamed = {'chunks_done': 'claims_done', 'chunk_idx': 'claim_idx',
-                       'chunk_started_at': 'claim_started_at',
-                       'cand_chunk_size': 'claim_total'}
-        for col, defn in [('chunks_done',      'INTEGER'),
-                          ('chunk_idx',        'INTEGER'),
-                          ('chunk_started_at', 'INTEGER'),
-                          ('cand_rate',        'REAL'),
-                          ('cache_hits',       'INTEGER'),
-                          ('cache_misses',     'INTEGER'),
-                          ('n_cutoff',         'INTEGER'),
-                          ('n_pruned',         'INTEGER'),
-                          ('n_ok',             'INTEGER'),
-                          ('best_guess',        'TEXT'),
-                          ('best_erd',         'REAL'),
-                          ('bound_erd',        'REAL'),
-                          ('cur_candidate',    'TEXT'),
-                          ('cand_n_seen',      'INTEGER'),
-                          ('cand_chunk_size',  'INTEGER'),
-                          ('cur_max_depth',    'INTEGER'),
-                          ('cur_nodes',        'INTEGER'),
-                          ('node_rate',        'REAL'),
-                          ('cur_path',         'TEXT')]:
-            new_name = _hb_renamed.get(col)
-            if col not in existing_hb and (new_name is None or new_name not in existing_hb):  # pragma: migration
-                self._conn.execute(
-                    f'ALTER TABLE worker_heartbeat ADD COLUMN {col} {defn}')
-
-        # Depth-limited ERD: each branch is solved at a guess budget; track the
-        # winner's worst-case line length (best_max_depth) and whether the cap
-        # excluded any candidate (tainted), aggregated across all workers.
-        existing_ab = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(active_branches)')}
-        for col, defn in [('budget',         'INTEGER'),
-                          ('best_max_depth', 'INTEGER'),
-                          ('tainted',        'INTEGER NOT NULL DEFAULT 0'),
-                          ('depth',          'INTEGER NOT NULL DEFAULT 0')]:
-            if col not in existing_ab:  # pragma: migration
-                self._conn.execute(
-                    f'ALTER TABLE active_branches ADD COLUMN {col} {defn}')
-
-        # Column renames from earlier terminology alignment: subset_key ->
-        # branch_key throughout; best_word -> best_guess; current_subset_key ->
-        # current_branch_key in worker_heartbeat.
-        existing_ps = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(pending_branches)')}
-        if 'subset_key' in existing_ps:  # pragma: migration
-            self._conn.execute(
-                'ALTER TABLE pending_branches RENAME COLUMN subset_key TO branch_key')
-        existing_ab = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(active_branches)')}
-        if 'subset_key' in existing_ab:  # pragma: migration
-            self._conn.execute(
-                'ALTER TABLE active_branches RENAME COLUMN subset_key TO branch_key')
-        if 'best_word' in existing_ab:  # pragma: migration
-            self._conn.execute(
-                'ALTER TABLE active_branches RENAME COLUMN best_word TO best_guess')
-        existing_bc = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(branch_chunks)')}
-        if 'subset_key' in existing_bc:  # pragma: migration
-            self._conn.execute(
-                'ALTER TABLE branch_chunks RENAME COLUMN subset_key TO branch_key')
-        existing_hb = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
-        if 'current_subset_key' in existing_hb:  # pragma: migration
-            self._conn.execute(
-                'ALTER TABLE worker_heartbeat '
-                'RENAME COLUMN current_subset_key TO current_branch_key')
-        if 'best_word' in existing_hb and 'best_guess' not in existing_hb:  # pragma: migration
-            self._conn.execute(
-                'ALTER TABLE worker_heartbeat RENAME COLUMN best_word TO best_guess')
-
-        # Rename branch_chunks -> candidate_claims.  The schema creates
-        # candidate_claims (empty) first; drop that shell before renaming so
-        # existing claim rows survive.
-        tables = {r['name'] for r in self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-        if 'branch_chunks' in tables:  # pragma: migration
-            self._conn.execute('DROP TABLE IF EXISTS candidate_claims')
-            self._conn.execute(
-                'ALTER TABLE branch_chunks RENAME TO candidate_claims')
-
-        # Rename worker_heartbeat coordination columns to claim vocabulary.
-        existing_hb = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(worker_heartbeat)')}
-        for old, new in [('chunks_done',      'claims_done'),
-                         ('chunk_idx',        'claim_idx'),
-                         ('chunk_started_at', 'claim_started_at'),
-                         ('cand_chunk_size',  'claim_total')]:
-            if old in existing_hb:  # pragma: migration
-                self._conn.execute(
-                    f'ALTER TABLE worker_heartbeat RENAME COLUMN {old} TO {new}')
-
-        # Add nodes_spent to active_branches for cost-model sampling.
-        existing_ab = {r['name'] for r in
-                       self._conn.execute('PRAGMA table_info(active_branches)')}
-        if 'nodes_spent' not in existing_ab:  # pragma: migration
-            self._conn.execute(
-                'ALTER TABLE active_branches ADD COLUMN nodes_spent INTEGER NOT NULL DEFAULT 0')
+        pass
 
     def close(self):
         self._conn.close()
@@ -483,9 +365,9 @@ class ERDQueue:
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
-                (branch_key, n_words, n_candidates, chunk_size,
+                (branch_key, n_words, n_candidates,
                  priority, source_word, source_pattern, status, created_at, budget, depth)
-            VALUES (?, ?, ?, 1, ?, ?, ?, 'open', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
         """, (branch_key, n_words, n_candidates,
               priority, source_word, source_pattern, now, budget, depth))
         return cur.rowcount == 1
@@ -670,22 +552,21 @@ class ERDQueue:
         """).fetchall()
 
     def reset_active_branches(self):
-        """Drop in-progress D-0 branch state; reclaim stale cooperative chunks.
+        """Drop in-progress D-0 branch state; free stale cooperative claims.
 
         D-0 branches have pending_branches rows that reset_stale_in_progress()
         already flipped back to 'pending', so wiping their active_branches and
-        chunk rows just discards half-done coordination — they re-promote and
+        claim rows just discards half-done coordination — they re-promote and
         redo cleanly.
 
         Cooperative branches (depth>0) have NO pending_branches row — they are
         inserted directly into active_branches by cooperative_solve.  Wiping
-        them throws away all partial-chunk progress with no recovery path.
-        Instead, only free their stale in-flight claims (done=0 chunk rows);
-        done=1 rows (completed chunks) and the branch row itself survive, so
-        the next worker to join picks up exactly where the killed worker left
-        off.
+        them throws away all partial-claim progress with no recovery path.
+        Instead, only free their stale in-flight claims (done=0 rows);
+        done=1 rows and the branch row itself survive, so the next worker to
+        join picks up exactly where the killed worker left off.
 
-        Returns (n_branches, n_chunks) cleared for D-0 branches only.
+        Returns (n_branches, n_claims) cleared for D-0 branches only.
         """
         nb = self._conn.execute(
             "SELECT COUNT(*) FROM active_branches WHERE depth = 0").fetchone()[0]
@@ -806,7 +687,7 @@ class ERDQueue:
         """Atomically remove a branch's chunk claims and active_branches row.
 
         All DELETEs run in one transaction so a crash partway through cannot
-        leave orphaned branch_chunks rows or a dangling active_branches row.
+        leave orphaned candidate_claims rows or a dangling active_branches row.
 
         With remove_from_queue=True, also deletes the pending_branches row
         (regardless of its status), fully removing the branch from the queue in
@@ -845,7 +726,7 @@ class ERDQueue:
         """Delete a pending (status='pending') branch from the queue.
 
         Returns True if a row was deleted.  Does not touch active_branches or
-        branch_chunks — call reset_active_branches() first if the branch is
+        candidate_claims — call reset_active_branches() first if the branch is
         currently in progress.
         """
         self._conn.execute(
