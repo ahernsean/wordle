@@ -1,12 +1,11 @@
 # Adaptive work decomposition for the ERD swarm
 
-> **Executor note.** This plan is written to be executed by an agent with an
-> empty context window. It cites code by **symbol name first**; any line numbers
-> are **approximate** (the tree drifts) — navigate by searching for the named
-> function/table/column. Run the full test suite (`python -m unittest discover -s
-> . -p 'test_*.py'`) green before every commit, per `CLAUDE.md`. The
-> `erd_queue.sqlite3` schema is Linux-only; all its migrations are idempotent and
-> need no phone coordination (unlike `wordle_cache.sqlite3`).
+> **Conventions.** Code is cited by **symbol name first**; line numbers are
+> **approximate** — navigate by searching for the named function/table/column. Run
+> the full test suite (`python -m unittest discover -s . -p 'test_*.py'`) green
+> before every commit, per `CLAUDE.md`. The `erd_queue.sqlite3` schema is
+> Linux-only; all its migrations are idempotent and need no phone coordination
+> (unlike `wordle_cache.sqlite3`).
 
 ## Context
 
@@ -18,7 +17,7 @@ The ERD precache swarm decomposes work with two static, count-based guesses:
   candidate lands in chunk 0, so one worker monopolizes the costly work while
   others devour the cheap tail and stall.
 - **A hardcoded promotion size.** A sub-branch is promoted to cooperative solving
-  only when `len(words) >= PROMOTE_MIN_SIZE` (60), in `ERDSwarmWorker._subbranch_solver`.
+  only when `len(words) >= PROMOTE_MIN_SIZE` (60), in `_BranchWorker._subbranch_solver`.
   Once a sub-branch commits to inline solving, the engine grinds it to completion
   no matter how wrong that size estimate was — the source of multi-minute
   single-worker stalls.
@@ -57,9 +56,7 @@ coordination, and existing ERD pruning is preserved.
    something that was actually cheap) costs a few single-candidate claim
    transactions — cheap, and *measured* by `claim_telemetry`. A false negative (fail
    to promote a tarpit) is a single worker stalling for minutes — the exact bug
-   this project exists to kill. The asymmetry runs toward publishing eagerly. This
-   **reverses** the "lean toward under-promoting" stance of earlier drafts, which
-   was inconsistent with the problem statement.
+   this project exists to kill. The asymmetry runs toward publishing eagerly.
 
 4. **Telemetry is outbound-only.** `claim_telemetry` signals to an external
    monitor and to offline analysis. It is **never** a runtime feedback input. No
@@ -84,7 +81,7 @@ differently, and the names must say which.
 
 Replace the overloaded returns with **explicit, reason-named statuses**. Anchor on
 the `CLAUDE.md` rule: *a name must include all essential context.* Recommended
-spellings (executor may refine, but each must name the **reason**):
+spellings (may be refined, but each must name the **reason**):
 
 | Today (inferred) | Reason | Recommended status |
 |---|---|---|
@@ -95,8 +92,8 @@ spellings (executor may refine, but each must name the **reason**):
 | `(ceiling, None, _, True)` (`cutoff=True`) | every candidate priced ≥ the known ERD bound — *lower bound only, do not cache* | `OVER_ERD_LIMIT` |
 
 The two `return None` cases are detected at **separate sites** (the deadline
-comparison vs. the `cancel_check()` call), so they become two distinct statuses,
-not one lumped "aborted" — each names its own cause.
+comparison vs. the `cancel_check()` call), so each gets its own status naming its
+cause.
 
 `evaluate_candidate`'s status strings (`'ok'`, `'cutoff'`, `'pruned'`, `'useless'`,
 `'abort'`) get the same treatment: `'cutoff'` → `OVER_ERD_LIMIT`, `'pruned'` →
@@ -400,7 +397,7 @@ it stops being entry-promoted.
   costs, which are not the same quantity — a real solve prunes most of the tail once
   the bound is tight, so the naive `per_candidate_mean × n_candidates` extrapolation
   **systematically overestimates** the full-solve cost. Two acceptable ways to
-  reconcile, executor's choice:
+  reconcile (either is fine):
   - **(preferred) Don't fabricate a full-solve sample.** Seed the bucket with the
     over-estimate `per_candidate_mean × n_candidates` and **mark it provisional**
     (low weight, e.g. `weight_sum = 1`), so the first real inline-return / finalize
