@@ -6,30 +6,29 @@ they miss:
 
 - _heartbeat(): node-counter throttling (counter increments on every call even
   when the 2-second DB-write gate suppresses the actual write).
-- evaluate_chunk(): cancellation path (stop_event set → returns False without
-  completing the chunk).
+- evaluate_claim(): cancellation path (stop_event set → returns False without
+  completing the claim).
 - _subbranch_solver(): the inline-vs-promote branching decision.
 - _maybe_checkpoint(): force=True always triggers checkpoint; force=False with a
   recently-set timestamp does not.
 - cooperative_solve(): the cached-result fast path (result already in cache →
-  returns immediately without evaluating any chunks).
+  returns immediately without evaluating any candidates).
 """
 import multiprocessing
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET, PROMOTE_MIN_SIZE
 from cache_sqlite import ScoreCache
-from wordle_engine import ERD_ALL
+from wordle_engine import ERD_ALL, SOLVED, OVER_ERD_LIMIT
 from erd_queue import ERDQueue
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train"]
-DIVISOR = 3
-MAX_CHUNKS = 256
 
 
 def _bare_worker():
@@ -41,8 +40,9 @@ def _bare_worker():
     w = _BranchWorker.__new__(_BranchWorker)
     w.name = "worker-0"
     w.stop_event = None
+    w.all_words = CANDIDATES
     w.n_candidates = len(CANDIDATES)
-    w.chunks_done = 0
+    w.claims_done = 0
     w.n_ok = w.n_cutoff = w.n_pruned = w.n_useless = 0
     w._nodes = 0
     w._nodes_at_last_hb = 0
@@ -55,11 +55,24 @@ def _bare_worker():
     w._hb_max_spine = {}
     w._log_max_spine = {}
     w.started = 0
+    w._coop_depth = 0
+    w._top_source_word = None
+    w._top_source_pattern = None
+    w._adaptive = True
+    w._typical_cache = {}
+    w._cost_model_buffer = {}
+    w._word_idx = {word: i for i, word in enumerate(w.all_words)}
+    w._coord_ema = erd_swarm._LogEMA()
+    w._node_time_ema = erd_swarm._LogEMA()
+    w._mid_loop_publisher = erd_swarm._MidLoopPublisher(w)
+    w.n_workers = 1
+    w.rcache = mock.MagicMock()
     w.score_cache = mock.MagicMock()
     w.score_cache.read_hits = 0
     w.score_cache.read_misses = 0
     w.queue = mock.MagicMock()
     w.queue.read_branch_best.return_value = (None, None)
+    w.queue.get_cost_typical.return_value = None  # cold model by default
     return w
 
 
@@ -71,12 +84,12 @@ class TestHeartbeatThrottling(unittest.TestCase):
         branch_key = ScoreCache.encode_subset(BRANCH)
 
         # First call: force=True bypasses the time gate — DB write happens.
-        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, None, force=True)
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
         self.assertEqual(w._nodes, 1)
         self.assertEqual(w.queue.heartbeat.call_count, 1)
 
         # Second call: force=False, but _last_hb was just set so the gate fires.
-        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, None)
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None)
         self.assertEqual(w._nodes, 2)          # counter still incremented
         self.assertEqual(w.queue.heartbeat.call_count, 1)  # still only one DB write
 
@@ -87,12 +100,12 @@ class TestHeartbeatThrottling(unittest.TestCase):
         w._note_depth(1, 50)
         w._note_depth(2, 12)
         branch_key = ScoreCache.encode_subset(BRANCH)
-        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, None, force=True)
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
         self.assertEqual(w._hb_max_spine, {})
 
 
 class TestCancelPath(unittest.TestCase):
-    """evaluate_chunk returns False without completing the chunk when cancelled."""
+    """evaluate_claim returns False without completing the claim when cancelled."""
 
     def _make_cancel_worker(self):
         stop = multiprocessing.Event()
@@ -101,23 +114,18 @@ class TestCancelPath(unittest.TestCase):
         w.stop_event = stop
         return w
 
-    def test_evaluate_chunk_returns_false_when_stop_event_set(self):
+    def test_evaluate_claim_returns_false_when_stop_event_set(self):
         w = self._make_cancel_worker()
         branch_key = ScoreCache.encode_subset(BRANCH)
-        # ranked must be long enough that the range(lo, hi) loop is entered.
-        result = w.evaluate_chunk(
-            branch_key, BRANCH, len(BRANCH),
-            ranked=CANDIDATES, idx=0, chunk_size=5)
+        result = w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
         self.assertFalse(result)
 
-    def test_chunk_not_marked_complete_when_cancelled(self):
+    def test_claim_not_marked_complete_when_cancelled(self):
         w = self._make_cancel_worker()
         branch_key = ScoreCache.encode_subset(BRANCH)
-        w.evaluate_chunk(
-            branch_key, BRANCH, len(BRANCH),
-            ranked=CANDIDATES, idx=0, chunk_size=5)
-        # complete_chunk must NOT have been called (chunk left at done=0 for reclaim).
-        w.queue.complete_chunk.assert_not_called()
+        w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
+        # complete_candidate must NOT have been called (claim left done=0 for reclaim).
+        w.queue.complete_candidate.assert_not_called()
 
 
 class TestSubbranchSolver(unittest.TestCase):
@@ -236,18 +244,17 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
         sc.write(branch_key, ERD_ALL, "crane", 1.5, max_depth=2, solve_budget=None)
         sc.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.cooperative_solve(words, ROOT_BUDGET)
         finally:
             w.close()
 
         self.assertIsNotNone(result)
-        cost, max_depth, floor_hit, cutoff = result
+        status, cost, max_depth, budget_tainted = result
+        self.assertEqual(status, SOLVED)
         self.assertAlmostEqual(cost, 1.5)
         self.assertEqual(max_depth, 2)
-        self.assertFalse(cutoff)   # cooperative results are never cutoffs
 
         # No chunks should have been created — the cache hit short-circuited.
         q = ERDQueue(self.queue_path)
@@ -255,10 +262,11 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
         q.close()
 
 
-class TestSolveBranchFocusedPrecompletedChunks(unittest.TestCase):
-    """solve_branch_focused finalizes correctly when all chunks are already done
-    by other workers: claim_chunk returns None, branch_done_chunks >= n_chunks,
-    so the worker finalizes from the idx-is-None path (not via evaluate_chunk)."""
+class TestSolveBranchFocusedPrecompletedCandidates(unittest.TestCase):
+    """solve_branch_focused finalizes correctly when all candidates are already
+    done by other workers: claim_candidate returns None,
+    branch_done_candidates >= n_candidates, so the worker finalizes from the
+    idx-is-None path (not via evaluate_claim)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -279,30 +287,25 @@ class TestSolveBranchFocusedPrecompletedChunks(unittest.TestCase):
             f.write("\n".join(words) + "\n")
         return p
 
-    def test_finalizes_when_all_chunks_pre_completed(self):
+    def test_finalizes_when_all_candidates_pre_completed(self):
         from erd_queue import ERDQueue
-        # Create a 2-chunk branch and pre-mark both chunks as done (simulating
-        # two other workers that have already evaluated them).
+        # Pre-mark all candidate claims as done (simulating other workers that
+        # have already evaluated every candidate).
         branch_key = ScoreCache.encode_subset(BRANCH)
         ScoreCache(self.cache_path, BRANCH).close()  # initialise schema
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
-        self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
-        q.create_branch(branch_key, len(BRANCH), n_candidates, chunk_size)
-        # Simulate two other workers each completing one chunk.
-        for chunk_idx in range(n_chunks):
-            q.claim_chunk(branch_key, f"other-{chunk_idx}", n_chunks)
-            q.complete_chunk(branch_key, chunk_idx)
+        q.create_branch(branch_key, len(BRANCH), n_candidates)
+        for cand_idx in range(n_candidates):
+            q.claim_candidate(branch_key, f"other-{cand_idx}", n_candidates)
+            q.complete_candidate(branch_key, cand_idx)
         q.close()
 
-        # Our worker enters solve_branch_focused: claim_chunk → None (all done),
-        # branch_done_chunks >= n_chunks → maybe_finalize.  Since no best_guess was
-        # set (no update_branch_best calls), maybe_finalize treats it as a loss and
-        # deletes the branch without writing a cache entry.
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        # Our worker enters solve_branch_focused: claim_candidate → None (all done),
+        # branch_done_candidates >= n_candidates → maybe_finalize.  Since no
+        # best_guess was set, maybe_finalize treats it as a loss and deletes the
+        # branch without writing a cache entry.
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             w.solve_branch_focused(branch_key)
         finally:
@@ -340,8 +343,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
     def test_solve_branch_focused_returns_early_for_missing_branch(self):
         ScoreCache(self.cache_path, BRANCH).close()
         branch_key = ScoreCache.encode_subset(BRANCH)
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             # Branch was never registered — should return without error.
             w.solve_branch_focused(branch_key)
@@ -349,33 +351,28 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
             w.close()
 
     def test_claim_one_skips_fully_claimed_in_progress_branch_and_joins_next(self):
-        """If the first in-progress branch has all chunks claimed, claim_one must
-        continue iterating and claim a chunk from the next in-progress branch."""
+        """If the first in-progress branch has all candidates claimed, claim_one
+        must continue iterating and claim a candidate from the next branch."""
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
-        self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
 
-        # Branch A: all chunks pre-claimed by another worker.
+        # Branch A: all candidates pre-claimed by another worker.
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
-        for i in range(n_chunks):
-            q.claim_chunk(key_a, "other-worker", n_chunks)
+        for i in range(n_candidates):
+            q.claim_candidate(key_a, "other-worker", n_candidates)
 
-        # Branch B: has a free chunk for our worker to claim (higher priority so
-        # branches_in_progress returns it second after A in priority order).
+        # Branch B: has a free candidate for our worker to claim.
         words_b = BRANCH[:4]
         key_b = ScoreCache.encode_subset(words_b)
-        q.create_branch(key_b, len(words_b), n_candidates, chunk_size,
+        q.create_branch(key_b, len(words_b), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.claim_one()
         finally:
@@ -393,23 +390,18 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
-        self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
         # Register branch as in-progress (created, not pending).
-        q.create_branch(branch_key, len(BRANCH), n_candidates, chunk_size,
-                        budget=ROOT_BUDGET)
+        q.create_branch(branch_key, len(BRANCH), n_candidates, budget=ROOT_BUDGET)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.claim_one()
         finally:
             w.close()
 
         # claim_one should have joined the in-progress branch via
-        # branches_in_progress() → claim_chunk() → return (branch, idx).
+        # branches_in_progress() → claim_candidate() → return (branch, idx).
         self.assertIsNotNone(result)
         branch, idx = result
         self.assertEqual(branch['branch_key'], branch_key)
@@ -417,11 +409,11 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
 
 class TestCooperativeSolveFullPath(unittest.TestCase):
-    """cooperative_solve evaluates all chunks and returns the correct result
+    """cooperative_solve evaluates all candidates and returns the correct result
     when the branch is NOT pre-cached.  This exercises the main cooperative
-    loop (create branch, evaluate chunks, finalize, read cache) and the
-    maybe_finalize early-return path (called after each chunk, returns early
-    until the last chunk makes all chunks done)."""
+    loop (create branch, evaluate candidates, finalize, read cache) and the
+    maybe_finalize early-return path (called after each candidate, returns early
+    until the last one makes all candidates done)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -443,23 +435,21 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         return p
 
     def test_solves_uncached_branch_and_returns_result(self):
-        # Use all 5 BRANCH words so the solver creates 2 chunks (DIVISOR=3:
-        # ceil(5/3)=2 chunks, each covering half of CANDIDATES).  This makes
-        # maybe_finalize() hit its early-return path on the first chunk and the
-        # finalize path on the second, exercising both branches.
+        # Use all 5 BRANCH words so cooperative_solve evaluates all 10 CANDIDATES
+        # one at a time.  maybe_finalize() returns early on each until the last
+        # candidate makes branch_done_candidates == n_candidates and finalizes.
         words = BRANCH
         branch_key = ScoreCache.encode_subset(words)
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w.cooperative_solve(words, ROOT_BUDGET)
         finally:
             w.close()
 
         self.assertIsNotNone(result)
-        cost, max_depth, floor_hit, cutoff = result
-        self.assertFalse(cutoff)   # cooperative results are never cutoffs
+        status, cost, max_depth, budget_tainted = result
+        self.assertEqual(status, SOLVED)
         self.assertGreater(cost, 0)
 
         # The branch must be finalized — rows deleted from the queue.
@@ -478,7 +468,7 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
 
 
 class TestHelpOtherBranch(unittest.TestCase):
-    """_help_other_branch claims and evaluates one chunk from a branch other
+    """_help_other_branch claims and evaluates one candidate from a branch other
     than the excluded branch, returning True if work was found, False if not."""
 
     def setUp(self):
@@ -500,58 +490,52 @@ class TestHelpOtherBranch(unittest.TestCase):
             f.write("\n".join(words) + "\n")
         return p
 
-    def test_help_other_branch_returns_true_when_chunk_evaluated(self):
-        """When a chunk is available in another branch, help_other_branch
+    def test_help_other_branch_returns_true_when_candidate_evaluated(self):
+        """When a candidate is available in another branch, help_other_branch
         claims and evaluates it, then returns True."""
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
 
         # Create branch A (the one being excluded).
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
 
-        # Create branch B with a free chunk.
+        # Create branch B with a free candidate claim.
         words_b = BRANCH[:4]
         key_b = ScoreCache.encode_subset(words_b)
-        q.create_branch(key_b, len(words_b), n_candidates, chunk_size,
+        q.create_branch(key_b, len(words_b), n_candidates,
                         budget=ROOT_BUDGET, priority=1)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w._help_other_branch(key_a)
         finally:
             w.close()
 
-        # Should have evaluated a chunk and returned True.
+        # Should have evaluated a candidate and returned True.
         self.assertTrue(result)
 
-    def test_help_other_branch_returns_false_when_no_chunks_available(self):
-        """When no other branches have available chunks, help_other_branch
+    def test_help_other_branch_returns_false_when_no_candidates_available(self):
+        """When no other branches have available candidate claims, help_other_branch
         returns False without claiming anything."""
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
-        n_chunks = ERDQueue.n_chunks_for(n_candidates, chunk_size)
 
-        # Create only one branch and fully claim all its chunks.
+        # Create only one branch and fully claim all its candidates.
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
-        for i in range(n_chunks):
-            q.claim_chunk(key_a, "other-worker", n_chunks)
+        for i in range(n_candidates):
+            q.claim_candidate(key_a, "other-worker", n_candidates)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             # Exclude a different branch key (none exist, so effectively no branches to help).
             fake_exclude_key = ScoreCache.encode_subset(BRANCH[:3])
@@ -559,7 +543,7 @@ class TestHelpOtherBranch(unittest.TestCase):
         finally:
             w.close()
 
-        # Should return False (no chunks to claim).
+        # Should return False (no candidates to claim).
         self.assertFalse(result)
 
     def test_help_other_branch_skips_excluded_branch(self):
@@ -569,24 +553,351 @@ class TestHelpOtherBranch(unittest.TestCase):
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        chunk_size = ERDQueue.chunk_size_for(len(BRANCH), n_candidates, DIVISOR, MAX_CHUNKS)
 
-        # Create one branch with free chunks.
+        # Create one branch with free candidates.
         key_a = ScoreCache.encode_subset(BRANCH)
-        q.create_branch(key_a, len(BRANCH), n_candidates, chunk_size,
+        q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
         q.close()
 
-        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
-                          DIVISOR, MAX_CHUNKS)
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             # Exclude the only branch — nothing else to help.
             result = w._help_other_branch(key_a)
         finally:
             w.close()
 
-        # Should return False (the only branch was excluded).
+        # Should return False (the only available branch was excluded).
         self.assertFalse(result)
+
+
+class TestMidLoopPublisher(unittest.TestCase):
+    """_MidLoopPublisher.enter() / check() / record_inline() unit tests."""
+
+    def _pub(self, predicted=None):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = predicted
+        pub = erd_swarm._MidLoopPublisher(w)
+        return pub, w
+
+    def test_enter_returns_none_below_min_words(self):
+        pub, _ = self._pub()
+        # MIN_PUBLISH_BRANCH_WORDS is 2; a 1-word frame is a base case.
+        self.assertIsNone(pub.enter(BRANCH[:1], depth=0))
+
+    def test_enter_returns_token_at_min_words(self):
+        pub, _ = self._pub(predicted=1000)
+        words = BRANCH[:2]  # exactly MIN_PUBLISH_BRANCH_WORDS
+        token = pub.enter(words, depth=0)
+        self.assertIsNotNone(token)
+        nodes_at_entry, predicted, entry_time, bw, depth = token
+        self.assertEqual(bw, words)
+        self.assertEqual(predicted, 1000)
+
+    def test_enter_cold_model_still_returns_token(self):
+        pub, _ = self._pub(predicted=None)  # cold model
+        token = pub.enter(BRANCH[:6], depth=1)
+        self.assertIsNotNone(token)
+        _, predicted, _, _, _ = token
+        self.assertIsNone(predicted)  # token carries None when model is cold
+
+    def test_check_returns_none_for_none_token(self):
+        pub, _ = self._pub()
+        self.assertIsNone(pub.check(None, CANDIDATES, 0, None, None, 5))
+
+    def test_check_cold_model_under_backstop_returns_none(self):
+        # Cold model: the node-proportionate check can't arm, and the wall-clock
+        # backstop hasn't elapsed on a fresh token, so the frame stays inline.
+        pub, _ = self._pub(predicted=None)
+        token = pub.enter(BRANCH[:6], depth=0)
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+
+    def test_check_fires_on_wall_clock_backstop_when_cold(self):
+        # Cold model, but the frame has run past COLD_BACKSTOP_SECONDS: the
+        # backstop hands off the remainder even with no cost-model prediction.
+        pub, w = self._pub(predicted=None)
+        nodes_at_entry, _, _, words, depth = pub.enter(BRANCH[:6], depth=0)
+        old_entry = time.time() - (erd_swarm.COLD_BACKSTOP_SECONDS + 1)
+        token = (nodes_at_entry, None, old_entry, words, depth)
+        w._nodes = nodes_at_entry + 50   # some work done, no prediction to compare
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        result = pub.check(token, CANDIDATES, 0, None, None, 5)
+        self.assertIsNotNone(result)
+        w.cooperative_solve.assert_called_once()
+        # The firing is recorded for offline tuning, with predicted=None (cold).
+        w.queue.add_backstop_telemetry.assert_called_once()
+        args = w.queue.add_backstop_telemetry.call_args[0]
+        self.assertEqual(args[0], len(words))   # n_words
+        self.assertIsNone(args[4])              # predicted_nodes is None when cold
+
+    def test_check_warm_overrun_does_not_record_backstop(self):
+        # The node-proportionate path is the model working as intended; only the
+        # wall-clock backstop is recorded for tuning.
+        pub, w = self._pub(predicted=10)
+        token = pub.enter(BRANCH[:6], depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        pub.check(token, CANDIDATES, 0, None, None, 5)
+        w.queue.add_backstop_telemetry.assert_not_called()
+
+    def test_check_returns_none_when_under_overrun_threshold(self):
+        pub, w = self._pub(predicted=100)
+        token = pub.enter(BRANCH[:6], depth=0)
+        # _nodes hasn't changed: delta = 0 <= OVERRUN_K * 100
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+
+    def test_check_fires_on_overrun(self):
+        pub, w = self._pub(predicted=10)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        # Simulate spending > OVERRUN_K * predicted nodes
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        # last_index=0 of a 10-candidate list → 9 remaining (>= MIN_HANDOFF).
+        result = pub.check(token, CANDIDATES, 0, None, None, 5)
+        self.assertIsNotNone(result)
+        w.cooperative_solve.assert_called_once()
+
+    def test_check_returns_none_when_remaining_count_below_threshold(self):
+        pub, w = self._pub(predicted=10)
+        token = pub.enter(BRANCH[:6], depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        # last_index=7 of a 10-candidate list → only 2 remaining (< MIN_HANDOFF=4)
+        self.assertIsNone(pub.check(token, CANDIDATES, 7, None, None, 5))
+
+    def test_check_marks_prefix_done(self):
+        pub, w = self._pub(predicted=10)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        # last_index=1 → the evaluated prefix is CANDIDATES[:2].
+        pub.check(token, CANDIDATES, 1, None, None, 5)
+        call_args = w.queue.mark_claims_done.call_args
+        self.assertIsNotNone(call_args)
+        marked_indices = call_args[0][1]  # second positional arg is the indices list
+        # Each evaluated prefix word appears in the done list at its all_words index.
+        for word in CANDIDATES[:2]:
+            self.assertIn(w.all_words.index(word), marked_indices)
+
+    def test_record_inline_accumulates_buffer(self):
+        import math
+        pub, w = self._pub(predicted=100)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = 200   # 200 - 0 = 200 nodes for this frame
+        pub.record_inline(token)
+        self.assertIn(len(words), w._cost_model_buffer)
+        s, sq, c = w._cost_model_buffer[len(words)]
+        self.assertEqual(c, 1)
+        self.assertAlmostEqual(s, math.log(200), places=6)
+        self.assertAlmostEqual(sq, math.log(200) ** 2, places=6)
+
+    def test_record_inline_is_noop_for_none_token(self):
+        pub, w = self._pub()
+        pub.record_inline(None)
+        self.assertEqual(w._cost_model_buffer, {})
+
+
+class TestSubbranchSolverCostModel(unittest.TestCase):
+    """_subbranch_solver respects cost model: warm model gates on predicted
+    nodes; cold model falls back to PROMOTE_MIN_SIZE size threshold."""
+
+    def test_warm_model_below_threshold_inlines(self):
+        w = _bare_worker()
+        # Warm model predicts < PUBLISH_THRESHOLD_BOOTSTRAP nodes.
+        w.queue.get_cost_typical.return_value = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP - 1
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        self.assertIsNone(w._subbranch_solver(words, budget=5))
+
+    def test_warm_model_above_threshold_promotes(self):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        expected = (erd_swarm.SOLVED, 2.0, 3, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertEqual(result, expected)
+        w.cooperative_solve.assert_called_once()
+
+    def test_cold_model_small_branch_inlines(self):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = None  # cold model
+        # A cold small branch inlines directly; the mid-loop publisher's
+        # wall-clock backstop bounds it if it turns out to be a tarpit.
+        w.cooperative_solve = mock.MagicMock()
+        words_small = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE - 1)
+        self.assertIsNone(w._subbranch_solver(words_small, budget=5))
+        w.cooperative_solve.assert_not_called()
+
+    def test_cold_model_above_size_threshold_promotes(self):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = None  # cold model
+        expected = (erd_swarm.SOLVED, 2.5, 4, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertEqual(result, expected)
+
+
+class TestLogEMA(unittest.TestCase):
+    """_LogEMA: edge cases for add() and value()."""
+
+    def test_add_nonpositive_value_is_noop(self):
+        ema = erd_swarm._LogEMA(tau=1.0, min_weight=1)
+        ema.add(0)
+        ema.add(-5)
+        self.assertIsNone(ema.value())  # weight still 0
+
+    def test_add_with_implicit_now_warms_ema(self):
+        ema = erd_swarm._LogEMA(tau=1.0, min_weight=1)
+        ema.add(10)   # now=None → time.time() called internally
+        self.assertIsNotNone(ema.value())
+
+    def test_add_twice_applies_decay(self):
+        # Use a very short tau so decay is substantial and clearly exercises the
+        # decay branch; min_weight=1 so value() is readable after each add.
+        ema = erd_swarm._LogEMA(tau=0.1, min_weight=1)
+        ema.add(100, now=0.0)
+        ema.add(100, now=1.0)   # second call: self._last is not None → decay applied
+        # Decayed weight < 2; value should still be computable with min_weight=1.
+        self.assertIsNotNone(ema.value())
+
+    def test_value_returns_geometric_mean_when_warm(self):
+        import math
+        ema = erd_swarm._LogEMA(tau=1e9, min_weight=2)  # huge tau → no decay
+        ema.add(10, now=0.0)
+        ema.add(1000, now=0.0)
+        expected = math.exp((math.log(10) + math.log(1000)) / 2)
+        self.assertAlmostEqual(ema.value(), expected, places=6)
+
+
+class TestPublishThresholdWarmPath(unittest.TestCase):
+    """_publish_threshold returns SAFETY_FACTOR * coord / node_time when warm."""
+
+    def test_warm_threshold_exceeds_bootstrap(self):
+        w = _bare_worker()
+        # Use now=0.0 for all adds so decay = exp(0) = 1 and weight accumulates
+        # cleanly to exactly min_weight, without floating-point decay undershooting.
+        for _ in range(erd_swarm._PUBLISH_EMA_MIN_WEIGHT):
+            w._coord_ema.add(0.01, now=0.0)      # 10 ms coordination
+            w._node_time_ema.add(1e-6, now=0.0)  # 1 µs / node
+        threshold = w._publish_threshold()
+        self.assertGreater(threshold, erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP)
+
+
+class TestFlushCostModelBuffer(unittest.TestCase):
+    """_flush_cost_model_buffer propagates buffered inline samples to the queue."""
+
+    def test_flush_calls_update_logsums_per_size(self):
+        w = _bare_worker()
+        w._cost_model_buffer = {5: (2.0, 4.0, 1), 10: (3.0, 9.0, 2)}
+        w._flush_cost_model_buffer()
+        self.assertEqual(w.queue.update_cost_model_logsums.call_count, 2)
+        w._typical_cache.clear()  # confirmed cleared by flush
+        self.assertEqual(w._cost_model_buffer, {})
+
+    def test_flush_empty_buffer_clears_without_update(self):
+        w = _bare_worker()
+        w._flush_cost_model_buffer()
+        w.queue.update_cost_model_logsums.assert_not_called()
+
+
+class TestRecordInlineEdgeCases(unittest.TestCase):
+    """record_inline edge cases: zero-node frame and duplicate size in buffer."""
+
+    def _pub(self):
+        w = _bare_worker()
+        pub = erd_swarm._MidLoopPublisher(w)
+        return pub, w
+
+    def test_record_inline_noop_when_nodes_unchanged(self):
+        pub, w = self._pub()
+        token = pub.enter(BRANCH[:4], depth=0)
+        # _nodes stays 0 → nodes_spent = 0 → early return, nothing buffered.
+        pub.record_inline(token)
+        self.assertEqual(w._cost_model_buffer, {})
+
+    def test_record_inline_accumulates_second_sample_for_same_size(self):
+        import math
+        pub, w = self._pub()
+        words = BRANCH[:4]
+        token1 = pub.enter(words, depth=0)
+        w._nodes = 100
+        pub.record_inline(token1)
+        token2 = pub.enter(words, depth=0)
+        w._nodes = 300   # 200 more nodes for second frame of same size
+        pub.record_inline(token2)
+        s, sq, c = w._cost_model_buffer[len(words)]
+        self.assertEqual(c, 2)
+        self.assertAlmostEqual(s, math.log(100) + math.log(200), places=6)
+
+
+class TestNoteDepthDeeperPruning(unittest.TestCase):
+    """_note_depth prunes deeper spine entries when resetting a shallower depth."""
+
+    def test_note_depth_prunes_deeper_entries(self):
+        w = _bare_worker()
+        w._note_depth(0, 200, guess="crane", pattern="00000")
+        w._note_depth(1, 50, guess="slate", pattern="10000")
+        w._note_depth(2, 10, guess="trace", pattern="22222")
+        # Revisit depth 1: depths 2+ should be pruned.
+        w._note_depth(1, 48, guess="tales", pattern="01000")
+        self.assertNotIn(2, w._spine)
+        self.assertIn(1, w._spine)
+
+    def test_sentinel_prunes_deeper_entries(self):
+        w = _bare_worker()
+        w._note_depth(1, 50, guess="crane", pattern="00000")
+        w._note_depth(2, 20, guess="slate", pattern="10000")
+        w._note_depth(3, 5, guess="trace", pattern="22222")
+        # Sentinel at depth 1 with n<0 should prune depths 2 and 3.
+        w._note_depth(1, -1)
+        self.assertNotIn(2, w._spine)
+        self.assertNotIn(3, w._spine)
+
+
+class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
+    """Publisher check() with best_guess and with empty done_indices."""
+
+    def _pub_overrun(self, predicted=10, best_guess=None):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = predicted
+        pub = erd_swarm._MidLoopPublisher(w)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * predicted + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        result = pub.check(token, CANDIDATES, 0, best_guess, 1.5, 5)
+        return result, w, pub
+
+    def test_check_calls_update_branch_best_when_best_guess_known(self):
+        result, w, _ = self._pub_overrun(best_guess="crane")
+        self.assertIsNotNone(result)
+        w.queue.update_branch_best.assert_called_once()
+
+    def test_check_skips_update_branch_best_when_no_best_guess(self):
+        result, w, _ = self._pub_overrun(best_guess=None)
+        self.assertIsNotNone(result)
+        w.queue.update_branch_best.assert_not_called()
+
+    def test_check_handles_empty_done_indices(self):
+        # Use a candidate_list of words that are NOT in word_idx so done_indices
+        # is empty — mark_claims_done should not be called.
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = 10
+        pub = erd_swarm._MidLoopPublisher(w)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        unknown_words = ["zzzzz"] * 10
+        pub.check(token, unknown_words, 0, None, None, 5)
+        w.queue.mark_claims_done.assert_not_called()
 
 
 if __name__ == "__main__":

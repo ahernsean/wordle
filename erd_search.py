@@ -369,7 +369,7 @@ def cmd_queue_inspect(args):
 
     pb = queue.get_pending_branch(branch_key)
     ab = queue.get_active_branch(branch_key)
-    chunks = queue.chunks_for_branch(branch_key) if ab else []
+    chunks = queue.claims_for_branch(branch_key) if ab else []
     queue.close()
 
     print(f'{word.upper()} {pat}  ({len(branch)} answer words)')
@@ -383,17 +383,17 @@ def cmd_queue_inspect(args):
               f'(higher number = worked sooner)')
 
     if ab:
-        n_chunks = ERDQueue.n_chunks_for(ab['n_candidates'], ab['chunk_size'])
+        n_candidates = ab['n_candidates']
         done_ct = sum(1 for c in chunks if c['done'])
         best_g = ab['best_guess'] or '---'
         best_e = f'{ab["best_erd"]:.4f}' if ab['best_erd'] is not None else '---'
-        print(f'  In-progress: chunks {done_ct}/{n_chunks}  '
+        print(f'  In-progress: claims {done_ct}/{n_candidates}  '
               f'best {best_g.upper()} {best_e}')
-        print(f'  Chunk detail:')
+        print(f'  Claim detail:')
         for c in chunks:
             holder = c['claimed_by'] or '(unclaimed)'
             status = 'done' if c['done'] else f'held by {holder}'
-            print(f'    chunk {c["idx"]:3d}: {status}')
+            print(f'    claim {c["idx"]:5d}: {status}')
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +587,7 @@ def cmd_run(args):
     nb, nc = queue.reset_active_branches()
     if stale or nb or nc:
         print(f'Recovery: {stale} pending rows reset, '
-              f'{nb} in-progress branches / {nc} chunk claims cleared.')
+              f'{nb} in-progress branches / {nc} candidate claims cleared.')
 
     counts = queue.counts_by_status()
     if not counts.get('pending') and not counts.get('in_progress'):
@@ -597,10 +597,8 @@ def cmd_run(args):
     queue.close()
 
     _setup_supervisor_logging()
-    logger.info('Supervisor starting: %d workers, min_words_per_chunk=%d, '
-                'max_chunk_count=%d, recycle_hours=%.1f',
-                args.workers, args.min_words_per_chunk,
-                args.max_chunk_count, args.recycle_hours)
+    logger.info('Supervisor starting: %d workers, recycle_hours=%.1f',
+                args.workers, args.recycle_hours)
 
     stop_event = multiprocessing.Event()
 
@@ -645,9 +643,9 @@ def cmd_run(args):
         # Backstop: free chunks held by any worker that died WITHOUT being
         # reaped above (e.g. it crashed and we haven't noticed yet).  Gated on
         # heartbeat liveness, so a slow-but-alive worker is never reclaimed.
-        freed = q.reclaim_stale_chunks(args.worker_timeout_seconds)
+        freed = q.reclaim_stale_claims(args.worker_timeout_seconds)
         if freed:
-            logger.info('Reclaimed %d stale chunk claim(s).', freed)
+            logger.info('Reclaimed %d stale candidate claim(s).', freed)
         counts = q.counts_by_status()
         in_flight = len(q.branches_in_progress())
 
@@ -673,27 +671,26 @@ def cmd_run(args):
 
 
 def _reap_worker(queue, worker_id: int):
-    """Free a dead/killed worker's in-flight chunk claims and clear its
+    """Free a dead/killed worker's in-flight candidate claims and clear its
     heartbeat, BEFORE a replacement of the same name starts heartbeating.
 
     Without this, a respawned worker-N would refresh the 'worker-N' heartbeat,
-    making the previous instance's orphaned (done=0) chunks look like they're
+    making the previous instance's orphaned (done=0) claims look like they're
     held by a live worker — so the liveness-gated reclaim would never free them
     and the affected branches would never finalize.
     """
     name = f'worker-{worker_id}'
-    freed = queue.reclaim_chunks_of_worker(name)
+    freed = queue.reclaim_claims_of_worker(name)
     queue.clear_heartbeat(name)
     if freed:
-        logger.info('Reaped worker %d: freed %d chunk claim(s).',
+        logger.info('Reaped worker %d: freed %d candidate claim(s).',
                     worker_id, freed)
 
 
 def _spawn_worker(worker_id: int, args, stop_event):
     p = multiprocessing.Process(
         target=erd_swarm.swarm_worker,
-        args=(worker_id, args.cache, args.queue, stop_event,
-              args.min_words_per_chunk, args.max_chunk_count, args.workers),
+        args=(worker_id, args.cache, args.queue, stop_event, args.workers),
         daemon=False,
         name=f'erd-worker-{worker_id}',
     )
@@ -726,7 +723,7 @@ def cmd_status(args):
             try:
                 sys.stdout.write('\033[?25l\033[2J\033[H')
                 sys.stdout.flush()
-                _redraw_status.prev_lines = []
+                _redraw_status.prev_sections = []
                 while True:
                     _redraw_status(args)
                     time.sleep(interval)
@@ -751,7 +748,7 @@ def _watch_with_keys(args, interval):
         termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
         sys.stdout.write('\033[?25l\033[2J\033[H')
         sys.stdout.flush()
-        _redraw_status.prev_lines = []
+        _redraw_status.prev_sections = []
         while True:
             _redraw_status(args, selected_worker=selected_worker)
             deadline = time.monotonic() + interval
@@ -769,7 +766,7 @@ def _watch_with_keys(args, interval):
                     if ch.isdigit():
                         w = int(ch)
                         selected_worker = None if selected_worker == w else w
-                        _redraw_status.prev_lines = []  # force full redraw
+                        _redraw_status.prev_sections = []  # force full redraw
                         break
     except KeyboardInterrupt:
         # ISIG stays enabled (only ICANON/ECHO are off), so Ctrl-C raises here
@@ -821,6 +818,45 @@ def _parse_spine(path):
     return result
 
 
+# Sentinel prefix for section-boundary markers emitted by _print_status in
+# interactive mode.  A marker line is '<prefix><section name>'.  The NUL byte
+# guarantees the prefix never collides with real status output.
+_SECTION_MARK = '\x00SECTION:'
+
+
+def _section_break(name, interactive):
+    """Emit a named section marker so _redraw_status can diff sections independently.
+
+    Change detection runs per section, matched by name across refreshes, so a
+    section that grows or shrinks (e.g. a branch added) repaints only its own
+    rows instead of shifting later sections into a spurious all-changed diff.
+    The marker is emitted only in interactive mode and is stripped before
+    display.
+    """
+    if interactive:
+        print(f'{_SECTION_MARK}{name}')
+
+
+def _split_sections(lines):
+    """Split captured status lines into (name, section_lines) pairs on markers.
+
+    Lines preceding the first marker form a leading section keyed ''.  Marker
+    lines are consumed as boundaries and do not appear in any section.
+    """
+    sections = []
+    name = ''
+    current = []
+    for line in lines:
+        if line.startswith(_SECTION_MARK):
+            sections.append((name, current))
+            name = line[len(_SECTION_MARK):]
+            current = []
+        else:
+            current.append(line)
+    sections.append((name, current))
+    return sections
+
+
 def _highlight_changes(new_line, old_line):
     """Return new_line with runs of changed characters highlighted in bold red."""
     if new_line == old_line:
@@ -849,17 +885,19 @@ def _redraw_status(args, selected_worker=None):
         _print_status(args, selected_worker=selected_worker, interactive=True)
     finally:
         sys.stdout = old_stdout
-    new_lines = buf.getvalue().splitlines()
-    prev_lines = getattr(_redraw_status, 'prev_lines', [])
-    _redraw_status.prev_lines = new_lines
+    new_sections = _split_sections(buf.getvalue().splitlines())
+    prev_sections = dict(getattr(_redraw_status, 'prev_sections', []))
+    _redraw_status.prev_sections = new_sections
 
     rendered = []
-    for i, line in enumerate(new_lines):
-        old_line = prev_lines[i] if i < len(prev_lines) else None
-        if old_line is not None and line != old_line:
-            rendered.append(_highlight_changes(line, old_line) + '\033[K')
-        else:
-            rendered.append(line + '\033[K')
+    for name, lines in new_sections:
+        prev = prev_sections.get(name)
+        for i, line in enumerate(lines):
+            old_line = prev[i] if prev is not None and i < len(prev) else None
+            if old_line is not None and line != old_line:
+                rendered.append(_highlight_changes(line, old_line) + '\033[K')
+            else:
+                rendered.append(line + '\033[K')
 
     # \033[H  — cursor to top-left (no screen erase, so no flash)
     # \033[J  — erase from last line to end of screen (removes stale lines if output shrank)
@@ -872,6 +910,8 @@ def _print_status(args, selected_worker=None, interactive=False):
     now_ts = int(time.time())
     from wordle_ui import fmt_pattern
 
+    _section_break('header', interactive)
+
     # Queue + swarm state
     try:
         queue = ERDQueue(args.queue)
@@ -880,7 +920,7 @@ def _print_status(args, selected_worker=None, interactive=False):
         hbs = queue.heartbeats_with_branch()
         worker_counts = queue.worker_counts_by_branch()
         # Per-branch done-chunk counts for the in-progress branches.
-        done_chunks = {bytes(b['branch_key']): queue.branch_done_chunks(b['branch_key'])
+        done_chunks = {bytes(b['branch_key']): queue.branch_done_candidates(b['branch_key'])
                        for b in branches}
         queue.close()
         queue_ok = True
@@ -947,6 +987,8 @@ def _print_status(args, selected_worker=None, interactive=False):
         print(cache_line)
     print()
 
+    _section_break('branches', interactive)
+
     # Branches in progress — the real progress unit.
     _COOP_PRIORITY = 1_000_000   # sentinel: cooperative sub-branch, not user-queued
     branch_hdr = 'Branches:'
@@ -963,22 +1005,20 @@ def _print_status(args, selected_worker=None, interactive=False):
     print(branch_hdr)
     denom_w = 2
     if branches:
-        max_nc = max(ERDQueue.n_chunks_for(b['n_candidates'] or 1, b['chunk_size'])
-                     for b in branches)
+        max_nc = max(b['n_candidates'] or 1 for b in branches)
         denom_w = len(str(max_nc))
-    chunks_col_w = 2 * denom_w + 5   # num/denom + ' ' + 2-digit int pct + '%'
+    claims_col_w = 2 * denom_w + 5   # num/denom + ' ' + 2-digit int pct + '%'
     if branches:
         print(f'  {"Root":<11s} {"D":>1s} {"Ans":>4s} '
-              f'{"Chunks":<{chunks_col_w}s} '
+              f'{"Claims":<{claims_col_w}s} '
               f'{"Best":<5s} {"ERD":>5s}  {"Pri":>3s} {"Wk":>2s} ETA')
     else:
         print('  (none)')
     for b in branches:
         key = bytes(b['branch_key'])
         n_cands = b['n_candidates'] or 0
-        n_chunks = ERDQueue.n_chunks_for(n_cands, b['chunk_size'])
         done = done_chunks.get(key, 0)
-        pct = 100.0 * done / n_chunks if n_chunks else 0.0
+        pct = 100.0 * done / n_cands if n_cands else 0.0
         src = (f'{b["source_word"].upper()} {fmt_pattern(b["source_pattern"])}'
                if b['source_word'] and b['source_pattern'] is not None
                else '-----')
@@ -992,14 +1032,16 @@ def _print_status(args, selected_worker=None, interactive=False):
         created = b['created_at'] or now_ts
         el = now_ts - created
         eta = ''
-        if wk > 0 and 0 < done < n_chunks and el > 0:
-            rem = (n_chunks - done) / (done / el)
+        if wk > 0 and 0 < done < n_cands and el > 0:
+            rem = (n_cands - done) / (done / el)
             eta = _fmt_duration(int(rem))
-        chunks_str = f'{done:>{denom_w}d}/{n_chunks:<{denom_w}d} {int(pct):2d}%'
+        claims_str = f'{done:>{denom_w}d}/{n_cands:<{denom_w}d} {int(pct):2d}%'
         print(f'  {src:<11s} {depth_val:1d} {nw:4d} '
-              f'{chunks_str} '
+              f'{claims_str} '
               f'{bw:<5s} {be:>5s} {pri_str:>4s} {wk:2d} {eta}')
     print()
+
+    _section_break('workers', interactive)
 
     # Workers — liveness and forward progress.
     if not hasattr(_print_status, '_answer_set'):
@@ -1023,7 +1065,7 @@ def _print_status(args, selected_worker=None, interactive=False):
     if not hbs:
         print('  (none active)')
     else:
-        print(f'  {"W":>2}  {"Root":<11}  {"D":>1}  {"Chk":>3}  {"Held":>6}  '
+        print(f'  {"W":>2}  {"Root":<11}  {"D":>1}  {"Idx":>5}  {"Held":>6}  '
               f'{"Best":<5}  {"ERD":>5}  {"Bound":>5}  HB')
     for h in sorted(hbs, key=lambda r: r['worker_id']):
         age = now_ts - h['updated_at']
@@ -1031,18 +1073,16 @@ def _print_status(args, selected_worker=None, interactive=False):
         flag = ' !!' if age > 120 else ''
         key = h['current_branch_key']
         if key is None:
-            print(f'  {wnum:>2}  {"(idle)":<11}  {0:1d}  {"":>3}  {"":>6}  '
+            print(f'  {wnum:>2}  {"(idle)":<11}  {0:1d}  {"":>5}  {"":>6}  '
                   f'{"":5}  {"":>5}  {"":>5}  {age}s{flag}')
             continue
         src = (f'{h["source_word"].upper()} {fmt_pattern(h["source_pattern"])}'
                if h['source_word'] and h['source_pattern'] is not None
                else '-----')
         w_depth = branch_depth_map.get(bytes(key), 0)
-        chunk = str(h['chunk_idx']) if h['chunk_idx'] is not None else '-'
-        held = now_ts - (h['chunk_started_at'] or now_ts)
+        chunk = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
+        held = now_ts - (h['claim_started_at'] or now_ts)
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
-        n_seen = (h['cand_n_seen'] if 'cand_n_seen' in h.keys() else None) or 0
-        c_total = (h['cand_chunk_size'] if 'cand_chunk_size' in h.keys() else None) or 0
         mdepth = (h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
         nrate = (h['node_rate'] if 'node_rate' in h.keys() else None) or 0.0
@@ -1070,17 +1110,17 @@ def _print_status(args, selected_worker=None, interactive=False):
         best_g_disp = best_g.upper() if best_g else '-----'
         best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
         bound_e_disp = f'{bound_e:.3f}' if bound_e is not None else '-----'
-        print(f'  {wnum:>2}  {src:<11}  {w_depth:1d}  {chunk:>3}  {_fmt_duration(held):>6}  '
+        print(f'  {wnum:>2}  {src:<11}  {w_depth:1d}  {chunk:>5}  {_fmt_duration(held):>6}  '
               f'{best_g_disp:<5}  {best_e_disp:>5}  {bound_e_disp:>5}  {age}s{flag}')
-        if cur and c_total:
+        if cur:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
             krate = f'{int(nrate / 1000)}kN/s'
-            cperc = int(n_seen / c_total * 100)
-            print(f'       {cur_disp}  {n_seen:>3}/{c_total:<3} {cperc:2d}%  MaxD:{mdepth}  {krate:>7}  {_spine_sizes(path)}')
+            print(f'       {cur_disp}  MaxD:{mdepth}  {krate:>7}  {_spine_sizes(path)}')
         else:
             print()
 
     if selected_worker is not None:
+        _section_break('detail', interactive)
         target = str(selected_worker)
         detail_hb = next(
             (h for h in hbs
@@ -1100,7 +1140,7 @@ def _print_status(args, selected_worker=None, interactive=False):
             print(f'  d0  {src_word}{src_star}  {src_pat}  {n_words:4d} words')
             rich_path = (detail_hb['cur_path'] if 'cur_path' in detail_hb.keys() else None) or ''
             cur_cand = (detail_hb['cur_candidate'] if 'cur_candidate' in detail_hb.keys() else None) or ''
-            chunk_held = (detail_hb['chunk_idx'] if 'chunk_idx' in detail_hb.keys() else None) is not None
+            chunk_held = (detail_hb['claim_idx'] if 'claim_idx' in detail_hb.keys() else None) is not None
             spine = _parse_spine(rich_path)
             if spine:
                 for di, (guess, pattern, size) in enumerate(spine, start=1):
@@ -1120,7 +1160,7 @@ def _print_status(args, selected_worker=None, interactive=False):
                                         if bytes(b['branch_key']) == bkey), None)
                     if branch_info:
                         n_cands = branch_info['n_candidates'] or 0
-                        total_chunks = ERDQueue.n_chunks_for(n_cands, branch_info['chunk_size'])
+                        total_chunks = n_cands
                         done_ct = done_chunks.get(bkey, 0)
                         co_workers = [
                             h['worker_id'].split('-')[-1]
@@ -1282,15 +1322,6 @@ def main():
                        help='Number of swarm worker processes (default: 6)')
     p_run.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_run.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_run.add_argument('--min-words-per-chunk', type=int, default=3, metavar='N',
-                       help='Minimum answer-word count per chunk of work: '
-                            'a branch is split into ceil(n_words/N) chunks '
-                            '(default: 3).  Lower = more chunks = more '
-                            'worker sharing on hard branches.')
-    p_run.add_argument('--max-chunk-count', type=int, default=256, metavar='N',
-                       help='Cap on the number of chunks per branch (default: 256). '
-                            'When --min-words-per-chunk would produce more chunks '
-                            'than this cap, the cap wins and chunks become larger.')
     p_run.add_argument('--recycle-hours', type=float, default=3.0,
                        metavar='H',
                        help='Respawn each worker after H hours wall time '
@@ -1299,7 +1330,7 @@ def main():
                             'in the queue and resumed by the fresh worker.')
     p_run.add_argument('--worker-timeout-seconds', type=int, default=30,
                        metavar='S',
-                       help='Declare a worker dead and reclaim its chunk '
+                       help='Declare a worker dead and reclaim its candidate '
                             'claims after S seconds of missed heartbeats '
                             '(default: 30).  Live workers heartbeat every '
                             '~2s regardless of how long a single candidate '

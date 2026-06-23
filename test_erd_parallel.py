@@ -1,7 +1,7 @@
 """End-to-end test of the parallel ERD swarm algorithm.
 
 Registers one branch and actually runs the swarm workers (cooperating on
-disjoint candidate chunks, sharing the running-best bound, finalizing exactly
+disjoint candidate claims, sharing the running-best bound, finalizing exactly
 once) and checks that the result is correct: it must equal both a single-worker
 run and the ground-truth depth-limited ERD from min_expected_guesses.  This is
 the regression guard that the parallelization hasn't broken the algorithm.
@@ -24,12 +24,10 @@ import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET
 from erd_queue import ERDQueue, encode_subset
 
-# A branch of 8 answers and 15 candidate guesses → 3 chunks (divisor 3), so two
-# workers genuinely split the candidate list and cooperate.
+# A branch of 8 answers and 15 candidate guesses: with single-candidate claiming,
+# two workers genuinely interleave candidate evaluation and cooperate.
 BRANCH = ["crane", "slate", "trace", "stale", "tales", "least", "heart", "share"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train", "grade", "shine"]
-DIVISOR = 3
-MAX_CHUNKS = 256
 
 
 class TestParallelSwarmSolve(unittest.TestCase):
@@ -62,18 +60,13 @@ class TestParallelSwarmSolve(unittest.TestCase):
         # Apply schema migrations once before the worker threads open the cache
         # concurrently (production always has a single pre-open first).
         ScoreCache(cache_path, BRANCH).close()
-        chunk_size = ERDQueue.chunk_size_for(
-            len(BRANCH), len(CANDIDATES), DIVISOR, MAX_CHUNKS)
         q = ERDQueue(queue_path)
         q.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
-                        chunk_size, budget=ROOT_BUDGET)
-        n_chunks = ERDQueue.n_chunks_for(len(CANDIDATES), chunk_size)
+                        budget=ROOT_BUDGET)
         q.close()
-        self.assertGreaterEqual(n_chunks, 2, "test needs a multi-chunk branch")
 
         def worker(wid):
-            w = _BranchWorker(wid, cache_path, queue_path, None,
-                              DIVISOR, MAX_CHUNKS)
+            w = _BranchWorker(wid, cache_path, queue_path, None)
             try:
                 w.solve_branch_focused(self.branch_key)
             finally:
@@ -156,7 +149,7 @@ class TestClaimSkipsCachedBranch(unittest.TestCase):
 
     def _worker(self):
         return _BranchWorker(0, self.cache_path, self.queue_path, None,
-                             DIVISOR, MAX_CHUNKS, budget=ROOT_BUDGET)
+                             budget=ROOT_BUDGET)
 
     def test_skips_branch_with_reusable_cache_entry(self):
         sc = ScoreCache(self.cache_path, BRANCH)
