@@ -723,7 +723,7 @@ def cmd_status(args):
             try:
                 sys.stdout.write('\033[?25l\033[2J\033[H')
                 sys.stdout.flush()
-                _redraw_status.prev_lines = []
+                _redraw_status.prev_sections = []
                 while True:
                     _redraw_status(args)
                     time.sleep(interval)
@@ -748,7 +748,7 @@ def _watch_with_keys(args, interval):
         termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
         sys.stdout.write('\033[?25l\033[2J\033[H')
         sys.stdout.flush()
-        _redraw_status.prev_lines = []
+        _redraw_status.prev_sections = []
         while True:
             _redraw_status(args, selected_worker=selected_worker)
             deadline = time.monotonic() + interval
@@ -766,7 +766,7 @@ def _watch_with_keys(args, interval):
                     if ch.isdigit():
                         w = int(ch)
                         selected_worker = None if selected_worker == w else w
-                        _redraw_status.prev_lines = []  # force full redraw
+                        _redraw_status.prev_sections = []  # force full redraw
                         break
     except KeyboardInterrupt:
         # ISIG stays enabled (only ICANON/ECHO are off), so Ctrl-C raises here
@@ -818,6 +818,45 @@ def _parse_spine(path):
     return result
 
 
+# Sentinel prefix for section-boundary markers emitted by _print_status in
+# interactive mode.  A marker line is '<prefix><section name>'.  The NUL byte
+# guarantees the prefix never collides with real status output.
+_SECTION_MARK = '\x00SECTION:'
+
+
+def _section_break(name, interactive):
+    """Emit a named section marker so _redraw_status can diff sections independently.
+
+    Change detection runs per section, matched by name across refreshes, so a
+    section that grows or shrinks (e.g. a branch added) repaints only its own
+    rows instead of shifting later sections into a spurious all-changed diff.
+    The marker is emitted only in interactive mode and is stripped before
+    display.
+    """
+    if interactive:
+        print(f'{_SECTION_MARK}{name}')
+
+
+def _split_sections(lines):
+    """Split captured status lines into (name, section_lines) pairs on markers.
+
+    Lines preceding the first marker form a leading section keyed ''.  Marker
+    lines are consumed as boundaries and do not appear in any section.
+    """
+    sections = []
+    name = ''
+    current = []
+    for line in lines:
+        if line.startswith(_SECTION_MARK):
+            sections.append((name, current))
+            name = line[len(_SECTION_MARK):]
+            current = []
+        else:
+            current.append(line)
+    sections.append((name, current))
+    return sections
+
+
 def _highlight_changes(new_line, old_line):
     """Return new_line with runs of changed characters highlighted in bold red."""
     if new_line == old_line:
@@ -846,17 +885,19 @@ def _redraw_status(args, selected_worker=None):
         _print_status(args, selected_worker=selected_worker, interactive=True)
     finally:
         sys.stdout = old_stdout
-    new_lines = buf.getvalue().splitlines()
-    prev_lines = getattr(_redraw_status, 'prev_lines', [])
-    _redraw_status.prev_lines = new_lines
+    new_sections = _split_sections(buf.getvalue().splitlines())
+    prev_sections = dict(getattr(_redraw_status, 'prev_sections', []))
+    _redraw_status.prev_sections = new_sections
 
     rendered = []
-    for i, line in enumerate(new_lines):
-        old_line = prev_lines[i] if i < len(prev_lines) else None
-        if old_line is not None and line != old_line:
-            rendered.append(_highlight_changes(line, old_line) + '\033[K')
-        else:
-            rendered.append(line + '\033[K')
+    for name, lines in new_sections:
+        prev = prev_sections.get(name)
+        for i, line in enumerate(lines):
+            old_line = prev[i] if prev is not None and i < len(prev) else None
+            if old_line is not None and line != old_line:
+                rendered.append(_highlight_changes(line, old_line) + '\033[K')
+            else:
+                rendered.append(line + '\033[K')
 
     # \033[H  — cursor to top-left (no screen erase, so no flash)
     # \033[J  — erase from last line to end of screen (removes stale lines if output shrank)
@@ -868,6 +909,8 @@ def _redraw_status(args, selected_worker=None):
 def _print_status(args, selected_worker=None, interactive=False):
     now_ts = int(time.time())
     from wordle_ui import fmt_pattern
+
+    _section_break('header', interactive)
 
     # Queue + swarm state
     try:
@@ -944,6 +987,8 @@ def _print_status(args, selected_worker=None, interactive=False):
         print(cache_line)
     print()
 
+    _section_break('branches', interactive)
+
     # Branches in progress — the real progress unit.
     _COOP_PRIORITY = 1_000_000   # sentinel: cooperative sub-branch, not user-queued
     branch_hdr = 'Branches:'
@@ -995,6 +1040,8 @@ def _print_status(args, selected_worker=None, interactive=False):
               f'{claims_str} '
               f'{bw:<5s} {be:>5s} {pri_str:>4s} {wk:2d} {eta}')
     print()
+
+    _section_break('workers', interactive)
 
     # Workers — liveness and forward progress.
     if not hasattr(_print_status, '_answer_set'):
@@ -1073,6 +1120,7 @@ def _print_status(args, selected_worker=None, interactive=False):
             print()
 
     if selected_worker is not None:
+        _section_break('detail', interactive)
         target = str(selected_worker)
         detail_hb = next(
             (h for h in hbs
