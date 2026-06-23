@@ -129,7 +129,11 @@ CREATE TABLE IF NOT EXISTS active_branches (
     best_max_depth INTEGER,
     tainted        INTEGER NOT NULL DEFAULT 0,
     depth          INTEGER NOT NULL DEFAULT 0,
-    nodes_spent    INTEGER NOT NULL DEFAULT 0
+    nodes_spent    INTEGER NOT NULL DEFAULT 0,
+    -- absolute path from the root word to this branch, as space-joined
+    -- "GUESS pattern" edges (e.g. "SALET -g-g- CRANE bb-y-").  NULL means no
+    -- edges recorded: a top-level branch, or a row predating spine capture.
+    spine          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
@@ -218,7 +222,12 @@ class ERDQueue:
         self._migrate()
 
     def _migrate(self):
-        pass
+        # active_branches.spine: additive, nullable, no backfill.  Existing rows
+        # keep NULL (display falls back to root + depth) until re-promoted.
+        cols = {r["name"] for r in
+                self._conn.execute("PRAGMA table_info(active_branches)")}
+        if "spine" not in cols:
+            self._conn.execute("ALTER TABLE active_branches ADD COLUMN spine TEXT")
 
     def close(self):
         self._conn.close()
@@ -389,7 +398,7 @@ class ERDQueue:
 
     def create_branch(self, branch_key, n_words, n_candidates,
                       priority=0, source_word=None, source_pattern=None,
-                      budget=None, depth=0) -> bool:
+                      budget=None, depth=0, spine=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
@@ -398,16 +407,19 @@ class ERDQueue:
         total claim slot count (one slot per candidate in the policy-canonical
         list).  budget is the guess budget for depth-limited ERD.  depth is
         the cooperative nesting level: 0 for user-queued branches, 1+ for
-        branches promoted inside cooperative_solve.
+        branches promoted inside cooperative_solve.  spine is the absolute
+        root -> branch edge path (see the active_branches.spine column); None
+        leaves the display to fall back to root + depth.
         """
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
                 (branch_key, n_words, n_candidates,
-                 priority, source_word, source_pattern, status, created_at, budget, depth)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                 priority, source_word, source_pattern, status, created_at,
+                 budget, depth, spine)
+            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
         """, (branch_key, n_words, n_candidates,
-              priority, source_word, source_pattern, now, budget, depth))
+              priority, source_word, source_pattern, now, budget, depth, spine))
         return cur.rowcount == 1
 
     def get_branch(self, branch_key):

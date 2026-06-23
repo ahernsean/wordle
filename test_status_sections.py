@@ -17,6 +17,47 @@ RED = '\033[1;31m'
 CLEAR_EOL = '\033[K'
 
 
+class BranchIdAndSpineHelperTest(unittest.TestCase):
+    """Pure display helpers: stable ids, spine rendering, compact fallback."""
+
+    def test_branch_id_is_stable_and_keyed_on_content(self):
+        key = b'some-branch-key'
+        self.assertEqual(erd_search._branch_id(key), erd_search._branch_id(key))
+        self.assertEqual(len(erd_search._branch_id(key)), 4)
+        self.assertNotEqual(erd_search._branch_id(key),
+                            erd_search._branch_id(b'other-key'))
+
+    def test_fmt_spine_path_pairs_edges(self):
+        self.assertEqual(
+            erd_search._fmt_spine_path('SALET -g-g- CRANE bb-y-'),
+            'SALET -g-g- ▸ CRANE bb-y-')
+        self.assertEqual(erd_search._fmt_spine_path(None), '')
+
+    def test_compact_spine_uses_stored_path(self):
+        out = erd_search._compact_spine_path(
+            'SALET -g-g- CRANE bb-y-', 'salet', 0, lambda p: '-g-g-', 2)
+        self.assertEqual(out, 'SALET -g-g- ▸ CRANE bb-y-')
+
+    def test_compact_spine_tail_truncates_long_path(self):
+        spine = 'SALET -g-g- CRANE bb-y- POUND g--y- MOUND gg--y QUILT yyyyy'
+        out = erd_search._compact_spine_path(
+            spine, 'salet', 0, lambda p: '-g-g-', 5, width=20)
+        self.assertTrue(out.startswith('…'))
+        self.assertLessEqual(len(out), 20)
+        # The tail (deepest edges) is what survives truncation.
+        self.assertTrue(out.endswith('QUILT yyyyy'))
+
+    def test_compact_spine_falls_back_to_root_with_depth_marker(self):
+        out = erd_search._compact_spine_path(
+            None, 'salet', 0, lambda p: '-g-g-', 3)
+        self.assertEqual(out, 'SALET -g-g- ▸ ?×3')
+
+    def test_compact_spine_fallback_root_only_at_depth_zero(self):
+        out = erd_search._compact_spine_path(
+            None, 'salet', 0, lambda p: '-g-g-', 0)
+        self.assertEqual(out, 'SALET -g-g-')
+
+
 class SplitSectionsTest(unittest.TestCase):
     def test_splits_on_markers(self):
         lines = [
@@ -52,7 +93,8 @@ class RedrawSectionDiffTest(unittest.TestCase):
         `sections` is a list of (name, [lines]); the stub prints the same
         section markers _print_status emits in interactive mode.
         """
-        def fake_print_status(args, selected_worker=None, interactive=False):
+        def fake_print_status(args, selected_worker=None, selected_branch=None,
+                              interactive=False):
             for name, lines in sections:
                 print(f'{erd_search._SECTION_MARK}{name}')
                 for line in lines:

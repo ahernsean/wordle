@@ -219,12 +219,15 @@ class _MidLoopPublisher:
         self._worker._note_depth(depth, -n, None, None)
 
         # Create the cooperative branch; idempotent if another worker raced us.
+        # First writer for this path, so the composed spine must be supplied here
+        # (cooperative_solve's later create_branch is a no-op once this row exists).
         self._worker.queue.create_branch(
             branch_key, n, self._worker.n_candidates,
             priority=PROMOTED_PRIORITY,
             source_word=self._worker._top_source_word,
             source_pattern=self._worker._top_source_pattern,
-            budget=budget, depth=self._worker._coop_depth + 1)
+            budget=budget, depth=self._worker._coop_depth + 1,
+            spine=self._worker._promoted_spine())
 
         # Mark the already-evaluated candidates done by their all_words index so
         # cooperative workers claim only the unevaluated remainder.  The prefix
@@ -321,6 +324,11 @@ class _BranchWorker:
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
+        # Absolute root -> branch spine of the branch the worker is currently
+        # descending (its claimed branch), as space-joined "GUESS pattern" edge
+        # tokens.  Promotion composes a child branch's spine as this base plus the
+        # live descent edges in self._spine.  None until the first claim.
+        self._claimed_branch_spine = None
         # Cooperative nesting depth: incremented on entry to cooperative_solve,
         # decremented on exit.  Passed to create_branch so the status display
         # can distinguish user-queued branches (depth 0) from sub-branches.
@@ -409,6 +417,29 @@ class _BranchWorker:
         return '→'.join(
             self._fmt_spine_entry(self._log_max_spine[d])
             for d in sorted(self._log_max_spine))
+
+    @staticmethod
+    def _root_spine(source_word, source_pattern):
+        """Single-edge spine string for a top-level branch: 'SALET -g-g-'."""
+        if not source_word or source_pattern is None:
+            return None
+        return f'{source_word.upper()} {fmt_pattern(source_pattern)}'
+
+    def _promoted_spine(self):
+        """Absolute root -> promoted-branch spine: the claimed branch's base plus
+        the live descent edges (depth-ordered "GUESS pattern" tokens).  Returns
+        None when the base is unknown, leaving the branch row to fall back to
+        root + depth.  Sentinel/size-only spine entries (no guess) are skipped.
+        """
+        base = getattr(self, '_claimed_branch_spine', None)
+        if not base:
+            return None
+        edges = []
+        for d in sorted(getattr(self, '_spine', {})):
+            _size, guess, pattern = self._spine[d]
+            if guess and guess != '•' and pattern:
+                edges.append(f'{guess.upper()} {pattern}')
+        return ' '.join([base, *edges])
 
     # -- cost model ---------------------------------------------------------
 
@@ -710,9 +741,16 @@ class _BranchWorker:
                 continue
             words = decode_subset(other_key)
             budget = branch['budget'] or self.budget
-            if self.evaluate_claim(other_key, words, branch['n_words'], idx,
-                                   budget=budget):
-                self.maybe_finalize(other_key, words, n_candidates)
+            # Promotions while helping must base off the helped branch's spine.
+            saved_spine = self._claimed_branch_spine
+            self._claimed_branch_spine = branch['spine'] if 'spine' in branch.keys() \
+                else None
+            try:
+                if self.evaluate_claim(other_key, words, branch['n_words'], idx,
+                                       budget=budget):
+                    self.maybe_finalize(other_key, words, n_candidates)
+            finally:
+                self._claimed_branch_spine = saved_spine
             self._maybe_checkpoint()
             return True
         return False
@@ -771,6 +809,10 @@ class _BranchWorker:
         and deadlock-free (a waiting worker holds no chunk).
         """
         self._coop_depth += 1
+        # Absolute spine of the branch being promoted, composed from the descent
+        # that reached it before this frame's own work overwrites self._spine.
+        child_spine = self._promoted_spine()
+        saved_spine = self._claimed_branch_spine
         try:
             branch_key = encode_subset(words)
             # Already solved by someone? reuse without re-promoting.
@@ -789,7 +831,9 @@ class _BranchWorker:
                 branch_key, n_words, self.n_candidates,
                 priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
                 source_pattern=self._top_source_pattern, budget=budget,
-                depth=self._coop_depth)
+                depth=self._coop_depth, spine=child_spine)
+            # Descents into this branch promote grandchildren relative to its spine.
+            self._claimed_branch_spine = child_spine
 
             while not self.cancel():
                 # Finished?  Check before claiming so we never touch a branch that
@@ -828,6 +872,7 @@ class _BranchWorker:
             return (OVER_DEPTH_BUDGET, float('inf'), None, True)  # pragma: no cover
         finally:
             self._coop_depth -= 1
+            self._claimed_branch_spine = saved_spine
 
     # -- scheduling: claim one chunk of the best available branch -----------
 
@@ -860,10 +905,13 @@ class _BranchWorker:
             self.queue.mark_done(claimed['branch_key'])
 
         n_words = claimed['n_words']
+        root_spine = self._root_spine(claimed['source_word'],
+                                      claimed['source_pattern'])
         self.queue.create_branch(
             claimed['branch_key'], n_words, self.n_candidates,
             priority=claimed['priority'], source_word=claimed['source_word'],
-            source_pattern=claimed['source_pattern'], budget=self.budget)
+            source_pattern=claimed['source_pattern'], budget=self.budget,
+            spine=root_spine)
         idx = self.queue.claim_candidate(claimed['branch_key'], self.name,
                                          self.n_candidates)
         branch = {
@@ -871,6 +919,7 @@ class _BranchWorker:
             'n_candidates': self.n_candidates,
             'source_word': claimed['source_word'],
             'source_pattern': claimed['source_pattern'],
+            'spine': root_spine,
             'budget': self.budget,
         }
         # idx can be None only if another worker grabbed every candidate between
@@ -898,6 +947,10 @@ class _BranchWorker:
             # descending (best-effort; for status display).
             self._top_source_word = branch.get('source_word')
             self._top_source_pattern = branch.get('source_pattern')
+            # Base spine for deeper promotions: a joined in-progress branch carries
+            # its own stored spine; a freshly promoted top branch falls back to root.
+            self._claimed_branch_spine = branch.get('spine') or self._root_spine(
+                branch.get('source_word'), branch.get('source_pattern'))
             words = decode_subset(branch_key)
             n_candidates = branch['n_candidates']
             if self.cancel():
