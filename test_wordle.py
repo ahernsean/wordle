@@ -30,7 +30,7 @@ from wordle_engine import (
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
     enumerate_branches, rank_candidates_by_max_group_size_then_entropy_gain, _cache_reuse,
-    _solve_subset,
+    _solve_subset, max_solvable_within,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -1810,6 +1810,25 @@ class TestDepthLimitedERD(unittest.TestCase):
             min_expected_guesses(self.LINEAR, self.lcache, None,
                                  guesses=self.LINEAR, budget=7))
 
+    def test_max_solvable_within_values(self):
+        # M(b) = 1 + 242*M(b-1), M(0) = 0.
+        self.assertEqual(max_solvable_within(0), 0)
+        self.assertEqual(max_solvable_within(1), 1)
+        self.assertEqual(max_solvable_within(2), 243)
+        self.assertEqual(max_solvable_within(3), 58807)
+
+    def test_oversized_branch_is_certain_loss(self):
+        # A single guess yields at most 243 patterns, so >243 distinct words
+        # cannot all be resolved in 2 guesses regardless of structure.  The size
+        # bound certifies the loss without scanning any candidate.
+        import itertools
+        words = [''.join(p) for p in itertools.islice(
+            itertools.product('abcdefg', repeat=5), max_solvable_within(2) + 1)]
+        self.assertEqual(len(words), 244)
+        cache = ResponseCache(words)
+        self.assertIsNone(
+            min_expected_guesses(words, cache, None, guesses=words, budget=2))
+
     def test_max_depth_persisted(self):
         tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
         tmp.close()
@@ -1824,6 +1843,47 @@ class TestDepthLimitedERD(unittest.TestCase):
             _bw, _score, max_depth, solve_budget = entry
             self.assertEqual(max_depth, 8)         # worst-case line length
             self.assertIsNone(solve_budget)        # untainted: budget 8 fit exactly
+        finally:
+            os.unlink(tmp.name)
+
+    def test_write_loss_keeps_widest_budget(self):
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, self.LINEAR)
+            key = b'aaaaabbbbb'
+            sc.write_loss(key, ERD_ALL, 3)
+            self.assertEqual(sc.read_loss(key, ERD_ALL), 3)
+            sc.write_loss(key, ERD_ALL, 2)   # narrower — ignored
+            self.assertEqual(sc.read_loss(key, ERD_ALL), 3)
+            sc.write_loss(key, ERD_ALL, 5)   # wider — widens reuse range
+            self.assertEqual(sc.read_loss(key, ERD_ALL), 5)
+            sc.close()
+            sc2 = ScoreCache(tmp.name, self.LINEAR)   # fresh: no session mirror
+            self.assertEqual(sc2.read_loss(key, ERD_ALL), 5)
+            self.assertIsNone(sc2.read_loss(b'never', ERD_ALL))
+        finally:
+            os.unlink(tmp.name)
+
+    def test_proven_loss_is_persisted_and_reused(self):
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            key = ScoreCache.encode_subset(self.LINEAR)
+            sc = ScoreCache(tmp.name, self.LINEAR)
+            lcache = ResponseCache(self.LINEAR, score_cache=sc)
+            # LINEAR needs budget 8; budget 7 is a proven loss, now persisted.
+            self.assertIsNone(min_expected_guesses(
+                self.LINEAR, lcache, sc, guesses=self.LINEAR, budget=7))
+            self.assertEqual(sc.read_loss(key, ERD_ALL), 7)
+            sc.close()
+            # A fresh process (no session mirror) reuses the persisted loss, and
+            # a loss within 7 is also a loss within 6 — both return immediately.
+            sc2 = ScoreCache(tmp.name, self.LINEAR)
+            self.assertEqual(sc2.read_loss(key, ERD_ALL), 7)
+            lcache2 = ResponseCache(self.LINEAR, score_cache=sc2)
+            self.assertIsNone(min_expected_guesses(
+                self.LINEAR, lcache2, sc2, guesses=self.LINEAR, budget=6))
         finally:
             os.unlink(tmp.name)
 

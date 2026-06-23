@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
-    SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT, NO_INFORMATION,
+    SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT, NO_INFORMATION_GAINED,
     DEADLINE_EXCEEDED, CANCEL_RECVD,
     calculate_response, score_groups, _encode_response, _ALL_GREEN_PATTERN,
     _perform_restriction, rank_candidates_by_max_group_size_then_entropy_gain,
@@ -357,7 +357,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
             remaining, "crane", None, None,
             n=None, best_erd=float('inf'),
             guesses=remaining, policy=ERD_ANSWERS, budget=None)
-        self.assertIn(status, (SOLVED, NO_INFORMATION, OVER_ERD_LIMIT, OVER_DEPTH_BUDGET))
+        self.assertIn(status, (SOLVED, NO_INFORMATION_GAINED, OVER_ERD_LIMIT, OVER_DEPTH_BUDGET))
 
     def test_evaluate_guess_matches_cached_decomposition(self):
         """cache=None path produces the same partition as the cache path."""

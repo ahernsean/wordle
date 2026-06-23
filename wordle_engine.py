@@ -113,9 +113,30 @@ CANCEL_RECVD      = 1   # external stop signal received
 SOLVED            = 2   # exact optimum found
 OVER_DEPTH_BUDGET = 3   # depth budget too small — proven no winning strategy
 OVER_ERD_LIMIT    = 4   # every candidate >= ERD bound — lower bound only, do not cache
-NO_INFORMATION    = 5   # candidate split yields k >= n (zero information gain)
+NO_INFORMATION_GAINED = 5  # a response group is the whole branch: split gained nothing
 
 _ABORT_STATUSES = frozenset({DEADLINE_EXCEEDED, CANCEL_RECVD})
+
+
+# Admissible ceiling on how many answer words any strategy can guarantee to
+# resolve within a given guess budget.  A guess yields at most 3**5 = 243
+# distinct response patterns; the all-green pattern resolves the guessed word
+# itself, and each of the other 242 patterns leads to a group that must be
+# resolved within budget-1.  Hence M(b) = 1 + 242*M(b-1), M(0) = 0.  A branch
+# holding more words than M(budget) cannot be solved within budget — a
+# never-false loss certificate.  The bound is sound but weak: M(2) = 243 and
+# M(3) = 58,807, so it fires only for very large branches and never at
+# budget >= 3 over a few-thousand-word universe.  Structural losses (specific
+# near-identical words a single guess cannot separate) sit far below it and
+# can only be certified by exhaustive search.
+_MAX_SOLVABLE_WITHIN = [0]
+
+
+def max_solvable_within(budget):
+    """Upper bound on answer words solvable within `budget` guesses (see above)."""
+    while len(_MAX_SOLVABLE_WITHIN) <= budget:
+        _MAX_SOLVABLE_WITHIN.append(1 + 242 * _MAX_SOLVABLE_WITHIN[-1])
+    return _MAX_SOLVABLE_WITHIN[budget]
 
 
 # ---------------------------------------------------------------------------
@@ -1040,7 +1061,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         if k == 1 and sub_branch[0] == candidate:
             continue  # self: solved by playing this candidate, 0 further guesses
         if k >= n:
-            return (NO_INFORMATION, None, None, floor)  # zero information
+            return (NO_INFORMATION_GAINED, None, None, floor)  # split gained nothing
         # Max ERD this sub-branch may have for the candidate to still beat the
         # bound, assuming the remaining siblings achieve only their lower bound.
         if best_erd == float('inf'):
@@ -1109,8 +1130,9 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         return (OVER_DEPTH_BUDGET, float('inf'), None, True)   # no guess available at all
     if n == 1:
         return (SOLVED, 1.0, 1, False)
-    if budget is not None and budget < 2:
-        # >=2 words need >=2 guesses (guess one; if wrong, play the other).
+    if budget is not None and n > max_solvable_within(budget):
+        # More words than any strategy can resolve within budget — certain loss.
+        # Subsumes the budget < 2 case (M(1) = 1): >=2 words need >=2 guesses.
         return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
     if policy is None:
@@ -1128,6 +1150,12 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             score_cache.read_with_depth(branch_key, policy), budget)
         if reuse is not None:
             return (SOLVED, *reuse)   # cached values are exact optima
+        # A loss proven within b guesses is a loss within any budget <= b.
+        # Reuse it instead of re-disproving every candidate from scratch.
+        if budget is not None:
+            loss_budget = score_cache.read_loss(branch_key, policy)
+            if loss_budget is not None and budget <= loss_budget:
+                return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
     if deadline is not None and time.time() > deadline:
         return DEADLINE_EXCEEDED
@@ -1208,6 +1236,10 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             # Do NOT cache — OVER_ERD_LIMIT so the caller discards it.
             return (OVER_ERD_LIMIT, ceiling, None, node_floor)
         # No feasible guess and no cutoff: proven unsolvable within budget.
+        # Persist the loss so this exhaustive disproof is never repeated for
+        # this branch at this (or any smaller) budget.
+        if score_cache and budget is not None:
+            score_cache.write_loss(branch_key, policy, budget)
         return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
     if score_cache:
