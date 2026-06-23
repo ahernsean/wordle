@@ -18,7 +18,7 @@ import time
 import unittest
 
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue
+from erd_queue import ERDQueue, cost_size_bucket
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
 N_CANDIDATES = 20
@@ -404,6 +404,55 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(row['coordination_millis'], 5000)
         self.assertEqual(row['work_nodes'], 300)
         self.assertEqual(row['worker_count'], 4)
+
+    def test_add_backstop_telemetry_inserts_row(self):
+        self.q.add_backstop_telemetry(8, 2, 65000, 500, None, 6)
+        row = self.q._conn.execute(
+            "SELECT * FROM backstop_telemetry ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['n_words'], 8)
+        self.assertEqual(row['depth'], 2)
+        self.assertEqual(row['elapsed_millis'], 65000)
+        self.assertEqual(row['nodes'], 500)
+        self.assertIsNone(row['predicted_nodes'])
+        self.assertEqual(row['remaining_candidates'], 6)
+
+    def test_add_backstop_telemetry_with_warm_prediction(self):
+        self.q.add_backstop_telemetry(12, 1, 120000, 1000, 800.5, 4)
+        row = self.q._conn.execute(
+            "SELECT * FROM backstop_telemetry ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertAlmostEqual(row['predicted_nodes'], 800.5, places=1)
+
+    def test_add_nodes_spent_noop_for_nonpositive_delta(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.q.add_nodes_spent(self.key, 0)
+        self.q.add_nodes_spent(self.key, -10)
+        row = self.q.get_branch(self.key)
+        self.assertEqual(row['nodes_spent'], 0)
+
+    def test_update_cost_model_noop_for_nonpositive_nodes(self):
+        from wordle_engine import ERD_ALL
+        self.q.update_cost_model(ERD_ALL, 10, 0)
+        self.q.update_cost_model(ERD_ALL, 10, -5)
+        self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 10))
+
+    def test_update_cost_model_logsums_noop_for_nonpositive_weight(self):
+        from wordle_engine import ERD_ALL
+        self.q.update_cost_model_logsums(ERD_ALL, 10, 3.0, 9.0, 0.0)
+        self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 10))
+
+    def test_get_cost_spread_returns_none_for_cold_bucket(self):
+        from wordle_engine import ERD_ALL
+        result = self.q.get_cost_spread(ERD_ALL, 10)
+        self.assertIsNone(result)
+
+    def test_cost_size_bucket_returns_zero_for_n_below_one(self):
+        # n_words < 1 hits the early-return guard (line 33); log(0) is undefined
+        # so this guard is the only valid path for zero or negative inputs.
+        self.assertEqual(cost_size_bucket(0), 0)
+        self.assertEqual(cost_size_bucket(-5), 0)
 
 
 if __name__ == "__main__":

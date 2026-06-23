@@ -742,5 +742,163 @@ class TestSubbranchSolverCostModel(unittest.TestCase):
         self.assertEqual(result, expected)
 
 
+class TestLogEMA(unittest.TestCase):
+    """_LogEMA: edge cases for add() and value()."""
+
+    def test_add_nonpositive_value_is_noop(self):
+        ema = erd_swarm._LogEMA(tau=1.0, min_weight=1)
+        ema.add(0)
+        ema.add(-5)
+        self.assertIsNone(ema.value())  # weight still 0
+
+    def test_add_with_implicit_now_warms_ema(self):
+        ema = erd_swarm._LogEMA(tau=1.0, min_weight=1)
+        ema.add(10)   # now=None → time.time() called internally
+        self.assertIsNotNone(ema.value())
+
+    def test_add_twice_applies_decay(self):
+        # Use a very short tau so decay is substantial and clearly exercises the
+        # decay branch; min_weight=1 so value() is readable after each add.
+        ema = erd_swarm._LogEMA(tau=0.1, min_weight=1)
+        ema.add(100, now=0.0)
+        ema.add(100, now=1.0)   # second call: self._last is not None → decay applied
+        # Decayed weight < 2; value should still be computable with min_weight=1.
+        self.assertIsNotNone(ema.value())
+
+    def test_value_returns_geometric_mean_when_warm(self):
+        import math
+        ema = erd_swarm._LogEMA(tau=1e9, min_weight=2)  # huge tau → no decay
+        ema.add(10, now=0.0)
+        ema.add(1000, now=0.0)
+        expected = math.exp((math.log(10) + math.log(1000)) / 2)
+        self.assertAlmostEqual(ema.value(), expected, places=6)
+
+
+class TestPublishThresholdWarmPath(unittest.TestCase):
+    """_publish_threshold returns SAFETY_FACTOR * coord / node_time when warm."""
+
+    def test_warm_threshold_exceeds_bootstrap(self):
+        w = _bare_worker()
+        # Use now=0.0 for all adds so decay = exp(0) = 1 and weight accumulates
+        # cleanly to exactly min_weight, without floating-point decay undershooting.
+        for _ in range(erd_swarm._PUBLISH_EMA_MIN_WEIGHT):
+            w._coord_ema.add(0.01, now=0.0)      # 10 ms coordination
+            w._node_time_ema.add(1e-6, now=0.0)  # 1 µs / node
+        threshold = w._publish_threshold()
+        self.assertGreater(threshold, erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP)
+
+
+class TestFlushCostModelBuffer(unittest.TestCase):
+    """_flush_cost_model_buffer propagates buffered inline samples to the queue."""
+
+    def test_flush_calls_update_logsums_per_size(self):
+        w = _bare_worker()
+        w._cost_model_buffer = {5: (2.0, 4.0, 1), 10: (3.0, 9.0, 2)}
+        w._flush_cost_model_buffer()
+        self.assertEqual(w.queue.update_cost_model_logsums.call_count, 2)
+        w._typical_cache.clear()  # confirmed cleared by flush
+        self.assertEqual(w._cost_model_buffer, {})
+
+    def test_flush_empty_buffer_clears_without_update(self):
+        w = _bare_worker()
+        w._flush_cost_model_buffer()
+        w.queue.update_cost_model_logsums.assert_not_called()
+
+
+class TestRecordInlineEdgeCases(unittest.TestCase):
+    """record_inline edge cases: zero-node frame and duplicate size in buffer."""
+
+    def _pub(self):
+        w = _bare_worker()
+        pub = erd_swarm._MidLoopPublisher(w)
+        return pub, w
+
+    def test_record_inline_noop_when_nodes_unchanged(self):
+        pub, w = self._pub()
+        token = pub.enter(BRANCH[:4], depth=0)
+        # _nodes stays 0 → nodes_spent = 0 → early return, nothing buffered.
+        pub.record_inline(token)
+        self.assertEqual(w._cost_model_buffer, {})
+
+    def test_record_inline_accumulates_second_sample_for_same_size(self):
+        import math
+        pub, w = self._pub()
+        words = BRANCH[:4]
+        token1 = pub.enter(words, depth=0)
+        w._nodes = 100
+        pub.record_inline(token1)
+        token2 = pub.enter(words, depth=0)
+        w._nodes = 300   # 200 more nodes for second frame of same size
+        pub.record_inline(token2)
+        s, sq, c = w._cost_model_buffer[len(words)]
+        self.assertEqual(c, 2)
+        self.assertAlmostEqual(s, math.log(100) + math.log(200), places=6)
+
+
+class TestNoteDepthDeeperPruning(unittest.TestCase):
+    """_note_depth prunes deeper spine entries when resetting a shallower depth."""
+
+    def test_note_depth_prunes_deeper_entries(self):
+        w = _bare_worker()
+        w._note_depth(0, 200, guess="crane", pattern="00000")
+        w._note_depth(1, 50, guess="slate", pattern="10000")
+        w._note_depth(2, 10, guess="trace", pattern="22222")
+        # Revisit depth 1: depths 2+ should be pruned.
+        w._note_depth(1, 48, guess="tales", pattern="01000")
+        self.assertNotIn(2, w._spine)
+        self.assertIn(1, w._spine)
+
+    def test_sentinel_prunes_deeper_entries(self):
+        w = _bare_worker()
+        w._note_depth(1, 50, guess="crane", pattern="00000")
+        w._note_depth(2, 20, guess="slate", pattern="10000")
+        w._note_depth(3, 5, guess="trace", pattern="22222")
+        # Sentinel at depth 1 with n<0 should prune depths 2 and 3.
+        w._note_depth(1, -1)
+        self.assertNotIn(2, w._spine)
+        self.assertNotIn(3, w._spine)
+
+
+class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
+    """Publisher check() with best_guess and with empty done_indices."""
+
+    def _pub_overrun(self, predicted=10, best_guess=None):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = predicted
+        pub = erd_swarm._MidLoopPublisher(w)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * predicted + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        result = pub.check(token, CANDIDATES, 0, best_guess, 1.5, 5)
+        return result, w, pub
+
+    def test_check_calls_update_branch_best_when_best_guess_known(self):
+        result, w, _ = self._pub_overrun(best_guess="crane")
+        self.assertIsNotNone(result)
+        w.queue.update_branch_best.assert_called_once()
+
+    def test_check_skips_update_branch_best_when_no_best_guess(self):
+        result, w, _ = self._pub_overrun(best_guess=None)
+        self.assertIsNotNone(result)
+        w.queue.update_branch_best.assert_not_called()
+
+    def test_check_handles_empty_done_indices(self):
+        # Use a candidate_list of words that are NOT in word_idx so done_indices
+        # is empty — mark_claims_done should not be called.
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = 10
+        pub = erd_swarm._MidLoopPublisher(w)
+        words = BRANCH[:6]
+        token = pub.enter(words, depth=0)
+        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        unknown_words = ["zzzzz"] * 10
+        pub.check(token, unknown_words, 0, None, None, 5)
+        w.queue.mark_claims_done.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
