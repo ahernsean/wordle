@@ -716,16 +716,29 @@ class _BranchWorker:
     def _subbranch_solver(self, words, budget):
         """Engine hook: decide whether to solve a sub-branch cooperatively.
 
-        When the cost model is warm, promotes sub-branches whose predicted node
-        cost exceeds the adaptive publish threshold.  When cold, falls back to the
-        PROMOTE_MIN_SIZE size threshold: large cold branches promote up front,
-        small ones inline under the mid-loop publisher's wall-clock backstop —
-        so a mispredicted small tarpit is bounded by COLD_BACKSTOP_SECONDS rather
-        than by a size heuristic that can't see it.  Returns the engine's
-        (status, cost, max_depth, floor) tuple, or None to inline.  Cooperative
-        results are always exact (no cutoff).
+        budget <= 2 branches are always solved inline: at budget=2, each
+        candidate needs a perfect separator (all response groups singletons),
+        which for n >= 3 is near-impossible — candidates return OVER_DEPTH_BUDGET
+        instantly, so cooperative overhead is never worthwhile.
+
+        For budget >= 3: when the cost model is warm, promotes sub-branches whose
+        predicted node cost exceeds the adaptive publish threshold.  When cold,
+        falls back to the PROMOTE_MIN_SIZE size threshold: large cold branches
+        promote up front, small ones inline under the mid-loop publisher's
+        wall-clock backstop — so a mispredicted small tarpit is bounded by
+        COLD_BACKSTOP_SECONDS rather than by a size heuristic that can't see it.
+        Returns the engine's (status, cost, max_depth, floor) tuple, or None to
+        inline.  Cooperative results are always exact (no cutoff).
         """
         if budget is None:
+            return None
+        # budget=2 means each candidate needs a perfect separator (every response
+        # group must be a singleton).  For n >= 3 this is near-impossible, so
+        # virtually every candidate returns OVER_DEPTH_BUDGET instantly.  The warm
+        # cost model handles this correctly (predicted ≈ 0 < threshold → inline),
+        # but the cold fallback promotes by size alone.  Guard both paths: these
+        # branches are not worth cooperative overhead regardless of model state.
+        if budget <= 2:
             return None
         n = len(words)
         if not self._adaptive:

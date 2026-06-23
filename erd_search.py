@@ -1018,7 +1018,7 @@ def _print_status(args, selected_worker=None, interactive=False):
     if not hbs:
         print('  (none active)')
     else:
-        print(f'  {"W":>2}  {"Root":<11}  {"D":>1}  {"Chk":>3}  {"Held":>6}  '
+        print(f'  {"W":>2}  {"Root":<11}  {"D":>1}  {"Idx":>5}  {"Held":>6}  '
               f'{"Best":<5}  {"ERD":>5}  {"Bound":>5}  HB')
     for h in sorted(hbs, key=lambda r: r['worker_id']):
         age = now_ts - h['updated_at']
@@ -1026,7 +1026,7 @@ def _print_status(args, selected_worker=None, interactive=False):
         flag = ' !!' if age > 120 else ''
         key = h['current_branch_key']
         if key is None:
-            print(f'  {wnum:>2}  {"(idle)":<11}  {0:1d}  {"":>3}  {"":>6}  '
+            print(f'  {wnum:>2}  {"(idle)":<11}  {0:1d}  {"":>5}  {"":>6}  '
                   f'{"":5}  {"":>5}  {"":>5}  {age}s{flag}')
             continue
         src = (f'{h["source_word"].upper()} {fmt_pattern(h["source_pattern"])}'
@@ -1036,8 +1036,6 @@ def _print_status(args, selected_worker=None, interactive=False):
         chunk = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
         held = now_ts - (h['claim_started_at'] or now_ts)
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
-        n_seen = (h['cand_n_seen'] if 'cand_n_seen' in h.keys() else None) or 0
-        c_total = (h['claim_total'] if 'claim_total' in h.keys() else None) or 0
         mdepth = (h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
         nrate = (h['node_rate'] if 'node_rate' in h.keys() else None) or 0.0
@@ -1065,13 +1063,12 @@ def _print_status(args, selected_worker=None, interactive=False):
         best_g_disp = best_g.upper() if best_g else '-----'
         best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
         bound_e_disp = f'{bound_e:.3f}' if bound_e is not None else '-----'
-        print(f'  {wnum:>2}  {src:<11}  {w_depth:1d}  {chunk:>3}  {_fmt_duration(held):>6}  '
+        print(f'  {wnum:>2}  {src:<11}  {w_depth:1d}  {chunk:>5}  {_fmt_duration(held):>6}  '
               f'{best_g_disp:<5}  {best_e_disp:>5}  {bound_e_disp:>5}  {age}s{flag}')
-        if cur and c_total:
+        if cur:
             cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
             krate = f'{int(nrate / 1000)}kN/s'
-            cperc = int(n_seen / c_total * 100)
-            print(f'       {cur_disp}  {n_seen:>3}/{c_total:<3} {cperc:2d}%  MaxD:{mdepth}  {krate:>7}  {_spine_sizes(path)}')
+            print(f'       {cur_disp}  MaxD:{mdepth}  {krate:>7}  {_spine_sizes(path)}')
         else:
             print()
 
