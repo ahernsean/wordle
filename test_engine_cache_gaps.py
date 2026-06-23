@@ -121,6 +121,32 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             sc.write(key, "full", "heart", 2.5)
 
+    # ---- write_loss() ----
+    def test_write_loss_swallows_disk_io_error(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        sc._conn = _ConnProxy(sc._conn, execute=boom)
+        with self.assertLogs("wordle", level="WARNING") as cm:
+            sc.write_loss(key, "full", 3)         # must not raise
+        self.assertTrue(any("write_loss" in m for m in cm.output))
+        # The session mirror still carries the verdict despite the failed write.
+        self.assertEqual(sc._loss_mem_cache[(key, "full")], 3)
+
+    def test_write_loss_reraises_non_disk_io_error(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+
+        sc._conn = _ConnProxy(sc._conn, execute=boom)
+        with self.assertRaises(sqlite3.OperationalError):
+            sc.write_loss(key, "full", 3)
+
     # ---- write_decomposition() ----
     def test_write_decomposition_swallows_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
@@ -242,6 +268,20 @@ class TestCacheSQLiteCloseAndMemory(unittest.TestCase):
         self.assertEqual(mc.read_misses, 1)
         self.assertIsNone(mc.read(key, ERD_ANSWERS))
         self.assertEqual(mc.read_misses, 2)
+
+    def test_memory_cache_loss_round_trip_keeps_widest_budget(self):
+        """MemoryScoreCache read_loss/write_loss: unknown key reads None; a
+        write records the budget; a wider budget replaces it, a narrower one
+        does not."""
+        mc = MemoryScoreCache()
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        self.assertIsNone(mc.read_loss(key, ERD_ANSWERS))
+        mc.write_loss(key, ERD_ANSWERS, 3)
+        self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 3)
+        mc.write_loss(key, ERD_ANSWERS, 2)        # narrower: ignored
+        self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 3)
+        mc.write_loss(key, ERD_ANSWERS, 5)        # wider: replaces
+        self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 5)
 
 
 # ===========================================================================
