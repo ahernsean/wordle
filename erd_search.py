@@ -47,11 +47,13 @@ queue-status    Show swarm queue coverage for a given word: which response
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import logging
 import multiprocessing
 import os
 import select
+from collections import defaultdict
 import signal
 import sys
 import termios
@@ -733,7 +735,8 @@ def cmd_status(args):
                 sys.stdout.write('\033[?25h')
                 sys.stdout.flush()
     else:
-        _print_status(args, selected_worker=args.worker)
+        _print_status(args, selected_worker=args.worker,
+                      selected_branch=args.branch)
 
 
 def _watch_with_keys(args, interval):
@@ -744,13 +747,15 @@ def _watch_with_keys(args, interval):
     # tty.setraw() also clears OPOST, which breaks \n → \r\n translation.
     new_settings[3] &= ~(termios.ICANON | termios.ECHO)
     selected_worker = None
+    selected_branch = None
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
         sys.stdout.write('\033[?25l\033[2J\033[H')
         sys.stdout.flush()
         _redraw_status.prev_sections = []
         while True:
-            _redraw_status(args, selected_worker=selected_worker)
+            _redraw_status(args, selected_worker=selected_worker,
+                           selected_branch=selected_branch)
             deadline = time.monotonic() + interval
             while True:
                 remaining = deadline - time.monotonic()
@@ -768,6 +773,14 @@ def _watch_with_keys(args, interval):
                         selected_worker = None if selected_worker == w else w
                         _redraw_status.prev_sections = []  # force full redraw
                         break
+                    # A branch hotkey letter drills into that branch (by its
+                    # stable id, so the selection survives position shifts).
+                    hotkeys = getattr(_print_status, '_branch_hotkeys', {})
+                    if ch in hotkeys:
+                        bid = hotkeys[ch]
+                        selected_branch = None if selected_branch == bid else bid
+                        _redraw_status.prev_sections = []
+                        break
     except KeyboardInterrupt:
         # ISIG stays enabled (only ICANON/ECHO are off), so Ctrl-C raises here
         # rather than arriving as a '\x03' byte from stdin.read().
@@ -776,6 +789,51 @@ def _watch_with_keys(args, interval):
         sys.stdout.write('\033[?25h')
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _branch_id(branch_key):
+    """Stable 4-hex-char label for a branch, derived from its key.
+
+    Same branch_key always yields the same id, so a branch keeps its identity
+    across refreshes even as its display position (and hotkey letter) shifts.
+    Collisions among the few dozen simultaneously-active branches are vanishingly
+    unlikely over a 16-bit space.
+    """
+    return hashlib.sha1(bytes(branch_key)).hexdigest()[:4]
+
+
+# Hotkey letters offered for branch drill-down, in display order.  'q' is the
+# quit key and is skipped; digits stay reserved for worker selection.
+_BRANCH_HOTKEYS = 'abcdefghijklmnoprstuvwxyz'
+
+
+def _fmt_spine_path(spine):
+    """Render a stored branch spine ('GUESS pattern GUESS pattern ...') as a
+    human path 'GUESS pattern ▸ GUESS pattern'.  Empty/None yields ''."""
+    if not spine:
+        return ''
+    toks = spine.split()
+    edges = [' '.join(toks[i:i + 2]) for i in range(0, len(toks), 2)]
+    return ' ▸ '.join(edges)
+
+
+def _compact_spine_path(spine, source_word, source_pattern, fmt_pattern,
+                        depth, width=40):
+    """One-line spine for the overview row, tail-truncated to `width`.
+
+    With a stored spine, shows the deepest `width` characters of the full path
+    (the most recent edges — where the branch actually sits), prefixed '…' when
+    truncated.  Without one (a row predating spine capture), falls back to the
+    root word plus a '▸ ?×N' marker for the N unrecorded intermediate edges.
+    """
+    full = _fmt_spine_path(spine)
+    if not full:
+        root = (f'{source_word.upper()} {fmt_pattern(source_pattern)}'
+                if source_word and source_pattern is not None else '-----')
+        return f'{root} ▸ ?×{depth}' if depth else root
+    if len(full) <= width:
+        return full
+    return '…' + full[-(width - 1):]
 
 
 def _spine_sizes(path):
@@ -877,12 +935,13 @@ def _highlight_changes(new_line, old_line):
     return ''.join(result)
 
 
-def _redraw_status(args, selected_worker=None):
+def _redraw_status(args, selected_worker=None, selected_branch=None):
     buf = io.StringIO()
     old_stdout = sys.stdout
     sys.stdout = buf
     try:
-        _print_status(args, selected_worker=selected_worker, interactive=True)
+        _print_status(args, selected_worker=selected_worker,
+                      selected_branch=selected_branch, interactive=True)
     finally:
         sys.stdout = old_stdout
     new_sections = _split_sections(buf.getvalue().splitlines())
@@ -906,7 +965,8 @@ def _redraw_status(args, selected_worker=None):
     sys.stdout.flush()
 
 
-def _print_status(args, selected_worker=None, interactive=False):
+def _print_status(args, selected_worker=None, selected_branch=None,
+                  interactive=False):
     now_ts = int(time.time())
     from wordle_ui import fmt_pattern
 
@@ -989,7 +1049,15 @@ def _print_status(args, selected_worker=None, interactive=False):
 
     _section_break('branches', interactive)
 
-    # Branches in progress — the real progress unit.
+    if not hasattr(_print_status, '_answer_set'):
+        _print_status._answer_set = set(load_word_list(ANSWER_FILE))
+    answer_set = _print_status._answer_set
+
+    # Branches in progress — the real progress unit.  Each branch carries a
+    # stable short #id (durable across refreshes) and a positional hotkey letter
+    # for drill-down; the workers cooperating on it are listed beneath it,
+    # matched by current_branch_key, so cooperation is spatial rather than a
+    # bare count.
     _COOP_PRIORITY = 1_000_000   # sentinel: cooperative sub-branch, not user-queued
     branch_hdr = 'Branches:'
     if queue_ok:
@@ -1003,85 +1071,43 @@ def _print_status(args, selected_worker=None, interactive=False):
         parts = [f'done {n_done:,}', in_prog_str, f'pending {n_pending:,}']
         branch_hdr += ' ' + ', '.join(parts)
     print(branch_hdr)
-    denom_w = 2
-    if branches:
-        max_nc = max(b['n_candidates'] or 1 for b in branches)
-        denom_w = len(str(max_nc))
-    claims_col_w = 2 * denom_w + 5   # num/denom + ' ' + 2-digit int pct + '%'
-    if branches:
-        print(f'  {"Root":<11s} {"D":>1s} {"Ans":>4s} '
-              f'{"Claims":<{claims_col_w}s} '
-              f'{"Best":<5s} {"ERD":>5s}  {"Pri":>3s} {"Wk":>2s} ETA')
-    else:
-        print('  (none)')
-    for b in branches:
-        key = bytes(b['branch_key'])
-        n_cands = b['n_candidates'] or 0
-        done = done_chunks.get(key, 0)
-        pct = 100.0 * done / n_cands if n_cands else 0.0
-        src = (f'{b["source_word"].upper()} {fmt_pattern(b["source_pattern"])}'
-               if b['source_word'] and b['source_pattern'] is not None
-               else '-----')
-        bw = (b['best_guess'] or '-----').upper()
-        be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '---'
-        nw = b['n_words'] or 0
-        wk = worker_counts.get(key, 0)
-        raw_pri = b['priority'] or 0
-        pri_str = 'COOP' if raw_pri >= _COOP_PRIORITY else str(raw_pri)
-        depth_val = b['depth'] if 'depth' in b.keys() else 0
-        created = b['created_at'] or now_ts
-        el = now_ts - created
-        eta = ''
-        if wk > 0 and 0 < done < n_cands and el > 0:
-            rem = (n_cands - done) / (done / el)
-            eta = _fmt_duration(int(rem))
-        claims_str = f'{done:>{denom_w}d}/{n_cands:<{denom_w}d} {int(pct):2d}%'
-        print(f'  {src:<11s} {depth_val:1d} {nw:4d} '
-              f'{claims_str} '
-              f'{bw:<5s} {be:>5s} {pri_str:>4s} {wk:2d} {eta}')
+    if live and total_evals:
+        stat_parts = []
+        if cutoff_pct is not None:
+            stat_parts.append(
+                f'ERD-pruned {_abbrev(n_cutoff)}/{_abbrev(total_evals)} '
+                f'({_fmt_pct(cutoff_pct)})')
+        if pruned_pct is not None:
+            stat_parts.append(
+                f'depth-pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} '
+                f'({_fmt_pct(pruned_pct)})')
+        if stat_parts:
+            print('  Workers: ' + ', '.join(stat_parts))
     print()
 
-    _section_break('workers', interactive)
-
-    # Workers — liveness and forward progress.
-    if not hasattr(_print_status, '_answer_set'):
-        _print_status._answer_set = set(load_word_list(ANSWER_FILE))
-    answer_set = _print_status._answer_set
-    worker_hdr = 'Workers:'
-    if live and total_evals:
-        parts = []
-        if cutoff_pct is not None:
-            parts.append(f'ERD-pruned {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({_fmt_pct(cutoff_pct)})')
-        if pruned_pct is not None:
-            parts.append(f'depth-pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({_fmt_pct(pruned_pct)})')
-        if parts:
-            # Replace the worker header
-            worker_hdr = f'Workers: {", ".join(parts)}:'
-    print(worker_hdr)
     branch_depth_map = {bytes(b['branch_key']): (b['depth'] if 'depth' in b.keys() else 0)
                         for b in branches}
-    # Fresh accumulator each cycle: path shown reflects this refresh only.
-    max_paths = {}
-    if not hbs:
-        print('  (none active)')
-    else:
-        print(f'  {"W":>2}  {"Root":<11}  {"D":>1}  {"Idx":>5}  {"Held":>6}  '
-              f'{"Best":<5}  {"ERD":>5}  {"Bound":>5}  HB')
-    for h in sorted(hbs, key=lambda r: r['worker_id']):
+
+    # Group live heartbeats under the branch each worker is contributing to.
+    workers_by_branch = defaultdict(list)
+    idle_workers = []
+    for h in hbs:
+        k = h['current_branch_key']
+        if k is None:
+            idle_workers.append(h)
+        else:
+            workers_by_branch[bytes(k)].append(h)
+
+    def _worker_num(h):
+        wid = h['worker_id']
+        return wid.split('-')[-1] if '-' in wid else wid
+
+    def _print_worker_row(h):
+        # One nested row: the worker's position in the shared candidate sweep
+        # (idx), its current candidate, and the downward recursion spine sizes.
         age = now_ts - h['updated_at']
-        wnum = h['worker_id'].split('-')[-1] if '-' in h['worker_id'] else h['worker_id']
         flag = ' !!' if age > 120 else ''
-        key = h['current_branch_key']
-        if key is None:
-            print(f'  {wnum:>2}  {"(idle)":<11}  {0:1d}  {"":>5}  {"":>6}  '
-                  f'{"":5}  {"":>5}  {"":>5}  {age}s{flag}')
-            continue
-        src = (f'{h["source_word"].upper()} {fmt_pattern(h["source_pattern"])}'
-               if h['source_word'] and h['source_pattern'] is not None
-               else '-----')
-        w_depth = branch_depth_map.get(bytes(key), 0)
         chunk = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
-        held = now_ts - (h['claim_started_at'] or now_ts)
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
         mdepth = (h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
@@ -1089,35 +1115,69 @@ def _print_status(args, selected_worker=None, interactive=False):
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
         if '>' in path:
             path = path.replace('>', '→')
-        # Show the deepest path seen across this watch cycle.  Each heartbeat
-        # writes the max spine from its own 2-second window (_hb_max_spine in
-        # erd_swarm.py, reset after each write); max_paths accumulates across
-        # successive heartbeat reads so the display shows the maximum over the
-        # full watch interval.  Tied depth overwrites so the displayed path is
-        # the most recent at that depth.
-        path_key = (h['worker_id'], bytes(key) if key else None)
-        prev_max = max_paths.get(path_key, '')
-        if path.count('→') >= prev_max.count('→'):
-            max_paths[path_key] = path
-        else:
-            path = prev_max
-        best_g = (h['best_guess'] if 'best_guess' in h.keys() else None) or ''
-        best_e = (h['best_erd'] if 'best_erd' in h.keys() else None)
-        bound_e = (h['bound_erd'] if 'bound_erd' in h.keys() else None)
         # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
         if age <= 10 and nrate == 0 and nodes:
             flag += ' ~?'
-        best_g_disp = best_g.upper() if best_g else '-----'
-        best_e_disp = f'{best_e:.3f}' if best_e is not None else '-----'
-        bound_e_disp = f'{bound_e:.3f}' if bound_e is not None else '-----'
-        print(f'  {wnum:>2}  {src:<11}  {w_depth:1d}  {chunk:>5}  {_fmt_duration(held):>6}  '
-              f'{best_g_disp:<5}  {best_e_disp:>5}  {bound_e_disp:>5}  {age}s{flag}')
-        if cur:
-            cur_disp = cur.upper() + ('*' if cur.lower() in answer_set else ' ')
-            krate = f'{int(nrate / 1000)}kN/s'
-            print(f'       {cur_disp}  MaxD:{mdepth}  {krate:>7}  {_spine_sizes(path)}')
-        else:
-            print()
+        cur_disp = (cur.upper() + ('*' if cur.lower() in answer_set else '')) if cur else '-----'
+        krate = f'{int(nrate / 1000)}kN/s' if nrate else ''
+        print(f'     W{_worker_num(h):<2} idx {chunk:>5}  {cur_disp:<6} d{mdepth} '
+              f'{krate:>7}  {_spine_sizes(path):<20}  {age}s{flag}')
+
+    if not branches:
+        print('  (no branches in progress)')
+    else:
+        print(f'  {"":1} {"#id":>5}  {"Ans":>4} {"D":>1}  {"Sweep":<15} '
+              f'{"Best":<11}  {"Wk":>3}  {"ETA":>7}  Spine')
+    branch_hotkeys = {}
+    hotkey_iter = iter(_BRANCH_HOTKEYS)
+    for b in branches:
+        key = bytes(b['branch_key'])
+        bid = _branch_id(key)
+        letter = next(hotkey_iter, ' ')
+        if letter != ' ':
+            branch_hotkeys[letter] = bid
+        n_cands = b['n_candidates'] or 0
+        done = done_chunks.get(key, 0)
+        pct = 100.0 * done / n_cands if n_cands else 0.0
+        bw = (b['best_guess'] or '-----').upper()
+        be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '-----'
+        best_disp = f'{bw:<5} {be:>5}'
+        nw = b['n_words'] or 0
+        wk = worker_counts.get(key, 0)
+        depth_val = branch_depth_map.get(key, 0)
+        created = b['created_at'] or now_ts
+        el = now_ts - created
+        eta = ''
+        if wk > 0 and 0 < done < n_cands and el > 0:
+            rem = (n_cands - done) / (done / el)
+            eta = _fmt_duration(int(rem))
+        sweep = f'{done:>5}/{n_cands:<5} {int(pct):2d}%'
+        spine = b['spine'] if 'spine' in b.keys() else None
+        spine_disp = _compact_spine_path(
+            spine, b['source_word'], b['source_pattern'], fmt_pattern, depth_val)
+        print(f'  {letter} #{bid}  {nw:4d} {depth_val:1d}  {sweep:<15} '
+              f'{best_disp:<11}  {wk:2d}wk  {eta:>7}  {spine_disp}')
+        for h in sorted(workers_by_branch.get(key, []),
+                        key=lambda r: int(_worker_num(r)) if _worker_num(r).isdigit()
+                        else 0):
+            _print_worker_row(h)
+
+    # Workers attached to a branch no longer in the in-progress list (just
+    # finalized) or idle between claims.
+    branch_keys = {bytes(b['branch_key']) for b in branches}
+    detached = [h for k, hs in workers_by_branch.items() if k not in branch_keys
+                for h in hs]
+    if idle_workers or detached:
+        print()
+        for h in sorted(idle_workers, key=lambda r: _worker_num(r)):
+            age = now_ts - h['updated_at']
+            flag = ' !!' if age > 120 else ''
+            print(f'  W{_worker_num(h):<2} (idle)  {age}s{flag}')
+        for h in sorted(detached, key=lambda r: _worker_num(r)):
+            age = now_ts - h['updated_at']
+            print(f'  W{_worker_num(h):<2} (branch finalizing)  {age}s')
+
+    _print_status._branch_hotkeys = branch_hotkeys
 
     if selected_worker is not None:
         _section_break('detail', interactive)
@@ -1181,6 +1241,71 @@ def _print_status(args, selected_worker=None, interactive=False):
                 print('  (no spine data yet)')
             if interactive:
                 print(f'  [press {selected_worker} to dismiss]')
+
+    if selected_branch is not None:
+        _section_break('branchdetail', interactive)
+        target = next((b for b in branches
+                       if _branch_id(b['branch_key']) == selected_branch), None)
+        print()
+        if target is None:
+            print(f'── Branch #{selected_branch} not found ─────────────────')
+        else:
+            key = bytes(target['branch_key'])
+            n_cands = target['n_candidates'] or 0
+            done = done_chunks.get(key, 0)
+            depth_val = branch_depth_map.get(key, 0)
+            print(f'── Branch #{selected_branch}  ({target["n_words"] or 0} words, '
+                  f'depth {depth_val}) ──────────')
+            # Full upward spine, root -> this branch, one edge per line.
+            spine = target['spine'] if 'spine' in target.keys() else None
+            full = _fmt_spine_path(spine)
+            if full:
+                for di, edge in enumerate(full.split(' ▸ ')):
+                    word = edge.split()[0] if edge.split() else ''
+                    star = '*' if word.lower() in answer_set else ' '
+                    label = 'root' if di == 0 else f'd{di:<2}'
+                    print(f'  {label}  {edge}{star}')
+            else:
+                src = (f'{target["source_word"].upper()} '
+                       f'{fmt_pattern(target["source_pattern"])}'
+                       if target['source_word'] and target['source_pattern'] is not None
+                       else '?????')
+                print(f'  root  {src}')
+                if depth_val:
+                    print(f'  d1..d{depth_val}  (intermediate edges not recorded — '
+                          f'pre-spine branch)')
+            # Candidate sweep with each cooperating worker's position marked.
+            best_disp = (f'{(target["best_guess"] or "-----").upper()} '
+                         f'{target["best_erd"]:.3f}'
+                         if target['best_erd'] is not None else 'none yet')
+            print(f'  sweep {done}/{n_cands}  best {best_disp}')
+            workers_here = sorted(
+                [h for h in hbs if h['current_branch_key']
+                 and bytes(h['current_branch_key']) == key],
+                key=lambda r: (r['claim_idx'] if r['claim_idx'] is not None else -1))
+            if workers_here and n_cands:
+                bar_w = 40
+                marks = [' '] * bar_w
+                for h in workers_here:
+                    idx = h['claim_idx']
+                    if idx is not None:
+                        pos = min(bar_w - 1, int(bar_w * idx / n_cands))
+                        marks[pos] = _worker_num(h)[-1]
+                print(f'  [{"".join(marks)}]  (digit = worker at that sweep position)')
+            # Each cooperating worker's downward exploration spine, stacked.
+            for h in workers_here:
+                path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
+                path = path.replace('>', '→')
+                cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
+                cur_disp = cur.upper() if cur else '-----'
+                print(f'  W{_worker_num(h):<2} idx {h["claim_idx"]}  {cur_disp:<6} '
+                      f'{_spine_sizes(path)}')
+            if interactive:
+                letter = next((lt for lt, bid
+                               in getattr(_print_status, '_branch_hotkeys', {}).items()
+                               if bid == selected_branch), None)
+                if letter:
+                    print(f'  [press {letter} to dismiss]')
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -1342,6 +1467,9 @@ def main():
     p_stat.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_stat.add_argument('--worker', type=int, default=None, metavar='N',
                         help='Print spine detail for worker N (one-shot, no --watch needed)')
+    p_stat.add_argument('--branch', default=None, metavar='ID',
+                        help='Print drill-down detail for branch #ID (the stable '
+                             '4-hex id shown in the overview; one-shot)')
     p_stat.add_argument('--watch', nargs='?', const=30, type=int,
                         metavar='SECONDS',
                         help='Repeat every SECONDS (default 30)')

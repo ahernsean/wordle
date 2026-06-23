@@ -282,5 +282,63 @@ class TestReportingInvariants(unittest.TestCase):
         self.assertEqual(max_paths['w'], '45→9→2')
 
 
+class TestBranchSpinePersistence(unittest.TestCase):
+    """active_branches.spine round-trips through create_branch / reads, and its
+    migration is additive and idempotent."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def test_spine_round_trips(self):
+        q = ERDQueue(self.queue_path)
+        key = encode_subset(BRANCH)
+        q.create_branch(key, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, spine="SALET -g-g- CRANE bb-y-")
+        row = q.get_branch(key)
+        self.assertEqual(row["spine"], "SALET -g-g- CRANE bb-y-")
+        # branches_in_progress (SELECT *) also surfaces it for the display.
+        listed = {bytes(b["branch_key"]): b for b in q.branches_in_progress()}
+        self.assertEqual(listed[key]["spine"], "SALET -g-g- CRANE bb-y-")
+        q.close()
+
+    def test_spine_defaults_to_null(self):
+        q = ERDQueue(self.queue_path)
+        key = encode_subset(BRANCH)
+        q.create_branch(key, len(BRANCH), len(CANDIDATES), budget=ROOT_BUDGET)
+        self.assertIsNone(q.get_branch(key)["spine"])
+        q.close()
+
+    def test_migration_is_idempotent_on_legacy_db(self):
+        # Simulate a pre-spine database: pre-create active_branches WITHOUT the
+        # spine column so ERDQueue's CREATE TABLE IF NOT EXISTS is a no-op and
+        # _migrate is the only thing that can add the column.
+        import sqlite3
+        raw = sqlite3.connect(self.queue_path)
+        raw.execute("""
+            CREATE TABLE active_branches (
+                branch_key BLOB PRIMARY KEY, n_words INTEGER NOT NULL,
+                n_candidates INTEGER NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+                source_word TEXT, source_pattern INTEGER, best_erd REAL,
+                best_guess TEXT, status TEXT NOT NULL DEFAULT 'open',
+                created_at INTEGER, finalized_at INTEGER, budget INTEGER,
+                best_max_depth INTEGER, tainted INTEGER NOT NULL DEFAULT 0,
+                depth INTEGER NOT NULL DEFAULT 0, nodes_spent INTEGER NOT NULL DEFAULT 0)
+        """)
+        raw.commit()
+        raw.close()
+
+        q = ERDQueue(self.queue_path)            # _migrate adds the column
+        cols = {r["name"] for r in
+                q._conn.execute("PRAGMA table_info(active_branches)")}
+        self.assertIn("spine", cols)
+        q._migrate()                              # second run must not raise/dup
+        cols2 = {r["name"] for r in
+                 q._conn.execute("PRAGMA table_info(active_branches)")}
+        self.assertEqual(cols, cols2)
+        q.close()
+
+
 if __name__ == "__main__":
     unittest.main()

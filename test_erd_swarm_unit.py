@@ -58,6 +58,7 @@ def _bare_worker():
     w._coop_depth = 0
     w._top_source_word = None
     w._top_source_pattern = None
+    w._claimed_branch_spine = None
     w._adaptive = True
     w._typical_cache = {}
     w._cost_model_buffer = {}
@@ -191,6 +192,45 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
         # If hb_max_spine was already size 3, it should NOT be overwritten.
         if len(pre_hb) > len(w._spine):
             self.assertEqual(w._hb_max_spine, pre_hb)
+
+
+class TestSpineComposition(unittest.TestCase):
+    """_root_spine / _promoted_spine build the absolute root -> branch path."""
+
+    def test_root_spine_formats_word_and_pattern(self):
+        from wordle_ui import fmt_pattern
+        w = _bare_worker()
+        self.assertEqual(w._root_spine('salet', 0),
+                         f'SALET {fmt_pattern(0)}')
+
+    def test_root_spine_none_without_source(self):
+        w = _bare_worker()
+        self.assertIsNone(w._root_spine(None, 0))
+        self.assertIsNone(w._root_spine('salet', None))
+
+    def test_promoted_spine_composes_base_and_descent_edges(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'SALET -g-g-'
+        # Pattern strings pass through unchanged (only ints are fmt_pattern'd).
+        w._note_depth(1, 50, 'crane', 'bb-y-')
+        w._note_depth(2, 12, 'pound', 'g--y-')
+        self.assertEqual(w._promoted_spine(),
+                         'SALET -g-g- CRANE bb-y- POUND g--y-')
+
+    def test_promoted_spine_none_without_base(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = None
+        w._note_depth(1, 50, 'crane', 'bb-y-')
+        self.assertIsNone(w._promoted_spine())
+
+    def test_promoted_spine_skips_sentinel_and_size_only_levels(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'SALET -g-g-'
+        w._note_depth(1, 50, 'crane', 'bb-y-')
+        w._note_depth(2, 12)            # size-only level: no guess/pattern
+        # Promotion sentinel preserves the guess but sets size to '•'; the edge
+        # is still a real edge and must be kept.
+        self.assertEqual(w._promoted_spine(), 'SALET -g-g- CRANE bb-y-')
 
 
 class TestMaybeCheckpoint(unittest.TestCase):
