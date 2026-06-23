@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,
-    SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT, NO_INFORMATION,
+    SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT, NO_INFORMATION_GAINED,
     DEADLINE_EXCEEDED, CANCEL_RECVD,
     calculate_response, score_groups, _encode_response, _ALL_GREEN_PATTERN,
     _perform_restriction, rank_candidates_by_max_group_size_then_entropy_gain,
@@ -120,6 +120,32 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
         sc._conn = _ConnProxy(sc._conn, execute=boom)
         with self.assertRaises(sqlite3.OperationalError):
             sc.write(key, "full", "heart", 2.5)
+
+    # ---- write_loss() ----
+    def test_write_loss_swallows_disk_io_error(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        sc._conn = _ConnProxy(sc._conn, execute=boom)
+        with self.assertLogs("wordle", level="WARNING") as cm:
+            sc.write_loss(key, "full", 3)         # must not raise
+        self.assertTrue(any("write_loss" in m for m in cm.output))
+        # The session mirror still carries the verdict despite the failed write.
+        self.assertEqual(sc._loss_mem_cache[(key, "full")], 3)
+
+    def test_write_loss_reraises_non_disk_io_error(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+
+        sc._conn = _ConnProxy(sc._conn, execute=boom)
+        with self.assertRaises(sqlite3.OperationalError):
+            sc.write_loss(key, "full", 3)
 
     # ---- write_decomposition() ----
     def test_write_decomposition_swallows_disk_io_error(self):
@@ -243,6 +269,20 @@ class TestCacheSQLiteCloseAndMemory(unittest.TestCase):
         self.assertIsNone(mc.read(key, ERD_ANSWERS))
         self.assertEqual(mc.read_misses, 2)
 
+    def test_memory_cache_loss_round_trip_keeps_widest_budget(self):
+        """MemoryScoreCache read_loss/write_loss: unknown key reads None; a
+        write records the budget; a wider budget replaces it, a narrower one
+        does not."""
+        mc = MemoryScoreCache()
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        self.assertIsNone(mc.read_loss(key, ERD_ANSWERS))
+        mc.write_loss(key, ERD_ANSWERS, 3)
+        self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 3)
+        mc.write_loss(key, ERD_ANSWERS, 2)        # narrower: ignored
+        self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 3)
+        mc.write_loss(key, ERD_ANSWERS, 5)        # wider: replaces
+        self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 5)
+
 
 # ===========================================================================
 # wordle_engine.py gaps
@@ -357,7 +397,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
             remaining, "crane", None, None,
             n=None, best_erd=float('inf'),
             guesses=remaining, policy=ERD_ANSWERS, budget=None)
-        self.assertIn(status, (SOLVED, NO_INFORMATION, OVER_ERD_LIMIT, OVER_DEPTH_BUDGET))
+        self.assertIn(status, (SOLVED, NO_INFORMATION_GAINED, OVER_ERD_LIMIT, OVER_DEPTH_BUDGET))
 
     def test_evaluate_guess_matches_cached_decomposition(self):
         """cache=None path produces the same partition as the cache path."""

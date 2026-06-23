@@ -129,6 +129,12 @@ class ScoreCache:
         # max_mem_entries caps the cache size with LRU eviction so long-lived
         # worker processes do not consume unbounded memory.  None = unbounded.
         self._mem_cache = _LRUDict(max_size=max_mem_entries)
+        # Session mirror of proven losses (positive hits only): (branch_key,
+        # policy) -> largest budget at which the branch is proven a loss.  A
+        # worker re-encounters the same inseparable residue under thousands of
+        # candidates within one branch sweep; this turns each repeat into an
+        # O(1) hit instead of a fresh exhaustive disproof.
+        self._loss_mem_cache = _LRUDict(max_size=max_mem_entries)
 
     def _is_migration_done(self, name):
         """Return True if migration `name` has been recorded as complete."""
@@ -216,6 +222,24 @@ class ScoreCache:
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_branch_updated
             ON branch_best_by_policy(answer_list_id, updated_at)
+        """)
+        # Proven depth-limited losses: a branch with no winning strategy within
+        # loss_budget guesses.  Distinct from branch_best_by_policy, whose
+        # best_guess is NOT NULL — a loss has no best guess to record.  A loss
+        # within b guesses is also a loss within any q <= b (fewer guesses can
+        # only be harder), so a row is reusable for every query budget <=
+        # loss_budget; loss_budget holds the largest budget at which the loss is
+        # proven.  Lets the recurring inseparable residues of a hard branch be
+        # proven once instead of re-swept under every candidate that produces them.
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS branch_loss_by_policy (
+                branch_key     BLOB    NOT NULL,
+                policy         TEXT    NOT NULL,
+                answer_list_id TEXT    NOT NULL,
+                loss_budget    INTEGER NOT NULL,
+                updated_at     INTEGER NOT NULL,
+                PRIMARY KEY (branch_key, policy, answer_list_id)
+            )
         """)
         # 'subset_blob' was renamed to 'subset_key' — same encoding, cleaner
         # name. Databases migrated from lookahead_result or subgroup_pick may
@@ -563,6 +587,58 @@ class ScoreCache:
         self._mem_cache[(branch_key, policy)] = (
             best_guess, best_score, max_depth, solve_budget)
 
+    def read_loss(self, branch_key, policy):
+        """Largest budget at which `branch_key` is proven a loss, or None.
+
+        A return of b means "no winning strategy within b guesses"; the caller
+        treats any query budget q <= b as a loss.  Positive hits are mirrored in
+        a session cache; misses fall through to SQLite (so a loss another worker
+        just proved is seen) — a stale miss only costs a recompute, never a wrong
+        answer.
+        """
+        cached = self._loss_mem_cache.get((branch_key, policy))
+        if cached is not None:
+            return cached or None        # 0 = "no loss known" sentinel
+        row = self._conn.execute("""
+            SELECT loss_budget
+            FROM branch_loss_by_policy
+            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+        """, (branch_key, policy, self.answer_list_id)).fetchone()
+        # Cache the miss (sentinel 0) too, so a no-loss branch revisited millions
+        # of times across sibling searches is not re-queried.  A later loss by a
+        # peer is missed until eviction — sound, since that only forgoes reuse.
+        value = row["loss_budget"] if row is not None else 0
+        self._loss_mem_cache[(branch_key, policy)] = value
+        return value or None
+
+    def write_loss(self, branch_key, policy, budget):
+        """Record `branch_key` as proven unsolvable within `budget` guesses,
+        keeping the largest budget seen (the widest reuse range).  Disk I/O
+        errors are logged and swallowed like write() — the session mirror still
+        carries the verdict for the rest of this run.
+        """
+        prior = self._loss_mem_cache.get((branch_key, policy))
+        if prior is not None and prior >= budget:
+            self._loss_mem_cache[(branch_key, policy)] = prior  # refresh LRU
+            return
+        now = int(time.time())
+        try:
+            self._conn.execute("""
+                INSERT INTO branch_loss_by_policy
+                    (branch_key, policy, answer_list_id, loss_budget, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (branch_key, policy, answer_list_id)
+                DO UPDATE SET loss_budget = MAX(loss_budget, excluded.loss_budget),
+                              updated_at  = excluded.updated_at
+            """, (branch_key, policy, self.answer_list_id, budget, now))
+            self.write_count += 1
+        except sqlite3.OperationalError as exc:
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("write_loss(%s, budget=%d) failed: %s",
+                           policy, budget, exc)
+        self._loss_mem_cache[(branch_key, policy)] = budget
+
     def read_detail(self, branch_key, policy):
         """Like read(), but also returns the unix timestamp of the last write.
 
@@ -731,6 +807,8 @@ class MemoryScoreCache:
     def __init__(self):
         # (scope, branch_key, policy) -> (best_guess, best_score, max_depth, solve_budget)
         self._data = {}
+        # (scope, branch_key, policy) -> largest budget proven a loss
+        self._losses = {}
         self._scope = None
         self.read_hits = 0
         self.read_misses = 0
@@ -770,6 +848,16 @@ class MemoryScoreCache:
               max_depth=None, solve_budget=None):
         self._data[(self._scope, branch_key, policy)] = (
             best_guess, best_score, max_depth, solve_budget)
+        self.write_count += 1
+
+    def read_loss(self, branch_key, policy):
+        return self._losses.get((self._scope, branch_key, policy))
+
+    def write_loss(self, branch_key, policy, budget):
+        key = (self._scope, branch_key, policy)
+        prior = self._losses.get(key)
+        if prior is None or budget > prior:
+            self._losses[key] = budget
         self.write_count += 1
 
     def close(self):

@@ -31,7 +31,7 @@ from wordle_engine import (
     SOLVED,
     OVER_DEPTH_BUDGET,
     OVER_ERD_LIMIT,
-    NO_INFORMATION,
+    NO_INFORMATION_GAINED,
     _ABORT_STATUSES,
     cache_all_scores,
     evaluate_candidate,
@@ -678,8 +678,12 @@ class _BranchWorker:
                         best_guess, best_erd, max_depth, budget,
                         ' TAINTED' if tainted else '')
         else:  # pragma: no cover
-            # No feasible guess within budget: this branch is a loss.  Don't
-            # write an ERD entry (there is no winning strategy to cache).
+            # No feasible guess within budget: this branch is a loss.  There is
+            # no winning strategy to record in branch_best_by_policy, but the
+            # loss itself is persisted so the branch is never re-swept at this
+            # (or any smaller) budget.
+            if budget is not None:
+                self.score_cache.write_loss(branch_key, ERD_ALL, budget)
             logger.warning('%s branch (%d words) UNSOLVABLE within budget %s '
                            '(loss) src=%s', self.name, len(words), budget,
                            branch_key[:25])
@@ -774,6 +778,11 @@ class _BranchWorker:
                 self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
             if reuse is not None:
                 return (SOLVED, *reuse)
+            # Already proven a loss within this budget? don't register a swarm
+            # branch just to re-disprove it.
+            loss_budget = self.score_cache.read_loss(branch_key, ERD_ALL)
+            if loss_budget is not None and budget <= loss_budget:
+                return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
             n_words = len(words)
             self.queue.create_branch(
