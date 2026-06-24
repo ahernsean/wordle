@@ -93,10 +93,11 @@ _PUBLISH_EMA_MIN_WEIGHT = 5     # decayed samples before the adaptive threshold 
 PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 
 GAME_GUESSES = 6              # a Wordle game allows 6 guesses total
-# Queue branches are positions AFTER the opener (guess 1), so they are solved
-# under the remaining budget.  Depth-limited ERD: a branch unsolvable within
-# this many guesses is a loss, not a finite cost.
-ROOT_BUDGET = GAME_GUESSES - 1
+# Budget at the root — before any guess is played.  A branch's remaining budget
+# is ROOT_BUDGET minus its guess_depth (the guesses already played to reach it),
+# so a queued position after the opener (guess_depth 1) is solved at ROOT_BUDGET
+# - 1.  Depth-limited ERD: a branch unsolvable within its budget is a loss.
+ROOT_BUDGET = GAME_GUESSES
 
 logger = logging.getLogger('wordle')
 
@@ -274,11 +275,11 @@ class _BranchWorker:
     """One worker process's state and operations on branches/chunks."""
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
-                 budget=ROOT_BUDGET, n_workers=1,
+                 root_budget=ROOT_BUDGET, n_workers=1,
                  enable_adaptive_decomposition=True):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
-        self.budget = budget
+        self.root_budget = root_budget
         self.n_workers = n_workers
         # The adaptive-decomposition layer — cost model, entry-gate publish
         # threshold, and the mid-loop overrun escape hatch with its wall-clock
@@ -367,14 +368,14 @@ class _BranchWorker:
     def _note_depth(self, budget, n, guess=None, pattern=None):
         # Per-position observer: the engine reports its working `budget` at each
         # frame; we key the live descent spine by absolute guess_depth
-        # (GAME_GUESSES - budget) so deeper frames sort larger and the display is
+        # (ROOT_BUDGET - budget) so deeper frames sort larger and the display is
         # an absolute position.  Each entry stores (size, guess, pattern): the
         # sub-branch size and the candidate+response that produced it.  n < 0 is
         # the cooperative-promotion sentinel: preserve the stored guess/pattern,
         # replace size with '•' to mark that the sub-branch was handed to the swarm.
         if budget is None:
             return
-        guess_depth = GAME_GUESSES - budget
+        guess_depth = ROOT_BUDGET - budget
         if n < 0:
             prev = self._spine.get(guess_depth, (None, None, None))
             self._spine[guess_depth] = ('•', prev[1], prev[2])
@@ -424,6 +425,12 @@ class _BranchWorker:
         if not source_word or source_pattern is None:
             return None
         return f'{source_word.upper()} {fmt_pattern(source_pattern)}'
+
+    def _spine_budget(self, spine):
+        """Remaining guess budget for a branch reached by the guesses on `spine`:
+        ROOT_BUDGET minus its guess_depth (the number of guesses played)."""
+        guess_depth = len(spine.split()) // 2 if spine else 0
+        return self.root_budget - guess_depth
 
     def _promoted_spine(self):
         """Absolute root -> promoted-branch spine: the claimed branch's base plus
@@ -740,7 +747,7 @@ class _BranchWorker:
             if idx is None:
                 continue
             words = decode_subset(other_key)
-            budget = branch['budget'] or self.budget
+            budget = branch['budget'] or self._spine_budget(branch['spine'])
             # Promotions while helping must base off the helped branch's spine.
             saved_spine = self._claimed_branch_spine
             self._claimed_branch_spine = branch['spine'] if 'spine' in branch.keys() \
@@ -895,20 +902,21 @@ class _BranchWorker:
             claimed = self.queue.claim_next(self.name)
             if claimed is None:
                 return None
+            root_spine = self._root_spine(claimed['source_word'],
+                                          claimed['source_pattern'])
+            budget = self._spine_budget(root_spine)
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
-                self.budget)
+                budget)
             if reuse is None:
                 break
             self.queue.mark_done(claimed['branch_key'])
 
         n_words = claimed['n_words']
-        root_spine = self._root_spine(claimed['source_word'],
-                                      claimed['source_pattern'])
         self.queue.create_branch(
             claimed['branch_key'], n_words, self.n_candidates,
             priority=claimed['priority'], source_word=claimed['source_word'],
-            source_pattern=claimed['source_pattern'], budget=self.budget,
+            source_pattern=claimed['source_pattern'], budget=budget,
             spine=root_spine)
         idx = self.queue.claim_candidate(claimed['branch_key'], self.name,
                                          self.n_candidates)
@@ -918,7 +926,7 @@ class _BranchWorker:
             'source_word': claimed['source_word'],
             'source_pattern': claimed['source_pattern'],
             'spine': root_spine,
-            'budget': self.budget,
+            'budget': budget,
         }
         # idx can be None only if another worker grabbed every candidate between
         # create and claim — rare; treat as "nothing for me right now".
@@ -955,7 +963,7 @@ class _BranchWorker:
                 break
             completed = self.evaluate_claim(
                 branch_key, words, branch['n_words'], idx,
-                budget=branch.get('budget') or self.budget)
+                budget=branch.get('budget') or self._spine_budget(branch.get('spine')))
             if completed:
                 self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
@@ -971,7 +979,7 @@ class _BranchWorker:
         if branch is None or branch['status'] != 'open':
             return
         words = decode_subset(branch_key)
-        budget = branch['budget'] or ROOT_BUDGET
+        budget = branch['budget'] or self._spine_budget(branch['spine'])
         n_candidates = branch['n_candidates']
         while not self.cancel():
             # Stop the moment the branch is finalized (and its rows deleted) by

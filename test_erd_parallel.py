@@ -149,7 +149,7 @@ class TestClaimSkipsCachedBranch(unittest.TestCase):
 
     def _worker(self):
         return _BranchWorker(0, self.cache_path, self.queue_path, None,
-                             budget=ROOT_BUDGET)
+                             root_budget=ROOT_BUDGET)
 
     def test_skips_branch_with_reusable_cache_entry(self):
         sc = ScoreCache(self.cache_path, BRANCH)

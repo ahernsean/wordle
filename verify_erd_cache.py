@@ -148,12 +148,12 @@ def _verify_chunk(args):
             # reconstruct max_depth from the sub-branch reads.
             new_md = _max_depth_from_cache(branch_words, best_guess_new,
                                            rcache, sc, n_words)
-            # Taint: if the new strategy relies on a tainted sub-branch, set
-            # solve_budget = ROOT_BUDGET so the entry is only reused at that
-            # budget.  Otherwise, untainted.
+            # Taint: if the new strategy relies on a tainted sub-branch, restrict
+            # reuse to the budget this entry was solved at.  Verify operates on
+            # top-level (guess_depth 1) entries, so that budget is ROOT_BUDGET - 1.
             is_tainted = _is_tainted(branch_words, best_guess_new, rcache, sc,
                                      n_words)
-            solve_budget = ROOT_BUDGET if is_tainted else None
+            solve_budget = (ROOT_BUDGET - 1) if is_tainted else None
             sc.write(branch_key, ERD_ALL, best_guess_new, best_erd,
                      max_depth=new_md, solve_budget=solve_budget)
             results.append(('SCORE_CORRECTED', n_words,
