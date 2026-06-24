@@ -1040,9 +1040,9 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         return f'{pct:.1f}%'
 
     print(f'ERD_ALL Precache — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-    cache_line = f'Cache:  {total_erd:,} ERD entries   +{recent:,} in last 5m' if cache_ok else None
+    cache_line = f'Cache: {total_erd:,}  +{recent:,}/5m' if cache_ok else None
     if cache_line and hit_pct is not None:
-        cache_line += f'   hits {_abbrev(hits)}/{_abbrev(hit_total)} ({_fmt_pct(hit_pct)})'
+        cache_line += f'  hits {_fmt_pct(hit_pct)} ({_abbrev(hits)}/{_abbrev(hit_total)})'
     if cache_line:
         print(cache_line)
     print()
@@ -1065,24 +1065,22 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         n_pending = counts.get('pending', 0)
         n_done = counts.get('done', 0)
         n_coop = sum(1 for b in branches if (b['priority'] or 0) >= _COOP_PRIORITY)
-        in_prog_str = f'in progress {n_in_prog}'
+        in_prog_str = f'in prog {n_in_prog}'
         if n_coop:
-            in_prog_str += f' ({n_coop} cooperative)'
+            in_prog_str += f' ({n_coop} coop)'
         parts = [f'done {n_done:,}', in_prog_str, f'pending {n_pending:,}']
-        branch_hdr += ' ' + ', '.join(parts)
+        branch_hdr += ' ' + '  '.join(parts)
     print(branch_hdr)
     if live and total_evals:
         stat_parts = []
         if cutoff_pct is not None:
             stat_parts.append(
-                f'ERD-pruned {_abbrev(n_cutoff)}/{_abbrev(total_evals)} '
-                f'({_fmt_pct(cutoff_pct)})')
+                f'ERD {_abbrev(n_cutoff)}/{_abbrev(total_evals)} ({_fmt_pct(cutoff_pct)})')
         if pruned_pct is not None:
             stat_parts.append(
-                f'depth-pruned {_abbrev(n_pruned)}/{_abbrev(total_evals)} '
-                f'({_fmt_pct(pruned_pct)})')
+                f'depth {_abbrev(n_pruned)}/{_abbrev(total_evals)} ({_fmt_pct(pruned_pct)})')
         if stat_parts:
-            print('  Workers: ' + ', '.join(stat_parts))
+            print('pruned: ' + '  '.join(stat_parts))
     print()
 
     # guess_depth = guesses already played to reach a branch = the number of
@@ -1112,8 +1110,9 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         return wid.split('-')[-1] if '-' in wid else wid
 
     def _print_worker_row(h):
-        # One nested row: the worker's position in the shared candidate sweep
-        # (idx), its current candidate, and the downward recursion spine sizes.
+        # One nested row, kept within 59 cols: worker, sweep index, current
+        # candidate, deepest guess_depth reached, node rate, then the descent
+        # sizes truncated to whatever width remains.
         age = now_ts - h['updated_at']
         flag = ' !!' if age > 120 else ''
         chunk = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
@@ -1127,19 +1126,30 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         # Forward-progress flag: heartbeat fresh but evaluation rate is zero == hang.
         if age <= 10 and nrate == 0 and nodes:
             flag += ' ~?'
-        cur_disp = (cur.upper() + ('*' if cur.lower() in answer_set else '')) if cur else '-----'
-        krate = f'{int(nrate / 1000)}kN/s' if nrate else ''
-        print(f'     W{_worker_num(h):<2} idx {chunk:>5}  {cur_disp:<6} d{mdepth} '
-              f'{krate:>7}  {_spine_sizes(path):<20}  {age}s{flag}')
+        cur_disp = (cur.upper() + ('*' if cur.lower() in answer_set else ' ')) if cur else '-----'
+        krate = f'{int(nrate / 1000)}k/s' if nrate else ''
+        head = (f'W{_worker_num(h):<2} {chunk:>5} {cur_disp:<6} '
+                f'd{mdepth} {krate:>6}')
+        tail = f' {age}s{flag}'
+        sizes = _spine_sizes(path)
+        room = 59 - len(head) - len(tail) - 1
+        if sizes and room > 1:
+            if len(sizes) > room:
+                sizes = sizes[:room - 1] + '…'
+            print(f'{head} {sizes}{tail}')
+        else:
+            print(f'{head}{tail}')
 
-    if not branches:
-        print('  (no branches in progress)')
-    else:
-        print(f'  {"":1} {"#id":>5} {"Ans":>3} {"D":>1}  {"Sweep":<15} '
-              f'{"Best":<12} {"Wk":>4} {"ETA":>7}  Spine')
+    # Show only branches a worker is currently on, so the screen stays within a
+    # phone's height: the worker count (<= 6 here) caps the number of branch
+    # blocks.  No-worker branches stay accounted for in the "Branches:" counts.
+    active = [b for b in branches
+              if workers_by_branch.get(bytes(b['branch_key']))]
+    if not active:
+        print('(no branches being worked)')
     branch_hotkeys = {}
     hotkey_iter = iter(_BRANCH_HOTKEYS)
-    for b in branches:
+    for b in active:
         key = bytes(b['branch_key'])
         bid = _branch_id(key)
         letter = next(hotkey_iter, ' ')
@@ -1147,26 +1157,27 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             branch_hotkeys[letter] = bid
         n_cands = b['n_candidates'] or 0
         done = done_chunks.get(key, 0)
-        pct = 100.0 * done / n_cands if n_cands else 0.0
+        pct = int(100.0 * done / n_cands) if n_cands else 0
         bw = (b['best_guess'] or '-----').upper()
         bstar = '*' if (b['best_guess'] or '').lower() in answer_set else ' '
         be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '-----'
-        best_disp = f'{bw}{bstar} {be:>5}'
         nw = b['n_words'] or 0
         wk = worker_counts.get(key, 0)
         guess_depth = branch_guess_depth.get(key, 0)
         created = b['created_at'] or now_ts
         el = now_ts - created
-        eta = ''
+        eta = '-'
         if wk > 0 and 0 < done < n_cands and el > 0:
             rem = (n_cands - done) / (done / el)
             eta = _fmt_duration(int(rem))
-        sweep = f'{done:>5}/{n_cands:<5} {int(pct):2d}%'
+        # Line 1: branch stats.  Line 2: the spine (guesses played), truncated.
+        print(f'{letter} #{bid} {nw:>3}w d{guess_depth} {pct:>3}% '
+              f'{bw}{bstar} {be:>5} {wk}wk {eta:>6}')
         spine = b['spine'] if 'spine' in b.keys() else None
         spine_disp = _compact_spine_path(
-            spine, b['source_word'], b['source_pattern'], fmt_pattern, guess_depth)
-        print(f'  {letter} #{bid} {nw:3d} {guess_depth:1d}  {sweep:<15} '
-              f'{best_disp:<12} {wk:2d}wk {eta:>7}  {spine_disp}')
+            spine, b['source_word'], b['source_pattern'], fmt_pattern,
+            guess_depth, width=57)
+        print(spine_disp)
         for h in sorted(workers_by_branch.get(key, []),
                         key=lambda r: int(_worker_num(r)) if _worker_num(r).isdigit()
                         else 0):
@@ -1182,10 +1193,10 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         for h in sorted(idle_workers, key=lambda r: _worker_num(r)):
             age = now_ts - h['updated_at']
             flag = ' !!' if age > 120 else ''
-            print(f'  W{_worker_num(h):<2} (idle)  {age}s{flag}')
+            print(f'W{_worker_num(h):<2} (idle)  {age}s{flag}')
         for h in sorted(detached, key=lambda r: _worker_num(r)):
             age = now_ts - h['updated_at']
-            print(f'  W{_worker_num(h):<2} (branch finalizing)  {age}s')
+            print(f'W{_worker_num(h):<2} (branch finalizing)  {age}s')
 
     _print_status._branch_hotkeys = branch_hotkeys
 
@@ -1199,29 +1210,45 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             None)
         print()
         if detail_hb is None:
-            print(f'── Worker {selected_worker} not found ──────────────────')
+            print(f'Worker {selected_worker} not found')
         else:
-            print(f'── Worker {selected_worker} spine ─────────────────────')
-            src_word = detail_hb['source_word'].upper() if detail_hb['source_word'] else '?????'
-            src_pat = (fmt_pattern(detail_hb['source_pattern'])
+            bkey = bytes(detail_hb['current_branch_key']) if detail_hb['current_branch_key'] else None
+            base_k = branch_guess_depth.get(bkey, 1) if bkey else 1
+            print(f'Worker {selected_worker}: branch '
+                  f'#{_branch_id(bkey) if bkey else "?"}, depth {base_k}')
+            # Path to the worker's branch: its absolute spine, one guess per line
+            # (d1..dK).  The first guess is d1; the bare root is d0 with no guess.
+            branch_info = next((b for b in branches
+                                if bkey and bytes(b['branch_key']) == bkey), None)
+            branch_spine = (branch_info['spine']
+                            if branch_info and 'spine' in branch_info.keys() else None)
+            full = _fmt_spine_path(branch_spine)
+            if full:
+                for di, guess_step in enumerate(full.split(' ▸ '), start=1):
+                    parts = guess_step.split()
+                    word = parts[0] if parts else ''
+                    rest = ' '.join(parts[1:])
+                    star = '*' if word.lower() in answer_set else ' '
+                    print(f'{f"d{di}":<4} {word}{star} {rest}')
+            elif detail_hb['source_word']:
+                star = '*' if detail_hb['source_word'].lower() in answer_set else ' '
+                pat = (fmt_pattern(detail_hb['source_pattern'])
                        if detail_hb['source_pattern'] is not None else '-----')
-            n_words = detail_hb['n_words'] or 0
-            src_star = '*' if detail_hb['source_word'] and detail_hb['source_word'].lower() in answer_set else ' '
-            print(f'  d0  {src_word}{src_star}  {src_pat}  {n_words:4d} words')
+                print(f'{"d1":<4} {detail_hb["source_word"].upper()}{star} {pat}')
             rich_path = (detail_hb['cur_path'] if 'cur_path' in detail_hb.keys() else None) or ''
             cur_cand = (detail_hb['cur_candidate'] if 'cur_candidate' in detail_hb.keys() else None) or ''
             chunk_held = (detail_hb['claim_idx'] if 'claim_idx' in detail_hb.keys() else None) is not None
-            spine = _parse_spine(rich_path)
-            if spine:
-                for di, (guess, pattern, size) in enumerate(spine, start=1):
-                    if guess and pattern:
-                        star = '*' if guess.lower() in answer_set else ' '
-                        print(f'  d{di}  {guess.upper()}{star}  {pattern}  {size:>4} words')
-                    else:
-                        print(f'  d{di}  {"":7}  {"":5}  {size:>4} words')
+            # The worker's live descent below its branch (dK+1..).  The first
+            # cur_path level is the claimed branch itself (size only) — skipped
+            # by filtering to levels that carry a guess.
+            descent = [(g, p, s) for (g, p, s) in _parse_spine(rich_path) if g and p]
+            if descent:
+                for di, (guess, pattern, size) in enumerate(descent, start=base_k + 1):
+                    star = '*' if guess.lower() in answer_set else ' '
+                    print(f'{f"d{di}":<4} {guess.upper()}{star} {pattern} {size:>4}w')
             elif cur_cand:
                 cand_disp = cur_cand.upper() + ('*' if cur_cand.lower() in answer_set else ' ')
-                print(f'  (no spine yet — evaluating {cand_disp})')
+                print(f'(no spine yet — evaluating {cand_disp})')
             elif not chunk_held:
                 bkey = bytes(detail_hb['current_branch_key']) if detail_hb['current_branch_key'] else None
                 w_guess_depth = branch_guess_depth.get(bkey, 0) if bkey else 0
@@ -1242,15 +1269,15 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                         ]
                         co_str = (f', W{",".join(co_workers)} also active'
                                   if co_workers else '')
-                        print(f'  (cooperating — {done_ct}/{total_chunks} chunks done{co_str})')
+                        print(f'(cooperating — {done_ct}/{total_chunks} chunks done{co_str})')
                     else:
-                        print('  (cooperating — sub-branch finalizing)')
+                        print('(cooperating — sub-branch finalizing)')
                 else:
-                    print('  (between chunks)')
+                    print('(between chunks)')
             else:
-                print('  (no spine data yet)')
+                print('(no spine data yet)')
             if interactive:
-                print(f'  [press {selected_worker} to dismiss]')
+                print(f'[press {selected_worker} to dismiss]')
 
     if selected_branch is not None:
         _section_break('branchdetail', interactive)
@@ -1276,20 +1303,20 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                     word = parts[0] if parts else ''
                     rest = ' '.join(parts[1:])
                     star = '*' if word.lower() in answer_set else ' '
-                    print(f'  {f"d{di}":<4} {word}{star} {rest}')
+                    print(f'{f"d{di}":<4} {word}{star} {rest}')
             else:
                 src = (f'{target["source_word"].upper()} '
                        f'{fmt_pattern(target["source_pattern"])}'
                        if target['source_word'] and target['source_pattern'] is not None
                        else '?????')
-                print(f'  {"d1":<4} {src}')
+                print(f'{"d1":<4} {src}')
                 if guess_depth > 1:
-                    print(f'  d2..d{guess_depth}  (intermediate guesses not recorded)')
+                    print(f'd2..d{guess_depth}  (intermediate guesses not recorded)')
             # Candidate sweep with each cooperating worker's position marked.
             best_disp = (f'{(target["best_guess"] or "-----").upper()} '
                          f'{target["best_erd"]:.3f}'
                          if target['best_erd'] is not None else 'none yet')
-            print(f'  sweep {done}/{n_cands}  best {best_disp}')
+            print(f'sweep {done}/{n_cands}  best {best_disp}')
             workers_here = sorted(
                 [h for h in hbs if h['current_branch_key']
                  and bytes(h['current_branch_key']) == key],
@@ -1310,21 +1337,21 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                         if pos >= bar_w:
                             pos = bar_w - 1
                         marks[pos] = _worker_num(h)[-1]
-                print(f'  [{"".join(marks)}]  (digit = worker at that sweep position)')
+                print(f'[{"".join(marks)}] (worker by pos)')
             # Each cooperating worker's downward exploration spine, stacked.
             for h in workers_here:
                 path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
                 path = path.replace('>', '→')
                 cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
                 cur_disp = cur.upper() if cur else '-----'
-                print(f'  W{_worker_num(h):<2} idx {h["claim_idx"]}  {cur_disp:<6} '
+                print(f'W{_worker_num(h):<2} idx {h["claim_idx"]}  {cur_disp:<6} '
                       f'{_spine_sizes(path)}')
             if interactive:
                 letter = next((lt for lt, bid
                                in getattr(_print_status, '_branch_hotkeys', {}).items()
                                if bid == selected_branch), None)
                 if letter:
-                    print(f'  [press {letter} to dismiss]')
+                    print(f'[press {letter} to dismiss]')
 
 
 def _fmt_duration(seconds: int) -> str:
