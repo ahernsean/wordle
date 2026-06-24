@@ -324,9 +324,9 @@ class _BranchWorker:
         self._top_source_word = None
         self._top_source_pattern = None
         # Absolute root -> branch spine of the branch the worker is currently
-        # descending (its claimed branch), as space-joined "GUESS pattern" edge
-        # tokens.  Promotion composes a child branch's spine as this base plus the
-        # live descent edges in self._spine.  None until the first claim.
+        # descending (its claimed branch): the guesses played, space-joined as
+        # "GUESS pattern".  Promotion composes a child branch's spine as this base
+        # plus the live descent guesses in self._spine.  None until the first claim.
         self._claimed_branch_spine = None
         # In-memory cache of cost-model predictions keyed by sub-branch size.
         # Cleared on any cost-model write so new samples take effect.
@@ -420,26 +420,26 @@ class _BranchWorker:
 
     @staticmethod
     def _root_spine(source_word, source_pattern):
-        """Single-edge spine string for a top-level branch: 'SALET -g-g-'."""
+        """Single-guess spine string for a top-level branch: 'SALET -g-g-'."""
         if not source_word or source_pattern is None:
             return None
         return f'{source_word.upper()} {fmt_pattern(source_pattern)}'
 
     def _promoted_spine(self):
         """Absolute root -> promoted-branch spine: the claimed branch's base plus
-        the live descent edges (depth-ordered "GUESS pattern" tokens).  Returns
-        None when the base is unknown, leaving the branch row to fall back to
-        root + depth.  Sentinel/size-only spine entries (no guess) are skipped.
+        the live descent guesses (guess_depth-ordered "GUESS pattern" tokens).
+        Returns None when the base is unknown, leaving the branch row to fall back
+        to the source word.  Sentinel/size-only spine entries (no guess) are skipped.
         """
         base = getattr(self, '_claimed_branch_spine', None)
         if not base:
             return None
-        edges = []
+        descent_guesses = []
         for d in sorted(getattr(self, '_spine', {})):
             _size, guess, pattern = self._spine[d]
             if guess and guess != '•' and pattern:
-                edges.append(f'{guess.upper()} {pattern}')
-        return ' '.join([base, *edges])
+                descent_guesses.append(f'{guess.upper()} {pattern}')
+        return ' '.join([base, *descent_guesses])
 
     # -- cost model ---------------------------------------------------------
 

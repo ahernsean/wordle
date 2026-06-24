@@ -36,7 +36,7 @@ viewed four ways. A bare `depth` is forbidden — always qualify it.
 
 | Term | Meaning |
 |---|---|
-| **guess_depth** | Guesses already *played* to reach a branch. Root (no guess) = 0; a one-guess seed = 1. Source of truth (seed / spine edge count). |
+| **guess_depth** | Guesses already *played* to reach a branch — the number of guesses on its spine. Root (no guess) = 0; a one-guess seed = 1. The source of truth. |
 | **budget** | *Allowed* remaining depth (the cap). The only quantity the ERD recurrence reads; each level spends one. |
 | **ERD** | *Expected* remaining depth — the mean line length; the objective (`cost` / `best_erd`). |
 | **max_remaining_depth** | *Maximum* remaining depth — worst-case line length. Feasibility gate (solvable iff `≤ budget`) and cache-reuse key (reusable at any `budget ≥ max_remaining_depth`). |

@@ -952,16 +952,16 @@ def _cache_reuse(entry, budget):
     """
     if entry is None:
         return None
-    _bw, score, md, sb = entry
+    _bw, score, max_remaining_depth, sb = entry
     if budget is None:
         if sb is not None:
             return None
-        return (score, md, False)
-    if md is None:
+        return (score, max_remaining_depth, False)
+    if max_remaining_depth is None:
         return None
     if sb is None:
-        return (score, md, False) if md <= budget else None
-    return (score, md, True) if sb == budget else None
+        return (score, max_remaining_depth, False) if max_remaining_depth <= budget else None
+    return (score, max_remaining_depth, True) if sb == budget else None
 
 
 def _by_group_size(item):
@@ -992,10 +992,10 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     improvements found by other workers without waiting for the next candidate.
 
     Returns (status, cost, max_depth, floor_hit):
-      ('ok', cost, md, floor)  fully evaluated; cost < best_erd; md is this
+      ('ok', cost, max_remaining_depth, floor)  fully evaluated; cost < best_erd; max_remaining_depth is this
                                strategy's worst-case line length (None when
                                unlimited — not tracked).
-      ('pruned', None, md, floor)   can't beat best_erd, OR infeasible within
+      ('pruned', None, max_remaining_depth, floor)   can't beat best_erd, OR infeasible within
                                budget (a sub-branch hit the floor).
       ('useless', None, None, floor) a response group is all of `branch_words`.
       ('abort', None, None, floor)  deadline/cancel fired; caller must stop.
@@ -1030,7 +1030,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         return (OVER_ERD_LIMIT, None, None, False)
 
     cost = 1.0
-    cand_md = 1 if budget is not None else None
+    cand_max_remaining_depth = 1 if budget is not None else None
     floor = False
     sub_budget = None if budget is None else budget - 1
     # Largest sub-branches first: highest weight (k/n), pushes cost up fastest
@@ -1076,22 +1076,22 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             mid_loop_publisher=mid_loop_publisher)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
-        sub_status, sub_cost, sub_md, sub_budget_tainted = sub
+        sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
         if sub_status == OVER_ERD_LIMIT:
             # Sub-branch search stopped at >= its ceiling: this candidate's cost
             # is therefore >= best_erd.  Discard it (sub_cost is only a lower
             # bound) WITHOUT marking taint — we never proved infeasibility.
-            return (OVER_ERD_LIMIT, None, cand_md, floor)
+            return (OVER_ERD_LIMIT, None, cand_max_remaining_depth, floor)
         floor = floor or sub_budget_tainted
         if sub_status == OVER_DEPTH_BUDGET:
             # Sub-branch unsolvable within budget — this candidate is infeasible.
             return (OVER_DEPTH_BUDGET, None, None, True)
         cost += (k / n) * sub_cost
         if budget is not None:
-            cand_md = max(cand_md, 1 + sub_md)
+            cand_max_remaining_depth = max(cand_max_remaining_depth, 1 + sub_max_remaining_depth)
         if cost >= best_erd:
-            return (OVER_ERD_LIMIT, None, cand_md, floor)
-    return (SOLVED, cost, cand_md, floor)
+            return (OVER_ERD_LIMIT, None, cand_max_remaining_depth, floor)
+    return (SOLVED, cost, cand_max_remaining_depth, floor)
 
 
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
@@ -1190,13 +1190,13 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # than a spurious optimum.
     best_erd = ceiling
     best_guess = None
-    best_md = None
+    best_max_remaining_depth = None
     node_floor = False
     cutoff_occurred = False
     token = mid_loop_publisher.enter(branch_words, budget) if mid_loop_publisher is not None else None
 
     for i, candidate in enumerate(candidate_list):
-        status, cost, md, budget_tainted = evaluate_candidate(
+        status, cost, max_remaining_depth, budget_tainted = evaluate_candidate(
             branch_words, candidate, cache, score_cache,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
@@ -1224,7 +1224,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         if cost < best_erd:
             best_erd = cost
             best_guess = candidate
-            best_md = md
+            best_max_remaining_depth = max_remaining_depth
 
         if progress_callback is not None:
             progress_callback(i + 1, len(candidate_list), best_guess, best_erd)
@@ -1250,13 +1250,13 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         # pruned provably-worse candidates, so the value is universally valid.
         solve_budget = None if (budget is None or not node_floor) else budget
         score_cache.write(branch_key, policy, best_guess, best_erd,
-                          max_depth=best_md, solve_budget=solve_budget)
+                          max_depth=best_max_remaining_depth, solve_budget=solve_budget)
         cache_all_scores(best_guess, branch_words, score_cache, branch_key, cache=cache)
 
     if mid_loop_publisher is not None and token is not None:
         mid_loop_publisher.record_inline(token)
 
-    return (SOLVED, best_erd, best_md, node_floor)
+    return (SOLVED, best_erd, best_max_remaining_depth, node_floor)
 
 
 def min_expected_guesses(branch_words, cache, score_cache,

@@ -129,9 +129,10 @@ CREATE TABLE IF NOT EXISTS active_branches (
     best_max_depth INTEGER,
     tainted        INTEGER NOT NULL DEFAULT 0,
     nodes_spent    INTEGER NOT NULL DEFAULT 0,
-    -- absolute path from the root word to this branch, as space-joined
-    -- "GUESS pattern" edges (e.g. "SALET -g-g- CRANE bb-y-").  NULL means no
-    -- edges recorded: a top-level branch, or a row predating spine capture.
+    -- the guesses played from the root to this branch, space-joined as
+    -- "GUESS pattern" (e.g. "SALET -g-g- CRANE bb-y-").  guess_depth is the
+    -- count of these guesses.  NULL = no spine recorded (a row predating spine
+    -- capture).
     spine          TEXT
 );
 
@@ -450,8 +451,8 @@ class ERDQueue:
         join.  Returns True if this call created the row.  n_candidates is the
         total claim slot count (one slot per candidate in the policy-canonical
         list).  budget is the guess budget for depth-limited ERD.  spine is the
-        absolute root -> branch edge path (see the active_branches.spine column);
-        None leaves the display to fall back to the source word.
+        guesses played from the root to this branch (see the active_branches.spine
+        column); None leaves the display to fall back to the source word.
         """
         now = int(time.time())
         cur = self._conn.execute("""

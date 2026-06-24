@@ -49,7 +49,7 @@ solve, measured per answer under optimal play — viewed four ways. Naming a bar
 
 | Term | Meaning |
 |---|---|
-| **`guess_depth`** | Guesses already *played* to reach a branch. The root (no guess) is `guess_depth 0`; a one-guess seed is `guess_depth 1`. The single source of truth, taken from the seed / spine edge count. |
+| **`guess_depth`** | Guesses already *played* to reach a branch — the number of guesses on its spine. The root (no guess) is `guess_depth 0`; a one-guess seed is `guess_depth 1`. The single source of truth. |
 | **`budget`** | The *allowed* remaining depth (the cap). The only quantity the ERD recurrence reads. Each recursive level spends one. |
 | **ERD** | *Expected* remaining depth — the probability-weighted mean line length. The objective the solver minimizes (`cost` / `best_erd`). |
 | **`max_remaining_depth`** | *Maximum* remaining depth — the worst-case line length under optimal play. The feasibility gate (a branch is solvable iff `max_remaining_depth ≤ budget`) and the cache-reuse key (a result is reusable at any `budget ≥ max_remaining_depth`). |

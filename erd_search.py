@@ -813,24 +813,24 @@ def _fmt_spine_path(spine):
     if not spine:
         return ''
     toks = spine.split()
-    edges = [' '.join(toks[i:i + 2]) for i in range(0, len(toks), 2)]
-    return ' ▸ '.join(edges)
+    guesses = [' '.join(toks[i:i + 2]) for i in range(0, len(toks), 2)]
+    return ' ▸ '.join(guesses)
 
 
 def _compact_spine_path(spine, source_word, source_pattern, fmt_pattern,
-                        depth, width=40):
+                        guess_depth, width=40):
     """One-line spine for the overview row, tail-truncated to `width`.
 
     With a stored spine, shows the deepest `width` characters of the full path
-    (the most recent edges — where the branch actually sits), prefixed '…' when
+    (the most recent guesses — where the branch actually sits), prefixed '…' when
     truncated.  Without one (a row predating spine capture), falls back to the
-    root word plus a '▸ ?×N' marker for the N unrecorded intermediate edges.
+    source word plus a '▸ ?×N' marker for the N unrecorded guesses.
     """
     full = _fmt_spine_path(spine)
     if not full:
-        root = (f'{source_word.upper()} {fmt_pattern(source_pattern)}'
-                if source_word and source_pattern is not None else '-----')
-        return f'{root} ▸ ?×{depth}' if depth else root
+        source = (f'{source_word.upper()} {fmt_pattern(source_pattern)}'
+                  if source_word and source_pattern is not None else '-----')
+        return f'{source} ▸ ?×{guess_depth}' if guess_depth else source
     if len(full) <= width:
         return full
     return '…' + full[-(width - 1):]
@@ -1086,7 +1086,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
     print()
 
     # guess_depth = guesses already played to reach a branch = the number of
-    # edges on its absolute spine.  A seed with no full spine yet but a recorded
+    # guesses on its absolute spine.  A seed with no full spine yet but a recorded
     # source word is one guess deep (the opener); the bare root (no guess) is 0.
     def _branch_guess_depth(b):
         spine = b['spine'] if 'spine' in b.keys() else None
@@ -1267,12 +1267,12 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             print(f'Branch #{selected_branch}: {target["n_words"] or 0} words: '
                   f'depth {guess_depth}')
             # Full spine, one guess per line: the first guess is d1 (the root,
-            # before any guess, is guess_depth 0 and has no edge to show).
+            # before any guess, is guess_depth 0 and has no guess to show).
             spine = target['spine'] if 'spine' in target.keys() else None
             full = _fmt_spine_path(spine)
             if full:
-                for di, edge in enumerate(full.split(' ▸ '), start=1):
-                    parts = edge.split()
+                for di, guess_step in enumerate(full.split(' ▸ '), start=1):
+                    parts = guess_step.split()
                     word = parts[0] if parts else ''
                     rest = ' '.join(parts[1:])
                     star = '*' if word.lower() in answer_set else ' '
@@ -1284,7 +1284,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                        else '?????')
                 print(f'  {"d1":<4} {src}')
                 if guess_depth > 1:
-                    print(f'  d2..d{guess_depth}  (intermediate edges not recorded)')
+                    print(f'  d2..d{guess_depth}  (intermediate guesses not recorded)')
             # Candidate sweep with each cooperating worker's position marked.
             best_disp = (f'{(target["best_guess"] or "-----").upper()} '
                          f'{target["best_erd"]:.3f}'
