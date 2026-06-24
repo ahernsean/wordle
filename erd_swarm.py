@@ -38,7 +38,8 @@ from wordle_engine import (
     load_word_list,
     _cache_reuse,
 )
-from erd_queue import ERDQueue, decode_subset, encode_subset
+from erd_queue import (ERDQueue, decode_subset, encode_subset,
+                       guess_depth_from_spine)
 from wordle_ui import fmt_pattern
 
 ANSWER_FILE = 'NYT_wordlist.txt'
@@ -437,8 +438,17 @@ class _BranchWorker:
     def _spine_budget(self, spine):
         """Remaining guess budget for a branch reached by the guesses on `spine`:
         ROOT_BUDGET minus its guess_depth (the number of guesses played)."""
-        guess_depth = len(spine.split()) // 2 if spine else 0
-        return self.root_budget - guess_depth
+        return self.root_budget - guess_depth_from_spine(spine)
+
+    def _branch_budget(self, branch):
+        """A branch row's solve budget: its stored `budget`, or — for a legacy
+        row (or a dict lacking the column) — derived from its spine.  Accepts
+        either a sqlite3.Row or a dict; both support `.keys()` and `[]`."""
+        keys = branch.keys()
+        stored = branch['budget'] if 'budget' in keys else None
+        if stored:
+            return stored
+        return self._spine_budget(branch['spine'] if 'spine' in keys else None)
 
     def _promoted_spine(self):
         """Absolute root -> promoted-branch spine: the claimed branch's base plus
@@ -768,7 +778,7 @@ class _BranchWorker:
             if idx is None:
                 continue
             words = decode_subset(other_key)
-            budget = branch['budget'] or self._spine_budget(branch['spine'])
+            budget = self._branch_budget(branch)
             # Promotions while helping must base off the helped branch's spine.
             saved_spine = self._claimed_branch_spine
             self._claimed_branch_spine = branch['spine'] if 'spine' in branch.keys() \
@@ -984,7 +994,7 @@ class _BranchWorker:
                 break
             completed = self.evaluate_claim(
                 branch_key, words, branch['n_words'], idx,
-                budget=branch.get('budget') or self._spine_budget(branch.get('spine')))
+                budget=self._branch_budget(branch))
             if completed:
                 self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
@@ -1000,7 +1010,7 @@ class _BranchWorker:
         if branch is None or branch['status'] != 'open':
             return
         words = decode_subset(branch_key)
-        budget = branch['budget'] or self._spine_budget(branch['spine'])
+        budget = self._branch_budget(branch)
         n_candidates = branch['n_candidates']
         while not self.cancel():
             # Stop the moment the branch is finalized (and its rows deleted) by

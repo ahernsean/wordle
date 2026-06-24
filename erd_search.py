@@ -62,7 +62,7 @@ from datetime import datetime
 
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
-from erd_queue import ERDQueue, encode_subset
+from erd_queue import ERDQueue, encode_subset, guess_depth_from_spine
 import erd_swarm
 
 ANSWER_FILE = 'NYT_wordlist.txt'
@@ -1091,7 +1091,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
     def _branch_guess_depth(b):
         spine = b['spine'] if 'spine' in b.keys() else None
         if spine:
-            return len(spine.split()) // 2
+            return guess_depth_from_spine(spine)
         return 1 if (b['source_word'] and b['source_pattern'] is not None) else 0
 
     branch_guess_depth = {bytes(b['branch_key']): _branch_guess_depth(b)

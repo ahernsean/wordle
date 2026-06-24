@@ -42,6 +42,14 @@ def decode_subset(blob: bytes) -> list[str]:
     return [blob[i:i + 5].decode() for i in range(0, len(blob), 5)]
 
 
+def guess_depth_from_spine(spine) -> int:
+    """Guesses played to reach a branch, from its `active_branches.spine` value.
+
+    A spine is space-joined "GUESS pattern" tokens (two tokens per guess), so the
+    guess count is the token count halved.  An empty/NULL spine is the root: 0.
+    """
+    return len(spine.split()) // 2 if spine else 0
+
 
 _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
