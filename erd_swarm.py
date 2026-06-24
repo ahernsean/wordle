@@ -320,6 +320,12 @@ class _BranchWorker:
         self._hb_max_spine = {}      # deepest spine since last heartbeat (→ DB)
         self._log_max_spine = {}     # deepest spine since last progress log (→ log file)
         self._last_progress_log = 0.0
+        # Utilisation accounting: cumulative wall time spent inside candidate
+        # evaluation (useful work) vs everything else the worker does between
+        # evaluations (claiming, waiting for coverage, finalizing, helping a
+        # peer).  Logged periodically so coordination overhead is measurable.
+        self._eval_seconds = 0.0
+        self._last_util_log = 0.0
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
         self._top_source_word = None
@@ -569,6 +575,18 @@ class _BranchWorker:
                         self._nodes / 1e6, node_rate / 1e3, bg, be)
             self._log_max_spine = {}
             self._cand_max_depth = 0
+        if now - self._last_util_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
+            # Fires on coordination heartbeats too (cur_candidate is None), so
+            # the split is visible precisely when the worker isn't evaluating.
+            self._last_util_log = now
+            elapsed = now - self.started
+            if elapsed > 0:
+                eval_pct = 100.0 * self._eval_seconds / elapsed
+                coord_seconds = elapsed - self._eval_seconds
+                logger.info('%s utilisation: eval %.0fs (%.0f%%)  '
+                            'coord %.0fs (%.0f%%)  over %.0fs',
+                            self.name, self._eval_seconds, eval_pct,
+                            coord_seconds, 100.0 - eval_pct, elapsed)
 
     # -- evaluate one candidate claim ---------------------------------------
 
@@ -635,6 +653,7 @@ class _BranchWorker:
                 local_candidate, local_best, bound_erd=_eff_bound(),
                 cur_candidate=candidate))
         cand_elapsed = time.time() - cand_t0
+        self._eval_seconds += cand_elapsed
         if cand_elapsed > 10:  # pragma: no cover
             logger.warning('%s slow candidate %s (idx=%d): %.1fs  '
                            'status=%s  max_depth=%d', self.name, candidate,

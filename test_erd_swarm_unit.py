@@ -48,6 +48,8 @@ def _bare_worker():
     w._nodes_at_last_hb = 0
     w._last_hb = 0.0
     w._last_progress_log = 0.0
+    w._last_util_log = 0.0
+    w._eval_seconds = 0.0
     w._last_checkpoint = 0.0
     w._cand_max_depth = 0
     w._cur_depth = 0

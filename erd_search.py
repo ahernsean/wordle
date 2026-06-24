@@ -1064,11 +1064,13 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         n_in_prog = counts.get('in_progress', 0)
         n_pending = counts.get('pending', 0)
         n_done = counts.get('done', 0)
+        # User-queued in-progress lives in pending_branches (counts['in_progress']);
+        # cooperative sub-branches have no pending_branches row and live only in
+        # active_branches.  They are independent quantities, so report them side by
+        # side rather than nesting coop inside a user-queued count it isn't part of.
         n_coop = sum(1 for b in branches if (b['priority'] or 0) >= _COOP_PRIORITY)
-        in_prog_str = f'in prog {n_in_prog}'
-        if n_coop:
-            in_prog_str += f' ({n_coop} coop)'
-        parts = [f'done {n_done:,}', in_prog_str, f'pending {n_pending:,}']
+        parts = [f'done {n_done:,}', f'user {n_in_prog:,}',
+                 f'coop {n_coop:,}', f'pending {n_pending:,}']
         branch_hdr += ' ' + '  '.join(parts)
     print(branch_hdr)
     if live and total_evals:
@@ -1128,7 +1130,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             flag += ' ~?'
         cur_disp = (cur.upper() + ('*' if cur.lower() in answer_set else ' ')) if cur else '-----'
         krate = f'{int(nrate / 1000)}k/s' if nrate else ''
-        head = (f'W{_worker_num(h):<2} {chunk:>5} {cur_disp:<6} '
+        head = (f' W{_worker_num(h):<2} {chunk:>5} {cur_disp:<6} '
                 f'd{mdepth} {krate:>6}')
         tail = f' {age}s{flag}'
         sizes = _spine_sizes(path)
@@ -1147,14 +1149,34 @@ def _print_status(args, selected_worker=None, selected_branch=None,
               if workers_by_branch.get(bytes(b['branch_key']))]
     if not active:
         print('(no branches being worked)')
-    branch_hotkeys = {}
-    hotkey_iter = iter(_BRANCH_HOTKEYS)
+    # Stable per-branch hotkey letters: a branch keeps its letter across refreshes,
+    # and a selected branch keeps it even after it finalizes, so its detail panel's
+    # "press X to dismiss" stays valid and letters don't shuffle under the user.
+    prev_letter_by_bid = getattr(_print_status, '_branch_letter_by_bid', {})
+    keep_bids = [_branch_id(bytes(b['branch_key'])) for b in active]
+    if selected_branch is not None and selected_branch not in keep_bids:
+        keep_bids.append(selected_branch)
+    branch_hotkeys = {}      # letter -> bid, consumed by the interactive input loop
+    letter_by_bid = {}       # bid -> letter, persisted across refreshes for stability
+    used = set()
+    for bid in keep_bids:
+        lt = prev_letter_by_bid.get(bid)
+        if lt and lt not in used:
+            letter_by_bid[bid] = lt
+            branch_hotkeys[lt] = bid
+            used.add(lt)
+    free_letters = (c for c in _BRANCH_HOTKEYS if c not in used)
+    for bid in keep_bids:
+        if bid not in letter_by_bid:
+            lt = next(free_letters, ' ')
+            if lt != ' ':
+                letter_by_bid[bid] = lt
+                branch_hotkeys[lt] = bid
+                used.add(lt)
     for b in active:
         key = bytes(b['branch_key'])
         bid = _branch_id(key)
-        letter = next(hotkey_iter, ' ')
-        if letter != ' ':
-            branch_hotkeys[letter] = bid
+        letter = letter_by_bid.get(bid, ' ')
         n_cands = b['n_candidates'] or 0
         done = done_chunks.get(key, 0)
         pct = int(100.0 * done / n_cands) if n_cands else 0
@@ -1199,6 +1221,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             print(f'W{_worker_num(h):<2} (branch finalizing)  {age}s')
 
     _print_status._branch_hotkeys = branch_hotkeys
+    _print_status._branch_letter_by_bid = letter_by_bid
 
     if selected_worker is not None:
         _section_break('detail', interactive)
@@ -1247,8 +1270,11 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                     star = '*' if guess.lower() in answer_set else ' '
                     print(f'{f"d{di}":<4} {guess.upper()}{star} {pattern} {size:>4}w')
             elif cur_cand:
-                cand_disp = cur_cand.upper() + ('*' if cur_cand.lower() in answer_set else ' ')
-                print(f'(no spine yet — evaluating {cand_disp})')
+                # The candidate under evaluation is the first guess of the descent
+                # (d{base_k+1}): render it as the spine line it is starting, not as
+                # a separate "no spine yet" message.
+                star = '*' if cur_cand.lower() in answer_set else ' '
+                print(f'{f"d{base_k + 1}":<4} {cur_cand.upper()}{star} (evaluating)')
             elif not chunk_held:
                 bkey = bytes(detail_hb['current_branch_key']) if detail_hb['current_branch_key'] else None
                 w_guess_depth = branch_guess_depth.get(bkey, 0) if bkey else 0
@@ -1286,6 +1312,14 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         print()
         if target is None:
             print(f'Branch #{selected_branch} not found')
+            if interactive:
+                # The branch's letter is held reserved while it stays selected, so
+                # re-pressing it still toggles the (now finalized) panel closed.
+                letter = next((lt for lt, bid
+                               in getattr(_print_status, '_branch_hotkeys', {}).items()
+                               if bid == selected_branch), None)
+                if letter:
+                    print(f'[press {letter} to dismiss]')
         else:
             key = bytes(target['branch_key'])
             n_cands = target['n_candidates'] or 0
@@ -1316,7 +1350,10 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             best_disp = (f'{(target["best_guess"] or "-----").upper()} '
                          f'{target["best_erd"]:.3f}'
                          if target['best_erd'] is not None else 'none yet')
-            print(f'sweep {done}/{n_cands}  best {best_disp}')
+            # The sweep searches the next guess (one past the branch's spine), so
+            # label it at that absolute depth to read as a continuation of d1..dK.
+            print(f'{f"d{guess_depth + 1}":<4} sweep {done}/{n_cands}  '
+                  f'best {best_disp}')
             workers_here = sorted(
                 [h for h in hbs if h['current_branch_key']
                  and bytes(h['current_branch_key']) == key],
