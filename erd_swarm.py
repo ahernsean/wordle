@@ -325,7 +325,9 @@ class _BranchWorker:
         # evaluations (claiming, waiting for coverage, finalizing, helping a
         # peer).  Logged periodically so coordination overhead is measurable.
         self._eval_seconds = 0.0
-        self._last_util_log = 0.0
+        # Seeded to construction time so the first utilisation sample waits a full
+        # interval rather than firing immediately against ~0s of elapsed work.
+        self._last_util_log = time.time()
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
         self._top_source_word = None
