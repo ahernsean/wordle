@@ -168,6 +168,8 @@ class TestStartupRecovery(_TmpQueue):
         self.assertEqual(self.q.reset_stale_in_progress(), 0)
 
     def test_reset_active_branches_clears_d0_branches_and_claims(self):
+        # A user-queued branch is identified by its pending_branches row.
+        self.q.add_pending_many([(self.key, len(WORDS), 0, None, None)])
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
         n_b, n_c = self.q.reset_active_branches()
@@ -177,14 +179,15 @@ class TestStartupRecovery(_TmpQueue):
         self.assertEqual(self.q.claims_for_branch(self.key), [])
 
     def test_reset_active_branches_preserves_cooperative_branch_progress(self):
-        # D=0 branch (has pending_branches backup — wiped on reset).
+        # User-queued branch: has a pending_branches row, so reset wipes it.
         d0_key = self.key
-        self.q.create_branch(d0_key, len(WORDS), N_CANDIDATES, depth=0)
+        self.q.add_pending_many([(d0_key, len(WORDS), 0, None, None)])
+        self.q.create_branch(d0_key, len(WORDS), N_CANDIDATES)
 
-        # D=1 cooperative branch (no pending_branches row — must survive reset).
+        # Cooperative branch: no pending_branches row — must survive reset.
         coop_words = WORDS[:3]
         coop_key = ScoreCache.encode_subset(coop_words)
-        self.q.create_branch(coop_key, len(coop_words), N_CANDIDATES, depth=1)
+        self.q.create_branch(coop_key, len(coop_words), N_CANDIDATES)
         # Simulate two claims: idx 0 completed, idx 1 stale in-flight.
         idx0 = self.q.claim_candidate(coop_key, "worker-0", N_CANDIDATES)
         self.q.complete_candidate(coop_key, idx0)
@@ -193,7 +196,7 @@ class TestStartupRecovery(_TmpQueue):
 
         n_b, n_c = self.q.reset_active_branches()
 
-        # D=0 branch is gone.
+        # User-queued branch is gone.
         self.assertEqual(n_b, 1)
         self.assertIsNone(self.q.get_branch(d0_key))
 
@@ -412,7 +415,7 @@ class TestCostModel(_TmpQueue):
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row['n_words'], 8)
-        self.assertEqual(row['depth'], 2)
+        self.assertEqual(row['budget'], 2)
         self.assertEqual(row['elapsed_millis'], 65000)
         self.assertEqual(row['nodes'], 500)
         self.assertIsNone(row['predicted_nodes'])

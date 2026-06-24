@@ -1085,8 +1085,17 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             print('  Workers: ' + ', '.join(stat_parts))
     print()
 
-    branch_depth_map = {bytes(b['branch_key']): (b['depth'] if 'depth' in b.keys() else 0)
-                        for b in branches}
+    # guess_depth = guesses already played to reach a branch = the number of
+    # edges on its absolute spine.  A seed with no full spine yet but a recorded
+    # source word is one guess deep (the opener); the bare root (no guess) is 0.
+    def _branch_guess_depth(b):
+        spine = b['spine'] if 'spine' in b.keys() else None
+        if spine:
+            return len(spine.split()) // 2
+        return 1 if (b['source_word'] and b['source_pattern'] is not None) else 0
+
+    branch_guess_depth = {bytes(b['branch_key']): _branch_guess_depth(b)
+                          for b in branches}
 
     # Group live heartbeats under the branch each worker is contributing to.
     workers_by_branch = defaultdict(list)
@@ -1126,8 +1135,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
     if not branches:
         print('  (no branches in progress)')
     else:
-        print(f'  {"":1} {"#id":>5}  {"Ans":>4} {"D":>1}  {"Sweep":<15} '
-              f'{"Best":<11}  {"Wk":>3}  {"ETA":>7}  Spine')
+        print(f'  {"":1} {"#id":>5} {"Ans":>3} {"D":>1}  {"Sweep":<15} '
+              f'{"Best":<12} {"Wk":>4} {"ETA":>7}  Spine')
     branch_hotkeys = {}
     hotkey_iter = iter(_BRANCH_HOTKEYS)
     for b in branches:
@@ -1140,11 +1149,12 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         done = done_chunks.get(key, 0)
         pct = 100.0 * done / n_cands if n_cands else 0.0
         bw = (b['best_guess'] or '-----').upper()
+        bstar = '*' if (b['best_guess'] or '').lower() in answer_set else ' '
         be = f'{b["best_erd"]:.3f}' if b['best_erd'] is not None else '-----'
-        best_disp = f'{bw:<5} {be:>5}'
+        best_disp = f'{bw}{bstar} {be:>5}'
         nw = b['n_words'] or 0
         wk = worker_counts.get(key, 0)
-        depth_val = branch_depth_map.get(key, 0)
+        guess_depth = branch_guess_depth.get(key, 0)
         created = b['created_at'] or now_ts
         el = now_ts - created
         eta = ''
@@ -1154,9 +1164,9 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         sweep = f'{done:>5}/{n_cands:<5} {int(pct):2d}%'
         spine = b['spine'] if 'spine' in b.keys() else None
         spine_disp = _compact_spine_path(
-            spine, b['source_word'], b['source_pattern'], fmt_pattern, depth_val)
-        print(f'  {letter} #{bid}  {nw:4d} {depth_val:1d}  {sweep:<15} '
-              f'{best_disp:<11}  {wk:2d}wk  {eta:>7}  {spine_disp}')
+            spine, b['source_word'], b['source_pattern'], fmt_pattern, guess_depth)
+        print(f'  {letter} #{bid} {nw:3d} {guess_depth:1d}  {sweep:<15} '
+              f'{best_disp:<12} {wk:2d}wk {eta:>7}  {spine_disp}')
         for h in sorted(workers_by_branch.get(key, []),
                         key=lambda r: int(_worker_num(r)) if _worker_num(r).isdigit()
                         else 0):
@@ -1214,8 +1224,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                 print(f'  (no spine yet — evaluating {cand_disp})')
             elif not chunk_held:
                 bkey = bytes(detail_hb['current_branch_key']) if detail_hb['current_branch_key'] else None
-                w_depth = branch_depth_map.get(bkey, 0) if bkey else 0
-                if w_depth > 0 and bkey:
+                w_guess_depth = branch_guess_depth.get(bkey, 0) if bkey else 0
+                if w_guess_depth > 1 and bkey:
                     branch_info = next((b for b in branches
                                         if bytes(b['branch_key']) == bkey), None)
                     if branch_info:
@@ -1248,32 +1258,33 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                        if _branch_id(b['branch_key']) == selected_branch), None)
         print()
         if target is None:
-            print(f'── Branch #{selected_branch} not found ─────────────────')
+            print(f'Branch #{selected_branch} not found')
         else:
             key = bytes(target['branch_key'])
             n_cands = target['n_candidates'] or 0
             done = done_chunks.get(key, 0)
-            depth_val = branch_depth_map.get(key, 0)
-            print(f'── Branch #{selected_branch}  ({target["n_words"] or 0} words, '
-                  f'depth {depth_val}) ──────────')
-            # Full upward spine, root -> this branch, one edge per line.
+            guess_depth = branch_guess_depth.get(key, 0)
+            print(f'Branch #{selected_branch}: {target["n_words"] or 0} words: '
+                  f'depth {guess_depth}')
+            # Full spine, one guess per line: the first guess is d1 (the root,
+            # before any guess, is guess_depth 0 and has no edge to show).
             spine = target['spine'] if 'spine' in target.keys() else None
             full = _fmt_spine_path(spine)
             if full:
-                for di, edge in enumerate(full.split(' ▸ ')):
-                    word = edge.split()[0] if edge.split() else ''
+                for di, edge in enumerate(full.split(' ▸ '), start=1):
+                    parts = edge.split()
+                    word = parts[0] if parts else ''
+                    rest = ' '.join(parts[1:])
                     star = '*' if word.lower() in answer_set else ' '
-                    label = 'root' if di == 0 else f'd{di:<2}'
-                    print(f'  {label}  {edge}{star}')
+                    print(f'  {f"d{di}":<4} {word}{star} {rest}')
             else:
                 src = (f'{target["source_word"].upper()} '
                        f'{fmt_pattern(target["source_pattern"])}'
                        if target['source_word'] and target['source_pattern'] is not None
                        else '?????')
-                print(f'  root  {src}')
-                if depth_val:
-                    print(f'  d1..d{depth_val}  (intermediate edges not recorded — '
-                          f'pre-spine branch)')
+                print(f'  {"d1":<4} {src}')
+                if guess_depth > 1:
+                    print(f'  d2..d{guess_depth}  (intermediate edges not recorded)')
             # Candidate sweep with each cooperating worker's position marked.
             best_disp = (f'{(target["best_guess"] or "-----").upper()} '
                          f'{target["best_erd"]:.3f}'
@@ -1290,6 +1301,14 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                     idx = h['claim_idx']
                     if idx is not None:
                         pos = min(bar_w - 1, int(bar_w * idx / n_cands))
+                        # Workers on adjacent candidates can map to the same cell;
+                        # nudge right to the next free one so both digits stay
+                        # visible.  The bar is approximate, so showing every worker
+                        # matters more than the exact cell.
+                        while pos < bar_w and marks[pos] != ' ':
+                            pos += 1
+                        if pos >= bar_w:
+                            pos = bar_w - 1
                         marks[pos] = _worker_num(h)[-1]
                 print(f'  [{"".join(marks)}]  (digit = worker at that sweep position)')
             # Each cooperating worker's downward exploration spine, stacked.

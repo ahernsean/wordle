@@ -128,7 +128,6 @@ CREATE TABLE IF NOT EXISTS active_branches (
     budget         INTEGER,
     best_max_depth INTEGER,
     tainted        INTEGER NOT NULL DEFAULT 0,
-    depth          INTEGER NOT NULL DEFAULT 0,
     nodes_spent    INTEGER NOT NULL DEFAULT 0,
     -- absolute path from the root word to this branch, as space-joined
     -- "GUESS pattern" edges (e.g. "SALET -g-g- CRANE bb-y-").  NULL means no
@@ -201,7 +200,7 @@ CREATE TABLE IF NOT EXISTS claim_telemetry (
 CREATE TABLE IF NOT EXISTS backstop_telemetry (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     n_words              INTEGER NOT NULL,
-    depth                INTEGER,
+    budget               INTEGER,            -- frame's remaining-guess budget at fire
     elapsed_millis       INTEGER NOT NULL,   -- wall time in frame at fire
     nodes                INTEGER NOT NULL,   -- nodes spent in frame at fire
     predicted_nodes      REAL,               -- typical(n) at entry; NULL = cold model
@@ -223,11 +222,56 @@ class ERDQueue:
 
     def _migrate(self):
         # active_branches.spine: additive, nullable, no backfill.  Existing rows
-        # keep NULL (display falls back to root + depth) until re-promoted.
+        # keep NULL (display falls back to the source word) until re-promoted.
         cols = {r["name"] for r in
                 self._conn.execute("PRAGMA table_info(active_branches)")}
         if "spine" not in cols:
             self._conn.execute("ALTER TABLE active_branches ADD COLUMN spine TEXT")
+        # active_branches.depth held a cooperative-nesting count.  It is retired:
+        # the only thing it distinguished — user-queued vs cooperatively-promoted
+        # — is read from pending_branches membership instead.  SQLite 3.34
+        # predates ALTER TABLE DROP COLUMN, so rebuild the table without it.
+        # active_branches is transient worker state and migrations run with
+        # workers stopped, so the rebuild discards nothing recoverable.
+        if "depth" in cols:
+            self._conn.executescript("""
+                CREATE TABLE active_branches_new (
+                    branch_key     BLOB    PRIMARY KEY,
+                    n_words        INTEGER NOT NULL,
+                    n_candidates   INTEGER NOT NULL,
+                    priority       INTEGER NOT NULL DEFAULT 0,
+                    source_word    TEXT,
+                    source_pattern INTEGER,
+                    best_erd       REAL,
+                    best_guess     TEXT,
+                    status         TEXT    NOT NULL DEFAULT 'open',
+                    created_at     INTEGER,
+                    finalized_at   INTEGER,
+                    budget         INTEGER,
+                    best_max_depth INTEGER,
+                    tainted        INTEGER NOT NULL DEFAULT 0,
+                    nodes_spent    INTEGER NOT NULL DEFAULT 0,
+                    spine          TEXT
+                );
+                INSERT INTO active_branches_new
+                    SELECT branch_key, n_words, n_candidates, priority,
+                           source_word, source_pattern, best_erd, best_guess,
+                           status, created_at, finalized_at, budget,
+                           best_max_depth, tainted, nodes_spent, spine
+                    FROM active_branches;
+                DROP TABLE active_branches;
+                ALTER TABLE active_branches_new RENAME TO active_branches;
+                CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
+                    ON active_branches(status, priority DESC, n_words DESC);
+            """)
+        # backstop_telemetry.depth recorded the engine recursion level; it now
+        # records the frame's remaining-guess budget.  RENAME COLUMN (3.25+) is
+        # available on this box.
+        bt_cols = {r["name"] for r in
+                   self._conn.execute("PRAGMA table_info(backstop_telemetry)")}
+        if "depth" in bt_cols and "budget" not in bt_cols:
+            self._conn.execute(
+                "ALTER TABLE backstop_telemetry RENAME COLUMN depth TO budget")
 
     def close(self):
         self._conn.close()
@@ -398,28 +442,26 @@ class ERDQueue:
 
     def create_branch(self, branch_key, n_words, n_candidates,
                       priority=0, source_word=None, source_pattern=None,
-                      budget=None, depth=0, spine=None) -> bool:
+                      budget=None, spine=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
         from the queue creates it; others that race simply see it exists and
         join.  Returns True if this call created the row.  n_candidates is the
         total claim slot count (one slot per candidate in the policy-canonical
-        list).  budget is the guess budget for depth-limited ERD.  depth is
-        the cooperative nesting level: 0 for user-queued branches, 1+ for
-        branches promoted inside cooperative_solve.  spine is the absolute
-        root -> branch edge path (see the active_branches.spine column); None
-        leaves the display to fall back to root + depth.
+        list).  budget is the guess budget for depth-limited ERD.  spine is the
+        absolute root -> branch edge path (see the active_branches.spine column);
+        None leaves the display to fall back to the source word.
         """
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
                 (branch_key, n_words, n_candidates,
                  priority, source_word, source_pattern, status, created_at,
-                 budget, depth, spine)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+                 budget, spine)
+            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
         """, (branch_key, n_words, n_candidates,
-              priority, source_word, source_pattern, now, budget, depth, spine))
+              priority, source_word, source_pattern, now, budget, spine))
         return cur.rowcount == 1
 
     def get_branch(self, branch_key):
@@ -602,31 +644,29 @@ class ERDQueue:
         """).fetchall()
 
     def reset_active_branches(self):
-        """Drop in-progress D-0 branch state; free stale cooperative claims.
+        """Drop in-progress user-queued branch state; free stale cooperative claims.
 
-        D-0 branches have pending_branches rows that reset_stale_in_progress()
-        already flipped back to 'pending', so wiping their active_branches and
-        claim rows just discards half-done coordination — they re-promote and
-        redo cleanly.
+        A branch is user-queued iff it has a pending_branches row.  Those rows
+        reset_stale_in_progress() already flipped back to 'pending', so wiping
+        their active_branches and claim rows just discards half-done coordination
+        — they re-promote and redo cleanly.
 
-        Cooperative branches (depth>0) have NO pending_branches row — they are
-        inserted directly into active_branches by cooperative_solve.  Wiping
-        them throws away all partial-claim progress with no recovery path.
-        Instead, only free their stale in-flight claims (done=0 rows);
-        done=1 rows and the branch row itself survive, so the next worker to
-        join picks up exactly where the killed worker left off.
+        Cooperative branches have NO pending_branches row — they are inserted
+        directly into active_branches by cooperative_solve.  Wiping them throws
+        away all partial-claim progress with no recovery path.  Instead, only
+        free their stale in-flight claims (done=0 rows); done=1 rows and the
+        branch row itself survive, so the next worker to join picks up exactly
+        where the killed worker left off.
 
-        Returns (n_branches, n_claims) cleared for D-0 branches only.
+        Returns (n_branches, n_claims) cleared for user-queued branches only.
         """
+        member = "branch_key IN (SELECT branch_key FROM pending_branches)"
         nb = self._conn.execute(
-            "SELECT COUNT(*) FROM active_branches WHERE depth = 0").fetchone()[0]
+            f"SELECT COUNT(*) FROM active_branches WHERE {member}").fetchone()[0]
         nc = self._conn.execute(
-            "SELECT COUNT(*) FROM candidate_claims WHERE branch_key IN "
-            "(SELECT branch_key FROM active_branches WHERE depth = 0)").fetchone()[0]
-        self._conn.execute(
-            "DELETE FROM candidate_claims WHERE branch_key IN "
-            "(SELECT branch_key FROM active_branches WHERE depth = 0)")
-        self._conn.execute("DELETE FROM active_branches WHERE depth = 0")
+            f"SELECT COUNT(*) FROM candidate_claims WHERE {member}").fetchone()[0]
+        self._conn.execute(f"DELETE FROM candidate_claims WHERE {member}")
+        self._conn.execute(f"DELETE FROM active_branches WHERE {member}")
         # Free stale in-flight claims on cooperative branches so their
         # remaining candidates are reclaimable as gaps.
         self._conn.execute(
@@ -926,16 +966,17 @@ class ERDQueue:
             VALUES (?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, work_nodes, worker_count, now))
 
-    def add_backstop_telemetry(self, n_words: int, depth, elapsed_millis: int,
+    def add_backstop_telemetry(self, n_words: int, budget, elapsed_millis: int,
                                nodes: int, predicted_nodes, remaining_candidates: int):
         """Append a wall-clock backstop firing to backstop_telemetry for offline
-        tuning of COLD_BACKSTOP_SECONDS.  predicted_nodes is None when the cost
-        model was cold for this size at the time the backstop fired."""
+        tuning of COLD_BACKSTOP_SECONDS.  budget is the frame's remaining-guess
+        budget at fire; predicted_nodes is None when the cost model was cold for
+        this size at the time the backstop fired."""
         now = int(time.time())
         self._conn.execute("""
             INSERT INTO backstop_telemetry
-                (n_words, depth, elapsed_millis, nodes, predicted_nodes,
+                (n_words, budget, elapsed_millis, nodes, predicted_nodes,
                  remaining_candidates, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (n_words, depth, elapsed_millis, nodes, predicted_nodes,
+        """, (n_words, budget, elapsed_millis, nodes, predicted_nodes,
               remaining_candidates, now))

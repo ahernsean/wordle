@@ -972,7 +972,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    n=None, best_erd=float('inf'),
                    deadline=None, guesses=None, policy=ERD_ALL,
                    cancel_check=None, heartbeat=None,
-                   depth=0, note_depth=None, budget=None,
+                   note_depth=None, budget=None,
                    subbranch_solver=None, bound_provider=None,
                    mid_loop_publisher=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
@@ -1070,7 +1070,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             sub_ceiling = (best_erd - cost - rest_lb[i + 1]) * (n / k) + _CEIL_EPS
         sub = _solve_subset(
             sub_branch, cache, score_cache, sub_budget, deadline, guesses,
-            policy, cancel_check, heartbeat, depth + 1, note_depth, None,
+            policy, cancel_check, heartbeat, note_depth, None,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code,
             mid_loop_publisher=mid_loop_publisher)
@@ -1095,7 +1095,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 
 
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
-                  policy, cancel_check, heartbeat, depth, note_depth,
+                  policy, cancel_check, heartbeat, note_depth,
                   progress_callback, subbranch_solver=None,
                   ceiling=float('inf'), entry_guess=None, entry_pattern=None,
                   mid_loop_publisher=None):
@@ -1125,7 +1125,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     if heartbeat is not None:
         heartbeat()
     if note_depth is not None:
-        note_depth(depth, n, entry_guess, entry_pattern)
+        note_depth(budget, n, entry_guess, entry_pattern)
     if budget is not None and budget < 1:
         return (OVER_DEPTH_BUDGET, float('inf'), None, True)   # no guess available at all
     if n == 1:
@@ -1170,7 +1170,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         delegated = subbranch_solver(branch_words, budget)
         if delegated is not None:
             if note_depth is not None:
-                note_depth(depth, -n, None, None)  # sentinel: this level was promoted
+                note_depth(budget, -n, None, None)  # sentinel: this level was promoted
             return delegated
 
     # Best-first ordering: evaluate the strongest splitter first (key = expected
@@ -1193,14 +1193,14 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     best_md = None
     node_floor = False
     cutoff_occurred = False
-    token = mid_loop_publisher.enter(branch_words, depth) if mid_loop_publisher is not None else None
+    token = mid_loop_publisher.enter(branch_words, budget) if mid_loop_publisher is not None else None
 
     for i, candidate in enumerate(candidate_list):
         status, cost, md, budget_tainted = evaluate_candidate(
             branch_words, candidate, cache, score_cache,
             n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
             policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
-            depth=depth, note_depth=note_depth, budget=budget,
+            note_depth=note_depth, budget=budget,
             subbranch_solver=subbranch_solver,
             mid_loop_publisher=mid_loop_publisher,
         )
@@ -1263,7 +1263,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
                           deadline=None, guesses=None,
                           policy=None, progress_callback=None,
                           cancel_check=None, heartbeat=None,
-                          depth=0, note_depth=None, budget=None,
+                          note_depth=None, budget=None,
                           subbranch_solver=None, mid_loop_publisher=None):
     """
     Exact expected guesses to solve branch_words, playing optimally.
@@ -1286,7 +1286,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
     already written to score_cache are kept and valid either way.
     """
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
-                        guesses, policy, cancel_check, heartbeat, depth,
+                        guesses, policy, cancel_check, heartbeat,
                         note_depth, progress_callback, subbranch_solver,
                         mid_loop_publisher=mid_loop_publisher)
     if res in _ABORT_STATUSES:

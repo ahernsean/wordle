@@ -209,15 +209,15 @@ class TestReportingInvariants(unittest.TestCase):
         the current candidate's recursion, not the chunk lifetime."""
         w = self._bare_worker()
 
-        w._note_depth(1, 50)
-        w._note_depth(2, 12)
+        w._note_depth(5, 50)
+        w._note_depth(4, 12)
         w._note_depth(3, 4)
         self.assertEqual(w._cand_max_depth, 3)
 
         # evaluate_chunk resets before candidate 2.
         w._cand_max_depth = 0
 
-        w._note_depth(1, 30)
+        w._note_depth(5, 30)
         self.assertEqual(w._cand_max_depth, 1)  # not 3 from candidate 1
 
     def test_spine_windows(self):
@@ -226,8 +226,8 @@ class TestReportingInvariants(unittest.TestCase):
         write.  Both reset when a new chunk starts."""
         w = self._bare_worker()
 
-        w._note_depth(1, 50)
-        w._note_depth(2, 12)
+        w._note_depth(5, 50)
+        w._note_depth(4, 12)
         w._note_depth(3, 4)
 
         # Both accumulators capture the depth-3 path.
@@ -236,20 +236,20 @@ class TestReportingInvariants(unittest.TestCase):
 
         # Heartbeat fires: hb resets, log accumulator is untouched.
         w._hb_max_spine = {}
-        w._note_depth(1, 20)
+        w._note_depth(5, 20)
         self.assertEqual(w._hb_spine_str().count('→'), 0)   # fresh 2s window
         self.assertEqual(w._log_spine_str().count('→'), 2)  # still has depth-3
 
         # Progress log fires: log resets.
         w._log_max_spine = {}
-        w._note_depth(1, 15)
+        w._note_depth(5, 15)
         self.assertEqual(w._log_spine_str().count('→'), 0)  # fresh 120s window
 
         # New chunk: both reset.
-        w._note_depth(2, 8)
+        w._note_depth(4, 8)
         w._hb_max_spine = {}
         w._log_max_spine = {}
-        w._note_depth(1, 10)
+        w._note_depth(5, 10)
         self.assertEqual(w._hb_spine_str().count('→'), 0)
         self.assertEqual(w._log_spine_str().count('→'), 0)
 

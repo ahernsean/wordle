@@ -412,16 +412,16 @@ class TestEvaluateGuessBranches(unittest.TestCase):
             self.assertAlmostEqual(s1[1], s2[1])
 
     def test_solve_subset_note_depth_called(self):
-        """note_depth is invoked (1058)."""
+        """note_depth is invoked with the frame's budget."""
         remaining = ["crane", "slate", "trace"]
         cache, _ = make_cache(None)
         seen = []
-        _solve_subset(remaining, cache, None, None, None, remaining,
-                      ERD_ANSWERS, None, None, 0,
-                      note_depth=lambda d, n, *_: seen.append((d, n)),
+        _solve_subset(remaining, cache, None, 5, None, remaining,
+                      ERD_ANSWERS, None, None,
+                      note_depth=lambda budget, n, *_: seen.append((budget, n)),
                       progress_callback=None)
         self.assertTrue(seen)
-        self.assertEqual(seen[0], (0, len(remaining)))
+        self.assertEqual(seen[0], (5, len(remaining)))
 
     def test_solve_subset_budget_below_one(self):
         """budget < 1 returns OVER_DEPTH_BUDGET immediately."""
@@ -429,7 +429,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         cache, _ = make_cache(None)
         status, cost, md, budget_tainted = _solve_subset(
             remaining, cache, None, 0, None, remaining,
-            ERD_ANSWERS, None, None, 0, None, None)
+            ERD_ANSWERS, None, None, None, None)
         self.assertEqual(status, OVER_DEPTH_BUDGET)
         self.assertEqual(cost, float('inf'))
         self.assertTrue(budget_tainted)
@@ -445,7 +445,7 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         # at >= ceiling, so the search reports a lower bound (OVER_ERD_LIMIT).
         status, cost, md, budget_tainted = _solve_subset(
             remaining, cache, None, None, None, remaining,
-            ERD_ANSWERS, None, None, 0, None, None, ceiling=0.5)
+            ERD_ANSWERS, None, None, None, None, ceiling=0.5)
         self.assertEqual(status, OVER_ERD_LIMIT)
         self.assertEqual(cost, 0.5)
 
