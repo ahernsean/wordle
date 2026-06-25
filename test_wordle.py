@@ -1906,7 +1906,7 @@ class TestSubbranchSolverHook(unittest.TestCase):
             calls.append(len(words))
             # Solve inline (no further delegation) -> identical to recursion.
             return _solve_subset(words, self.cache, None, budget, None, GUESSES,
-                                 ERD_ALL, None, None, 0, None, None, None)
+                                 ERD_ALL, None, None, None, None, None)
 
         with_hook = min_expected_guesses(subset, self.cache, None,
                                          guesses=GUESSES, budget=6,

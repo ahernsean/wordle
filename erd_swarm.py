@@ -38,7 +38,8 @@ from wordle_engine import (
     load_word_list,
     _cache_reuse,
 )
-from erd_queue import ERDQueue, decode_subset, encode_subset
+from erd_queue import (ERDQueue, decode_subset, encode_subset,
+                       guess_depth_from_spine)
 from wordle_ui import fmt_pattern
 
 ANSWER_FILE = 'NYT_wordlist.txt'
@@ -93,10 +94,11 @@ _PUBLISH_EMA_MIN_WEIGHT = 5     # decayed samples before the adaptive threshold 
 PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 
 GAME_GUESSES = 6              # a Wordle game allows 6 guesses total
-# Queue branches are positions AFTER the opener (guess 1), so they are solved
-# under the remaining budget.  Depth-limited ERD: a branch unsolvable within
-# this many guesses is a loss, not a finite cost.
-ROOT_BUDGET = GAME_GUESSES - 1
+# Budget at the root — before any guess is played.  A branch's remaining budget
+# is ROOT_BUDGET minus its guess_depth (the guesses already played to reach it),
+# so a queued position after the opener (guess_depth 1) is solved at ROOT_BUDGET
+# - 1.  Depth-limited ERD: a branch unsolvable within its budget is a loss.
+ROOT_BUDGET = GAME_GUESSES
 
 logger = logging.getLogger('wordle')
 
@@ -157,11 +159,11 @@ class _MidLoopPublisher:
     def __init__(self, worker):
         self._worker = worker
 
-    def enter(self, branch_words, depth):
+    def enter(self, branch_words, budget):
         """Called just before the candidate loop of each _solve_subset frame.
 
         Returns an opaque token
-        (nodes_at_entry, predicted, entry_time, branch_words, depth) for any
+        (nodes_at_entry, predicted, entry_time, branch_words, budget) for any
         non-trivial frame (>= MIN_PUBLISH_BRANCH_WORDS answer words).  predicted
         may be None (cold model) — the node-proportionate check then can't arm,
         but the wall-clock backstop in check() still fires off entry_time, and
@@ -171,7 +173,7 @@ class _MidLoopPublisher:
         if n < MIN_PUBLISH_BRANCH_WORDS:
             return None
         predicted = self._worker._typical(n)
-        return (self._worker._nodes, predicted, time.time(), branch_words, depth)
+        return (self._worker._nodes, predicted, time.time(), branch_words, budget)
 
     def check(self, token, candidate_list, last_index,
               best_guess, best_erd, budget):
@@ -195,7 +197,7 @@ class _MidLoopPublisher:
         """
         if token is None:
             return None
-        nodes_at_entry, predicted, entry_time, branch_words, depth = token
+        nodes_at_entry, predicted, entry_time, branch_words, entry_budget = token
         delta = self._worker._nodes - nodes_at_entry
         node_overrun = predicted is not None and delta > OVERRUN_K * predicted
         elapsed = time.time() - entry_time
@@ -212,11 +214,11 @@ class _MidLoopPublisher:
         # intended and isn't what we're tuning.
         if time_overrun:
             self._worker.queue.add_backstop_telemetry(
-                n, depth, int(elapsed * 1000), delta, predicted, remaining_count)
+                n, entry_budget, int(elapsed * 1000), delta, predicted, remaining_count)
         branch_key = encode_subset(branch_words)
 
         # Spine sentinel: mark this frame as handed off in the heartbeat display.
-        self._worker._note_depth(depth, -n, None, None)
+        self._worker._note_depth(entry_budget, -n, None, None)
 
         # Create the cooperative branch; idempotent if another worker raced us.
         # First writer for this path, so the composed spine must be supplied here
@@ -226,8 +228,7 @@ class _MidLoopPublisher:
             priority=PROMOTED_PRIORITY,
             source_word=self._worker._top_source_word,
             source_pattern=self._worker._top_source_pattern,
-            budget=budget, depth=self._worker._coop_depth + 1,
-            spine=self._worker._promoted_spine())
+            budget=budget, spine=self._worker._promoted_spine())
 
         # Mark the already-evaluated candidates done by their all_words index so
         # cooperative workers claim only the unevaluated remainder.  The prefix
@@ -257,7 +258,7 @@ class _MidLoopPublisher:
         """
         if token is None:
             return
-        nodes_at_entry, _predicted, _entry_time, branch_words, _depth = token
+        nodes_at_entry, _predicted, _entry_time, branch_words, _entry_budget = token
         n = len(branch_words)
         nodes = self._worker._nodes - nodes_at_entry
         if nodes <= 0:
@@ -275,11 +276,11 @@ class _BranchWorker:
     """One worker process's state and operations on branches/chunks."""
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
-                 budget=ROOT_BUDGET, n_workers=1,
+                 root_budget=ROOT_BUDGET, n_workers=1,
                  enable_adaptive_decomposition=True):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
-        self.budget = budget
+        self.root_budget = root_budget
         self.n_workers = n_workers
         # The adaptive-decomposition layer — cost model, entry-gate publish
         # threshold, and the mid-loop overrun escape hatch with its wall-clock
@@ -309,30 +310,34 @@ class _BranchWorker:
         self._last_hb = 0.0
         self._last_checkpoint = time.time()
         self._last_ram_check = time.time()
-        self._cand_max_depth = 0
+        self._cand_max_depth = 0     # deepest guess_depth reached this candidate
         # Live search probe (transparency): a monotonic node counter plus the
-        # active recursion spine, so a long candidate evaluation never looks
+        # active descent spine, so a long candidate evaluation never looks
         # frozen — node count climbs every heartbeat even mid-candidate.
         self._nodes = 0              # candidate evaluations this chunk
         self._nodes_at_last_hb = 0
         self._cur_depth = 0
-        self._spine = {}             # depth -> subset size on the active descent
+        self._spine = {}             # guess_depth -> subset size on the active descent
         self._hb_max_spine = {}      # deepest spine since last heartbeat (→ DB)
         self._log_max_spine = {}     # deepest spine since last progress log (→ log file)
         self._last_progress_log = 0.0
+        # Utilisation accounting: cumulative wall time spent inside candidate
+        # evaluation (useful work) vs everything else the worker does between
+        # evaluations (claiming, waiting for coverage, finalizing, helping a
+        # peer).  Logged periodically so coordination overhead is measurable.
+        self._eval_seconds = 0.0
+        # Seeded to construction time so the first utilisation sample waits a full
+        # interval rather than firing immediately against ~0s of elapsed work.
+        self._last_util_log = time.time()
         # Attribution for promoted sub-branches: which top-level (opener,pattern)
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
         # Absolute root -> branch spine of the branch the worker is currently
-        # descending (its claimed branch), as space-joined "GUESS pattern" edge
-        # tokens.  Promotion composes a child branch's spine as this base plus the
-        # live descent edges in self._spine.  None until the first claim.
+        # descending (its claimed branch): the guesses played, space-joined as
+        # "GUESS pattern".  Promotion composes a child branch's spine as this base
+        # plus the live descent guesses in self._spine.  None until the first claim.
         self._claimed_branch_spine = None
-        # Cooperative nesting depth: incremented on entry to cooperative_solve,
-        # decremented on exit.  Passed to create_branch so the status display
-        # can distinguish user-queued branches (depth 0) from sub-branches.
-        self._coop_depth = 0
         # In-memory cache of cost-model predictions keyed by sub-branch size.
         # Cleared on any cost-model write so new samples take effect.
         self._typical_cache = {}
@@ -369,16 +374,21 @@ class _BranchWorker:
 
     # -- depth instrumentation ----------------------------------------------
 
-    def _note_depth(self, depth, n, guess=None, pattern=None):
-        # Per-position observer: track max depth and the live recursion spine.
-        # Each entry stores (size, guess, pattern): the sub-branch size and the
-        # candidate+response that produced it.  n < 0 is the cooperative-
-        # promotion sentinel: preserve the stored guess/pattern, replace size
-        # with '•' to mark that the sub-branch was handed to the swarm.
+    def _note_depth(self, budget, n, guess=None, pattern=None):
+        # Per-position observer: the engine reports its working `budget` at each
+        # frame; we key the live descent spine by absolute guess_depth
+        # (ROOT_BUDGET - budget) so deeper frames sort larger and the display is
+        # an absolute position.  Each entry stores (size, guess, pattern): the
+        # sub-branch size and the candidate+response that produced it.  n < 0 is
+        # the cooperative-promotion sentinel: preserve the stored guess/pattern,
+        # replace size with '•' to mark that the sub-branch was handed to the swarm.
+        if budget is None:
+            return
+        guess_depth = ROOT_BUDGET - budget
         if n < 0:
-            prev = self._spine.get(depth, (None, None, None))
-            self._spine[depth] = ('•', prev[1], prev[2])
-            deeper = [d for d in self._spine if d > depth]
+            prev = self._spine.get(guess_depth, (None, None, None))
+            self._spine[guess_depth] = ('•', prev[1], prev[2])
+            deeper = [d for d in self._spine if d > guess_depth]
             for d in deeper:
                 del self._spine[d]
             if len(self._spine) >= len(self._hb_max_spine):
@@ -386,12 +396,12 @@ class _BranchWorker:
             if len(self._spine) >= len(self._log_max_spine):
                 self._log_max_spine = dict(self._spine)
             return
-        if depth > self._cand_max_depth:
-            self._cand_max_depth = depth
-        self._cur_depth = depth
+        if guess_depth > self._cand_max_depth:
+            self._cand_max_depth = guess_depth
+        self._cur_depth = guess_depth
         pattern_str = fmt_pattern(pattern) if isinstance(pattern, int) else pattern
-        self._spine[depth] = (n, guess, pattern_str)
-        deeper = [d for d in self._spine if d > depth]
+        self._spine[guess_depth] = (n, guess, pattern_str)
+        deeper = [d for d in self._spine if d > guess_depth]
         for d in deeper:
             del self._spine[d]
         if len(self._spine) >= len(self._hb_max_spine):
@@ -420,26 +430,41 @@ class _BranchWorker:
 
     @staticmethod
     def _root_spine(source_word, source_pattern):
-        """Single-edge spine string for a top-level branch: 'SALET -g-g-'."""
+        """Single-guess spine string for a top-level branch: 'SALET -g-g-'."""
         if not source_word or source_pattern is None:
             return None
         return f'{source_word.upper()} {fmt_pattern(source_pattern)}'
 
+    def _spine_budget(self, spine):
+        """Remaining guess budget for a branch reached by the guesses on `spine`:
+        ROOT_BUDGET minus its guess_depth (the number of guesses played)."""
+        return self.root_budget - guess_depth_from_spine(spine)
+
+    def _branch_budget(self, branch):
+        """A branch row's solve budget: its stored `budget`, or — for a legacy
+        row (or a dict lacking the column) — derived from its spine.  Accepts
+        either a sqlite3.Row or a dict; both support `.keys()` and `[]`."""
+        keys = branch.keys()
+        stored = branch['budget'] if 'budget' in keys else None
+        if stored:
+            return stored
+        return self._spine_budget(branch['spine'] if 'spine' in keys else None)
+
     def _promoted_spine(self):
         """Absolute root -> promoted-branch spine: the claimed branch's base plus
-        the live descent edges (depth-ordered "GUESS pattern" tokens).  Returns
-        None when the base is unknown, leaving the branch row to fall back to
-        root + depth.  Sentinel/size-only spine entries (no guess) are skipped.
+        the live descent guesses (guess_depth-ordered "GUESS pattern" tokens).
+        Returns None when the base is unknown, leaving the branch row to fall back
+        to the source word.  Sentinel/size-only spine entries (no guess) are skipped.
         """
         base = getattr(self, '_claimed_branch_spine', None)
         if not base:
             return None
-        edges = []
+        descent_guesses = []
         for d in sorted(getattr(self, '_spine', {})):
             _size, guess, pattern = self._spine[d]
             if guess and guess != '•' and pattern:
-                edges.append(f'{guess.upper()} {pattern}')
-        return ' '.join([base, *edges])
+                descent_guesses.append(f'{guess.upper()} {pattern}')
+        return ' '.join([base, *descent_guesses])
 
     # -- cost model ---------------------------------------------------------
 
@@ -555,13 +580,25 @@ class _BranchWorker:
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
             bg = (best_guess or '-').upper()
             logger.info('%s claim %d: %s in progress  '
-                        'depth=%d path=%s  %.1fM nodes %.0fk/s  best=%s %s',
+                        'guess_depth=%d path=%s  %.1fM nodes %.0fk/s  best=%s %s',
                         self.name, claim_idx,
                         cur_candidate.upper(),
                         self._cand_max_depth, self._log_spine_str(),
                         self._nodes / 1e6, node_rate / 1e3, bg, be)
             self._log_max_spine = {}
             self._cand_max_depth = 0
+        if now - self._last_util_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
+            # Fires on coordination heartbeats too (cur_candidate is None), so
+            # the split is visible precisely when the worker isn't evaluating.
+            self._last_util_log = now
+            elapsed = now - self.started
+            if elapsed > 0:
+                eval_pct = 100.0 * self._eval_seconds / elapsed
+                coord_seconds = elapsed - self._eval_seconds
+                logger.info('%s utilisation: eval %.0fs (%.0f%%)  '
+                            'coord %.0fs (%.0f%%)  over %.0fs',
+                            self.name, self._eval_seconds, eval_pct,
+                            coord_seconds, 100.0 - eval_pct, elapsed)
 
     # -- evaluate one candidate claim ---------------------------------------
 
@@ -619,7 +656,7 @@ class _BranchWorker:
             words, candidate, self.rcache, self.score_cache,
             n=n_words, best_erd=float('inf'), guesses=self.all_words,
             policy=ERD_ALL, cancel_check=self.cancel,
-            depth=0, note_depth=self._note_depth, budget=budget,
+            note_depth=self._note_depth, budget=budget,
             subbranch_solver=self._subbranch_solver,
             bound_provider=_bound_provider,
             mid_loop_publisher=self._mid_loop_publisher,
@@ -628,6 +665,7 @@ class _BranchWorker:
                 local_candidate, local_best, bound_erd=_eff_bound(),
                 cur_candidate=candidate))
         cand_elapsed = time.time() - cand_t0
+        self._eval_seconds += cand_elapsed
         if cand_elapsed > 10:  # pragma: no cover
             logger.warning('%s slow candidate %s (idx=%d): %.1fs  '
                            'status=%s  max_depth=%d', self.name, candidate,
@@ -740,7 +778,7 @@ class _BranchWorker:
             if idx is None:
                 continue
             words = decode_subset(other_key)
-            budget = branch['budget'] or self.budget
+            budget = self._branch_budget(branch)
             # Promotions while helping must base off the helped branch's spine.
             saved_spine = self._claimed_branch_spine
             self._claimed_branch_spine = branch['spine'] if 'spine' in branch.keys() \
@@ -808,7 +846,6 @@ class _BranchWorker:
         from cache.  Never idle-blocks (the worker that needs it drives it),
         and deadlock-free (a waiting worker holds no chunk).
         """
-        self._coop_depth += 1
         # Absolute spine of the branch being promoted, composed from the descent
         # that reached it before this frame's own work overwrites self._spine.
         child_spine = self._promoted_spine()
@@ -831,7 +868,7 @@ class _BranchWorker:
                 branch_key, n_words, self.n_candidates,
                 priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
                 source_pattern=self._top_source_pattern, budget=budget,
-                depth=self._coop_depth, spine=child_spine)
+                spine=child_spine)
             # Descents into this branch promote grandchildren relative to its spine.
             self._claimed_branch_spine = child_spine
 
@@ -871,7 +908,6 @@ class _BranchWorker:
             # Finalized as a loss: proven unsolvable within budget (not a cutoff).
             return (OVER_DEPTH_BUDGET, float('inf'), None, True)  # pragma: no cover
         finally:
-            self._coop_depth -= 1
             self._claimed_branch_spine = saved_spine
 
     # -- scheduling: claim one chunk of the best available branch -----------
@@ -897,20 +933,21 @@ class _BranchWorker:
             claimed = self.queue.claim_next(self.name)
             if claimed is None:
                 return None
+            root_spine = self._root_spine(claimed['source_word'],
+                                          claimed['source_pattern'])
+            budget = self._spine_budget(root_spine)
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
-                self.budget)
+                budget)
             if reuse is None:
                 break
             self.queue.mark_done(claimed['branch_key'])
 
         n_words = claimed['n_words']
-        root_spine = self._root_spine(claimed['source_word'],
-                                      claimed['source_pattern'])
         self.queue.create_branch(
             claimed['branch_key'], n_words, self.n_candidates,
             priority=claimed['priority'], source_word=claimed['source_word'],
-            source_pattern=claimed['source_pattern'], budget=self.budget,
+            source_pattern=claimed['source_pattern'], budget=budget,
             spine=root_spine)
         idx = self.queue.claim_candidate(claimed['branch_key'], self.name,
                                          self.n_candidates)
@@ -920,7 +957,7 @@ class _BranchWorker:
             'source_word': claimed['source_word'],
             'source_pattern': claimed['source_pattern'],
             'spine': root_spine,
-            'budget': self.budget,
+            'budget': budget,
         }
         # idx can be None only if another worker grabbed every candidate between
         # create and claim — rare; treat as "nothing for me right now".
@@ -957,7 +994,7 @@ class _BranchWorker:
                 break
             completed = self.evaluate_claim(
                 branch_key, words, branch['n_words'], idx,
-                budget=branch.get('budget') or self.budget)
+                budget=self._branch_budget(branch))
             if completed:
                 self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
@@ -973,7 +1010,7 @@ class _BranchWorker:
         if branch is None or branch['status'] != 'open':
             return
         words = decode_subset(branch_key)
-        budget = branch['budget'] or ROOT_BUDGET
+        budget = self._branch_budget(branch)
         n_candidates = branch['n_candidates']
         while not self.cancel():
             # Stop the moment the branch is finalized (and its rows deleted) by

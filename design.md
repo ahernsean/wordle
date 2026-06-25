@@ -41,6 +41,40 @@ for i, candidate in enumerate(candidate_list):
         best_guess = candidate   # ← candidate becomes the guess here
 ```
 
+### Depth and budget
+
+Everything on the guess axis is **remaining depth** — guesses still needed to
+solve, measured per answer under optimal play — viewed four ways. Naming a bare
+`depth` is forbidden; always say which one.
+
+| Term | Meaning |
+|---|---|
+| **`guess_depth`** | Guesses already *played* to reach a branch — the number of guesses on its spine. The root (no guess) is `guess_depth 0`; a one-guess seed is `guess_depth 1`. The single source of truth. |
+| **`budget`** | The *allowed* remaining depth (the cap). The only quantity the ERD recurrence reads. Each recursive level spends one. |
+| **ERD** | *Expected* remaining depth — the probability-weighted mean line length. The objective the solver minimizes (`cost` / `best_erd`). |
+| **`max_remaining_depth`** | *Maximum* remaining depth — the worst-case line length under optimal play. The feasibility gate (a branch is solvable iff `max_remaining_depth ≤ budget`) and the cache-reuse key (a result is reusable at any `budget ≥ max_remaining_depth`). |
+
+`GAME_GUESSES = 6` is the root's budget — zero guesses played. The invariant
+`budget + guess_depth = GAME_GUESSES` holds at every node, because each recursive
+level spends one budget and adds one guess; so `guess_depth = GAME_GUESSES − budget`.
+
+ERD and `max_remaining_depth` are the **mean** and the **max** of the same
+per-answer remaining-depth distribution — the same recurrence, two reductions:
+
+```python
+cost    += (k / n) * sub_cost          # weighted MEAN over sub-branches → ERD
+cand_md  = max(cand_md, 1 + sub_md)    # MAX over sub-branches           → max_remaining_depth
+```
+
+ERD is what we optimize; `max_remaining_depth` is the hard 6-guess constraint
+the mean can't see (a low average with one 7-long line still loses).
+
+There is **no** "promotion depth" or "recursion depth." The number of
+cooperative spawns and the engine's recursion level were both `depth` names
+that carried no information `budget`/`guess_depth` don't — they were removed.
+Whether a branch is human-queued or swarm-spawned is answered by `pending_branches`
+membership, not by any depth.
+
 ---
 
 ## Word Lists

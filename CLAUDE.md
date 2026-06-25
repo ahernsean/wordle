@@ -29,6 +29,26 @@ for i, candidate in enumerate(candidate_list):
         best_guess = candidate   # ← candidate becomes the guess here
 ```
 
+### Depth and budget
+
+The guess axis is **remaining depth** (guesses still needed under optimal play),
+viewed four ways. A bare `depth` is forbidden — always qualify it.
+
+| Term | Meaning |
+|---|---|
+| **guess_depth** | Guesses already *played* to reach a branch — the number of guesses on its spine. Root (no guess) = 0; a one-guess seed = 1. The source of truth. |
+| **budget** | *Allowed* remaining depth (the cap). The only quantity the ERD recurrence reads; each level spends one. |
+| **ERD** | *Expected* remaining depth — the mean line length; the objective (`cost` / `best_erd`). |
+| **max_remaining_depth** | *Maximum* remaining depth — worst-case line length. Feasibility gate (solvable iff `≤ budget`) and cache-reuse key (reusable at any `budget ≥ max_remaining_depth`). |
+
+`GAME_GUESSES = 6` is the root's budget (zero guesses). Invariant at every node:
+`budget + guess_depth = GAME_GUESSES`, so `guess_depth = GAME_GUESSES − budget`.
+ERD and `max_remaining_depth` are the mean and max of the same per-answer distribution.
+
+There is no "promotion depth" or "recursion depth" — both were uninformative
+`depth` aliases of `budget`/`guess_depth` and were removed. Human-queued vs
+swarm-spawned is decided by `pending_branches` membership, not a depth.
+
 ---
 
 ## Naming rules

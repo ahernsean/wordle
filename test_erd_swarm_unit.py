@@ -48,6 +48,8 @@ def _bare_worker():
     w._nodes_at_last_hb = 0
     w._last_hb = 0.0
     w._last_progress_log = 0.0
+    w._last_util_log = 0.0
+    w._eval_seconds = 0.0
     w._last_checkpoint = 0.0
     w._cand_max_depth = 0
     w._cur_depth = 0
@@ -55,7 +57,6 @@ def _bare_worker():
     w._hb_max_spine = {}
     w._log_max_spine = {}
     w.started = 0
-    w._coop_depth = 0
     w._top_source_word = None
     w._top_source_pattern = None
     w._claimed_branch_spine = None
@@ -98,8 +99,8 @@ class TestHeartbeatThrottling(unittest.TestCase):
         """_hb_max_spine is cleared after each DB write so the 2-second window
         starts fresh — the next heartbeat builds a new spine from scratch."""
         w = _bare_worker()
-        w._note_depth(1, 50)
-        w._note_depth(2, 12)
+        w._note_depth(5, 50)
+        w._note_depth(4, 12)
         branch_key = ScoreCache.encode_subset(BRANCH)
         w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
         self.assertEqual(w._hb_max_spine, {})
@@ -155,22 +156,27 @@ class TestSubbranchSolver(unittest.TestCase):
 
 
 class TestNoteDepthPromotionSentinel(unittest.TestCase):
-    """_note_depth with n<0 marks a cooperative-promoted sub-branch with '•'."""
+    """_note_depth with n<0 marks a cooperative-promoted sub-branch with '•'.
+
+    _note_depth's first arg is the engine's `budget`; the spine is keyed by
+    guess_depth = GAME_GUESSES (6) - budget.  Budgets 5/4/3 are guess_depths
+    1/2/3 — a worker descending one guess at a time.
+    """
 
     def test_sentinel_marks_spine_with_bullet(self):
         w = _bare_worker()
-        w._note_depth(1, 50)
-        w._note_depth(2, 12)
+        w._note_depth(5, 50)
+        w._note_depth(4, 12)
         # n=-1 is the cooperative-promotion sentinel.
-        w._note_depth(2, -1)
+        w._note_depth(4, -1)
         size, guess, pattern = w._spine[2]
         self.assertEqual(size, '•')
         self.assertIn(1, w._spine)  # parent depth untouched
 
     def test_sentinel_updates_hb_and_log_max_spine(self):
         w = _bare_worker()
-        w._note_depth(1, 50)
-        w._note_depth(2, -1)
+        w._note_depth(5, 50)
+        w._note_depth(4, -1)
         self.assertIn(2, w._hb_max_spine)
         self.assertIn(2, w._log_max_spine)
 
@@ -179,8 +185,8 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
         _hb_max_spine nor _log_max_spine is overwritten (depth NOT extended)."""
         w = _bare_worker()
         # Build a 3-level max spine.
-        w._note_depth(1, 100)
-        w._note_depth(2, 50)
+        w._note_depth(5, 100)
+        w._note_depth(4, 50)
         w._note_depth(3, 20)
         # Reset spine to a single-level view.
         w._spine = {1: 100}
@@ -188,7 +194,7 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
         # be < len(hb_max_spine=3) depending on prior history, so this exercises
         # the False branch of the len comparison.
         pre_hb = dict(w._hb_max_spine)
-        w._note_depth(2, -1)  # spine becomes {1:100, 2:('•',…)}, len=2 < 3
+        w._note_depth(4, -1)  # spine becomes {1:100, 2:('•',…)}, len=2 < 3
         # If hb_max_spine was already size 3, it should NOT be overwritten.
         if len(pre_hb) > len(w._spine):
             self.assertEqual(w._hb_max_spine, pre_hb)
@@ -212,22 +218,22 @@ class TestSpineComposition(unittest.TestCase):
         w = _bare_worker()
         w._claimed_branch_spine = 'SALET -g-g-'
         # Pattern strings pass through unchanged (only ints are fmt_pattern'd).
-        w._note_depth(1, 50, 'crane', 'bb-y-')
-        w._note_depth(2, 12, 'pound', 'g--y-')
+        w._note_depth(5, 50, 'crane', 'bb-y-')
+        w._note_depth(4, 12, 'pound', 'g--y-')
         self.assertEqual(w._promoted_spine(),
                          'SALET -g-g- CRANE bb-y- POUND g--y-')
 
     def test_promoted_spine_none_without_base(self):
         w = _bare_worker()
         w._claimed_branch_spine = None
-        w._note_depth(1, 50, 'crane', 'bb-y-')
+        w._note_depth(5, 50, 'crane', 'bb-y-')
         self.assertIsNone(w._promoted_spine())
 
     def test_promoted_spine_skips_sentinel_and_size_only_levels(self):
         w = _bare_worker()
         w._claimed_branch_spine = 'SALET -g-g-'
-        w._note_depth(1, 50, 'crane', 'bb-y-')
-        w._note_depth(2, 12)            # size-only level: no guess/pattern
+        w._note_depth(5, 50, 'crane', 'bb-y-')
+        w._note_depth(4, 12)            # size-only level: no guess/pattern
         # Promotion sentinel preserves the guess but sets size to '•'; the edge
         # is still a real edge and must be kept.
         self.assertEqual(w._promoted_spine(), 'SALET -g-g- CRANE bb-y-')
@@ -623,12 +629,12 @@ class TestMidLoopPublisher(unittest.TestCase):
     def test_enter_returns_none_below_min_words(self):
         pub, _ = self._pub()
         # MIN_PUBLISH_BRANCH_WORDS is 2; a 1-word frame is a base case.
-        self.assertIsNone(pub.enter(BRANCH[:1], depth=0))
+        self.assertIsNone(pub.enter(BRANCH[:1], budget=0))
 
     def test_enter_returns_token_at_min_words(self):
         pub, _ = self._pub(predicted=1000)
         words = BRANCH[:2]  # exactly MIN_PUBLISH_BRANCH_WORDS
-        token = pub.enter(words, depth=0)
+        token = pub.enter(words, budget=0)
         self.assertIsNotNone(token)
         nodes_at_entry, predicted, entry_time, bw, depth = token
         self.assertEqual(bw, words)
@@ -636,7 +642,7 @@ class TestMidLoopPublisher(unittest.TestCase):
 
     def test_enter_cold_model_still_returns_token(self):
         pub, _ = self._pub(predicted=None)  # cold model
-        token = pub.enter(BRANCH[:6], depth=1)
+        token = pub.enter(BRANCH[:6], budget=1)
         self.assertIsNotNone(token)
         _, predicted, _, _, _ = token
         self.assertIsNone(predicted)  # token carries None when model is cold
@@ -649,16 +655,16 @@ class TestMidLoopPublisher(unittest.TestCase):
         # Cold model: the node-proportionate check can't arm, and the wall-clock
         # backstop hasn't elapsed on a fresh token, so the frame stays inline.
         pub, _ = self._pub(predicted=None)
-        token = pub.enter(BRANCH[:6], depth=0)
+        token = pub.enter(BRANCH[:6], budget=0)
         self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
 
     def test_check_fires_on_wall_clock_backstop_when_cold(self):
         # Cold model, but the frame has run past COLD_BACKSTOP_SECONDS: the
         # backstop hands off the remainder even with no cost-model prediction.
         pub, w = self._pub(predicted=None)
-        nodes_at_entry, _, _, words, depth = pub.enter(BRANCH[:6], depth=0)
+        nodes_at_entry, _, _, words, entry_budget = pub.enter(BRANCH[:6], budget=0)
         old_entry = time.time() - (erd_swarm.COLD_BACKSTOP_SECONDS + 1)
-        token = (nodes_at_entry, None, old_entry, words, depth)
+        token = (nodes_at_entry, None, old_entry, words, entry_budget)
         w._nodes = nodes_at_entry + 50   # some work done, no prediction to compare
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
@@ -675,7 +681,7 @@ class TestMidLoopPublisher(unittest.TestCase):
         # The node-proportionate path is the model working as intended; only the
         # wall-clock backstop is recorded for tuning.
         pub, w = self._pub(predicted=10)
-        token = pub.enter(BRANCH[:6], depth=0)
+        token = pub.enter(BRANCH[:6], budget=0)
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
@@ -684,14 +690,14 @@ class TestMidLoopPublisher(unittest.TestCase):
 
     def test_check_returns_none_when_under_overrun_threshold(self):
         pub, w = self._pub(predicted=100)
-        token = pub.enter(BRANCH[:6], depth=0)
+        token = pub.enter(BRANCH[:6], budget=0)
         # _nodes hasn't changed: delta = 0 <= OVERRUN_K * 100
         self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
 
     def test_check_fires_on_overrun(self):
         pub, w = self._pub(predicted=10)
         words = BRANCH[:6]
-        token = pub.enter(words, depth=0)
+        token = pub.enter(words, budget=0)
         # Simulate spending > OVERRUN_K * predicted nodes
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
@@ -702,7 +708,7 @@ class TestMidLoopPublisher(unittest.TestCase):
 
     def test_check_returns_none_when_remaining_count_below_threshold(self):
         pub, w = self._pub(predicted=10)
-        token = pub.enter(BRANCH[:6], depth=0)
+        token = pub.enter(BRANCH[:6], budget=0)
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
         # last_index=7 of a 10-candidate list → only 2 remaining (< MIN_HANDOFF=4)
         self.assertIsNone(pub.check(token, CANDIDATES, 7, None, None, 5))
@@ -710,7 +716,7 @@ class TestMidLoopPublisher(unittest.TestCase):
     def test_check_marks_prefix_done(self):
         pub, w = self._pub(predicted=10)
         words = BRANCH[:6]
-        token = pub.enter(words, depth=0)
+        token = pub.enter(words, budget=0)
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         # last_index=1 → the evaluated prefix is CANDIDATES[:2].
@@ -726,7 +732,7 @@ class TestMidLoopPublisher(unittest.TestCase):
         import math
         pub, w = self._pub(predicted=100)
         words = BRANCH[:6]
-        token = pub.enter(words, depth=0)
+        token = pub.enter(words, budget=0)
         w._nodes = 200   # 200 - 0 = 200 nodes for this frame
         pub.record_inline(token)
         self.assertIn(len(words), w._cost_model_buffer)
@@ -855,7 +861,7 @@ class TestRecordInlineEdgeCases(unittest.TestCase):
 
     def test_record_inline_noop_when_nodes_unchanged(self):
         pub, w = self._pub()
-        token = pub.enter(BRANCH[:4], depth=0)
+        token = pub.enter(BRANCH[:4], budget=0)
         # _nodes stays 0 → nodes_spent = 0 → early return, nothing buffered.
         pub.record_inline(token)
         self.assertEqual(w._cost_model_buffer, {})
@@ -864,10 +870,10 @@ class TestRecordInlineEdgeCases(unittest.TestCase):
         import math
         pub, w = self._pub()
         words = BRANCH[:4]
-        token1 = pub.enter(words, depth=0)
+        token1 = pub.enter(words, budget=0)
         w._nodes = 100
         pub.record_inline(token1)
-        token2 = pub.enter(words, depth=0)
+        token2 = pub.enter(words, budget=0)
         w._nodes = 300   # 200 more nodes for second frame of same size
         pub.record_inline(token2)
         s, sq, c = w._cost_model_buffer[len(words)]
@@ -880,21 +886,21 @@ class TestNoteDepthDeeperPruning(unittest.TestCase):
 
     def test_note_depth_prunes_deeper_entries(self):
         w = _bare_worker()
-        w._note_depth(0, 200, guess="crane", pattern="00000")
-        w._note_depth(1, 50, guess="slate", pattern="10000")
-        w._note_depth(2, 10, guess="trace", pattern="22222")
+        w._note_depth(6, 200, guess="crane", pattern="00000")
+        w._note_depth(5, 50, guess="slate", pattern="10000")
+        w._note_depth(4, 10, guess="trace", pattern="22222")
         # Revisit depth 1: depths 2+ should be pruned.
-        w._note_depth(1, 48, guess="tales", pattern="01000")
+        w._note_depth(5, 48, guess="tales", pattern="01000")
         self.assertNotIn(2, w._spine)
         self.assertIn(1, w._spine)
 
     def test_sentinel_prunes_deeper_entries(self):
         w = _bare_worker()
-        w._note_depth(1, 50, guess="crane", pattern="00000")
-        w._note_depth(2, 20, guess="slate", pattern="10000")
+        w._note_depth(5, 50, guess="crane", pattern="00000")
+        w._note_depth(4, 20, guess="slate", pattern="10000")
         w._note_depth(3, 5, guess="trace", pattern="22222")
         # Sentinel at depth 1 with n<0 should prune depths 2 and 3.
-        w._note_depth(1, -1)
+        w._note_depth(5, -1)
         self.assertNotIn(2, w._spine)
         self.assertNotIn(3, w._spine)
 
@@ -907,7 +913,7 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         w.queue.get_cost_typical.return_value = predicted
         pub = erd_swarm._MidLoopPublisher(w)
         words = BRANCH[:6]
-        token = pub.enter(words, depth=0)
+        token = pub.enter(words, budget=0)
         w._nodes = erd_swarm.OVERRUN_K * predicted + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
@@ -931,7 +937,7 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         w.queue.get_cost_typical.return_value = 10
         pub = erd_swarm._MidLoopPublisher(w)
         words = BRANCH[:6]
-        token = pub.enter(words, depth=0)
+        token = pub.enter(words, budget=0)
         w._nodes = erd_swarm.OVERRUN_K * 10 + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
