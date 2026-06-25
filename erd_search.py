@@ -70,6 +70,13 @@ WORDS_FILE = 'wordle.txt'
 DEFAULT_CACHE = 'wordle_cache.sqlite3'
 DEFAULT_QUEUE = 'erd_queue.sqlite3'
 
+# Seconds of missed heartbeats after which a worker is considered dead: its
+# candidate claims are reclaimed by the queue and its heartbeat row stops
+# counting as live.  Workers heartbeat every ~2s, so this only ever fires on a
+# crashed process.  Liveness alone — not a separate display window — governs
+# both reclaim and what the status screen treats as a live worker.
+WORKER_LIVENESS_SECONDS = 30
+
 logger = logging.getLogger('wordle')
 
 
@@ -1013,7 +1020,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         total_erd = recent = 0
 
     # Aggregate cache-hit and pruning effectiveness across live workers.
-    live = [h for h in hbs if now_ts - h['updated_at'] <= 120]
+    live = [h for h in hbs if now_ts - h['updated_at'] <= WORKER_LIVENESS_SECONDS]
     hits = sum(h['cache_hits'] or 0 for h in live)
     misses = sum(h['cache_misses'] or 0 for h in live)
     n_ok = sum(h['n_ok'] or 0 for h in live)
@@ -1116,7 +1123,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         # candidate, deepest guess_depth reached, node rate, then the descent
         # sizes truncated to whatever width remains.
         age = now_ts - h['updated_at']
-        flag = ' !!' if age > 120 else ''
+        flag = ' !!' if age > WORKER_LIVENESS_SECONDS else ''
         chunk = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
         mdepth = (h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
@@ -1214,7 +1221,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         print()
         for h in sorted(idle_workers, key=lambda r: _worker_num(r)):
             age = now_ts - h['updated_at']
-            flag = ' !!' if age > 120 else ''
+            flag = ' !!' if age > WORKER_LIVENESS_SECONDS else ''
             print(f'W{_worker_num(h):<2} (idle)  {age}s{flag}')
         for h in sorted(detached, key=lambda r: _worker_num(r)):
             age = now_ts - h['updated_at']
@@ -1536,7 +1543,8 @@ def main():
                             '(default: 3).  Bounds per-worker ScoreCache '
                             'memory growth while in-progress work is preserved '
                             'in the queue and resumed by the fresh worker.')
-    p_run.add_argument('--worker-timeout-seconds', type=int, default=30,
+    p_run.add_argument('--worker-timeout-seconds', type=int,
+                       default=WORKER_LIVENESS_SECONDS,
                        metavar='S',
                        help='Declare a worker dead and reclaim its candidate '
                             'claims after S seconds of missed heartbeats '
