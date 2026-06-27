@@ -19,7 +19,6 @@ These four terms have precise meanings throughout the codebase. Use them consist
 | **guess** | A word actually played as a turn in the game. |
 | **candidate** | A word under evaluation during search — not yet played. A candidate becomes the guess when it wins. |
 | **branch** | The remaining answer words after a guess + response. Identified by a (guess, pattern) pair at each level. |
-| **chunk** | A contiguous slice of a branch's ranked candidate list; the unit of work claimed by one swarm worker. |
 
 The phase boundary between candidate and guess is explicit in the code:
 ```python

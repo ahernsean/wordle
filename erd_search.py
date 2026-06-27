@@ -21,14 +21,14 @@ queue-add       Add branches for a word or word list to the work queue.
                 higher priority.  --delete-erd-cache forces a recompute of
                 branches that are already cached.
 
-queue-clear     Wipe all queue state (pending branches, active state, chunk
+queue-clear     Wipe all queue state (pending branches, active state, candidate
                 claims, heartbeats).  Does not touch the ERD cache.
 
 queue-inspect   Show queue and worker detail for a specific branch.
 
 queue-remove    Remove a pending branch from the queue.  Use --force to also
                 cancel an in-progress branch (workers move on after their
-                current chunk completes).
+                current candidate evaluation completes).
 
 queue-priority  Change the priority of a queued branch.  Higher numbers are
                 worked sooner; 0 is the default.
@@ -325,7 +325,7 @@ def cmd_queue_add(args):
 # ---------------------------------------------------------------------------
 
 def cmd_queue_clear(args):
-    """Wipe all queue state (pending branches, active branches, chunk claims,
+    """Wipe all queue state (pending branches, active branches, candidate claims,
     heartbeats, and run metadata).  The ERD cache is not touched.
 
     Requires confirmation unless --yes is passed.
@@ -378,7 +378,7 @@ def cmd_queue_inspect(args):
 
     pb = queue.get_pending_branch(branch_key)
     ab = queue.get_active_branch(branch_key)
-    chunks = queue.claims_for_branch(branch_key) if ab else []
+    claims = queue.claims_for_branch(branch_key) if ab else []
     queue.close()
 
     print(f'{word.upper()} {pat}  ({len(branch)} answer words)')
@@ -393,13 +393,13 @@ def cmd_queue_inspect(args):
 
     if ab:
         n_candidates = ab['n_candidates']
-        done_ct = sum(1 for c in chunks if c['done'])
+        done_ct = sum(1 for c in claims if c['done'])
         best_g = ab['best_guess'] or '---'
         best_e = f'{ab["best_erd"]:.4f}' if ab['best_erd'] is not None else '---'
         print(f'  In-progress: claims {done_ct}/{n_candidates}  '
               f'best {best_g.upper()} {best_e}')
         print(f'  Claim detail:')
-        for c in chunks:
+        for c in claims:
             holder = c['claimed_by'] or '(unclaimed)'
             status = 'done' if c['done'] else f'held by {holder}'
             print(f'    claim {c["idx"]:5d}: {status}')
@@ -414,7 +414,7 @@ def cmd_queue_remove(args):
 
     Only removes branches with status='pending'.  If the branch is currently
     in-progress (being worked by a worker), use --force to also cancel it by
-    clearing its active_branches and chunk rows so the worker's next heartbeat
+    clearing its active_branches and candidate_claims rows so the worker's next heartbeat
     yields no further claims.  The worker will eventually notice the branch
     is gone and move on.
     """
@@ -446,7 +446,7 @@ def cmd_queue_remove(args):
         return
 
     if active and args.force:
-        # Atomically clear chunk claims, the active_branches row, and the
+        # Atomically clear candidate claims, the active_branches row, and the
         # pending_branches row.  All three DELETEs run in one transaction so a
         # crash partway through cannot leave orphaned rows.  (remove_pending()
         # alone would silently no-op here because the pending row still has
@@ -649,9 +649,9 @@ def cmd_run(args):
                 _reap_worker(q, wid)
                 procs[wid] = _spawn_worker(wid, args, stop_event)
 
-        # Backstop: free chunks held by any worker that died WITHOUT being
-        # reaped above (e.g. it crashed and we haven't noticed yet).  Gated on
-        # heartbeat liveness, so a slow-but-alive worker is never reclaimed.
+        # Backstop: free candidate claims held by any worker that died WITHOUT
+        # being reaped above (e.g. it crashed and we haven't noticed yet).  Gated
+        # on heartbeat liveness, so a slow-but-alive worker is never reclaimed.
         freed = q.reclaim_stale_claims(args.worker_timeout_seconds)
         if freed:
             logger.info('Reclaimed %d stale candidate claim(s).', freed)
@@ -986,8 +986,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         branches = queue.branches_in_progress()
         hbs = queue.heartbeats_with_branch()
         worker_counts = queue.worker_counts_by_branch()
-        # Per-branch done-chunk counts for the in-progress branches.
-        done_chunks = {bytes(b['branch_key']): queue.branch_done_candidates(b['branch_key'])
+        # Per-branch done-candidate counts for the in-progress branches.
+        done_candidates = {bytes(b['branch_key']): queue.branch_done_candidates(b['branch_key'])
                        for b in branches}
         queue.close()
         queue_ok = True
@@ -998,7 +998,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         branches = []
         hbs = []
         worker_counts = {}
-        done_chunks = {}
+        done_candidates = {}
 
     # Cache throughput
     try:
@@ -1124,7 +1124,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         # sizes truncated to whatever width remains.
         age = now_ts - h['updated_at']
         flag = ' !!' if age > WORKER_LIVENESS_SECONDS else ''
-        chunk = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
+        claim_idx_str = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
         mdepth = (h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
@@ -1137,7 +1137,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             flag += ' ~?'
         cur_disp = (cur.upper() + ('*' if cur.lower() in answer_set else ' ')) if cur else '-----'
         krate = f'{int(nrate / 1000)}k/s' if nrate else ''
-        head = (f' W{_worker_num(h):<2} {chunk:>5} {cur_disp:<6} '
+        head = (f' W{_worker_num(h):<2} {claim_idx_str:>5} {cur_disp:<6} '
                 f'd{mdepth} {krate:>6}')
         tail = f' {age}s{flag}'
         sizes = _spine_sizes(path)
@@ -1185,7 +1185,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         bid = _branch_id(key)
         letter = letter_by_bid.get(bid, ' ')
         n_cands = b['n_candidates'] or 0
-        done = done_chunks.get(key, 0)
+        done = done_candidates.get(key, 0)
         pct = int(100.0 * done / n_cands) if n_cands else 0
         bw = (b['best_guess'] or '-----').upper()
         bstar = '*' if (b['best_guess'] or '').lower() in answer_set else ' '
@@ -1290,8 +1290,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                                         if bytes(b['branch_key']) == bkey), None)
                     if branch_info:
                         n_cands = branch_info['n_candidates'] or 0
-                        total_chunks = n_cands
-                        done_ct = done_chunks.get(bkey, 0)
+                        total_candidates = n_cands
+                        done_ct = done_candidates.get(bkey, 0)
                         co_workers = [
                             h['worker_id'].split('-')[-1]
                             if '-' in h['worker_id'] else h['worker_id']
@@ -1302,11 +1302,11 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                         ]
                         co_str = (f', W{",".join(co_workers)} also active'
                                   if co_workers else '')
-                        print(f'(cooperating — {done_ct}/{total_chunks} chunks done{co_str})')
+                        print(f'(cooperating — {done_ct}/{total_candidates} candidates done{co_str})')
                     else:
                         print('(cooperating — sub-branch finalizing)')
                 else:
-                    print('(between chunks)')
+                    print('(between candidates)')
             else:
                 print('(no spine data yet)')
             if interactive:
@@ -1330,7 +1330,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         else:
             key = bytes(target['branch_key'])
             n_cands = target['n_candidates'] or 0
-            done = done_chunks.get(key, 0)
+            done = done_candidates.get(key, 0)
             guess_depth = branch_guess_depth.get(key, 0)
             print(f'Branch #{selected_branch}: {target["n_words"] or 0} words: '
                   f'depth {guess_depth}')
@@ -1637,7 +1637,7 @@ def main():
                       help='Response pattern (5 chars: g=green y=yellow -=gray)')
     p_qr.add_argument('--force', action='store_true',
                       help='Also cancel an in-progress branch (clears active '
-                           'state so the worker moves on after its current chunk)')
+                           'state so the worker moves on after its current candidate)')
     p_qr.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qr.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
 

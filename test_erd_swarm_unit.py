@@ -296,7 +296,7 @@ class TestMaybeCheckpoint(unittest.TestCase):
 
 class TestCooperativeSolveCachedPath(unittest.TestCase):
     """cooperative_solve returns the cached result immediately when the branch
-    is already solved in ScoreCache, without evaluating any candidate chunks."""
+    is already solved in ScoreCache, without claiming or evaluating any candidate."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -338,7 +338,7 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
         self.assertAlmostEqual(cost, 1.5)
         self.assertEqual(max_depth, 2)
 
-        # No chunks should have been created — the cache hit short-circuited.
+        # No candidate claims should have been created — the cache hit short-circuited.
         q = ERDQueue(self.queue_path)
         self.assertIsNone(q.get_branch(branch_key))
         q.close()

@@ -46,9 +46,9 @@ ANSWER_FILE = 'NYT_wordlist.txt'
 WORDS_FILE = 'wordle.txt'
 
 BEST_REFRESH_SECONDS = 0.25   # how often a worker re-reads the shared bound
-HB_SECONDS = 2.0              # liveness heartbeat cadence during a long chunk
+HB_SECONDS = 2.0              # liveness heartbeat cadence during a long candidate evaluation
 # A worker that hasn't heartbeat within this many seconds is presumed dead, and
-# only then are its in-flight chunk claims reclaimed.  Live workers heartbeat
+# only then are its in-flight candidate claims reclaimed.  Live workers heartbeat
 # every HB_SECONDS regardless of how long a single candidate takes (the
 # heartbeat fires on every recursive sub-branch call, not just between
 # candidates), so a slow-but-alive worker is never reclaimed — only a crashed
@@ -274,7 +274,7 @@ class _MidLoopPublisher:
 
 
 class _BranchWorker:
-    """One worker process's state and operations on branches/chunks."""
+    """One worker process's state and operations on branches and candidates."""
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
                  root_budget=ROOT_BUDGET, n_workers=1,
@@ -315,7 +315,7 @@ class _BranchWorker:
         # Live search probe (transparency): a monotonic node counter plus the
         # active descent spine, so a long candidate evaluation never looks
         # frozen — node count climbs every heartbeat even mid-candidate.
-        self._nodes = 0              # candidate evaluations this chunk
+        self._nodes = 0              # candidate evaluations since last claim start
         self._nodes_at_last_hb = 0
         self._cur_depth = 0
         self._spine = {}             # guess_depth -> subset size on the active descent
@@ -864,10 +864,10 @@ class _BranchWorker:
         a cooperative solve runs to the exact optimum).
 
         Registers the sub-branch as a first-class swarm branch, then *helps*
-        solve it — claiming and evaluating its chunks alongside any other
+        solve it — claiming and evaluating candidates alongside any other
         worker that needs it — until it is finalized, then reads the result
         from cache.  Never idle-blocks (the worker that needs it drives it),
-        and deadlock-free (a waiting worker holds no chunk).
+        and deadlock-free (a waiting worker holds no claim).
         """
         # Absolute spine of the branch being promoted, composed from the descent
         # that reached it before this frame's own work overwrites self._spine.
@@ -933,7 +933,7 @@ class _BranchWorker:
         finally:
             self._claimed_branch_spine = saved_spine
 
-    # -- scheduling: claim one chunk of the best available branch -----------
+    # -- scheduling: claim one candidate from the best available branch ------
 
     def claim_one(self):
         """Return (branch_row_dict, claim_idx) for the next candidate to work,
@@ -993,7 +993,7 @@ class _BranchWorker:
         while not self.cancel():
             work = self.claim_one()
             if work is None:
-                # Nothing claimable: queue empty or all chunks in flight.
+                # Nothing claimable: queue empty or all candidates in flight.
                 if idle_since is None:
                     idle_since = time.time()
                 self._heartbeat(None, None, None, None,

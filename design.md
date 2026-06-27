@@ -15,7 +15,7 @@ Four layers:
 | `wordle_engine.py` | All algorithms: scoring, ERD search, response simulation. No I/O. |
 | `wordle.py` | REPL, display, all command handlers. |
 | `cache_sqlite.py` | SQLite-backed `ScoreCache`: ERD results, candidate scores, response decompositions. |
-| `erd_swarm.py` / `erd_queue.py` / `erd_search.py` | Parallel precache workers: branch assignment, chunk dispatch, cooperative ERD solving. |
+| `erd_swarm.py` / `erd_queue.py` / `erd_search.py` | Parallel precache workers: branch assignment, candidate claiming, cooperative ERD solving. |
 
 Support files: `merge_cache.py` (merge two `.sqlite3` files), `backfill_max_depth.py`
 (populate `max_depth` for legacy rows), diagnostic scripts (`diag_*.py`).
@@ -31,7 +31,6 @@ These terms have precise meanings throughout the codebase:
 | **guess** | A word actually played as a turn in the game. |
 | **candidate** | A word under evaluation during search — not yet played. A candidate becomes the guess when it wins. |
 | **branch** | The remaining answer words after a guess + response. Identified by a (guess, pattern) pair at each level. |
-| **chunk** | A contiguous slice of a branch's ranked candidate list; the unit of work claimed by one swarm worker. |
 
 The phase boundary between candidate and guess is explicit:
 ```python
@@ -333,25 +332,25 @@ against a branch is slow, multiple workers cooperate:
 
 - `erd_queue.sqlite3` — coordination-only database (separate from `wordle_cache.sqlite3`
   to avoid contention). Contains the `pending_subgroups` table of branches to solve,
-  chunk claims, heartbeats, and done flags.
-- `_BranchWorker` (`erd_swarm.py`) — one per OS process. Claims one chunk at a time,
-  evaluates candidates in that slice, writes sub-branch results to `wordle_cache.sqlite3`,
-  and updates chunk state in `erd_queue.sqlite3`.
+  candidate claims, heartbeats, and done flags.
+- `_BranchWorker` (`erd_swarm.py`) — one per OS process. Claims one candidate at a time,
+  evaluates it, writes sub-branch results to `wordle_cache.sqlite3`, and updates claim
+  state in `erd_queue.sqlite3`.
 - `ERDQueue` (`erd_queue.py`) — single writer to `erd_queue.sqlite3`. Used by workers to
-  claim chunks, record heartbeats, mark chunks done, and promote large sub-branches to the queue.
+  claim candidates, record heartbeats, mark claims done, and promote large sub-branches to the queue.
 
 ### Branch lifecycle
 
-1. A branch is added to the queue with a chunk count proportional to its word count.
-2. Each worker calls `claim_one()` to atomically claim an unclaimed (or timed-out) chunk.
-3. The worker evaluates each candidate in its slice, writing sub-branch ERD results as it goes.
-4. On `done=1`, the worker calls `maybe_finalize`: if every chunk for this branch is done, it
+1. A branch is added to the queue with one candidate slot per candidate word.
+2. Each worker calls `claim_one()` to atomically claim an unclaimed (or timed-out) candidate.
+3. The worker evaluates the candidate, writing sub-branch ERD results as it goes.
+4. On `done=1`, the worker calls `maybe_finalize`: if every candidate for this branch is done, it
    writes the final `branch_best_by_policy` row and removes the branch from the queue.
 
 ### Trust model
 
-A claimed chunk is advisory; only a `done=1` chunk is authoritative. A branch is finalized only
-once every chunk is done. A crashed worker's chunk times out (`HB_TIMEOUT_SECONDS = 120`) and is
+A claim is advisory; only a `done=1` claim is authoritative. A branch is finalized only
+once every candidate is done. A crashed worker's claim times out (`HB_TIMEOUT_SECONDS = 120`) and is
 reclaimed — never skipped, never double-counted.
 
 ### Sub-branch promotion
