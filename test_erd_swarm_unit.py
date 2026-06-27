@@ -142,7 +142,7 @@ class TestPromotedSpine(unittest.TestCase):
         self.assertIsNone(w._promoted_spine())
 
 
-class TestHBSpineStr(unittest.TestCase):
+class TestHeartbeatSpineStrFilter(unittest.TestCase):
     """_hb_spine_str omits outer-frame entries at or shallower than the claimed branch.
 
     _solve_subset fires note_depth before calling subbranch_solver, so the

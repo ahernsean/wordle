@@ -424,7 +424,7 @@ class _BranchWorker:
             return f'{guess.upper()}:{pattern}/{size}'
         return str(size)
 
-    def _descent_base_gd(self):
+    def _claimed_branch_guess_depth(self):
         """Guess depth of the current claimed branch.
 
         Entries in _hb_max_spine / _log_max_spine at this depth and shallower
@@ -438,18 +438,18 @@ class _BranchWorker:
         return guess_depth_from_spine(spine) if spine else 0
 
     def _hb_spine_str(self):
-        base_gd = self._descent_base_gd()
+        claimed_guess_depth = self._claimed_branch_guess_depth()
         return '→'.join(
             self._fmt_spine_entry(self._hb_max_spine[d])
             for d in sorted(self._hb_max_spine)
-            if d > base_gd)
+            if d > claimed_guess_depth)
 
     def _log_spine_str(self):
-        base_gd = self._descent_base_gd()
+        claimed_guess_depth = self._claimed_branch_guess_depth()
         return '→'.join(
             self._fmt_spine_entry(self._log_max_spine[d])
             for d in sorted(self._log_max_spine)
-            if d > base_gd)
+            if d > claimed_guess_depth)
 
     @staticmethod
     def _root_spine(source_word, source_pattern):
