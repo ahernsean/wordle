@@ -1268,10 +1268,19 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             rich_path = (detail_hb['cur_path'] if 'cur_path' in detail_hb.keys() else None) or ''
             cur_cand = (detail_hb['cur_candidate'] if 'cur_candidate' in detail_hb.keys() else None) or ''
             chunk_held = (detail_hb['claim_idx'] if 'claim_idx' in detail_hb.keys() else None) is not None
-            # The worker's live descent below its branch (dK+1..).  The first
-            # cur_path level is the claimed branch itself (size only) — skipped
-            # by filtering to levels that carry a guess.
+            # Live descent below the claimed branch (d{K+1}..).  Filter to
+            # entries that carry a guess, then drop any leading entry that
+            # duplicates the last edge of the stored spine: _solve_subset fires
+            # note_depth before subbranch_solver, so the entry at the claimed-
+            # branch level carries the reaching guess and must not be re-shown.
             descent = [(g, p, s) for (g, p, s) in _parse_spine(rich_path) if g and p]
+            if descent and branch_spine:
+                spine_tokens = branch_spine.split()
+                if len(spine_tokens) >= 2:
+                    last_guess = spine_tokens[-2].upper()
+                    last_pattern = spine_tokens[-1]
+                    if descent[0][0].upper() == last_guess and descent[0][1] == last_pattern:
+                        descent = descent[1:]
             if descent:
                 for di, (guess, pattern, size) in enumerate(descent, start=base_k + 1):
                     star = '*' if guess.lower() in answer_set else ' '
