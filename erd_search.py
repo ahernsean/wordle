@@ -861,25 +861,33 @@ def _spine_sizes(path):
 
 
 def _parse_spine(path):
-    """Parse a rich spine string into a list of (guess, pattern, size) tuples.
+    """Parse a rich spine string into a list of (depth, guess, pattern, size) tuples.
 
-    Each token in the '→'-separated path is either a bare size (root level,
-    no guess/pattern yet) or 'GUESS:pattern/size'.  Returns one tuple per
-    level in depth order.
+    New-format tokens: 'guess_depth:GUESS:pattern/size' or 'guess_depth:size'.
+    Old-format tokens: 'GUESS:pattern/size' or a bare size string.
+
+    Old-format tokens always begin with a letter or sentinel character, never a
+    digit, so the leading digit is an unambiguous marker for the new format.
+    depth is an integer for new-format tokens, None for old-format.
     """
     if not path:
         return []
     result = []
     for tok in path.split('→'):
+        depth = None
+        if tok and tok[0].isdigit():
+            colon_pos = tok.index(':')
+            depth = int(tok[:colon_pos])
+            tok = tok[colon_pos + 1:]
         if '/' in tok:
             gp, size_str = tok.rsplit('/', 1)
             if ':' in gp:
                 guess, pattern = gp.split(':', 1)
             else:
                 guess, pattern = None, gp
-            result.append((guess, pattern, size_str))
+            result.append((depth, guess, pattern, size_str))
         elif tok:
-            result.append((None, None, tok))
+            result.append((depth, None, None, tok))
     return result
 
 
@@ -1268,12 +1276,27 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             rich_path = (detail_hb['cur_path'] if 'cur_path' in detail_hb.keys() else None) or ''
             cur_cand = (detail_hb['cur_candidate'] if 'cur_candidate' in detail_hb.keys() else None) or ''
             chunk_held = (detail_hb['claim_idx'] if 'claim_idx' in detail_hb.keys() else None) is not None
-            # The worker's live descent below its branch (dK+1..).  The first
-            # cur_path level is the claimed branch itself (size only) — skipped
-            # by filtering to levels that carry a guess.
-            descent = [(g, p, s) for (g, p, s) in _parse_spine(rich_path) if g and p]
+            # Live descent below the claimed branch (d{base_k+1}..).
+            # New-format heartbeats carry an explicit guess_depth on each token;
+            # filter out outer-frame entries (depth <= base_k) and use the stored
+            # depth directly as the label.  Old-format heartbeats (depth=None) fall
+            # back to the spine-edge heuristic: drop the leading entry if its
+            # guess+pattern matches the last edge of the stored branch spine.
+            descent_all = [(d, g, p, s) for (d, g, p, s) in _parse_spine(rich_path) if g and p]
+            if descent_all and descent_all[0][0] is not None:
+                descent = [(d, g, p, s) for (d, g, p, s) in descent_all if d > base_k]
+            else:
+                descent = descent_all
+                if descent and branch_spine:
+                    spine_tokens = branch_spine.split()
+                    if len(spine_tokens) >= 2:
+                        last_guess = spine_tokens[-2].upper()
+                        last_pattern = spine_tokens[-1]
+                        if descent[0][1].upper() == last_guess and descent[0][2] == last_pattern:
+                            descent = descent[1:]
             if descent:
-                for di, (guess, pattern, size) in enumerate(descent, start=base_k + 1):
+                for i, (depth, guess, pattern, size) in enumerate(descent, start=base_k + 1):
+                    di = depth if depth is not None else i
                     star = '*' if guess.lower() in answer_set else ' '
                     print(f'{f"d{di}":<4} {guess.upper()}{star} {pattern} {size:>4}w')
             elif cur_cand:

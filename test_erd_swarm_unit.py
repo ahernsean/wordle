@@ -176,6 +176,18 @@ class TestHeartbeatSpineStrFilter(unittest.TestCase):
         self.assertIn('CRANE', result)
         self.assertIn('DOGMA', result)
 
+    def test_tokens_carry_explicit_guess_depth_prefix(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._note_depth(4, 30, 'crane', '-yg--')   # guess_depth 2
+        w._note_depth(3, 8, 'dogma', 'y---y')    # guess_depth 3
+        w._hb_max_spine = dict(w._spine)
+        result = w._hb_spine_str()
+        # Each token is prefixed 'guess_depth:GUESS:...' so the display can label
+        # and filter entries without positional inference.
+        self.assertIn('2:CRANE', result)
+        self.assertIn('3:DOGMA', result)
+
 
 class TestCancelPath(unittest.TestCase):
     """evaluate_claim returns False without completing the claim when cancelled."""

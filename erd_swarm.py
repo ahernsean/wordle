@@ -440,14 +440,14 @@ class _BranchWorker:
     def _hb_spine_str(self):
         claimed_guess_depth = self._claimed_branch_guess_depth()
         return '→'.join(
-            self._fmt_spine_entry(self._hb_max_spine[d])
+            f'{d}:{self._fmt_spine_entry(self._hb_max_spine[d])}'
             for d in sorted(self._hb_max_spine)
             if d > claimed_guess_depth)
 
     def _log_spine_str(self):
         claimed_guess_depth = self._claimed_branch_guess_depth()
         return '→'.join(
-            self._fmt_spine_entry(self._log_max_spine[d])
+            f'{d}:{self._fmt_spine_entry(self._log_max_spine[d])}'
             for d in sorted(self._log_max_spine)
             if d > claimed_guess_depth)
 
