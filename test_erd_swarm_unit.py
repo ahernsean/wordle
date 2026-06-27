@@ -142,6 +142,41 @@ class TestPromotedSpine(unittest.TestCase):
         self.assertIsNone(w._promoted_spine())
 
 
+class TestHeartbeatSpineStrFilter(unittest.TestCase):
+    """_hb_spine_str omits outer-frame entries at or shallower than the claimed branch.
+
+    _solve_subset fires note_depth before calling subbranch_solver, so the
+    entry at the claimed branch's own guess_depth is written by the outer frame
+    and persists into inner cooperative_solve sessions.  It belongs to the base
+    spine, not to the live descent, and must be filtered out of the heartbeat
+    string so the worker detail panel does not display the reaching guess twice.
+    """
+
+    def test_outer_frame_entry_at_claimed_depth_is_excluded(self):
+        w = _bare_worker()
+        # Outer frame set _spine[3] = (44, 'peaze', '-yy--') before calling
+        # subbranch_solver, then cooperative_solve advanced _claimed_branch_spine
+        # to include PEAZE.  The outer frame's entry should not appear as a live
+        # descent step.
+        w._claimed_branch_spine = 'SALET -g-g- ABOVE y---y PEAZE -yy--'
+        w._note_depth(3, 44, 'peaze', '-yy--')   # outer frame's entry at guess_depth 3
+        w._note_depth(2, 16, 'nurdy', '---y-')   # real descent at guess_depth 4
+        w._hb_max_spine = dict(w._spine)
+        result = w._hb_spine_str()
+        self.assertNotIn('PEAZE', result)
+        self.assertIn('NURDY', result)
+
+    def test_descent_below_claimed_branch_is_included(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._note_depth(4, 30, 'crane', '-yg--')   # guess_depth 2
+        w._note_depth(3, 8, 'dogma', 'y---y')    # guess_depth 3
+        w._hb_max_spine = dict(w._spine)
+        result = w._hb_spine_str()
+        self.assertIn('CRANE', result)
+        self.assertIn('DOGMA', result)
+
+
 class TestCancelPath(unittest.TestCase):
     """evaluate_claim returns False without completing the claim when cancelled."""
 
