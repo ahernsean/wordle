@@ -48,6 +48,23 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertEqual(row["n_words"], len(WORDS))
         self.assertEqual(row["budget"], 5)
 
+    def test_create_branch_accepts_consistent_spine_budget(self):
+        # SALET ABORT DOGMA = guess_depth 3; budget 3; 3 + 3 == root_budget 6.
+        spine = 'SALET -g-g- ABORT y---- DOGMA y---y'
+        self.assertTrue(self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES,
+            budget=3, spine=spine, root_budget=6))
+
+    def test_create_branch_rejects_spine_budget_mismatch(self):
+        # The duplicated-guess spine: guess_depth 4 with budget 3 violates
+        # budget + guess_depth == root_budget.  Must raise, not persist.
+        bad = 'SALET -g-g- ABORT y---- ABORT y---- DOGMA y---y'
+        with self.assertRaises(ValueError):
+            self.q.create_branch(
+                self.key, len(WORDS), N_CANDIDATES,
+                budget=3, spine=bad, root_budget=6)
+        self.assertIsNone(self.q.get_branch(self.key))
+
     def test_get_branch_returns_none_after_delete(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self.q.delete_branch(self.key)

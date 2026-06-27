@@ -228,7 +228,8 @@ class _MidLoopPublisher:
             priority=PROMOTED_PRIORITY,
             source_word=self._worker._top_source_word,
             source_pattern=self._worker._top_source_pattern,
-            budget=budget, spine=self._worker._promoted_spine())
+            budget=budget, spine=self._worker._promoted_spine(),
+            root_budget=self._worker.root_budget)
 
         # Mark the already-evaluated candidates done by their all_words index so
         # cooperative workers claim only the unevaluated remainder.  The prefix
@@ -464,12 +465,22 @@ class _BranchWorker:
         base = getattr(self, '_claimed_branch_spine', None)
         if not base:
             return None
-        descent_guesses = []
+        # The live descent dict keeps a shallow entry until a shallower frame
+        # overwrites it, so after the base is advanced it still holds the guess
+        # that reached the base — whose edge then repeats the base's tail.  A
+        # real spine never replays a guess (a replay gains no information and is
+        # never selected), so an edge identical to the one before it is always
+        # that seam artifact.  Dropping it keeps budget + guess_depth = GAME_GUESSES.
+        edges = base.split()   # flat "GUESS pattern GUESS pattern ..." tokens
         for d in sorted(getattr(self, '_spine', {})):
             _size, guess, pattern = self._spine[d]
-            if guess and guess != '•' and pattern:
-                descent_guesses.append(f'{guess.upper()} {pattern}')
-        return ' '.join([base, *descent_guesses])
+            if not (guess and guess != '•' and pattern):
+                continue
+            guess = guess.upper()
+            if len(edges) >= 2 and edges[-2] == guess and edges[-1] == pattern:
+                continue
+            edges.extend((guess, pattern))
+        return ' '.join(edges)
 
     # -- cost model ---------------------------------------------------------
 
@@ -880,7 +891,7 @@ class _BranchWorker:
                 branch_key, n_words, self.n_candidates,
                 priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
                 source_pattern=self._top_source_pattern, budget=budget,
-                spine=child_spine)
+                spine=child_spine, root_budget=self.root_budget)
             # Descents into this branch promote grandchildren relative to its spine.
             self._claimed_branch_spine = child_spine
 
@@ -960,7 +971,7 @@ class _BranchWorker:
             claimed['branch_key'], n_words, self.n_candidates,
             priority=claimed['priority'], source_word=claimed['source_word'],
             source_pattern=claimed['source_pattern'], budget=budget,
-            spine=root_spine)
+            spine=root_spine, root_budget=self.root_budget)
         idx = self.queue.claim_candidate(claimed['branch_key'], self.name,
                                          self.n_candidates)
         branch = {
