@@ -58,6 +58,36 @@ class BranchIdAndSpineHelperTest(unittest.TestCase):
         self.assertEqual(out, 'SALET -g-g-')
 
 
+class ParseSpineTest(unittest.TestCase):
+    """_parse_spine handles both old-format and new depth-tagged tokens."""
+
+    def test_new_format_returns_depth_guess_pattern_size(self):
+        result = erd_search._parse_spine('3:KHAKI:--y--/33→4:NURDY:---y-/17')
+        self.assertEqual(result, [
+            (3, 'KHAKI', '--y--', '33'),
+            (4, 'NURDY', '---y-', '17'),
+        ])
+
+    def test_old_format_returns_none_depth(self):
+        result = erd_search._parse_spine('KHAKI:--y--/33→NURDY:---y-/17')
+        self.assertEqual(result, [
+            (None, 'KHAKI', '--y--', '33'),
+            (None, 'NURDY', '---y-', '17'),
+        ])
+
+    def test_empty_path_returns_empty_list(self):
+        self.assertEqual(erd_search._parse_spine(''), [])
+        self.assertEqual(erd_search._parse_spine(None), [])
+
+    def test_size_only_sentinel_new_format(self):
+        result = erd_search._parse_spine('3:•')
+        self.assertEqual(result, [(3, None, None, '•')])
+
+    def test_size_only_sentinel_old_format(self):
+        result = erd_search._parse_spine('•')
+        self.assertEqual(result, [(None, None, None, '•')])
+
+
 class SplitSectionsTest(unittest.TestCase):
     def test_splits_on_markers(self):
         lines = [
