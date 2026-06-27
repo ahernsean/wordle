@@ -601,7 +601,7 @@ class ERDQueue:
 
         Returns True only for the single caller that wins the transition; that
         caller writes the branch's ERD entry to the persistent cache and then
-        calls delete_branch.  Caller must have confirmed full chunk coverage
+        calls delete_branch.  Caller must have confirmed all candidates are done
         first; the WHERE status='open' guard makes the finalize idempotent.
         """
         now = int(time.time())
@@ -733,7 +733,7 @@ class ERDQueue:
 
     def clear(self):
         """Wipe all queue state: pending/done branches, active branches,
-        chunk claims, heartbeats, and run_meta.
+        candidate claims, heartbeats, and run_meta.
 
         The persistent cache (wordle_cache.sqlite3) is not touched — only
         the transient coordination tables in erd_queue.sqlite3.
@@ -802,7 +802,7 @@ class ERDQueue:
 
     def cancel_active_branch(self, branch_key: bytes,
                              remove_from_queue: bool = False):
-        """Atomically remove a branch's chunk claims and active_branches row.
+        """Atomically remove a branch's candidate claims and active_branches row.
 
         All DELETEs run in one transaction so a crash partway through cannot
         leave orphaned candidate_claims rows or a dangling active_branches row.

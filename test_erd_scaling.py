@@ -5,7 +5,7 @@ Three checks:
 1. Work amplification (deterministic, thread-driven): the TOTAL number of
    candidate evaluations across all workers must stay equal to the candidate
    count regardless of how many workers run.  If coordination regressed and
-   workers redid each other's chunks, total work would balloon — this catches
+   workers redid each other's candidates, total work would balloon — this catches
    that without depending on wall-clock timing.  Each run must also still
    produce the correct ERD.
 

@@ -119,9 +119,9 @@ class TestParallelSwarmSolve(unittest.TestCase):
 
 
 class TestClaimSkipsCachedBranch(unittest.TestCase):
-    """claim_one() must not re-chunk a pending branch whose ERD is already
-    reusable in ScoreCache at the worker's budget: it should mark the
-    pending row done directly instead of promoting it for real work."""
+    """claim_one() must not re-claim candidates for a pending branch whose ERD
+    is already reusable in ScoreCache at the worker's budget: it should mark
+    the pending row done directly instead of promoting it for real work."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -206,7 +206,7 @@ class TestReportingInvariants(unittest.TestCase):
 
     def test_cand_max_depth_resets_per_candidate(self):
         """_cand_max_depth is zeroed before each candidate so MaxD reflects
-        the current candidate's recursion, not the chunk lifetime."""
+        only the current candidate's recursion."""
         w = self._bare_worker()
 
         w._note_depth(5, 50)
@@ -214,7 +214,7 @@ class TestReportingInvariants(unittest.TestCase):
         w._note_depth(3, 4)
         self.assertEqual(w._cand_max_depth, 3)
 
-        # evaluate_chunk resets before candidate 2.
+        # evaluate_claim resets before candidate 2.
         w._cand_max_depth = 0
 
         w._note_depth(5, 30)
@@ -223,7 +223,7 @@ class TestReportingInvariants(unittest.TestCase):
     def test_spine_windows(self):
         """_hb_max_spine resets after each heartbeat write (2s window for the
         status display); _log_max_spine resets after each 120s progress log
-        write.  Both reset when a new chunk starts."""
+        write.  Both reset when a new candidate claim starts."""
         w = self._bare_worker()
 
         w._note_depth(5, 50)
@@ -245,7 +245,7 @@ class TestReportingInvariants(unittest.TestCase):
         w._note_depth(5, 15)
         self.assertEqual(w._log_spine_str().count('→'), 0)  # fresh 120s window
 
-        # New chunk: both reset.
+        # New candidate claim: both reset.
         w._note_depth(4, 8)
         w._hb_max_spine = {}
         w._log_max_spine = {}

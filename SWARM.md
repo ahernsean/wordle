@@ -9,7 +9,7 @@ Two SQLite files are involved:
 | File | Purpose |
 |---|---|
 | `wordle_cache.sqlite3` | Durable ERD results; shared with the iPhone |
-| `erd_queue.sqlite3` | Transient coordination only (queue, chunk claims, heartbeats) |
+| `erd_queue.sqlite3` | Transient coordination only (queue, candidate claims, heartbeats) |
 
 `queue-clear` wipes only the queue file — the cache is never touched by any
 queue command.
@@ -59,8 +59,6 @@ SIGTERM.  Useful flags:
 |---|---|---|
 | `--workers N` | 6 | Number of worker processes |
 | `--recycle-hours H` | 3.0 | Restart each worker after H hours to bound per-worker memory growth |
-| `--min-words-per-chunk N` | 3 | Granularity: lower = more chunks = more sharing on hard branches |
-| `--max-chunk-count N` | 256 | Cap on chunks per branch |
 | `--worker-timeout-seconds S` | 30 | Declare a worker dead after S seconds without a heartbeat |
 
 ---
@@ -81,11 +79,11 @@ The display has three sections:
 
 **Branches in progress** — one row per branch currently being swarmed.  Columns:
 `Source` (opener word + response pattern), `Ans` (answer-word count),
-`Chunks` (done/total and percent), `Best guess` (running-best candidate),
+`Cands` (done/total and percent), `Best guess` (running-best candidate),
 `ERD` (running-best score), `Wkrs` (active worker count), `ETA`.
 
 **Workers** — one row per worker with its liveness heartbeat age (`hb=Ns`),
-the branch it is on, chunk held and hold time, total chunks done, and the
+the branch it is on, claim index held and hold time, total claims done, and the
 candidate currently under evaluation (`[WORD N/total depth D M evals K/s
 path:X>Y>Z]`).  A `!!STALE` flag appears when a heartbeat is more than 120 s
 old.  A `!!HANG` flag appears when the heartbeat is fresh but the node rate is
@@ -96,16 +94,16 @@ zero (evaluation stuck).
 | File | Content |
 |---|---|
 | `erd_search.log` | Supervisor: spawn/recycle events, queue-empty signal |
-| `erd_worker_N.log` | Per-worker: chunk timing, finalize events, RAM warnings |
+| `erd_worker_N.log` | Per-worker: candidate timing, finalize events, RAM warnings |
 
 ```bash
 tail -f erd_search.log
 tail -f erd_worker_0.log
 ```
 
-Workers log a summary line after each chunk completes:
+Workers log a summary line after each candidate claim completes:
 ```
-chunk N done: K cands in T.1s (R.1/s)  ok=X pruned=Y useless=Z  best=WORD E.EEEE
+claim N done: K nodes in T.1s (R.1/s)  ok=X pruned=Y useless=Z  best=WORD E.EEEE
 ```
 
 ---
@@ -160,8 +158,8 @@ python3.13 erd_search.py queue-inspect --word salet --pattern .....
 ```
 
 Shows the pending-queue status (pending / in_progress / done), priority, and
-— if the branch is currently active — the chunk completion table with which
-worker holds each chunk.
+— if the branch is currently active — the candidate claim table with which
+worker holds each claim.
 
 ### Change priority
 
@@ -178,7 +176,7 @@ changing it on an in-progress branch has no effect).
 # Remove from the pending queue (no-op if in-progress or done):
 python3.13 erd_search.py queue-remove --word salet --pattern .....
 
-# Also cancel any in-progress work (workers move on after their current chunk):
+# Also cancel any in-progress work (workers move on after their current candidate):
 python3.13 erd_search.py queue-remove --word salet --pattern ..... --force
 ```
 
@@ -189,7 +187,7 @@ python3.13 erd_search.py queue-clear       # prompts for confirmation
 python3.13 erd_search.py queue-clear --yes # skip prompt
 ```
 
-Wipes pending, in-progress, done branches, chunk claims, heartbeats, and run
+Wipes pending, in-progress, done branches, candidate claims, heartbeats, and run
 metadata.  The ERD cache (`wordle_cache.sqlite3`) is not touched.
 
 ### Reset stuck in-progress rows
