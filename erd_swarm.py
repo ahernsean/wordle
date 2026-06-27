@@ -360,6 +360,11 @@ class _BranchWorker:
         # twins — the claim_telemetry table is never read back for control.
         self._coord_ema = _LogEMA()
         self._node_time_ema = _LogEMA()
+        # Completion time of the previous evaluated claim.  The outbound
+        # claim_telemetry coordination figure telescopes from here, so it
+        # captures claim acquisition and inter-claim overhead — matching the
+        # lifetime eval%/coord% split, not just the in-evaluate_claim window.
+        self._last_claim_complete = time.time()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -701,15 +706,22 @@ class _BranchWorker:
         self.queue.complete_candidate(branch_key, idx)
         if self._adaptive:
             coord_seconds = max(0.0, elapsed - cand_elapsed)
-            # Feed the in-memory estimators behind the adaptive publish threshold
-            # in seconds (the ratio is unit-free).  These are the control-path
-            # twins of the outbound claim_telemetry row, which the table never
-            # feeds back; the table stores milliseconds for readable offline rows.
+            # The in-memory estimators feed the adaptive publish threshold and use
+            # the narrow in-evaluate_claim coordination window (the ratio is
+            # unit-free).  The outbound claim_telemetry row instead telescopes from
+            # the previous claim's completion, so its coordination figure also
+            # includes claim acquisition (the claim_candidate scan) and any
+            # inter-claim overhead; this is the offline-diagnostic span and is not
+            # fed back into control.
+            now_complete = time.time()
+            full_coord_seconds = max(
+                0.0, (now_complete - self._last_claim_complete) - cand_elapsed)
+            self._last_claim_complete = now_complete
             self._coord_ema.add(coord_seconds)
             if nodes_delta > 0 and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
             self.queue.add_claim_telemetry(
-                n_words, int(coord_seconds * 1e3), nodes_delta, self.n_workers)
+                n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
         self.claims_done += 1
         self._heartbeat(branch_key, n_words, idx, claim_started,
                         local_candidate, local_best, bound_erd=_eff_bound(),

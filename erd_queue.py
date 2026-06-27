@@ -499,14 +499,22 @@ class ERDQueue:
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
                 return None
-            taken = {r["idx"] for r in self._conn.execute(
-                "SELECT idx FROM candidate_claims WHERE branch_key = ?",
-                (branch_key,))}
-            idx = None
-            for c in range(n_candidates):
-                if c not in taken:
-                    idx = c
-                    break
+            # Lowest index in [0, n_candidates) with no row yet, computed by the
+            # database instead of materialising every claimed index per call.
+            # The virtual -1 row lets index 0 be chosen when it is free; both
+            # references to candidate_claims are answered from the (branch_key,
+            # idx) primary key.  A reclaimed slot is a deleted row, so it
+            # reappears as the lowest gap and is re-handed-out here.
+            idx = self._conn.execute("""
+                SELECT MIN(slot) + 1 AS idx FROM (
+                    SELECT -1 AS slot
+                    UNION ALL
+                    SELECT idx AS slot FROM candidate_claims WHERE branch_key = ?
+                )
+                WHERE slot + 1 < ?
+                  AND slot + 1 NOT IN (
+                      SELECT idx FROM candidate_claims WHERE branch_key = ?)
+            """, (branch_key, n_candidates, branch_key)).fetchone()["idx"]
             if idx is None:
                 self._conn.execute("COMMIT")
                 return None

@@ -137,6 +137,18 @@ class TestCandidateClaiming(_TmpQueue):
         # All candidates claimed — next call returns None.
         self.assertIsNone(self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES))
 
+    def test_claim_candidate_refills_lowest_reclaimed_hole(self):
+        # Claim the first three slots, then free the middle one the way
+        # reclaim_stale_claims does: the row is deleted, reopening a gap.
+        for _ in range(3):
+            self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+        self.q._conn.execute(
+            "DELETE FROM candidate_claims WHERE branch_key = ? AND idx = 1",
+            (self.key,))
+        # The next claim fills the lowest gap (1), not the next fresh slot (3).
+        idx = self.q.claim_candidate(self.key, "worker-1", N_CANDIDATES)
+        self.assertEqual(idx, 1)
+
     def test_complete_candidate_marks_done(self):
         idx = self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
         self.q.complete_candidate(self.key, idx)
