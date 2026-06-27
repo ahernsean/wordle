@@ -25,7 +25,7 @@ import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET, PROMOTE_MIN_SIZE
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_ERD_LIMIT
-from erd_queue import ERDQueue
+from erd_queue import ERDQueue, guess_depth_from_spine
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train"]
@@ -40,6 +40,7 @@ def _bare_worker():
     w = _BranchWorker.__new__(_BranchWorker)
     w.name = "worker-0"
     w.stop_event = None
+    w.root_budget = ROOT_BUDGET
     w.all_words = CANDIDATES
     w.n_candidates = len(CANDIDATES)
     w.claims_done = 0
@@ -105,6 +106,40 @@ class TestHeartbeatThrottling(unittest.TestCase):
         branch_key = ScoreCache.encode_subset(BRANCH)
         w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
         self.assertEqual(w._hb_max_spine, {})
+
+
+class TestPromotedSpine(unittest.TestCase):
+    """_promoted_spine composes base + descent without overlap.
+
+    The live descent dict keeps shallow entries until a shallower frame
+    overwrites them, so after the base is advanced it still holds the guesses
+    that reach the base.  Those belong to the base, not the descent; appending
+    them re-emits the base's own reaching guess and over-counts guess_depth.
+    """
+
+    def test_descent_at_or_above_base_depth_is_not_reappended(self):
+        w = _bare_worker()
+        # Base reaches a guess_depth-2 branch via SALET then ABORT.
+        w._claimed_branch_spine = 'SALET -g-g- ABORT y----'
+        # Live descent still carries the reaching guess (depth 2, budget 4) AND
+        # a genuine child below it (depth 3, budget 3).
+        w._note_depth(4, 12, 'abort', 'y----')   # guess_depth 2 — the base tail
+        w._note_depth(3, 5, 'dogma', 'y---y')     # guess_depth 3 — the real child
+        spine = w._promoted_spine()
+        self.assertEqual(spine, 'SALET -g-g- ABORT y---- DOGMA y---y')
+        self.assertEqual(guess_depth_from_spine(spine), 3)
+
+    def test_pure_descent_below_base_is_appended(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._note_depth(4, 5, 'dogma', 'y---y')     # guess_depth 2 — below the base
+        self.assertEqual(w._promoted_spine(), 'SALET -g-g- DOGMA y---y')
+
+    def test_no_base_yields_none(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = None
+        w._note_depth(4, 5, 'dogma', 'y---y')
+        self.assertIsNone(w._promoted_spine())
 
 
 class TestCancelPath(unittest.TestCase):

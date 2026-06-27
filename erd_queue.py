@@ -451,7 +451,7 @@ class ERDQueue:
 
     def create_branch(self, branch_key, n_words, n_candidates,
                       priority=0, source_word=None, source_pattern=None,
-                      budget=None, spine=None) -> bool:
+                      budget=None, spine=None, root_budget=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
@@ -461,7 +461,18 @@ class ERDQueue:
         list).  budget is the guess budget for depth-limited ERD.  spine is the
         guesses played from the root to this branch (see the active_branches.spine
         column); None leaves the display to fall back to the source word.
+
+        When root_budget is supplied alongside both budget and spine, the
+        invariant budget + guess_depth = root_budget is enforced: a spine whose
+        guess count contradicts the budget is a composition bug and is rejected
+        rather than persisted.
         """
+        if root_budget is not None and budget is not None and spine is not None:
+            guess_depth = guess_depth_from_spine(spine)
+            if budget + guess_depth != root_budget:
+                raise ValueError(
+                    f"spine guess_depth {guess_depth} + budget {budget} "
+                    f"!= root_budget {root_budget} for spine {spine!r}")
         now = int(time.time())
         cur = self._conn.execute("""
             INSERT OR IGNORE INTO active_branches
