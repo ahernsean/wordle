@@ -1,5 +1,12 @@
 # Adaptive chunk claiming for cheap candidates
 
+> **Superseded by `adaptive_claim_packing.md`.** That doc keeps this problem
+> statement and the measured motivation, but replaces the single contiguous-slice
+> proposal with work-sorted bin-packing, a republish-on-overrun loop that never
+> regresses to one-candidate-per-claim, and a telemetry-epoch scheme for computing
+> a fresh cost model across the change. Read it instead; this file is retained for
+> the problem framing and the invariant list it shares.
+
 ## Problem
 
 A swarm worker claims and evaluates **one candidate at a time** against a branch.
