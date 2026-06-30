@@ -1,30 +1,29 @@
 # Adaptive claim packing with republish-on-overrun
 
-Supersedes `adaptive_chunk_claiming.md`. That doc proposed sizing a single
-contiguous slice ("chunk") per claim from a node-cost heuristic. This design
-keeps its goal — amortize coordination over real work — but fixes the two ways a
-naive version regresses to a past failure: (1) it groups candidates by *predicted
-work*, not by adjacency or count, so it never recreates the old chunk imbalance;
-and (2) when a claim turns out heavier than predicted, it republishes the
-unfinished candidates **as work-sized groups, never one-candidate-per-claim**.
+This is the plan to replace the swarm's single-candidate claiming with work-sized
+claim packing — handing out a *group* of candidates per claim, sized to amortize
+coordination over real evaluation work. It fixes the two failure modes a naive
+version hits: (1) it groups candidates by *predicted work*, not by adjacency or
+count, so the expensive candidates never all land in one slice; and (2) when a
+claim turns out heavier than predicted, it republishes the unfinished candidates
+**as work-sized groups, never one-candidate-per-claim**.
 
 ### Relationship to issues #67 and #68
 
-- **#67 (adaptive chunk claiming)** — this is the refined plan that addresses it.
-  #67's Problem, measurements, invariants, and acceptance criteria carry over
-  unchanged; its proposed *Direction* (a contiguous slice sized by a node-cost
-  ratio) is replaced here, because a contiguous slice of a best-first list
-  reproduces the old chunk imbalance. This document is the design #67 should adopt.
-- **#68 (optimistic monotonic `next_idx` cursor)** — **obviated as a standalone
-  change, absorbed as a requirement.** #68 optimizes `claim_candidate`, the
-  single-index handout this design *deletes* (replaced by `claim_next_group`,
-  §6). Its `next_idx`-on-`active_branches` migration therefore does not apply. But
-  #68's underlying requirement — O(1)-amortized handout so a branch drains in O(n)
-  not O(n²), with reclaimed holes picked up lazily rather than rescanned on every
-  call — is a correctness/performance requirement of the packer, folded into §5
-  (single forward cursor over best-first order) and §12 (shared cursor state).
-  #68's equivalence test (an injected mid-sweep reclaim yields identical coverage)
-  is retained there.
+- **#67 (adaptive claim packing)** — this document is the plan that addresses it.
+  #67's Problem, measurements, invariants, and acceptance criteria hold here; its
+  original *Direction* (a contiguous slice sized by a node-cost ratio) is replaced,
+  because a contiguous slice of a best-first list lands all the expensive candidates
+  in one slice.
+- **#68 (monotonic `next_idx` cursor for `claim_candidate`)** — **obviated as a
+  standalone change, absorbed as a requirement.** This design *deletes*
+  `claim_candidate` (replaced by `claim_next_group`, §6), so #68's
+  `next_idx`-on-`active_branches` migration does not apply. Its underlying
+  requirement — O(1)-amortized handout so a branch drains in O(n) not O(n²), with
+  reclaimed holes picked up lazily rather than rescanned on every call — is a
+  requirement of the packer, met in §5 (single forward cursor over best-first order)
+  and §12 (shared cursor state). #68's equivalence test (an injected mid-sweep
+  reclaim yields identical coverage) is retained there.
 
 ---
 
@@ -56,7 +55,7 @@ designs sit at opposite failures of that distribution:
 - **Old chunks** cut the best-first-ranked candidate list into equal-**cardinality**
   contiguous slices. The first slice held all the expensive candidates → one
   worker ground it for hours while the rest finished tail slices in milliseconds.
-  Radical imbalance. (The old `chunk_size_for` docstring admitted this directly.)
+  Radical imbalance.
 - **Current single-candidate atoms** use granularity 1 → perfect balance but the
   816× coordination above.
 
@@ -97,7 +96,7 @@ Two pieces, one feedback loop:
   *group* of currently unclaimed candidate indices whose summed predicted work ≈ a
   target `W`. Predicted-heavy candidates become singleton groups; predicted-cheap
   ones coalesce into large groups. (This is a scheduling choice only — it never sets
-  a bound; see §3.)
+  a bound; see the correctness principle below.)
 - **Republish-on-overrun (runtime correction).** A worker measures *actual* nodes
   as it evaluates its group. If the group overruns a threshold `T = c·W` before it
   is done, the worker stops, returns its unfinished candidates to the unclaimed
@@ -340,7 +339,7 @@ Guardrails:
 
 ## 8. Invariants preserved
 
-From `adaptive_chunk_claiming.md` and the ERD pruning invariants:
+These must continue to hold (the ERD pruning invariants plus the claim-level ones):
 
 1. **Shared-best folding stays per candidate.** Grouping defers the queue
    round-trip *between* candidates, never the best update; a worker refreshes and
@@ -368,10 +367,9 @@ differs.
 
 ## 9. Measurement: telemetry epochs (prerequisite, land first)
 
-We must be able to separate **pre-implementation** from **post-implementation**
-telemetry so we can recompute the cost model and compare coordination statistics
-across the change. Land this *before* the claim-path change so there is a clean
-baseline.
+The telemetry must separate **pre-change** from **post-change** rows so the cost
+model can be recomputed and coordination statistics compared across the change. Land
+this *before* the claim-path change so there is a clean baseline.
 
 ### 9.1 Epoch tagging
 
@@ -418,10 +416,10 @@ candidate's actual cost — the ideal place to validate. Log per claim:
 `predicted_work`, **the bound `B` it was computed against**, `cost_lb`, whether the
 candidate was gated, `actual_work_nodes`, `n_words`, `budget`, `epoch`.
 
-This stream lets us (a) confirm `predicted_work(c | B)` correlates strongly and
+This stream is used to (a) confirm `predicted_work(c | B)` correlates strongly and
 *positively* with actual cost — the §11 go/no-go gate; (b) verify the gating split
 (`cost_lb ≥ B` ⇒ ~0 nodes) holds in practice; (c) detect systematic bias to set the
-§7 scale factor; (d) decide the cheapest adequate proxy. Logging `B` and `cost_lb`
+§7 scale factor; (d) choose the cheapest adequate proxy. Logging `B` and `cost_lb`
 alongside is essential — without them a gated candidate's near-zero cost looks like
 a wildly wrong prediction rather than a correct one.
 
@@ -438,12 +436,13 @@ a wildly wrong prediction rather than a correct one.
   finalize. Recompute the post-epoch model from `cost_samples` filtered to the new
   epoch (and the new key) once enough samples accrue; seed it from the prior model
   so packing is not cold at cutover.
-- The genuinely *new* model is the per-candidate work model from §9.3, which did
-  not exist under single-candidate claiming at useful fidelity.
+- The per-candidate work model from §9.3 is genuinely new; it is built from the
+  accuracy stream and validated at the §10 gate.
 
-### 9.5 Settle the lock-contention question while here
+### 9.5 Settle the lock-contention question
 
-To close the contention question the data currently cannot answer: populate
+The current telemetry cannot decide whether lock contention matters: `worker_count`
+never varies and `claim_retries` is unpopulated. To settle it, populate
 `claim_retries` and a `busy_wait_millis` on each claim (see §9.6), and decompose
 `coordination_millis` into components (claim-scan / complete / finalize /
 idle-search). Then a run with `--workers` varied gives the contention signal
@@ -572,8 +571,3 @@ value** — a censored lower bound is honest; a guessed point estimate is not.
   cheap (one `group_counts`), but if it shows up in §9.5's decomposition, precompute
   the per-candidate `cost_lb`/work vector once when the branch is promoted (the same
   pass as the best-first sort) and only read it inside the lock.
-
-(Resolved during review, no longer open: the earlier "gate the tail until `best_erd`
-is set" idea is dropped — it risked seeding/starvation. The bound-relative metric
-(§4) packs the not-yet-provably-gated tail *small* instead, so nothing is gated
-behind a bound and nothing is seeded.)
