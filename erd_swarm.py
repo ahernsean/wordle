@@ -79,6 +79,13 @@ OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publ
 # records every firing for offline tuning.
 COLD_BACKSTOP_SECONDS = 600
 MIN_HANDOFF_CANDIDATES = 4   # minimum remaining candidates to bother handing off
+
+# candidate_accuracy logs every non-gated claim (the metric-design signal, rare in
+# the deep regime) but only 1-in-N gated claims (~1 node each, redundant) so a
+# multi-day corpus stays bounded.  1 = log all (the validation-gate default);
+# raise it (e.g. ERD_ACCURACY_GATED_SAMPLE_EVERY=100) for a long production run.
+ACCURACY_GATED_SAMPLE_EVERY = max(
+    1, int(os.environ.get('ERD_ACCURACY_GATED_SAMPLE_EVERY', '1')))
 MIN_PUBLISH_BRANCH_WORDS = 2  # frames with fewer answer words are base cases, never
                               # worth tracking for overrun (the candidate loop on a
                               # 1-word branch never even runs)
@@ -347,6 +354,8 @@ class _BranchWorker:
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
+        # Counts gated candidate_accuracy claims for 1-in-N down-sampling.
+        self._gated_accuracy_n = 0
         # Absolute root -> branch spine of the branch the worker is currently
         # descending (its claimed branch): the guesses played, space-joined as
         # "GUESS pattern".  Promotion composes a child branch's spine as this base
@@ -801,10 +810,19 @@ class _BranchWorker:
             if nodes_delta > 0 and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
             if metric:
-                self.queue.add_candidate_accuracy(
-                    branch_key, n_words, budget, metric['predicted'],
-                    metric['bound'], metric['cost_lb'], metric['gated'],
-                    nodes_delta, group_sizes=metric['group_sizes'])
+                # Log every non-gated claim; down-sample the redundant gated mass
+                # so a multi-day corpus stays bounded (see ACCURACY_GATED_SAMPLE_EVERY).
+                if metric['gated']:
+                    log_it = (self._gated_accuracy_n % ACCURACY_GATED_SAMPLE_EVERY) == 0
+                    self._gated_accuracy_n += 1
+                else:
+                    log_it = True
+                if log_it:
+                    self.queue.add_candidate_accuracy(
+                        branch_key, n_words, budget, metric['predicted'],
+                        metric['bound'], metric['cost_lb'], metric['gated'],
+                        nodes_delta, group_sizes=metric['group_sizes'],
+                        source_word=self._top_source_word)
             self.queue.add_claim_telemetry(
                 n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
         self.claims_done += 1

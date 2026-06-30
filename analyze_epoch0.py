@@ -143,6 +143,9 @@ def main():
     ap.add_argument("--false-pred", type=float, default=1000)
     ap.add_argument("--max-false", type=float, default=0.20)
     ap.add_argument("--tail-nodes", type=int, default=100)
+    ap.add_argument("--min-bounded", type=int, default=2000,
+                    help="min bounded non-gated rows before the verdict uses the "
+                         "bounded subset instead of the full set (default 2000)")
     ap.add_argument("--gate-metric", default="cutoff", choices=list(METRICS))
     args = ap.parse_args()
 
@@ -189,14 +192,28 @@ def main():
           f"(skipped {skipped:,} pre-column rows); with a known bound: "
           f"{have_bound:,} ({100*have_bound/max(1,len(rows)):.1f}%)")
 
-    # Checks 2 & 3: every metric, recomputed offline
-    print("\n=== Metric comparison (recomputed offline from group_sizes) ===")
-    results = {name: evaluate_metric(name, fn, rows, typical, args)
-               for name, fn in METRICS.items()}
+    # Checks 2 & 3: every metric, recomputed offline.  Report the full non-gated
+    # set AND the bounded-only subset: the cutoff metric is identical to uncut on
+    # unbounded rows (no bound to cut against), so its value shows ONLY on bounded
+    # rows.  The verdict keys on the bounded subset when it is large enough.
+    bounded = [r for r in rows if r[2] is not None]
+    print("\n=== Metric comparison: ALL non-gated (mostly unbounded) ===")
+    results_all = {name: evaluate_metric(name, fn, rows, typical, args)
+                   for name, fn in METRICS.items()}
+    print(f"\n=== Metric comparison: BOUNDED-only subset (n={len(bounded):,}) — "
+          f"where cutoff differs from uncut ===")
+    results_bounded = ({name: evaluate_metric(name, fn, bounded, typical, args)
+                        for name, fn in METRICS.items()}
+                       if len(bounded) >= args.min_bounded else None)
+    if results_bounded is None:
+        print(f"  (only {len(bounded):,} bounded rows — under --min-bounded "
+              f"{args.min_bounded}; verdict uses the full set)")
 
-    # Verdict on the chosen packer metric
+    # Verdict on the chosen packer metric, preferring the bounded subset.
+    results = results_bounded or results_all
     fe_frac, rho_tail, _ = results[args.gate_metric]
-    print(f"\n=== §11 go/no-go  (gate metric: '{args.gate_metric}') ===")
+    used = "bounded subset" if results_bounded else "full non-gated set"
+    print(f"\n=== §11 go/no-go  (gate metric: '{args.gate_metric}', basis: {used}) ===")
     gate_ok = (not gated) or gfrac >= 0.95
     fe_ok = not math.isnan(fe_frac) and fe_frac <= args.max_false
     tail_ok = not math.isnan(rho_tail) and rho_tail >= args.strong

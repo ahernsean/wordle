@@ -297,6 +297,14 @@ class TestCandidateAccuracyGroupSizes(_TmpQueue):
             "SELECT group_sizes FROM candidate_accuracy").fetchone()
         self.assertIsNone(row["group_sizes"])
 
+    def test_source_word_persisted_for_per_opener_segmentation(self):
+        self.q.add_candidate_accuracy(
+            b"k", 30, 4, 820.0, 3.41, 2.9, gated=False, actual_nodes=771,
+            group_sizes="12-8-5", source_word="salet")
+        row = self.q._conn.execute(
+            "SELECT source_word FROM candidate_accuracy").fetchone()
+        self.assertEqual(row["source_word"], "salet")
+
 
 class TestMetricObserverHook(unittest.TestCase):
     """evaluate_candidate reports the work-metric inputs exactly once per call."""

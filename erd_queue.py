@@ -275,6 +275,7 @@ CREATE TABLE IF NOT EXISTS candidate_accuracy (
     gated          INTEGER NOT NULL,
     actual_nodes   INTEGER NOT NULL,
     group_sizes    TEXT,
+    source_word    TEXT,
     epoch          INTEGER NOT NULL DEFAULT 0,
     recorded_at    INTEGER NOT NULL
 );
@@ -417,6 +418,7 @@ class ERDQueue:
         })
         self._add_columns("candidate_accuracy", {
             "group_sizes": "TEXT",
+            "source_word": "TEXT",
         })
 
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
@@ -1229,22 +1231,25 @@ class ERDQueue:
 
     def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
                                bound_erd, cost_lb, gated, actual_nodes,
-                               group_sizes=None):
+                               group_sizes=None, source_word=None):
         """Log one predicted-vs-actual work point for the §10 metric-validation gate.
 
         Under single-candidate claiming a claim is exactly one candidate, so
         actual_nodes is that candidate's true cost.  group_sizes ('-'-joined
         response-group sizes) is the sufficient statistic for recomputing any work
-        metric offline; logged only for non-gated rows.
+        metric offline; logged only for non-gated rows.  source_word is the root
+        opener of the branch's spine, so a multi-day corpus can be segmented per
+        opener (different openers reach differently-shaped answer sets).
         """
         now = int(time.time())
         self._conn.execute("""
             INSERT INTO candidate_accuracy
                 (branch_key, n_words, budget, predicted_work, bound_erd, cost_lb,
-                 gated, actual_nodes, group_sizes, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 gated, actual_nodes, group_sizes, source_word, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, n_words, budget, predicted_work, bound_erd, cost_lb,
-              1 if gated else 0, actual_nodes, group_sizes, self.epoch, now))
+              1 if gated else 0, actual_nodes, group_sizes, source_word,
+              self.epoch, now))
 
     def set_epoch(self, epoch: int, label: str = None, git_sha: str = None,
                   notes: str = None):
