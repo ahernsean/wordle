@@ -17,8 +17,8 @@ import tempfile
 import unittest
 
 from erd_queue import ERDQueue, cost_size_bucket, _AGGREGATE_BUDGET
-from wordle_engine import (estimate_candidate_work, evaluate_candidate,
-                           ERD_ANSWERS, ERD_ALL)
+from wordle_engine import (estimate_candidate_work, estimate_candidate_work_cutoff,
+                           evaluate_candidate, ERD_ANSWERS, ERD_ALL)
 
 
 class _TmpQueue(unittest.TestCase):
@@ -233,6 +233,69 @@ class TestEstimateCandidateWork(unittest.TestCase):
         estimate_candidate_work(
             [2], has_self=False, n=7, best_erd=3.0, budget=4, typical=typical)
         self.assertEqual(seen["budget"], 3)   # budget - 1
+
+
+class TestCutoffMetric(unittest.TestCase):
+    """estimate_candidate_work_cutoff stops at the engine's accumulated-cost cutoff,
+    so a weak splitter near the bound predicts ~0 where the uncut sum predicts large."""
+
+    @staticmethod
+    def _warm(value):
+        return lambda k, budget: value
+
+    def test_gated_predicts_zero(self):
+        # cost_lb = 3 - (2)/7 ~= 2.71; bound below it -> gated.
+        self.assertEqual(
+            estimate_candidate_work_cutoff([4, 3], False, 7, 2.0, 4, self._warm(99.0)),
+            0.0)
+
+    def test_inf_bound_falls_back_to_uncut(self):
+        sizes, n = [3, 2, 2], 7
+        self.assertEqual(
+            estimate_candidate_work_cutoff(sizes, False, n, float("inf"), 4, self._warm(10.0)),
+            estimate_candidate_work(sizes, False, n, float("inf"), 4, self._warm(10.0)))
+
+    def test_weak_splitter_cut_early_predicts_far_less_than_uncut(self):
+        # Several large groups, cost_lb just under the bound: the estimated ERD
+        # accumulation busts the bound after the first couple of groups, so later
+        # groups are never reached and not counted — far below the uncut sum.
+        sizes, n, bound = [40, 30, 20, 10], 80, 2.96
+        cut = estimate_candidate_work_cutoff(sizes, False, n, bound, 4, self._warm(1000.0))
+        uncut = estimate_candidate_work(sizes, False, n, bound, 4, self._warm(1000.0))
+        self.assertLess(cut, uncut)
+
+    def test_strong_splitter_reaches_many_groups(self):
+        # Many small groups, cost_lb far below the bound: the cutoff is not reached
+        # early, so most groups contribute -> a large estimate.
+        sizes = [2] * 20
+        n = 41
+        work = estimate_candidate_work_cutoff(sizes, False, n, 3.0, 4, self._warm(5.0))
+        self.assertGreater(work, 5.0 * 5)   # many groups counted, not just one
+
+    def test_cutoff_never_underestimates_reached_groups(self):
+        # Lower-bound accumulation => cutoff fires no earlier than the engine's,
+        # so cutoff work is an UPPER bound on the truly-reached groups: <= uncut.
+        sizes, n = [10, 8, 6, 4, 2], 41
+        cut = estimate_candidate_work_cutoff(sizes, False, n, 2.9, 4, self._warm(7.0))
+        uncut = estimate_candidate_work(sizes, False, n, 2.9, 4, self._warm(7.0))
+        self.assertLessEqual(cut, uncut)
+
+
+class TestCandidateAccuracyGroupSizes(_TmpQueue):
+    def test_group_sizes_persisted(self):
+        self.q.add_candidate_accuracy(
+            b"k", 30, 4, 820.0, 3.41, 2.9, gated=False, actual_nodes=771,
+            group_sizes="12-8-5-3-1")
+        row = self.q._conn.execute(
+            "SELECT group_sizes FROM candidate_accuracy").fetchone()
+        self.assertEqual(row["group_sizes"], "12-8-5-3-1")
+
+    def test_group_sizes_optional_defaults_null(self):
+        self.q.add_candidate_accuracy(
+            b"k", 30, 4, 0.0, 3.41, 3.5, gated=True, actual_nodes=4)
+        row = self.q._conn.execute(
+            "SELECT group_sizes FROM candidate_accuracy").fetchone()
+        self.assertIsNone(row["group_sizes"])
 
 
 class TestMetricObserverHook(unittest.TestCase):

@@ -730,6 +730,11 @@ class _BranchWorker:
             metric['bound'] = None if bound == float('inf') else bound
             metric['cost_lb'] = cost_lb
             metric['gated'] = gated
+            # Persist the group-size multiset for non-gated rows: the sufficient
+            # statistic to recompute any candidate work metric offline.  Gated
+            # rows are exactly 0, so their sizes carry no metric-design signal.
+            metric['group_sizes'] = (None if gated else
+                                     '-'.join(str(k) for k in group_sizes))
 
         status, cost, cand_md, budget_tainted = evaluate_candidate(
             words, candidate, self.rcache, self.score_cache,
@@ -799,7 +804,7 @@ class _BranchWorker:
                 self.queue.add_candidate_accuracy(
                     branch_key, n_words, budget, metric['predicted'],
                     metric['bound'], metric['cost_lb'], metric['gated'],
-                    nodes_delta)
+                    nodes_delta, group_sizes=metric['group_sizes'])
             self.queue.add_claim_telemetry(
                 n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
         self.claims_done += 1

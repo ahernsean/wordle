@@ -968,24 +968,29 @@ def _by_group_size(item):
     return len(item[1])
 
 
+def _candidate_cost_lb(group_sizes, has_self, n):
+    """The engine's admissible lower bound on a candidate's ERD (wordle_engine
+    line ~1027): cost >= 3 - (number_of_groups + has_self) / n."""
+    return 3.0 - (len(group_sizes) + (1 if has_self else 0)) / n
+
+
 def estimate_candidate_work(group_sizes, has_self, n, best_erd, budget, typical):
-    """Predicted search work (in nodes) for a candidate, cutoff-aware.
+    """Predicted search work (in nodes), UNCUT sum over recursed groups.
 
     Returns 0.0 when the candidate is provably gated (cost_lb >= best_erd): the
-    engine cuts it for free, so this is exact, not a guess.  Otherwise it sums the
-    cost model's typical node count for each response group the candidate would
-    recurse into — the singletons and the all-of-branch group cost nothing.
+    engine cuts it for free, so this is exact.  Otherwise it sums the cost model's
+    typical node count for EVERY response group the candidate could recurse into.
+
+    This is the naive estimate §4 warns about: it ignores the accumulated-cost
+    cutoff, so it over-predicts weak splitters that pass the entry gate but are cut
+    almost immediately.  Kept for comparison against estimate_candidate_work_cutoff
+    in the metric-validation gate; the packer should prefer the cutoff-aware form.
 
     `typical(k, sub_budget)` returns the model's geometric-mean node count for a
     sub-branch of size k at the given budget, or None when cold; a cold size falls
-    back to k itself (a strong splitter has more, smaller groups, so this keeps
-    the estimate monotone in branching even before the model warms).
-
-    This is a *scheduling* estimate only — it never sets a pruning bound.  It is
-    the quantity the §10 go/no-go gate validates against epoch-0 actuals.
+    back to k itself.  A scheduling estimate only — it never sets a pruning bound.
     """
-    cost_lb = 3.0 - (len(group_sizes) + (1 if has_self else 0)) / n
-    if best_erd is not None and cost_lb >= best_erd:
+    if best_erd is not None and _candidate_cost_lb(group_sizes, has_self, n) >= best_erd:
         return 0.0
     sub_budget = None if budget is None else budget - 1
     total = 0.0
@@ -994,6 +999,57 @@ def estimate_candidate_work(group_sizes, has_self, n, best_erd, budget, typical)
             continue
         t = typical(k, sub_budget)
         total += t if t is not None else float(k)
+    return total
+
+
+def estimate_candidate_work_cutoff(group_sizes, has_self, n, best_erd, budget,
+                                   typical):
+    """Predicted search work, CUTOFF-AWARE — the §4 metric.
+
+    Mirrors evaluate_candidate's sub-branch loop: process groups largest-first,
+    accumulating the admissible lower-bound ERD, and sum the cost model's node
+    estimate only for the groups the engine actually reaches before the
+    accumulated cost meets best_erd.  Because the accumulation uses each
+    sub-branch's lower bound (2 - 1/k), real cost is >= it, so this cutoff fires no
+    earlier than the engine's — an upper bound on reached groups, never an
+    under-estimate.
+
+    The effect: a weak splitter (few large groups, cost_lb just under best_erd)
+    busts the bound after one or two groups and predicts ~0; a strong splitter
+    (cost_lb far below best_erd) reaches many groups and predicts large.  This is
+    the direction the uncut estimate gets backwards.  Scheduling only; never a bound.
+    """
+    if best_erd is None or best_erd == float('inf'):
+        # No real bound yet: nothing is provably cut, so fall back to the uncut
+        # sum (the conservative, finer-granularity direction per §4).
+        return estimate_candidate_work(group_sizes, has_self, n, best_erd, budget,
+                                       typical)
+    if _candidate_cost_lb(group_sizes, has_self, n) >= best_erd:
+        return 0.0
+    sub_budget = None if budget is None else budget - 1
+    cost = 1.0                      # the candidate's own guess
+    self_pending = has_self         # one size-1 group is the candidate itself (0 cost)
+    total = 0.0
+    for k in sorted(group_sizes, reverse=True):   # engine order: largest first
+        if k >= n:
+            continue                # no information gained; engine rejects
+        if k == 1:
+            if self_pending:
+                self_pending = False
+                continue            # the self singleton: 0 further guesses
+            cost += 1.0 / n         # a non-self singleton: ~0 search, small cost
+        else:
+            t = typical(k, sub_budget)
+            total += t if t is not None else float(k)
+            # Accumulate an ESTIMATE of the sub-branch's real ERD, not its
+            # admissible lower bound: the lower bound (2 - 1/k) ~= cost_lb summed,
+            # so it never trips for a non-gated candidate and the cutoff would
+            # never fire.  `3 - 2/k` is a monotone imperfect-split proxy in [2, 3)
+            # — bigger groups cost more — and is the dial to calibrate offline
+            # against the group_sizes corpus.
+            cost += (k / n) * (3.0 - 2.0 / k)
+        if cost >= best_erd:
+            break                   # engine cuts here; later groups never reached
     return total
 
 
