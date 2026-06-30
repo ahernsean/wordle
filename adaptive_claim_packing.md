@@ -1,12 +1,12 @@
 # Adaptive claim packing with republish-on-overrun
 
 This is the plan to replace the swarm's single-candidate claiming with work-sized
-claim packing — handing out a *group* of candidates per claim, sized to amortize
+claim packing — handing out a *bundle* of candidates per claim, sized to amortize
 coordination over real evaluation work. It fixes the two failure modes a naive
-version hits: (1) it groups candidates by *predicted work*, not by adjacency or
+version hits: (1) it bundles candidates by *predicted work*, not by adjacency or
 count, so the expensive candidates never all land in one slice; and (2) when a
 claim turns out heavier than predicted, it republishes the unfinished candidates
-**as work-sized groups, never one-candidate-per-claim**.
+**as work-sized bundles, never one-candidate-per-claim**.
 
 ### Relationship to issues #67 and #68
 
@@ -17,7 +17,7 @@ claim turns out heavier than predicted, it republishes the unfinished candidates
   in one slice.
 - **#68 (monotonic `next_idx` cursor for `claim_candidate`)** — **obviated as a
   standalone change, absorbed as a requirement.** This design *deletes*
-  `claim_candidate` (replaced by `claim_next_group`, §6), so #68's
+  `claim_candidate` (replaced by `claim_next_bundle`, §6), so #68's
   `next_idx`-on-`active_branches` migration does not apply. Its underlying
   requirement — O(1)-amortized handout so a branch drains in O(n) not O(n²), with
   reclaimed holes picked up lazily rather than rescanned on every call — is a
@@ -93,14 +93,14 @@ head self-fragments toward singletons, the cheap tail self-coalesces into bulk.
 Two pieces, one feedback loop:
 
 - **Packing (static, model-driven scheduling).** Handing out a claim selects a
-  *group* of currently unclaimed candidate indices whose summed predicted work ≈ a
-  target `W`. Predicted-heavy candidates become singleton groups; predicted-cheap
-  ones coalesce into large groups. (This is a scheduling choice only — it never sets
+  *bundle* of currently unclaimed candidate indices whose summed predicted work ≈ a
+  target `W`. Predicted-heavy candidates become singleton bundles; predicted-cheap
+  ones coalesce into large bundles. (This is a scheduling choice only — it never sets
   a bound; see the correctness principle below.)
 - **Republish-on-overrun (runtime correction).** A worker measures *actual* nodes
-  as it evaluates its group. If the group overruns a threshold `T = c·W` before it
+  as it evaluates its bundle. If the bundle overruns a threshold `T = c·W` before it
   is done, the worker stops, returns its unfinished candidates to the unclaimed
-  pool, and they are **re-packed into work-sized groups** on the next handout —
+  pool, and they are **re-packed into work-sized bundles** on the next handout —
   with their per-candidate estimates scaled up by the observed error.
 
 The division of labor is the whole point:
@@ -121,7 +121,7 @@ This is an absolute invariant, not a preference:
   acceptable; a bound that could be *better* than reality is never acceptable,
   because it could discard the real optimum.
 - The cost model, `predicted_work`, and the overrun scale factor are **scheduling
-  signals only**. They decide which candidates share a claim and how big a group
+  signals only**. They decide which candidates share a claim and how big a bundle
   is. They can make the swarm slower or less balanced if wrong, but they can
   **never** change which guess wins or what ERD is recorded. A wrong estimate costs
   time; it can never cost correctness.
@@ -149,7 +149,7 @@ recurses. This gate is the source of the skew — the 99.4% of <10-node claims a
 gated weak splitters. So the naive `Σ typical(|g|)` (the un-cut cost) is exactly the
 *wrong* signal: it is largest for the weak splitters that actually cost ~0. Ranking
 by it descending would isolate the free candidates and bury the expensive strong
-splitters in a bulk group — recreating the imbalance this design exists to prevent.
+splitters in a bulk bundle — recreating the imbalance this design exists to prevent.
 
 The correct estimate is **relative to the current real bound `B = best_erd`**:
 
@@ -167,10 +167,10 @@ Two properties make this both correct and safe:
   *will* be cut for free. Predicting ~0 work for it is correct, not a guess.
 - **It is conservative when `B` is loose.** Before any candidate is solved, `B` is
   only the budget ceiling, so few candidates are gated and most are predicted
-  non-trivial → packed into small groups. That is the safe direction: more, smaller
-  claims (a little extra coordination) rather than a bulk group that hides a
+  non-trivial → packed into small bundles. That is the safe direction: more, smaller
+  claims (a little extra coordination) rather than a bulk bundle that hides a
   contender. As real solved results tighten `B`, more candidates become provably
-  gated and coalesce into bulk groups — where the coordination win is.
+  gated and coalesce into bulk bundles — where the coordination win is.
 
 `B` here is **always the real `best_erd`** from solved candidates — never a model
 estimate (§3 correctness principle). The cost model only sizes the *non-gated* head,
@@ -188,7 +188,7 @@ sort already does (`_solve_subset`, `wordle_engine.py:1097`, sort at `~1182`).
 **Ordering is the engine's existing best-first sort** (`Σk²` ascending, strongest
 splitter first, `wordle_engine.py:1176`): it both propagates `B` fastest and places
 the candidates most likely to be non-gated at the front, where the packer keeps
-groups small.
+bundles small.
 
 **The model is weak — validate before relying on it.** Its self-reported spread
 (`weighted_log_sq` → σ) reaches σ(ln nodes)=3.3 (737× band); raw actuals for
@@ -206,52 +206,52 @@ beside it (§9.3) and require a strongly positive correlation as a go/no-go gate
 ## 5. The packer
 
 Candidates are kept in the engine's best-first order (`Σk²` ascending — §4). The
-packer walks them front-to-back with a single monotonic cursor and grows the group
+packer walks them front-to-back with a single monotonic cursor and grows the bundle
 as the bound proves later candidates free. `predicted_work(c | B)` is evaluated
 against the branch's **current real `best_erd`** at handout time.
 
 ```
-def next_group(cursor, candidates_best_first, B, W, count_cap):
+def next_bundle(cursor, candidates_best_first, B, W, count_cap):
     # cursor: lowest not-yet-claimed position in best-first order
     if cursor past end: return holes_pass()            # §6: reclaimed/republished slots
-    group, total = [], 0
-    while cursor in range and len(group) < count_cap:
+    bundle, total = [], 0
+    while cursor in range and len(bundle) < count_cap:
         w = predicted_work(candidates[cursor] | B)     # 0 if provably gated (cost_lb >= B)
-        if group and total + w > W:                    # don't exceed the work target
+        if bundle and total + w > W:                    # don't exceed the work target
             break
-        group.append(cursor); total += w; cursor += 1
+        bundle.append(cursor); total += w; cursor += 1
         if w >= W:                                     # a single non-gated heavy item
             break                                      # stands alone
-    return group
+    return bundle
 ```
 
 Behaviour:
 
-- **Non-gated head → small groups / singletons.** While `B` is loose, the front
-  candidates carry real predicted work, so groups stay small and the strong
+- **Non-gated head → small bundles / singletons.** While `B` is loose, the front
+  candidates carry real predicted work, so bundles stay small and the strong
   splitters (the likely winner and near-ties) are evaluated first and in parallel —
   tightening `B` fast. A single item with `predicted_work ≥ W` stands alone.
-- **Gated tail → bulk groups.** Once `B` is tight, every further candidate has
+- **Gated tail → bulk bundles.** Once `B` is tight, every further candidate has
   `predicted_work = 0`, so the loop absorbs candidates up to `count_cap` into one
-  group — collapsing claim count where the 99.4% live.
+  bundle — collapsing claim count where the 99.4% live.
 - **No fabricated bound, no gate, no starvation.** There is no "wait until `B` is
   set" rule, and *nothing seeds `B`* (§3). When `B` is loose the tail is simply not
   *provably* free yet, so it packs small (correct, slightly more coordination); when
   real results tighten `B`, it packs bulk. Workers always have claimable head work,
   so the gate-induced starvation failure mode cannot arise.
 
-A bulk group could otherwise absorb an unbounded run of zero-predicted candidates,
-so cap each group by **count (`count_cap`) and wall-time**, not only by `W` (§7): a
+A bulk bundle could otherwise absorb an unbounded run of zero-predicted candidates,
+so cap each bundle by **count (`count_cap`) and wall-time**, not only by `W` (§7): a
 provably-gated candidate is nearly free but not exactly free, and a crashed worker
-holding a huge group widens the reclaim window. `W`, `count_cap`, and the wall cap
+holding a huge bundle widens the reclaim window. `W`, `count_cap`, and the wall cap
 are the tuning dials (§12): `W` sets non-gated-head granularity at, e.g., ~100k
 nodes (~1.5 s compute), making the ~21 ms coordination ~1.5% overhead; the caps
-bound the gated-tail group.
+bound the gated-tail bundle.
 
 **Cost of the walk (absorbs #68).** The cursor advances monotonically through
 best-first order, so the common (no-hole) path is O(1) amortized per candidate and a
 branch drains in O(n_candidates) — never #68's O(n²) per-call gap scan. This is
-#68's monotonic `next_idx` cursor generalized: it advances by a group, not by 1, so
+#68's monotonic `next_idx` cursor generalized: it advances by a bundle, not by 1, so
 #68's separate change is unnecessary. Reclaimed or republished positions are picked
 up by `holes_pass()` once the forward cursor is exhausted (or on a periodic sweep),
 preserving #68's lazy end-of-sweep semantics. The O(n) bound is for the no-overrun
@@ -265,24 +265,25 @@ re-admitted count, not to n.
 Today `candidate_claims` is one row per candidate, PK `(branch_key, idx)`, and
 `claim_candidate` returns the single lowest unclaimed `idx`. The change:
 
-- **Replace `claim_candidate` with `claim_next_group`**, which runs the §5 packer
+- **Replace `claim_candidate` with `claim_next_bundle`**, which runs the §5 packer
   *inside the `BEGIN IMMEDIATE` transaction* over the unclaimed pool, inserts one
   `candidate_claims` row per chosen `idx` (all `claimed_by` = this worker, same
-  `claimed_at`), and returns the index list. One transaction per *group*, not per
+  `claimed_at`), and returns the index list. One transaction per *bundle*, not per
   candidate — that is where the coordination win comes from.
-- A logical claim is the set of rows sharing `(branch_key, claimed_by,
-  claimed_at)`. No new table is required; group identity is derivable. (Optionally
-  add a `group_id` column for cleaner reclaim queries.)
+- A **bundle** is the set of `candidate_claims` rows sharing `(branch_key,
+  claimed_by, claimed_at)` — the candidates a worker is handed and evaluates
+  together in one transaction. No new table is required; bundle identity is
+  derivable. (Optionally add a `bundle_id` column for cleaner reclaim queries.)
 - **Finalize coverage is unchanged**: a branch finalizes when all `n_candidates`
   rows are `done=1`, whoever observes full coverage.
 
 Crucially, because *handout itself is the packer*, **every** source of work-to-do
-flows through it and therefore produces work-sized groups:
+flows through it and therefore produces work-sized bundles:
 
-- Fresh candidates → packer groups them.
+- Fresh candidates → packer bundles them.
 - Reclaimed candidates from a dead worker (`reclaim_stale_claims` deletes the
-  `done=0` rows → they reappear in the unclaimed pool) → packer **re-groups** them.
-- Republished candidates from an overrun (§7) → packer **re-groups** them.
+  `done=0` rows → they reappear in the unclaimed pool) → packer **re-bundles** them.
+- Republished candidates from an overrun (§7) → packer **re-bundles** them.
 
 There is no code path that hands out a lone candidate except the §5 heavy-singleton
 case. This is the structural guarantee against the "1 candidate = 1 claim" trap.
@@ -291,30 +292,30 @@ case. This is the structural guarantee against the "1 candidate = 1 claim" trap.
 
 ## 7. Republish-on-overrun (the no-singleton rule)
 
-A worker evaluating a group tracks actual nodes spent. Two distinct overruns:
+A worker evaluating a bundle tracks actual nodes spent. Two distinct overruns:
 
-**(a) Cross-candidate overrun** — the *group* has spent `≥ T = c·W` actual nodes
+**(a) Cross-candidate overrun** — the *bundle* has spent `≥ T = c·W` actual nodes
 and still has unfinished candidates `R`. The worker:
 
 1. Marks the candidates it finished `done=1` (their results already folded into
    shared best).
 2. Returns `R` to the unclaimed pool (delete the `done=0` rows for `R`).
 3. **Scales the scheduling estimate** for each `r ∈ R` by the observed error on
-   this group, `actual_so_far / predicted_so_far`, and writes the scaled work back
+   this bundle, `actual_so_far / predicted_so_far`, and writes the scaled work back
    to the branch's work vector. This scaled value is a **scheduling signal only**
-   (§3): it makes the re-pack produce smaller groups for dense work; it never
+   (§3): it makes the re-pack produce smaller bundles for dense work; it never
    touches `best_erd` or any ERD.
 4. Does **not** create `|R|` claims. The positions in `R` re-enter as holes in the
-   best-first order, picked up by the next `claim_next_group` / `holes_pass` (§5,
+   best-first order, picked up by the next `claim_next_bundle` / `holes_pass` (§5,
    §6) and re-packed. Because their estimates were just scaled up, the re-pack
-   produces *smaller* groups where work turned out dense — finer granularity exactly
+   produces *smaller* bundles where work turned out dense — finer granularity exactly
    where needed, still multi-candidate wherever items remain individually cheap.
 
-Evaluate within a group in **best-first order** (the engine's `Σk²` ascending order
+Evaluate within a bundle in **best-first order** (the engine's `Σk²` ascending order
 the candidates already carry): the strong splitters go first, tightening `B` and
 carrying the partial best (invariant 2, §8), and the remainder `R` left by an
 overrun is the later, more-likely-gated tail — so the common case re-packs into a
-few groups rather than re-isolating a heavy item repeatedly.
+few bundles rather than re-isolating a heavy item repeatedly.
 
 **(b) Within-candidate overrun** — a *single* candidate's own recursive subtree
 exceeds `T`. This is not a packing problem; it is the existing **sub-branch
@@ -326,14 +327,14 @@ promotion decides *how one expensive candidate's subtree is parallelized*.
 
 Guardrails:
 
-- **Floor on group size during re-pack:** keep grouping while items are
+- **Floor on bundle size during re-pack:** keep bundling while items are
   individually `< W`. Only isolate an item when its (possibly scaled) estimate
   reaches `W`. This prevents the re-pack from drifting toward singletons.
 - **Bounded republish depth:** cap how many times the same candidate can be
   republished before it is forced through promotion (b) instead, so a
   badly-modeled candidate converges instead of thrashing the pool.
-- **Cap a group's wall-time**, not just its nodes, so a worker cannot sit on a
-  group long enough to widen the reclaim window after a crash.
+- **Cap a bundle's wall-time**, not just its nodes, so a worker cannot sit on a
+  bundle long enough to widen the reclaim window after a crash.
 
 ---
 
@@ -343,22 +344,22 @@ These must continue to hold (the ERD pruning invariants plus the claim-level one
 
 1. **Shared-best folding stays per candidate.** Grouping defers the queue
    round-trip *between* candidates, never the best update; a worker refreshes and
-   may tighten the branch's shared best between candidates in its group.
-2. **Sequential-sibling pruning preserved.** Candidates in a group are evaluated in
+   may tighten the branch's shared best between candidates in its bundle.
+2. **Sequential-sibling pruning preserved.** Candidates in a bundle are evaluated in
    order, carrying the partial best, exactly as a single-worker sweep. Across
-   groups, the existing shared-best refresh supplies the cross-worker bound. No new
+   bundles, the existing shared-best refresh supplies the cross-worker bound. No new
    cross-subtree cancellation is introduced.
 3. **Taint propagation unchanged.** Any candidate excluded by the depth budget
    taints the branch, winner or not.
 4. **Finalization coverage unchanged.** Finalize fires only when all
    `n_candidates` slots are `done=1`.
 5. **Reclaim correctness preserved and improved.** A dead worker's `done=0` rows
-   are freed and re-enter the pool; the packer re-groups them. The end state is
+   are freed and re-enter the pool; the packer re-bundles them. The end state is
    identical to single-candidate claiming, never a swarm of singleton gaps.
 
 An equivalence test must assert: for a fixed branch, packed claiming yields the
 **same winning guess** and **same `max_depth`** as single-candidate claiming, and
-an ERD **within ±1e-5** of it (not bit-exact — claim grouping reorders the weighted
+an ERD **within ±1e-5** of it (not bit-exact — claim bundling reorders the weighted
 sum). The pruning is the same minimum either way (the bound is only ever tightened
 by real solved results, §3), so the optimum is unchanged; only float summation order
 differs.
@@ -400,7 +401,7 @@ branch_finalize_log(
   created_at, finalized_at,           -- wall-clock span (upper bound; interleaved)
   nodes_spent,                        -- compute volume
   n_claims, total_coord_millis,       -- coordination attributable to this branch
-  n_groups, max_group_nodes           -- packing/balance diagnostics
+  n_bundles, max_bundle_nodes           -- packing/balance diagnostics
 )
 ```
 
@@ -457,7 +458,7 @@ the cheapest measurements available because the tables already exist:
 | Column | State today | Fix |
 |---|---|---|
 | `cost_samples.wall_millis` | INSERT omits it (`erd_queue.py:983`); 0/1378 rows | Pass wall time into `add_cost_sample`; it is the only per-solve wall figure. |
-| `claim_telemetry.claim_retries` | INSERT omits it (`erd_queue.py:992`); 0/72M rows | Count `BEGIN IMMEDIATE` busy retries in `claim_next_group` and pass them — the direct lock-contention signal (§9.5). |
+| `claim_telemetry.claim_retries` | INSERT omits it (`erd_queue.py:992`); 0/72M rows | Count `BEGIN IMMEDIATE` busy retries in `claim_next_bundle` and pass them — the direct lock-contention signal (§9.5). |
 | `backstop_telemetry.predicted_nodes` | Wired but always passed `None`; 0/30 rows | Compute `get_cost_typical(n_words, budget)` at frame entry and pass it — the paired predicted-vs-actual the model accuracy work (§9.4) needs. |
 | `active_branches.created_at / finalized_at / nodes_spent` | Populated, then destroyed by `delete_branch` at finalize | Copy into `branch_finalize_log` (§9.2) before delete, so per-branch wall span and node cost survive. |
 
@@ -487,10 +488,10 @@ Strategy:
   as lower bounds (survival-style), not as exact points, so a handful of capped
   monsters do not bias `typical(k)` — and do not masquerade as cheap.
 - **Cap is the same mechanism as §5/§7.** The per-unit node/wall cap used in
-  measurement is exactly the group wall-cap and the within-candidate promotion
+  measurement is exactly the bundle wall-cap and the within-candidate promotion
   threshold from the packer, so epoch-0 and epoch-1 bound work the same way and the
   baseline is comparable.
-- **Flag imbalance in the finalize log.** `branch_finalize_log.max_group_nodes` (and
+- **Flag imbalance in the finalize log.** `branch_finalize_log.max_bundle_nodes` (and
   a `censored_units` count) surface any unit that ran away, so a regression is
   visible in the data instead of as a mysteriously stalled worker.
 
@@ -516,7 +517,7 @@ value** — a censored lower bound is honest; a guessed point estimate is not.
 4. **Implement packing + republish** (§5–§8) behind the same restart discipline.
    Bump to epoch 1.
 5. **Compare epoch 0 vs epoch 1** from `branch_finalize_log` and `claim_telemetry`:
-   claims/branch, coordination fraction, claims-per-second, straggler (max group
+   claims/branch, coordination fraction, claims-per-second, straggler (max bundle
    nodes) distribution, effective throughput, per-branch wall-time.
 
 ---
@@ -533,8 +534,8 @@ value** — a censored lower bound is honest; a guessed point estimate is not.
   the per-claim fixed-overhead bands disappear; the largest drop is at three or more
   guesses played. (The ≥100 ms finalize/starvation tail is only partly claim-count
   driven, so treat a specific percentage as directional, not a hard target.)
-- No straggler regression: the `max_group_nodes` distribution in
-  `branch_finalize_log` has no tail of multi-`W` groups that fail to republish —
+- No straggler regression: the `max_bundle_nodes` distribution in
+  `branch_finalize_log` has no tail of multi-`W` bundles that fail to republish —
   i.e., the old chunk imbalance does not reappear.
 - ERD results match single-candidate claiming **within ±1e-5**, with **identical
   winning guess and `max_depth`** (equivalence test, §8).
@@ -551,15 +552,15 @@ value** — a censored lower bound is honest; a guessed point estimate is not.
 ## 12. Open questions
 
 - **Choosing `W`, `count_cap`, and `c`.** Start `W` from `coord_millis / node_time`
-  so a group's compute dwarfs its coordination; set `count_cap` so a fully-gated
-  bulk group still completes within the wall cap; choose the overrun factor `c`
+  so a bundle's compute dwarfs its coordination; set `count_cap` so a fully-gated
+  bulk bundle still completes within the wall cap; choose the overrun factor `c`
   (e.g. 2–4) from the §9.3 accuracy data — large enough not to thrash, small enough
   to cap stragglers.
 - **Cursor and bound state are shared across processes (correctness constraint, not
-  optional).** Six worker *processes* call `claim_next_group` concurrently, so the
+  optional).** Six worker *processes* call `claim_next_bundle` concurrently, so the
   best-first candidate order, the forward cursor, and the `B` read must live in the
   queue DB and be advanced under the same `BEGIN IMMEDIATE` that inserts the claim
-  rows — never in worker-local memory — or two workers pack overlapping groups. Open
+  rows — never in worker-local memory — or two workers pack overlapping bundles. Open
   choice: store the cursor on `active_branches` (a `next_idx`-style column, the one
   piece of #68 that survives) versus deriving the frontier from `candidate_claims`
   each call. Holes from reclaim/republish are handled by `holes_pass` once the
