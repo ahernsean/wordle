@@ -71,6 +71,27 @@ def spearman(xs, ys):
     return _pearson(_ranks(xs), _ranks(ys))
 
 
+def loglog_fit(preds, acts):
+    """Pearson on log10(predicted) vs log10(actual), plus the regression slope and
+    residual sigma.  Spearman only sees rank; this sees MAGNITUDE proportionality —
+    which is what bundle sizing depends on (the packer sums predicted work to W).
+    slope ~ 1 means predicted is proportional to actual; resid_sigma is the
+    bundle-sizing noise in dex (log10 units).  Filters to positive pairs."""
+    xs = [math.log10(p) for p, a in zip(preds, acts) if p > 0 and a > 0]
+    ys = [math.log10(a) for p, a in zip(preds, acts) if p > 0 and a > 0]
+    if len(xs) < 3:
+        return float("nan"), float("nan"), float("nan")
+    r = _pearson(xs, ys)
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    slope = (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+             if sxx else float("nan"))
+    b = my - slope * mx
+    sigma = (sum((y - slope * x - b) ** 2 for x, y in zip(xs, ys)) / n) ** 0.5
+    return r, slope, sigma
+
+
 def load_cost_model(conn):
     """Snapshot cost_model into a typical(k, budget) closure with the same
     (size_bucket, budget) -> budget-aggregate fallback the live model uses."""
@@ -130,6 +151,9 @@ def evaluate_metric(name, fn, rows, typical, args):
           f"= {100*fe_frac:.1f}%")
     print(f"  Spearman overall = {rho_all:.3f}   "
           f"load-bearing tail (actual>={args.tail_nodes}, n={len(tail)}) Spearman = {rho_tail:.3f}")
+    r_log, slope, sigma = loglog_fit(preds, acts)
+    print(f"  log10 calibration: Pearson(log) = {r_log:.3f}   slope = {slope:.3f}   "
+          f"resid_sigma = {sigma:.2f} dex  (slope~1 & low sigma => well-sized bundles)")
     return fe_frac, rho_tail, rho_all
 
 
