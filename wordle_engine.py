@@ -968,13 +968,42 @@ def _by_group_size(item):
     return len(item[1])
 
 
+def estimate_candidate_work(group_sizes, has_self, n, best_erd, budget, typical):
+    """Predicted search work (in nodes) for a candidate, cutoff-aware.
+
+    Returns 0.0 when the candidate is provably gated (cost_lb >= best_erd): the
+    engine cuts it for free, so this is exact, not a guess.  Otherwise it sums the
+    cost model's typical node count for each response group the candidate would
+    recurse into — the singletons and the all-of-branch group cost nothing.
+
+    `typical(k, sub_budget)` returns the model's geometric-mean node count for a
+    sub-branch of size k at the given budget, or None when cold; a cold size falls
+    back to k itself (a strong splitter has more, smaller groups, so this keeps
+    the estimate monotone in branching even before the model warms).
+
+    This is a *scheduling* estimate only — it never sets a pruning bound.  It is
+    the quantity the §10 go/no-go gate validates against epoch-0 actuals.
+    """
+    cost_lb = 3.0 - (len(group_sizes) + (1 if has_self else 0)) / n
+    if best_erd is not None and cost_lb >= best_erd:
+        return 0.0
+    sub_budget = None if budget is None else budget - 1
+    total = 0.0
+    for k in group_sizes:
+        if k <= 1 or k >= n:
+            continue
+        t = typical(k, sub_budget)
+        total += t if t is not None else float(k)
+    return total
+
+
 def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    n=None, best_erd=float('inf'),
                    deadline=None, guesses=None, policy=ERD_ALL,
                    cancel_check=None, heartbeat=None,
                    note_depth=None, budget=None,
                    subbranch_solver=None, bound_provider=None,
-                   mid_loop_publisher=None):
+                   mid_loop_publisher=None, metric_observer=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1024,7 +1053,15 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # Admissible lower bound on this candidate's cost — cost >= 3 - (G + has_self)/n.
     has_self = _ALL_GREEN_PATTERN in groups
     cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
-    if cost_lb >= best_erd:
+    gated = cost_lb >= best_erd
+    # Report the work-metric inputs the moment they are known (cost_lb, group
+    # sizes, the bound actually in force after any external tightening) so a
+    # measurement layer can log predicted-vs-actual without recomputing them.
+    # gated candidates are reported too — their near-zero cost is the signal.
+    if metric_observer is not None:
+        metric_observer([len(g) for g in groups.values()], has_self,
+                        cost_lb, best_erd, gated)
+    if gated:
         # Provably can't beat the bound (but may well be feasible) — a cutoff,
         # not infeasibility.  See OVER_ERD_LIMIT in _solve_subset.
         return (OVER_ERD_LIMIT, None, None, False)

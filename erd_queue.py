@@ -17,6 +17,9 @@ from cache_sqlite import ScoreCache
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
 _COST_MODEL_MIN_WEIGHT = 1.0
+# Sentinel budget for the cost_model cell that aggregates samples across all
+# budgets — the warm cross-budget fallback for a still-cold (size, budget) cell.
+_AGGREGATE_BUDGET = -1
 
 # Geometric size bucketing.  Sub-branch sizes are sparse and heavy-tailed, so a
 # bucket per exact word-count would almost never accumulate enough samples to
@@ -165,39 +168,110 @@ CREATE TABLE IF NOT EXISTS candidate_claims (
 );
 
 -- Per-size-bucket online cost model (time-weighted geometric mean of
--- recursion-node cost).  Keyed by (policy, size_bucket) so ERD_ALL and
--- ERD_ANSWERS models never cross-contaminate.
+-- recursion-node cost).  Keyed by (policy, size_bucket, budget): the same word
+-- count costs very different node totals at different remaining-guess budgets,
+-- so budget is part of the key.  budget = -1 is the budget-aggregate accumulator
+-- (every sample also folds into it), read as a warm fallback when a specific
+-- (size_bucket, budget) bucket is still cold.  policy keeps ERD_ALL and
+-- ERD_ANSWERS models from cross-contaminating.
 CREATE TABLE IF NOT EXISTS cost_model (
     policy           TEXT    NOT NULL,
     size_bucket      INTEGER NOT NULL,
+    budget           INTEGER NOT NULL DEFAULT -1,
     weighted_log_sum REAL    NOT NULL DEFAULT 0,
     weight_sum       REAL    NOT NULL DEFAULT 0,
     weighted_log_sq  REAL    NOT NULL DEFAULT 0,
     last_updated     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (policy, size_bucket)
+    PRIMARY KEY (policy, size_bucket, budget)
 );
 
 -- Raw per-solve samples for offline distribution analysis and threshold tuning.
+-- censored = 1 marks a sample whose unit was handed off at the node/wall cap
+-- before it finished: `nodes` is then a LOWER BOUND on the true cost, and an
+-- offline survival fit must treat it as such rather than as an exact point.
 CREATE TABLE IF NOT EXISTS cost_samples (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     policy      TEXT    NOT NULL,
     n_words     INTEGER NOT NULL,
     nodes       INTEGER NOT NULL,
     wall_millis INTEGER,
-    source      TEXT,        -- 'inline' or 'finalize'
+    budget      INTEGER,
+    censored    INTEGER NOT NULL DEFAULT 0,
+    source      TEXT,        -- 'finalize' or 'censored'
+    epoch       INTEGER NOT NULL DEFAULT 0,
     recorded_at INTEGER NOT NULL
 );
 
 -- Outbound-only coordination telemetry for offline clustering-decision analysis.
--- Never read by any runtime control path; freely droppable.
+-- Never read by any runtime control path; freely droppable.  busy_wait_millis is
+-- the wall time spent acquiring the claim's write lock (the direct contention
+-- signal); claim_retries counts application-level BEGIN IMMEDIATE retries.
 CREATE TABLE IF NOT EXISTS claim_telemetry (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     n_words             INTEGER NOT NULL,
     coordination_millis INTEGER NOT NULL,
     work_nodes          INTEGER NOT NULL,
     claim_retries      INTEGER,
+    busy_wait_millis   INTEGER,
     worker_count       INTEGER,
+    epoch              INTEGER NOT NULL DEFAULT 0,
     recorded_at        INTEGER NOT NULL
+);
+
+-- One row per telemetry epoch: a contiguous run under one claiming regime.
+-- epoch 0 is the single-candidate-atom baseline; the packer deploy inserts a new
+-- row and bumps run_meta.epoch.  All offline comparisons filter on epoch.
+CREATE TABLE IF NOT EXISTS telemetry_epoch (
+    epoch      INTEGER PRIMARY KEY,
+    label      TEXT,
+    git_sha    TEXT,
+    started_at INTEGER,
+    notes      TEXT
+);
+
+-- Durable per-branch timing/cost record, written at finalize BEFORE delete_branch
+-- copies the otherwise-destroyed active_branches.created_at/finalized_at/
+-- nodes_spent out of the transient row.  Subbranches finalize as first-class
+-- branches under recursive promotion, so each gets one row here.  The packer-era
+-- columns (n_bundles, max_bundle_nodes, total_coord_millis, censored_units) are
+-- NULL under single-candidate claiming and populated once bundling lands.
+CREATE TABLE IF NOT EXISTS branch_finalize_log (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_key         BLOB,
+    spine              TEXT,
+    n_words            INTEGER,
+    budget             INTEGER,
+    epoch              INTEGER NOT NULL DEFAULT 0,
+    created_at         INTEGER,
+    finalized_at       INTEGER,
+    nodes_spent        INTEGER,
+    n_claims           INTEGER,
+    n_bundles          INTEGER,
+    max_bundle_nodes   INTEGER,
+    total_coord_millis INTEGER,
+    censored_units     INTEGER,
+    recorded_at        INTEGER NOT NULL
+);
+
+-- Per-candidate predicted-vs-actual work, collected under single-candidate
+-- claiming (epoch 0) where one claim == one candidate so actual_nodes IS that
+-- candidate's true cost.  Validates the packer's work metric: predicted_work is
+-- estimate_candidate_work(c | bound_erd); gated = (cost_lb >= bound_erd) means
+-- the candidate was provably cut for free (predicted_work 0).  bound_erd and
+-- cost_lb are logged so a gated candidate's near-zero cost reads as a correct
+-- prediction, not a wild miss.  The §10 go/no-go gate is computed from this.
+CREATE TABLE IF NOT EXISTS candidate_accuracy (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_key     BLOB,
+    n_words        INTEGER NOT NULL,
+    budget         INTEGER,
+    predicted_work REAL,
+    bound_erd      REAL,
+    cost_lb        REAL,
+    gated          INTEGER NOT NULL,
+    actual_nodes   INTEGER NOT NULL,
+    epoch          INTEGER NOT NULL DEFAULT 0,
+    recorded_at    INTEGER NOT NULL
 );
 
 -- One row per wall-clock backstop firing: a frame handed off its remainder
@@ -228,6 +302,14 @@ class ERDQueue:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate()
+        # Active epoch, read once: workers open the queue after the supervisor has
+        # stamped run_meta.epoch, and are restarted across a cutover, so caching
+        # here is safe and keeps every telemetry insert off a per-row SELECT.
+        self.epoch = int(self.get_meta('epoch') or 0)
+        # Per-claim contention metrics, refreshed by the claim path and read by
+        # the next add_claim_telemetry without changing claim_* return shapes.
+        self._last_claim_busy_millis = 0
+        self._last_claim_retries = 0
 
     def _migrate(self):
         # active_branches.spine: additive, nullable, no backfill.  Existing rows
@@ -281,6 +363,75 @@ class ERDQueue:
         if "depth" in bt_cols and "budget" not in bt_cols:
             self._conn.execute(
                 "ALTER TABLE backstop_telemetry RENAME COLUMN depth TO budget")
+
+        # cost_model re-key: (policy, size_bucket) -> (policy, size_bucket, budget).
+        # The same word count costs very different node totals at different
+        # budgets, so the old single-budget bucket conflated them.  Rebuild with
+        # budget in the key; existing accumulators carry across as the budget = -1
+        # aggregate (every new sample still folds into -1, so the prior model
+        # stays warm as a fallback and packing is not cold at cutover).
+        cm_cols = {r["name"] for r in
+                   self._conn.execute("PRAGMA table_info(cost_model)")}
+        if cm_cols and "budget" not in cm_cols:
+            self._conn.executescript("""
+                CREATE TABLE cost_model_new (
+                    policy           TEXT    NOT NULL,
+                    size_bucket      INTEGER NOT NULL,
+                    budget           INTEGER NOT NULL DEFAULT -1,
+                    weighted_log_sum REAL    NOT NULL DEFAULT 0,
+                    weight_sum       REAL    NOT NULL DEFAULT 0,
+                    weighted_log_sq  REAL    NOT NULL DEFAULT 0,
+                    last_updated     INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (policy, size_bucket, budget)
+                );
+                INSERT INTO cost_model_new
+                    (policy, size_bucket, budget, weighted_log_sum, weight_sum,
+                     weighted_log_sq, last_updated)
+                    SELECT policy, size_bucket, -1, weighted_log_sum, weight_sum,
+                           weighted_log_sq, last_updated
+                    FROM cost_model;
+                DROP TABLE cost_model;
+                ALTER TABLE cost_model_new RENAME TO cost_model;
+            """)
+
+        # Epoch tagging: stamp every append-only telemetry table with the active
+        # epoch.  Existing rows default to epoch 0 (the single-candidate baseline).
+        # Additive columns the CREATE shape declares for fresh DBs but that an
+        # existing DB needs via ALTER.
+        self._add_columns("claim_telemetry", {
+            "busy_wait_millis": "INTEGER",
+            "epoch": "INTEGER NOT NULL DEFAULT 0",
+        })
+        self._add_columns("cost_samples", {
+            "budget": "INTEGER",
+            "censored": "INTEGER NOT NULL DEFAULT 0",
+            "epoch": "INTEGER NOT NULL DEFAULT 0",
+        })
+        self._add_columns("backstop_telemetry", {
+            "epoch": "INTEGER NOT NULL DEFAULT 0",
+        })
+
+        # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
+        # stamped later (set_epoch) when a deploy knows it.
+        now = int(time.time())
+        self._conn.execute(
+            "INSERT OR IGNORE INTO telemetry_epoch (epoch, label, started_at) "
+            "VALUES (0, 'single-candidate atom baseline', ?)", (now,))
+        self._conn.execute(
+            "INSERT OR IGNORE INTO run_meta (key, value) VALUES ('epoch', '0')")
+
+    def _add_columns(self, table: str, columns: dict):
+        """Idempotently ALTER TABLE ADD COLUMN for any of `columns` not present.
+
+        columns maps name -> SQL type/constraint.  A NOT NULL column must carry a
+        DEFAULT so the add is safe on a populated table.
+        """
+        have = {r["name"] for r in
+                self._conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in have:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self):
         self._conn.close()
@@ -499,7 +650,14 @@ class ERDQueue:
         candidate list), or None if every slot already has a row (fully claimed
         — the worker should look elsewhere, NEVER block).
         """
+        # Time the write-lock acquisition: under contention BEGIN IMMEDIATE blocks
+        # on the busy timeout, so this wall span is the direct lock-contention
+        # signal (busy_wait_millis).  No application-level retry loop, so the retry
+        # count is 0 — the wait, not a retry, is what contention costs here.
+        _acquire_t0 = time.perf_counter()
         self._conn.execute("BEGIN IMMEDIATE")
+        self._last_claim_busy_millis = int((time.perf_counter() - _acquire_t0) * 1e3)
+        self._last_claim_retries = 0
         try:
             # Never hand out a claim for a branch that has been finalized and
             # deleted: a worker still looping would otherwise redo it from scratch.
@@ -884,58 +1042,82 @@ class ERDQueue:
     # Cost model (online time-weighted geometric mean per size bucket)
     # ------------------------------------------------------------------
 
-    def _cost_bucket_row(self, policy: str, n_words: int):
+    def _cost_bucket_row(self, policy: str, n_words: int, budget):
+        """The cost_model accumulators for one (policy, size_bucket, budget) cell.
+
+        budget = _AGGREGATE_BUDGET (-1) reads the budget-aggregate accumulator
+        every sample also folds into.
+        """
         return self._conn.execute(
             "SELECT weighted_log_sum, weight_sum, weighted_log_sq, last_updated "
-            "FROM cost_model WHERE policy = ? AND size_bucket = ?",
-            (policy, cost_size_bucket(n_words))).fetchone()
+            "FROM cost_model WHERE policy = ? AND size_bucket = ? AND budget = ?",
+            (policy, cost_size_bucket(n_words), budget)).fetchone()
 
-    def get_cost_typical(self, policy: str, n_words: int):
-        """Return the geometric-mean node count for n_words' size bucket, or None.
+    def _warm_bucket_row(self, policy: str, n_words: int, budget):
+        """Warm accumulators for n_words at `budget`, or None.
 
-        The estimate is exp(weighted_log_sum / weight_sum).  When weight_sum is
-        below _COST_MODEL_MIN_WEIGHT the bucket reads cold and None is returned —
-        the caller should fall back to a size-based heuristic.
+        Reads the specific (size_bucket, budget) cell when budget is given and
+        falls back to the budget-aggregate (-1) cell when that cell is cold.
+        budget=None reads the aggregate directly.
         """
-        row = self._cost_bucket_row(policy, n_words)
+        if budget is not None:
+            row = self._cost_bucket_row(policy, n_words, budget)
+            if row is not None and row['weight_sum'] >= _COST_MODEL_MIN_WEIGHT:
+                return row
+        row = self._cost_bucket_row(policy, n_words, _AGGREGATE_BUDGET)
         if row is None or row['weight_sum'] < _COST_MODEL_MIN_WEIGHT:
+            return None
+        return row
+
+    def get_cost_typical(self, policy: str, n_words: int, budget=None):
+        """Geometric-mean node count for n_words at `budget`, or None when cold.
+
+        The estimate is exp(weighted_log_sum / weight_sum).  budget keys the model
+        on remaining-guess budget; a cold (size_bucket, budget) cell falls back to
+        the budget-aggregate, and a cold aggregate returns None so the caller can
+        use a size-based heuristic.
+        """
+        row = self._warm_bucket_row(policy, n_words, budget)
+        if row is None:
             return None
         return math.exp(row['weighted_log_sum'] / row['weight_sum'])
 
-    def get_cost_spread(self, policy: str, n_words: int):
-        """Std-dev of ln(nodes) for n_words' bucket (the log-normal sigma), or None.
+    def get_cost_spread(self, policy: str, n_words: int, budget=None):
+        """Std-dev of ln(nodes) for n_words at `budget` (log-normal sigma), or None.
 
         Recovered from the stored second log-moment:
             sigma^2 = weighted_log_sq/weight_sum - mu^2
         Round-off can make this marginally negative when every sample is equal;
-        clamp to 0.  Used for the over-promotion shade exp(mu - Z*sigma) and for
-        offline distribution analysis.
+        clamp to 0.  Same (size_bucket, budget) -> aggregate fallback as
+        get_cost_typical.  Used for the over-promotion shade exp(mu - Z*sigma) and
+        for offline distribution analysis.
         """
-        row = self._cost_bucket_row(policy, n_words)
-        if row is None or row['weight_sum'] < _COST_MODEL_MIN_WEIGHT:
+        row = self._warm_bucket_row(policy, n_words, budget)
+        if row is None:
             return None
         mu = row['weighted_log_sum'] / row['weight_sum']
         var = row['weighted_log_sq'] / row['weight_sum'] - mu * mu
         return math.sqrt(var) if var > 0 else 0.0
 
     def update_cost_model(self, policy: str, n_words: int, nodes: int,
-                          weight: float = 1.0, now: int = None):
+                          weight: float = 1.0, now: int = None, budget=None):
         """Fold one node-cost sample (value `nodes`, multiplicity `weight`).
 
         weight > 1 records `weight` identical samples of `nodes` in one call.
         For a batch of *distinct* samples whose individual magnitudes matter to
         the spread, use update_cost_model_logsums so each sample reaches the
-        second log-moment without a lossy pre-averaging collapse.
+        second log-moment without a lossy pre-averaging collapse.  budget, when
+        given, also keys a (size_bucket, budget) cell in addition to the aggregate.
         """
         if nodes <= 0 or weight <= 0:
             return
         log_n = math.log(nodes)
-        self._fold_cost_sample(policy, n_words,
-                               log_n * weight, log_n * log_n * weight, weight, now)
+        self._fold_cost_sample(policy, n_words, log_n * weight,
+                               log_n * log_n * weight, weight, now, budget)
 
     def update_cost_model_logsums(self, policy: str, n_words: int,
                                   log_sum: float, log_sq_sum: float,
-                                  weight: float, now: int = None):
+                                  weight: float, now: int = None, budget=None):
         """Fold a pre-summed batch of log samples: (Σ ln x, Σ ln²x, count).
 
         The worker's inline-sample buffer accumulates these sums directly, so the
@@ -944,23 +1126,34 @@ class ERDQueue:
         """
         if weight <= 0:
             return
-        self._fold_cost_sample(policy, n_words, log_sum, log_sq_sum, weight, now)
+        self._fold_cost_sample(policy, n_words, log_sum, log_sq_sum, weight, now,
+                               budget)
 
-    def _fold_cost_sample(self, policy, n_words, d_log_sum, d_log_sq, d_weight, now):
-        bucket = cost_size_bucket(n_words)
+    def _fold_cost_sample(self, policy, n_words, d_log_sum, d_log_sq, d_weight,
+                          now, budget):
         if now is None:
             now = int(time.time())
+        bucket = cost_size_bucket(n_words)
+        # Every sample feeds the budget-aggregate (-1) cell so it stays a warm
+        # cross-budget fallback; a known budget additionally feeds its own cell.
+        self._fold_one(policy, bucket, _AGGREGATE_BUDGET,
+                       d_log_sum, d_log_sq, d_weight, now)
+        if budget is not None and budget != _AGGREGATE_BUDGET:
+            self._fold_one(policy, bucket, budget,
+                           d_log_sum, d_log_sq, d_weight, now)
+
+    def _fold_one(self, policy, bucket, budget, d_log_sum, d_log_sq, d_weight, now):
         row = self._conn.execute(
             "SELECT weighted_log_sum, weight_sum, weighted_log_sq, last_updated "
-            "FROM cost_model WHERE policy = ? AND size_bucket = ?",
-            (policy, bucket)).fetchone()
+            "FROM cost_model WHERE policy = ? AND size_bucket = ? AND budget = ?",
+            (policy, bucket, budget)).fetchone()
         if row is None:
             self._conn.execute("""
                 INSERT INTO cost_model
-                    (policy, size_bucket, weighted_log_sum, weight_sum,
+                    (policy, size_bucket, budget, weighted_log_sum, weight_sum,
                      weighted_log_sq, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (policy, bucket, d_log_sum, d_weight, d_log_sq, now))
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (policy, bucket, budget, d_log_sum, d_weight, d_log_sq, now))
         else:
             # Continuous-time EMA: decay every accumulator by the age of the
             # bucket before folding the new contribution.  Clamp elapsed at 0 so
@@ -970,29 +1163,97 @@ class ERDQueue:
                 UPDATE cost_model
                 SET weighted_log_sum = ?, weight_sum = ?, weighted_log_sq = ?,
                     last_updated = ?
-                WHERE policy = ? AND size_bucket = ?
+                WHERE policy = ? AND size_bucket = ? AND budget = ?
             """, (decay * row['weighted_log_sum'] + d_log_sum,
                   decay * row['weight_sum'] + d_weight,
                   decay * row['weighted_log_sq'] + d_log_sq,
-                  now, policy, bucket))
+                  now, policy, bucket, budget))
 
-    def add_cost_sample(self, policy: str, n_words: int, nodes: int, source: str):
-        """Append a raw sample to cost_samples for offline analysis."""
+    def add_cost_sample(self, policy: str, n_words: int, nodes: int, source: str,
+                        budget=None, wall_millis=None, censored: int = 0):
+        """Append a raw sample to cost_samples for offline analysis.
+
+        wall_millis is the per-solve wall span (the only such figure, populated at
+        finalize).  censored=1 marks a handed-off unit whose `nodes` is a lower
+        bound, so a survival fit must not treat it as exact.
+        """
         now = int(time.time())
         self._conn.execute("""
-            INSERT INTO cost_samples (policy, n_words, nodes, source, recorded_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (policy, n_words, nodes, source, now))
+            INSERT INTO cost_samples
+                (policy, n_words, nodes, wall_millis, budget, censored, source,
+                 epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (policy, n_words, nodes, wall_millis, budget, censored, source,
+              self.epoch, now))
 
     def add_claim_telemetry(self, n_words: int, coordination_millis: int,
                             work_nodes: int, worker_count: int):
-        """Append a claim coordination record to claim_telemetry for offline analysis."""
+        """Append a claim coordination record to claim_telemetry for offline analysis.
+
+        claim_retries / busy_wait_millis come from the most recent claim path on
+        this connection (set by claim_candidate), the direct lock-contention
+        signal; the row is stamped with the active epoch.
+        """
         now = int(time.time())
         self._conn.execute("""
             INSERT INTO claim_telemetry
-                (n_words, coordination_millis, work_nodes, worker_count, recorded_at)
+                (n_words, coordination_millis, work_nodes, claim_retries,
+                 busy_wait_millis, worker_count, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (n_words, coordination_millis, work_nodes, self._last_claim_retries,
+              self._last_claim_busy_millis, worker_count, self.epoch, now))
+
+    def add_branch_finalize_log(self, branch_key, spine, n_words, budget,
+                                created_at, finalized_at, nodes_spent, n_claims):
+        """Persist a branch's timing/cost the moment before delete_branch drops it.
+
+        Packer-era columns (n_bundles, max_bundle_nodes, total_coord_millis,
+        censored_units) are left NULL under single-candidate claiming.
+        """
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO branch_finalize_log
+                (branch_key, spine, n_words, budget, epoch, created_at,
+                 finalized_at, nodes_spent, n_claims, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (branch_key, spine, n_words, budget, self.epoch, created_at,
+              finalized_at, nodes_spent, n_claims, now))
+
+    def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
+                               bound_erd, cost_lb, gated, actual_nodes):
+        """Log one predicted-vs-actual work point for the §10 metric-validation gate.
+
+        Under single-candidate claiming a claim is exactly one candidate, so
+        actual_nodes is that candidate's true cost.
+        """
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO candidate_accuracy
+                (branch_key, n_words, budget, predicted_work, bound_erd, cost_lb,
+                 gated, actual_nodes, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (branch_key, n_words, budget, predicted_work, bound_erd, cost_lb,
+              1 if gated else 0, actual_nodes, self.epoch, now))
+
+    def set_epoch(self, epoch: int, label: str = None, git_sha: str = None,
+                  notes: str = None):
+        """Register a new telemetry epoch and make it active.
+
+        Inserts the telemetry_epoch row (idempotent), points run_meta.epoch at it,
+        and updates this connection's cached epoch so subsequent telemetry stamps
+        with it.  Called by a deploy that changes the claiming regime.
+        """
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO telemetry_epoch (epoch, label, git_sha, started_at, notes)
             VALUES (?, ?, ?, ?, ?)
-        """, (n_words, coordination_millis, work_nodes, worker_count, now))
+            ON CONFLICT(epoch) DO UPDATE SET
+                label   = COALESCE(excluded.label, label),
+                git_sha = COALESCE(excluded.git_sha, git_sha),
+                notes   = COALESCE(excluded.notes, notes)
+        """, (epoch, label, git_sha, now, notes))
+        self.set_meta('epoch', str(epoch))
+        self.epoch = epoch
 
     def add_backstop_telemetry(self, n_words: int, budget, elapsed_millis: int,
                                nodes: int, predicted_nodes, remaining_candidates: int):
