@@ -281,6 +281,10 @@ class _BranchWorker:
                  enable_adaptive_decomposition=True):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
+        # Process-local stop request, set by this worker's own SIGTERM/SIGINT
+        # handler.  Separate from the shared stop_event so terminating one worker
+        # (e.g. a recycle) does not signal the whole pool.
+        self._stop_requested = False
         self.root_budget = root_budget
         self.n_workers = n_workers
         # The adaptive-decomposition layer — cost model, entry-gate publish
@@ -375,8 +379,17 @@ class _BranchWorker:
         self.score_cache.close()
         self.queue.close()
 
+    def request_stop(self):
+        """Ask the worker to finish its current candidate and exit cleanly.
+
+        Called from the process's SIGTERM/SIGINT handler so the normal-exit path
+        (run() returns -> close() clears the heartbeat row) runs instead of the
+        process dying mid-evaluation."""
+        self._stop_requested = True
+
     def cancel(self):
-        return self.stop_event is not None and self.stop_event.is_set()
+        return self._stop_requested or (
+            self.stop_event is not None and self.stop_event.is_set())
 
     # -- depth instrumentation ----------------------------------------------
 
@@ -1084,6 +1097,8 @@ class _BranchWorker:
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no cover
                  n_workers=1, enable_adaptive_decomposition=True):
     """Process entry point for a swarm worker (target= for mp.Process)."""
+    # Drop the supervisor's inherited handler during startup; a signal here would
+    # otherwise run the parent's handler against the shared stop_event.
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     _setup_logging(worker_id)
@@ -1091,6 +1106,16 @@ def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no co
     w = _BranchWorker(worker_id, cache_path, queue_path, stop_event,
                       n_workers=n_workers,
                       enable_adaptive_decomposition=enable_adaptive_decomposition)
+
+    # Now that the worker exists, handle termination cooperatively: request a stop
+    # so run() returns and the finally below runs close(), which clears this
+    # worker's heartbeat row.  request_stop sets a process-local flag only, so a
+    # single recycled worker does not stop the rest of the pool.
+    def _graceful_stop(signum, frame):
+        w.request_stop()
+    signal.signal(signal.SIGTERM, _graceful_stop)
+    signal.signal(signal.SIGINT, _graceful_stop)
+
     try:
         w.run()
     finally:
