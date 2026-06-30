@@ -40,6 +40,7 @@ def _bare_worker():
     w = _BranchWorker.__new__(_BranchWorker)
     w.name = "worker-0"
     w.stop_event = None
+    w._stop_requested = False
     w.root_budget = ROOT_BUDGET
     w.all_words = CANDIDATES
     w.n_candidates = len(CANDIDATES)
@@ -211,6 +212,16 @@ class TestCancelPath(unittest.TestCase):
         w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
         # complete_candidate must NOT have been called (claim left done=0 for reclaim).
         w.queue.complete_candidate.assert_not_called()
+
+    def test_request_stop_cancels_without_shared_event(self):
+        # A worker's own SIGTERM/SIGINT handler calls request_stop(); this must
+        # cancel the worker via a process-local flag, never touching the shared
+        # stop_event (so recycling one worker does not stop the pool).
+        w = _bare_worker()           # stop_event is None
+        self.assertFalse(w.cancel())
+        w.request_stop()
+        self.assertTrue(w.cancel())
+        self.assertIsNone(w.stop_event)
 
 
 class TestSubbranchSolver(unittest.TestCase):
