@@ -1,389 +1,824 @@
 # Full best-ERD tree for all ~13k openers — implementation plan
 
-The goal: populate `branch_best_by_policy` (`ERD_ALL`) with the best-ERD result
-for every branch of every ~13k opener, on one small Linux box, in weeks rather
-than years.
+The goal: populate `branch_best_by_policy` (policy `ERD_ALL`) with the best-ERD
+result for every response branch of every opener in `wordle.txt` (~12,972
+words), on one small Linux box, in weeks rather than years — and make the
+result usable from the iPhone.
 
-The measured baseline (see `adaptive_claim_packing.md` §1) delivers ~900 branch
-sweeps/day; the full job is ~1.5–2M top-level branches. Three multiplicative
-levers close the gap:
+This document is written to be executed section-by-section by lower-capability
+agents. Part I is shared context every implementer must read. Part II is the
+non-negotiable rules. Part III is the work, one section per agent-sized task.
 
-| Lever | Expected gain | Status |
+Related artifacts:
+
+| Artifact | What it is |
+|---|---|
+| Issue #77 | Remove the `queue-add` 300-answer-word cap (implemented by §1 here) |
+| PR #76 (`claude/issue-67-review-8v65i1`) | Adaptive-claim-packing **measurement layer**; feeding a multi-day epoch-0 run ending Friday afternoon |
+| `adaptive_claim_packing.md` | The packing plan PR #76 instruments; proceeds on its own gates, orthogonal to this plan |
+| PR #78 (`claude/wordle-search-algorithm-kv7kij`) | This document |
+
+The three multiplicative levers this plan is built on, against the measured
+baseline of ~900 branch sweeps/day (`adaptive_claim_packing.md` §1):
+
+| Lever | Expected gain | Where |
 |---|---|---|
-| Claim packing (coordination overhead) | ~5–6× | Planned in `adaptive_claim_packing.md`; measurement layer on `claude/issue-67-review-8v65i1` |
-| Vectorized partition kernel (NumPy) | ~10–50× on node rate and on the warm-cache sweep floor | This plan, §2–§5 |
-| Candidate equivalence-class dedupe | up to ~10× on deep branches | This plan, §6 |
+| Claim packing (coordination overhead ~83% of in-loop wall) | ~5–6× | `adaptive_claim_packing.md`, gated on the PR #76 run |
+| Vectorized partition kernel (NumPy) | ~10–50× on node rate and on the warm-cache sweep floor | §2–§5 |
+| Candidate equivalence-class dedupe | up to ~10× on deep branches | §6 |
 
-Plus two prerequisites that are not speedups but are mandatory for the goal:
-removing the `queue-add` branch-size cap (§1 — a full tree needs every branch),
-and a monster-branch calibration solve (§7 — the current telemetry contains no
-branch over 300 answer words, so no schedule estimate is trustworthy without one).
+Plus two prerequisites that are not speedups: uncapping `queue-add` (§1 — a
+full tree needs every branch) and a monster-branch calibration solve (§7 — the
+current telemetry contains no branch over 300 answer words, so no schedule
+estimate is trustworthy without one).
 
-Each section below is scoped to be independently implementable: it names the
-files touched, the exact behaviour change, and the acceptance tests. Sections
-marked **[independent]** can be done in any order; others list their
-prerequisites.
+**All file:line references in this document are against `main` @ `364566a`.**
+PR #76 changes `wordle_engine.py`, `erd_queue.py`, `erd_swarm.py`, and
+`erd_search.py`; after it merges, re-locate by symbol name, not line number.
 
 ---
 
-## §0. Ground rules (read before implementing any section)
+# Part I — Context
 
-These are absolute constraints, in the spirit of `adaptive_claim_packing.md` §3:
+## C1. Vocabulary and identifier glossary
 
-1. **Vectorization must be result-identical, not just value-close.** The NumPy
-   paths in §2–§5 replace *how* a quantity is computed, never *which* quantity
-   or *in what order* candidates are evaluated. For a fixed branch and budget,
-   the solve must produce the **identical winning guess, identical ERD (bit-for-
-   bit), and identical `max_remaining_depth`** as the pure-Python path. This is
-   achievable because the plan requires identical candidate ordering (stable
-   sorts on the same integer keys) and identical response-group ordering — so
-   every floating-point sum happens in the same order.
-2. **The pure-Python path stays.** Every vectorized function has the existing
-   implementation as its fallback, selected by NumPy availability at import.
-   Pythonista bundles NumPy, but the fallback guarantees the phone (and the
-   tests) never *require* it.
-3. **Old-NumPy-safe APIs only.** Pythonista's bundled NumPy can lag years behind.
-   Allowed: `frombuffer`, `bincount`, `argsort(kind='mergesort')` (stable),
-   `add.at`, basic fancy indexing, `nonzero`, `unique`. Forbidden:
-   `kind='stable'` (needs ≥1.15), `unique(axis=...)` semantics beyond 1D unless
-   guarded, anything newer.
-4. **No estimated value ever bounds the search.** Unchanged from the packing
-   plan: `best_erd` is tightened only by exact solved costs or admissible lower
-   bounds. Nothing in this plan touches that; a reviewer should verify each
-   section preserves it.
-5. **Deployment discipline.** Any section that changes worker behaviour follows
-   SWARM.md's stop → deploy → start sequence, and any section that changes node
-   *timing* (§4, §5, §6) must bump the telemetry epoch (`telemetry_epoch`,
-   `run_meta.epoch` — the §9.1 machinery from the packing plan) so cost-model
-   fits never mix node rates from different kernels.
+The four anchored terms (CLAUDE.md) apply everywhere: **guess** (a word
+actually played), **candidate** (a word under evaluation, not yet played),
+**branch** (the remaining answer words after a guess + response), and the four
+qualified depth terms (**guess_depth**, **budget**, **ERD**,
+**max_remaining_depth**). Never write a bare `depth`.
+
+Additional identifiers used throughout this plan:
+
+| Identifier | Type | Meaning |
+|---|---|---|
+| `n` | int | Number of answer words in the branch under evaluation (`len(branch_words)`). |
+| `branch_words` | list[str] | The branch's answer words. |
+| `candidate_list` | list[str] | Candidate vocabulary swept at a node; the full ~12,972 words for `ERD_ALL`. |
+| `pattern` / `pattern_int` | int 0–242 | A response encoded base-3 (gray=0, yellow=1, green=2), most-significant digit first. 242 = all-green. |
+| response group | — | One cell of the partition of `branch_words` by the response each word would give to a candidate. Not "subgroup". |
+| `groups` | dict[int, list[str]] | `{pattern_int: response group}` for one candidate against one branch (`ResponseCache.group_words`). |
+| `G` | int | `len(groups)` — number of non-empty response groups, including the self group when present. |
+| `has_self` | bool/int | Whether the all-green pattern is present, i.e. the candidate itself is in `branch_words`. |
+| `best_erd` | float | The running branch-and-bound bound at a node: the best exact candidate cost found so far (or the alpha-beta `ceiling` it was seeded with). |
+| `cost_lb` | float | Admissible lower bound on one candidate's cost — see C2.1. |
+| `rest_lb` | list[float] | Admissible lower bound on the weighted cost of the response groups after position i (`wordle_engine.py:1050`). |
+| `subset_idx` | np.ndarray[int32] | New in this plan: a branch expressed as indices into the canonical answer-word list (column indices of the pattern matrix). |
+| `counts` | np.ndarray[int32] (G_vocab × 243) | New in this plan: response-group sizes of every candidate against one branch, one row per candidate. |
+| `answer_list_id` | str | SHA-256 identity of the answer universe; keys every cache table. |
+| `branch_key` | bytes | `ScoreCache.encode_subset(branch_words)`: sorted words concatenated, 5 bytes/word. |
+| epoch | int | Telemetry era from PR #76 (`telemetry_epoch` table, `run_meta.epoch`). Epoch 0 = single-candidate-claim baseline. |
+
+## C2. The two quantities every implementer must understand
+
+Both are exact, derived quantities — not heuristics. Getting either subtly
+wrong corrupts pruning decisions or evaluation order, which corrupts cached
+results.
+
+### C2.1 `cost_lb` — the candidate cost lower bound
+
+Defined at `wordle_engine.py:1026`:
+
+```python
+cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+```
+
+**Meaning:** the lowest ERD this candidate could possibly achieve on this
+branch, granted the most optimistic continuation imaginable. Derivation:
+
+- Playing the candidate costs 1 guess, always.
+- A non-self response group of size k then costs at least `2 − 1/k` expected
+  further guesses: the best conceivable next guess identifies every word in
+  the group immediately, so one word costs 1 more guess and the other k−1 cost
+  2 more, mean `(1 + 2(k−1))/k = 2 − 1/k`. Nothing can beat this.
+- The self group (the candidate itself, if it is in `branch_words`) costs 0
+  further guesses.
+
+Summing `1 + Σ (k_i/n)(2 − 1/k_i)` over non-self groups and simplifying gives
+exactly `3 − (G + has_self)/n`. Intuition: "3 minus the resolution rate" —
+each additional response group moves one more answer word from the
+2-more-guesses column toward the 1-more-guess column, lowering the bound by
+`1/n`. More groups ⇒ lower bound ⇒ stronger candidate.
+
+**Why it is safe to prune with:** it is *admissible* — never higher than the
+candidate's true cost — so `cost_lb >= best_erd` proves the candidate cannot
+beat the current best and can be discarded with zero recursion. This one-line
+gate is why 99.4% of measured claims cost <10 nodes.
+
+**Naming:** `cost_lb` violates the no-abbreviations rule; §9 proposes the
+rename (`candidate_cost_lower_bound`) and when it is safe to do.
+
+### C2.2 `Σk²` — the sum of squared response-group sizes
+
+The best-first sort key at `wordle_engine.py:1181-1186`:
+
+```python
+key=lambda c: sum(k * k for k in cache.group_counts(c, branch_words).values())
+```
+
+**Meaning:** `Σk²/n` is the **expected number of answer words remaining after
+playing the candidate**. The answer lands in response group i with probability
+`k_i/n`, and then exactly `k_i` words remain, so
+`E[remaining] = Σ (k_i/n) · k_i = Σk²/n`. The engine sorts by `Σk²` (same
+ordering, skips the division). Ascending order = strongest expected splitter
+first, which tightens `best_erd` after the fewest evaluations.
+
+**The square is not a tuning knob.** The k² arises because group size appears
+twice for structural reasons: once as the probability weight of landing in the
+group (`k/n`) and once as the size of what you are then left with (`k`). It is
+a probability-weighted mean, not a variance-flavored penalty. This is the same
+quantity as the `WEIGHTED_AVG` scoring method (`Σk²/N`, `score_groups` at
+`wordle_engine.py:459`), so the sort and the scoring method must stay
+consistent — there is one definition, used twice.
+
+**Ordering is correctness-relevant even though it is "just" ordering:** when
+two candidates have exactly equal optimal ERD, the one evaluated *first* wins
+`best_guess` (strict `<` at `wordle_engine.py:1224`). Any change that reorders
+equal-`Σk²` candidates can change which tied word is cached as `best_guess` —
+not wrong, but no longer byte-identical, which breaks the equivalence tests
+this plan relies on. Hence the stable-sort requirements in §4/§5.
+
+## C3. Coordination with the measurement run (PR #76) — schedule constraints
+
+**State as of Wednesday Jul 2:** PR #76 landed the measurement layer
+(telemetry epochs, `branch_finalize_log`, `candidate_accuracy`
+predicted-vs-actual stream, cost model re-keyed on
+`(policy, size_bucket, budget)`, censoring). The swarm is mid-way through a
+multi-day epoch-0 run on the Linux box, expected to finish **Friday
+afternoon**. After it ends, `analyze_epoch0.py` is the go/no-go gate for the
+packer metric. The owner intends to merge PR #76 to `main` when the run
+completes.
+
+Rules that follow:
+
+1. **Nothing in this plan deploys to the Linux box before the run ends.**
+   Deploying mid-run would mix node-timing regimes inside epoch 0 and violate
+   the stop-workers-before-deploy rule (SWARM.md).
+2. **Engine/swarm/queue sections (§1, §4, §5, §6) branch from `main` only
+   after PR #76 merges.** They touch the same files
+   (`wordle_engine.py:evaluate_candidate` now carries a `metric_observer`
+   hook; `erd_search.py`, `erd_swarm.py`, `erd_queue.py` all changed).
+   Implementing them against pre-merge `main` guarantees painful rebases and
+   risks silently dropping PR #76's instrumentation.
+3. **New-file sections (§2, §3) and the doc section (§9's SWARM.md fix) can
+   be implemented immediately** — `pattern_matrix.py` and its tests touch
+   nothing PR #76 touches. §8 (export) touches `erd_search.py` and should
+   also wait for the merge (the conflict is small but nonzero).
+4. **Any section that changes node timing (§4, §5, §6) must bump the
+   telemetry epoch on deploy** using PR #76's own machinery
+   (`ERDQueue.set_epoch`, a new `telemetry_epoch` row with a descriptive
+   label and git SHA), so cost-model fits never mix node rates from
+   different kernels. One epoch bump per deploy, not per section.
+5. **The `metric_observer` contract must be preserved.** PR #76 feeds
+   `candidate_accuracy` from a hook in `evaluate_candidate`. §4's pre-gating
+   and §6's dedupe both *skip* `evaluate_candidate` calls; each section below
+   states what the observer must still see. Read
+   `test_claim_packing_measurement.py` on merged `main` before touching the
+   candidate loop.
+
+**Suggested calendar** (owner's stated intent, made explicit):
+
+| When | What |
+|---|---|
+| Now → Friday | §2, §3 implemented and reviewed (new files only, no deploy). §9's SWARM.md `ROOT_BUDGET` fix. Optionally §8 drafted but not merged. |
+| Friday afternoon | Epoch-0 run ends. Owner runs `analyze_epoch0.py`; packer go/no-go decided (that track proceeds independently per `adaptive_claim_packing.md` §10). |
+| After PR #76 merges | §1, §4 branched from `main`, implemented, tested, deployed together (one worker restart, one epoch bump). Then §7 calibration. |
+| After §7 numbers | Decide §5/§6 scope; §8 lands before the first full-tree phone sync. |
+
+## C4. The phone usage model — three modes the plan must serve
+
+The cache is exported from Linux and imported into Pythonista on the iPhone
+(SWARM.md, `erd_search.py export`). Three distinct phone workloads:
+
+**Mode A — on-tree descent (the daily solve).** Play the cached best guess,
+enter Wordle's feedback, look up the resulting branch, repeat. Requires: the
+branch row for every position on any best-ERD path from any opener the owner
+actually starts with. §8's reachable-only export covers this by construction.
+
+**Mode B — off-tree recovery (mistyped feedback).** The owner occasionally
+mistypes a response into the tool, plays the (now wrong) suggested word in
+real Wordle, and is stranded on a branch no best-ERD path reaches. Wordle has
+no undo. The tool must still descend well from there. **This already works
+and is not an export problem:** `ERDSolver` (`wordle.py:2749`) live-solves
+the *current* branch with `min_expected_guesses`, consulting the cache for
+every sub-branch it touches — an off-tree branch's subtree overlaps heavily
+with cached on-tree subtrees, so the live solve is far cheaper than cold.
+Two verification items for §8's acceptance:
+  - **(B-1) Measure it:** time a live `ERDSolver` run in Pythonista on
+    representative off-tree branches (n ≈ 10, 40, 100) against a
+    reachable-only cache. Unknown U5 in C5. If n ≈ 100 takes minutes, the
+    fallback plan is a coarser first step (entropy ranking, already instant)
+    while `ERDSolver` refines in the background — which is exactly how the
+    interactive flow already behaves.
+  - **(B-2) Budget question (investigate, do not silently change):**
+    `ERDSolver` calls `min_expected_guesses` with no `budget`, i.e. the
+    unconstrained optimum. Late in a recovered game, the unconstrained-optimal
+    guess is not necessarily feasible within the guesses actually remaining
+    (its `max_remaining_depth` may exceed them). Confirm the behaviour,
+    document it, and propose (in conversation, not code) whether the
+    interactive solver should pass `budget = GAME_GUESSES − guess_depth`.
+
+**Mode C — family analysis (the ALIBI question).** The owner's sons play
+independently and compare afterward; the owner wants to say *precisely* how
+good or bad their choices were: root ERD of an arbitrary opener (e.g. ALIBI),
+words remaining at each of their steps, and what better choices existed.
+Consequences for this plan:
+
+- **Any first guess is covered by §8 as specified**, because the reachable
+  export's *seed set* is every (opener, pattern) branch for **all ~13k
+  openers** — not just the owner's favorites. A son's opener + its actual
+  response is a seed row: the phone has its best guess, its ERD, and the
+  whole best-ERD descent under it.
+- **The opener's root ERD is computable from those same rows** — it does not
+  need to be stored per opener, but it does need every branch of that opener
+  present (including the monster branches — another reason §1 precedes the
+  full run). §8b adds the small reporting command that does the arithmetic.
+- **A son's second-and-later off-best guesses** leave the exported tree, the
+  same as Mode B, and are served the same way: live `ERDSolver` on the
+  branch, heavily cache-assisted. If U5 measurement shows this is too slow on
+  the phone for comfortable dinner-table use, the escalation path is a small
+  HTTP lookup service on the Linux box exposing the *full* Linux cache
+  (which contains far more than the reachable export) to Pythonista. That
+  service is explicitly **out of scope for this plan** — noted here so the
+  option is not forgotten. Decide after U5 is measured.
+
+## C5. Assumptions and unknowns register
+
+Every schedule claim in this plan rests on these. Confirm or measure each;
+record the answer next to it when known.
+
+| # | Unknown / assumption | How to resolve | Blocks |
+|---|---|---|---|
+| U1 | NumPy version bundled in Pythonista on the owner's phone (§0 rule 3 assumes it may be years old). | Owner runs `import numpy; print(numpy.__version__)` in Pythonista, reports back. | §2 API choices if older than assumed |
+| U2 | Pattern-matrix memory: ~12,972 × ~3,185 uint8 ≈ 41MB. Six worker processes must not hold six private copies. | §2 persists a `.npy` and workers load with `mmap_mode='r'` (OS page cache shares one copy). Confirm RSS with 6 workers running. | §4 deploy |
+| U3 | Monster-branch cost (branches over 300 answer words) — zero data today. | §7 calibration solve; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | The whole-job schedule |
+| U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
+| U5 | Phone live-solve latency on off-tree branches (Modes B/C) with a reachable-only cache. | Timed `ERDSolver` runs in Pythonista at n ≈ 10 / 40 / 100. | Whether Mode C needs the out-of-scope lookup service |
+| U6 | The packer metric passes the `analyze_epoch0.py` gate (Spearman on load-bearing claims, log-log slope ≈ 1). | Friday's run + the gate script. | The packing lever (not this plan's sections) |
+| U7 | Top-level branch count: estimated 1.5–2M distinct (opener, pattern) subsets with ≥ 2 words. | §7's census script computes it exactly (cheap once §2 exists). | Schedule precision; §8 export size projection |
+| U8 | Exact-equality equivalence between pure-Python and vectorized paths is achievable (stable ordering everywhere). | §4/§5/§6 acceptance tests enforce it; any failure is a design bug to fix, not a tolerance to widen. | §4, §5, §6 |
+
+---
+
+# Part II — Ground rules (every section, every implementer)
+
+1. **Result-identical vectorization.** The NumPy paths replace *how* a
+   quantity is computed, never *which* quantity or *in what order* candidates
+   or response groups are considered. For a fixed branch and budget, the solve
+   must produce the **identical `best_guess`, bit-identical ERD, and identical
+   `max_remaining_depth`** as the pure-Python path, and the identical set of
+   cache writes. Identical ordering ⇒ identical float summation order ⇒
+   bit-identical results. If a test needs a tolerance, the implementation is
+   wrong (see C2.2's tie-order note and U8).
+2. **The pure-Python path stays, permanently.** Every vectorized function has
+   the existing implementation as its fallback, selected once at import
+   (`pattern_matrix.available()`). The engine must import and pass its full
+   test suite with NumPy absent. Pythonista bundles NumPy, but the fallback
+   guarantees the phone and the tests never *require* it.
+3. **Old-NumPy-safe APIs only** (pending U1). Allowed: `np.frombuffer`,
+   `np.bincount`, `argsort(kind='mergesort')` (stable since ancient versions),
+   `np.add.at`, basic/fancy indexing, `np.nonzero`, 1-D `np.unique`,
+   `np.load(..., mmap_mode='r')`. Forbidden: `kind='stable'` (1.15+),
+   `np.unique(axis=...)` (1.13+ and slow), anything newer, anything from
+   `numpy.typing`.
+4. **No estimated value ever bounds the search** (same law as
+   `adaptive_claim_packing.md` §3): `best_erd` is tightened only by exact
+   solved costs or admissible lower bounds (`cost_lb`, `rest_lb`, the
+   `_CEIL_EPS`-padded ceiling). Nothing in this plan introduces a new bound;
+   reviewers verify each section preserves this.
+5. **Deployment discipline.** Sections that change worker behaviour follow
+   SWARM.md: stop supervisor → verify workers gone → deploy → start. Sections
+   that change node *timing* (§4, §5, §6) additionally bump the telemetry
+   epoch (C3 rule 4). Never let old workers outlive an engine change.
 6. **Tests before push.** `python -m unittest discover -s . -p 'test_*.py'`
-   passes before every commit that gets pushed.
+   green before every pushed commit. New behaviour ⇒ new tests in the same
+   commit.
+7. **Vocabulary and naming.** CLAUDE.md rules apply to every new identifier:
+   full words, no abbreviations, acronyms uniform-cased, scoring methods by
+   their canonical names, "response group" not "subgroup", no bare `depth`.
+8. **Comment style.** Comments describe what the code *is* and its
+   invariants — never the change history, never "replaces the old X".
 
 ---
 
-## §1. Remove the `queue-add` 300-answer branch-size cap **[independent]**
+# Part III — The work
 
-Tracked as a GitHub issue; this section is its implementation.
+Each section states: what to read first, current behaviour, the change,
+step-by-step detail, edge cases, what to measure, acceptance criteria, and
+what is explicitly out of scope. "Definition of done" = all acceptance items
+checked, suite green, docs touched if named.
 
-**Problem.** `erd_search.py` `cmd_queue_add` skips any branch with more than
-`--max-branch-size` answer words, default 300 (`erd_search.py:1629`, skip logic
-at `erd_search.py:291` and `:303`). An opener's root ERD is
-`1 + Σ (k/n)·ERD(branch)` over **all** of its response branches, so skipping
-the large ones (every weak opener's all-gray branch is 300–1,900 words) makes
-every root ERD uncomputable. The cap also means the swarm's telemetry contains
-zero data about large branches.
+## §1. Remove the `queue-add` 300-answer branch-size cap — implements issue #77
+
+**Read first:** issue #77; `erd_search.py` `cmd_queue_add` (line 238) and the
+argparse block (line 1625); SWARM.md "Add branches to the queue".
+**Prerequisite:** PR #76 merged (touches `erd_search.py`).
+
+**Current behaviour.** `--max-branch-size` defaults to 300
+(`erd_search.py:1629`). Single-branch adds print-and-skip above it
+(`erd_search.py:291-295`); whole-word adds filter silently
+(`erd_search.py:303`). Consequence: every opener's largest branches — the
+all-gray branch of a weak opener is 300–1,900 answer words — have never been
+queued, solved, or measured, and no opener's root ERD is computable.
 
 **Change.**
-- Default `--max-branch-size` to unlimited (`None`); when `None`, queue every
-  branch with ≥ 2 answer words. Keep the flag so an explicit cap can still be
-  passed for deliberately bounded runs.
-- Update the `--max-branch-size` help text, the `cmd_queue_add` docstring, and
-  the SWARM.md `queue-add` examples (drop "skips branches with >300 answer
-  words"; document the flag as an optional bound).
+1. Default `--max-branch-size` to `None`. Help text: "Skip branches with more
+   than N answer words (default: no limit)".
+2. Where the cap is applied, treat `None` as unlimited:
+   `if args.max_branch_size is not None and len(branch) > args.max_branch_size`.
+   The `>= 2` lower bound is unchanged.
+3. SWARM.md: update the `queue-add` example comment ("skips branches with
+   >300 answer words") and the flag description; note the
+   `--max-branch-size 999`+`--priority` example no longer needs the size
+   override for large branches, only the priority.
 
-**Notes.** No engine change is needed: large branches already work — they were
-only filtered at queue time, and sub-branch promotion (`erd_swarm.py`,
-`PROMOTE_MIN_SIZE` / the adaptive publish threshold) is the mechanism that keeps
-one monster from monopolizing a worker. Do **not** mass-queue monsters as part
-of this section; §7 calibrates one first.
+**Edge cases.**
+- `--max-branch-size 0` / negative: leave argparse as-is (queues nothing /
+  nothing above the bound); not worth validation code.
+- Idempotency is untouched: `queue-add` already never duplicates queued
+  branches and only upgrades priority.
+
+**Explicitly out of scope.** Do NOT mass-queue monster branches in this
+section, and do not add any automatic "queue everything" command. §7
+calibrates exactly one monster first; mass-queueing is an operational decision
+taken after U3 is known.
 
 **Acceptance.**
-- `queue-add --word <weak-opener>` queues its all-gray branch (unit test:
-  branch with > 300 words appears in `pending_branches`).
-- `queue-add --word X --max-branch-size 300` reproduces the old behaviour.
-- Existing `test_cli_*` / queue tests pass.
+- New unit test (alongside the existing `cmd_queue_add` tests): a branch with
+  more than 300 answer words is queued when no cap is passed, and skipped when
+  `--max-branch-size 300` is passed explicitly.
+- Existing CLI/queue tests pass unmodified.
+- SWARM.md updated in the same commit.
 
----
+## §2. Pattern matrix module — new file `pattern_matrix.py`
 
-## §2. Pattern matrix module (`pattern_matrix.py`) **[independent; foundation for §3–§6]**
+**Read first:** `ResponseCache` (`wordle_engine.py:352-435`) — the matrix is
+its data, reshaped; `ScoreCache.read_decomposition` / `write_decomposition`
+(`cache_sqlite.py`); C1 glossary; ground rules 2–3.
+**Prerequisite:** none (new file). Can start immediately.
 
-A new module owning one object:
+**What it is.** One class owning a single `uint8` array:
 
 ```python
 class PatternMatrix:
-    """uint8 matrix of encoded response patterns: rows = guess words in
-    canonical guess-list order, columns = answer words in canonical
-    answer-list order.  matrix[g, a] == encoded pattern (0-242) of guess g
-    against answer a — exactly the byte ResponseCache stores per guess."""
+    """Response patterns for every (guess, answer) pair.
+
+    matrix[g, a] is the encoded response pattern (0-242) of guess word g
+    (row, canonical guess-list order) against answer word a (column,
+    canonical answer-list order) — exactly the byte ResponseCache stores
+    per guess, all guesses stacked.
+    """
 ```
 
-**Construction.** Rows are exactly the `ResponseCache` decomposition blobs
-(one byte per answer, canonical order — `wordle_engine.py:352-435`). Build by
-stacking `np.frombuffer(blob, dtype=np.uint8)` for each guess word, loading
-blobs through the existing `ScoreCache.read_decomposition` path and computing
-(and persisting) any that are missing, same as `ResponseCache._ensure`. Size:
-12,972 × ~3,185 ≈ 41MB — fine on Linux and on a modern iPhone.
+Shape (~12,972 × ~3,185) ≈ 41MB. Rows are byte-for-byte the
+`ResponseCache` decomposition blobs.
 
-API (all pure NumPy, no engine imports beyond the encoders):
+**Construction and persistence.**
+- `PatternMatrix.build(guess_words, answer_words, score_cache=None)`:
+  for each guess word, obtain its decomposition blob — from
+  `score_cache.read_decomposition(guess)` when available, else compute via
+  `calculate_response` + `_encode_response` per answer (and write it back
+  through `score_cache.write_decomposition`, so building the matrix also
+  warms the SQLite decomposition table). Stack with
+  `np.frombuffer(blob, dtype=np.uint8)` into the matrix.
+- `PatternMatrix.save(path)` / `PatternMatrix.load(path, guess_words,
+  answer_words)`: persist as `.npy`; load with `np.load(path,
+  mmap_mode='r')` so N worker processes share one page-cached copy (U2).
+  The filename embeds `answer_list_id` (and the guess-list length) so a
+  stale file for a different universe can never be loaded; on any shape or
+  identity mismatch, rebuild.
+- `pattern_matrix.available() -> bool`: True iff NumPy imported successfully.
+  This module is the **only** place the engine imports NumPy, and the import
+  is guarded.
 
-- `PatternMatrix.build(guess_words, answer_words, score_cache=None)`
-- `guess_index(word) -> int`, `answer_indices(words) -> np.ndarray[int32]`
-- `row(guess_word) -> np.ndarray[uint8]` (length = n_answers)
-- `counts_for_all_candidates(subset_idx) -> np.ndarray[int32]` of shape
-  `(n_guesses, 243)`: response-group sizes of **every** candidate against the
-  branch identified by `subset_idx`, in one shot. Implementation is the
-  offset-bincount trick:
+**Index plumbing.**
+- `guess_index(word) -> int` (KeyError on unknown — callers decide fallback).
+- `answer_indices(words) -> np.ndarray[int32]` — a branch as column indices;
+  raises on any word not in the answer universe (see §5 for the fallback
+  path; the swarm's branches are always answer subsets).
 
-  ```python
-  sub = self.matrix[:, subset_idx]                     # (G, n) uint8
-  flat = sub.astype(np.int64) + np.arange(G)[:, None] * 243
-  counts = np.bincount(flat.ravel(), minlength=G * 243).reshape(G, 243)
-  ```
-
-  For n = 100 that is ~1.3M elements through one C loop — milliseconds, versus
-  ~13k Python-level `group_counts` calls.
-
-- `patterns_for_candidates(candidate_idx, subset_idx) -> np.ndarray[uint8]` of
-  shape `(len(candidate_idx), n)` — raw pattern rows restricted to a branch
-  (used by §5 and §6).
-
-Optionally cache the built matrix as an `.npy` file next to the SQLite cache,
-keyed by `answer_list_id` in the filename, to skip the blob-stacking on every
-process start (worker recycling every 3h makes startup cost matter). Loading
-41MB from disk is near-instant; rebuilding from SQLite blobs is seconds.
-
-**Acceptance.**
-- New `test_pattern_matrix.py`: for ~200 random (guess, answer) pairs,
-  `matrix[g, a] == _encode_response(calculate_response(guess, answer))`.
-- For ~20 random (candidate, subset) pairs, `counts_for_all_candidates`
-  row equals `ResponseCache.group_counts` as a dict (zeros dropped).
-- Module imports and degrades cleanly when NumPy is absent
-  (`PatternMatrix.available()` → False; nothing else imports NumPy at top level
-  of the engine).
-
----
-
-## §3. Vectorized candidate statistics (in `pattern_matrix.py`) — requires §2
-
-Derived, whole-vocabulary vectors from one `counts_for_all_candidates` result.
-These are the quantities the engine currently derives per candidate in Python:
-
-| Vector | Formula (per row `c` of `counts`) | Engine twin |
-|---|---|---|
-| `n_groups` | `(counts[c] > 0).sum()` | `len(groups)` |
-| `has_self` | `counts[c, 242] > 0` (all-green occurs iff candidate ∈ branch) | `_ALL_GREEN_PATTERN in groups` |
-| `cost_lb` | `3.0 - (n_groups + has_self) / n` | `wordle_engine.py:1026` |
-| `sum_k_squared` | `(counts[c] ** 2).sum()` (int64) | sort key at `wordle_engine.py:1184` |
-| `max_group_size` | `counts[c].max()` | `score_groups` MAX_GROUP_SIZE |
-| `entropy_gain` | `-Σ p log2 p` over nonzero sizes | `score_groups` ENTROPY_GAIN |
-
-Package as `candidate_stats(subset_idx) -> dict of named vectors` (or a small
-NamedTuple of arrays). `sum_k_squared` must be integer (exact), so the §4 sort
-key is identical to the Python `sum(k*k for k in ...)`.
-
-**Acceptance.** For several fixed branches (sizes ~8, 30, 100, 500), every
-vector matches the per-candidate Python computation exactly (integers equal;
-floats to full precision for `cost_lb`, `<1e-12` for entropy). Include a branch
-containing candidate words (so `has_self` varies) and one not.
-
----
-
-## §4. Engine integration: vectorized ranking and gating — requires §3
-
-The highest-value change: eliminate the two per-candidate Python sweeps that
-run at **every** solved node with `n >= ORDER_MIN_N`, including nodes where
-everything below is a cache hit.
-
-**4a. Best-first sort** (`wordle_engine.py:1181-1186`). Today:
+**The core primitive** — response-group sizes of *every* candidate against a
+branch, one call:
 
 ```python
-candidate_list = sorted(candidate_list,
-    key=lambda c: sum(k*k for k in cache.group_counts(c, branch_words).values()))
+def counts_for_all_candidates(self, subset_idx):
+    """(n_guesses, 243) int32: counts[g, p] = number of words in the branch
+    whose response to guess-word g encodes to pattern p."""
+    sub = self.matrix[:, subset_idx]                        # (G_vocab, n) uint8
+    flat = sub.astype(np.int64) + (np.arange(self.n_guesses,
+                                             dtype=np.int64)[:, None] * 243)
+    return np.bincount(flat.ravel(),
+                       minlength=self.n_guesses * 243
+                       ).reshape(self.n_guesses, 243).astype(np.int32)
 ```
 
-Replace, when a `PatternMatrix` is available, with `sum_k_squared` from §3 and
-a **stable** argsort (`kind='mergesort'`) over the keys *in `candidate_list`
-order*. Python's `sorted` is stable, so equal-key candidates keep their
-`candidate_list` order; the mergesort argsort reproduces exactly that. This is
-what makes §0 rule 1 (identical winner) hold — do not skip the stability
-requirement.
+One C-speed pass over `n_guesses × n` elements (~1.3M for n = 100 —
+milliseconds) replacing ~13k Python-level `group_counts` calls (~seconds).
+Also provide `patterns_for_candidates(candidate_idx, subset_idx)` returning
+the raw `(len(candidate_idx), n)` uint8 slice (§5, §6 reuse it).
 
-**4b. Pre-gating.** In `_solve_subset`'s candidate loop, before calling
-`evaluate_candidate`, consult the precomputed `cost_lb` vector: if
-`cost_lb[c] >= best_erd` (current running bound), record the same outcome the
-engine would have produced (`OVER_ERD_LIMIT` → `cutoff_occurred = True`) and
-skip the call. This is decision-identical to `evaluate_candidate`'s own gate at
-`wordle_engine.py:1027` — same admissible bound, same comparison, evaluated
-against the same running `best_erd` — but costs an array lookup instead of a
-full `group_words` partition. The mid-loop publisher overrun check must still
-run per iteration exactly as today (`wordle_engine.py:1211-1217`).
-
-**4c. Plumbing.** Thread one shared `PatternMatrix` instance the same way
-`ResponseCache` is shared today:
-
-- `erd_swarm.py`: `_BranchWorker` builds/loads it once per process, next to its
-  `ResponseCache`.
-- `wordle.py`: build lazily at session start when NumPy is present (interactive
-  use benefits too, e.g. the `s`/`b` full-vocabulary scoring commands can use
-  §3 vectors — optional, separate commit).
-- Signature suggestion: give `_solve_subset` / `min_expected_guesses` an
-  optional `pattern_matrix=None` parameter, defaulting to the current behaviour.
-
-**4d. Epoch bump.** Node timing changes → new `telemetry_epoch` row (label
-`"numpy-kernel"`) on deploy, per §0 rule 5.
+**What to measure.** Build time cold (all blobs computed) and warm (all blobs
+in SQLite); `.npy` load time; `counts_for_all_candidates` wall time at
+n ∈ {8, 30, 100, 300, 1000}; peak RSS with the matrix mmap-loaded in 6
+processes (U2).
 
 **Acceptance.**
-- Equivalence test (the core deliverable): for a fixed set of branches (sizes
-  ~8, 30, 81, 146 — reuse the `diag_order_tune.py` branch fixtures if
-  convenient), solve with `pattern_matrix=None` and with the matrix; assert
-  **identical** best_guess, ERD (exact float equality), `max_remaining_depth`,
-  and identical cache writes.
-- Benchmark script `diag_kernel_bench.py` (new): times both paths on the same
-  branches, prints speedup; asserts result equality. Not part of the unittest
-  suite (it is a diagnostic like the other `diag_*.py`).
-- Full test suite passes with and without NumPy importable (run once with
-  NumPy hidden via a test that monkeypatches availability, or a CI env split).
+- New `test_pattern_matrix.py`:
+  - ~200 random (guess, answer) pairs:
+    `matrix[g, a] == _encode_response(calculate_response(guess, answer))`.
+  - ~20 random (candidate, branch) pairs: the nonzero entries of
+    `counts_for_all_candidates(subset_idx)[g]` equal
+    `ResponseCache.group_counts(candidate, branch_words)` as a dict.
+  - Save/load round-trip equals the built matrix; identity mismatch rebuilds.
+  - With NumPy absent (simulated via import guard), `available()` is False
+    and importing the module (and the engine) still succeeds.
+- No file outside `pattern_matrix.py` + its test file is modified.
 
----
+## §3. Vectorized candidate statistics — extends `pattern_matrix.py`
 
-## §5. Vectorized group partitioning (`group_words` fast path) — requires §2; do after §4 and only if profiling justifies it
+**Read first:** §2; C2 (both derivations); `score_groups`
+(`wordle_engine.py:441-477`); the `cost_lb` line (`wordle_engine.py:1026`).
+**Prerequisite:** §2.
 
-After §4, the remaining per-node Python cost is `cache.group_words` inside each
-non-gated `evaluate_candidate` (`wordle_engine.py:1013`) — one Python loop over
-the branch per candidate that survives gating. Replace its interior with the
-matrix while preserving the exact structure the recursion depends on:
+**What it is.** From one `counts_for_all_candidates` result, the
+whole-vocabulary versions of the quantities the engine currently derives one
+candidate at a time. Return a small NamedTuple of parallel arrays, index =
+guess-word row:
 
-- Compute `pats = matrix[g, subset_idx]`, then build the `{pattern: [words]}`
-  dict. **Group iteration order must match today's** (first-appearance order of
-  each pattern while walking the subset, because `evaluate_candidate` sorts
-  groups by size with a *stable* sort — `wordle_engine.py:1038` — so tie order
-  inherits dict insertion order, and a different tie order can change which of
-  several equal-ERD winners is found first). Recipe: stable-argsort `pats`,
-  find group boundaries, then emit groups ordered by each pattern's first index
-  in the subset. Words within a group keep subset order (stable argsort gives
-  this for free).
-- Membership fallback for words outside the answer universe stays (the
-  `_answer_index.get(word) is None` path at `wordle_engine.py:412-415` /
-  `:424-429`) — branch words are always answers in the swarm path, but the
-  interactive fallback mode can pass non-answers; route those through the
-  existing per-word path.
+| Field | dtype | Formula per row `c` | Engine twin |
+|---|---|---|---|
+| `group_count` | int32 | `(counts[c] > 0).sum()` | `len(groups)` |
+| `has_self` | bool | `counts[c, 242] > 0` (all-green ⇔ candidate ∈ branch) | `_ALL_GREEN_PATTERN in groups` |
+| `cost_lower_bound` | float64 | `3.0 - (group_count + has_self) / n` | `cost_lb`, `wordle_engine.py:1026` |
+| `sum_squared_group_sizes` | int64 | `(counts[c].astype(int64) ** 2).sum()` | sort key, `wordle_engine.py:1184` |
+| `max_group_size` | int32 | `counts[c].max()` | `score_groups` MAX_GROUP_SIZE |
+| `entropy_gain` | float64 | `-Σ p·log2(p)` over nonzero sizes, `p = k/n` | `score_groups` ENTROPY_GAIN |
 
-This is a drop-in inside `ResponseCache.group_words` (accepting an optional
-precomputed index array), so no engine call sites change.
+Notes for the implementer:
+- `sum_squared_group_sizes` **must be integer** — it is compared for exact
+  ordering equality with Python's `sum(k*k ...)`; int64 cannot overflow
+  (worst case 3,200² × 243 ≈ 2.5e9 « 2⁶³).
+- `cost_lower_bound` must be computed as `3.0 - (g + s) / n` with float64
+  division — the same expression shape as the engine line — so the float is
+  bit-identical to the scalar computation.
+- Entropy: mask zeros before `log2`; accumulate in float64. This one is
+  allowed `<1e-12` test tolerance (the engine's own accumulation order over a
+  dict is not canonical), because nothing orders or prunes on entropy at
+  solve time — it is a display/ranking aid (`rank_candidates_by_...` tie
+  break). Everything else: exact.
 
-**Acceptance.** Property test: for random (guess, subset) pairs, new and old
-`group_words` return dicts equal in keys, values, **and iteration order**. The
-§4 equivalence test re-run with §5 enabled still shows identical solve results.
+**Acceptance.** In `test_pattern_matrix.py`: for fixed branches of sizes
+{8, 30, 100, 500} (at least one containing candidate words and one not),
+every field matches the per-candidate Python computation — integers exactly,
+`cost_lower_bound` exactly, entropy within 1e-12.
 
----
+## §4. Engine integration: vectorized ranking and pre-gating
 
-## §6. Candidate equivalence-class dedupe — requires §2; independent of §4/§5
+**Read first:** `_solve_subset` in full (`wordle_engine.py:1097-1259`);
+`evaluate_candidate` (`wordle_engine.py:971-1094`); C2.2's tie-order warning;
+C3 rules 2, 4, 5 (merge-first, epoch bump, deploy discipline); the
+`metric_observer` hook and its tests on merged `main`
+(`test_claim_packing_measurement.py`).
+**Prerequisites:** §3, PR #76 merged.
 
-Two candidates that induce the **same partition** of `branch_words` have the
-same ERD against it: the recurrence (`evaluate_candidate`) reads only the
-groups, the self-singleton, and the budget. On deep/small branches most of the
-13k candidates collapse into few classes (e.g. all words whose letters are
-disjoint from the branch's letters induce the single all-gray group).
+This is the highest-value section: it removes the two per-candidate Python
+sweeps that run at **every** solved node with `n >= ORDER_MIN_N` (= 8), even
+nodes where everything beneath is a cache hit.
 
-**Where.** In `_solve_subset`, immediately after the §4a best-first ordering
-and before the candidate loop, when a `PatternMatrix` is available and
-`guesses is not None` (full-vocabulary sweeps only — answers-only sweeps are
-small):
+**4a. Vectorized best-first sort.** Current code
+(`wordle_engine.py:1181-1186`) sorts `candidate_list` by the Python `Σk²`
+scan. Replacement when a matrix is available:
 
-- Signature per candidate = the raw bytes of `matrix[g, subset_idx]`
-  (from `patterns_for_candidates`). Build `{signature: first_candidate_in_order}`;
-  evaluate only the representatives, in their existing order.
+```python
+if pattern_matrix is not None and cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
+    subset_idx = pattern_matrix.answer_indices(branch_words)
+    stats = pattern_matrix.candidate_stats(subset_idx)           # §3
+    keys = stats.sum_squared_group_sizes[candidate_row_indices]  # aligned to candidate_list
+    order = np.argsort(keys, kind='mergesort')                   # stable
+    candidate_list = [candidate_list[i] for i in order]
+```
 
-**Why the winner is unchanged.** The representative is the *earliest* class
-member in the evaluation order. Today, the first evaluated member of a class
-either sets `best_erd` or fails to beat it; later members of the same class
-compute the identical cost and never *strictly* beat it (`cost < best_erd` at
-`wordle_engine.py:1224`), so they can never become `best_guess`. Skipping them
-changes nothing about the result — winner, ERD, and `max_remaining_depth` are
-identical, not merely equivalent. Taint aggregation is also unaffected: a
-skipped member would have produced the same `floor` flag as its representative.
+Correctness argument the implementer must preserve: Python's `sorted` is
+stable, so equal-`Σk²` candidates keep their `candidate_list` relative order;
+`kind='mergesort'` is the stable argsort that reproduces exactly that. The
+keys are integers on both paths, so there is no float-comparison ambiguity.
+Result: byte-identical candidate order, hence identical winner on ties
+(C2.2). Cache the `stats`/`subset_idx` on the frame — 4b and §6 reuse them.
 
-**Scope limit.** Engine-inline solves only. Swarm top-level claiming hands out
-candidates by index (`candidate_claims`), and finalize requires all
-`n_candidates` slots done — claim-level dedupe therefore interacts with the
-claim protocol and belongs with the packing work (a bundle could carry a whole
-class and mark all members done together). Note it in `adaptive_claim_packing.md`
-§12 as an open extension; do not attempt it here.
+If any word in `candidate_list` is missing from the guess vocabulary
+(possible only in exotic interactive states), fall back to the pure-Python
+sort for that node rather than special-casing.
 
-**Cost note.** The signature pass costs one `(G × n)` slice — the same data §4
-already materializes; reuse it rather than re-slicing.
+**4b. Pre-gating in the candidate loop.** Inside the loop at
+`wordle_engine.py:1198`, before calling `evaluate_candidate`:
+
+```python
+if precomputed_cost_lower_bound is not None and \
+        precomputed_cost_lower_bound[i] >= best_erd:
+    cutoff_occurred = True
+    # mid-loop publisher check still runs this iteration (see below)
+    continue
+```
+
+This is decision-identical to the gate `evaluate_candidate` itself applies at
+`wordle_engine.py:1027` — same admissible bound (C2.1), same `>=` comparison,
+against the same running `best_erd` — but costs an array read instead of a
+full `group_words` partition (the dominant cost of a gated candidate).
+
+Three invariants to preserve, each already load-bearing today:
+1. **The mid-loop publisher check runs every iteration** including pre-gated
+   ones (today's loop runs it before the status `continue`s —
+   `wordle_engine.py:1211-1217`). Keep the call order: evaluate-or-skip,
+   then publisher check, then dispatch on status.
+2. **`cutoff_occurred` semantics:** a pre-gated candidate is an
+   `OVER_ERD_LIMIT`-equivalent, so it must set `cutoff_occurred = True`
+   (otherwise a node where *every* candidate is pre-gated would fall through
+   to the "proven unsolvable" branch at `wordle_engine.py:1232-1243` and
+   **write a false loss row** — the single worst bug this section could
+   introduce).
+3. **`metric_observer`:** on merged `main`, decide per its actual contract:
+   either the observer receives the same "gated, ~0 nodes" observation it
+   would have received from `evaluate_candidate`, or pre-gating is disabled
+   when an observer is attached (observers ride swarm claims, where the claim
+   loop — not this inline loop — dominates; disabling there costs little).
+   State the choice in the PR description.
+
+**4c. Plumbing.** Thread one shared `PatternMatrix` exactly the way
+`ResponseCache` is shared:
+- New optional parameter `pattern_matrix=None` on `min_expected_guesses`,
+  `_solve_subset`, `evaluate_candidate` (for its §5 future use), defaulted so
+  every existing caller is unchanged.
+- `erd_swarm.py`: `_BranchWorker` loads (mmap) or builds the matrix once per
+  process, alongside its `ResponseCache`, and passes it down.
+- `wordle.py`: build lazily at session start when `available()`; interactive
+  commands that rank the full vocabulary (`s`, `b`) may use §3 stats in a
+  follow-up commit — optional, not part of this section's acceptance.
+
+**4d. Epoch bump on deploy** (C3 rule 4): new `telemetry_epoch` row, label
+`numpy-kernel`, current git SHA; deploy with the stop→deploy→start sequence.
+
+**What to measure (drives the §5/§6 decision).** New diagnostic
+`diag_kernel_bench.py` (same family as the other `diag_*.py`, not part of the
+unittest suite): for branches of sizes {8, 30, 81, 146, 500}, solve
+matrix-on vs matrix-off; assert identical results; report wall time, node
+count, and the per-node share still spent in `group_words` (that share is
+§5's entire justification).
 
 **Acceptance.**
-- Unit test: on a branch over few distinct letters, class count is much smaller
-  than candidate count (sanity), and the solve result equals the non-deduped
-  solve exactly (winner, ERD, max_remaining_depth, cache writes).
-- The §4 equivalence fixtures re-run with dedupe on: identical results.
+- The equivalence test (the core deliverable), in a new
+  `test_kernel_equivalence.py`: for fixed branches of sizes ~{8, 30, 81, 146}
+  and budgets {None, 5, 4}, `_solve_subset` with and without the matrix
+  produces identical `best_guess`, bit-identical ERD, identical
+  `max_remaining_depth`, identical taint, and identical rows written to a
+  fresh in-memory ScoreCache (compare full table dumps).
+- A regression test for invariant 2: a branch/budget where every candidate is
+  pre-gated (tight seeded ceiling) still returns `OVER_ERD_LIMIT`-style
+  cutoff, and writes **no** loss row.
+- Full suite green with NumPy present and absent.
+- PR description states the `metric_observer` choice (invariant 3).
 
----
+## §5. Vectorized group partitioning (`group_words` fast path) — only if §4's measurement justifies it
 
-## §7. Monster-branch calibration (operational, no code) — requires §1; §4 strongly recommended first
+**Read first:** §4's `diag_kernel_bench.py` output (the `group_words` share);
+`ResponseCache.group_words` (`wordle_engine.py:418-430`); the group-ordering
+subtleties below.
+**Prerequisites:** §2, §4 deployed, and a measured `group_words` share that
+still dominates. If §4 leaves `group_words` under ~30% of node time, skip
+this section — the complexity is not free.
 
-The schedule estimate for the full tree is dominated by an unmeasured regime.
-Before mass-queueing anything:
+**Current behaviour.** Each non-pre-gated `evaluate_candidate` builds
+`{pattern: [words]}` with a Python loop over the branch
+(`wordle_engine.py:1013`). After §4 this is the main surviving per-node
+Python cost.
 
-1. Pick one weak opener with a large all-gray branch (over 1,000 answer words).
-2. `queue-add --word <opener> --pattern ..... --priority 1000` (no cap after §1).
-3. Let the swarm drain it; sub-branch promotion will fan it out.
-4. Read the cost from the issue-67 measurement layer (`branch_finalize_log`
-   rows for the branch and its promoted descendants, summed by spine), plus
-   wall-clock span.
-5. Extrapolate: (number of >300-word branches across all openers) × (measured
-   cost, adjusted for cache warming) — this is the go/no-go number for the
-   "weeks" schedule and decides how much §5/§6 matter.
+**Change.** Inside `ResponseCache.group_words`, accept an optional
+`(pattern_matrix, subset_idx)` fast path that produces an **identical dict**
+— same keys, same value lists, same *iteration order* — via one matrix row
+read plus a stable argsort, instead of the per-word loop.
 
-Deliverable: a short section appended to this file (or a note in the issue)
-with the measured numbers and the revised whole-job estimate.
+Why iteration order is load-bearing: `evaluate_candidate` sorts groups by
+size **descending with a stable sort** (`wordle_engine.py:1038`), so
+equal-size groups are processed in dict insertion order; group processing
+order determines float accumulation order of `cost` and, under a ceiling,
+*which* sub-branch triggers a cutoff first. Today's insertion order is
+**first-appearance order of each pattern while walking the branch words**.
+The fast path must reproduce exactly that:
 
----
+1. `pats = matrix[g, subset_idx]` (uint8, length n).
+2. `order = np.argsort(pats, kind='mergesort')` — sorts by pattern value,
+   preserving branch order within a pattern (so each group's word list is in
+   branch order, matching today).
+3. Walk `order` once, cutting at pattern-value boundaries → groups keyed by
+   pattern, each with its word list.
+4. Emit the dict **in first-appearance order**: compute each present
+   pattern's first index in `pats` (e.g. via the boundary walk plus a second
+   pass ordering group keys by `first_index[pattern]`), and insert in that
+   order. Do not emit in ascending-pattern order; that reorders equal-size
+   ties.
+5. Words outside the answer universe (the interactive fallback mode —
+   `wordle_engine.py:424-429`) cannot be in `subset_idx`; when the caller
+   cannot form `subset_idx` (any branch word unknown), it must pass none and
+   take the existing loop. The swarm path always can.
 
-## §8. Phone export filter (`export --reachable-only`) **[independent; needed before full-tree sync]**
+**Acceptance.**
+- Property test: for ~50 random (guess, branch) pairs, fast and slow
+  `group_words` return dicts equal in keys, values, and **iteration order**
+  (compare `list(d.items())`).
+- `test_kernel_equivalence.py` re-run with §5 enabled: still byte-identical.
+- `diag_kernel_bench.py` before/after numbers in the PR description.
 
-`branch_best_by_policy` already holds 3M+ rows; a full run adds tens of
-millions, most of which are search memoization (sub-branches of *losing*
-candidates) the phone never consults. The playable tree is tiny by comparison:
-from any top-level (opener, pattern) branch, play only follows `best_guess`
-partitions downward.
+## §6. Candidate equivalence-class dedupe
 
-**Change.** Add `--reachable-only` to `erd_search.py export`:
+**Read first:** C2, §4 (reuses its cached frame data); the winner-tie
+argument below — it is the whole correctness case.
+**Prerequisites:** §2; §4 recommended first (shares the per-frame
+`patterns_for_candidates` slice). Independent of §5.
 
-- Seed set: every branch with ≥ 2 words for every opener in `wordle.txt`
-  (equivalently: every branch_key reachable as (opener, pattern) — these are
-  the rows the phone looks up after the first guess). Computing seeds needs the
-  pattern matrix or the decomposition blobs; reuse §2 if landed, else
-  `ResponseCache.group_words`.
-- BFS: for each cached seed, partition its words by its `best_guess` (the same
-  walk `verify_erd_cache` does at `wordle_engine.py:1329-1360`), enqueue each
-  ≥2-word sub-branch, export every visited row. Uncached nodes terminate their
-  path (export is best-effort on a partial cache).
+**Fact this exploits.** A candidate's evaluation depends only on (a) the
+partition it induces on `branch_words` and (b) whether it is itself in the
+branch — and both are fully encoded in its pattern row restricted to the
+branch (`matrix[g, subset_idx]`; membership shows as pattern 242). Two
+candidates with identical rows are indistinguishable to the recurrence: same
+groups, same costs, same `max_remaining_depth`, same taint. On deep branches
+over few distinct letters, most of the ~13k candidates collapse into few
+classes (extreme case: every word sharing no letters with the branch induces
+the single all-gray group).
+
+**Change.** In `_solve_subset`, after the §4a ordering, when a matrix is
+available and `guesses is not None` (full-vocabulary sweeps only): build
+`{row_bytes: representative}` keeping the **first** class member in the
+already-sorted order (a plain dict walk — `bytes(row)` as key), and run the
+candidate loop over representatives only.
+
+**Why the recorded winner is unchanged (do not skip this reasoning):** class
+members have equal `Σk²` (the key is a function of the partition), so under
+the stable sort they are adjacent and the representative is the earliest in
+evaluation order. Today, the first member either becomes `best_guess` or
+fails; later members compute the identical cost and can never pass the strict
+`cost < best_erd` (`wordle_engine.py:1224`), so they can never become
+`best_guess` anyway. Skipping them changes no recorded value — winner, ERD,
+`max_remaining_depth`, taint, and cache writes are all identical, not merely
+equivalent.
+
+**Boundaries.**
+- **Inline recursion only.** Swarm top-level claims hand out candidates by
+  index (`candidate_claims`), and finalize requires all `n_candidates` slots
+  done — claim-level dedupe belongs to the packing design (a bundle carrying
+  a whole class, marked done together). Add it to
+  `adaptive_claim_packing.md` §12 as an open extension; do not build it here.
+- **`metric_observer`:** skipped members produce no observation. Confirm the
+  observer is not attached on inline recursion frames (expected — it rides
+  claims); if it can be, disable dedupe on observed frames, same policy as
+  §4b invariant 3.
+- The signature pass costs one `(G_vocab × n)` slice already materialized by
+  §4a — reuse it; do not re-slice.
+
+**What to measure.** Class-count vs candidate-count distribution by branch
+size (log in `diag_kernel_bench.py`): expect collapse to grow as branches
+shrink; this number decides how much §6 matters below the promotion threshold.
+
+**Acceptance.**
+- Unit test: a small branch over few distinct letters yields far fewer
+  classes than candidates (sanity), and the solve with dedupe on equals the
+  solve with it off — byte-identical across all recorded values and cache
+  writes.
+- `test_kernel_equivalence.py` fixtures re-run with dedupe on: identical.
+- Suite green with NumPy absent (dedupe silently off).
+
+## §7. Monster-branch calibration and top-level census — operational
+
+**Read first:** §1 (must be deployed); PR #76's `branch_finalize_log` and
+censoring semantics; C5 U3/U4/U7.
+**Prerequisites:** §1 deployed; §4 strongly recommended deployed (calibrating
+the slow kernel mismeasures the plan); PR #76's instrumentation live.
+
+**7a. Census (30-minute script, do first).** New `diag_toplevel_census.py`:
+using the §2 matrix, for every opener compute its partition of the answer
+list; count distinct `branch_key`s with ≥ 2 words across all openers, the
+size histogram, and specifically the count above 300 words (the never-queued
+regime). Resolves U7 exactly and sizes §8's export. Read-only; runs anywhere.
+
+**7b. Calibration solve.** Queue exactly one weak opener's all-gray branch
+(pick one from the census with ≥ 1,000 words) at high priority:
+`queue-add --word <opener> --pattern ..... --priority 1000`. Let the swarm
+drain it; sub-branch promotion fans it out. Then aggregate cost from
+`branch_finalize_log` over the branch and its promoted descendants (join by
+spine), **treating censored rows as lower bounds** (PR #76's §9.7 semantics),
+plus wall-clock span.
+
+**7c. The schedule memo.** Extrapolate: census counts × measured per-regime
+costs, adjusted by the U4 warm-cache trend ⇒ the revised whole-job estimate.
+Deliverable: a dated section appended to this file with the numbers and the
+go/no-go call on "weeks", plus the §5/§6 scope decision. No code.
+
+## §8. Phone export: reachable-only filter, plus the opener report
+
+**Read first:** `erd_search.py export` (`cmd_export`); `verify_erd_cache`'s
+best-guess walk (`wordle_engine.py:1329-1360`) — the BFS to imitate; C4 (all
+three modes); §7a census output for size projection.
+**Prerequisites:** PR #76 merged (touches `erd_search.py`). §2 useful but
+optional (decomposition blobs suffice for seeds).
+
+**Problem.** `branch_best_by_policy` holds 3M+ rows already
+(`cache_sqlite.py:220` comment) and a full run adds tens of millions; most
+rows are search memoization (sub-branches of *losing* candidates) that Mode
+A/C lookups never touch. Syncing multi-GB SQLite over iCloud to Pythonista is
+the bottleneck the phone does not need.
+
+**8a. `export --reachable-only`.**
+- **Seed set:** every (opener, pattern) branch with ≥ 2 answer words, for
+  **every opener in `wordle.txt`** — this is what makes Mode C's "any first
+  guess" work (C4). Enumerate via decomposition blobs (or the §2 matrix);
+  the seed *keys* are exactly the census (§7a) population.
+- **BFS:** for each seed present in the cache: read its `best_guess`,
+  partition its words by that guess (`ResponseCache.group_words`), enqueue
+  every ≥ 2-word response group, and export every visited row. A node absent
+  from the cache terminates its path silently — export is best-effort on a
+  partial cache and re-runnable as coverage grows.
 - Export the same three tables as today (`answer_list`,
-  `response_decomposition`, `branch_best_by_policy`), just row-filtered on the
-  third. Keep default behaviour (full export) unchanged.
+  `response_decomposition`, `branch_best_by_policy`), row-filtered on the
+  third. `--reachable-only` is a new flag; default behaviour unchanged.
+  Existing incremental semantics (INSERT OR IGNORE) unchanged.
+- Also export `branch_loss_by_policy` rows for visited keys if the phone
+  code reads losses (verify; if it never does, say so in the PR and skip).
 
-**Acceptance.** Unit test on a small synthetic cache: reachable rows exported,
-an unreachable row (sub-branch of a non-best guess) excluded; re-running is
-incremental (INSERT OR IGNORE) as today. Document in SWARM.md's export section.
+**8b. Opener report (`opener-erd`).** The Mode C arithmetic, small and
+read-only. Given an opener w and the cached rows:
+
+```
+root_erd(w) = 1
+            + Σ over response groups g with |g| >= 2:   (|g|/n) · ERD(g)
+            + (count of non-self singleton groups) / n
+```
+
+where n = answer-list size, ERD(g) comes from the branch row, and the self
+group (w itself, when w is a possible answer) contributes 0 beyond the
+initial 1. If any ≥ 2-word branch of w is uncached, report the partial sum
+**as a lower bound, clearly labeled** — never as the ERD (the same honesty
+rule as everywhere else: a bound is honest, a guess is not).
+- Linux CLI: `erd_search.py opener-erd --word alibi` printing root ERD, the
+  per-pattern table (pattern, group size, cached best guess, ERD), and
+  coverage (branches cached / total).
+- Phone: same computation exposed in the interactive tool (natural home: the
+  `t` analyse-word command, which already aggregates per-word views), so
+  "how awful was ALIBI, exactly" is answerable at the dinner table:
+  `root_erd(ALIBI) − root_erd(best opener)` in expected guesses.
+
+**Mode B verification rides this section** (C4): B-1 timed phone
+measurements (U5) against a reachable-only export, and the B-2
+`ERDSolver`-budget observation, both reported in the PR description —
+findings, not code changes.
+
+**Acceptance.**
+- Unit test on a small synthetic cache: reachable rows exported; a planted
+  sub-branch row of a *non-best* candidate is excluded; uncached nodes
+  terminate cleanly; re-export is incremental.
+- `opener-erd` unit test on a synthetic cache with known arithmetic,
+  including the partial-coverage lower-bound path and the self-group case.
+- Size report in the PR: full vs reachable row counts and file bytes on the
+  real cache.
+- SWARM.md export section updated.
+
+## §9. Naming and documentation sync
+
+**Read first:** CLAUDE.md naming rules; C2.1; C3 rule 2.
+
+**9a. Doc fixes (can do now).**
+- SWARM.md Budget section: "Workers solve branches under `ROOT_BUDGET = 5`"
+  is stale — the code has `ROOT_BUDGET = GAME_GUESSES` with each queued
+  branch solved at `ROOT_BUDGET − guess_depth` (`erd_swarm.py:98-101`).
+- After §2/§4 land: add `pattern_matrix.py` to the layer tables in CLAUDE.md
+  and design.md, plus a short design.md section: what the matrix is, which
+  engine paths consult it, and the fallback rule (Part II rule 2).
+
+**9b. Rename proposal (owner decision; implement only after the epoch-0 run
+and its analysis are complete).** `cost_lb` and `rest_lb` violate the
+no-abbreviations rule and under-describe themselves (C2.1). Proposed:
+- `cost_lb` → `candidate_cost_lower_bound`
+- `rest_lb` → `remaining_groups_cost_lower_bound`
+- Scope: Python identifiers in `wordle_engine.py`, `erd_swarm.py`,
+  `analyze_epoch0.py`, and docs. The `candidate_accuracy.cost_lb` SQLite
+  column (queue DB, Linux-only) can be renamed by an idempotent
+  `ERDQueue._migrate()` step — but **not while `analyze_epoch0.py` still
+  needs to read the epoch-0 corpus**, so schedule after the gate analysis is
+  finished and archived. If the owner prefers, the column may simply keep
+  its name with the mapping documented where it is read.
 
 ---
 
-## §9. Documentation sync **[independent, small]**
-
-- SWARM.md still says "Workers solve branches under `ROOT_BUDGET = 5`"; the
-  code now has `ROOT_BUDGET = GAME_GUESSES` with per-branch budget =
-  `ROOT_BUDGET − guess_depth` (`erd_swarm.py:98-101`). Fix the Budget section.
-- After §1: SWARM.md `queue-add` examples and flag description (covered there).
-- After §2/§4: add `pattern_matrix.py` to the layer tables in CLAUDE.md and
-  design.md, and a short design.md section describing the matrix and which
-  engine paths consult it.
-
----
-
-## Sequencing
+# Sequencing
 
 ```
-§1 (uncap queue-add)  ──────────────┐
-§2 (pattern matrix)  → §3 (stats) → §4 (rank+gate) → §5 (group_words, if profiling says so)
-                       §2 ─────────→ §6 (dedupe)
-§1 + §4 ────────────────────────────→ §7 (monster calibration → schedule decision)
-§8 (export filter)  — any time before the first full-tree phone sync
-§9 (docs)           — with each section it trails
-Claim packing        — proceeds on its own plan/gates, orthogonal to all of the above
+now → Friday      §2 → §3 (new files, no deploy)          §9a SWARM.md fix
+Friday pm         epoch-0 run ends → analyze_epoch0.py gate (packing track)
+after PR #76      §1 ─┐
+merges            §4 ─┴─ deploy together: one restart, one epoch bump
+then              §7a census → §7b calibration → §7c schedule memo
+then              §5 and/or §6 per §7's numbers            §8 before first full-tree sync
+anytime after     §9b rename (after epoch-0 analysis archived)
+parallel track    claim packing per adaptive_claim_packing.md, gated on U6
 ```
 
-Suggested order of landing: §1, §2, §3, §4 (the big win), §7 (measure), then
-decide how much of §5/§6 the numbers demand while the packing work proceeds in
-parallel.
+Dependency summary: §2→§3→§4→§5; §2→§6; §1+§4→§7; §8 independent after the
+merge; §9a independent; §9b last. The packing lever multiplies with all of
+it and is managed by its own document.
