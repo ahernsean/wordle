@@ -19,6 +19,10 @@ Shared constraints for every item:
   flash.
 - Every drawing must degrade at phone width (390 px) without horizontal body
   scroll.
+- Every item extends `test_status_client.py` (phase 3's Playwright harness)
+  with cases for its new DOM: drive rendering via `applySnapshot` snapshot
+  pairs, assert on elements/classes/computed styles, and add a screenshot
+  artifact of the new visual at 390 px and 1200 px.
 
 ## Item A — Candidate sweep bar with worker markers
 

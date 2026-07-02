@@ -71,9 +71,12 @@ Design principles the plans enforce:
 - **The terminal display is untouched.** `_print_status` / `_redraw_status`
   keep working exactly as they do now; the browser client is additive. (The
   terminal path may be simplified later, but that is not part of these plans.)
-- **No new dependencies.** Python stdlib only on the server; a single
-  self-contained HTML file with vanilla JavaScript on the client (no CDN,
-  no build step — it must work on a LAN with no internet).
+- **No new dependencies in shipped code.** Python stdlib only on the server; a
+  single self-contained HTML file with vanilla JavaScript on the client (no
+  CDN, no build step — it must work on a LAN with no internet). Tests are the
+  one exception: browser behavior is verified with Playwright + headless
+  Chromium as a development-only dependency, skip-guarded so the suite still
+  passes where it isn't installed (see plan 03).
 
 Remote access (Tailscale vs. tunnel) is deliberately **not** part of these
 plans. The server binds to the LAN; how it becomes reachable from elsewhere is

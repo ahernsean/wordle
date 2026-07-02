@@ -4,6 +4,14 @@ Read `00-overview.md` first. Requires phase 2 merged. Develop against the
 fixture server: `python status_server.py --fixture status_fixture.json`, then
 open `http://<host>:8765/` in a browser (phone or desktop).
 
+Automated browser tests use **Playwright with headless Chromium** — a
+development-only dependency; the shipped server and client stay
+dependency-free. On a normal Linux machine install it with
+`pip install playwright && playwright install chromium`. In a Claude Code
+remote/web session Chromium is already provided via
+`PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers` — do NOT run
+`playwright install` there.
+
 ## Goal
 
 Replace the placeholder `status_client.html` with a single self-contained HTML
@@ -26,6 +34,7 @@ that polls `/api/status` and renders the snapshot with:
 ## Files touched
 
 - `status_client.html` — replaced
+- `test_status_client.py` — new (Playwright browser tests, skip-guarded)
 
 ## Data contract
 
@@ -89,11 +98,32 @@ Top to bottom:
 5. **Empty state** — when no branch has workers: the line
    `no branches being worked`, still inside the normal layout.
 
-Rendering approach: full re-render on every poll. One function
-`render(snapshot, previousSnapshot)` rebuilds the content container's DOM
-(template strings + `innerHTML` is fine). All cell values are produced by a
-single helper `cell(value, changeClass)` so headers and data flow through the
-same path and change classes cannot drift from values.
+## Client architecture (normative — this is what makes the page testable)
+
+Split the script into two layers:
+
+1. **`applySnapshot(snapshot, previousSnapshot)`** — does ALL rendering and
+   diffing: full re-render of the content container's DOM from the two
+   snapshots (template strings + `innerHTML` is fine), computing every change
+   class synchronously before insertion. It must not fetch, read clocks for
+   data ages, or depend on any state other than its arguments and the
+   expansion set. Assign it to `window.applySnapshot` so tests can call it
+   directly with fixture data via Playwright's `page.evaluate`.
+2. **The poll loop** — fetches `/api/status`, tracks connection state,
+   remembers the previous snapshot, and calls `applySnapshot`. Nothing else.
+
+The poll interval is read from the URL so tests can speed it up or park it:
+
+```javascript
+const POLL_INTERVAL_MILLISECONDS =
+    Number(new URLSearchParams(location.search).get('poll')) || 2000;
+```
+
+All cell values are produced by a single helper `cell(value, changeClass)` so
+headers and data flow through the same path and change classes cannot drift
+from values. Give the elements tests must find stable ids or data attributes:
+each branch card gets `data-branch="<branch_key_hex>"`, each worker row
+`data-worker="<worker_id>"`, and the connection chip `id="connection"`.
 
 ## Change highlighting rules (normative)
 
@@ -150,39 +180,93 @@ must be at least 32 px tall on narrow screens.
   hotkey-pinning behavior).
 - **Tap a worker row** toggles the same descent detail inline for just that
   worker.
-- Poll every 2000 ms (`POLL_INTERVAL_MILLISECONDS = 2000` at the top of the
-  script). When `document.hidden`, skip polls; poll immediately on
-  `visibilitychange` back to visible.
+- Poll every `POLL_INTERVAL_MILLISECONDS` (2000 default; see Client
+  architecture for the `?poll=` override). When `document.hidden`, skip
+  polls; poll immediately on `visibilitychange` back to visible.
 
-## Manual test checklist (run against the fixture server)
+## Automated browser tests: `test_status_client.py`
 
-Since the client is a single static file, testing is manual, against
-`status_server.py --fixture status_fixture.json`:
+Standard `unittest`, guarded so the suite stays green where Playwright is not
+installed:
 
-- [ ] All four fixture workers render: two on the user-queued branch card, one
-      idle, one dead (red `!!`, age 120 s).
-- [ ] The cooperative branch shows the `coop` badge and the `▸ ?×1`
-      unrecorded-spine marker.
-- [ ] Pattern tiles show correct colors for a known pattern string.
-- [ ] Narrow window (< 400 px): tier-2/tier-3 columns disappear, no horizontal
-      body scroll; wide window: multiple card columns.
-- [ ] Edit a value in `status_fixture.json` (e.g. lower a `best_erd`, change a
-      `cur_candidate`) while the server runs: within one poll the cell flashes
-      green (improvement) / red (change) and fades.
-- [ ] Kill the server: within ~2 polls the connection chip turns red and reads
-      `disconnected`; data stays on screen. Restart: chip recovers.
-- [ ] Expanding a card and waiting through several polls keeps it expanded.
-- [ ] Live end-to-end: run `python status_server.py` against the real
-      databases with the swarm running; verify branch/worker rows match
+```python
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+@unittest.skipUnless(PLAYWRIGHT_AVAILABLE, 'playwright not installed')
+class StatusClientTest(unittest.TestCase):
+    ...
+```
+
+Harness, once per test class (`setUpClass` / `tearDownClass`):
+
+- Start the real server exactly as `test_status_server.py` does
+  (`ThreadingHTTPServer(('127.0.0.1', 0), StatusRequestHandler)` in a daemon
+  thread) with `StatusRequestHandler.fixture_path = 'status_fixture.json'`.
+- `playwright = sync_playwright().start()`;
+  `browser = playwright.chromium.launch()` (headless is the default);
+  a fresh `page = browser.new_page()` per test.
+- Load with the poll loop parked so tests control rendering:
+  `page.goto(url + '?poll=3600000')`, then wait for the first render
+  (`page.wait_for_selector('[data-branch]')`).
+- In Python, load `status_fixture.json` once; tests that need "snapshot B"
+  mutate a `copy.deepcopy` of it and inject both with
+  `page.evaluate('([a, b]) => applySnapshot(b, a)', [snapshot_a, snapshot_b])`.
+- Assert flash classes immediately after `evaluate` returns — `applySnapshot`
+  applies them synchronously and the 1.5 s removal timer won't have fired.
+
+Required cases:
+
+1. **Fixture render**: all four fixture workers appear (two rows under the
+   user-queued branch card, one idle, one dead); the cooperative branch card
+   shows the `coop` badge and the `▸ ?×1` unrecorded-spine marker.
+2. **Tile colors**: a tile for `g` has computed background `rgb(83, 141, 78)`
+   (`#538d4e`), `y` → `rgb(181, 159, 59)`, `-` → `rgb(58, 58, 60)`
+   (via `locator.evaluate('el => getComputedStyle(el).backgroundColor')`).
+3. **Responsive tiers**: at viewport width 390 the first `.tier-2` cell
+   `is_hidden()`; at 375 `.tier-3` is also hidden; at 800 both are visible.
+   At every width tested:
+   `page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')`
+   is true (no horizontal body scroll).
+4. **Value change flashes red**: mutate a worker's `cur_candidate`, inject,
+   assert that worker row's candidate cell has class `flash-changed` and no
+   other row gained a flash class.
+5. **Improvement flashes green**: lower a branch's `best_erd` and raise its
+   `done_candidates`; both cells get `flash-improved`, not `flash-changed`.
+6. **Appearance**: add a worker to snapshot B; its row has `flash-added`.
+7. **Time-tick exemption**: change only `generated_at` (+2) so every age
+   grows; assert no `flash-*` class anywhere.
+8. **Staleness**: the fixture's dead worker's age cell has `stale-dead` and
+   text ending `!!`; mutate a live worker's `updated_at` to make its age 7 s
+   → `stale-warn`.
+9. **Expansion persistence**: click a branch card header, assert the expanded
+   detail (sweep line) is visible, inject a new snapshot pair, assert it is
+   still expanded.
+10. **Disconnect indicator**: open a second page with `?poll=100`, let it
+    render, then `page.route('**/api/status', lambda route: route.abort())`;
+    within a few polls `#connection` gains the disconnected class and the
+    branch cards are still present. Unroute; it recovers.
+11. **Screenshot artifacts** (review aid, not an assertion): write
+    `page.screenshot(path=...)` at widths 390 and 1200 into a temp/scratch
+    directory and print the paths, so a reviewer can eyeball the layout.
+
+## Manual checklist (the part automation can't cover)
+
+- [ ] On the actual iPhone browser against the fixture server: tiles render,
+      tap targets are comfortable, no horizontal scroll, pinch behavior sane.
+- [ ] Live end-to-end: `python status_server.py` against the real databases
+      with the swarm running; branch/worker rows agree with
       `python erd_search.py status`.
-
-Also run the full unit test suite (it must stay green; this phase should not
-affect it).
 
 ## Acceptance checklist
 
 - [ ] `status_client.html` is fully self-contained (grep it for `http://`,
       `https://`, `//` URLs — none may appear in `src`/`href` attributes).
-- [ ] Every item in the manual test checklist passes.
-- [ ] Full unit test suite passes.
+- [ ] `python -m unittest test_status_client` passes with Playwright
+      installed, and is cleanly SKIPPED (not failed) without it.
+- [ ] Full test suite passes.
+- [ ] Both manual checklist items pass.
 - [ ] No file outside the "Files touched" list is modified.
