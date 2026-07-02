@@ -20,6 +20,27 @@ This is **semantic zoom**: what an element *is* changes with scale, not just
 its size. It is a map, not a dashboard — a different artifact from the phase
 3/4 status page, sharing the same data service.
 
+### Context anchoring: the loupe / minimap
+
+Zooming must never cost situational awareness: at any zoom level the user
+should still see where in the larger forest the current view sits, and where
+work is happening elsewhere. Two dual forms of the same **overview + detail**
+pattern (both standard in mapping and visualization UIs):
+
+- **Minimap**: the main view is the zoomed detail; a small inset shows the
+  whole forest with (a) a rectangle marking the main view's viewport and
+  (b) persistent markers for live activity — every worker's current branch,
+  plus recent-completion heat. Tapping a marker pans/zooms the main view to
+  it.
+- **Loupe**: the main view is the broad forest; one or more small magnified
+  windows float over it, each anchored by a leader line to its true position
+  in the forest and showing detail-level content (e.g. one worker's live
+  descent into a sub-branch) regardless of the main view's zoom. "Follow
+  worker N" is a loupe pinned to that worker's position as it moves.
+
+Both let the user watch one worker chew through a sub-branch while
+simultaneously seeing where that sub-branch sits in the whole landscape.
+
 ## Why this is canvas (and phases 3–4 are not)
 
 The status page shows dozens of live entities; DOM/SVG handles that with
@@ -51,7 +72,21 @@ proves too slow) is the right tool at that scale.
    is the terrain; the phase 1 snapshot (queue DB: open branches, workers,
    claims) is a small live layer drawn on top of it. The two data sources
    stay separate; the client composites them.
-4. **Same palette, same meanings.** Wordle tile colors for pattern/word
+4. **Views are viewport-parameterized and composable.** `buildScene` takes
+   the viewport (center, scale, pixel size) as an argument, so the minimap
+   and each loupe are just additional `buildScene` calls with different
+   viewports painted onto their own small canvases, sharing one client-side
+   tile cache with the main view. No view is special; all are equally
+   testable through the scene graph.
+5. **Tree-space coordinates are stable and addressable.** The layout function
+   must map any node to its position deterministically from the node's
+   identity/spine alone — never from which parts of the tree happen to be
+   loaded or how the view arrived there. This is what lets a minimap place a
+   worker marker (whose location is known only as a spine from the
+   heartbeat) without loading that region's tiles, lets a loupe anchor its
+   leader line correctly at any zoom, and keeps positions consistent across
+   all simultaneous views.
+6. **Same palette, same meanings.** Wordle tile colors for pattern/word
    semantics; the phase 3 alert-red/amber only for change/staleness. New
    encodings (e.g. heat for exploration density, a distinct treatment for
    pruned vs. cut-off vs. unexplored) must not collide with those.
@@ -71,6 +106,11 @@ proves too slow) is the right tool at that scale.
   per branch node. Showing "what got pruned" at the map's finest zoom may
   need the engine to persist more than it does today — scope carefully;
   possibly a coarser proxy (cached vs. absent) is enough for v1.
+- **Overview + detail ergonomics on a phone**: minimap and loupe are duals;
+  which is the default given iPhone screen real estate? (Likely: minimap
+  always present as a small corner inset; loupes opt-in, one at a time,
+  spawned from "follow worker N".) How many simultaneous views fit in the
+  performance budget?
 - **Gesture handling**: pinch/pan via Pointer Events with
   `touch-action: none` on the canvas; inertia and zoom-about-point math;
   what the desktop equivalent is (wheel + drag).
