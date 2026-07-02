@@ -210,13 +210,15 @@ Two verification items for §8's acceptance:
     fallback plan is a coarser first step (entropy ranking, already instant)
     while `ERDSolver` refines in the background — which is exactly how the
     interactive flow already behaves.
-  - **(B-2) Budget question (investigate, do not silently change):**
-    `ERDSolver` calls `min_expected_guesses` with no `budget`, i.e. the
-    unconstrained optimum. Late in a recovered game, the unconstrained-optimal
-    guess is not necessarily feasible within the guesses actually remaining
-    (its `max_remaining_depth` may exceed them). Confirm the behaviour,
-    document it, and propose (in conversation, not code) whether the
-    interactive solver should pass `budget = GAME_GUESSES − guess_depth`.
+  - **(B-2) Budget gap — now issue #79:** `ERDSolver` calls
+    `min_expected_guesses` with no `budget`, i.e. the unconstrained optimum,
+    so late in a recovered game the recommended guess is not necessarily
+    feasible within the guesses actually remaining (its
+    `max_remaining_depth` may exceed them). Issue #79 carries the fix plan
+    (pass `budget = GAME_GUESSES − guess_depth`, surface the proven-loss
+    outcome in the UI); it is independent of this plan's sections and can be
+    implemented on the same post-PR-#76 schedule as the other
+    `wordle.py`-touching work.
 
 **Mode C — family analysis (the ALIBI question).** The owner's sons play
 independently and compare afterward; the owner wants to say *precisely* how
