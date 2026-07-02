@@ -23,7 +23,7 @@ baseline of ~900 branch sweeps/day (`adaptive_claim_packing.md` §1):
 
 | Lever | Expected gain | Where |
 |---|---|---|
-| Claim packing (coordination overhead ~83% of in-loop wall) | ~5–6× | `adaptive_claim_packing.md`, gated on the PR #76 run |
+| Claim packing (coordination overhead ~83% of in-loop wall) | ~5–6× | `adaptive_claim_packing.md`, gated on the PR #76 run — mid-run gate is provisionally **NO-GO on the magnitude metric** (see U6); the exact gating half passed, so the lever likely survives in a simplified form |
 | Vectorized partition kernel (NumPy) | ~10–50× on node rate and on the warm-cache sweep floor | §2–§5 |
 | Candidate equivalence-class dedupe | up to ~10× on deep branches | §6 |
 
@@ -140,14 +140,34 @@ this plan relies on. Hence the stable-sort requirements in §4/§5.
 
 ## C3. Coordination with the measurement run (PR #76) — schedule constraints
 
-**State as of Wednesday Jul 2:** PR #76 landed the measurement layer
+**State as of Jul 2 (mid-run):** PR #76 landed the measurement layer
 (telemetry epochs, `branch_finalize_log`, `candidate_accuracy`
 predicted-vs-actual stream, cost model re-keyed on
-`(policy, size_bucket, budget)`, censoring). The swarm is mid-way through a
-multi-day epoch-0 run on the Linux box, expected to finish **Friday
-afternoon**. After it ends, `analyze_epoch0.py` is the go/no-go gate for the
-packer metric. The owner intends to merge PR #76 to `main` when the run
-completes.
+`(policy, size_bucket, budget)`, censoring). A 3-day representative epoch-0
+run is in progress on the Linux box (self-stops ~Friday AM) across four
+openers — SALET/CRANE/TRACE plus ALIBI as a deliberately weak one. The
+mid-run analyzer snapshot is committed on that branch
+(`analysis/epoch0_snapshot_2026-07-02_midrun.txt`); its headline numbers:
+
+- Gating is **exact** (100% of gated rows ≤ 1 node) and the §4
+  false-expensive trap is 0% once the budget-keyed cost model is warm —
+  the *reliable* half of the metric, and the same gate §4b of this plan
+  vectorizes.
+- Work is hyper-concentrated: top 1% of candidates ≈ 99.5% of node work.
+- The *magnitude* half provisionally **fails the gate** on the bounded
+  subset (load-bearing tail Spearman 0.21 vs the ≥ 0.5 bar; log-log slope
+  ≈ 0.2 vs ~1 wanted; residual σ ≈ 1.4 dex) — with the caveat that the
+  bounded corpus is ~99% ALIBI. Friday's assessment splits pathological vs
+  typical openers before the final verdict.
+- ALIBI alone is ~99% of the run's work, and produced few queueable
+  branches because many exceed the 300-word cap (issue #77) — i.e. the
+  gate corpus still excludes the monster regime entirely (U3).
+
+Consequence for this plan: the **vectorized kernel (§2–§5) is the critical
+path** — it is unconditional, while the packing lever may ship late or in a
+simplified form (e.g. gate-only bundling with republish-on-overrun carrying
+the balance). Nothing else in the calendar changes; the owner still intends
+to merge PR #76 when the run completes.
 
 Rules that follow:
 
@@ -230,7 +250,10 @@ Consequences for this plan:
   export's *seed set* is every (opener, pattern) branch for **all ~13k
   openers** — not just the owner's favorites. A son's opener + its actual
   response is a seed row: the phone has its best guess, its ERD, and the
-  whole best-ERD descent under it.
+  whole best-ERD descent under it. (Interim state: the epoch-0 run solved
+  ALIBI's ≤ 300-word branches, so the next export gives *partial* ALIBI
+  coverage; its root ERD stays a labeled lower bound until the over-cap
+  branches are solved — §1 then §7b.)
 - **The opener's root ERD is computable from those same rows** — it does not
   need to be stored per opener, but it does need every branch of that opener
   present (including the monster branches — another reason §1 precedes the
@@ -256,7 +279,7 @@ record the answer next to it when known.
 | U3 | Monster-branch cost (branches over 300 answer words) — zero data today. | §7 calibration solve; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | The whole-job schedule |
 | U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
 | U5 | Phone live-solve latency on off-tree branches (Modes B/C) with a reachable-only cache. | Timed `ERDSolver` runs in Pythonista at n ≈ 10 / 40 / 100. | Whether Mode C needs the out-of-scope lookup service |
-| U6 | The packer metric passes the `analyze_epoch0.py` gate (Spearman on load-bearing claims, log-log slope ≈ 1). | Friday's run + the gate script. | The packing lever (not this plan's sections) |
+| U6 | The packer metric passes the `analyze_epoch0.py` gate. **Mid-run: provisionally NO-GO** — gating exact and §4 trap 0% (PASS), but load-bearing tail Spearman 0.21 and log-log slope ≈ 0.2 / σ ≈ 1.4 dex (FAIL), on a bounded corpus that is ~99% ALIBI. | Friday's full assessment (pathological vs typical opener split); if the magnitude metric stays failed, the packing track falls back to gate-only bundling + republish-on-overrun. | The packing lever's size and timing (not this plan's sections) |
 | U7 | Top-level branch count: estimated 1.5–2M distinct (opener, pattern) subsets with ≥ 2 words. | §7's census script computes it exactly (cheap once §2 exists). | Schedule precision; §8 export size projection |
 | U8 | Exact-equality equivalence between pure-Python and vectorized paths is achievable (stable ordering everywhere). | §4/§5/§6 acceptance tests enforce it; any failure is a design bug to fix, not a tolerance to widen. | §4, §5, §6 |
 
@@ -701,7 +724,11 @@ size histogram, and specifically the count above 300 words (the never-queued
 regime). Resolves U7 exactly and sizes §8's export. Read-only; runs anywhere.
 
 **7b. Calibration solve.** Queue exactly one weak opener's all-gray branch
-(pick one from the census with ≥ 1,000 words) at high priority:
+at high priority. **ALIBI is the natural choice:** the epoch-0 run already
+solved its ≤ 300-word branches (so its subtree cache is warm and the
+marginal cost measured is the monster's own), and its all-gray branch is
+simultaneously the missing piece of the Mode C root-ERD answer (C4).
+Otherwise pick from the census (≥ 1,000 words):
 `queue-add --word <opener> --pattern ..... --priority 1000`. Let the swarm
 drain it; sub-branch promotion fans it out. Then aggregate cost from
 `branch_finalize_log` over the branch and its promoted descendants (join by
