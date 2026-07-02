@@ -30,7 +30,7 @@ with no other context.
 | `01-status-model.md` | `status_model.py`: `collect_status()` returns the full status as a JSON-serializable dict | — |
 | `02-status-server.md` | `status_server.py`: HTTP server for `/api/status` + static client, with a fixture mode; `status_fixture.json` | 01 |
 | `03-browser-client.md` | `status_client.html`: polling browser UI with semantic change highlighting and width-adaptive layout | 02 |
-| `04-visual-modalities.md` | Menu of independent visual upgrades (sweep bars, pattern tiles everywhere, branch tree, candidate grid) | 03 |
+| `04-visual-modalities.md` | Menu of independent visual upgrades: sweep bar (A), completion ring (B), worker chips (C), spine tree (D), candidate grid (E) | 03 |
 | `05-landscape-view.md` | PLACEHOLDER (not implementable): pinch-zoom semantic-zoom map of the explored search landscape | 03, 04 item D, and a design conversation |
 
 ## Architecture and rationale

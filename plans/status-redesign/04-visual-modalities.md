@@ -91,10 +91,10 @@ unclaimed. This is the "candidates in relation to their siblings" view.
 
 Model/server extension (mirror the phase 1/2 style):
 
-1. `erd_queue.py`: add a read-only method
-   `claims_for_branch(branch_key) -> list` returning
-   `(idx, claimed_by, done)` rows ordered by `idx`
-   (`SELECT idx, claimed_by, done FROM candidate_claims WHERE branch_key = ? ORDER BY idx`).
+1. `erd_queue.py` already has the needed read-only method — use it, do not
+   add another: `claims_for_branch(branch_key)` returns full
+   `candidate_claims` rows ordered by `idx` (a superset of the
+   `idx`/`claimed_by`/`done` fields consumed below).
 2. `status_model.py`: add
    `collect_branch_detail(queue_path, branch_key_hex) -> dict` returning
    `{"schema_version", "generated_at", "branch_key_hex", "claims": [{"idx": int, "worker_number": str or null, "done": bool}]}`

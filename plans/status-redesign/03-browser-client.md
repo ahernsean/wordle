@@ -45,10 +45,10 @@ The model sends raw data only; this client computes every derived value:
 |---|---|
 | worker heartbeat age | `snapshot.generated_at - worker.updated_at` — NEVER use the browser clock (`Date.now()`) against snapshot timestamps; clocks may disagree and fixtures are frozen |
 | branch % done | `100 * done_candidates / n_candidates` (0 when `n_candidates` is 0) |
-| branch ETA seconds | with `elapsed = generated_at - created_at`: `(n_candidates - done_candidates) / (done_candidates / elapsed)`, only when `worker_count > 0`, `0 < done_candidates < n_candidates`, and `elapsed > 0`; otherwise show `-` |
+| branch ETA seconds | with `elapsed = generated_at - created_at`: `(n_candidates - done_candidates) / (done_candidates / elapsed)`, only when `created_at !== null`, `worker_count > 0`, `0 < done_candidates < n_candidates`, and `elapsed > 0`; otherwise show `-`. (The null guard is load-bearing: in JavaScript `generated_at - null` equals `generated_at`, which passes `elapsed > 0` and yields a huge bogus ETA.) |
 | cache hit rate | `100 * hits / (hits + misses)` from `worker_totals`, blank when the denominator is 0 |
 | ERD-cutoff / depth-pruned rates | `n_cutoff / (n_ok + n_cutoff + n_pruned)` and `n_pruned / (...)` from `worker_totals`, blank when the denominator is 0 |
-| hang suspicion (`~?`) | `age <= 10 && node_rate === 0 && cur_nodes > 0` (mirrors the terminal) |
+| hang suspicion (`~?`) | `age <= 10 && !node_rate && cur_nodes > 0` — `!node_rate` (not `=== 0`) so a NULL `node_rate` counts as zero, mirroring the terminal's `or 0.0` coercion |
 | worker state label | `branch_key_hex === null` → "idle"; `branch_key_hex` not among `branches[].branch_key_hex` → "finalizing"; else on-branch |
 | node rate display | `Math.round(node_rate / 1000) + 'k/s'` when non-zero |
 | duration display | `MMmSSs` under an hour, `HhMMm` above (mirrors `_fmt_duration`) |

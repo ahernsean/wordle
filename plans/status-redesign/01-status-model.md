@@ -130,7 +130,7 @@ Top level:
 | `counts` | object | `{"pending": int, "in_progress": int, "done": int, "cooperative": int}` — first three from `counts_by_status()` (`.get(key, 0)`); `cooperative` = number of rows in `branches` with `(priority or 0) >= 1_000_000` |
 | `worker_totals` | object | `{"cache_hits", "cache_misses", "n_ok", "n_cutoff", "n_pruned"}` — each int, summed over **live** workers only (heartbeat age ≤ `WORKER_LIVENESS_SECONDS`), treating NULL columns as 0 |
 | `branches` | array | One object per row of `branches_in_progress()`, in query order (priority DESC, n_words DESC) |
-| `workers` | array | One object per row of `heartbeats_with_branch()`, sorted by numeric `worker_number` when it is all digits, else by `worker_id` |
+| `workers` | array | One object per row of `heartbeats_with_branch()`, sorted with the tuple key `(0, int(worker_number), '')` when `worker_number` is all digits, else `(1, 0, worker_id)` — digit-numbered workers first in numeric order, the rest after in `worker_id` order. (A bare conditional key of `int` vs `str` raises `TypeError` when the two kinds coexist.) |
 
 Each element of `branches`:
 
@@ -152,7 +152,7 @@ Each element of `branches`:
 | `budget` | int/null | `row['budget']` (guard with `'budget' in row.keys()` — legacy rows may predate the column) |
 | `created_at` | int/null | `row['created_at']` |
 | `nodes_spent` | int | `row['nodes_spent'] or 0` |
-| `guess_depth` | int | if the row has a non-empty `spine`: `guess_depth_from_spine(spine)`; else 1 if both `source_word` and `source_pattern` are set, else 0 (this mirrors `_branch_guess_depth` in `_print_status`) |
+| `guess_depth` | int | if the row has a non-empty `spine`: `guess_depth_from_spine(spine)`; else `1 if (row['source_word'] and row['source_pattern'] is not None) else 0`. CAUTION: the pattern check must be `is not None`, never truthiness — pattern code `0` (all gray) is a valid, falsy value and counts as set. (Mirrors `_branch_guess_depth` in `_print_status`.) |
 | `spine` | array | Parsed from the `spine` text: split on whitespace, take tokens pairwise as `(guess, pattern)`; each entry `{"guess": <UPPERCASE str>, "pattern": <pattern str>, "guess_is_answer": bool}`. NULL/empty spine → `[]`. (A branch with `guess_depth > len(spine)` has an unrecorded spine; renderers handle that.) |
 | `worker_count` | int | `worker_counts.get(bytes(row['branch_key']), 0)` |
 
@@ -177,7 +177,7 @@ Each element of `workers` (heartbeat row `h`; guard optional columns with
 | `cur_max_depth` | int/null | `h['cur_max_depth']` |
 | `cur_nodes` | int/null | `h['cur_nodes']` |
 | `node_rate` | float/null | `h['node_rate']` |
-| `descent` | array | `parse_rich_spine(h['cur_path'] or '')` mapped to `{"guess_depth": int or null, "guess": <UPPERCASE str> or null, "pattern": str or null, "size": str or null}` per tuple. `size` stays the string the parser yields (old-format tokens may be non-numeric sentinels — do not coerce to int). Missing/NULL `cur_path` → `[]`. Do not filter entries — renderers decide which depths to show. |
+| `descent` | array | `parse_rich_spine((h['cur_path'] or '').replace('>', '→'))` — the replace normalizes legacy heartbeat rows whose levels are `>`-separated, exactly as `_print_status` does before displaying a path — mapped to `{"guess_depth": int or null, "guess": <UPPERCASE str> or null, "pattern": str or null, "size": str or null}` per tuple. `size` stays the string the parser yields (old-format tokens may be non-numeric sentinels — do not coerce to int). Missing/NULL `cur_path` → `[]`. Do not filter entries — renderers decide which depths to show. |
 | `cache_hits` / `cache_misses` / `n_ok` / `n_cutoff` / `n_pruned` | int | each `h[col] or 0` |
 | `best_guess` | str/null | `h['best_guess']` |
 | `best_erd` | float/null | `h['best_erd']` |
@@ -222,9 +222,13 @@ Required test cases:
      `descent == [{"guess_depth": 2, "guess": "SALET", "pattern": "-y---", "size": "12"}, {"guess_depth": 3, "guess": None, "pattern": None, "size": "7"}]`
 4. **Cooperative flag**: a branch created with `priority=1_000_000` yields
    `is_cooperative is True` and `counts['cooperative'] == 1`.
-5. **JSON round-trip**: `json.loads(json.dumps(snapshot))` equals the
+5. **Fallback guess_depth with all-gray pattern**: a branch created with
+   `spine=None`, `source_word='crane'`, `source_pattern=0` yields
+   `guess_depth == 1` and `spine == []` (catches the truthiness bug where
+   pattern code 0 is misread as "not set").
+6. **JSON round-trip**: `json.loads(json.dumps(snapshot))` equals the
    snapshot (dict equality).
-6. **Helper stability**: `status_model.branch_id(b'key')` returns the same
+7. **Helper stability**: `status_model.branch_id(b'key')` returns the same
    4-char value on repeated calls and differs for a different key (mirrors the
    existing `test_status_sections.py` assertions, now against the public name).
 
