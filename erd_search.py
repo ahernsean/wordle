@@ -238,9 +238,9 @@ def cmd_queue_status(args):
 def cmd_queue_add(args):
     """Add branches for one word (or a word-list file) to the queue.
 
-    With --word: adds all response branches for that word whose answer-word
-    count is between 2 and --max-branch-size.  With --pattern as well: adds
-    only that single branch.
+    With --word: adds all response branches for that word with at least 2
+    answer words, or up to --max-branch-size if given.  With --pattern as
+    well: adds only that single branch.
 
     With --word-list: walks every word in the file, same as --word repeated.
     --priority-words marks a subset of those words as higher priority: they
@@ -288,7 +288,8 @@ def cmd_queue_add(args):
                     print(f'{word.upper()} {fmt_pattern(code)}: '
                           f'{len(branch)} answer word(s) — nothing to queue.')
                     continue
-                if len(branch) > args.max_branch_size:
+                if (args.max_branch_size is not None
+                        and len(branch) > args.max_branch_size):
                     print(f'{word.upper()} {fmt_pattern(code)}: '
                           f'{len(branch)} words exceeds --max-branch-size '
                           f'{args.max_branch_size}, skipping.')
@@ -300,7 +301,9 @@ def cmd_queue_add(args):
                 rows = [
                     (encode_subset(branch), len(branch), priority, word, code)
                     for code, branch in groups.items()
-                    if 2 <= len(branch) <= args.max_branch_size
+                    if len(branch) >= 2
+                    and (args.max_branch_size is None
+                         or len(branch) <= args.max_branch_size)
                 ]
             if rows:
                 if args.delete_erd_cache:
@@ -1626,9 +1629,9 @@ def main():
                       help='With --word-list: only these words are queued at '
                            '--priority, the rest at 0 (e.g. '
                            '--priority-words salet crane)')
-    p_qa.add_argument('--max-branch-size', type=int, default=300, metavar='N',
+    p_qa.add_argument('--max-branch-size', type=int, default=None, metavar='N',
                       help='Skip branches with more than N answer words '
-                           '(default: 300)')
+                           '(default: unlimited)')
     p_qa.add_argument('--delete-erd-cache', action='store_true',
                       help='Delete any existing ERD cache entry for each '
                            'queued branch first, so it is recomputed instead '

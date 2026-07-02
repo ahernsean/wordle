@@ -113,7 +113,7 @@ claim N done: K nodes in T.1s (R.1/s)  ok=X pruned=Y useless=Z  best=WORD E.EEEE
 ### Add branches to the queue
 
 ```bash
-# All branches for one opener word (skips branches with >300 answer words):
+# All branches for one opener word (every branch with >= 2 answer words):
 python3.13 erd_search.py queue-add --word salet
 
 # One specific branch (word + response pattern):
@@ -126,9 +126,8 @@ python3.13 erd_search.py queue-add --word-list wordle.txt
 python3.13 erd_search.py queue-add --word-list wordle.txt \
     --priority-words salet crane --priority 1
 
-# A branch too large for the default cap, pushed to the front of the queue:
-python3.13 erd_search.py queue-add --word salet --pattern ..... \
-    --max-branch-size 999 --priority 1000
+# Bound a deliberately limited run to branches of at most 300 answer words:
+python3.13 erd_search.py queue-add --word salet --max-branch-size 300
 
 # Force a recompute of an already-cached branch:
 python3.13 erd_search.py queue-add --word salet --pattern ..... \
