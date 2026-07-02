@@ -119,7 +119,9 @@ python3.13 erd_search.py queue-add --word salet
 # One specific branch (word + response pattern):
 python3.13 erd_search.py queue-add --word salet --pattern .....
 
-# All words in a file:
+# All words in a file (queues every branch for every word, unbounded --
+# including each opener's monster all-gray branch; pass --max-branch-size
+# to bound a bulk run):
 python3.13 erd_search.py queue-add --word-list wordle.txt
 
 # All words in a file, with a subset prioritized (others queued at 0):

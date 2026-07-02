@@ -239,8 +239,8 @@ def cmd_queue_add(args):
     """Add branches for one word (or a word-list file) to the queue.
 
     With --word: adds all response branches for that word with at least 2
-    answer words, or up to --max-branch-size if given.  With --pattern as
-    well: adds only that single branch.
+    answer words (and at most --max-branch-size, if given).  With --pattern
+    as well: adds only that single branch.
 
     With --word-list: walks every word in the file, same as --word repeated.
     --priority-words marks a subset of those words as higher priority: they
