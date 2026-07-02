@@ -1,0 +1,50 @@
+epoch-0 metric-validation snapshot — MID-RUN (Thursday, ~2 days into the 3-day run)
+generated: Thu Jul  2 05:06:38 PM UTC 2026  |  branch: 43d72bd
+NOTE: run still in progress; ALIBI-dominated + budget-3-dominated. Not the final Friday assessment.
+======================================================================
+epoch 0: 5,253,333 candidate_accuracy rows  (spearman via scipy)
+
+gated: 200,171 (3.8%)   non-gated: 5,053,162 (96.2%)
+
+=== Gating split: actual_nodes by class ===
+  gated         : n=  200171  median=     1.0  p99=       1.0  max=          1  mean=       1.0
+  non-gated     : n= 5053162  median=     2.0  p99=   25709.0  max=   93429206  mean=    2378.6
+  gated rows with actual < 10: 200,171/200,171 = 100.00%
+
+non-gated with group_sizes: 5,053,162  (skipped 0 pre-column rows); with a known bound: 171,449 (3.4%)
+
+=== Metric comparison: ALL non-gated (mostly unbounded) ===
+
+--- metric 'uncut' (non-gated, n=5,053,162) ---
+  median predicted = 62.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = 0.088   load-bearing tail (actual>=100, n=258635) Spearman = 0.466
+  log10 calibration: Pearson(log) = 0.010   slope = 0.037   resid_sigma = 0.91 dex  (slope~1 & low sigma => well-sized bundles)
+
+--- metric 'cutoff' (non-gated, n=5,053,162) ---
+  median predicted = 62.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = 0.086   load-bearing tail (actual>=100, n=258635) Spearman = 0.480
+  log10 calibration: Pearson(log) = 0.006   slope = 0.022   resid_sigma = 0.91 dex  (slope~1 & low sigma => well-sized bundles)
+
+=== Metric comparison: BOUNDED-only subset (n=171,449) — where cutoff differs from uncut ===
+
+--- metric 'uncut' (non-gated, n=171,449) ---
+  median predicted = 23.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = -0.214   load-bearing tail (actual>=100, n=26616) Spearman = 0.138
+  log10 calibration: Pearson(log) = 0.038   slope = 0.183   resid_sigma = 1.41 dex  (slope~1 & low sigma => well-sized bundles)
+
+--- metric 'cutoff' (non-gated, n=171,449) ---
+  median predicted = 20.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = -0.191   load-bearing tail (actual>=100, n=26616) Spearman = 0.206
+  log10 calibration: Pearson(log) = 0.055   slope = 0.291   resid_sigma = 1.41 dex  (slope~1 & low sigma => well-sized bundles)
+
+=== §11 go/no-go  (gate metric: 'cutoff', basis: bounded subset) ===
+  [PASS] gating split exact (100.0% near-zero)
+  [PASS] §4 trap avoided (<= 20% false-expensive, got 0.0%)
+  [FAIL] load-bearing rank (tail Spearman >= 0.5, got 0.206)
+
+  VERDICT: NO-GO (refine metric before packer)
+
+======================================================================
+PER-OPENER split (metrics on a capped sample per opener; uncut metric):
+  alibi : n(sampled)=200,000 bounded=  6759 heavy= 9798  Spearman_all=0.082 tail=0.483  logPearson=0.002 slope=0.01 sigma=0.89dex
+  crane : n(sampled)= 41,671 bounded=   369 heavy= 9710  Spearman_all=-0.048 tail=0.226  logPearson=-0.121 slope=-1.96 sigma=1.72dex
