@@ -76,6 +76,13 @@ class ComplianceFilter(Enum):
 
 
 # ---------------------------------------------------------------------------
+# Game constants
+# ---------------------------------------------------------------------------
+
+GAME_GUESSES = 6   # a Wordle game allows 6 guesses total; the root's budget
+
+
+# ---------------------------------------------------------------------------
 # ERD cache policy names — distinguish the guess-vocabulary namespaces under
 # which min_expected_guesses results are stored. Each name spells out both
 # the GuessUniverse and ComplianceFilter it was computed under, so namespaces
