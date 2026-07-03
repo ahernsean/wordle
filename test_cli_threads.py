@@ -114,7 +114,8 @@ class TestERDSolverEdges(unittest.TestCase):
         sc.set_scope("scope")
 
         def fake_meg(remaining, cache, score_cache, guesses=None, policy=None,
-                     progress_callback=None, cancel_check=None, heartbeat=None):
+                     progress_callback=None, cancel_check=None, heartbeat=None,
+                     budget=None):
             cancel_check()  # exercise the _cancel_or_paused closure
             progress_callback(1, len(guesses), guesses[0], 1.5)
             if heartbeat:
