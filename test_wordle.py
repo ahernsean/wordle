@@ -3190,6 +3190,43 @@ class TestERDSolverBudget(unittest.TestCase):
         self.assertIn("[ERD ready: 4.500", text)
         self.assertNotIn("no guaranteed finish", text)
 
+    def test_pause_resume_race_does_not_misreport_budget_loss(self):
+        """min_expected_guesses returns None for two different reasons: an
+        abort (cancel/pause fired cancel_check mid-search) and a genuine
+        budget floor. The main thread's pause()/resume() wrap tightly
+        around each command handler (main()), so self._paused can already
+        be set again by the time _scan inspects it — even right after a
+        real pause aborted the search. _scan must not infer "proven loss"
+        from that racy flag; it must consult the persisted loss record,
+        which a merely-aborted call never wrote."""
+        solver, score_cache = self._solver(budget=8)  # a feasible budget
+
+        real_min_expected = min_expected_guesses
+        calls = {'n': 0}
+
+        def flaky_first_call(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                # No loss is written for this call — it is a bare abort,
+                # not an exhausted, proven-infeasible search. self._paused
+                # is left set (as if resume() already fired), reproducing
+                # the race even without real threads.
+                return None
+            return real_min_expected(*args, **kwargs)
+
+        out = io.StringIO()
+        with mock.patch('wordle.min_expected_guesses', side_effect=flaky_first_call), \
+             redirect_stdout(out):
+            solver._scan(score_cache)
+
+        text = out.getvalue()
+        self.assertNotIn("no guaranteed finish", text,
+            "an aborted (not exhausted) search must not be reported as a "
+            "proven budget floor")
+        self.assertIn("[ERD ready: 4.500", text,
+            "the retried search must still deliver the real recommendation")
+        self.assertEqual(calls['n'], 2)
+
 
 # ---------------------------------------------------------------------------
 # BranchPrecacheSolver: precache ERD for sibling branches of a guess

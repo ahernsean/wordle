@@ -2779,19 +2779,27 @@ class ERDSolver(threading.Thread):
                 if self._cancel.is_set():
                     logger.info("ERDSolver cancelled mid-scan")
                     return
-                if self._paused.is_set():
-                    # Not cancelled and not paused: cancel_check (deadline is
-                    # never set here) can only have fired via a genuine budget
-                    # floor — min_expected_guesses proved branch_words has no
-                    # winning strategy within `budget` guesses. (Unconstrained
-                    # search never hits this floor, so budget is not None here.)
-                    print(f'\n  [ERD: no guaranteed finish within {budget} guesses]',
-                          flush=True)
-                    logger.info("ERD: no guaranteed finish within %d guesses", budget)
-                    if budget == self._budget:
-                        budget = None  # retry unconstrained, clearly labeled above
-                        continue
-                    return
+                # A None result means either an abort (cancel/pause fired
+                # cancel_check mid-search) or a genuine budget floor. The
+                # main thread's pause()/resume() wrap tightly around each
+                # command handler, so `self._paused` can already be set
+                # again by the time we get here even after a real pause
+                # aborted the search — reading it now would misclassify
+                # that race as a floor. Read the persisted loss record
+                # instead: write_loss for the root only ever happens when
+                # the search actually exhausted every candidate without one
+                # succeeding (an abort returns before reaching that code),
+                # so this check is race-free ground truth.
+                if budget is not None:
+                    loss_budget = score_cache.read_loss(root_key, policy)
+                    if loss_budget is not None and budget <= loss_budget:
+                        print(f'\n  [ERD: no guaranteed finish within {budget} guesses]',
+                              flush=True)
+                        logger.info("ERD: no guaranteed finish within %d guesses", budget)
+                        if budget == self._budget:
+                            budget = None  # retry unconstrained, clearly labeled above
+                            continue
+                        return
                 # Paused — wait for the main thread to finish its operation.
                 self._paused.wait()
                 if self._cancel.is_set():  # pragma: no cover - cancel-while-paused race
