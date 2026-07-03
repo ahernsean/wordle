@@ -13,13 +13,18 @@ Related artifacts:
 
 | Artifact | What it is |
 |---|---|
-| Issue #77 | Remove the `queue-add` 300-answer-word cap (implemented by §1 here) |
+| Issue #77 / PR #80 | Remove the `queue-add` 300-answer-word cap — **closed/merged**; §1 records what landed |
 | PR #76 (`claude/issue-67-review-8v65i1`) | Adaptive-claim-packing **measurement layer**; feeding a multi-day epoch-0 run ending Friday afternoon |
 | `adaptive_claim_packing.md` | The packing plan PR #76 instruments; proceeds on its own gates, orthogonal to this plan |
 | PR #78 (`claude/wordle-search-algorithm-kv7kij`) | This document |
 
-The three multiplicative levers this plan is built on, against the measured
-baseline of ~900 branch sweeps/day (`adaptive_claim_packing.md` §1):
+The three multiplicative levers this plan is built on, against a measured
+baseline of **~900 branch sweeps/day**. That figure is derived, not quoted:
+`adaptive_claim_packing.md` §1 reports 70.56M claims over the ~6-day
+Jun 23–29 run, one claim = one candidate under single-candidate claiming,
+and a branch sweep is ~12,972 candidates — 70.56M / 12,972 ≈ 5,400 sweeps
+/ 6 days ≈ 900/day (an upper bound on distinct branches, since promoted
+sub-branches also consume claims):
 
 | Lever | Expected gain | Where |
 |---|---|---|
@@ -27,10 +32,11 @@ baseline of ~900 branch sweeps/day (`adaptive_claim_packing.md` §1):
 | Vectorized partition kernel (NumPy) | ~10–50× on node rate and on the warm-cache sweep floor | §2–§5 |
 | Candidate equivalence-class dedupe | up to ~10× on deep branches | §6 |
 
-Plus two prerequisites that are not speedups: uncapping `queue-add` (§1 — a
-full tree needs every branch) and a monster-branch calibration solve (§7 — the
-current telemetry contains no branch over 300 answer words, so no schedule
-estimate is trustworthy without one).
+Plus one prerequisite that is not a speedup: a monster-branch calibration
+solve (§7 — the current telemetry contains no branch over 300 answer words,
+so no schedule estimate is trustworthy without one). Its own former
+prerequisite, uncapping `queue-add`, is already **done** — issue #77 was
+implemented by PR #80 and merged (§1 records the landed state).
 
 **All file:line references in this document are against `main` @ `364566a`.**
 PR #76 changes `wordle_engine.py`, `erd_queue.py`, `erd_swarm.py`, and
@@ -63,7 +69,7 @@ Additional identifiers used throughout this plan:
 | `best_erd` | float | The running branch-and-bound bound at a node: the best exact candidate cost found so far (or the alpha-beta `ceiling` it was seeded with). |
 | `cost_lb` | float | Admissible lower bound on one candidate's cost — see C2.1. |
 | `rest_lb` | list[float] | Admissible lower bound on the weighted cost of the response groups after position i (`wordle_engine.py:1050`). |
-| `subset_idx` | np.ndarray[int32] | New in this plan: a branch expressed as indices into the canonical answer-word list (column indices of the pattern matrix). |
+| `branch_indices` | np.ndarray[int32] | New in this plan: a branch expressed as indices into the canonical answer-word list (column indices of the pattern matrix). Full words per CLAUDE.md — not `subset_idx` (both halves would be wrong: "subset" is the retired vocabulary for branch, and `idx` is an abbreviation). |
 | `counts` | np.ndarray[int32] (G_vocab × 243) | New in this plan: response-group sizes of every candidate against one branch, one row per candidate. |
 | `answer_list_id` | str | SHA-256 identity of the answer universe; keys every cache table. |
 | `branch_key` | bytes | `ScoreCache.encode_subset(branch_words)`: sorted words concatenated, 5 bytes/word. |
@@ -174,13 +180,13 @@ Rules that follow:
 1. **Nothing in this plan deploys to the Linux box before the run ends.**
    Deploying mid-run would mix node-timing regimes inside epoch 0 and violate
    the stop-workers-before-deploy rule (SWARM.md).
-2. **Engine/swarm/queue sections (§1, §4, §5, §6) branch from `main` only
+2. **Engine/swarm/queue sections (§4, §5, §6) branch from `main` only
    after PR #76 merges.** They touch the same files
    (`wordle_engine.py:evaluate_candidate` now carries a `metric_observer`
-   hook; `erd_search.py`, `erd_swarm.py`, `erd_queue.py` all changed).
-   Implementing them against pre-merge `main` guarantees painful rebases and
-   risks silently dropping PR #76's instrumentation.
-3. **New-file sections (§2, §3) and the doc section (§9's SWARM.md fix) can
+   hook; `erd_swarm.py`, `erd_queue.py` changed). Implementing them against
+   pre-merge `main` guarantees painful rebases and risks silently dropping
+   PR #76's instrumentation.
+3. **New-file sections (§2, §3) and the doc section (§9's design.md fix) can
    be implemented immediately** — `pattern_matrix.py` and its tests touch
    nothing PR #76 touches. §8 (export) touches `erd_search.py` and should
    also wait for the merge (the conflict is small but nonzero).
@@ -200,9 +206,9 @@ Rules that follow:
 
 | When | What |
 |---|---|
-| Now → Friday | §2, §3 implemented and reviewed (new files only, no deploy). §9's SWARM.md `ROOT_BUDGET` fix. Optionally §8 drafted but not merged. |
+| Now → Friday | §2, §3 implemented and reviewed (new files only, no deploy). §9's design.md `ROOT_BUDGET` fix. Optionally §8 drafted but not merged. |
 | Friday afternoon | Epoch-0 run ends. Owner runs `analyze_epoch0.py`; packer go/no-go decided (that track proceeds independently per `adaptive_claim_packing.md` §10). |
-| After PR #76 merges | §1, §4 branched from `main`, implemented, tested, deployed together (one worker restart, one epoch bump). Then §7 calibration. |
+| After PR #76 merges | §4 branched from `main`, implemented, tested, deployed (one worker restart, one epoch bump; the box pulls PR #80's uncapped `queue-add` in the same deploy). Then §7 calibration. |
 | After §7 numbers | Decide §5/§6 scope; §8 lands before the first full-tree phone sync. |
 
 ## C4. The phone usage model — three modes the plan must serve
@@ -253,10 +259,10 @@ Consequences for this plan:
   whole best-ERD descent under it. (Interim state: the epoch-0 run solved
   ALIBI's ≤ 300-word branches, so the next export gives *partial* ALIBI
   coverage; its root ERD stays a labeled lower bound until the over-cap
-  branches are solved — §1 then §7b.)
+  branches are solved — PR #80's uncapped `queue-add`, then §7b.)
 - **The opener's root ERD is computable from those same rows** — it does not
   need to be stored per opener, but it does need every branch of that opener
-  present (including the monster branches — another reason §1 precedes the
+  present (including the monster branches — another reason the cap removal (PR #80) precedes the
   full run). §8b adds the small reporting command that does the arithmetic.
 - **A son's second-and-later off-best guesses** leave the exported tree, the
   same as Mode B, and are served the same way: live `ERDSolver` on the
@@ -275,7 +281,7 @@ record the answer next to it when known.
 | # | Unknown / assumption | How to resolve | Blocks |
 |---|---|---|---|
 | U1 | NumPy version bundled in Pythonista on the owner's phone (§0 rule 3 assumes it may be years old). | Owner runs `import numpy; print(numpy.__version__)` in Pythonista, reports back. | §2 API choices if older than assumed |
-| U2 | Pattern-matrix memory: ~12,972 × ~3,185 uint8 ≈ 41MB. Six worker processes must not hold six private copies. | §2 persists a `.npy` and workers load with `mmap_mode='r'` (OS page cache shares one copy). Confirm RSS with 6 workers running. | §4 deploy |
+| U2 | Pattern-matrix memory: the 41MB matrix itself (~12,972 × ~3,185 uint8) **plus the per-call transients of `counts_for_all_candidates`**, which recur at every solved node once §4 lands and dominate the matrix unless bounded. | §2 persists a `.npy` and workers load with `mmap_mode='r'` (one page-cached copy); the chunked kernel bounds transients at ~16MB/call. Confirm total and per-call-transient RSS with 6 workers running, including a large-n solve. | §4 deploy |
 | U3 | Monster-branch cost (branches over 300 answer words) — zero data today. | §7 calibration solve; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | The whole-job schedule |
 | U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
 | U5 | Phone live-solve latency on off-tree branches (Modes B/C) with a reachable-only cache. | Timed `ERDSolver` runs in Pythonista at n ≈ 10 / 40 / 100. | Whether Mode C needs the out-of-scope lookup service |
@@ -333,47 +339,21 @@ step-by-step detail, edge cases, what to measure, acceptance criteria, and
 what is explicitly out of scope. "Definition of done" = all acceptance items
 checked, suite green, docs touched if named.
 
-## §1. Remove the `queue-add` 300-answer branch-size cap — implements issue #77
+## §1. Remove the `queue-add` 300-answer branch-size cap — **DONE (issue #77, PR #80, merged)**
 
-**Read first:** issue #77; `erd_search.py` `cmd_queue_add` (line 238) and the
-argparse block (line 1625); SWARM.md "Add branches to the queue".
-**Prerequisite:** PR #76 merged (touches `erd_search.py`).
+No implementation work remains; this section records what landed so later
+sections can rely on it. PR #80 (merged to `main` at `67f0b74`):
+`--max-branch-size` defaults to `None` = unlimited (`erd_search.py`, argparse
+block and both cap checks), SWARM.md's `queue-add` section updated, and the
+acceptance test added (`test_queue_add.py` — over-cap branch queued by
+default, skipped under an explicit `--max-branch-size 300`).
 
-**Current behaviour.** `--max-branch-size` defaults to 300
-(`erd_search.py:1629`). Single-branch adds print-and-skip above it
-(`erd_search.py:291-295`); whole-word adds filter silently
-(`erd_search.py:303`). Consequence: every opener's largest branches — the
-all-gray branch of a weak opener is 300–1,900 answer words — have never been
-queued, solved, or measured, and no opener's root ERD is computable.
-
-**Change.**
-1. Default `--max-branch-size` to `None`. Help text: "Skip branches with more
-   than N answer words (default: no limit)".
-2. Where the cap is applied, treat `None` as unlimited:
-   `if args.max_branch_size is not None and len(branch) > args.max_branch_size`.
-   The `>= 2` lower bound is unchanged.
-3. SWARM.md: update the `queue-add` example comment ("skips branches with
-   >300 answer words") and the flag description; note the
-   `--max-branch-size 999`+`--priority` example no longer needs the size
-   override for large branches, only the priority.
-
-**Edge cases.**
-- `--max-branch-size 0` / negative: leave argparse as-is (queues nothing /
-  nothing above the bound); not worth validation code.
-- Idempotency is untouched: `queue-add` already never duplicates queued
-  branches and only upgrades priority.
-
-**Explicitly out of scope.** Do NOT mass-queue monster branches in this
-section, and do not add any automatic "queue everything" command. §7
-calibrates exactly one monster first; mass-queueing is an operational decision
+**The one live remainder is operational:** the Linux box must have PR #80's
+code pulled before §7 queues the calibration monster (fold into the first
+post-PR-#76 deploy — see the C3 calendar). And the out-of-scope warning
+stands: do NOT mass-queue monster branches just because the cap is gone; §7
+calibrates exactly one first, and mass-queueing is an operational decision
 taken after U3 is known.
-
-**Acceptance.**
-- New unit test (alongside the existing `cmd_queue_add` tests): a branch with
-  more than 300 answer words is queued when no cap is passed, and skipped when
-  `--max-branch-size 300` is passed explicitly.
-- Existing CLI/queue tests pass unmodified.
-- SWARM.md updated in the same commit.
 
 ## §2. Pattern matrix module — new file `pattern_matrix.py`
 
@@ -418,42 +398,60 @@ Shape (~12,972 × ~3,185) ≈ 41MB. Rows are byte-for-byte the
 
 **Index plumbing.**
 - `guess_index(word) -> int` (KeyError on unknown — callers decide fallback).
-- `answer_indices(words) -> np.ndarray[int32]` — a branch as column indices;
-  raises on any word not in the answer universe (see §5 for the fallback
-  path; the swarm's branches are always answer subsets).
+- `answer_indices(words) -> np.ndarray[int32]` — a branch as column indices
+  (`branch_indices`); raises on any word not in the answer universe (see §5
+  for the fallback path; the swarm's branches are always answer subsets).
 
 **The core primitive** — response-group sizes of *every* candidate against a
-branch, one call:
+branch, one call. Chunked over guess rows so the per-call transient is a
+fixed ~16MB regardless of branch size — an unchunked
+`matrix[:, branch_indices].astype(...)` would materialize
+`n_guesses × n × itemsize` bytes (≈100–200MB per worker on a 1,900-word
+monster branch or §7a's full-answer-list census), and *that*, not the 41MB
+mmap-shared matrix, would be the real memory risk on a 6-worker box:
 
 ```python
-def counts_for_all_candidates(self, subset_idx):
+_COUNT_CHUNK_ROWS = 1024   # transient = 2 × _COUNT_CHUNK_ROWS × n × 4 bytes
+
+def counts_for_all_candidates(self, branch_indices):
     """(n_guesses, 243) int32: counts[g, p] = number of words in the branch
     whose response to guess-word g encodes to pattern p."""
-    sub = self.matrix[:, subset_idx]                        # (G_vocab, n) uint8
-    flat = sub.astype(np.int64) + (np.arange(self.n_guesses,
-                                             dtype=np.int64)[:, None] * 243)
-    return np.bincount(flat.ravel(),
-                       minlength=self.n_guesses * 243
-                       ).reshape(self.n_guesses, 243).astype(np.int32)
+    counts = np.empty((self.n_guesses, 243), dtype=np.int32)
+    row_offsets = np.arange(_COUNT_CHUNK_ROWS, dtype=np.int32)[:, None] * 243
+    for start in range(0, self.n_guesses, _COUNT_CHUNK_ROWS):
+        stop = min(start + _COUNT_CHUNK_ROWS, self.n_guesses)
+        rows = stop - start
+        branch_patterns = self.matrix[start:stop, branch_indices].astype(np.int32)
+        offset_patterns = branch_patterns + row_offsets[:rows]
+        counts[start:stop] = np.bincount(
+            offset_patterns.ravel(), minlength=rows * 243
+        ).reshape(rows, 243)
+    return counts
 ```
 
-One C-speed pass over `n_guesses × n` elements (~1.3M for n = 100 —
-milliseconds) replacing ~13k Python-level `group_counts` calls (~seconds).
-Also provide `patterns_for_candidates(candidate_idx, subset_idx)` returning
-the raw `(len(candidate_idx), n)` uint8 slice (§5, §6 reuse it).
+`int32` is safe: the largest offset key is `_COUNT_CHUNK_ROWS × 243 ≈ 249k`
+and the largest count is the answer-list size (~3,185). One C-speed pass over
+`n_guesses × n` elements (~1.3M for n = 100 — milliseconds) replacing ~13k
+Python-level `group_counts` calls (~seconds).
+Also provide `patterns_for_candidates(candidate_indices, branch_indices)`
+returning the raw `(len(candidate_indices), n)` uint8 slice (§5, §6 reuse
+it).
 
 **What to measure.** Build time cold (all blobs computed) and warm (all blobs
 in SQLite); `.npy` load time; `counts_for_all_candidates` wall time at
-n ∈ {8, 30, 100, 300, 1000}; peak RSS with the matrix mmap-loaded in 6
-processes (U2).
+n ∈ {8, 30, 100, 300, 1000, 1900}; peak RSS with the matrix mmap-loaded in 6
+processes **including per-call transient RSS at the large-n end** — the
+transients, not the shared matrix, are the dominant allocation (U2).
 
 **Acceptance.**
 - New `test_pattern_matrix.py`:
   - ~200 random (guess, answer) pairs:
     `matrix[g, a] == _encode_response(calculate_response(guess, answer))`.
   - ~20 random (candidate, branch) pairs: the nonzero entries of
-    `counts_for_all_candidates(subset_idx)[g]` equal
-    `ResponseCache.group_counts(candidate, branch_words)` as a dict.
+    `counts_for_all_candidates(branch_indices)[g]` equal
+    `ResponseCache.group_counts(candidate, branch_words)` as a dict —
+    including at least one branch larger than `_COUNT_CHUNK_ROWS` worth of
+    work and one that exercises the final partial chunk.
   - Save/load round-trip equals the built matrix; identity mismatch rebuilds.
   - With NumPy absent (simulated via import guard), `available()` is False
     and importing the module (and the engine) still succeeds.
@@ -465,10 +463,12 @@ processes (U2).
 (`wordle_engine.py:441-477`); the `cost_lb` line (`wordle_engine.py:1026`).
 **Prerequisite:** §2.
 
-**What it is.** From one `counts_for_all_candidates` result, the
-whole-vocabulary versions of the quantities the engine currently derives one
-candidate at a time. Return a small NamedTuple of parallel arrays, index =
-guess-word row:
+**What it is.** `candidate_stats(branch_indices)`: from one
+`counts_for_all_candidates` result, the whole-vocabulary versions of the
+quantities the engine currently derives one candidate at a time. Returns a
+small NamedTuple of parallel arrays, index = guess-word (matrix-row) space —
+see §4a's index-alignment hazard before consuming them in candidate-list
+order:
 
 | Field | dtype | Formula per row `c` | Engine twin |
 |---|---|---|---|
@@ -516,11 +516,14 @@ scan. Replacement when a matrix is available:
 
 ```python
 if pattern_matrix is not None and cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
-    subset_idx = pattern_matrix.answer_indices(branch_words)
-    stats = pattern_matrix.candidate_stats(subset_idx)           # §3
-    keys = stats.sum_squared_group_sizes[candidate_row_indices]  # aligned to candidate_list
-    order = np.argsort(keys, kind='mergesort')                   # stable
+    branch_indices = pattern_matrix.answer_indices(branch_words)
+    stats = pattern_matrix.candidate_stats(branch_indices)        # §3
+    candidate_rows = np.array([pattern_matrix.guess_index(c)
+                               for c in candidate_list], dtype=np.int32)
+    sort_keys = stats.sum_squared_group_sizes[candidate_rows]     # aligned to candidate_list
+    order = np.argsort(sort_keys, kind='mergesort')               # stable
     candidate_list = [candidate_list[i] for i in order]
+    candidate_cost_lower_bounds = stats.cost_lower_bound[candidate_rows][order]
 ```
 
 Correctness argument the implementer must preserve: Python's `sorted` is
@@ -528,33 +531,57 @@ stable, so equal-`Σk²` candidates keep their `candidate_list` relative order;
 `kind='mergesort'` is the stable argsort that reproduces exactly that. The
 keys are integers on both paths, so there is no float-comparison ambiguity.
 Result: byte-identical candidate order, hence identical winner on ties
-(C2.2). Cache the `stats`/`subset_idx` on the frame — 4b and §6 reuse them.
+(C2.2). Cache `stats`/`branch_indices` on the frame — 4b and §6 reuse them.
+
+**Index-alignment hazard (silent-wrong-answer severity).** Three index
+spaces exist here: matrix guess rows, pre-sort `candidate_list` positions,
+and post-sort positions. Every §3 vector is in *matrix row* space; the loop
+in 4b runs in *post-sort* space. The bound array 4b reads must therefore be
+permuted by **both** `candidate_rows` and `order` — exactly the last line of
+the snippet. Reading an unpermuted array with the loop index gates each
+candidate against *some other candidate's* bound: a non-admissible prune
+that can silently discard the true winner and cache a wrong ERD. The
+acceptance tests below include a fixture built to catch this.
 
 If any word in `candidate_list` is missing from the guess vocabulary
 (possible only in exotic interactive states), fall back to the pure-Python
 sort for that node rather than special-casing.
 
 **4b. Pre-gating in the candidate loop.** Inside the loop at
-`wordle_engine.py:1198`, before calling `evaluate_candidate`:
+`wordle_engine.py:1198`, replace the unconditional `evaluate_candidate` call
+with a gated one that **falls through** to the rest of the loop body — no
+early `continue`, because everything after the call (abort dispatch, taint
+fold, the mid-loop publisher check, the status dispatch) must still run for
+a pre-gated candidate exactly as it runs for one `evaluate_candidate`
+rejected itself:
 
 ```python
-if precomputed_cost_lower_bound is not None and \
-        precomputed_cost_lower_bound[i] >= best_erd:
-    cutoff_occurred = True
-    # mid-loop publisher check still runs this iteration (see below)
-    continue
+if (candidate_cost_lower_bounds is not None
+        and candidate_cost_lower_bounds[i] >= best_erd):
+    # Pre-gated: the same admissible bound evaluate_candidate would compute
+    # (C2.1) already proves this candidate cannot beat best_erd.
+    status, cost, max_remaining_depth, budget_tainted = (
+        OVER_ERD_LIMIT, None, None, False)
+else:
+    status, cost, max_remaining_depth, budget_tainted = evaluate_candidate(
+        branch_words, candidate, cache, score_cache, ...)
+# ... unchanged from here: abort dispatch, node_floor fold, mid-loop
+# publisher check, then `if status == OVER_ERD_LIMIT: cutoff_occurred = True;
+# continue` — the pre-gated tuple flows through the same dispatch.
 ```
 
 This is decision-identical to the gate `evaluate_candidate` itself applies at
 `wordle_engine.py:1027` — same admissible bound (C2.1), same `>=` comparison,
-against the same running `best_erd` — but costs an array read instead of a
+against the same running `best_erd`, and the same result tuple
+`(OVER_ERD_LIMIT, None, None, False)` — but costs an array read instead of a
 full `group_words` partition (the dominant cost of a gated candidate).
 
 Three invariants to preserve, each already load-bearing today:
 1. **The mid-loop publisher check runs every iteration** including pre-gated
    ones (today's loop runs it before the status `continue`s —
-   `wordle_engine.py:1211-1217`). Keep the call order: evaluate-or-skip,
-   then publisher check, then dispatch on status.
+   `wordle_engine.py:1211-1217`). The 4b snippet's fall-through structure
+   exists precisely for this: evaluate-or-skip, then publisher check, then
+   dispatch on status. Never write pre-gating as an early `continue`.
 2. **`cutoff_occurred` semantics:** a pre-gated candidate is an
    `OVER_ERD_LIMIT`-equivalent, so it must set `cutoff_occurred = True`
    (otherwise a node where *every* candidate is pre-gated would fall through
@@ -599,6 +626,12 @@ count, and the per-node share still spent in `group_words` (that share is
 - A regression test for invariant 2: a branch/budget where every candidate is
   pre-gated (tight seeded ceiling) still returns `OVER_ERD_LIMIT`-style
   cutoff, and writes **no** loss row.
+- A regression test for the index-alignment hazard (4a): a fixture branch
+  where the best-first order differs substantially from vocabulary order and
+  the winning candidate sits late in vocabulary order but early in sorted
+  order — chosen so that gating any candidate against a misaligned bound
+  changes the recorded winner or ERD, making the equivalence assertion catch
+  an unpermuted or half-permuted bound array.
 - Full suite green with NumPy present and absent.
 - PR description states the `metric_observer` choice (invariant 3).
 
@@ -617,7 +650,7 @@ this section — the complexity is not free.
 Python cost.
 
 **Change.** Inside `ResponseCache.group_words`, accept an optional
-`(pattern_matrix, subset_idx)` fast path that produces an **identical dict**
+`(pattern_matrix, branch_indices)` fast path that produces an **identical dict**
 — same keys, same value lists, same *iteration order* — via one matrix row
 read plus a stable argsort, instead of the per-word loop.
 
@@ -629,21 +662,21 @@ order determines float accumulation order of `cost` and, under a ceiling,
 **first-appearance order of each pattern while walking the branch words**.
 The fast path must reproduce exactly that:
 
-1. `pats = matrix[g, subset_idx]` (uint8, length n).
-2. `order = np.argsort(pats, kind='mergesort')` — sorts by pattern value,
-   preserving branch order within a pattern (so each group's word list is in
-   branch order, matching today).
+1. `branch_patterns = matrix[g, branch_indices]` (uint8, length n).
+2. `order = np.argsort(branch_patterns, kind='mergesort')` — sorts by
+   pattern value, preserving branch order within a pattern (so each group's
+   word list is in branch order, matching today).
 3. Walk `order` once, cutting at pattern-value boundaries → groups keyed by
    pattern, each with its word list.
 4. Emit the dict **in first-appearance order**: compute each present
-   pattern's first index in `pats` (e.g. via the boundary walk plus a second
-   pass ordering group keys by `first_index[pattern]`), and insert in that
-   order. Do not emit in ascending-pattern order; that reorders equal-size
-   ties.
+   pattern's first index in `branch_patterns` (e.g. via the boundary walk
+   plus a second pass ordering group keys by `first_index[pattern]`), and
+   insert in that order. Do not emit in ascending-pattern order; that
+   reorders equal-size ties.
 5. Words outside the answer universe (the interactive fallback mode —
-   `wordle_engine.py:424-429`) cannot be in `subset_idx`; when the caller
-   cannot form `subset_idx` (any branch word unknown), it must pass none and
-   take the existing loop. The swarm path always can.
+   `wordle_engine.py:424-429`) cannot be in `branch_indices`; when the
+   caller cannot form `branch_indices` (any branch word unknown), it must
+   pass none and take the existing loop. The swarm path always can.
 
 **Acceptance.**
 - Property test: for ~50 random (guess, branch) pairs, fast and slow
@@ -662,7 +695,7 @@ argument below — it is the whole correctness case.
 **Fact this exploits.** A candidate's evaluation depends only on (a) the
 partition it induces on `branch_words` and (b) whether it is itself in the
 branch — and both are fully encoded in its pattern row restricted to the
-branch (`matrix[g, subset_idx]`; membership shows as pattern 242). Two
+branch (`matrix[g, branch_indices]`; membership shows as pattern 242). Two
 candidates with identical rows are indistinguishable to the recurrence: same
 groups, same costs, same `max_remaining_depth`, same taint. On deep branches
 over few distinct letters, most of the ~13k candidates collapse into few
@@ -712,9 +745,10 @@ shrink; this number decides how much §6 matters below the promotion threshold.
 
 ## §7. Monster-branch calibration and top-level census — operational
 
-**Read first:** §1 (must be deployed); PR #76's `branch_finalize_log` and
+**Read first:** §1 (what PR #80 landed); PR #76's `branch_finalize_log` and
 censoring semantics; C5 U3/U4/U7.
-**Prerequisites:** §1 deployed; §4 strongly recommended deployed (calibrating
+**Prerequisites:** PR #80's uncapped `queue-add` pulled onto the Linux box;
+§4 strongly recommended deployed (calibrating
 the slow kernel mismeasures the plan); PR #76's instrumentation live.
 
 **7a. Census (30-minute script, do first).** New `diag_toplevel_census.py`:
@@ -813,9 +847,11 @@ findings, not code changes.
 **Read first:** CLAUDE.md naming rules; C2.1; C3 rule 2.
 
 **9a. Doc fixes (can do now).**
-- SWARM.md Budget section: "Workers solve branches under `ROOT_BUDGET = 5`"
+- design.md's Budget subsection of "Parallel ERD Precache (Swarm)"
+  (`design.md:362-366`): "Workers solve branches under `ROOT_BUDGET = 5`"
   is stale — the code has `ROOT_BUDGET = GAME_GUESSES` with each queued
   branch solved at `ROOT_BUDGET − guess_depth` (`erd_swarm.py:98-101`).
+  (SWARM.md contains no budget text; the stale line lives in design.md.)
 - After §2/§4 land: add `pattern_matrix.py` to the layer tables in CLAUDE.md
   and design.md, plus a short design.md section: what the matrix is, which
   engine paths consult it, and the fallback rule (Part II rule 2).
@@ -838,16 +874,17 @@ no-abbreviations rule and under-describe themselves (C2.1). Proposed:
 # Sequencing
 
 ```
-now → Friday      §2 → §3 (new files, no deploy)          §9a SWARM.md fix
+already done      §1 (issue #77 / PR #80, merged — box pulls it at next deploy)
+now → Friday      §2 → §3 (new files, no deploy)          §9a design.md fix
 Friday pm         epoch-0 run ends → analyze_epoch0.py gate (packing track)
-after PR #76      §1 ─┐
-merges            §4 ─┴─ deploy together: one restart, one epoch bump
+after PR #76      §4 — deploy: one restart, one epoch bump (brings PR #80
+merges                 onto the box in the same pull)
 then              §7a census → §7b calibration → §7c schedule memo
 then              §5 and/or §6 per §7's numbers            §8 before first full-tree sync
 anytime after     §9b rename (after epoch-0 analysis archived)
 parallel track    claim packing per adaptive_claim_packing.md, gated on U6
 ```
 
-Dependency summary: §2→§3→§4→§5; §2→§6; §1+§4→§7; §8 independent after the
-merge; §9a independent; §9b last. The packing lever multiplies with all of
-it and is managed by its own document.
+Dependency summary: §2→§3→§4→§5; §2→§6; §4 (+PR #80 on the box)→§7; §8
+independent after the merge; §9a independent; §9b last. The packing lever
+multiplies with all of it and is managed by its own document.
