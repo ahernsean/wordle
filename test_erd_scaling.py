@@ -19,6 +19,7 @@ Three checks:
    of 1-worker time.  Key design constraints that make the comparison
    meaningful are documented on TestCooperativeDrainSmoke.
 """
+import json
 import multiprocessing as mp
 import os
 import sys
@@ -40,6 +41,22 @@ BRANCH = ["crane", "slate", "trace", "stale", "tales", "least",
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train", "grade",
                        "shine", "mount", "frost", "plumb", "dwarf", "gawky"]
 WORKER_COUNTS = (1, 2, 4)
+
+# The multi-process scaling smoke tests need a fork start method and >=2 CPUs.
+# Where those aren't available the tests skip, and a skipped scaling test looks
+# identical to a passing suite in the CI summary — a green check would then hide
+# the fact that the swarm was never actually exercised across processes. Emit a
+# loud line to stderr so the skip is visible in the run log.
+SCALING_SMOKE_REQS_MET = "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2
+SCALING_SMOKE_SKIP_REASON = "needs fork start method and >=2 CPUs"
+
+if not SCALING_SMOKE_REQS_MET:
+    print(
+        f"WARNING: skipping multi-process scaling smoke tests "
+        f"(TestProcessScalingSmoke, TestCooperativeDrainSmoke): "
+        f"{SCALING_SMOKE_SKIP_REASON} "
+        f"(fork={'fork' in mp.get_all_start_methods()}, cpus={os.cpu_count()})",
+        file=sys.stderr, flush=True)
 
 
 class _Base(unittest.TestCase):
@@ -138,9 +155,7 @@ class TestWorkDoesNotAmplify(_Base):
                     f"expected {len(CANDIDATES)} (work amplification!)")
 
 
-@unittest.skipUnless(
-    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
-    "needs fork start method and >=2 CPUs")
+@unittest.skipUnless(SCALING_SMOKE_REQS_MET, SCALING_SMOKE_SKIP_REASON)
 class TestProcessScalingSmoke(_Base):
     """Verify that ERD results from real forked swarm_worker processes agree.
 
@@ -202,9 +217,7 @@ class TestProcessScalingSmoke(_Base):
                 self.assertAlmostEqual(result[1], truth, places=6)
 
 
-@unittest.skipUnless(
-    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
-    "needs fork start method and >=2 CPUs")
+@unittest.skipUnless(SCALING_SMOKE_REQS_MET, SCALING_SMOKE_SKIP_REASON)
 class TestCooperativeDrainSmoke(unittest.TestCase):
     # -------------------------------------------------------------------------
     # PURPOSE: verify that N cooperative swarm workers drain a shared queue
@@ -349,6 +362,25 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         with open(summary_path, 'a') as f:
             f.write('\n'.join(lines) + '\n')
 
+    @staticmethod
+    def _write_result_file(n, t1, tN, passed, ratio):
+        """Record the measured drain speedup as JSON so a dedicated CI step
+        can display and re-check it, the way `coverage report` surfaces the
+        coverage number in its own step. Path is $SCALING_RESULT_PATH (default
+        scaling_result.json in the cwd)."""
+        path = os.environ.get('SCALING_RESULT_PATH', 'scaling_result.json')
+        with open(path, 'w') as f:
+            json.dump({
+                'workers':      n,
+                't1_drain':     t1,
+                'tN_drain':     tN,
+                'speedup':      t1 / tN,
+                'min_speedup':  1 / ratio,
+                'threshold_ratio': ratio,
+                'passed':       passed,
+                'cpu_count':    os.cpu_count(),
+            }, f)
+
     def test_Nworkers_faster_than_1worker(self):
         n = min(4, os.cpu_count() or 1)
         r1 = self._drain(1, "w1")
@@ -363,6 +395,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
 
         passed = tN < t1 * self._SPEEDUP_RATIO
         self._publish_summary([r1, rN], n, t1, tN, passed)
+        self._write_result_file(n, t1, tN, passed, self._SPEEDUP_RATIO)
 
         sys.stderr.write(
             f"\n[drain] cpu_count={os.cpu_count()}  "
