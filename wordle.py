@@ -35,6 +35,7 @@ from wordle_engine import (
     answer_to_restriction, enumerate_branches,
     min_expected_guesses, verify_erd_cache, rank_candidates_by_max_group_size_then_entropy_gain,
     ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
+    GAME_GUESSES,
 )
 
 # ---------------------------------------------------------------------------
@@ -45,7 +46,7 @@ ANSWER_FILE = "NYT_wordlist.txt"
 WORDS_FILE = "wordle.txt"
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = "wordle_debug.log"
-BUILD = "b135"
+BUILD = "b136"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -2517,7 +2518,7 @@ class ERDSolver(threading.Thread):
     def __init__(self, current_words, all_answers, effective_guesses,
                  score_cache_path,
                  policy=ERD_ALL, persist=True, seed_mem_cache=None,
-                 last_guess=None):
+                 last_guess=None, budget=None):
         super().__init__(daemon=True, name='ERDSolver')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
@@ -2527,6 +2528,9 @@ class ERDSolver(threading.Thread):
         self._policy = policy
         self._persist = persist
         self._seed_mem_cache = seed_mem_cache
+        # Allowed remaining depth from this position (budget + guess_depth =
+        # GAME_GUESSES). None means unconstrained ERD (legacy behaviour).
+        self._budget = budget
         # (word, response) of the guess that produced _words — used only to
         # title the periodic "Targeted scan" report (see _scan). None in
         # tests that construct an ERDSolver directly without a Solution.
@@ -2737,6 +2741,11 @@ class ERDSolver(threading.Thread):
                 self._start_word(score_cache, ranked_guesses, done)
                 _maybe_print()
 
+            # budget starts as the caller's constrained value (None = already
+            # unconstrained). If a constrained search proves the position a
+            # loss, it is set to None once so the loop falls back to an
+            # unconstrained best-effort recommendation instead of silence.
+            budget = self._budget
             while True:
                 self.root_done = 0
                 self.root_total = 0
@@ -2753,19 +2762,35 @@ class ERDSolver(threading.Thread):
                     progress_callback=_progress,
                     cancel_check=_cancel_or_paused,
                     heartbeat=_maybe_print,
+                    budget=budget,
                 )
                 if result is not None:
                     if not self._cancel.is_set():
                         word = self.root_best[0] if self.root_best else None
                         word_tag = f' {word.upper()}' if word else ''
-                        print(f'\n  [ERD ready: {result:.3f}{word_tag}]',
+                        label = ('ERD ready' if budget == self._budget
+                                 else 'ERD best-effort (unconstrained)')
+                        print(f'\n  [{label}: {result:.3f}{word_tag}]',
                               flush=True)
-                        logger.info("ERD ready: %.3f%s", result, word_tag)
+                        logger.info("%s: %.3f%s", label, result, word_tag)
                     else:
                         logger.info("ERDSolver cancelled before result delivered")
                     return
                 if self._cancel.is_set():
                     logger.info("ERDSolver cancelled mid-scan")
+                    return
+                if self._paused.is_set():
+                    # Not cancelled and not paused: cancel_check (deadline is
+                    # never set here) can only have fired via a genuine budget
+                    # floor — min_expected_guesses proved branch_words has no
+                    # winning strategy within `budget` guesses. (Unconstrained
+                    # search never hits this floor, so budget is not None here.)
+                    print(f'\n  [ERD: no guaranteed finish within {budget} guesses]',
+                          flush=True)
+                    logger.info("ERD: no guaranteed finish within %d guesses", budget)
+                    if budget == self._budget:
+                        budget = None  # retry unconstrained, clearly labeled above
+                        continue
                     return
                 # Paused — wait for the main thread to finish its operation.
                 self._paused.wait()
@@ -3119,6 +3144,7 @@ def main():  # pragma: no cover - interactive REPL loop, exercised manually
                     persist=cfg.persist,
                     seed_mem_cache=seed_cache,
                     last_guess=tuple(soln0.guesses[-1]),
+                    budget=GAME_GUESSES - len(soln0.guesses),
                 )
                 _solver.start()
                 _solver_key = branch_key
