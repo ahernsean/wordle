@@ -19,6 +19,7 @@ Three checks:
    of 1-worker time.  Key design constraints that make the comparison
    meaningful are documented on TestCooperativeDrainSmoke.
 """
+import json
 import multiprocessing as mp
 import os
 import sys
@@ -361,6 +362,25 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         with open(summary_path, 'a') as f:
             f.write('\n'.join(lines) + '\n')
 
+    @staticmethod
+    def _write_result_file(n, t1, tN, passed, ratio):
+        """Record the measured drain speedup as JSON so a dedicated CI step
+        can display and re-check it, the way `coverage report` surfaces the
+        coverage number in its own step. Path is $SCALING_RESULT_PATH (default
+        scaling_result.json in the cwd)."""
+        path = os.environ.get('SCALING_RESULT_PATH', 'scaling_result.json')
+        with open(path, 'w') as f:
+            json.dump({
+                'workers':      n,
+                't1_drain':     t1,
+                'tN_drain':     tN,
+                'speedup':      t1 / tN,
+                'min_speedup':  1 / ratio,
+                'threshold_ratio': ratio,
+                'passed':       passed,
+                'cpu_count':    os.cpu_count(),
+            }, f)
+
     def test_Nworkers_faster_than_1worker(self):
         n = min(4, os.cpu_count() or 1)
         r1 = self._drain(1, "w1")
@@ -375,6 +395,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
 
         passed = tN < t1 * self._SPEEDUP_RATIO
         self._publish_summary([r1, rN], n, t1, tN, passed)
+        self._write_result_file(n, t1, tN, passed, self._SPEEDUP_RATIO)
 
         sys.stderr.write(
             f"\n[drain] cpu_count={os.cpu_count()}  "

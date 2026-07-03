@@ -24,3 +24,7 @@ wordle_erd_export.sqlite3-wal
 .coverage.*
 coverage.xml
 htmlcov/
+
+# Scaling smoke-test result (written by test_erd_scaling, read by the CI
+# "Validate scaling" step)
+scaling_result.json
