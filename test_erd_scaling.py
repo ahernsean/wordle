@@ -41,6 +41,22 @@ CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train", "grade",
                        "shine", "mount", "frost", "plumb", "dwarf", "gawky"]
 WORKER_COUNTS = (1, 2, 4)
 
+# The multi-process scaling smoke tests need a fork start method and >=2 CPUs.
+# Where those aren't available the tests skip, and a skipped scaling test looks
+# identical to a passing suite in the CI summary — a green check would then hide
+# the fact that the swarm was never actually exercised across processes. Emit a
+# loud line to stderr so the skip is visible in the run log.
+SCALING_SMOKE_REQS_MET = "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2
+SCALING_SMOKE_SKIP_REASON = "needs fork start method and >=2 CPUs"
+
+if not SCALING_SMOKE_REQS_MET:
+    print(
+        f"WARNING: skipping multi-process scaling smoke tests "
+        f"(TestProcessScalingSmoke, TestCooperativeDrainSmoke): "
+        f"{SCALING_SMOKE_SKIP_REASON} "
+        f"(fork={'fork' in mp.get_all_start_methods()}, cpus={os.cpu_count()})",
+        file=sys.stderr, flush=True)
+
 
 class _Base(unittest.TestCase):
     def setUp(self):
@@ -138,9 +154,7 @@ class TestWorkDoesNotAmplify(_Base):
                     f"expected {len(CANDIDATES)} (work amplification!)")
 
 
-@unittest.skipUnless(
-    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
-    "needs fork start method and >=2 CPUs")
+@unittest.skipUnless(SCALING_SMOKE_REQS_MET, SCALING_SMOKE_SKIP_REASON)
 class TestProcessScalingSmoke(_Base):
     """Verify that ERD results from real forked swarm_worker processes agree.
 
@@ -202,9 +216,7 @@ class TestProcessScalingSmoke(_Base):
                 self.assertAlmostEqual(result[1], truth, places=6)
 
 
-@unittest.skipUnless(
-    "fork" in mp.get_all_start_methods() and (os.cpu_count() or 1) >= 2,
-    "needs fork start method and >=2 CPUs")
+@unittest.skipUnless(SCALING_SMOKE_REQS_MET, SCALING_SMOKE_SKIP_REASON)
 class TestCooperativeDrainSmoke(unittest.TestCase):
     # -------------------------------------------------------------------------
     # PURPOSE: verify that N cooperative swarm workers drain a shared queue
