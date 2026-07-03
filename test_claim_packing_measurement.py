@@ -280,6 +280,23 @@ class TestCutoffMetric(unittest.TestCase):
         uncut = estimate_candidate_work(sizes, False, n, 2.9, 4, self._warm(7.0))
         self.assertLessEqual(cut, uncut)
 
+    def test_full_branch_group_skipped(self):
+        # A group of size n gains no information; the engine rejects it, so the
+        # cutoff metric skips it and only the genuine sub-branches contribute.
+        sizes, n = [10, 3, 2], 10
+        # cost_lb = 3 - 3/10 = 2.7 < bound -> not gated; the k==n group is skipped.
+        work = estimate_candidate_work_cutoff(sizes, False, n, 5.0, 4, self._warm(4.0))
+        self.assertEqual(work, 4.0 * 2)   # only the size-3 and size-2 groups counted
+
+    def test_singleton_groups_cost_no_search(self):
+        # Two size-1 groups with has_self: the first is the candidate itself (0
+        # further guesses), the second is a non-self singleton (~0 search).  Neither
+        # contributes search work, so the estimate is just the one real sub-branch.
+        sizes, n = [3, 1, 1], 5
+        # cost_lb = 3 - (3+1)/5 = 2.2 < bound -> not gated; loop reaches both 1s.
+        work = estimate_candidate_work_cutoff(sizes, True, n, 3.0, 4, self._warm(1.0))
+        self.assertEqual(work, 1.0)       # only the size-3 group contributes
+
 
 class TestCandidateAccuracyGroupSizes(_TmpQueue):
     def test_group_sizes_persisted(self):
