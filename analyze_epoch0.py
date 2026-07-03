@@ -157,6 +157,38 @@ def evaluate_metric(name, fn, rows, typical, args):
     return fe_frac, rho_tail, rho_all
 
 
+def estimate_claim_reduction(conn, epoch, small_count, count_cap):
+    """The reframed §11 gate: claim transactions to drain a branch under the
+    binary/coarse packing scheme vs single-candidate claiming — which needs only
+    exact gating, not a good magnitude estimate.
+
+    Per finalized branch of `total` candidates with `N` non-gated: the non-gated
+    pack into ceil(N/small_count) small fixed-count bundles and the gated
+    G = total - N coalesce into ceil(G/count_cap) count-capped bulk bundles.
+    reduction = total / bundles.  Gating is exact, so a wrong work estimate cannot
+    change this — it only decides which non-gated candidates share a small bundle.
+    """
+    import math
+    total_by = {bytes(r[0]): r[1] for r in conn.execute(
+        "SELECT branch_key, n_claims FROM branch_finalize_log WHERE n_claims > 0")}
+    ng_by = {}
+    for bk, cnt in conn.execute(
+        "SELECT branch_key, COUNT(*) FROM candidate_accuracy "
+        "WHERE epoch = ? AND gated = 0 GROUP BY branch_key", (epoch,)):
+        ng_by[bytes(bk)] = cnt
+    tot_claims = tot_bundles = 0
+    per = []
+    for bk, total in total_by.items():
+        N = min(ng_by.get(bk, 0), total)
+        G = total - N
+        bundles = max(1, math.ceil(N / small_count)
+                      + (math.ceil(G / count_cap) if G else 0))
+        tot_claims += total
+        tot_bundles += bundles
+        per.append(total / bundles)
+    return tot_claims, tot_bundles, per
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -171,15 +203,21 @@ def main():
                     help="min bounded non-gated rows before the verdict uses the "
                          "bounded subset instead of the full set (default 2000)")
     ap.add_argument("--gate-metric", default="cutoff", choices=list(METRICS))
+    ap.add_argument("--small-count", type=int, default=8,
+                    help="non-gated candidates per small bundle (binary scheme)")
+    ap.add_argument("--count-cap", type=int, default=512,
+                    help="gated candidates per count-capped bulk bundle")
+    ap.add_argument("--min-reduction", type=float, default=50.0,
+                    help="claim-count reduction the reframed gate requires (x)")
     args = ap.parse_args()
 
     conn = sqlite3.connect(f"file:{args.queue}?mode=ro", uri=True)
     typical = load_cost_model(conn)
     all_rows = conn.execute("""
-        SELECT n_words, budget, bound_erd, gated, actual_nodes, group_sizes
+        SELECT n_words, budget, bound_erd, gated, actual_nodes, group_sizes,
+               source_word
         FROM candidate_accuracy WHERE epoch = ?
     """, (args.epoch,)).fetchall()
-    conn.close()
 
     n = len(all_rows)
     print(f"epoch {args.epoch}: {n:,} candidate_accuracy rows  "
@@ -190,6 +228,9 @@ def main():
 
     gated = [r for r in all_rows if r[3]]
     nongated_raw = [r for r in all_rows if not r[3]]
+    # by-opener counts (segmentation for the per-opener split)
+    from collections import Counter
+    opener_counts = Counter(r[6] for r in nongated_raw)
     print(f"gated: {len(gated):,} ({100*len(gated)/n:.1f}%)   "
           f"non-gated: {len(nongated_raw):,} ({100*len(nongated_raw)/n:.1f}%)")
 
@@ -204,13 +245,16 @@ def main():
 
     # Parse group sizes once; drop rows missing them (older rows before the column)
     rows = []
+    rows_by_opener = {}
     skipped = 0
-    for n_words, budget, bound, _g, actual, gs in nongated_raw:
+    for n_words, budget, bound, _g, actual, gs, opener in nongated_raw:
         if not gs:
             skipped += 1
             continue
         sizes = [int(x) for x in gs.split("-") if x]
-        rows.append((n_words, budget, bound, actual, sizes))
+        row = (n_words, budget, bound, actual, sizes)
+        rows.append(row)
+        rows_by_opener.setdefault(opener, []).append(row)
     have_bound = sum(1 for r in rows if r[2] is not None)
     print(f"\nnon-gated with group_sizes: {len(rows):,}  "
           f"(skipped {skipped:,} pre-column rows); with a known bound: "
@@ -233,22 +277,56 @@ def main():
         print(f"  (only {len(bounded):,} bounded rows — under --min-bounded "
               f"{args.min_bounded}; verdict uses the full set)")
 
-    # Verdict on the chosen packer metric, preferring the bounded subset.
+    # Per-opener split: different openers reach differently-shaped answer sets, so
+    # report the bounded metric per opener (thin openers flagged as noise).
+    print("\n=== Per-opener split (bounded rows, uncut metric) ===")
+    for opener in sorted(rows_by_opener, key=lambda o: -opener_counts[o]):
+        obounded = [r for r in rows_by_opener[opener] if r[2] is not None]
+        if len(obounded) < 50:
+            print(f"  {opener}: {len(obounded)} bounded rows (too few — noise)")
+            continue
+        evaluate_metric(opener, estimate_candidate_work, obounded, typical, args)
+
+    # The reframed gate (per the watching agent): claim-count reduction under the
+    # binary/coarse scheme, which needs only exact gating — not a good estimate.
+    tot_claims, tot_bundles, per = estimate_claim_reduction(
+        conn, args.epoch, args.small_count, args.count_cap)
+    print(f"\n=== Reframed gate: claim-count reduction "
+          f"(small_count={args.small_count}, count_cap={args.count_cap}) ===")
+    if tot_bundles:
+        agg = tot_claims / tot_bundles
+        med = statistics.median(per) if per else float("nan")
+        print(f"  finalized branches: {len(per):,}   "
+              f"aggregate claims {tot_claims:,} -> bundles {tot_bundles:,} "
+              f"= {agg:.1f}x fewer   median per-branch = {med:.1f}x")
+    else:
+        print("  (no finalized branches with n_claims)")
+    conn.close()
+
+    # Two verdicts: the rank-based gate (which a magnitude metric must pass) and
+    # the reframed gate (which the binary scheme passes on exact gating alone).
     results = results_bounded or results_all
     fe_frac, rho_tail, _ = results[args.gate_metric]
     used = "bounded subset" if results_bounded else "full non-gated set"
-    print(f"\n=== §11 go/no-go  (gate metric: '{args.gate_metric}', basis: {used}) ===")
     gate_ok = (not gated) or gfrac >= 0.95
     fe_ok = not math.isnan(fe_frac) and fe_frac <= args.max_false
     tail_ok = not math.isnan(rho_tail) and rho_tail >= args.strong
+    reduction_ok = bool(tot_bundles) and (tot_claims / tot_bundles) >= args.min_reduction
+    print(f"\n=== §11 go/no-go ===")
     print(f"  [{'PASS' if gate_ok else 'FAIL'}] gating split exact "
           f"({100*gfrac:.1f}% near-zero)" if gated else "  [n/a ] gating split")
-    print(f"  [{'PASS' if fe_ok else 'FAIL'}] §4 trap avoided "
-          f"(<= {100*args.max_false:.0f}% false-expensive, got {100*fe_frac:.1f}%)")
-    print(f"  [{'PASS' if tail_ok else 'FAIL'}] load-bearing rank "
-          f"(tail Spearman >= {args.strong}, got {rho_tail:.3f})")
-    go = gate_ok and fe_ok and tail_ok
-    print(f"\n  VERDICT: {'GO — build the packer on this metric' if go else 'NO-GO (refine metric before packer)'}")
+    print(f"  RANK-based gate (metric '{args.gate_metric}', {used}):")
+    print(f"    [{'PASS' if fe_ok else 'FAIL'}] §4 trap avoided "
+          f"({100*fe_frac:.1f}% false-expensive)")
+    print(f"    [{'PASS' if tail_ok else 'FAIL'}] load-bearing rank "
+          f"(tail Spearman {rho_tail:.3f} >= {args.strong})")
+    print(f"  REFRAMED gate (binary scheme, magnitude-free):")
+    print(f"    [{'PASS' if reduction_ok else 'FAIL'}] claim-count reduction "
+          f">= {args.min_reduction:g}x "
+          f"(got {tot_claims/tot_bundles:.1f}x)" if tot_bundles else
+          "    [n/a ] claim-count reduction (no data)")
+    print(f"\n  VERDICT: rank-gate = {'GO' if (gate_ok and fe_ok and tail_ok) else 'NO-GO'}"
+          f"   |   reframed-gate = {'GO' if (gate_ok and reduction_ok) else 'NO-GO'}")
 
 
 if __name__ == "__main__":

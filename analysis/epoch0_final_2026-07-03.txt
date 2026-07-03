@@ -1,0 +1,64 @@
+epoch-0 metric-validation FINAL assessment
+generated: Fri Jul  3 07:45:17 PM UTC 2026  |  branch: cfe2639
+3-day run stopped Fri; corpus 6.84M rows, 297k bounded, 99.4% ALIBI, budget-3, <=300-word branches.
+CAVEAT: ALIBI-dominated + monster regime (>300 words) EXCLUDED. Verdict provisional for that gap.
+===================================================================================
+epoch 0: 6,838,711 candidate_accuracy rows  (spearman via scipy)
+
+gated: 321,707 (4.7%)   non-gated: 6,517,004 (95.3%)
+
+=== Gating split: actual_nodes by class ===
+  gated         : n=  321707  median=     1.0  p99=       1.0  max=          1  mean=       1.0
+  non-gated     : n= 6517004  median=     2.0  p99=   25677.0  max=   93429206  mean=    2171.8
+  gated rows with actual < 10: 321,707/321,707 = 100.00%
+
+non-gated with group_sizes: 6,517,004  (skipped 0 pre-column rows); with a known bound: 297,602 (4.6%)
+
+=== Metric comparison: ALL non-gated (mostly unbounded) ===
+
+--- metric 'uncut' (non-gated, n=6,517,004) ---
+  median predicted = 55.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = 0.099   load-bearing tail (actual>=100, n=310891) Spearman = 0.498
+  log10 calibration: Pearson(log) = 0.012   slope = 0.041   resid_sigma = 0.88 dex  (slope~1 & low sigma => well-sized bundles)
+
+--- metric 'cutoff' (non-gated, n=6,517,004) ---
+  median predicted = 55.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = 0.096   load-bearing tail (actual>=100, n=310891) Spearman = 0.515
+  log10 calibration: Pearson(log) = 0.007   slope = 0.024   resid_sigma = 0.88 dex  (slope~1 & low sigma => well-sized bundles)
+
+=== Metric comparison: BOUNDED-only subset (n=297,602) — where cutoff differs from uncut ===
+
+--- metric 'uncut' (non-gated, n=297,602) ---
+  median predicted = 24.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = -0.240   load-bearing tail (actual>=100, n=39638) Spearman = 0.141
+  log10 calibration: Pearson(log) = 0.016   slope = 0.073   resid_sigma = 1.32 dex  (slope~1 & low sigma => well-sized bundles)
+
+--- metric 'cutoff' (non-gated, n=297,602) ---
+  median predicted = 20.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = -0.215   load-bearing tail (actual>=100, n=39638) Spearman = 0.210
+  log10 calibration: Pearson(log) = 0.033   slope = 0.169   resid_sigma = 1.32 dex  (slope~1 & low sigma => well-sized bundles)
+
+=== Per-opener split (bounded rows, uncut metric) ===
+
+--- metric 'alibi' (non-gated, n=297,233) ---
+  median predicted = 24.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = -0.243   load-bearing tail (actual>=100, n=39340) Spearman = 0.140
+  log10 calibration: Pearson(log) = 0.014   slope = 0.063   resid_sigma = 1.32 dex  (slope~1 & low sigma => well-sized bundles)
+
+--- metric 'crane' (non-gated, n=369) ---
+  median predicted = 54.0   §4 false-expensive (pred>1000, actual<10) = 0.0%
+  Spearman overall = 0.043   load-bearing tail (actual>=100, n=298) Spearman = -0.129
+  log10 calibration: Pearson(log) = 0.142   slope = 0.828   resid_sigma = 1.44 dex  (slope~1 & low sigma => well-sized bundles)
+
+=== Reframed gate: claim-count reduction (small_count=8, count_cap=512) ===
+  finalized branches: 2,958   aggregate claims 38,371,176 -> bundles 879,000 = 43.7x fewer   median per-branch = 418.5x
+
+=== §11 go/no-go ===
+  [PASS] gating split exact (100.0% near-zero)
+  RANK-based gate (metric 'cutoff', bounded subset):
+    [PASS] §4 trap avoided (0.0% false-expensive)
+    [FAIL] load-bearing rank (tail Spearman 0.210 >= 0.5)
+  REFRAMED gate (binary scheme, magnitude-free):
+    [FAIL] claim-count reduction >= 50x (got 43.7x)
+
+  VERDICT: rank-gate = NO-GO   |   reframed-gate = NO-GO
