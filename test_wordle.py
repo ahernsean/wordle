@@ -2844,7 +2844,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def cancel_during_root(remaining, cache, sc, deadline=None,
                                 guesses=None, policy=None,
                                 progress_callback=None,
-                                cancel_check=None, heartbeat=None):
+                                cancel_check=None, heartbeat=None,
+                                budget=None):
             solver.stop()  # e.g. the user moved on; a fresh solver supersedes this one
             return 1.8
 
@@ -3000,7 +3001,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
                                progress_callback=None, cancel_check=None,
-                               heartbeat=None):
+                               heartbeat=None, budget=None):
             if 'pass' not in snapshot:
                 snapshot['pass'] = 1
                 progress_callback(1, len(words), words[0], 1.5)
@@ -3064,7 +3065,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
                                progress_callback=None, cancel_check=None,
-                               heartbeat=None):
+                               heartbeat=None, budget=None):
             heartbeat()
             return 1.5
 
@@ -3111,7 +3112,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
                                progress_callback=None, cancel_check=None,
-                               heartbeat=None):
+                               heartbeat=None, budget=None):
             heartbeat()
             return 1.5
 
@@ -3122,6 +3123,109 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
                 solver._scan(score_cache)
 
         self.assertNotIn("Targeted scan", out.getvalue())
+
+
+class TestERDSolverBudget(unittest.TestCase):
+    """ERDSolver must thread its remaining-guess budget into
+    min_expected_guesses (issue #79): a recommendation is only announced if
+    it is guaranteed to finish within the guesses actually remaining, and a
+    proven-unsolvable position is reported instead of silently announcing an
+    unconstrained (possibly game-losing) recommendation."""
+
+    # Same fixture as TestDepthLimitedERD: 8 words sharing suffix "ound",
+    # each distinguished by a first letter absent from "ound" — answers-only
+    # guessing isolates one word per guess, worst-case line 8, ERD 4.5.
+    LINEAR = ["bound", "found", "hound", "mound",
+              "pound", "round", "sound", "wound"]
+
+    def _solver(self, budget):
+        score_cache = MemoryScoreCache()
+        score_cache.set_scope('test-scope')
+        solver = ERDSolver(self.LINEAR, self.LINEAR, self.LINEAR, None,
+                           policy=ERD_ALL, persist=False,
+                           seed_mem_cache=score_cache, budget=budget)
+        solver._rcache = ResponseCache(self.LINEAR)
+        return solver, score_cache
+
+    def test_feasible_budget_announces_ready(self):
+        """budget=8 exactly fits LINEAR's worst-case line: the recommendation
+        is announced normally, unlabeled as best-effort."""
+        solver, score_cache = self._solver(budget=8)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            solver._scan(score_cache)
+        text = out.getvalue()
+        self.assertIn("[ERD ready: 4.500", text)
+        self.assertNotIn("no guaranteed finish", text)
+        self.assertNotIn("best-effort", text)
+
+    def test_infeasible_budget_reports_loss_and_best_effort_fallback(self):
+        """budget=7 is one short of LINEAR's worst-case line 8: no strategy
+        wins every game, so the solver must report the loss instead of an
+        unconstrained recommendation, then fall back to a clearly labeled
+        best-effort (unconstrained) value so the player isn't left with
+        nothing."""
+        solver, score_cache = self._solver(budget=7)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            solver._scan(score_cache)
+        text = out.getvalue()
+        self.assertIn("[ERD: no guaranteed finish within 7 guesses]", text)
+        self.assertIn("[ERD best-effort (unconstrained): 4.500", text)
+        self.assertNotIn("[ERD ready:", text)
+
+        # The exhaustive disproof at budget=7 is persisted, not just announced.
+        root_key = ScoreCache.encode_subset(self.LINEAR)
+        self.assertEqual(score_cache.read_loss(root_key, ERD_ALL), 7)
+
+    def test_unconstrained_solver_never_reports_loss(self):
+        """budget=None (legacy/unconstrained callers) must behave exactly as
+        before: no loss branch is reachable since min_expected_guesses never
+        returns None except on cancel."""
+        solver, score_cache = self._solver(budget=None)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            solver._scan(score_cache)
+        text = out.getvalue()
+        self.assertIn("[ERD ready: 4.500", text)
+        self.assertNotIn("no guaranteed finish", text)
+
+    def test_pause_resume_race_does_not_misreport_budget_loss(self):
+        """min_expected_guesses returns None for two different reasons: an
+        abort (cancel/pause fired cancel_check mid-search) and a genuine
+        budget floor. The main thread's pause()/resume() wrap tightly
+        around each command handler (main()), so self._paused can already
+        be set again by the time _scan inspects it — even right after a
+        real pause aborted the search. _scan must not infer "proven loss"
+        from that racy flag; it must consult the persisted loss record,
+        which a merely-aborted call never wrote."""
+        solver, score_cache = self._solver(budget=8)  # a feasible budget
+
+        real_min_expected = min_expected_guesses
+        calls = {'n': 0}
+
+        def flaky_first_call(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                # No loss is written for this call — it is a bare abort,
+                # not an exhausted, proven-infeasible search. self._paused
+                # is left set (as if resume() already fired), reproducing
+                # the race even without real threads.
+                return None
+            return real_min_expected(*args, **kwargs)
+
+        out = io.StringIO()
+        with mock.patch('wordle.min_expected_guesses', side_effect=flaky_first_call), \
+             redirect_stdout(out):
+            solver._scan(score_cache)
+
+        text = out.getvalue()
+        self.assertNotIn("no guaranteed finish", text,
+            "an aborted (not exhausted) search must not be reported as a "
+            "proven budget floor")
+        self.assertIn("[ERD ready: 4.500", text,
+            "the retried search must still deliver the real recommendation")
+        self.assertEqual(calls['n'], 2)
 
 
 # ---------------------------------------------------------------------------

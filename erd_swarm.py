@@ -26,6 +26,7 @@ import time
 from cache_sqlite import ScoreCache, mem_cache_limit
 from wordle_engine import (
     ERD_ALL,
+    GAME_GUESSES,
     ResponseCache,
     CANCEL_RECVD,
     SOLVED,
@@ -93,7 +94,6 @@ _PUBLISH_EMA_TAU = 86400.0      # half-life (s) for the coordination/node-time E
 _PUBLISH_EMA_MIN_WEIGHT = 5     # decayed samples before the adaptive threshold goes live
 PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 
-GAME_GUESSES = 6              # a Wordle game allows 6 guesses total
 # Budget at the root — before any guess is played.  A branch's remaining budget
 # is ROOT_BUDGET minus its guess_depth (the guesses already played to reach it),
 # so a queued position after the opener (guess_depth 1) is solved at ROOT_BUDGET

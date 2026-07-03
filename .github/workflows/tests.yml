@@ -24,5 +24,26 @@ jobs:
       - name: Run test suite with coverage
         run: coverage run -m unittest discover -s . -p 'test_*.py'
 
+      - name: Validate scaling (>1.25x speedup)
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          path = os.environ.get('SCALING_RESULT_PATH', 'scaling_result.json')
+          if not os.path.exists(path):
+              print('Scaling smoke test did not run (skipped) — nothing to validate.')
+              sys.exit(0)
+          with open(path) as f:
+              r = json.load(f)
+          print(f"{r['workers']} workers vs 1 (cpu_count={r['cpu_count']}): "
+                f"{r['speedup']:.2f}x speedup "
+                f"(drain {r['tN_drain']:.3f}s vs {r['t1_drain']:.3f}s); "
+                f"threshold >{r['min_speedup']:.2f}x")
+          if not r['passed']:
+              print(f"FAIL: {r['speedup']:.2f}x is below the {r['min_speedup']:.2f}x threshold")
+              sys.exit(1)
+          print('PASS')
+          PY
+
       - name: Enforce coverage threshold (>98%)
         run: coverage report --fail-under=98
