@@ -165,3 +165,15 @@ The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any 
 3. Never require manual SQL — migrations run automatically on first open
 
 The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in `ERDQueue._migrate()`.
+
+---
+
+## Session token usage
+
+To check remaining session token budget and reset time, run:
+
+```
+claude -p /usage
+```
+
+There is no in-session tool that exposes this — it is the only way to see the limits.
