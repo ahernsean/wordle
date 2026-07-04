@@ -149,6 +149,22 @@ class TestCountsForAllCandidates(unittest.TestCase):
         self.assertEqual(counts.shape, (len(self.guess_words), 243))
         self.assertEqual(counts.dtype, np.int32)
 
+    def test_single_chunk_matches_response_cache(self):
+        # Vocabulary smaller than _COUNT_CHUNK_ROWS exercises the single-chunk
+        # path (one partial chunk, no full chunk preceding it).
+        rng = random.Random(11)
+        small_guess_words = _ALL_GUESS_WORDS[:50]
+        small_pm = PatternMatrix.build(small_guess_words, self.answer_words)
+        small_rc = ResponseCache(self.answer_words)
+        candidate = rng.choice(small_guess_words)
+        branch_words = rng.sample(self.answer_words, 80)
+        branch_indices = small_pm.answer_indices(branch_words)
+        counts = small_pm.counts_for_all_candidates(branch_indices)
+        g = small_pm.guess_index(candidate)
+        matrix_counts = {p: int(counts[g, p]) for p in range(243) if counts[g, p] > 0}
+        rc_counts = dict(small_rc.group_counts(candidate, branch_words))
+        self.assertEqual(matrix_counts, rc_counts)
+
     def test_counts_sum_to_branch_size(self):
         rng = random.Random(5)
         branch_words = rng.sample(self.answer_words, 37)
@@ -206,6 +222,17 @@ class TestSaveLoad(unittest.TestCase):
             self.assertIsNotNone(pm2)
             np.testing.assert_array_equal(self.pm.matrix, pm2.matrix)
             self.assertEqual(pm2.answer_list_id, self.pm.answer_list_id)
+
+    def test_save_and_load_without_npy_extension_agree(self):
+        # save(p) and load(p, ...) must find the same file whether or not
+        # the caller includes the '.npy' suffix — np.save appends it silently
+        # but np.load does not, so both methods must normalize consistently.
+        with tempfile.TemporaryDirectory() as tmp:
+            path_no_ext = os.path.join(tmp, "matrix")  # no '.npy'
+            self.pm.save(path_no_ext)
+            pm2 = PatternMatrix.load(path_no_ext, self.guess_words, self.answer_words)
+            self.assertIsNotNone(pm2, "load without .npy suffix should find the file save() wrote")
+            np.testing.assert_array_equal(self.pm.matrix, pm2.matrix)
 
     def test_missing_file_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -66,17 +66,29 @@ class PatternMatrix:
         return cls(matrix, guess_words, answer_words)
 
     def save(self, path):
-        """Persist the matrix as a .npy file at path."""
+        """Persist the matrix as a .npy file at path.
+
+        Appends '.npy' if the path does not already end with it, matching
+        the normalization np.save applies internally, so save(p) and
+        load(p, ...) always agree on the filename regardless of whether the
+        caller includes the extension.
+        """
+        path = str(path)
+        if not path.endswith('.npy'):
+            path = path + '.npy'
         np.save(path, self.matrix)
 
     @classmethod
     def load(cls, path, guess_words, answer_words):
         """Load from path with mmap_mode='r'; return None on file-not-found or shape mismatch.
 
-        Shape mismatch means the file was built for a different vocabulary
-        (different answer universe or different guess-list length). Callers
-        should rebuild and re-save when this returns None.
+        Applies the same '.npy' suffix normalization as save(), so load(p, ...)
+        finds whatever save(p) wrote. Shape mismatch means the file was built
+        for a different vocabulary; callers should rebuild and re-save.
         """
+        path = str(path)
+        if not path.endswith('.npy'):
+            path = path + '.npy'
         try:
             matrix = np.load(path, mmap_mode='r')
         except (FileNotFoundError, ValueError, OSError):
@@ -121,6 +133,6 @@ class PatternMatrix:
         return counts
 
     def patterns_for_candidates(self, candidate_indices, branch_indices):
-        """Raw (len(candidate_indices), n) uint8 slice for §5/§6 reuse."""
+        """Raw (len(candidate_indices), n) uint8 slice of response pattern values."""
         rows = np.asarray(candidate_indices, dtype=np.int32)
         return self.matrix[rows][:, branch_indices]
