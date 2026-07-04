@@ -474,10 +474,14 @@ class TestCandidateStats(unittest.TestCase):
         self.assertTrue(np.all(stats.cost_lower_bound >= 0.0))
         self.assertTrue(np.all(stats.cost_lower_bound <= 3.0))
 
-    def test_sum_squared_dtype_not_int32_overflow(self):
-        """sum_squared_group_sizes is int64; a large branch confirms no int32 overflow."""
-        # With 500 branch words concentrated in few patterns, group sizes can be large.
-        # int32 max is ~2.1e9; worst-case sum-of-squares approaches 3200^2 × 243 ≈ 2.5e9.
+    def test_sum_squared_dtype_is_int64(self):
+        """sum_squared_group_sizes is int64 — the spec type for exact comparison with Python.
+
+        Response groups partition the branch (Σk = n), so Σk² is maximized when all
+        words land in one group: n² ≤ 3185² ≈ 10M, which fits int32 comfortably. int64
+        is the spec type so that int(stats.sum_squared_group_sizes[g]) compares exactly
+        against Python's arbitrary-precision sum(k*k).
+        """
         rng = random.Random(207)
         branch_words = rng.sample(self.answer_words, 500)
         branch_indices = self.pm.answer_indices(branch_words)
