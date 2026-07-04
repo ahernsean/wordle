@@ -151,6 +151,9 @@ class PatternMatrix:
     def candidate_stats(self, branch_indices):
         """Vectorized per-candidate statistics for every guess word against one branch.
 
+        Requires len(branch_indices) >= 1; an empty branch yields NaN for all
+        float fields (silent IEEE 754 division by zero, no exception raised).
+
         Calls counts_for_all_candidates once and derives all fields from the result.
         Returns a CandidateStats of parallel arrays in guess-word (matrix-row) space:
         index g corresponds to self.matrix row g, not to any position in a candidate_list.
