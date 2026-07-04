@@ -1,4 +1,4 @@
-"""Tests for pattern_matrix.py — §2 acceptance criteria.
+"""Tests for pattern_matrix.py — §2 and §3 acceptance criteria.
 
 Acceptance bullets:
   (a) ~200 random (guess, answer) pairs: matrix[g, a] matches _encode_response.
@@ -7,8 +7,12 @@ Acceptance bullets:
       branches that exercise multiple guess-row chunks and the final partial chunk.
   (c) Save/load round-trip equals the built matrix; shape mismatch → None.
   (d) With NumPy absent, available() is False and import still succeeds.
+  (e) §3 candidate_stats: for branch sizes {8, 30, 100, 500}, every field matches
+      the per-candidate pure-Python computation — integers exactly,
+      cost_lower_bound exactly, entropy within 1e-12.
 """
 import importlib
+import math
 import os
 import random
 import sys
@@ -22,7 +26,9 @@ except ImportError:
     _NUMPY_AVAILABLE = False
 
 import pattern_matrix
-from pattern_matrix import PatternMatrix, _COUNT_CHUNK_ROWS, _compute_answer_list_id
+from pattern_matrix import (
+    CandidateStats, PatternMatrix, _COUNT_CHUNK_ROWS, _compute_answer_list_id,
+)
 from wordle_engine import ResponseCache, calculate_response, _encode_response
 
 
@@ -308,6 +314,181 @@ class TestBuildWithScoreCache(unittest.TestCase):
         pm = PatternMatrix.build(guess_words, answer_words, score_cache=None)
         self.assertEqual(pm.matrix.shape, (5, 10))
         self.assertEqual(pm.matrix.dtype, np.uint8)
+
+
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
+class TestCandidateStats(unittest.TestCase):
+    """Acceptance §3: candidate_stats returns correct parallel arrays for all branch sizes.
+
+    For fixed branches of sizes {8, 30, 100, 500} — at least one branch whose words
+    include candidates (has_self=True for some rows) and at least one whose words
+    exclude all candidates (has_self=False for all rows) — every field matches a
+    per-candidate pure-Python computation: integers exactly, cost_lower_bound exactly,
+    entropy within 1e-12.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # 150 guess words keeps build time short while verifying all rows.
+        cls.guess_words = _ALL_GUESS_WORDS[:150]
+        cls.answer_words = _ALL_ANSWER_WORDS
+        cls.pm = PatternMatrix.build(cls.guess_words, cls.answer_words)
+        guess_word_set = set(cls.guess_words)
+        # Answer words that are also in our 150-word guess vocabulary — these produce
+        # has_self=True when included in the branch.
+        cls.answer_also_guess = [w for w in cls.answer_words if w in guess_word_set]
+        # Answer words NOT in our guess vocabulary — no candidate produces has_self=True
+        # when the branch is drawn only from these.
+        cls.answer_not_guess = [w for w in cls.answer_words if w not in guess_word_set]
+
+    @staticmethod
+    def _python_stats_for_row(counts_row, branch_size):
+        """Pure-Python reference for one candidate's row of response-group counts.
+
+        counts_row is the 243-element int32 array from counts_for_all_candidates[g].
+        Matches the scalar formulas in wordle_engine.evaluate_candidate and score_groups.
+        """
+        groups = {pattern: int(count) for pattern, count in enumerate(counts_row) if count > 0}
+        group_count = len(groups)
+        has_self = groups.get(242, 0) > 0
+        cost_lower_bound = 3.0 - (group_count + (1 if has_self else 0)) / branch_size
+        sum_squared = sum(count * count for count in groups.values())
+        max_group = max(groups.values()) if groups else 0
+        entropy = 0.0
+        for count in groups.values():
+            probability = count / branch_size
+            entropy -= probability * math.log2(probability)
+        return {
+            'group_count': group_count,
+            'has_self': has_self,
+            'cost_lower_bound': cost_lower_bound,
+            'sum_squared_group_sizes': sum_squared,
+            'max_group_size': max_group,
+            'entropy_gain': entropy,
+        }
+
+    def _verify_all_candidates(self, branch_words, label):
+        """Check every field of candidate_stats against the per-row Python reference."""
+        branch_indices = self.pm.answer_indices(branch_words)
+        branch_size = len(branch_words)
+        stats = self.pm.candidate_stats(branch_indices)
+        # Fetch counts separately to feed _python_stats_for_row. Non-circularity
+        # comes from the Python arithmetic in that helper, not from this fetch.
+        counts = self.pm.counts_for_all_candidates(branch_indices)
+
+        for g in range(len(self.guess_words)):
+            expected = self._python_stats_for_row(counts[g], branch_size)
+            word = self.guess_words[g]
+            failure_message = f"{label}, candidate={word!r}"
+            self.assertEqual(int(stats.group_count[g]), expected['group_count'], failure_message)
+            self.assertEqual(bool(stats.has_self[g]), expected['has_self'], failure_message)
+            self.assertEqual(
+                float(stats.cost_lower_bound[g]), expected['cost_lower_bound'], failure_message)
+            self.assertEqual(
+                int(stats.sum_squared_group_sizes[g]), expected['sum_squared_group_sizes'],
+                failure_message)
+            self.assertEqual(int(stats.max_group_size[g]), expected['max_group_size'],
+                             failure_message)
+            self.assertAlmostEqual(
+                float(stats.entropy_gain[g]), expected['entropy_gain'],
+                delta=1e-12, msg=failure_message)
+
+    def test_branch_size_8_no_candidate_in_branch(self):
+        """Branch of size 8 drawn entirely from words outside the guess vocabulary.
+
+        No candidate can produce the all-green pattern (242) for any branch word,
+        so has_self is False for every row — the 'not containing candidate words' case.
+        """
+        rng = random.Random(200)
+        branch_words = rng.sample(self.answer_not_guess, 8)
+        self._verify_all_candidates(branch_words, "size-8 (no candidate in branch)")
+        # Confirm the has_self=False invariant directly.
+        branch_indices = self.pm.answer_indices(branch_words)
+        stats = self.pm.candidate_stats(branch_indices)
+        self.assertFalse(np.any(stats.has_self),
+                         "has_self must be False for all candidates when branch words "
+                         "are outside the guess vocabulary")
+
+    def test_branch_size_30_candidates_in_branch(self):
+        """Branch of size 30 that includes words present in the guess vocabulary.
+
+        Those words produce has_self=True for their corresponding candidate rows —
+        the 'containing candidate words' case.
+        """
+        rng = random.Random(201)
+        # Seed with 5 answer words that are also in our guess vocabulary.
+        in_both = self.answer_also_guess[:5]
+        remainder = rng.sample(self.answer_not_guess, 25)
+        branch_words = in_both + remainder
+        self._verify_all_candidates(branch_words, "size-30 (candidates in branch)")
+        # Confirm has_self=True for the candidates whose word is in the branch.
+        branch_word_set = set(branch_words)
+        branch_indices = self.pm.answer_indices(branch_words)
+        stats = self.pm.candidate_stats(branch_indices)
+        for g, word in enumerate(self.guess_words):
+            if word in branch_word_set:
+                self.assertTrue(bool(stats.has_self[g]),
+                                f"has_self must be True for {word!r} (word is in branch)")
+
+    def test_branch_size_100(self):
+        rng = random.Random(202)
+        branch_words = rng.sample(self.answer_words, 100)
+        self._verify_all_candidates(branch_words, "size-100")
+
+    def test_branch_size_500(self):
+        rng = random.Random(203)
+        branch_words = rng.sample(self.answer_words, 500)
+        self._verify_all_candidates(branch_words, "size-500")
+
+    def test_output_dtypes(self):
+        """Field dtypes match the plan specification."""
+        rng = random.Random(204)
+        branch_words = rng.sample(self.answer_words, 20)
+        branch_indices = self.pm.answer_indices(branch_words)
+        stats = self.pm.candidate_stats(branch_indices)
+        self.assertIsInstance(stats, CandidateStats)
+        self.assertEqual(stats.group_count.dtype, np.int32)
+        self.assertEqual(stats.has_self.dtype, np.bool_)
+        self.assertEqual(stats.cost_lower_bound.dtype, np.float64)
+        self.assertEqual(stats.sum_squared_group_sizes.dtype, np.int64)
+        self.assertEqual(stats.max_group_size.dtype, np.int32)
+        self.assertEqual(stats.entropy_gain.dtype, np.float64)
+
+    def test_array_lengths(self):
+        """All six parallel arrays have length n_guesses."""
+        rng = random.Random(205)
+        branch_words = rng.sample(self.answer_words, 15)
+        branch_indices = self.pm.answer_indices(branch_words)
+        stats = self.pm.candidate_stats(branch_indices)
+        n_guesses = len(self.guess_words)
+        for field in stats._fields:
+            self.assertEqual(len(getattr(stats, field)), n_guesses,
+                             f"{field} has wrong length")
+
+    def test_cost_lower_bound_range(self):
+        """cost_lower_bound is bounded by [0, 3] for all candidates."""
+        rng = random.Random(206)
+        branch_words = rng.sample(self.answer_words, 50)
+        branch_indices = self.pm.answer_indices(branch_words)
+        stats = self.pm.candidate_stats(branch_indices)
+        self.assertTrue(np.all(stats.cost_lower_bound >= 0.0))
+        self.assertTrue(np.all(stats.cost_lower_bound <= 3.0))
+
+    def test_sum_squared_dtype_is_int64(self):
+        """sum_squared_group_sizes is int64 — the spec type for exact comparison with Python.
+
+        Response groups partition the branch (Σk = n), so Σk² is maximized when all
+        words land in one group: n² ≤ 3185² ≈ 10M, which fits int32 comfortably. int64
+        is the spec type so that int(stats.sum_squared_group_sizes[g]) compares exactly
+        against Python's arbitrary-precision sum(k*k).
+        """
+        rng = random.Random(207)
+        branch_words = rng.sample(self.answer_words, 500)
+        branch_indices = self.pm.answer_indices(branch_words)
+        stats = self.pm.candidate_stats(branch_indices)
+        self.assertEqual(stats.sum_squared_group_sizes.dtype, np.int64)
+        # All values must be non-negative integers.
+        self.assertTrue(np.all(stats.sum_squared_group_sizes >= 0))
 
 
 class TestNumpyAbsent(unittest.TestCase):

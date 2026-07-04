@@ -4,6 +4,7 @@ This module is the sole NumPy import point in the engine. The import is guarded
 so all other modules work — and pass their full test suites — with NumPy absent.
 Check available() before constructing or using PatternMatrix.
 """
+import collections
 import hashlib
 
 try:
@@ -11,6 +12,16 @@ try:
     _NUMPY_AVAILABLE = True
 except ImportError:
     _NUMPY_AVAILABLE = False
+
+
+# Parallel arrays returned by candidate_stats(), one entry per guess-word (matrix row).
+# All fields share a common axis-0 length of n_guesses; consumers index them by the
+# guess-word's matrix row number, not by position in any candidate_list.
+CandidateStats = collections.namedtuple(
+    'CandidateStats',
+    ['group_count', 'has_self', 'cost_lower_bound',
+     'sum_squared_group_sizes', 'max_group_size', 'entropy_gain'],
+)
 
 
 def available():
@@ -136,3 +147,68 @@ class PatternMatrix:
         """Raw (len(candidate_indices), n) uint8 slice of response pattern values."""
         rows = np.asarray(candidate_indices, dtype=np.int32)
         return self.matrix[rows][:, branch_indices]
+
+    def candidate_stats(self, branch_indices):
+        """Vectorized per-candidate statistics for every guess word against one branch.
+
+        Requires len(branch_indices) >= 1; an empty branch yields NaN for all
+        float fields (silent IEEE 754 division by zero, no exception raised).
+
+        Calls counts_for_all_candidates once and derives all fields from the result.
+        Returns a CandidateStats of parallel arrays in guess-word (matrix-row) space:
+        index g corresponds to self.matrix row g, not to any position in a candidate_list.
+
+        Fields and dtypes (branch_size = len(branch_indices)):
+          group_count             int32    number of non-empty response groups
+          has_self                bool     candidate is in the branch (all-green pattern present)
+          cost_lower_bound        float64  3.0 - (group_count + has_self) / branch_size
+          sum_squared_group_sizes int64    Σk² over all response groups; sort key for best-first order
+          max_group_size          int32    size of the largest response group
+          entropy_gain            float64  Shannon entropy in bits; 1e-12 tolerance vs scalar path
+        """
+        branch_size = len(branch_indices)
+        counts = self.counts_for_all_candidates(branch_indices)
+
+        # Number of non-empty response groups per candidate (includes self group when present).
+        group_count = (counts > 0).sum(axis=1).astype(np.int32)
+
+        # Candidate is in the branch iff the all-green pattern (242) is non-empty.
+        has_self = counts[:, 242] > 0
+
+        # Admissible lower bound: same formula as evaluate_candidate's cost_lb.
+        # Integer numerator cast to float64 before division so the result is
+        # bit-identical to the scalar computation 3.0 - (G + s) / branch_size.
+        cost_lower_bound = (
+            np.float64(3.0)
+            - (group_count.astype(np.float64) + has_self.astype(np.float64))
+            / np.float64(branch_size)
+        )
+
+        # Σk² sort key; int64 output. Worst case is n² (all words in one group);
+        # actual max ≈ 3185² ≈ 10M, which fits int32, but int64 is the spec type.
+        # Zero entries contribute 0, so summing the full row is correct.
+        sum_squared_group_sizes = (counts ** 2).sum(axis=1, dtype=np.int64)
+
+        max_group_size = counts.max(axis=1).astype(np.int32)
+
+        # Shannon entropy: -Σ p·log2(p) over non-empty groups, p = k/branch_size.
+        # The double-where avoids log2(0): the inner where substitutes 1.0
+        # (log2(1.0) = 0.0) for zero-count entries so log2 never sees zero,
+        # and the outer where explicitly zeroes those contributions.
+        group_probabilities = counts.astype(np.float64) / np.float64(branch_size)
+        nonzero = counts > 0
+        log2_group_probabilities = np.where(
+            nonzero,
+            np.log2(np.where(nonzero, group_probabilities, np.float64(1.0))),
+            np.float64(0.0),
+        )
+        entropy_gain = -(group_probabilities * log2_group_probabilities).sum(axis=1)
+
+        return CandidateStats(
+            group_count=group_count,
+            has_self=has_self,
+            cost_lower_bound=cost_lower_bound,
+            sum_squared_group_sizes=sum_squared_group_sizes,
+            max_group_size=max_group_size,
+            entropy_gain=entropy_gain,
+        )
