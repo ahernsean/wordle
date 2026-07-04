@@ -829,8 +829,9 @@ class TestMidLoopPublisher(unittest.TestCase):
         token = pub.enter(words, budget=0)
         w._nodes = 200   # 200 - 0 = 200 nodes for this frame
         pub.record_inline(token)
-        self.assertIn(len(words), w._cost_model_buffer)
-        s, sq, c = w._cost_model_buffer[len(words)]
+        # Buffer is keyed by (size, budget); this frame entered at budget=0.
+        self.assertIn((len(words), 0), w._cost_model_buffer)
+        s, sq, c = w._cost_model_buffer[(len(words), 0)]
         self.assertEqual(c, 1)
         self.assertAlmostEqual(s, math.log(200), places=6)
         self.assertAlmostEqual(sq, math.log(200) ** 2, places=6)
@@ -933,9 +934,13 @@ class TestFlushCostModelBuffer(unittest.TestCase):
 
     def test_flush_calls_update_logsums_per_size(self):
         w = _bare_worker()
-        w._cost_model_buffer = {5: (2.0, 4.0, 1), 10: (3.0, 9.0, 2)}
+        # Buffer is keyed by (size, budget); flush forwards budget as a kwarg.
+        w._cost_model_buffer = {(5, 0): (2.0, 4.0, 1), (10, 1): (3.0, 9.0, 2)}
         w._flush_cost_model_buffer()
         self.assertEqual(w.queue.update_cost_model_logsums.call_count, 2)
+        budgets = {c.kwargs.get('budget')
+                   for c in w.queue.update_cost_model_logsums.call_args_list}
+        self.assertEqual(budgets, {0, 1})
         w._typical_cache.clear()  # confirmed cleared by flush
         self.assertEqual(w._cost_model_buffer, {})
 
@@ -970,7 +975,7 @@ class TestRecordInlineEdgeCases(unittest.TestCase):
         token2 = pub.enter(words, budget=0)
         w._nodes = 300   # 200 more nodes for second frame of same size
         pub.record_inline(token2)
-        s, sq, c = w._cost_model_buffer[len(words)]
+        s, sq, c = w._cost_model_buffer[(len(words), 0)]
         self.assertEqual(c, 2)
         self.assertAlmostEqual(s, math.log(100) + math.log(200), places=6)
 

@@ -26,6 +26,7 @@ import time
 from cache_sqlite import ScoreCache, mem_cache_limit
 from wordle_engine import (
     ERD_ALL,
+    GAME_GUESSES,
     ResponseCache,
     CANCEL_RECVD,
     SOLVED,
@@ -35,6 +36,7 @@ from wordle_engine import (
     _ABORT_STATUSES,
     cache_all_scores,
     evaluate_candidate,
+    estimate_candidate_work,
     load_word_list,
     _cache_reuse,
 )
@@ -78,6 +80,13 @@ OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publ
 # records every firing for offline tuning.
 COLD_BACKSTOP_SECONDS = 600
 MIN_HANDOFF_CANDIDATES = 4   # minimum remaining candidates to bother handing off
+
+# candidate_accuracy logs every non-gated claim (the metric-design signal, rare in
+# the deep regime) but only 1-in-N gated claims (~1 node each, redundant) so a
+# multi-day corpus stays bounded.  1 = log all (the validation-gate default);
+# raise it (e.g. ERD_ACCURACY_GATED_SAMPLE_EVERY=100) for a long production run.
+ACCURACY_GATED_SAMPLE_EVERY = max(
+    1, int(os.environ.get('ERD_ACCURACY_GATED_SAMPLE_EVERY', '1')))
 MIN_PUBLISH_BRANCH_WORDS = 2  # frames with fewer answer words are base cases, never
                               # worth tracking for overrun (the candidate loop on a
                               # 1-word branch never even runs)
@@ -93,7 +102,6 @@ _PUBLISH_EMA_TAU = 86400.0      # half-life (s) for the coordination/node-time E
 _PUBLISH_EMA_MIN_WEIGHT = 5     # decayed samples before the adaptive threshold goes live
 PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 
-GAME_GUESSES = 6              # a Wordle game allows 6 guesses total
 # Budget at the root — before any guess is played.  A branch's remaining budget
 # is ROOT_BUDGET minus its guess_depth (the guesses already played to reach it),
 # so a queued position after the opener (guess_depth 1) is solved at ROOT_BUDGET
@@ -172,7 +180,7 @@ class _MidLoopPublisher:
         n = len(branch_words)
         if n < MIN_PUBLISH_BRANCH_WORDS:
             return None
-        predicted = self._worker._typical(n)
+        predicted = self._worker._typical(n, budget)
         return (self._worker._nodes, predicted, time.time(), branch_words, budget)
 
     def check(self, token, candidate_list, last_index,
@@ -215,6 +223,13 @@ class _MidLoopPublisher:
         if time_overrun:
             self._worker.queue.add_backstop_telemetry(
                 n, entry_budget, int(elapsed * 1000), delta, predicted, remaining_count)
+        # This frame is handed off before finishing, so its true cost exceeds the
+        # `delta` nodes measured so far: record a right-censored sample (a lower
+        # bound).  The online cost model only folds COMPLETED frames, so a partial
+        # never pollutes it; this keeps a capped monster honestly visible to an
+        # offline survival fit instead of vanishing.
+        self._worker.queue.add_cost_sample(
+            ERD_ALL, n, delta, 'censored', budget=entry_budget, censored=1)
         branch_key = encode_subset(branch_words)
 
         # Spine sentinel: mark this frame as handed off in the heartbeat display.
@@ -259,18 +274,19 @@ class _MidLoopPublisher:
         """
         if token is None:
             return
-        nodes_at_entry, _predicted, _entry_time, branch_words, _entry_budget = token
+        nodes_at_entry, _predicted, _entry_time, branch_words, entry_budget = token
         n = len(branch_words)
         nodes = self._worker._nodes - nodes_at_entry
         if nodes <= 0:
             return
         log_n = math.log(nodes)
         buf = self._worker._cost_model_buffer
-        if n in buf:
-            s, sq, c = buf[n]
-            buf[n] = (s + log_n, sq + log_n * log_n, c + 1)
+        key = (n, entry_budget)
+        if key in buf:
+            s, sq, c = buf[key]
+            buf[key] = (s + log_n, sq + log_n * log_n, c + 1)
         else:
-            buf[n] = (log_n, log_n * log_n, 1)
+            buf[key] = (log_n, log_n * log_n, 1)
 
 
 class _BranchWorker:
@@ -338,6 +354,8 @@ class _BranchWorker:
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
+        # Counts gated candidate_accuracy claims for 1-in-N down-sampling.
+        self._gated_accuracy_n = 0
         # Absolute root -> branch spine of the branch the worker is currently
         # descending (its claimed branch): the guesses played, space-joined as
         # "GUESS pattern".  Promotion composes a child branch's spine as this base
@@ -347,9 +365,10 @@ class _BranchWorker:
         # Cleared on any cost-model write so new samples take effect.
         self._typical_cache = {}
         # In-memory buffer for inline node-cost samples:
-        # {n: (sum_log, sum_log_sq, count)}.  Flushed to the DB at each
+        # {(n, budget): (sum_log, sum_log_sq, count)}.  Flushed to the DB at each
         # checkpoint to avoid per-frame SQLite writes.
-        self._cost_model_buffer: dict[int, tuple[float, float, int]] = {}
+        self._cost_model_buffer: dict[tuple[int, int],
+                                      tuple[float, float, int]] = {}
         # Reverse map word → all_words index, built once: the publisher marks the
         # evaluated prefix done by these indices.  Both are needed only by the
         # adaptive layer, so they're skipped (and the publisher is None, which
@@ -514,24 +533,33 @@ class _BranchWorker:
 
     # -- cost model ---------------------------------------------------------
 
-    def _typical(self, n):
+    def _typical(self, n, budget=None):
         """Return the cost model's geometric-mean node count for sub-branches of
-        size n, or None when the model is cold for this size bucket.
+        size n at remaining-guess `budget`, or None when the model is cold.
 
-        Results are cached in-memory for the life of the worker; the cache entry
-        for a given size is invalidated on cooperative finalize so new samples
-        take effect without re-querying on every enter() call.
+        The model is keyed on (size, budget); a cold (size, budget) cell falls
+        back to the budget-aggregate inside the queue.  Results are cached
+        in-memory keyed by (n, budget) for the life of the worker; entries are
+        invalidated on cooperative finalize so new samples take effect without
+        re-querying on every enter() call.
         """
-        if n in self._typical_cache:
-            return self._typical_cache[n]
-        result = self.queue.get_cost_typical(ERD_ALL, n)
-        self._typical_cache[n] = result
+        key = (n, budget)
+        if key in self._typical_cache:
+            return self._typical_cache[key]
+        result = self.queue.get_cost_typical(ERD_ALL, n, budget)
+        self._typical_cache[key] = result
         return result
 
-    def _update_cost_model(self, n_words, nodes):
-        """Update the cost model with a finalized cooperative branch's node count."""
-        self.queue.update_cost_model(ERD_ALL, n_words, nodes)
-        self.queue.add_cost_sample(ERD_ALL, n_words, nodes, 'finalize')
+    def _update_cost_model(self, n_words, nodes, budget=None, wall_millis=None):
+        """Update the cost model with a finalized cooperative branch's node count.
+
+        budget keys the (size, budget) cell (and the aggregate); wall_millis is
+        the branch's wall span, the only per-solve wall figure, recorded on the
+        raw sample.
+        """
+        self.queue.update_cost_model(ERD_ALL, n_words, nodes, budget=budget)
+        self.queue.add_cost_sample(ERD_ALL, n_words, nodes, 'finalize',
+                                   budget=budget, wall_millis=wall_millis)
         self._typical_cache.clear()   # bucket changed: drop cached predictions
 
     def _flush_cost_model_buffer(self):
@@ -541,9 +569,10 @@ class _BranchWorker:
         the cost model, so each sample's magnitude reaches the geometric mean and
         the second log-moment without an exp/int/log round-trip.
         """
-        for n, (sum_log, sum_log_sq, count) in self._cost_model_buffer.items():
+        for (n, budget), (sum_log, sum_log_sq, count) in \
+                self._cost_model_buffer.items():
             self.queue.update_cost_model_logsums(
-                ERD_ALL, n, sum_log, sum_log_sq, float(count))
+                ERD_ALL, n, sum_log, sum_log_sq, float(count), budget=budget)
         if self._cost_model_buffer:
             self._typical_cache.clear()
         self._cost_model_buffer.clear()
@@ -698,6 +727,24 @@ class _BranchWorker:
         self._cand_max_depth = 0
         nodes_before = self._nodes
         cand_t0 = time.time()
+        # Work-metric capture for the §10 validation gate: under single-candidate
+        # claiming this claim's nodes_delta IS the candidate's true cost, so the
+        # observer records the predicted work and the bound it was computed
+        # against; the accuracy row is written below once actual_nodes is known.
+        metric = {}
+
+        def _metric_observer(group_sizes, has_self, cost_lb, bound, gated):
+            metric['predicted'] = estimate_candidate_work(
+                group_sizes, has_self, n_words, bound, budget, self._typical)
+            metric['bound'] = None if bound == float('inf') else bound
+            metric['cost_lb'] = cost_lb
+            metric['gated'] = gated
+            # Persist the group-size multiset for non-gated rows: the sufficient
+            # statistic to recompute any candidate work metric offline.  Gated
+            # rows are exactly 0, so their sizes carry no metric-design signal.
+            metric['group_sizes'] = (None if gated else
+                                     '-'.join(str(k) for k in group_sizes))
+
         status, cost, cand_md, budget_tainted = evaluate_candidate(
             words, candidate, self.rcache, self.score_cache,
             n=n_words, best_erd=float('inf'), guesses=self.all_words,
@@ -706,6 +753,7 @@ class _BranchWorker:
             subbranch_solver=self._subbranch_solver,
             bound_provider=_bound_provider,
             mid_loop_publisher=self._mid_loop_publisher,
+            metric_observer=_metric_observer if self._adaptive else None,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound(),
@@ -761,6 +809,20 @@ class _BranchWorker:
             self._coord_ema.add(coord_seconds)
             if nodes_delta > 0 and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
+            if metric:
+                # Log every non-gated claim; down-sample the redundant gated mass
+                # so a multi-day corpus stays bounded (see ACCURACY_GATED_SAMPLE_EVERY).
+                if metric['gated']:
+                    log_it = (self._gated_accuracy_n % ACCURACY_GATED_SAMPLE_EVERY) == 0
+                    self._gated_accuracy_n += 1
+                else:
+                    log_it = True
+                if log_it:
+                    self.queue.add_candidate_accuracy(
+                        branch_key, n_words, budget, metric['predicted'],
+                        metric['bound'], metric['cost_lb'], metric['gated'],
+                        nodes_delta, group_sizes=metric['group_sizes'],
+                        source_word=self._top_source_word)
             self.queue.add_claim_telemetry(
                 n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
         self.claims_done += 1
@@ -781,6 +843,15 @@ class _BranchWorker:
         best_guess, best_erd, max_depth, tainted, budget = meta
         branch_row = self.queue.get_branch(branch_key)
         nodes_spent = branch_row['nodes_spent'] if branch_row else 0
+        created_at = branch_row['created_at'] if branch_row else None
+        finalized_at = branch_row['finalized_at'] if branch_row else None
+        spine = branch_row['spine'] if branch_row else None
+        # Wall span of the branch (upper bound — solves interleave).  The only
+        # per-solve wall figure, recorded on the cost sample and the finalize log.
+        wall_millis = (None if created_at is None or finalized_at is None
+                       else max(0, (finalized_at - created_at) * 1000))
+        # Claims drained to finalize, captured before delete_branch drops the rows.
+        n_claims = self.queue.branch_done_candidates(branch_key)
         if best_guess is not None:
             # Untainted => unconstrained optimum, reusable at any budget >=
             # max_depth (solve_budget NULL).  Tainted => valid only at this
@@ -791,7 +862,8 @@ class _BranchWorker:
             cache_all_scores(best_guess, words, self.score_cache, branch_key,
                              cache=self.rcache)
             if self._adaptive and nodes_spent > 0:
-                self._update_cost_model(len(words), nodes_spent)
+                self._update_cost_model(len(words), nodes_spent, budget=budget,
+                                        wall_millis=wall_millis)
             # NB: no per-finalize checkpoint — with recursive promotion a worker
             # finalizes thousands of sub-branches; checkpointing each one is
             # ruinous.  WAL is drained by the periodic _maybe_checkpoint instead.
@@ -809,6 +881,11 @@ class _BranchWorker:
             logger.warning('%s branch (%d words) UNSOLVABLE within budget %s '
                            '(loss) src=%s', self.name, len(words), budget,
                            branch_key[:25])
+        # Persist the branch's timing/cost before delete_branch destroys it, so
+        # "how long / how much did branch X cost" stays answerable offline.
+        self.queue.add_branch_finalize_log(
+            branch_key, spine, len(words), budget, created_at, finalized_at,
+            nodes_spent, n_claims)
         self.queue.mark_done(branch_key)        # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
 

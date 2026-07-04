@@ -606,6 +606,9 @@ def cmd_run(args):
         print('Warning: queue appears empty.  '
               'Run queue-add to load branches before starting workers.',
               file=sys.stderr)
+    # Telemetry epoch the workers will stamp their rows with.  Epoch 0 is the
+    # single-candidate-atom baseline; a claiming-regime change calls set_epoch.
+    print(f'Telemetry epoch: {queue.epoch}')
     queue.close()
 
     _setup_supervisor_logging()
