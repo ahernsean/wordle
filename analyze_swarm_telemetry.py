@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""analyze_epoch0.py — the §10/§11 go/no-go gate for the adaptive-packing metric.
+"""analyze_swarm_telemetry.py — the §10/§11 go/no-go gate for the adaptive-packing
+metric.
 
-Reads erd_queue.sqlite3 (read-only) and evaluates, on the epoch-0 single-candidate
-baseline, whether a candidate work metric is sound enough to build the packer on.
+Reads erd_queue.sqlite3 (read-only) and evaluates, on one telemetry epoch's claim
+corpus (--epoch, default 0 = the single-candidate baseline), whether a candidate
+work metric is sound enough to build the packer on.
 
 Because candidate_accuracy logs each non-gated candidate's `group_sizes` (the
 sufficient statistic) and the bound it saw, this recomputes EVERY metric offline
@@ -111,7 +113,7 @@ def load_cost_model(conn):
     return typical
 
 
-def _pctile(s, p):
+def _percentile(s, p):
     return s[min(len(s) - 1, int(p / 100.0 * len(s)))] if s else float("nan")
 
 
@@ -120,8 +122,8 @@ def _describe(label, vals):
         print(f"  {label:14s}: (no rows)")
         return
     s = sorted(vals)
-    print(f"  {label:14s}: n={len(s):>8d}  median={_pctile(s,50):>8.1f}  "
-          f"p99={_pctile(s,99):>10.1f}  max={s[-1]:>11.0f}  mean={statistics.fmean(s):>10.1f}")
+    print(f"  {label:14s}: n={len(s):>8d}  median={_percentile(s,50):>8.1f}  "
+          f"p99={_percentile(s,99):>10.1f}  max={s[-1]:>11.0f}  mean={statistics.fmean(s):>10.1f}")
 
 
 METRICS = {
@@ -131,31 +133,33 @@ METRICS = {
 
 
 def evaluate_metric(name, fn, rows, typical, args):
-    """rows: non-gated (n_words, budget, bound_erd, actual, sizes-list).  Returns
-    (false_expensive_frac, tail_spearman, overall_spearman)."""
+    """rows: non-gated (n_words, budget, bound_erd, actual, sizes-list, has_self).
+    Returns (false_expensive_frac, tail_spearman, overall_spearman, slope,
+    pearson_log)."""
     preds, acts = [], []
-    fe = 0
-    for n_words, budget, bound, actual, sizes in rows:
+    false_expensive_count = 0
+    for n_words, budget, bound, actual, sizes, has_self in rows:
         b = bound if bound is not None else float("inf")
-        p = fn(sizes, False, n_words, b, budget, typical)
+        p = fn(sizes, has_self, n_words, b, budget, typical)
         preds.append(p)
         acts.append(actual)
         if p > args.false_pred and actual < args.small_nodes:
-            fe += 1
-    fe_frac = fe / len(rows) if rows else float("nan")
+            false_expensive_count += 1
+    false_expensive_frac = (false_expensive_count / len(rows) if rows
+                            else float("nan"))
     rho_all = spearman(preds, acts)
     tail = [(p, a) for p, a in zip(preds, acts) if a >= args.tail_nodes]
     rho_tail = spearman([p for p, _ in tail], [a for _, a in tail]) if len(tail) > 2 else float("nan")
     print(f"\n--- metric '{name}' (non-gated, n={len(rows):,}) ---")
     print(f"  median predicted = {statistics.median(preds):,.1f}   "
           f"§4 false-expensive (pred>{args.false_pred:g}, actual<{args.small_nodes}) "
-          f"= {100*fe_frac:.1f}%")
+          f"= {100*false_expensive_frac:.1f}%")
     print(f"  Spearman overall = {rho_all:.3f}   "
           f"load-bearing tail (actual>={args.tail_nodes}, n={len(tail)}) Spearman = {rho_tail:.3f}")
     r_log, slope, sigma = loglog_fit(preds, acts)
     print(f"  log10 calibration: Pearson(log) = {r_log:.3f}   slope = {slope:.3f}   "
           f"resid_sigma = {sigma:.2f} dex  (slope~1 & low sigma => well-sized bundles)")
-    return fe_frac, rho_tail, rho_all, slope, r_log
+    return false_expensive_frac, rho_tail, rho_all, slope, r_log
 
 
 def estimate_claim_reduction(conn, epoch, small_count, count_cap):
@@ -171,7 +175,8 @@ def estimate_claim_reduction(conn, epoch, small_count, count_cap):
     """
     import math
     total_by = {bytes(r[0]): r[1] for r in conn.execute(
-        "SELECT branch_key, n_claims FROM branch_finalize_log WHERE n_claims > 0")}
+        "SELECT branch_key, n_claims FROM branch_finalize_log "
+        "WHERE epoch = ? AND n_claims > 0", (epoch,))}
     ng_by = {}
     for bk, cnt in conn.execute(
         "SELECT branch_key, COUNT(*) FROM candidate_accuracy "
@@ -216,7 +221,7 @@ def main():
     typical = load_cost_model(conn)
     all_rows = conn.execute("""
         SELECT n_words, budget, bound_erd, gated, actual_nodes, group_sizes,
-               source_word
+               source_word, cost_lb
         FROM candidate_accuracy WHERE epoch = ?
     """, (args.epoch,)).fetchall()
 
@@ -248,12 +253,17 @@ def main():
     rows = []
     rows_by_opener = {}
     skipped = 0
-    for n_words, budget, bound, _g, actual, gs, opener in nongated_raw:
+    for n_words, budget, bound, _g, actual, gs, opener, cost_lb in nongated_raw:
         if not gs:
             skipped += 1
             continue
         sizes = [int(x) for x in gs.split("-") if x]
-        row = (n_words, budget, bound, actual, sizes)
+        # has_self is not logged directly, but the runtime cost_lb is, and
+        # cost_lb = 3 - (G + has_self)/n with G = len(sizes) — so it is
+        # recoverable exactly.
+        has_self = (cost_lb is not None
+                    and round(n_words * (3.0 - cost_lb)) - len(sizes) == 1)
+        row = (n_words, budget, bound, actual, sizes, has_self)
         rows.append(row)
         rows_by_opener.setdefault(opener, []).append(row)
     have_bound = sum(1 for r in rows if r[2] is not None)
@@ -313,7 +323,7 @@ def main():
     # The design rests on two proven facts, not on the magnitude estimate: exact
     # ERD-lower-bound elimination, and a searched mass that is overwhelmingly cheap.
     results = results_bounded or results_all
-    fe_frac, rho_tail, _, slope, r_log = results[args.gate_metric]
+    false_expensive_frac, rho_tail, _, slope, r_log = results[args.gate_metric]
     used = "bounded subset" if results_bounded else "full non-gated set"
     elim_ok = (not gated) or gfrac >= 0.95
     print(f"\n=== Packer decision ===")
@@ -322,7 +332,8 @@ def main():
           if gated else "  [n/a ] elimination split (no eliminated rows)")
     print(f"  Magnitude estimate (metric '{args.gate_metric}', {used}): "
           f"log-log slope {slope:.3f}, Pearson(log) {r_log:.3f}, "
-          f"false-expensive {100*fe_frac:.1f}%, tail Spearman {rho_tail:.3f}")
+          f"false-expensive {100*false_expensive_frac:.1f}%, "
+          f"tail Spearman {rho_tail:.3f}")
     print(f"    -> NOT usable for bundle sizing: it over-predicts the cheap searched "
           f"mass (a size-only cost model cannot see the bound propagate into "
           f"children).  The packer must be magnitude-free.")

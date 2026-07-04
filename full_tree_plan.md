@@ -207,7 +207,7 @@ Rules that follow:
 | When | What |
 |---|---|
 | Now → Friday | §2, §3 implemented and reviewed (new files only, no deploy). §9's design.md `ROOT_BUDGET` fix. Optionally §8 drafted but not merged. |
-| Friday afternoon | Epoch-0 run ends. Owner runs `analyze_epoch0.py`; packer go/no-go decided (that track proceeds independently per `adaptive_claim_packing.md` §10). |
+| Friday afternoon | Epoch-0 run ends. Owner runs `analyze_swarm_telemetry.py`; packer go/no-go decided (that track proceeds independently per `adaptive_claim_packing.md` §10). |
 | After PR #76 merges | §4 branched from `main`, implemented, tested, deployed (one worker restart, one epoch bump; the box pulls PR #80's uncapped `queue-add` in the same deploy). Then §7 calibration. |
 | After §7 numbers | Decide §5/§6 scope; §8 lands before the first full-tree phone sync. |
 
@@ -285,7 +285,7 @@ record the answer next to it when known.
 | U3 | Monster-branch cost (branches over 300 answer words) — zero data today. | §7 calibration solve; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | The whole-job schedule |
 | U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
 | U5 | Phone live-solve latency on off-tree branches (Modes B/C) with a reachable-only cache. | Timed `ERDSolver` runs in Pythonista at n ≈ 10 / 40 / 100. | Whether Mode C needs the out-of-scope lookup service |
-| U6 | The packer metric passes the `analyze_epoch0.py` gate. **Mid-run: provisionally NO-GO** — gating exact and §4 trap 0% (PASS), but load-bearing tail Spearman 0.21 and log-log slope ≈ 0.2 / σ ≈ 1.4 dex (FAIL), on a bounded corpus that is ~99% ALIBI. | Friday's full assessment (pathological vs typical opener split); if the magnitude metric stays failed, the packing track falls back to gate-only bundling + republish-on-overrun. | The packing lever's size and timing (not this plan's sections) |
+| U6 | The packer metric passes the `analyze_swarm_telemetry.py` gate. **Mid-run: provisionally NO-GO** — gating exact and §4 trap 0% (PASS), but load-bearing tail Spearman 0.21 and log-log slope ≈ 0.2 / σ ≈ 1.4 dex (FAIL), on a bounded corpus that is ~99% ALIBI. | Friday's full assessment (pathological vs typical opener split); if the magnitude metric stays failed, the packing track falls back to gate-only bundling + republish-on-overrun. | The packing lever's size and timing (not this plan's sections) |
 | U7 | Top-level branch count: estimated 1.5–2M distinct (opener, pattern) subsets with ≥ 2 words. | §7's census script computes it exactly (cheap once §2 exists). | Schedule precision; §8 export size projection |
 | U8 | Exact-equality equivalence between pure-Python and vectorized paths is achievable (stable ordering everywhere). | §4/§5/§6 acceptance tests enforce it; any failure is a design bug to fix, not a tolerance to widen. | §4, §5, §6 |
 
@@ -862,9 +862,9 @@ no-abbreviations rule and under-describe themselves (C2.1). Proposed:
 - `cost_lb` → `candidate_cost_lower_bound`
 - `rest_lb` → `remaining_groups_cost_lower_bound`
 - Scope: Python identifiers in `wordle_engine.py`, `erd_swarm.py`,
-  `analyze_epoch0.py`, and docs. The `candidate_accuracy.cost_lb` SQLite
+  `analyze_swarm_telemetry.py`, and docs. The `candidate_accuracy.cost_lb` SQLite
   column (queue DB, Linux-only) can be renamed by an idempotent
-  `ERDQueue._migrate()` step — but **not while `analyze_epoch0.py` still
+  `ERDQueue._migrate()` step — but **not while `analyze_swarm_telemetry.py` still
   needs to read the epoch-0 corpus**, so schedule after the gate analysis is
   finished and archived. If the owner prefers, the column may simply keep
   its name with the mapping documented where it is read.
@@ -876,7 +876,7 @@ no-abbreviations rule and under-describe themselves (C2.1). Proposed:
 ```
 already done      §1 (issue #77 / PR #80, merged — box pulls it at next deploy)
 now → Friday      §2 → §3 (new files, no deploy)          §9a design.md fix
-Friday pm         epoch-0 run ends → analyze_epoch0.py gate (packing track)
+Friday pm         epoch-0 run ends → analyze_swarm_telemetry.py gate (packing track)
 after PR #76      §4 — deploy: one restart, one epoch bump (brings PR #80
 merges                 onto the box in the same pull)
 then              §7a census → §7b calibration → §7c schedule memo

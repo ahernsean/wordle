@@ -1014,12 +1014,14 @@ def estimate_candidate_work_cutoff(group_sizes, has_self, n, best_erd, budget,
     """Predicted search work, CUTOFF-AWARE — the §4 metric.
 
     Mirrors evaluate_candidate's sub-branch loop: process groups largest-first,
-    accumulating the admissible lower-bound ERD, and sum the cost model's node
-    estimate only for the groups the engine actually reaches before the
-    accumulated cost meets best_erd.  Because the accumulation uses each
-    sub-branch's lower bound (2 - 1/k), real cost is >= it, so this cutoff fires no
-    earlier than the engine's — an upper bound on reached groups, never an
-    under-estimate.
+    accumulating a per-group ERD proxy (3 - 2/k), and sum the cost model's node
+    estimate only for the groups reached before the accumulated cost meets
+    best_erd.  The proxy deliberately exceeds the admissible lower bound
+    (2 - 1/k): the admissible bound sums to ~cost_lb, which by construction
+    never reaches best_erd for a non-gated candidate, so a cutoff built on it
+    would never fire.  The price is that this modeled cutoff can fire EARLIER
+    than the engine's, under-counting reached groups — acceptable for a
+    scheduling estimate.
 
     The effect: a weak splitter (few large groups, cost_lb just under best_erd)
     busts the bound after one or two groups and predicts ~0; a strong splitter
