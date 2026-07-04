@@ -372,8 +372,8 @@ class TestCandidateStats(unittest.TestCase):
         branch_indices = self.pm.answer_indices(branch_words)
         branch_size = len(branch_words)
         stats = self.pm.candidate_stats(branch_indices)
-        # Recompute counts as the Python reference input; this is independent of
-        # candidate_stats so the comparison is not circular.
+        # Fetch counts separately to feed _python_stats_for_row. Non-circularity
+        # comes from the Python arithmetic in that helper, not from this fetch.
         counts = self.pm.counts_for_all_candidates(branch_indices)
 
         for g in range(len(self.guess_words)):
