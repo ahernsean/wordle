@@ -181,8 +181,9 @@ class PatternMatrix:
             / np.float64(branch_size)
         )
 
-        # Σk² sort key; int64 required — worst case 3200² × 243 ≈ 2.5e9 exceeds int32 max.
-        # Zero entries contribute 0² = 0, so summing the full row is correct.
+        # Σk² sort key; int64 output. Worst case is n² (all words in one group);
+        # actual max ≈ 3185² ≈ 10M, which fits int32, but int64 is the spec type.
+        # Zero entries contribute 0, so summing the full row is correct.
         sum_squared_group_sizes = (counts.astype(np.int64) ** 2).sum(axis=1)
 
         max_group_size = counts.max(axis=1).astype(np.int32)
