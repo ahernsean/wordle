@@ -15,7 +15,11 @@ import sys
 import tempfile
 import unittest
 
-import numpy as np
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
 
 import pattern_matrix
 from pattern_matrix import PatternMatrix, _COUNT_CHUNK_ROWS, _compute_answer_list_id
@@ -33,11 +37,13 @@ _ALL_GUESS_WORDS = _load_words(os.path.join(_REPO_DIR, "wordle.txt"))
 _ALL_ANSWER_WORDS = _load_words(os.path.join(_REPO_DIR, "NYT_wordlist.txt"))
 
 
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestAvailable(unittest.TestCase):
     def test_available_true_with_numpy(self):
         self.assertTrue(pattern_matrix.available())
 
 
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestMatrixCorrectness(unittest.TestCase):
     """Acceptance (a): matrix[g, a] == _encode_response(calculate_response(g, a))."""
 
@@ -76,6 +82,7 @@ class TestMatrixCorrectness(unittest.TestCase):
         np.testing.assert_array_equal(indices, [0, 1, 2, 3, 4])
 
 
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestCountsForAllCandidates(unittest.TestCase):
     """Acceptance (b): counts match ResponseCache.group_counts for ~20 random pairs.
 
@@ -153,6 +160,7 @@ class TestCountsForAllCandidates(unittest.TestCase):
                         f"row sums not all {len(branch_words)}: {row_sums[row_sums != len(branch_words)]}")
 
 
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestPatternsForCandidates(unittest.TestCase):
     """patterns_for_candidates returns the correct uint8 slice."""
 
@@ -179,6 +187,7 @@ class TestPatternsForCandidates(unittest.TestCase):
             np.testing.assert_array_equal(result[out_row], expected)
 
 
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestSaveLoad(unittest.TestCase):
     """Acceptance (c): save/load round-trip; shape mismatch → None."""
 
@@ -234,6 +243,7 @@ class TestSaveLoad(unittest.TestCase):
                 pm2.matrix[0, 0] = 0
 
 
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestBuildWithScoreCache(unittest.TestCase):
     """build() reads from score_cache when available and writes back misses."""
 
