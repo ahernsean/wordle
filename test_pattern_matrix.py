@@ -342,22 +342,22 @@ class TestCandidateStats(unittest.TestCase):
         cls.answer_not_guess = [w for w in cls.answer_words if w not in guess_word_set]
 
     @staticmethod
-    def _python_stats_for_row(counts_row, n):
+    def _python_stats_for_row(counts_row, branch_size):
         """Pure-Python reference for one candidate's row of response-group counts.
 
         counts_row is the 243-element int32 array from counts_for_all_candidates[g].
         Matches the scalar formulas in wordle_engine.evaluate_candidate and score_groups.
         """
-        groups = {p: int(k) for p, k in enumerate(counts_row) if k > 0}
+        groups = {pattern: int(count) for pattern, count in enumerate(counts_row) if count > 0}
         group_count = len(groups)
         has_self = groups.get(242, 0) > 0
-        cost_lower_bound = 3.0 - (group_count + (1 if has_self else 0)) / n
-        sum_squared = sum(k * k for k in groups.values())
+        cost_lower_bound = 3.0 - (group_count + (1 if has_self else 0)) / branch_size
+        sum_squared = sum(count * count for count in groups.values())
         max_group = max(groups.values()) if groups else 0
         entropy = 0.0
-        for k in groups.values():
-            p = k / n
-            entropy -= p * math.log2(p)
+        for count in groups.values():
+            probability = count / branch_size
+            entropy -= probability * math.log2(probability)
         return {
             'group_count': group_count,
             'has_self': has_self,
@@ -370,26 +370,28 @@ class TestCandidateStats(unittest.TestCase):
     def _verify_all_candidates(self, branch_words, label):
         """Check every field of candidate_stats against the per-row Python reference."""
         branch_indices = self.pm.answer_indices(branch_words)
-        n = len(branch_words)
+        branch_size = len(branch_words)
         stats = self.pm.candidate_stats(branch_indices)
         # Recompute counts as the Python reference input; this is independent of
         # candidate_stats so the comparison is not circular.
         counts = self.pm.counts_for_all_candidates(branch_indices)
 
         for g in range(len(self.guess_words)):
-            expected = self._python_stats_for_row(counts[g], n)
+            expected = self._python_stats_for_row(counts[g], branch_size)
             word = self.guess_words[g]
-            ctx = f"{label}, candidate={word!r}"
-            self.assertEqual(int(stats.group_count[g]), expected['group_count'], ctx)
-            self.assertEqual(bool(stats.has_self[g]), expected['has_self'], ctx)
+            failure_message = f"{label}, candidate={word!r}"
+            self.assertEqual(int(stats.group_count[g]), expected['group_count'], failure_message)
+            self.assertEqual(bool(stats.has_self[g]), expected['has_self'], failure_message)
             self.assertEqual(
-                float(stats.cost_lower_bound[g]), expected['cost_lower_bound'], ctx)
+                float(stats.cost_lower_bound[g]), expected['cost_lower_bound'], failure_message)
             self.assertEqual(
-                int(stats.sum_squared_group_sizes[g]), expected['sum_squared_group_sizes'], ctx)
-            self.assertEqual(int(stats.max_group_size[g]), expected['max_group_size'], ctx)
+                int(stats.sum_squared_group_sizes[g]), expected['sum_squared_group_sizes'],
+                failure_message)
+            self.assertEqual(int(stats.max_group_size[g]), expected['max_group_size'],
+                             failure_message)
             self.assertAlmostEqual(
                 float(stats.entropy_gain[g]), expected['entropy_gain'],
-                delta=1e-12, msg=ctx)
+                delta=1e-12, msg=failure_message)
 
     def test_branch_size_8_no_candidate_in_branch(self):
         """Branch of size 8 drawn entirely from words outside the guess vocabulary.
