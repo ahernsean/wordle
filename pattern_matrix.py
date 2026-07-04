@@ -155,15 +155,15 @@ class PatternMatrix:
         Returns a CandidateStats of parallel arrays in guess-word (matrix-row) space:
         index g corresponds to self.matrix row g, not to any position in a candidate_list.
 
-        Fields and dtypes (n = len(branch_indices)):
+        Fields and dtypes (branch_size = len(branch_indices)):
           group_count             int32    number of non-empty response groups
           has_self                bool     candidate is in the branch (all-green pattern present)
-          cost_lower_bound        float64  3.0 - (group_count + has_self) / n
+          cost_lower_bound        float64  3.0 - (group_count + has_self) / branch_size
           sum_squared_group_sizes int64    Σk² over all response groups; sort key for best-first order
           max_group_size          int32    size of the largest response group
           entropy_gain            float64  Shannon entropy in bits; 1e-12 tolerance vs scalar path
         """
-        n = len(branch_indices)
+        branch_size = len(branch_indices)
         counts = self.counts_for_all_candidates(branch_indices)
 
         # Number of non-empty response groups per candidate (includes self group when present).
@@ -174,11 +174,11 @@ class PatternMatrix:
 
         # Admissible lower bound: same formula as evaluate_candidate's cost_lb.
         # Integer numerator cast to float64 before division so the result is
-        # bit-identical to the scalar computation 3.0 - (G + s) / n.
+        # bit-identical to the scalar computation 3.0 - (G + s) / branch_size.
         cost_lower_bound = (
             np.float64(3.0)
             - (group_count.astype(np.float64) + has_self.astype(np.float64))
-            / np.float64(n)
+            / np.float64(branch_size)
         )
 
         # Σk² sort key; int64 required — worst case 3200² × 243 ≈ 2.5e9 exceeds int32 max.
@@ -187,18 +187,18 @@ class PatternMatrix:
 
         max_group_size = counts.max(axis=1).astype(np.int32)
 
-        # Shannon entropy: -Σ p·log2(p) over non-empty groups, p = k/n.
+        # Shannon entropy: -Σ p·log2(p) over non-empty groups, p = k/branch_size.
         # The double-where avoids log2(0): the inner where substitutes 1.0
         # (log2(1.0) = 0.0) for zero-count entries so log2 never sees zero,
         # and the outer where explicitly zeroes those contributions.
-        p = counts.astype(np.float64) / np.float64(n)
+        group_probabilities = counts.astype(np.float64) / np.float64(branch_size)
         nonzero = counts > 0
-        log_p = np.where(
+        log2_group_probabilities = np.where(
             nonzero,
-            np.log2(np.where(nonzero, p, np.float64(1.0))),
+            np.log2(np.where(nonzero, group_probabilities, np.float64(1.0))),
             np.float64(0.0),
         )
-        entropy_gain = -(p * log_p).sum(axis=1)
+        entropy_gain = -(group_probabilities * log2_group_probabilities).sum(axis=1)
 
         return CandidateStats(
             group_count=group_count,
