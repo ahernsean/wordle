@@ -671,6 +671,11 @@ class GameState:
         )
         self.cache = ResponseCache(all_answers, self.score_cache)
         print(f"Score cache: {self.score_cache_path}")
+        # A cold build (no cached .npy, or a decomposition table that isn't
+        # warm yet) can run long enough to look like a hung startup; this
+        # print is the only feedback the user gets until it returns, since
+        # load_or_build is synchronous and doesn't report cold vs warm.
+        print("Loading response-pattern matrix...", flush=True)
         self.pattern_matrix = pattern_matrix_module.PatternMatrix.load_or_build(
             self.score_cache_path, all_words, all_answers, self.score_cache)
         # Long-lived: hard-mode ERD results are namespaced internally by a
