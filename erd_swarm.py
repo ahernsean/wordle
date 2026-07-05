@@ -23,6 +23,7 @@ import os
 import signal
 import time
 
+import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, mem_cache_limit
 from wordle_engine import (
     ERD_ALL,
@@ -289,6 +290,37 @@ class _MidLoopPublisher:
             buf[key] = (log_n, log_n * log_n, 1)
 
 
+def _load_or_build_pattern_matrix(cache_path, guess_words, answer_words, score_cache):
+    """Load this process's PatternMatrix, building and persisting it on a miss.
+
+    Returns None when NumPy is unavailable (pattern_matrix_module.available()
+    is False) — callers then fall back to the pure-Python engine path.
+
+    The .npy path sits alongside cache_path and embeds the answer-list
+    identity, so a different answer universe never loads a stale matrix (the
+    load() shape check alone would not catch two same-size, different-content
+    universes). Multiple worker processes may race to build on a cold start;
+    each writes to its own temp file and renames into place, so a racing
+    build only wastes CPU, never corrupts the file another worker is mmap
+    reading.
+    """
+    if not pattern_matrix_module.available():
+        return None
+    matrix_dir = os.path.dirname(os.path.abspath(cache_path))
+    matrix_path = os.path.join(
+        matrix_dir, f'pattern_matrix_{score_cache.answer_list_id}')
+    matrix = pattern_matrix_module.PatternMatrix.load(
+        matrix_path, guess_words, answer_words)
+    if matrix is not None:
+        return matrix
+    matrix = pattern_matrix_module.PatternMatrix.build(
+        guess_words, answer_words, score_cache=score_cache)
+    tmp_path = f'{matrix_path}.tmp{os.getpid()}'
+    matrix.save(tmp_path)
+    os.replace(f'{tmp_path}.npy', f'{matrix_path}.npy')
+    return matrix
+
+
 class _BranchWorker:
     """One worker process's state and operations on branches and candidates."""
 
@@ -320,6 +352,8 @@ class _BranchWorker:
         self.score_cache = ScoreCache(cache_path, self.all_answers,
                                       max_mem_entries=max_entries)
         self.rcache = ResponseCache(self.all_answers, self.score_cache)
+        self.pattern_matrix = _load_or_build_pattern_matrix(
+            cache_path, self.all_words, self.all_answers, self.score_cache)
         self.queue = ERDQueue(queue_path)
 
         self.started = int(time.time())
@@ -754,6 +788,7 @@ class _BranchWorker:
             bound_provider=_bound_provider,
             mid_loop_publisher=self._mid_loop_publisher,
             metric_observer=_metric_observer if self._adaptive else None,
+            pattern_matrix=self.pattern_matrix,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound(),

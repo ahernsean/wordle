@@ -1068,7 +1068,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    cancel_check=None, heartbeat=None,
                    note_depth=None, budget=None,
                    subbranch_solver=None, bound_provider=None,
-                   mid_loop_publisher=None, metric_observer=None):
+                   mid_loop_publisher=None, metric_observer=None,
+                   pattern_matrix=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1175,7 +1176,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             policy, cancel_check, heartbeat, note_depth, None,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code,
-            mid_loop_publisher=mid_loop_publisher)
+            mid_loop_publisher=mid_loop_publisher, pattern_matrix=pattern_matrix)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
@@ -1344,6 +1345,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                 note_depth=note_depth, budget=budget,
                 subbranch_solver=subbranch_solver,
                 mid_loop_publisher=mid_loop_publisher,
+                pattern_matrix=pattern_matrix,
             )
         if status in _ABORT_STATUSES:
             return status
@@ -1405,7 +1407,8 @@ def min_expected_guesses(branch_words, cache, score_cache,
                           policy=None, progress_callback=None,
                           cancel_check=None, heartbeat=None,
                           note_depth=None, budget=None,
-                          subbranch_solver=None, mid_loop_publisher=None):
+                          subbranch_solver=None, mid_loop_publisher=None,
+                          pattern_matrix=None):
     """
     Exact expected guesses to solve branch_words, playing optimally.
 
@@ -1421,6 +1424,10 @@ def min_expected_guesses(branch_words, cache, score_cache,
              once per fully-evaluated top-level candidate (top level only).
     cancel_check / heartbeat / note_depth: threaded into every recursive
              call (see _solve_subset / evaluate_candidate).
+    pattern_matrix: optional PatternMatrix (pattern_matrix.py) shared across
+             the whole solve; when supplied, best-first ordering and
+             candidate pre-gating run vectorized instead of per-candidate
+             Python scans. None (the default) keeps the pure-Python path.
 
     Returns the expected-guesses cost, or None if the deadline/cancel fired or
     (when budgeted) `branch_words` is unsolvable within budget.  Partial results
@@ -1429,7 +1436,8 @@ def min_expected_guesses(branch_words, cache, score_cache,
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat,
                         note_depth, progress_callback, subbranch_solver,
-                        mid_loop_publisher=mid_loop_publisher)
+                        mid_loop_publisher=mid_loop_publisher,
+                        pattern_matrix=pattern_matrix)
     if res in _ABORT_STATUSES:
         return None
     status, cost, _md, _budget_tainted = res

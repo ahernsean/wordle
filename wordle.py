@@ -25,6 +25,7 @@ except ImportError:
     console = None
 
 import wordle_engine
+import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle_ui import _is_gray_char
 from wordle_engine import (
@@ -653,6 +654,28 @@ def print_guesses(soln):
 
 
 
+def _load_or_build_pattern_matrix(cache_path, guess_words, answer_words, score_cache):
+    """This session's PatternMatrix, built and persisted on a miss; None
+    when NumPy is unavailable (pattern_matrix_module.available() is False).
+
+    The .npy path sits alongside cache_path and embeds the answer-list
+    identity, so a different answer universe never loads a stale matrix.
+    """
+    if not pattern_matrix_module.available():
+        return None
+    matrix_dir = os.path.dirname(os.path.abspath(cache_path))
+    matrix_path = os.path.join(
+        matrix_dir, f'pattern_matrix_{score_cache.answer_list_id}')
+    matrix = pattern_matrix_module.PatternMatrix.load(
+        matrix_path, guess_words, answer_words)
+    if matrix is not None:
+        return matrix
+    matrix = pattern_matrix_module.PatternMatrix.build(
+        guess_words, answer_words, score_cache=score_cache)
+    matrix.save(matrix_path)
+    return matrix
+
+
 # ---------------------------------------------------------------------------
 # Game state
 # ---------------------------------------------------------------------------
@@ -670,6 +693,8 @@ class GameState:
         )
         self.cache = ResponseCache(all_answers, self.score_cache)
         print(f"Score cache: {self.score_cache_path}")
+        self.pattern_matrix = _load_or_build_pattern_matrix(
+            self.score_cache_path, all_words, all_answers, self.score_cache)
         # Long-lived: hard-mode ERD results are namespaced internally by a
         # fingerprint of the eligible-guess vocabulary (see set_scope), so
         # entries from earlier positions/games simply become unreachable
@@ -2181,7 +2206,7 @@ def cmd_precache(gs):
     gs.precache_solver = BranchPrecacheSolver(
         guess_word, branches, gs.all_answers, gs.all_words,
         gs.score_cache_path, anchor_word_count=len(soln.current_words),
-        precached_keys=precached_keys)
+        precached_keys=precached_keys, pattern_matrix=gs.pattern_matrix)
     gs.precache_solver.start()
     print(f"Precaching ERD for {len(branches)} branches of "
           f"{guess_word.upper()} in the background "
@@ -2518,7 +2543,7 @@ class ERDSolver(threading.Thread):
     def __init__(self, current_words, all_answers, effective_guesses,
                  score_cache_path,
                  policy=ERD_ALL, persist=True, seed_mem_cache=None,
-                 last_guess=None, budget=None):
+                 last_guess=None, budget=None, pattern_matrix=None):
         super().__init__(daemon=True, name='ERDSolver')
         self._words = list(current_words)        # snapshot
         self._all_answers = all_answers
@@ -2528,6 +2553,7 @@ class ERDSolver(threading.Thread):
         self._policy = policy
         self._persist = persist
         self._seed_mem_cache = seed_mem_cache
+        self._pattern_matrix = pattern_matrix
         # Allowed remaining depth from this position (budget + guess_depth =
         # GAME_GUESSES). None means unconstrained ERD (legacy behaviour).
         self._budget = budget
@@ -2763,6 +2789,7 @@ class ERDSolver(threading.Thread):
                     cancel_check=_cancel_or_paused,
                     heartbeat=_maybe_print,
                     budget=budget,
+                    pattern_matrix=self._pattern_matrix,
                 )
                 if result is not None:
                     if not self._cancel.is_set():
@@ -2837,13 +2864,15 @@ class BranchPrecacheSolver(threading.Thread):
     """
 
     def __init__(self, guess_word, branches, all_answers, all_words,
-                 score_cache_path, anchor_word_count, precached_keys=frozenset()):
+                 score_cache_path, anchor_word_count, precached_keys=frozenset(),
+                 pattern_matrix=None):
         super().__init__(daemon=True, name='BranchPrecacheSolver')
         self.guess_word = guess_word
         self._branches = branches            # [(code, branch_words), ...]
         self._all_answers = all_answers
         self._all_words = all_words
         self._cache_path = score_cache_path
+        self._pattern_matrix = pattern_matrix
         self.anchor_word_count = anchor_word_count
         self._cancel = threading.Event()
         self._paused = threading.Event()
@@ -3015,7 +3044,8 @@ class BranchPrecacheSolver(threading.Thread):
                         # long time while the first top-level candidate
                         # (best_erd still unbounded) recurses through its
                         # whole subtree.
-                        heartbeat=_maybe_print)
+                        heartbeat=_maybe_print,
+                        pattern_matrix=self._pattern_matrix)
                     if result is not None:
                         break
                     if self._cancel.is_set():  # pragma: no cover - cancel/pause-retry race
@@ -3153,6 +3183,7 @@ def main():  # pragma: no cover - interactive REPL loop, exercised manually
                     seed_mem_cache=seed_cache,
                     last_guess=tuple(soln0.guesses[-1]),
                     budget=GAME_GUESSES - len(soln0.guesses),
+                    pattern_matrix=gs.pattern_matrix,
                 )
                 _solver.start()
                 _solver_key = branch_key
