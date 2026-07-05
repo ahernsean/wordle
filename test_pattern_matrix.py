@@ -396,6 +396,33 @@ class TestLoadOrBuild(unittest.TestCase):
         expected = PatternMatrix.build(other_guess_words, self.answer_words)
         np.testing.assert_array_equal(pm_other.matrix, expected.matrix)
 
+    def _leftover_tmp_files(self):
+        return [f for f in os.listdir(self._tmp.name) if ".tmp" in f]
+
+    def test_save_failure_still_returns_matrix_and_leaves_no_tmp_file(self):
+        # Persisting is an optimization: a disk-full/permission error writing
+        # the .npy must not crash construction (erd_swarm.py's
+        # _BranchWorker.__init__ or wordle.py's GameState.__init__ call this
+        # synchronously) and must not leak the per-PID temp file.
+        with mock.patch.object(PatternMatrix, "save",
+                               side_effect=OSError("disk full")):
+            pm = PatternMatrix.load_or_build(
+                self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(pm)
+        expected = PatternMatrix.build(self.guess_words, self.answer_words)
+        np.testing.assert_array_equal(pm.matrix, expected.matrix)
+        self.assertEqual(self._leftover_tmp_files(), [])
+
+    def test_replace_failure_still_returns_matrix_and_leaves_no_tmp_file(self):
+        with mock.patch("pattern_matrix.os.replace",
+                        side_effect=OSError("cross-device link")):
+            pm = PatternMatrix.load_or_build(
+                self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(pm)
+        expected = PatternMatrix.build(self.guess_words, self.answer_words)
+        np.testing.assert_array_equal(pm.matrix, expected.matrix)
+        self.assertEqual(self._leftover_tmp_files(), [])
+
 
 class TestLoadOrBuildNumpyAbsent(unittest.TestCase):
     def test_returns_none_when_numpy_unavailable(self):

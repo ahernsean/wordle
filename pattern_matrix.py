@@ -6,6 +6,7 @@ Check available() before constructing or using PatternMatrix.
 """
 import collections
 import hashlib
+import logging
 import os
 
 try:
@@ -13,6 +14,8 @@ try:
     _NUMPY_AVAILABLE = True
 except ImportError:
     _NUMPY_AVAILABLE = False
+
+logger = logging.getLogger("wordle")
 
 
 # Parallel arrays returned by candidate_stats(), one entry per guess-word (matrix row).
@@ -145,8 +148,24 @@ class PatternMatrix:
             return matrix
         matrix = cls.build(guess_words, answer_words, score_cache=score_cache)
         tmp_path = f'{matrix_path}.tmp{os.getpid()}'
-        matrix.save(tmp_path)
-        os.replace(f'{tmp_path}.npy', f'{matrix_path}.npy')
+        tmp_npy_path = f'{tmp_path}.npy'
+        try:
+            matrix.save(tmp_path)
+            os.replace(tmp_npy_path, f'{matrix_path}.npy')
+        except OSError as exc:
+            # Persisting is an optimization, not a durability requirement:
+            # the matrix just built is still returned and usable this
+            # session, so a write failure here (disk full, or on iOS a
+            # transient iCloud File Provider Storage lock — see
+            # ScoreCache.checkpoint) only costs a rebuild next time, not
+            # this one. Clean up any partial temp file rather than leaking
+            # it across every future worker restart.
+            logger.warning("PatternMatrix persist failed for %s: %s",
+                           matrix_path, exc)
+            try:
+                os.unlink(tmp_npy_path)
+            except OSError:
+                pass
         return matrix
 
     def guess_index(self, word):
