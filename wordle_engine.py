@@ -1288,7 +1288,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # candidate_cost_lower_bounds, when set, is the vectorized twin of
     # evaluate_candidate's own admissible cost_lb bound (C2.1), aligned
     # index-for-index with the (already reordered) candidate_list — see the
-    # pruning check in the candidate loop below.
+    # ERD-pruning check in the candidate loop below.
     candidate_cost_lower_bounds = None
     if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
         vectorized = False
@@ -1337,12 +1337,12 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             # dispatch below as an OVER_ERD_LIMIT from evaluate_candidate
             # itself — in particular the status == OVER_ERD_LIMIT check just
             # below still sets cutoff_occurred, so a node where every
-            # candidate is pruned is never mistaken for a proven loss.
+            # candidate is ERD-pruned is never mistaken for a proven loss.
             #
             # The heartbeat tick mirrors evaluate_candidate's own unconditional
             # first action: the node counter it drives (erd_swarm.py's
             # _BranchWorker._nodes) is documented to count every candidate
-            # considered, pruned or not, and the swarm's cost-model
+            # considered, ERD-pruned or not, and the swarm's cost-model
             # calibration (nodes_spent) depends on that count staying exact.
             if heartbeat is not None:
                 heartbeat()

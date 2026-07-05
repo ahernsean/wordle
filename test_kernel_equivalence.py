@@ -5,9 +5,9 @@ Covers full_tree_plan.md §4's acceptance list:
   - equivalence across branch sizes {8, 30, 81, 146} and budgets {None, 5, 4}:
     identical best_guess/ERD/max_remaining_depth/taint and identical rows
     written to a fresh ScoreCache.
-  - invariant 2: a node where every candidate is pruned still returns a
+  - invariant 2: a node where every candidate is ERD-pruned still returns a
     cutoff and writes no loss row (never a false "proven unsolvable").
-  - the §4a index-alignment hazard: pruning a candidate against a
+  - the §4a index-alignment hazard: ERD-pruning a candidate against a
     misaligned (unpermuted) bound array changes the recorded winner/ERD.
 """
 import os
@@ -114,14 +114,14 @@ class TestKernelEquivalence(_TmpCacheMixin, unittest.TestCase):
 
 
 @unittest.skipUnless(pattern_matrix_module.available(), "NumPy not available")
-class TestAllCandidatesPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
-    """§4b invariant 2: a node where every candidate is pruned returns a
+class TestAllCandidatesERDPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
+    """§4b invariant 2: a node where every candidate is ERD-pruned returns a
     cutoff, not a loss.
 
     3 - (n+1)/n is the lowest cost_lb any candidate can possibly achieve
     (C2.1: G <= n non-self-inclusive groups, plus has_self) — so seeding the
     ceiling below that floor (here 1.5, valid for every n >= 2) guarantees
-    every candidate is pruned, regardless of branch content.
+    every candidate is ERD-pruned, regardless of branch content.
     """
 
     @classmethod
@@ -131,7 +131,7 @@ class TestAllCandidatesPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
         cls.guess_words = cls.answer_words
         cls.pattern_matrix = PatternMatrix.build(cls.guess_words, cls.answer_words)
 
-    def test_all_candidates_pruned_returns_cutoff_not_loss(self):
+    def test_all_candidates_erd_pruned_returns_cutoff_not_loss(self):
         branch_words = sorted(random.Random(2).sample(self.answer_words, 20))
         result, (best_rows, loss_rows) = self._solve(
             branch_words, self.answer_words, self.guess_words,
@@ -140,19 +140,19 @@ class TestAllCandidatesPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
         self.assertEqual(status, OVER_ERD_LIMIT)
         self.assertEqual(cost, 1.5)
         # The single worst bug §4b could introduce: a node where every
-        # candidate is pruned falling through to the "proven unsolvable"
+        # candidate is ERD-pruned falling through to the "proven unsolvable"
         # branch and writing a false loss row instead of reporting a cutoff.
         self.assertEqual(loss_rows, [])
         self.assertEqual(best_rows, [])
 
-    def test_heartbeat_still_ticks_once_per_pruned_candidate(self):
+    def test_heartbeat_still_ticks_once_per_erd_pruned_candidate(self):
         # evaluate_candidate's own heartbeat call is the swarm's node counter
         # (erd_swarm.py's _BranchWorker._nodes), documented to count every
-        # candidate considered, pruned or not. Pruning must not silently
-        # skip it, or nodes_spent telemetry undercounts whenever a
+        # candidate considered, ERD-pruned or not. ERD-pruning must not
+        # silently skip it, or nodes_spent telemetry undercounts whenever a
         # PatternMatrix is active. Total ticks = one from _solve_subset's own
         # node-entry heartbeat, plus one per candidate in the loop (all of
-        # them pruned here, per this class's docstring).
+        # them ERD-pruned here, per this class's docstring).
         branch_words = sorted(random.Random(2).sample(self.answer_words, 20))
         ticks = [0]
         self._solve(
@@ -167,7 +167,7 @@ class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
     """§4a: the sort-key and cost-lower-bound arrays must be permuted by BOTH
     candidate_rows and the sort order. This fixture makes a candidate's raw
     vocabulary position (weak first, strong second) diverge from its
-    best-first position (strong first, weak second) enough that pruning
+    best-first position (strong first, weak second) enough that ERD-pruning
     either candidate against the OTHER's bound flips the outcome from a
     concrete SOLVED winner to a cutoff — an unpermuted or half-permuted
     bound array cannot pass this test by accident.
@@ -218,9 +218,9 @@ class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
             ceiling=self.ceiling)
         status, cost, _max_remaining_depth, _tainted = result
         # Correct alignment: strong (sorted first) evaluates under its own
-        # low bound, solves, and wins; weak (sorted second) is pruned by
+        # low bound, solves, and wins; weak (sorted second) is ERD-pruned by
         # the tightened best_erd. A misaligned array would instead swap which
-        # candidate is pruned at which position, wrongly dropping strong
+        # candidate is ERD-pruned at which position, wrongly dropping strong
         # before it ever evaluates and reporting a cutoff instead of a
         # concrete winner (see the module docstring's full trace).
         self.assertEqual(status, SOLVED)
