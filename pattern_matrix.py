@@ -1,19 +1,17 @@
 """Pattern matrix: precomputed response patterns for all (guess, answer) pairs.
 
-This module is the sole NumPy import point in the engine. The import is guarded
-so all other modules work — and pass their full test suites — with NumPy absent.
-Check available() before constructing or using PatternMatrix.
+This module is the sole NumPy import point in the engine. NumPy is a hard
+requirement on every deployment target (Pythonista bundles 1.22.3, the API
+floor). The engine's pure-Python implementations remain permanently — not as
+a runtime fallback but as the reference implementation the vectorized path is
+tested against; selecting them is a caller choice (pattern_matrix=None).
 """
 import collections
 import hashlib
 import logging
 import os
 
-try:
-    import numpy as np
-    _NUMPY_AVAILABLE = True
-except ImportError:
-    _NUMPY_AVAILABLE = False
+import numpy as np
 
 logger = logging.getLogger("wordle")
 
@@ -26,11 +24,6 @@ CandidateStats = collections.namedtuple(
     ['group_count', 'has_self', 'cost_lower_bound',
      'sum_squared_group_sizes', 'max_group_size', 'entropy_gain'],
 )
-
-
-def available():
-    """True iff NumPy is importable; every caller must check this before using PatternMatrix."""
-    return _NUMPY_AVAILABLE
 
 
 # Guess rows processed per bincount call. Bounds the per-call transient at
@@ -121,8 +114,7 @@ class PatternMatrix:
     @classmethod
     def load_or_build(cls, cache_path, guess_words, answer_words, score_cache):
         """This process's PatternMatrix: load()ed from disk, or build()+save()d
-        on a miss. Returns None when NumPy is unavailable — callers then fall
-        back to the pure-Python engine path.
+        on a miss.
 
         The .npy path sits alongside cache_path and embeds both the
         answer-list identity and the guess-vocabulary identity, so neither a
@@ -136,8 +128,6 @@ class PatternMatrix:
         truncate a file another process still has mmap'd, which an in-place
         save() could.
         """
-        if not available():
-            return None
         matrix_dir = os.path.dirname(os.path.abspath(cache_path))
         matrix_path = os.path.join(
             matrix_dir,

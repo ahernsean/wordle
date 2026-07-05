@@ -382,9 +382,11 @@ candidate whose admissible bound already meets `best_erd`, decision-identical to
 `evaluate_candidate` itself applies. Results are bit-identical to the pure-Python path by
 construction and by test (`test_kernel_equivalence.py`).
 
-The import is guarded: with NumPy absent, `pattern_matrix.available()` is False and every
-consumer runs the pure-Python path. The phone (Pythonista bundles NumPy 1.22.3) sets the API
-floor — nothing newer than 1.22.
+NumPy is a hard requirement on every deployment target. The pure-Python implementations stay
+permanently — not as a runtime fallback but as the reference implementation the vectorized
+path is tested against; they are prohibited from calling NumPy, and selecting them is a
+caller choice (`pattern_matrix=None`). The phone (Pythonista bundles NumPy 1.22.3) sets the
+API floor — nothing newer than 1.22.
 
 ---
 
