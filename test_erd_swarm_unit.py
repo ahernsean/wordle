@@ -72,6 +72,7 @@ def _bare_worker():
     w._mid_loop_publisher = erd_swarm._MidLoopPublisher(w)
     w.n_workers = 1
     w.rcache = mock.MagicMock()
+    w.pattern_matrix = None
     w.score_cache = mock.MagicMock()
     w.score_cache.read_hits = 0
     w.score_cache.read_misses = 0
@@ -222,6 +223,30 @@ class TestCancelPath(unittest.TestCase):
         w.request_stop()
         self.assertTrue(w.cancel())
         self.assertIsNone(w.stop_event)
+
+
+class TestEvaluateClaimPatternMatrix(unittest.TestCase):
+    """evaluate_claim threads self.pattern_matrix into evaluate_candidate.
+
+    _bare_worker() must keep mirroring _BranchWorker.__init__: an
+    unconditional field read added to evaluate_claim (like this one) needs
+    the matching field added to _bare_worker(), or any non-cancelled call
+    to evaluate_claim on a bare worker raises AttributeError (see
+    reference_heartbeat_test_skeleton.md for the same class of gap in
+    _heartbeat).
+    """
+
+    def test_evaluate_candidate_receives_worker_pattern_matrix(self):
+        # Deliberately relies on _bare_worker()'s own construction for
+        # self.pattern_matrix rather than setting it here afterward --
+        # setting it here would mask the exact gap this test exists to catch.
+        w = _bare_worker()           # stop_event is None -> not cancelled
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        with mock.patch('erd_swarm.evaluate_candidate',
+                        return_value=(SOLVED, 1.5, 1, False)) as mock_eval:
+            result = w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
+        self.assertTrue(result)
+        self.assertIsNone(mock_eval.call_args.kwargs['pattern_matrix'])
 
 
 class TestSubbranchSolver(unittest.TestCase):
