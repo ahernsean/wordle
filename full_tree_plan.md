@@ -28,7 +28,7 @@ sub-branches also consume claims):
 
 | Lever | Expected gain | Where |
 |---|---|---|
-| Claim packing (coordination overhead ~83% of in-loop wall) | ~5–6× | `adaptive_claim_packing.md` — gate decided (U6): the magnitude metric is **dead**; the lever survives as exact ERD-lower-bound elimination + count-bundling + republish-on-overrun, with a measured claim-count reduction of 44–231× depending on bundle cap |
+| Claim packing (coordination overhead ~83% of in-loop wall) | ~5–6× | `adaptive_claim_packing.md` — go/no-go decided (U6): the magnitude metric is **dead**; the lever survives as exact ERD-lower-bound pruning + count-bundling + republish-on-overrun, with a measured claim-count reduction of 44–231× depending on bundle cap |
 | Vectorized partition kernel (NumPy) | ~10–50× on node rate and on the warm-cache sweep floor | §2–§5 |
 | Candidate equivalence-class dedupe | up to ~10× on deep branches | §6 |
 
@@ -117,7 +117,7 @@ each additional response group moves one more answer word from the
 **Why it is safe to prune with:** it is *admissible* — never higher than the
 candidate's true cost — so `cost_lb >= best_erd` proves the candidate cannot
 beat the current best and can be discarded with zero recursion. This one-line
-gate is why 99.4% of measured claims cost <10 nodes.
+pruning test is why 99.4% of measured claims cost <10 nodes.
 
 **Naming:** `cost_lb` violates the no-abbreviations rule; §9 proposes the
 rename (`candidate_cost_lower_bound`) and when it is safe to do.
@@ -156,18 +156,19 @@ this plan relies on. Hence the stable-sort requirements in §4/§5.
 
 **Final state (Jul 4):** PR #76 is merged to `main`, the epoch-0 baseline
 run is complete, and the swarm is stopped. The final corpus
-(`analyze_swarm_telemetry.py`, epoch 0) is ~10.7M `candidate_accuracy` rows
-with a 33.8% gated share — much larger and differently mixed than the
-mid-run snapshot (6.8M rows, 4.7% gated), and the verdict held across both,
-so it is robust to corpus composition:
+(`analyze_swarm_telemetry.py`, epoch 0) is ~10.7M `candidate_accuracy` rows,
+33.8% of them ERD-lower-bound pruned (the telemetry's legacy `gated` flag —
+§9b) — much larger and differently mixed than the mid-run snapshot (6.8M
+rows, 4.7% pruned), and the verdict held across both, so it is robust to
+corpus composition:
 
-- **Gating/elimination is exact — PASS.** 100% of gated rows ≤ 1 node; the
-  §4 false-expensive trap is 0% once the budget-keyed cost model is warm.
-  This is the half §4b of this plan vectorizes.
+- **ERD-lower-bound pruning is exact — PASS.** 100% of pruned rows ≤ 1
+  node; the §4 false-expensive trap is 0% once the budget-keyed cost model
+  is warm. This is the half §4b of this plan vectorizes.
 - **The magnitude metric is dead — FAIL.** 81.1% false-expensive rate;
   log-log slope 0.850 but Pearson-log correlation 0.191 — predicted
   magnitude carries almost no information about actual node cost.
-- **Packer design decided:** exact ERD-lower-bound elimination +
+- **Packer design decided:** exact ERD-lower-bound pruning +
   count-bundling + republish-on-overrun, with **no work-magnitude model**.
   Measured claim-count reduction from count-bundling alone: 44× / 82× /
   144× / 231× at small-bundle caps of 8 / 16 / 32 / 64.
@@ -193,8 +194,9 @@ them by number; rules 4–5 remain binding on every deploy.
    label and git SHA), so cost-model fits never mix node rates from
    different kernels. One epoch bump per deploy, not per section.
 5. **The `metric_observer` contract must be preserved.** PR #76 feeds
-   `candidate_accuracy` from a hook in `evaluate_candidate`. §4's pre-gating
-   and §6's dedupe both *skip* `evaluate_candidate` calls; each section below
+   `candidate_accuracy` from a hook in `evaluate_candidate`. §4's
+   ERD-lower-bound pruning and §6's dedupe both *skip* `evaluate_candidate`
+   calls; each section below
    states what the observer must still see. Read
    `test_claim_packing_measurement.py` before touching the candidate loop.
 
@@ -202,7 +204,7 @@ them by number; rules 4–5 remain binding on every deploy.
 
 | When | What |
 |---|---|
-| Done | §2 (PR #84) and §3 (PR #85) merged into this branch; epoch-0 run complete; packer gate decided (U6). |
+| Done | §2 (PR #84) and §3 (PR #85) merged into this branch; epoch-0 run complete; packer go/no-go decided (U6). |
 | Next | §4 implemented and reviewed on this branch; deploy = one worker restart, one epoch bump (the box pulls PR #80's uncapped `queue-add` in the same deploy). |
 | After §4 deploys | §7a census, then §7b calibration (the queued 841-word ALIBI branch), then §7c schedule memo. |
 | After §7 numbers | Decide §5/§6 scope; §8 lands before the first full-tree phone sync. |
@@ -282,7 +284,7 @@ record the answer next to it when known.
 | U3 | Monster-branch cost. **First hard data point (Jul 4):** a 208-word budget-4 ALIBI branch — a legitimate feasible solve, not a pathology — spent ~90h / 7.6B nodes on ~8.7% of its optimality certificate ⇒ ~43 days/node extrapolated, pure Python. That settles the headline schedule question (pure Python = years; kernel unconditional). The over-300-word regime is still unmeasured. | §7b calibration on the queued 841-word ALIBI all-gray branch, after §4 deploys; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | Schedule *refinement* only — the go/no-go answer is already in |
 | U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
 | U5 | Phone live-solve latency on off-tree branches (Modes B/C) with a reachable-only cache. | Timed `ERDSolver` runs in Pythonista at n ≈ 10 / 40 / 100. | Whether Mode C needs the out-of-scope lookup service |
-| U6 | **Resolved (final epoch-0 analysis, ~10.7M rows).** Elimination half exact — 100% of gated rows ≤ 1 node (PASS). Magnitude half dead — 81.1% false-expensive, Pearson-log 0.191 (FAIL). Packer design: exact ERD-lower-bound elimination + count-bundling + republish-on-overrun, no work-magnitude model; measured claim reduction 44–231× by bundle cap. | Done. Remaining: revise `adaptive_claim_packing.md` to this scheme (its own track). | Nothing in this plan's sections |
+| U6 | **Resolved (final epoch-0 analysis, ~10.7M rows).** Pruning half exact — 100% of ERD-lower-bound-pruned rows (the telemetry's legacy `gated` flag, §9b) ≤ 1 node (PASS). Magnitude half dead — 81.1% false-expensive, Pearson-log 0.191 (FAIL). Packer design: exact ERD-lower-bound pruning + count-bundling + republish-on-overrun, no work-magnitude model; measured claim reduction 44–231× by bundle cap. | Done. Remaining: revise `adaptive_claim_packing.md` to this scheme (its own track). | Nothing in this plan's sections |
 | U7 | Top-level branch count: estimated 1.5–2M distinct (opener, pattern) subsets with ≥ 2 words. | §7's census script computes it exactly (cheap once §2 exists). | Schedule precision; §8 export size projection |
 | U8 | Exact-equality equivalence between pure-Python and vectorized paths is achievable (stable ordering everywhere). | §4/§5/§6 acceptance tests enforce it; any failure is a design bug to fix, not a tolerance to widen. | §4, §5, §6 |
 
@@ -515,7 +517,7 @@ Notes for the implementer:
 every field matches the per-candidate Python computation — integers exactly,
 `cost_lower_bound` exactly, entropy within 1e-12.
 
-## §4. Engine integration: vectorized ranking and pre-gating
+## §4. Engine integration: vectorized ranking and ERD-lower-bound pruning
 
 **Read first:** `_solve_subset` in full (`wordle_engine.py:1097-1259`);
 `evaluate_candidate` (`wordle_engine.py:971-1094`); C2.2's tie-order warning;
@@ -557,7 +559,7 @@ spaces exist here: matrix guess rows, pre-sort `candidate_list` positions,
 and post-sort positions. Every §3 vector is in *matrix row* space; the loop
 in 4b runs in *post-sort* space. The bound array 4b reads must therefore be
 permuted by **both** `candidate_rows` and `order` — exactly the last line of
-the snippet. Reading an unpermuted array with the loop index gates each
+the snippet. Reading an unpermuted array with the loop index checks each
 candidate against *some other candidate's* bound: a non-admissible prune
 that can silently discard the true winner and cache a wrong ERD. The
 acceptance tests below include a fixture built to catch this.
@@ -566,19 +568,19 @@ If any word in `candidate_list` is missing from the guess vocabulary
 (possible only in exotic interactive states), fall back to the pure-Python
 sort for that node rather than special-casing.
 
-**4b. Pre-gating in the candidate loop.** Inside the loop at
-`wordle_engine.py:1198`, replace the unconditional `evaluate_candidate` call
-with a gated one that **falls through** to the rest of the loop body — no
+**4b. ERD-lower-bound pruning in the candidate loop.** Inside the loop at
+`wordle_engine.py:1198`, guard the unconditional `evaluate_candidate` call
+with the pruning test, **falling through** to the rest of the loop body — no
 early `continue`, because everything after the call (abort dispatch, taint
 fold, the mid-loop publisher check, the status dispatch) must still run for
-a pre-gated candidate exactly as it runs for one `evaluate_candidate`
+a pruned candidate exactly as it runs for one `evaluate_candidate`
 rejected itself:
 
 ```python
 if (candidate_cost_lower_bounds is not None
         and candidate_cost_lower_bounds[i] >= best_erd):
-    # Pre-gated: the same admissible bound evaluate_candidate would compute
-    # (C2.1) already proves this candidate cannot beat best_erd.
+    # ERD-lower-bound pruned: the same admissible bound evaluate_candidate
+    # would compute (C2.1) already proves this candidate cannot beat best_erd.
     status, cost, max_remaining_depth, budget_tainted = (
         OVER_ERD_LIMIT, None, None, False)
 else:
@@ -586,33 +588,34 @@ else:
         branch_words, candidate, cache, score_cache, ...)
 # ... unchanged from here: abort dispatch, node_floor fold, mid-loop
 # publisher check, then `if status == OVER_ERD_LIMIT: cutoff_occurred = True;
-# continue` — the pre-gated tuple flows through the same dispatch.
+# continue` — the pruned candidate's tuple flows through the same dispatch.
 ```
 
-This is decision-identical to the gate `evaluate_candidate` itself applies at
-`wordle_engine.py:1027` — same admissible bound (C2.1), same `>=` comparison,
-against the same running `best_erd`, and the same result tuple
+This is decision-identical to the pruning test `evaluate_candidate` itself
+applies at `wordle_engine.py:1027` — same admissible bound (C2.1), same `>=`
+comparison, against the same running `best_erd`, and the same result tuple
 `(OVER_ERD_LIMIT, None, None, False)` — but costs an array read instead of a
-full `group_words` partition (the dominant cost of a gated candidate).
+full `group_words` partition (the dominant cost of a pruned candidate).
 
 Three invariants to preserve, each already load-bearing today:
-1. **The mid-loop publisher check runs every iteration** including pre-gated
+1. **The mid-loop publisher check runs every iteration** including pruned
    ones (today's loop runs it before the status `continue`s —
    `wordle_engine.py:1211-1217`). The 4b snippet's fall-through structure
    exists precisely for this: evaluate-or-skip, then publisher check, then
-   dispatch on status. Never write pre-gating as an early `continue`.
-2. **`cutoff_occurred` semantics:** a pre-gated candidate is an
+   dispatch on status. Never write the pruning check as an early `continue`.
+2. **`cutoff_occurred` semantics:** a pruned candidate is an
    `OVER_ERD_LIMIT`-equivalent, so it must set `cutoff_occurred = True`
-   (otherwise a node where *every* candidate is pre-gated would fall through
+   (otherwise a node where *every* candidate is pruned would fall through
    to the "proven unsolvable" branch at `wordle_engine.py:1232-1243` and
    **write a false loss row** — the single worst bug this section could
    introduce).
 3. **`metric_observer`:** on merged `main`, decide per its actual contract:
-   either the observer receives the same "gated, ~0 nodes" observation it
-   would have received from `evaluate_candidate`, or pre-gating is disabled
-   when an observer is attached (observers ride swarm claims, where the claim
-   loop — not this inline loop — dominates; disabling there costs little).
-   State the choice in the PR description.
+   either the observer receives the same observation it would have received
+   from `evaluate_candidate` (~0 nodes, its legacy `gated` flag set — §9b),
+   or the pruning check is disabled when an observer is attached (observers
+   ride swarm claims, where the claim loop — not this inline loop —
+   dominates; disabling there costs little). State the choice in the PR
+   description.
 
 **4c. Plumbing.** Thread one shared `PatternMatrix` exactly the way
 `ResponseCache` is shared:
@@ -643,12 +646,12 @@ count, and the per-node share still spent in `group_words` (that share is
   `max_remaining_depth`, identical taint, and identical rows written to a
   fresh in-memory ScoreCache (compare full table dumps).
 - A regression test for invariant 2: a branch/budget where every candidate is
-  pre-gated (tight seeded ceiling) still returns `OVER_ERD_LIMIT`-style
+  pruned (tight seeded ceiling) still returns `OVER_ERD_LIMIT`-style
   cutoff, and writes **no** loss row.
 - A regression test for the index-alignment hazard (4a): a fixture branch
   where the best-first order differs substantially from vocabulary order and
   the winning candidate sits late in vocabulary order but early in sorted
-  order — chosen so that gating any candidate against a misaligned bound
+  order — chosen so that pruning any candidate against a misaligned bound
   changes the recorded winner or ERD, making the equivalence assertion catch
   an unpermuted or half-permuted bound array.
 - Full suite green with NumPy present and absent.
@@ -663,10 +666,10 @@ subtleties below.
 still dominates. If §4 leaves `group_words` under ~30% of node time, skip
 this section — the complexity is not free.
 
-**Current behaviour.** Each non-pre-gated `evaluate_candidate` builds
-`{pattern: [words]}` with a Python loop over the branch
-(`wordle_engine.py:1013`). After §4 this is the main surviving per-node
-Python cost.
+**Current behaviour.** Each `evaluate_candidate` call that survives
+ERD-lower-bound pruning builds `{pattern: [words]}` with a Python loop over
+the branch (`wordle_engine.py:1013`). After §4 this is the main surviving
+per-node Python cost.
 
 **Change.** Inside `ResponseCache.group_words`, accept an optional
 `(pattern_matrix, branch_indices)` fast path that produces an **identical dict**
@@ -877,19 +880,26 @@ findings, not code changes.
   and design.md, plus a short design.md section: what the matrix is, which
   engine paths consult it, and the fallback rule (Part II rule 2).
 
-**9b. Rename proposal (owner decision; the epoch-0 run and its gate
-analysis are complete, so this is unblocked once the owner considers the
-epoch-0 corpus archived).** `cost_lb` and `rest_lb` violate the
-no-abbreviations rule and under-describe themselves (C2.1). Proposed:
+**9b. Rename proposal (owner decision; the epoch-0 run and its analysis
+are complete, so this is unblocked once the owner considers the epoch-0
+corpus archived).** `cost_lb` and `rest_lb` violate the no-abbreviations
+rule and under-describe themselves (C2.1), and the `gated` family names the
+mechanism's shape (a gate) while omitting the criterion (the ERD lower
+bound) — the same flaw as `MINIMAX`. Prose already says "ERD-lower-bound
+pruned" throughout this document; the identifiers should follow. Proposed:
 - `cost_lb` → `candidate_cost_lower_bound`
 - `rest_lb` → `remaining_groups_cost_lower_bound`
+- `gated` (the `candidate_accuracy` flag, the `metric_observer` parameter,
+  `ACCURACY_GATED_SAMPLE_EVERY`, and the analyzer's output labels) → the
+  `erd_lower_bound_pruned` family.
 - Scope: Python identifiers in `wordle_engine.py`, `erd_swarm.py`,
-  `analyze_swarm_telemetry.py`, and docs. The `candidate_accuracy.cost_lb` SQLite
-  column (queue DB, Linux-only) can be renamed by an idempotent
-  `ERDQueue._migrate()` step — but **not while `analyze_swarm_telemetry.py` still
-  needs to read the epoch-0 corpus**, so schedule after the gate analysis is
-  finished and archived. If the owner prefers, the column may simply keep
-  its name with the mapping documented where it is read.
+  `analyze_swarm_telemetry.py`, and docs. The `candidate_accuracy.cost_lb`
+  and `.gated` SQLite columns (queue DB, Linux-only) can be renamed by an
+  idempotent `ERDQueue._migrate()` step — but **not while
+  `analyze_swarm_telemetry.py` still needs to read the epoch-0 corpus**, so
+  schedule after the epoch-0 analysis is finished and archived. If the
+  owner prefers, the columns may simply keep their names with the mapping
+  documented where they are read.
 
 ---
 
@@ -898,7 +908,7 @@ no-abbreviations rule and under-describe themselves (C2.1). Proposed:
 ```
 already done      §1 (issue #77 / PR #80, merged to main)
                   §2 (PR #84) and §3 (PR #85), merged into this branch
-                  epoch-0 run complete; packer gate decided (U6)
+                  epoch-0 run complete; packer go/no-go decided (U6)
 next              §4 — implement on this branch; deploy = one worker restart
                       + one epoch bump (box pulls PR #80's code in the same
                       deploy)
@@ -908,8 +918,9 @@ then              §5 and/or §6 per §7's numbers            §8 before first f
 anytime           §9a design.md fix (still open)
                   §9b rename (unblocked once the epoch-0 corpus is archived)
 parallel track    claim packing per adaptive_claim_packing.md — binary scheme
-                  (exact elimination + count-bundling + republish-on-overrun);
-                  that document still needs revision to the scheme
+                  (exact ERD-lower-bound pruning + count-bundling +
+                  republish-on-overrun); that document still needs revision
+                  to the scheme
 ```
 
 Dependency summary: §4→§5; §2→§6 (§2 done); §4 deployed→§7; §8 independent;
