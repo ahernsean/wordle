@@ -1288,7 +1288,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # candidate_cost_lower_bounds, when set, is the vectorized twin of
     # evaluate_candidate's own admissible cost_lb bound (C2.1), aligned
     # index-for-index with the (already reordered) candidate_list — see the
-    # ERD-prune check in the candidate loop below.
+    # pruning check in the candidate loop below.
     candidate_cost_lower_bounds = None
     if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
         vectorized = False
@@ -1331,19 +1331,19 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     for i, candidate in enumerate(candidate_list):
         if (candidate_cost_lower_bounds is not None
                 and candidate_cost_lower_bounds[i] >= best_erd):
-            # ERD-pruned: the same admissible bound evaluate_candidate would
-            # compute (C2.1) already proves this candidate cannot beat
-            # best_erd. Falls through to the same dispatch below as an
-            # OVER_ERD_LIMIT from evaluate_candidate itself — in particular
-            # the status == OVER_ERD_LIMIT check just below still sets
-            # cutoff_occurred, so a node where every candidate is ERD-pruned
-            # is never mistaken for a proven loss.
+            # ERD-lower-bound pruned: the same admissible bound
+            # evaluate_candidate would compute (C2.1) already proves this
+            # candidate cannot beat best_erd. Falls through to the same
+            # dispatch below as an OVER_ERD_LIMIT from evaluate_candidate
+            # itself — in particular the status == OVER_ERD_LIMIT check just
+            # below still sets cutoff_occurred, so a node where every
+            # candidate is pruned is never mistaken for a proven loss.
             #
             # The heartbeat tick mirrors evaluate_candidate's own unconditional
             # first action: the node counter it drives (erd_swarm.py's
             # _BranchWorker._nodes) is documented to count every candidate
-            # considered, gated or not, and the swarm's cost-model calibration
-            # (nodes_spent) depends on that count staying exact.
+            # considered, pruned or not, and the swarm's cost-model
+            # calibration (nodes_spent) depends on that count staying exact.
             if heartbeat is not None:
                 heartbeat()
             status, cost, max_remaining_depth, budget_tainted = (
@@ -1437,7 +1437,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
              call (see _solve_subset / evaluate_candidate).
     pattern_matrix: optional PatternMatrix (pattern_matrix.py) shared across
              the whole solve; when supplied, best-first ordering and
-             candidate pre-gating run vectorized instead of per-candidate
+             ERD-lower-bound pruning run vectorized instead of per-candidate
              Python scans. None (the default) keeps the pure-Python path.
 
     Returns the expected-guesses cost, or None if the deadline/cancel fired or
