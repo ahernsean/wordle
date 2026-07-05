@@ -1200,7 +1200,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, note_depth,
                   progress_callback, subbranch_solver=None,
                   ceiling=float('inf'), entry_guess=None, entry_pattern=None,
-                  mid_loop_publisher=None):
+                  mid_loop_publisher=None, pattern_matrix=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1280,12 +1280,39 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # (best_erd) is tight from the 2nd candidate on, letting evaluate_candidate's
     # partial-sum cutoff prune the rest before they recurse.  Order-only — the
     # minimum, and therefore every cached result, is unchanged.
+    #
+    # candidate_cost_lower_bounds, when set, is the vectorized twin of
+    # evaluate_candidate's own cost_lb gate (C2.1), aligned index-for-index
+    # with the (already reordered) candidate_list — see the pre-gating check
+    # in the candidate loop below.
+    candidate_cost_lower_bounds = None
     if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
-        candidate_list = sorted(
-            candidate_list,
-            key=lambda c: sum(
-                k * k for k in cache.group_counts(c, branch_words).values()),
-        )
+        vectorized = False
+        if pattern_matrix is not None:
+            try:
+                branch_indices = pattern_matrix.answer_indices(branch_words)
+                candidate_rows = [pattern_matrix.guess_index(c) for c in candidate_list]
+            except KeyError:
+                candidate_rows = None  # exotic interactive word: fall back below
+            if candidate_rows is not None:
+                stats = pattern_matrix.candidate_stats(branch_indices)
+                # Python's sort is stable, so this reproduces exactly the order
+                # np.argsort(kind='mergesort') would give on the same keys —
+                # equal-Σk² candidates keep their pre-sort relative order (C2.2).
+                order = sorted(
+                    range(len(candidate_list)),
+                    key=lambda i: stats.sum_squared_group_sizes[candidate_rows[i]],
+                )
+                candidate_list = [candidate_list[i] for i in order]
+                candidate_cost_lower_bounds = [
+                    stats.cost_lower_bound[candidate_rows[i]] for i in order]
+                vectorized = True
+        if not vectorized:
+            candidate_list = sorted(
+                candidate_list,
+                key=lambda c: sum(
+                    k * k for k in cache.group_counts(c, branch_words).values()),
+            )
 
     # Seed the bound with the alpha-beta ceiling: any candidate that can't beat
     # it is a cutoff, and if none can we report a cutoff (lower bound) rather
