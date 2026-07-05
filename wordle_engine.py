@@ -976,8 +976,11 @@ def _by_group_size(item):
 
 
 def _candidate_cost_lb(group_sizes, has_self, n):
-    """The engine's admissible lower bound on a candidate's ERD (wordle_engine
-    line ~1027): cost >= 3 - (number_of_groups + has_self) / n."""
+    """The engine's admissible lower bound on a candidate's ERD, shared by
+    evaluate_candidate and the cost-estimator functions below: cost >=
+    3 - (number_of_groups + has_self) / n. group_sizes need only support
+    len() — evaluate_candidate passes groups.values() directly rather than
+    materializing a list of sizes."""
     return 3.0 - (len(group_sizes) + (1 if has_self else 0)) / n
 
 
@@ -1118,7 +1121,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 
     # Admissible lower bound on this candidate's cost — cost >= 3 - (G + has_self)/n.
     has_self = _ALL_GREEN_PATTERN in groups
-    cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+    cost_lb = _candidate_cost_lb(groups.values(), has_self, n)
     gated = cost_lb >= best_erd
     # Report the work-metric inputs the moment they are known (cost_lb, group
     # sizes, the bound actually in force after any external tightening) so a
