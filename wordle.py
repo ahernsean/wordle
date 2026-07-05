@@ -654,28 +654,6 @@ def print_guesses(soln):
 
 
 
-def _load_or_build_pattern_matrix(cache_path, guess_words, answer_words, score_cache):
-    """This session's PatternMatrix, built and persisted on a miss; None
-    when NumPy is unavailable (pattern_matrix_module.available() is False).
-
-    The .npy path sits alongside cache_path and embeds the answer-list
-    identity, so a different answer universe never loads a stale matrix.
-    """
-    if not pattern_matrix_module.available():
-        return None
-    matrix_dir = os.path.dirname(os.path.abspath(cache_path))
-    matrix_path = os.path.join(
-        matrix_dir, f'pattern_matrix_{score_cache.answer_list_id}')
-    matrix = pattern_matrix_module.PatternMatrix.load(
-        matrix_path, guess_words, answer_words)
-    if matrix is not None:
-        return matrix
-    matrix = pattern_matrix_module.PatternMatrix.build(
-        guess_words, answer_words, score_cache=score_cache)
-    matrix.save(matrix_path)
-    return matrix
-
-
 # ---------------------------------------------------------------------------
 # Game state
 # ---------------------------------------------------------------------------
@@ -693,7 +671,7 @@ class GameState:
         )
         self.cache = ResponseCache(all_answers, self.score_cache)
         print(f"Score cache: {self.score_cache_path}")
-        self.pattern_matrix = _load_or_build_pattern_matrix(
+        self.pattern_matrix = pattern_matrix_module.PatternMatrix.load_or_build(
             self.score_cache_path, all_words, all_answers, self.score_cache)
         # Long-lived: hard-mode ERD results are namespaced internally by a
         # fingerprint of the eligible-guess vocabulary (see set_scope), so

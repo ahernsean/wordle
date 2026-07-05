@@ -6,6 +6,7 @@ Check available() before constructing or using PatternMatrix.
 """
 import collections
 import hashlib
+import os
 
 try:
     import numpy as np
@@ -107,6 +108,35 @@ class PatternMatrix:
         if matrix.shape != (len(guess_words), len(answer_words)):
             return None
         return cls(matrix, guess_words, answer_words)
+
+    @classmethod
+    def load_or_build(cls, cache_path, guess_words, answer_words, score_cache):
+        """This process's PatternMatrix: load()ed from disk, or build()+save()d
+        on a miss. Returns None when NumPy is unavailable — callers then fall
+        back to the pure-Python engine path.
+
+        The .npy path sits alongside cache_path and embeds the answer-list
+        identity, so a different answer universe never loads a stale matrix
+        (the load() shape check alone would not catch two same-size,
+        different-content universes). Multiple processes (swarm workers, an
+        interactive session) may race to build on a cold start or a rebuild;
+        each writes to its own PID-suffixed temp file and renames into place,
+        so a racing build only wastes CPU — it can never truncate a file
+        another process still has mmap'd, which an in-place save() could.
+        """
+        if not available():
+            return None
+        matrix_dir = os.path.dirname(os.path.abspath(cache_path))
+        matrix_path = os.path.join(
+            matrix_dir, f'pattern_matrix_{score_cache.answer_list_id}')
+        matrix = cls.load(matrix_path, guess_words, answer_words)
+        if matrix is not None:
+            return matrix
+        matrix = cls.build(guess_words, answer_words, score_cache=score_cache)
+        tmp_path = f'{matrix_path}.tmp{os.getpid()}'
+        matrix.save(tmp_path)
+        os.replace(f'{tmp_path}.npy', f'{matrix_path}.npy')
+        return matrix
 
     def guess_index(self, word):
         """Row index of word in the guess vocabulary; KeyError if word is unknown."""

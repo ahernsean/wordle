@@ -1,9 +1,11 @@
 """diag_kernel_bench.py -- §4 kernel bench: matrix-on vs matrix-off.
 
 For each branch size, solves the same branch with and without a shared
-PatternMatrix, asserts identical ERD, and reports wall time, node count
-(heartbeat ticks), and the fraction of wall time spent inside
-ResponseCache.group_words -- the per-node share §5 would vectorize next.
+PatternMatrix, checks the two ERDs are exactly equal (exiting nonzero on any
+mismatch instead of just flagging it in the log -- a tolerance here would be
+the same design bug Part II rule 1 forbids everywhere else), and reports
+wall time, node count (heartbeat ticks), and the fraction of wall time spent
+inside ResponseCache.group_words -- the per-node share §5 would vectorize next.
 
 Self-contained: builds its own temp ScoreCache and PatternMatrix from the
 real word lists rather than touching any production database, so it is safe
@@ -19,6 +21,7 @@ box should leave it at 0 against a warm production decomposition table.
 """
 import os
 import random
+import sys
 import tempfile
 import time
 
@@ -88,6 +91,7 @@ def solve(branch_words, matrix):
 
 print(f'budget={BUDGET}  deadline={DEADLINE_S}s  vocab={len(vocab)}  '
       f'answers={len(answers)}  sizes={BRANCH_SIZES}', flush=True)
+mismatches = []
 for size in BRANCH_SIZES:
     if size > len(answers):
         print(f'\n=== branch n={size} skipped (larger than answer list) ===', flush=True)
@@ -105,11 +109,19 @@ for size in BRANCH_SIZES:
               f'group_words {share:5.1f}%', flush=True)
         results[tag] = erd
     if 'on' in results and 'off' in results:
+        # Exact equality, per Part II rule 1: the matrix-on and matrix-off
+        # paths must produce bit-identical results, never "close enough" —
+        # a tolerance here would hide the exact bug this bench exists to
+        # catch. `==` also covers the both-aborted (None) case correctly.
         expected, actual = results['off'], results['on']
-        match = ('ERD MATCH' if (expected == actual or
-                                 (expected is not None and actual is not None
-                                  and abs(expected - actual) < 1e-9))
-                 else '*** ERD DIFF ***')
-        print(f'  -> {match}', flush=True)
+        if expected == actual:
+            print('  -> ERD MATCH', flush=True)
+        else:
+            print(f'  -> *** ERD DIFF *** off={expected!r} on={actual!r}', flush=True)
+            mismatches.append((size, expected, actual))
 
 print('\ndone', flush=True)
+if mismatches:
+    print(f'\n{len(mismatches)} branch(es) diverged between matrix-on and '
+          f'matrix-off: {mismatches}', flush=True)
+    sys.exit(1)
