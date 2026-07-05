@@ -1283,9 +1283,9 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # minimum, and therefore every cached result, is unchanged.
     #
     # candidate_cost_lower_bounds, when set, is the vectorized twin of
-    # evaluate_candidate's own cost_lb gate (C2.1), aligned index-for-index
-    # with the (already reordered) candidate_list — see the pre-gating check
-    # in the candidate loop below.
+    # evaluate_candidate's own admissible cost_lb bound (C2.1), aligned
+    # index-for-index with the (already reordered) candidate_list — see the
+    # ERD-prune check in the candidate loop below.
     candidate_cost_lower_bounds = None
     if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
         vectorized = False
@@ -1328,13 +1328,13 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     for i, candidate in enumerate(candidate_list):
         if (candidate_cost_lower_bounds is not None
                 and candidate_cost_lower_bounds[i] >= best_erd):
-            # Pre-gated: the same admissible bound evaluate_candidate would
+            # ERD-pruned: the same admissible bound evaluate_candidate would
             # compute (C2.1) already proves this candidate cannot beat
             # best_erd. Falls through to the same dispatch below as an
             # OVER_ERD_LIMIT from evaluate_candidate itself — in particular
             # the status == OVER_ERD_LIMIT check just below still sets
-            # cutoff_occurred, so an all-pre-gated node is never mistaken
-            # for a proven loss.
+            # cutoff_occurred, so a node where every candidate is ERD-pruned
+            # is never mistaken for a proven loss.
             status, cost, max_remaining_depth, budget_tainted = (
                 OVER_ERD_LIMIT, None, None, False)
         else:

@@ -1,13 +1,13 @@
-"""§4 acceptance: the vectorized kernel (best-first sort + pre-gating, §4a/§4b)
+"""§4 acceptance: the vectorized kernel (best-first sort + ERD pruning, §4a/§4b)
 must be result-identical to the pure-Python path it replaces.
 
 Covers full_tree_plan.md §4's acceptance list:
   - equivalence across branch sizes {8, 30, 81, 146} and budgets {None, 5, 4}:
     identical best_guess/ERD/max_remaining_depth/taint and identical rows
     written to a fresh ScoreCache.
-  - invariant 2: a node where every candidate is pre-gated still returns a
+  - invariant 2: a node where every candidate is ERD-pruned still returns a
     cutoff and writes no loss row (never a false "proven unsolvable").
-  - the §4a index-alignment hazard: gating a candidate against a
+  - the §4a index-alignment hazard: ERD-pruning a candidate against a
     misaligned (unpermuted) bound array changes the recorded winner/ERD.
 """
 import os
@@ -83,10 +83,11 @@ class TestKernelEquivalence(_TmpCacheMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         rng = random.Random(0)
-        # A guess vocabulary of real 5-letter words, large enough to exercise
-        # ORDER_MIN_N-gated ordering; the answer vocabulary is a subset of it
-        # so every branch word is always a valid candidate too (as in the
-        # real game, where the guess list is a superset of the answer list).
+        # A guess vocabulary of real 5-letter words, large enough to reach
+        # ORDER_MIN_N and trigger vectorized ordering; the answer vocabulary
+        # is a subset of it so every branch word is always a valid candidate
+        # too (as in the real game, where the guess list is a superset of
+        # the answer list).
         cls.answer_words = sorted(rng.sample(_ALL_ANSWER_WORDS, 150))
         extra_guesses = rng.sample(
             [w for w in _ALL_GUESS_WORDS if w not in set(cls.answer_words)], 150)
@@ -113,13 +114,14 @@ class TestKernelEquivalence(_TmpCacheMixin, unittest.TestCase):
 
 
 @unittest.skipUnless(pattern_matrix_module.available(), "NumPy not available")
-class TestAllPreGatedInvariant(_TmpCacheMixin, unittest.TestCase):
-    """§4b invariant 2: an all-pre-gated node returns a cutoff, not a loss.
+class TestAllCandidatesErdPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
+    """§4b invariant 2: a node where every candidate is ERD-pruned returns a
+    cutoff, not a loss.
 
     3 - (n+1)/n is the lowest cost_lb any candidate can possibly achieve
     (C2.1: G <= n non-self-inclusive groups, plus has_self) — so seeding the
     ceiling below that floor (here 1.5, valid for every n >= 2) guarantees
-    every candidate is pre-gated, regardless of branch content.
+    every candidate is ERD-pruned, regardless of branch content.
     """
 
     @classmethod
@@ -129,7 +131,7 @@ class TestAllPreGatedInvariant(_TmpCacheMixin, unittest.TestCase):
         cls.guess_words = cls.answer_words
         cls.pattern_matrix = PatternMatrix.build(cls.guess_words, cls.answer_words)
 
-    def test_all_pre_gated_returns_cutoff_not_loss(self):
+    def test_all_candidates_erd_pruned_returns_cutoff_not_loss(self):
         branch_words = sorted(random.Random(2).sample(self.answer_words, 20))
         result, (best_rows, loss_rows) = self._solve(
             branch_words, self.answer_words, self.guess_words,
@@ -137,9 +139,9 @@ class TestAllPreGatedInvariant(_TmpCacheMixin, unittest.TestCase):
         status, cost, max_remaining_depth, tainted = result
         self.assertEqual(status, OVER_ERD_LIMIT)
         self.assertEqual(cost, 1.5)
-        # The single worst bug §4b could introduce: an all-pre-gated node
-        # falling through to the "proven unsolvable" branch and writing a
-        # false loss row instead of reporting a cutoff.
+        # The single worst bug §4b could introduce: a node where every
+        # candidate is ERD-pruned falling through to the "proven unsolvable"
+        # branch and writing a false loss row instead of reporting a cutoff.
         self.assertEqual(loss_rows, [])
         self.assertEqual(best_rows, [])
 
@@ -149,7 +151,7 @@ class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
     """§4a: the sort-key and cost-lower-bound arrays must be permuted by BOTH
     candidate_rows and the sort order. This fixture makes a candidate's raw
     vocabulary position (weak first, strong second) diverge from its
-    best-first position (strong first, weak second) enough that gating
+    best-first position (strong first, weak second) enough that ERD-pruning
     either candidate against the OTHER's bound flips the outcome from a
     concrete SOLVED winner to a cutoff — an unpermuted or half-permuted
     bound array cannot pass this test by accident.
@@ -179,13 +181,15 @@ class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
         status, strong_cost, _, _ = evaluate_candidate(
             cls.branch_words, cls.strong, probe_cache, None,
             best_erd=float("inf"))
-        assert status == SOLVED, "fixture precondition: strong must be solvable"
+        if status != SOLVED:
+            raise RuntimeError("fixture precondition: strong must be solvable")
         cls.strong_cost = strong_cost
         cls.ceiling = strong_cost + 1e-6
-        assert weak_cost_lb >= cls.ceiling, (
-            "fixture precondition failed: weak's cost_lb must dominate the "
-            "ceiling seeded from strong's true cost — widen the candidate "
-            "pool if this ever breaks")
+        if weak_cost_lb < cls.ceiling:
+            raise RuntimeError(
+                "fixture precondition failed: weak's cost_lb must dominate "
+                "the ceiling seeded from strong's true cost — widen the "
+                "candidate pool if this ever breaks")
         # candidate_list in raw (pre-sort) order: weak first, strong last —
         # the opposite of best-first order, which is exactly what an
         # unpermuted or half-permuted bound array would misalign.
@@ -198,9 +202,9 @@ class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
             ceiling=self.ceiling)
         status, cost, _max_remaining_depth, _tainted = result
         # Correct alignment: strong (sorted first) evaluates under its own
-        # low bound, solves, and wins; weak (sorted second) is gated by the
-        # tightened best_erd. A misaligned array would instead swap which
-        # candidate is gated at which position, wrongly dropping strong
+        # low bound, solves, and wins; weak (sorted second) is ERD-pruned by
+        # the tightened best_erd. A misaligned array would instead swap which
+        # candidate is ERD-pruned at which position, wrongly dropping strong
         # before it ever evaluates and reporting a cutoff instead of a
         # concrete winner (see the module docstring's full trace).
         self.assertEqual(status, SOLVED)
