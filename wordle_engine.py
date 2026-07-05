@@ -1325,14 +1325,26 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     token = mid_loop_publisher.enter(branch_words, budget) if mid_loop_publisher is not None else None
 
     for i, candidate in enumerate(candidate_list):
-        status, cost, max_remaining_depth, budget_tainted = evaluate_candidate(
-            branch_words, candidate, cache, score_cache,
-            n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
-            policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
-            note_depth=note_depth, budget=budget,
-            subbranch_solver=subbranch_solver,
-            mid_loop_publisher=mid_loop_publisher,
-        )
+        if (candidate_cost_lower_bounds is not None
+                and candidate_cost_lower_bounds[i] >= best_erd):
+            # Pre-gated: the same admissible bound evaluate_candidate would
+            # compute (C2.1) already proves this candidate cannot beat
+            # best_erd. Falls through to the same dispatch below as an
+            # OVER_ERD_LIMIT from evaluate_candidate itself — in particular
+            # the status == OVER_ERD_LIMIT check just below still sets
+            # cutoff_occurred, so an all-pre-gated node is never mistaken
+            # for a proven loss.
+            status, cost, max_remaining_depth, budget_tainted = (
+                OVER_ERD_LIMIT, None, None, False)
+        else:
+            status, cost, max_remaining_depth, budget_tainted = evaluate_candidate(
+                branch_words, candidate, cache, score_cache,
+                n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
+                policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
+                note_depth=note_depth, budget=budget,
+                subbranch_solver=subbranch_solver,
+                mid_loop_publisher=mid_loop_publisher,
+            )
         if status in _ABORT_STATUSES:
             return status
         node_floor = node_floor or budget_tainted
