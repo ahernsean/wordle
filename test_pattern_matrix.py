@@ -334,8 +334,11 @@ class TestLoadOrBuild(unittest.TestCase):
         self.addCleanup(self.score_cache.close)
 
     def _expected_matrix_path(self):
+        from pattern_matrix import _compute_guess_vocabulary_id
         return os.path.join(
-            self._tmp.name, f"pattern_matrix_{self.score_cache.answer_list_id}.npy")
+            self._tmp.name,
+            f"pattern_matrix_{self.score_cache.answer_list_id}"
+            f"_{_compute_guess_vocabulary_id(self.guess_words)}.npy")
 
     def test_cold_start_builds_and_persists(self):
         self.assertFalse(os.path.exists(self._expected_matrix_path()))
@@ -373,6 +376,24 @@ class TestLoadOrBuild(unittest.TestCase):
             other_cache_path, self.guess_words, other_answers, other_score_cache)
         self.assertIsNotNone(pm_other)
         expected = PatternMatrix.build(self.guess_words, other_answers)
+        np.testing.assert_array_equal(pm_other.matrix, expected.matrix)
+
+    def test_different_guess_vocabulary_of_same_length_does_not_reuse_stale_file(self):
+        # Same answer universe (so answer_list_id alone can't distinguish),
+        # same guess *count*, different guess *words* -- exactly the case
+        # load()'s shape check can't catch: only the guess-vocabulary
+        # identity in the filename can.
+        PatternMatrix.load_or_build(
+            self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        rng = random.Random(12)
+        other_pool = [w for w in _ALL_GUESS_WORDS if w not in set(self.guess_words)]
+        other_guess_words = rng.sample(other_pool, len(self.guess_words))
+        self.assertNotEqual(sorted(other_guess_words), sorted(self.guess_words))
+
+        pm_other = PatternMatrix.load_or_build(
+            self.cache_path, other_guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(pm_other)
+        expected = PatternMatrix.build(other_guess_words, self.answer_words)
         np.testing.assert_array_equal(pm_other.matrix, expected.matrix)
 
 

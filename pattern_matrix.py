@@ -40,6 +40,12 @@ def _compute_answer_list_id(answer_words):
     return hashlib.sha256("\n".join(answer_words).encode()).hexdigest()
 
 
+def _compute_guess_vocabulary_id(guess_words):
+    """SHA-256 identity of the guess vocabulary, order-sensitive like
+    _compute_answer_list_id (row index assignment depends on guess order)."""
+    return hashlib.sha256("\n".join(guess_words).encode()).hexdigest()
+
+
 class PatternMatrix:
     """Response patterns for every (guess, answer) pair.
 
@@ -115,20 +121,25 @@ class PatternMatrix:
         on a miss. Returns None when NumPy is unavailable — callers then fall
         back to the pure-Python engine path.
 
-        The .npy path sits alongside cache_path and embeds the answer-list
-        identity, so a different answer universe never loads a stale matrix
-        (the load() shape check alone would not catch two same-size,
-        different-content universes). Multiple processes (swarm workers, an
-        interactive session) may race to build on a cold start or a rebuild;
-        each writes to its own PID-suffixed temp file and renames into place,
-        so a racing build only wastes CPU — it can never truncate a file
-        another process still has mmap'd, which an in-place save() could.
+        The .npy path sits alongside cache_path and embeds both the
+        answer-list identity and the guess-vocabulary identity, so neither a
+        different answer universe nor a different (or reordered) guess list
+        of the same length ever loads a stale matrix — the load() shape
+        check alone only catches a different row/column *count*, not two
+        same-size, different-content vocabularies. Multiple processes (swarm
+        workers, an interactive session) may race to build on a cold start or
+        a rebuild; each writes to its own PID-suffixed temp file and renames
+        into place, so a racing build only wastes CPU — it can never
+        truncate a file another process still has mmap'd, which an in-place
+        save() could.
         """
         if not available():
             return None
         matrix_dir = os.path.dirname(os.path.abspath(cache_path))
         matrix_path = os.path.join(
-            matrix_dir, f'pattern_matrix_{score_cache.answer_list_id}')
+            matrix_dir,
+            f'pattern_matrix_{score_cache.answer_list_id}'
+            f'_{_compute_guess_vocabulary_id(guess_words)}')
         matrix = cls.load(matrix_path, guess_words, answer_words)
         if matrix is not None:
             return matrix
