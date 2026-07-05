@@ -14,9 +14,9 @@ Related artifacts:
 | Artifact | What it is |
 |---|---|
 | Issue #77 / PR #80 | Remove the `queue-add` 300-answer-word cap — **closed/merged**; §1 records what landed |
-| PR #76 (`claude/issue-67-review-8v65i1`) | Adaptive-claim-packing **measurement layer**; feeding a multi-day epoch-0 run ending Friday afternoon |
-| `adaptive_claim_packing.md` | The packing plan PR #76 instruments; proceeds on its own gates, orthogonal to this plan |
-| PR #78 (`claude/wordle-search-algorithm-kv7kij`) | This document |
+| PR #76 (`claude/issue-67-review-8v65i1`) | Adaptive-claim-packing **measurement layer** — **merged**; the epoch-0 run it fed is complete and analyzed (C3, U6) |
+| `adaptive_claim_packing.md` | The packing plan PR #76 instruments; the U6 verdict killed its magnitude metric, so the document needs revision to the surviving binary scheme — its own track, orthogonal to this plan |
+| PR #78 (`claude/wordle-search-algorithm-kv7kij`) | This document — the **integration branch**; section PRs merge into it (§2 = PR #84, §3 = PR #85, both merged) |
 
 The three multiplicative levers this plan is built on, against a measured
 baseline of **~900 branch sweeps/day**. That figure is derived, not quoted:
@@ -28,19 +28,27 @@ sub-branches also consume claims):
 
 | Lever | Expected gain | Where |
 |---|---|---|
-| Claim packing (coordination overhead ~83% of in-loop wall) | ~5–6× | `adaptive_claim_packing.md`, gated on the PR #76 run — mid-run gate is provisionally **NO-GO on the magnitude metric** (see U6); the exact gating half passed, so the lever likely survives in a simplified form |
+| Claim packing (coordination overhead ~83% of in-loop wall) | ~5–6× | `adaptive_claim_packing.md` — gate decided (U6): the magnitude metric is **dead**; the lever survives as exact ERD-lower-bound elimination + count-bundling + republish-on-overrun, with a measured claim-count reduction of 44–231× depending on bundle cap |
 | Vectorized partition kernel (NumPy) | ~10–50× on node rate and on the warm-cache sweep floor | §2–§5 |
 | Candidate equivalence-class dedupe | up to ~10× on deep branches | §6 |
 
 Plus one prerequisite that is not a speedup: a monster-branch calibration
-solve (§7 — the current telemetry contains no branch over 300 answer words,
-so no schedule estimate is trustworthy without one). Its own former
-prerequisite, uncapping `queue-add`, is already **done** — issue #77 was
+solve (§7). The telemetry still contains no *finished* branch over 300 answer
+words, but a first hard calibration point now exists (U3): a 208-word
+budget-4 ALIBI branch ran ~90 hours / 7.6 billion nodes for ~8.7% of its
+optimality certificate — ~43 days per such node extrapolated, pure Python.
+That number settles the headline question by itself: the pure-Python engine
+cannot finish the tree in acceptable time, and the vectorized kernel (§2–§5)
+is the unconditional critical path. §7's over-300-word calibration (ALIBI's
+841-word all-gray branch, already queued at priority 100,000) waits for the
+§4 kernel so it measures the engine that will actually run the job. The
+former prerequisite, uncapping `queue-add`, is **done** — issue #77 was
 implemented by PR #80 and merged (§1 records the landed state).
 
 **All file:line references in this document are against `main` @ `364566a`.**
-PR #76 changes `wordle_engine.py`, `erd_queue.py`, `erd_swarm.py`, and
-`erd_search.py`; after it merges, re-locate by symbol name, not line number.
+PR #76 (now merged) changed `wordle_engine.py`, `erd_queue.py`,
+`erd_swarm.py`, and `erd_search.py`, so line numbers have drifted — re-locate
+by symbol name, not line number.
 
 ---
 
@@ -144,52 +152,41 @@ equal-`Σk²` candidates can change which tied word is cached as `best_guess` �
 not wrong, but no longer byte-identical, which breaks the equivalence tests
 this plan relies on. Hence the stable-sort requirements in §4/§5.
 
-## C3. Coordination with the measurement run (PR #76) — schedule constraints
+## C3. Coordination with the measurement run (PR #76) — resolved; surviving rules
 
-**State as of Jul 2 (mid-run):** PR #76 landed the measurement layer
-(telemetry epochs, `branch_finalize_log`, `candidate_accuracy`
-predicted-vs-actual stream, cost model re-keyed on
-`(policy, size_bucket, budget)`, censoring). A 3-day representative epoch-0
-run is in progress on the Linux box (self-stops ~Friday AM) across four
-openers — SALET/CRANE/TRACE plus ALIBI as a deliberately weak one. The
-mid-run analyzer snapshot is committed on that branch
-(`analysis/epoch0_snapshot_2026-07-02_midrun.txt`); its headline numbers:
+**Final state (Jul 4):** PR #76 is merged to `main`, the epoch-0 baseline
+run is complete, and the swarm is stopped. The final corpus
+(`analyze_swarm_telemetry.py`, epoch 0) is ~10.7M `candidate_accuracy` rows
+with a 33.8% gated share — much larger and differently mixed than the
+mid-run snapshot (6.8M rows, 4.7% gated), and the verdict held across both,
+so it is robust to corpus composition:
 
-- Gating is **exact** (100% of gated rows ≤ 1 node) and the §4
-  false-expensive trap is 0% once the budget-keyed cost model is warm —
-  the *reliable* half of the metric, and the same gate §4b of this plan
-  vectorizes.
-- Work is hyper-concentrated: top 1% of candidates ≈ 99.5% of node work.
-- The *magnitude* half provisionally **fails the gate** on the bounded
-  subset (load-bearing tail Spearman 0.21 vs the ≥ 0.5 bar; log-log slope
-  ≈ 0.2 vs ~1 wanted; residual σ ≈ 1.4 dex) — with the caveat that the
-  bounded corpus is ~99% ALIBI. Friday's assessment splits pathological vs
-  typical openers before the final verdict.
-- ALIBI alone is ~99% of the run's work, and produced few queueable
-  branches because many exceed the 300-word cap (issue #77) — i.e. the
-  gate corpus still excludes the monster regime entirely (U3).
+- **Gating/elimination is exact — PASS.** 100% of gated rows ≤ 1 node; the
+  §4 false-expensive trap is 0% once the budget-keyed cost model is warm.
+  This is the half §4b of this plan vectorizes.
+- **The magnitude metric is dead — FAIL.** 81.1% false-expensive rate;
+  log-log slope 0.850 but Pearson-log correlation 0.191 — predicted
+  magnitude carries almost no information about actual node cost.
+- **Packer design decided:** exact ERD-lower-bound elimination +
+  count-bundling + republish-on-overrun, with **no work-magnitude model**.
+  Measured claim-count reduction from count-bundling alone: 44× / 82× /
+  144× / 231× at small-bundle caps of 8 / 16 / 32 / 64.
 
-Consequence for this plan: the **vectorized kernel (§2–§5) is the critical
-path** — it is unconditional, while the packing lever may ship late or in a
-simplified form (e.g. gate-only bundling with republish-on-overrun carrying
-the balance). Nothing else in the calendar changes; the owner still intends
-to merge PR #76 when the run completes.
+Consequence unchanged: the **vectorized kernel (§2–§5) is the critical
+path**. The packing track proceeds per `adaptive_claim_packing.md`, which
+still needs its revision to the binary scheme.
 
-Rules that follow:
+Rules 1–3 below are satisfied and kept only because later sections cite
+them by number; rules 4–5 remain binding on every deploy.
 
-1. **Nothing in this plan deploys to the Linux box before the run ends.**
-   Deploying mid-run would mix node-timing regimes inside epoch 0 and violate
-   the stop-workers-before-deploy rule (SWARM.md).
-2. **Engine/swarm/queue sections (§4, §5, §6) branch from `main` only
-   after PR #76 merges.** They touch the same files
-   (`wordle_engine.py:evaluate_candidate` now carries a `metric_observer`
-   hook; `erd_swarm.py`, `erd_queue.py` changed). Implementing them against
-   pre-merge `main` guarantees painful rebases and risks silently dropping
-   PR #76's instrumentation.
-3. **New-file sections (§2, §3) and the doc section (§9's design.md fix) can
-   be implemented immediately** — `pattern_matrix.py` and its tests touch
-   nothing PR #76 touches. §8 (export) touches `erd_search.py` and should
-   also wait for the merge (the conflict is small but nonzero).
+1. *Satisfied.* Nothing was to deploy before the run ended; the run has
+   ended and the swarm is stopped, so deploys are unblocked
+   (stop-workers-before-deploy still applies, SWARM.md).
+2. *Satisfied.* Engine/swarm/queue sections (§4, §5, §6) were to wait for
+   the PR #76 merge; it is merged, and this integration branch already
+   contains `main`, so those sections are implementable now.
+3. *Satisfied.* The new-file sections are done — §2 (PR #84) and §3
+   (PR #85). §9a's design.md fix is still open.
 4. **Any section that changes node timing (§4, §5, §6) must bump the
    telemetry epoch on deploy** using PR #76's own machinery
    (`ERDQueue.set_epoch`, a new `telemetry_epoch` row with a descriptive
@@ -199,16 +196,15 @@ Rules that follow:
    `candidate_accuracy` from a hook in `evaluate_candidate`. §4's pre-gating
    and §6's dedupe both *skip* `evaluate_candidate` calls; each section below
    states what the observer must still see. Read
-   `test_claim_packing_measurement.py` on merged `main` before touching the
-   candidate loop.
+   `test_claim_packing_measurement.py` before touching the candidate loop.
 
-**Suggested calendar** (owner's stated intent, made explicit):
+**Remaining schedule:**
 
 | When | What |
 |---|---|
-| Now → Friday | §2, §3 implemented and reviewed (new files only, no deploy). §9's design.md `ROOT_BUDGET` fix. Optionally §8 drafted but not merged. |
-| Friday afternoon | Epoch-0 run ends. Owner runs `analyze_swarm_telemetry.py`; packer go/no-go decided (that track proceeds independently per `adaptive_claim_packing.md` §10). |
-| After PR #76 merges | §4 branched from `main`, implemented, tested, deployed (one worker restart, one epoch bump; the box pulls PR #80's uncapped `queue-add` in the same deploy). Then §7 calibration. |
+| Done | §2 (PR #84) and §3 (PR #85) merged into this branch; epoch-0 run complete; packer gate decided (U6). |
+| Next | §4 implemented and reviewed on this branch; deploy = one worker restart, one epoch bump (the box pulls PR #80's uncapped `queue-add` in the same deploy). |
+| After §4 deploys | §7a census, then §7b calibration (the queued 841-word ALIBI branch), then §7c schedule memo. |
 | After §7 numbers | Decide §5/§6 scope; §8 lands before the first full-tree phone sync. |
 
 ## C4. The phone usage model — three modes the plan must serve
@@ -257,9 +253,10 @@ Consequences for this plan:
   openers** — not just the owner's favorites. A son's opener + its actual
   response is a seed row: the phone has its best guess, its ERD, and the
   whole best-ERD descent under it. (Interim state: the epoch-0 run solved
-  ALIBI's ≤ 300-word branches, so the next export gives *partial* ALIBI
-  coverage; its root ERD stays a labeled lower bound until the over-cap
-  branches are solved — PR #80's uncapped `queue-add`, then §7b.)
+  most of ALIBI's smaller branches — one 208-word branch remains mid-
+  certificate (U3) — so the next export gives *partial* ALIBI coverage; its
+  root ERD stays a labeled lower bound until the remaining branches are
+  solved, including the queued 841-word all-gray monster, §7b.)
 - **The opener's root ERD is computable from those same rows** — it does not
   need to be stored per opener, but it does need every branch of that opener
   present (including the monster branches — another reason the cap removal (PR #80) precedes the
@@ -282,10 +279,10 @@ record the answer next to it when known.
 |---|---|---|---|
 | U1 | NumPy version bundled in Pythonista on the owner's phone (§0 rule 3 assumes it may be years old). | Owner runs `import numpy; print(numpy.__version__)` in Pythonista, reports back. | §2 API choices if older than assumed |
 | U2 | Pattern-matrix memory: the 41MB matrix itself (~12,972 × ~3,185 uint8) **plus the per-call transients of `counts_for_all_candidates`**, which recur at every solved node once §4 lands and dominate the matrix unless bounded. | §2 persists a `.npy` and workers load with `mmap_mode='r'` (one page-cached copy); the chunked kernel bounds transients at ~16MB/call. Confirm total and per-call-transient RSS with 6 workers running, including a large-n solve. | §4 deploy |
-| U3 | Monster-branch cost (branches over 300 answer words) — zero data today. | §7 calibration solve; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | The whole-job schedule |
+| U3 | Monster-branch cost. **First hard data point (Jul 4):** a 208-word budget-4 ALIBI branch — a legitimate feasible solve, not a pathology — spent ~90h / 7.6B nodes on ~8.7% of its optimality certificate ⇒ ~43 days/node extrapolated, pure Python. That settles the headline schedule question (pure Python = years; kernel unconditional). The over-300-word regime is still unmeasured. | §7b calibration on the queued 841-word ALIBI all-gray branch, after §4 deploys; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | Schedule *refinement* only — the go/no-go answer is already in |
 | U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
 | U5 | Phone live-solve latency on off-tree branches (Modes B/C) with a reachable-only cache. | Timed `ERDSolver` runs in Pythonista at n ≈ 10 / 40 / 100. | Whether Mode C needs the out-of-scope lookup service |
-| U6 | The packer metric passes the `analyze_swarm_telemetry.py` gate. **Mid-run: provisionally NO-GO** — gating exact and §4 trap 0% (PASS), but load-bearing tail Spearman 0.21 and log-log slope ≈ 0.2 / σ ≈ 1.4 dex (FAIL), on a bounded corpus that is ~99% ALIBI. | Friday's full assessment (pathological vs typical opener split); if the magnitude metric stays failed, the packing track falls back to gate-only bundling + republish-on-overrun. | The packing lever's size and timing (not this plan's sections) |
+| U6 | **Resolved (final epoch-0 analysis, ~10.7M rows).** Elimination half exact — 100% of gated rows ≤ 1 node (PASS). Magnitude half dead — 81.1% false-expensive, Pearson-log 0.191 (FAIL). Packer design: exact ERD-lower-bound elimination + count-bundling + republish-on-overrun, no work-magnitude model; measured claim reduction 44–231× by bundle cap. | Done. Remaining: revise `adaptive_claim_packing.md` to this scheme (its own track). | Nothing in this plan's sections |
 | U7 | Top-level branch count: estimated 1.5–2M distinct (opener, pattern) subsets with ≥ 2 words. | §7's census script computes it exactly (cheap once §2 exists). | Schedule precision; §8 export size projection |
 | U8 | Exact-equality equivalence between pure-Python and vectorized paths is achievable (stable ordering everywhere). | §4/§5/§6 acceptance tests enforce it; any failure is a design bug to fix, not a tolerance to widen. | §4, §5, §6 |
 
@@ -348,19 +345,25 @@ block and both cap checks), SWARM.md's `queue-add` section updated, and the
 acceptance test added (`test_queue_add.py` — over-cap branch queued by
 default, skipped under an explicit `--max-branch-size 300`).
 
-**The one live remainder is operational:** the Linux box must have PR #80's
-code pulled before §7 queues the calibration monster (fold into the first
-post-PR-#76 deploy — see the C3 calendar). And the out-of-scope warning
+**The one live remainder is operational:** the calibration monster is
+already queued with the uncapped `queue-add` (§7b — ALIBI all-gray, 841
+words), so PR #80's purpose here is served; the Linux box still picks up the
+code in the first §4 deploy. And the out-of-scope warning
 stands: do NOT mass-queue monster branches just because the cap is gone; §7
 calibrates exactly one first, and mass-queueing is an operational decision
 taken after U3 is known.
 
-## §2. Pattern matrix module — new file `pattern_matrix.py`
+## §2. Pattern matrix module — new file `pattern_matrix.py` — **DONE (PR #84, merged)**
+
+Implemented as specified: `pattern_matrix.py` + `test_pattern_matrix.py`
+landed via PR #84, and CI now installs NumPy so both the NumPy-present and
+NumPy-absent paths are exercised. The spec below stands as the module's
+reference documentation.
 
 **Read first:** `ResponseCache` (`wordle_engine.py:352-435`) — the matrix is
 its data, reshaped; `ScoreCache.read_decomposition` / `write_decomposition`
 (`cache_sqlite.py`); C1 glossary; ground rules 2–3.
-**Prerequisite:** none (new file). Can start immediately.
+**Prerequisite:** none (new file).
 
 **What it is.** One class owning a single `uint8` array:
 
@@ -457,7 +460,14 @@ transients, not the shared matrix, are the dominant allocation (U2).
     and importing the module (and the engine) still succeeds.
 - No file outside `pattern_matrix.py` + its test file is modified.
 
-## §3. Vectorized candidate statistics — extends `pattern_matrix.py`
+## §3. Vectorized candidate statistics — extends `pattern_matrix.py` — **DONE (PR #85, merged)**
+
+Implemented via PR #85: `candidate_stats(branch_indices)` returns a
+`CandidateStats` NamedTuple. Two implementation notes beyond the original
+spec: the documented precondition is `len(branch_indices) >= 1` (an empty
+branch would silently produce NaN through the 0/0 divisions rather than
+raise), and the entropy computation routes zero counts through a
+double-`np.where` so `log2` never sees zero.
 
 **Read first:** §2; C2 (both derivations); `score_groups`
 (`wordle_engine.py:441-477`); the `cost_lb` line (`wordle_engine.py:1026`).
@@ -475,14 +485,20 @@ order:
 | `group_count` | int32 | `(counts[c] > 0).sum()` | `len(groups)` |
 | `has_self` | bool | `counts[c, 242] > 0` (all-green ⇔ candidate ∈ branch) | `_ALL_GREEN_PATTERN in groups` |
 | `cost_lower_bound` | float64 | `3.0 - (group_count + has_self) / n` | `cost_lb`, `wordle_engine.py:1026` |
-| `sum_squared_group_sizes` | int64 | `(counts[c].astype(int64) ** 2).sum()` | sort key, `wordle_engine.py:1184` |
+| `sum_squared_group_sizes` | int64 | `(counts[c] ** 2).sum(dtype=int64)` | sort key, `wordle_engine.py:1184` |
 | `max_group_size` | int32 | `counts[c].max()` | `score_groups` MAX_GROUP_SIZE |
 | `entropy_gain` | float64 | `-Σ p·log2(p)` over nonzero sizes, `p = k/n` | `score_groups` ENTROPY_GAIN |
 
 Notes for the implementer:
 - `sum_squared_group_sizes` **must be integer** — it is compared for exact
-  ordering equality with Python's `sum(k*k ...)`; int64 cannot overflow
-  (worst case 3,200² × 243 ≈ 2.5e9 « 2⁶³).
+  ordering equality with Python's arbitrary-precision `sum(k*k ...)`, so the
+  int64 dtype is an exactness spec, not overflow protection. Response groups
+  partition the branch (Σk = n ≤ ~3,185), so Σk² ≤ n² ≈ 10.1M — comfortably
+  inside int32 (an earlier revision claimed a worst case of 3,200² × 243,
+  which wrongly assumed 243 groups could each be full-size). Squares are
+  computed in int32 and accumulated with `.sum(axis=1, dtype=np.int64)`,
+  which avoids materializing an int64 upcast of the whole counts array
+  (~25MB at full vocabulary — the U2 transient concern).
 - `cost_lower_bound` must be computed as `3.0 - (g + s) / n` with float64
   division — the same expression shape as the engine line — so the float is
   bit-identical to the scalar computation.
@@ -504,7 +520,8 @@ every field matches the per-candidate Python computation — integers exactly,
 C3 rules 2, 4, 5 (merge-first, epoch bump, deploy discipline); the
 `metric_observer` hook and its tests on merged `main`
 (`test_claim_packing_measurement.py`).
-**Prerequisites:** §3, PR #76 merged.
+**Prerequisites:** §3, PR #76 merged — **both satisfied; this is the next
+section to implement.**
 
 This is the highest-value section: it removes the two per-candidate Python
 sweeps that run at **every** solved node with `n >= ORDER_MIN_N` (= 8), even
@@ -747,9 +764,9 @@ shrink; this number decides how much §6 matters below the promotion threshold.
 
 **Read first:** §1 (what PR #80 landed); PR #76's `branch_finalize_log` and
 censoring semantics; C5 U3/U4/U7.
-**Prerequisites:** PR #80's uncapped `queue-add` pulled onto the Linux box;
-§4 strongly recommended deployed (calibrating
-the slow kernel mismeasures the plan); PR #76's instrumentation live.
+**Prerequisites:** §4 deployed (calibrating the slow kernel mismeasures the
+plan); PR #76's instrumentation live (satisfied — merged). The calibration
+branch itself is already queued (7b).
 
 **7a. Census (30-minute script, do first).** New `diag_toplevel_census.py`:
 using the §2 matrix, for every opener compute its partition of the answer
@@ -757,14 +774,16 @@ list; count distinct `branch_key`s with ≥ 2 words across all openers, the
 size histogram, and specifically the count above 300 words (the never-queued
 regime). Resolves U7 exactly and sizes §8's export. Read-only; runs anywhere.
 
-**7b. Calibration solve.** Queue exactly one weak opener's all-gray branch
-at high priority. **ALIBI is the natural choice:** the epoch-0 run already
-solved its ≤ 300-word branches (so its subtree cache is warm and the
-marginal cost measured is the monster's own), and its all-gray branch is
-simultaneously the missing piece of the Mode C root-ERD answer (C4).
-Otherwise pick from the census (≥ 1,000 words):
-`queue-add --word <opener> --pattern ..... --priority 1000`. Let the swarm
-drain it; sub-branch promotion fans it out. Then aggregate cost from
+**7b. Calibration solve.** The calibration branch is **already queued**:
+ALIBI's all-gray branch (841 answer words, priority 100,000, pending in
+`erd_queue.sqlite3`). ALIBI is the right choice: the epoch-0 run solved most
+of its smaller branches (so its subtree cache is warm and the marginal cost
+measured is the monster's own), and its all-gray branch is simultaneously
+the missing piece of the Mode C root-ERD answer (C4). Do **not** start it
+before §4 deploys — calibrating the pure-Python kernel mismeasures the plan,
+and the U3 data point already shows that regime is ~43 days/node. Once the
+swarm restarts on the new kernel, let it drain the branch; sub-branch
+promotion fans it out. Then aggregate cost from
 `branch_finalize_log` over the branch and its promoted descendants (join by
 spine), **treating censored rows as lower bounds** (PR #76's §9.7 semantics),
 plus wall-clock span.
@@ -779,8 +798,8 @@ go/no-go call on "weeks", plus the §5/§6 scope decision. No code.
 **Read first:** `erd_search.py export` (`cmd_export`); `verify_erd_cache`'s
 best-guess walk (`wordle_engine.py:1329-1360`) — the BFS to imitate; C4 (all
 three modes); §7a census output for size projection.
-**Prerequisites:** PR #76 merged (touches `erd_search.py`). §2 useful but
-optional (decomposition blobs suffice for seeds).
+**Prerequisites:** PR #76 merged (touches `erd_search.py`) — satisfied. §2
+useful but optional (decomposition blobs suffice for seeds).
 
 **Problem.** `branch_best_by_policy` holds 3M+ rows already
 (`cache_sqlite.py:220` comment) and a full run adds tens of millions; most
@@ -856,8 +875,9 @@ findings, not code changes.
   and design.md, plus a short design.md section: what the matrix is, which
   engine paths consult it, and the fallback rule (Part II rule 2).
 
-**9b. Rename proposal (owner decision; implement only after the epoch-0 run
-and its analysis are complete).** `cost_lb` and `rest_lb` violate the
+**9b. Rename proposal (owner decision; the epoch-0 run and its gate
+analysis are complete, so this is unblocked once the owner considers the
+epoch-0 corpus archived).** `cost_lb` and `rest_lb` violate the
 no-abbreviations rule and under-describe themselves (C2.1). Proposed:
 - `cost_lb` → `candidate_cost_lower_bound`
 - `rest_lb` → `remaining_groups_cost_lower_bound`
@@ -874,17 +894,22 @@ no-abbreviations rule and under-describe themselves (C2.1). Proposed:
 # Sequencing
 
 ```
-already done      §1 (issue #77 / PR #80, merged — box pulls it at next deploy)
-now → Friday      §2 → §3 (new files, no deploy)          §9a design.md fix
-Friday pm         epoch-0 run ends → analyze_swarm_telemetry.py gate (packing track)
-after PR #76      §4 — deploy: one restart, one epoch bump (brings PR #80
-merges                 onto the box in the same pull)
-then              §7a census → §7b calibration → §7c schedule memo
+already done      §1 (issue #77 / PR #80, merged to main)
+                  §2 (PR #84) and §3 (PR #85), merged into this branch
+                  epoch-0 run complete; packer gate decided (U6)
+next              §4 — implement on this branch; deploy = one worker restart
+                      + one epoch bump (box pulls PR #80's code in the same
+                      deploy)
+then              §7a census → §7b calibration (841-word ALIBI branch,
+                      already queued) → §7c schedule memo
 then              §5 and/or §6 per §7's numbers            §8 before first full-tree sync
-anytime after     §9b rename (after epoch-0 analysis archived)
-parallel track    claim packing per adaptive_claim_packing.md, gated on U6
+anytime           §9a design.md fix (still open)
+                  §9b rename (unblocked once the epoch-0 corpus is archived)
+parallel track    claim packing per adaptive_claim_packing.md — binary scheme
+                  (exact elimination + count-bundling + republish-on-overrun);
+                  that document still needs revision to the scheme
 ```
 
-Dependency summary: §2→§3→§4→§5; §2→§6; §4 (+PR #80 on the box)→§7; §8
-independent after the merge; §9a independent; §9b last. The packing lever
-multiplies with all of it and is managed by its own document.
+Dependency summary: §4→§5; §2→§6 (§2 done); §4 deployed→§7; §8 independent;
+§9a independent; §9b last. The packing lever multiplies with all of it and is
+managed by its own document.
