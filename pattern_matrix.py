@@ -6,12 +6,16 @@ Check available() before constructing or using PatternMatrix.
 """
 import collections
 import hashlib
+import logging
+import os
 
 try:
     import numpy as np
     _NUMPY_AVAILABLE = True
 except ImportError:
     _NUMPY_AVAILABLE = False
+
+logger = logging.getLogger("wordle")
 
 
 # Parallel arrays returned by candidate_stats(), one entry per guess-word (matrix row).
@@ -37,6 +41,12 @@ _COUNT_CHUNK_ROWS = 1024
 def _compute_answer_list_id(answer_words):
     """SHA-256 identity of the answer universe (matches ScoreCache._ensure_answer_list)."""
     return hashlib.sha256("\n".join(answer_words).encode()).hexdigest()
+
+
+def _compute_guess_vocabulary_id(guess_words):
+    """SHA-256 identity of the guess vocabulary, order-sensitive like
+    _compute_answer_list_id (row index assignment depends on guess order)."""
+    return hashlib.sha256("\n".join(guess_words).encode()).hexdigest()
 
 
 class PatternMatrix:
@@ -107,6 +117,56 @@ class PatternMatrix:
         if matrix.shape != (len(guess_words), len(answer_words)):
             return None
         return cls(matrix, guess_words, answer_words)
+
+    @classmethod
+    def load_or_build(cls, cache_path, guess_words, answer_words, score_cache):
+        """This process's PatternMatrix: load()ed from disk, or build()+save()d
+        on a miss. Returns None when NumPy is unavailable — callers then fall
+        back to the pure-Python engine path.
+
+        The .npy path sits alongside cache_path and embeds both the
+        answer-list identity and the guess-vocabulary identity, so neither a
+        different answer universe nor a different (or reordered) guess list
+        of the same length ever loads a stale matrix — the load() shape
+        check alone only catches a different row/column *count*, not two
+        same-size, different-content vocabularies. Multiple processes (swarm
+        workers, an interactive session) may race to build on a cold start or
+        a rebuild; each writes to its own PID-suffixed temp file and renames
+        into place, so a racing build only wastes CPU — it can never
+        truncate a file another process still has mmap'd, which an in-place
+        save() could.
+        """
+        if not available():
+            return None
+        matrix_dir = os.path.dirname(os.path.abspath(cache_path))
+        matrix_path = os.path.join(
+            matrix_dir,
+            f'pattern_matrix_{score_cache.answer_list_id}'
+            f'_{_compute_guess_vocabulary_id(guess_words)}')
+        matrix = cls.load(matrix_path, guess_words, answer_words)
+        if matrix is not None:
+            return matrix
+        matrix = cls.build(guess_words, answer_words, score_cache=score_cache)
+        tmp_path = f'{matrix_path}.tmp{os.getpid()}'
+        tmp_npy_path = f'{tmp_path}.npy'
+        try:
+            matrix.save(tmp_path)
+            os.replace(tmp_npy_path, f'{matrix_path}.npy')
+        except OSError as exc:
+            # Persisting is an optimization, not a durability requirement:
+            # the matrix just built is still returned and usable this
+            # session, so a write failure here (disk full, or on iOS a
+            # transient iCloud File Provider Storage lock — see
+            # ScoreCache.checkpoint) only costs a rebuild next time, not
+            # this one. Clean up any partial temp file rather than leaking
+            # it across every future worker restart.
+            logger.warning("PatternMatrix persist failed for %s: %s",
+                           matrix_path, exc)
+            try:
+                os.unlink(tmp_npy_path)
+            except OSError:
+                pass
+        return matrix
 
     def guess_index(self, word):
         """Row index of word in the guess vocabulary; KeyError if word is unknown."""

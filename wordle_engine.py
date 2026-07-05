@@ -976,8 +976,11 @@ def _by_group_size(item):
 
 
 def _candidate_cost_lb(group_sizes, has_self, n):
-    """The engine's admissible lower bound on a candidate's ERD (wordle_engine
-    line ~1027): cost >= 3 - (number_of_groups + has_self) / n."""
+    """The engine's admissible lower bound on a candidate's ERD, shared by
+    evaluate_candidate and the cost-estimator functions below: cost >=
+    3 - (number_of_groups + has_self) / n. group_sizes need only support
+    len() — evaluate_candidate passes groups.values() directly rather than
+    materializing a list of sizes."""
     return 3.0 - (len(group_sizes) + (1 if has_self else 0)) / n
 
 
@@ -1068,7 +1071,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    cancel_check=None, heartbeat=None,
                    note_depth=None, budget=None,
                    subbranch_solver=None, bound_provider=None,
-                   mid_loop_publisher=None, metric_observer=None):
+                   mid_loop_publisher=None, metric_observer=None,
+                   pattern_matrix=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1117,7 +1121,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 
     # Admissible lower bound on this candidate's cost — cost >= 3 - (G + has_self)/n.
     has_self = _ALL_GREEN_PATTERN in groups
-    cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+    cost_lb = _candidate_cost_lb(groups.values(), has_self, n)
     gated = cost_lb >= best_erd
     # Report the work-metric inputs the moment they are known (cost_lb, group
     # sizes, the bound actually in force after any external tightening) so a
@@ -1175,7 +1179,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             policy, cancel_check, heartbeat, note_depth, None,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code,
-            mid_loop_publisher=mid_loop_publisher)
+            mid_loop_publisher=mid_loop_publisher, pattern_matrix=pattern_matrix)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
@@ -1200,7 +1204,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, note_depth,
                   progress_callback, subbranch_solver=None,
                   ceiling=float('inf'), entry_guess=None, entry_pattern=None,
-                  mid_loop_publisher=None):
+                  mid_loop_publisher=None, pattern_matrix=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1280,12 +1284,39 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # (best_erd) is tight from the 2nd candidate on, letting evaluate_candidate's
     # partial-sum cutoff prune the rest before they recurse.  Order-only — the
     # minimum, and therefore every cached result, is unchanged.
+    #
+    # candidate_cost_lower_bounds, when set, is the vectorized twin of
+    # evaluate_candidate's own admissible cost_lb bound (C2.1), aligned
+    # index-for-index with the (already reordered) candidate_list — see the
+    # ERD-pruning check in the candidate loop below.
+    candidate_cost_lower_bounds = None
     if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
-        candidate_list = sorted(
-            candidate_list,
-            key=lambda c: sum(
-                k * k for k in cache.group_counts(c, branch_words).values()),
-        )
+        vectorized = False
+        if pattern_matrix is not None:
+            try:
+                branch_indices = pattern_matrix.answer_indices(branch_words)
+                candidate_rows = [pattern_matrix.guess_index(c) for c in candidate_list]
+            except KeyError:
+                candidate_rows = None  # exotic interactive word: fall back below
+            if candidate_rows is not None:
+                stats = pattern_matrix.candidate_stats(branch_indices)
+                # Python's sort is stable, so this reproduces exactly the order
+                # np.argsort(kind='mergesort') would give on the same keys —
+                # equal-Σk² candidates keep their pre-sort relative order (C2.2).
+                order = sorted(
+                    range(len(candidate_list)),
+                    key=lambda i: stats.sum_squared_group_sizes[candidate_rows[i]],
+                )
+                candidate_list = [candidate_list[i] for i in order]
+                candidate_cost_lower_bounds = [
+                    stats.cost_lower_bound[candidate_rows[i]] for i in order]
+                vectorized = True
+        if not vectorized:
+            candidate_list = sorted(
+                candidate_list,
+                key=lambda c: sum(
+                    k * k for k in cache.group_counts(c, branch_words).values()),
+            )
 
     # Seed the bound with the alpha-beta ceiling: any candidate that can't beat
     # it is a cutoff, and if none can we report a cutoff (lower bound) rather
@@ -1298,14 +1329,35 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     token = mid_loop_publisher.enter(branch_words, budget) if mid_loop_publisher is not None else None
 
     for i, candidate in enumerate(candidate_list):
-        status, cost, max_remaining_depth, budget_tainted = evaluate_candidate(
-            branch_words, candidate, cache, score_cache,
-            n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
-            policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
-            note_depth=note_depth, budget=budget,
-            subbranch_solver=subbranch_solver,
-            mid_loop_publisher=mid_loop_publisher,
-        )
+        if (candidate_cost_lower_bounds is not None
+                and candidate_cost_lower_bounds[i] >= best_erd):
+            # ERD-lower-bound pruned: the same admissible bound
+            # evaluate_candidate would compute (C2.1) already proves this
+            # candidate cannot beat best_erd. Falls through to the same
+            # dispatch below as an OVER_ERD_LIMIT from evaluate_candidate
+            # itself — in particular the status == OVER_ERD_LIMIT check just
+            # below still sets cutoff_occurred, so a node where every
+            # candidate is ERD-pruned is never mistaken for a proven loss.
+            #
+            # The heartbeat tick mirrors evaluate_candidate's own unconditional
+            # first action: the node counter it drives (erd_swarm.py's
+            # _BranchWorker._nodes) is documented to count every candidate
+            # considered, ERD-pruned or not, and the swarm's cost-model
+            # calibration (nodes_spent) depends on that count staying exact.
+            if heartbeat is not None:
+                heartbeat()
+            status, cost, max_remaining_depth, budget_tainted = (
+                OVER_ERD_LIMIT, None, None, False)
+        else:
+            status, cost, max_remaining_depth, budget_tainted = evaluate_candidate(
+                branch_words, candidate, cache, score_cache,
+                n=n, best_erd=best_erd, deadline=deadline, guesses=guesses,
+                policy=policy, cancel_check=cancel_check, heartbeat=heartbeat,
+                note_depth=note_depth, budget=budget,
+                subbranch_solver=subbranch_solver,
+                mid_loop_publisher=mid_loop_publisher,
+                pattern_matrix=pattern_matrix,
+            )
         if status in _ABORT_STATUSES:
             return status
         node_floor = node_floor or budget_tainted
@@ -1366,7 +1418,8 @@ def min_expected_guesses(branch_words, cache, score_cache,
                           policy=None, progress_callback=None,
                           cancel_check=None, heartbeat=None,
                           note_depth=None, budget=None,
-                          subbranch_solver=None, mid_loop_publisher=None):
+                          subbranch_solver=None, mid_loop_publisher=None,
+                          pattern_matrix=None):
     """
     Exact expected guesses to solve branch_words, playing optimally.
 
@@ -1382,6 +1435,10 @@ def min_expected_guesses(branch_words, cache, score_cache,
              once per fully-evaluated top-level candidate (top level only).
     cancel_check / heartbeat / note_depth: threaded into every recursive
              call (see _solve_subset / evaluate_candidate).
+    pattern_matrix: optional PatternMatrix (pattern_matrix.py) shared across
+             the whole solve; when supplied, best-first ordering and
+             ERD-lower-bound pruning run vectorized instead of per-candidate
+             Python scans. None (the default) keeps the pure-Python path.
 
     Returns the expected-guesses cost, or None if the deadline/cancel fired or
     (when budgeted) `branch_words` is unsolvable within budget.  Partial results
@@ -1390,7 +1447,8 @@ def min_expected_guesses(branch_words, cache, score_cache,
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat,
                         note_depth, progress_callback, subbranch_solver,
-                        mid_loop_publisher=mid_loop_publisher)
+                        mid_loop_publisher=mid_loop_publisher,
+                        pattern_matrix=pattern_matrix)
     if res in _ABORT_STATUSES:
         return None
     status, cost, _md, _budget_tainted = res

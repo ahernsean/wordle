@@ -18,6 +18,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 try:
     import numpy as np
@@ -314,6 +315,120 @@ class TestBuildWithScoreCache(unittest.TestCase):
         pm = PatternMatrix.build(guess_words, answer_words, score_cache=None)
         self.assertEqual(pm.matrix.shape, (5, 10))
         self.assertEqual(pm.matrix.dtype, np.uint8)
+
+
+@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
+class TestLoadOrBuild(unittest.TestCase):
+    """load_or_build(): the one path erd_swarm.py and wordle.py both use —
+    load a cached matrix, or build and atomically persist one on a miss."""
+
+    def setUp(self):
+        from cache_sqlite import ScoreCache
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        rng = random.Random(10)
+        self.guess_words = rng.sample(_ALL_GUESS_WORDS, 12)
+        self.answer_words = rng.sample(_ALL_ANSWER_WORDS, 8)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.score_cache = ScoreCache(self.cache_path, self.answer_words)
+        self.addCleanup(self.score_cache.close)
+
+    def _expected_matrix_path(self):
+        from pattern_matrix import _compute_guess_vocabulary_id
+        return os.path.join(
+            self._tmp.name,
+            f"pattern_matrix_{self.score_cache.answer_list_id}"
+            f"_{_compute_guess_vocabulary_id(self.guess_words)}.npy")
+
+    def test_cold_start_builds_and_persists(self):
+        self.assertFalse(os.path.exists(self._expected_matrix_path()))
+        pm = PatternMatrix.load_or_build(
+            self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(pm)
+        self.assertTrue(os.path.exists(self._expected_matrix_path()))
+        # No leftover per-PID temp file: the atomic tmp+replace left only the
+        # final path behind.
+        leftovers = [f for f in os.listdir(self._tmp.name) if ".tmp" in f]
+        self.assertEqual(leftovers, [])
+
+    def test_warm_start_loads_without_rebuilding(self):
+        built = PatternMatrix.load_or_build(
+            self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        with mock.patch.object(PatternMatrix, "build",
+                               side_effect=AssertionError("must not rebuild on a warm load")):
+            loaded = PatternMatrix.load_or_build(
+                self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(loaded)
+        np.testing.assert_array_equal(built.matrix, loaded.matrix)
+
+    def test_different_answer_universe_does_not_reuse_stale_file(self):
+        from cache_sqlite import ScoreCache
+        PatternMatrix.load_or_build(
+            self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        rng = random.Random(11)
+        other_answers = rng.sample(_ALL_ANSWER_WORDS, 8)
+        other_cache_path = os.path.join(self._tmp.name, "cache2.sqlite3")
+        other_score_cache = ScoreCache(other_cache_path, other_answers)
+        self.addCleanup(other_score_cache.close)
+        self.assertNotEqual(self.score_cache.answer_list_id,
+                            other_score_cache.answer_list_id)
+        pm_other = PatternMatrix.load_or_build(
+            other_cache_path, self.guess_words, other_answers, other_score_cache)
+        self.assertIsNotNone(pm_other)
+        expected = PatternMatrix.build(self.guess_words, other_answers)
+        np.testing.assert_array_equal(pm_other.matrix, expected.matrix)
+
+    def test_different_guess_vocabulary_of_same_length_does_not_reuse_stale_file(self):
+        # Same answer universe (so answer_list_id alone can't distinguish),
+        # same guess *count*, different guess *words* -- exactly the case
+        # load()'s shape check can't catch: only the guess-vocabulary
+        # identity in the filename can.
+        PatternMatrix.load_or_build(
+            self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        rng = random.Random(12)
+        other_pool = [w for w in _ALL_GUESS_WORDS if w not in set(self.guess_words)]
+        other_guess_words = rng.sample(other_pool, len(self.guess_words))
+        self.assertNotEqual(sorted(other_guess_words), sorted(self.guess_words))
+
+        pm_other = PatternMatrix.load_or_build(
+            self.cache_path, other_guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(pm_other)
+        expected = PatternMatrix.build(other_guess_words, self.answer_words)
+        np.testing.assert_array_equal(pm_other.matrix, expected.matrix)
+
+    def _leftover_tmp_files(self):
+        return [f for f in os.listdir(self._tmp.name) if ".tmp" in f]
+
+    def test_save_failure_still_returns_matrix_and_leaves_no_tmp_file(self):
+        # Persisting is an optimization: a disk-full/permission error writing
+        # the .npy must not crash construction (erd_swarm.py's
+        # _BranchWorker.__init__ or wordle.py's GameState.__init__ call this
+        # synchronously) and must not leak the per-PID temp file.
+        with mock.patch.object(PatternMatrix, "save",
+                               side_effect=OSError("disk full")):
+            pm = PatternMatrix.load_or_build(
+                self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(pm)
+        expected = PatternMatrix.build(self.guess_words, self.answer_words)
+        np.testing.assert_array_equal(pm.matrix, expected.matrix)
+        self.assertEqual(self._leftover_tmp_files(), [])
+
+    def test_replace_failure_still_returns_matrix_and_leaves_no_tmp_file(self):
+        with mock.patch("pattern_matrix.os.replace",
+                        side_effect=OSError("cross-device link")):
+            pm = PatternMatrix.load_or_build(
+                self.cache_path, self.guess_words, self.answer_words, self.score_cache)
+        self.assertIsNotNone(pm)
+        expected = PatternMatrix.build(self.guess_words, self.answer_words)
+        np.testing.assert_array_equal(pm.matrix, expected.matrix)
+        self.assertEqual(self._leftover_tmp_files(), [])
+
+
+class TestLoadOrBuildNumpyAbsent(unittest.TestCase):
+    def test_returns_none_when_numpy_unavailable(self):
+        with mock.patch.object(pattern_matrix, "_NUMPY_AVAILABLE", False):
+            self.assertIsNone(PatternMatrix.load_or_build(
+                "/nonexistent/cache.sqlite3", [], [], None))
 
 
 @unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
