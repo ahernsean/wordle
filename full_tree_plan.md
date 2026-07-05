@@ -82,6 +82,7 @@ Additional identifiers used throughout this plan:
 | `answer_list_id` | str | SHA-256 identity of the answer universe; keys every cache table. |
 | `branch_key` | bytes | `ScoreCache.encode_subset(branch_words)`: sorted words concatenated, 5 bytes/word. |
 | epoch | int | Telemetry era from PR #76 (`telemetry_epoch` table, `run_meta.epoch`). Epoch 0 = single-candidate-claim baseline. |
+| ERD-lower-bound pruned | — | A candidate discarded because its admissible ERD lower bound (`cost_lb`, C2.1) already meets `best_erd`. Sanctioned short form: **"ERD-pruned"**. Never a bare "pruned" (the engine has other prunes: `rest_lb` partial-sum cutoffs, ceiling cutoffs) and never "gate/gated/pre-gated" (legacy vocabulary — §9b). |
 
 ## C2. The two quantities every implementer must understand
 
@@ -117,7 +118,7 @@ each additional response group moves one more answer word from the
 **Why it is safe to prune with:** it is *admissible* — never higher than the
 candidate's true cost — so `cost_lb >= best_erd` proves the candidate cannot
 beat the current best and can be discarded with zero recursion. This one-line
-pruning test is why 99.4% of measured claims cost <10 nodes.
+ERD-lower-bound pruning test is why 99.4% of measured claims cost <10 nodes.
 
 **Naming:** `cost_lb` violates the no-abbreviations rule; §9 proposes the
 rename (`candidate_cost_lower_bound`) and when it is safe to do.
@@ -159,7 +160,7 @@ run is complete, and the swarm is stopped. The final corpus
 (`analyze_swarm_telemetry.py`, epoch 0) is ~10.7M `candidate_accuracy` rows,
 33.8% of them ERD-lower-bound pruned (the telemetry's legacy `gated` flag —
 §9b) — much larger and differently mixed than the mid-run snapshot (6.8M
-rows, 4.7% pruned), and the verdict held across both, so it is robust to
+rows, 4.7% ERD-pruned), and the verdict held across both, so it is robust to
 corpus composition:
 
 - **ERD-lower-bound pruning is exact — PASS.** 100% of pruned rows ≤ 1
@@ -570,10 +571,11 @@ sort for that node rather than special-casing.
 
 **4b. ERD-lower-bound pruning in the candidate loop.** Inside the loop at
 `wordle_engine.py:1198`, guard the unconditional `evaluate_candidate` call
-with the pruning test, **falling through** to the rest of the loop body — no
+with the ERD-lower-bound pruning test, **falling through** to the rest of the
+loop body — no
 early `continue`, because everything after the call (abort dispatch, taint
 fold, the mid-loop publisher check, the status dispatch) must still run for
-a pruned candidate exactly as it runs for one `evaluate_candidate`
+an ERD-pruned candidate exactly as it runs for one `evaluate_candidate`
 rejected itself:
 
 ```python
@@ -588,31 +590,31 @@ else:
         branch_words, candidate, cache, score_cache, ...)
 # ... unchanged from here: abort dispatch, node_floor fold, mid-loop
 # publisher check, then `if status == OVER_ERD_LIMIT: cutoff_occurred = True;
-# continue` — the pruned candidate's tuple flows through the same dispatch.
+# continue` — the ERD-pruned candidate's tuple flows through the same dispatch.
 ```
 
-This is decision-identical to the pruning test `evaluate_candidate` itself
+This is decision-identical to the ERD-lower-bound pruning test `evaluate_candidate` itself
 applies at `wordle_engine.py:1027` — same admissible bound (C2.1), same `>=`
 comparison, against the same running `best_erd`, and the same result tuple
 `(OVER_ERD_LIMIT, None, None, False)` — but costs an array read instead of a
-full `group_words` partition (the dominant cost of a pruned candidate).
+full `group_words` partition (the dominant cost of an ERD-pruned candidate).
 
 Three invariants to preserve, each already load-bearing today:
-1. **The mid-loop publisher check runs every iteration** including pruned
+1. **The mid-loop publisher check runs every iteration** including ERD-pruned
    ones (today's loop runs it before the status `continue`s —
    `wordle_engine.py:1211-1217`). The 4b snippet's fall-through structure
    exists precisely for this: evaluate-or-skip, then publisher check, then
-   dispatch on status. Never write the pruning check as an early `continue`.
-2. **`cutoff_occurred` semantics:** a pruned candidate is an
+   dispatch on status. Never write the ERD-pruning check as an early `continue`.
+2. **`cutoff_occurred` semantics:** an ERD-pruned candidate is an
    `OVER_ERD_LIMIT`-equivalent, so it must set `cutoff_occurred = True`
-   (otherwise a node where *every* candidate is pruned would fall through
+   (otherwise a node where *every* candidate is ERD-pruned would fall through
    to the "proven unsolvable" branch at `wordle_engine.py:1232-1243` and
    **write a false loss row** — the single worst bug this section could
    introduce).
 3. **`metric_observer`:** on merged `main`, decide per its actual contract:
    either the observer receives the same observation it would have received
    from `evaluate_candidate` (~0 nodes, its legacy `gated` flag set — §9b),
-   or the pruning check is disabled when an observer is attached (observers
+   or the ERD-pruning check is disabled when an observer is attached (observers
    ride swarm claims, where the claim loop — not this inline loop —
    dominates; disabling there costs little). State the choice in the PR
    description.
@@ -646,12 +648,12 @@ count, and the per-node share still spent in `group_words` (that share is
   `max_remaining_depth`, identical taint, and identical rows written to a
   fresh in-memory ScoreCache (compare full table dumps).
 - A regression test for invariant 2: a branch/budget where every candidate is
-  pruned (tight seeded ceiling) still returns `OVER_ERD_LIMIT`-style
+  ERD-pruned (tight seeded ceiling) still returns `OVER_ERD_LIMIT`-style
   cutoff, and writes **no** loss row.
 - A regression test for the index-alignment hazard (4a): a fixture branch
   where the best-first order differs substantially from vocabulary order and
   the winning candidate sits late in vocabulary order but early in sorted
-  order — chosen so that pruning any candidate against a misaligned bound
+  order — chosen so that ERD-pruning any candidate against a misaligned bound
   changes the recorded winner or ERD, making the equivalence assertion catch
   an unpermuted or half-permuted bound array.
 - Full suite green with NumPy present and absent.
