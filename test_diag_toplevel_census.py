@@ -14,6 +14,7 @@ try:
 except ImportError:
     _NUMPY_AVAILABLE = False
 
+from erd_queue import cost_size_bucket
 from wordle_engine import calculate_response, _encode_response, load_word_list
 
 if _NUMPY_AVAILABLE:
@@ -72,6 +73,28 @@ class CensusTest(unittest.TestCase):
                     expected_histogram[bucket_index] += 1
                     break
         self.assertEqual(result.histogram, expected_histogram)
+
+        expected_cost_model_histogram = {}
+        for branch in distinct_branches:
+            bucket_index = cost_size_bucket(len(branch))
+            expected_cost_model_histogram[bucket_index] = (
+                expected_cost_model_histogram.get(bucket_index, 0) + 1)
+        self.assertEqual(result.cost_model_histogram,
+                         expected_cost_model_histogram)
+
+    def test_cost_model_bucket_ranges_partition_the_size_axis(self):
+        max_branch_size = len(self.answer_words)
+        ranges = diag_toplevel_census.cost_model_bucket_ranges(max_branch_size)
+        for bucket_index, (low, high) in ranges.items():
+            self.assertLessEqual(low, high)
+            self.assertEqual(cost_size_bucket(low), bucket_index)
+            self.assertEqual(cost_size_bucket(high), bucket_index)
+        # Contiguous cover of 2..max_branch_size with no overlap.
+        boundaries = sorted(ranges.values())
+        self.assertEqual(boundaries[0][0], 2)
+        self.assertEqual(boundaries[-1][1], max_branch_size)
+        for (_, previous_high), (next_low, _) in zip(boundaries, boundaries[1:]):
+            self.assertEqual(next_low, previous_high + 1)
 
     def test_branch_segments_indices_are_sorted_and_correct(self):
         pattern_values = np.asarray(self.matrix.matrix[0])

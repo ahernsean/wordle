@@ -3,9 +3,11 @@
 For every opener in wordle.txt, partitions the NYT answer list by response
 pattern using the pattern matrix, then counts the distinct branches (answer
 subsets with >= 2 words) across ALL openers: the same subset reached from two
-different openers counts once. Reports the aggregate distinct count, a
-branch-size histogram, and the count of branches over 300 words (the
-never-queued regime). Per-opener totals are deliberately not reported.
+different openers counts once. Reports the aggregate distinct count, two
+branch-size histograms (human-scale buckets, and the cost model's
+erd_queue.cost_size_bucket binning for the §7c census-count x per-regime-cost
+arithmetic), and the count of branches over 300 words (the never-queued
+regime). Per-opener totals are deliberately not reported.
 
 Each branch is keyed by the SHA-256 digest of its sorted answer-column
 indices (int32, little-endian), not by its word list -- ~1.5-2M distinct
@@ -31,6 +33,7 @@ import random
 import sys
 
 import pattern_matrix
+from erd_queue import cost_size_bucket
 from wordle_engine import load_word_list
 
 OPENER_LIST_PATH = 'wordle.txt'
@@ -66,6 +69,9 @@ class CensusResult:
         self.over_count = 0
         self.largest_branch_size = 0
         self.histogram = [0] * len(HISTOGRAM_BUCKETS)
+        # {cost_size_bucket index: distinct-branch count} — the §7c memo
+        # multiplies these by measured per-regime costs.
+        self.cost_model_histogram = {}
 
     def record_distinct(self, branch_size):
         self.distinct_count += 1
@@ -73,10 +79,28 @@ class CensusResult:
             self.over_count += 1
         if branch_size > self.largest_branch_size:
             self.largest_branch_size = branch_size
+        cost_model_bucket = cost_size_bucket(branch_size)
+        self.cost_model_histogram[cost_model_bucket] = (
+            self.cost_model_histogram.get(cost_model_bucket, 0) + 1)
         for bucket_index, (low, high) in enumerate(HISTOGRAM_BUCKETS):
             if branch_size >= low and (high is None or branch_size <= high):
                 self.histogram[bucket_index] += 1
                 return
+
+
+def cost_model_bucket_ranges(max_branch_size):
+    """{cost_size_bucket index: (smallest, largest) word count} over branch
+    sizes 2..max_branch_size, derived by scanning the imported function so
+    the printed ranges can never drift from the cost model's binning."""
+    ranges = {}
+    for branch_size in range(2, max_branch_size + 1):
+        bucket_index = cost_size_bucket(branch_size)
+        if bucket_index in ranges:
+            low, high = ranges[bucket_index]
+            ranges[bucket_index] = (min(low, branch_size), max(high, branch_size))
+        else:
+            ranges[bucket_index] = (branch_size, branch_size)
+    return ranges
 
 
 def branch_segments(pattern_values):
@@ -134,6 +158,17 @@ def format_report(result):
         else:
             label = f'{low}-{high}'
         lines.append(f'  {label:>9} : {count}')
+    lines += [
+        '',
+        'distinct-branch count per cost-model size bucket'
+        ' (erd_queue.cost_size_bucket):',
+    ]
+    for bucket_index, (low, high) in sorted(
+            cost_model_bucket_ranges(result.answer_count).items()):
+        word_range = f'{low}' if low == high else f'{low}-{high}'
+        count = result.cost_model_histogram.get(bucket_index, 0)
+        lines.append(f'  bucket {bucket_index:>2} ({word_range + " words":>15})'
+                     f' : {count}')
     lines += [
         '',
         f'distinct branches over {OVER_WORD_COUNT} words: {result.over_count}',
