@@ -148,5 +148,80 @@ class TestCopyTableWithProgress(_TmpDB):
         self.assertEqual(n, 0)
 
 
+class TestCreateTargetTableFromSource(_TmpDB):
+    """Merging into a target that has no tables (a fresh device recovering a
+    lost cache) must create each table from the source's schema."""
+
+    def _make_src_with_entry(self):
+        sc = self._cache("source.sqlite3")
+        key = ScoreCache.encode_subset(WORDS)
+        sc.write(key, ERD_ALL, "crane", 1.5, max_depth=2, solve_budget=None)
+        sc.close()
+
+    def _connect_empty_target(self):
+        conn = sqlite3.connect(self.path("target.sqlite3"),
+                               isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"ATTACH DATABASE '{self.path('source.sqlite3')}' AS src")
+        return conn
+
+    def test_target_has_table_reflects_main_schema(self):
+        self._make_src_with_entry()
+        conn = self._connect_empty_target()
+        try:
+            self.assertFalse(
+                merge_cache._target_has_table(conn, "branch_best_by_policy"))
+            merge_cache._create_target_table_from_source(
+                conn, "branch_best_by_policy")
+            self.assertTrue(
+                merge_cache._target_has_table(conn, "branch_best_by_policy"))
+        finally:
+            conn.execute("DETACH DATABASE src")
+            conn.close()
+
+    def test_created_table_matches_source_columns_and_indexes(self):
+        self._make_src_with_entry()
+        conn = self._connect_empty_target()
+        try:
+            merge_cache._create_target_table_from_source(
+                conn, "branch_best_by_policy")
+            self.assertEqual(
+                merge_cache._all_cols(conn, "branch_best_by_policy"),
+                [r[1] for r in conn.execute(
+                    "PRAGMA src.table_info(branch_best_by_policy)")])
+            src_indexes = {r[0] for r in conn.execute(
+                "SELECT name FROM src.sqlite_master WHERE type='index' "
+                "AND tbl_name='branch_best_by_policy' AND sql IS NOT NULL")}
+            main_indexes = {r[0] for r in conn.execute(
+                "SELECT name FROM main.sqlite_master WHERE type='index' "
+                "AND tbl_name='branch_best_by_policy' AND sql IS NOT NULL")}
+            self.assertEqual(src_indexes, main_indexes)
+        finally:
+            conn.execute("DETACH DATABASE src")
+            conn.close()
+
+    def test_copy_into_created_table_yields_readable_cache(self):
+        # End-to-end: schema from source, rows copied, and the result opens
+        # cleanly through ScoreCache (its migrations must all be no-ops).
+        self._make_src_with_entry()
+        conn = self._connect_empty_target()
+        try:
+            merge_cache._create_target_table_from_source(
+                conn, "branch_best_by_policy")
+            n = merge_cache._copy_table_with_progress(
+                conn, "branch_best_by_policy")
+        finally:
+            conn.execute("DETACH DATABASE src")
+            conn.close()
+        self.assertGreater(n, 0)
+
+        sc = ScoreCache(self.path("target.sqlite3"), WORDS,
+                        checkpoint_on_close=False)
+        result = sc.read(ScoreCache.encode_subset(WORDS), ERD_ALL)
+        sc.close()
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "crane")
+
+
 if __name__ == "__main__":
     unittest.main()

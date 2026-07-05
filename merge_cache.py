@@ -10,6 +10,12 @@ cache tables.  Three of them (answer_list, response_decomposition, candidate_sco
 are deterministic given the same answer-word universe — matching keys imply
 identical values — so INSERT OR IGNORE is exact.
 
+A missing target is not an error: it is created and any table the target
+lacks is built from the source's schema before merging, so merging an export
+into a fresh device restores a working cache.  ScoreCache._ensure_schema
+fills in whatever the source didn't carry (e.g. candidate_scores is absent
+from exports) the first time the app opens the merged cache.
+
 branch_best_by_policy is the exception: its primary key
 (branch_key, policy, answer_list_id) does NOT include solve_budget, so two caches
 can legitimately hold DIFFERENT entries for the same key — e.g. one solved
@@ -27,6 +33,8 @@ for the SQLite write lock, though the 30s timeout makes concurrent use safe.
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sqlite3
 import sys
 import time
@@ -72,6 +80,37 @@ def _insert_sql(table: str, cols: list[str]) -> str:
         """
     return (f'INSERT OR IGNORE INTO main.{table} ({col_list}) '
             f'VALUES ({placeholders})')
+
+
+def _target_has_table(conn, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone() is not None
+
+
+def _create_target_table_from_source(conn, table: str) -> None:
+    """Create main.{table} (and its indexes) from the source's schema.
+
+    A target that never existed — e.g. recovering a lost cache by merging an
+    export into a fresh device — opens as an empty database with no tables.
+    The source carries the authoritative CREATE statements in sqlite_master,
+    so copy them across (the same way erd_search.cmd_export builds the export
+    file).  The caller must have verified the table exists in the source.
+    """
+    schema_row = conn.execute(
+        "SELECT sql FROM src.sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone()
+    create_sql = re.sub(
+        r'^(CREATE\s+TABLE\s+)', r'\1IF NOT EXISTS ',
+        schema_row[0], count=1, flags=re.IGNORECASE)
+    conn.execute(create_sql)
+    for idx_row in conn.execute(
+            "SELECT sql FROM src.sqlite_master "
+            "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL", (table,)):
+        idx_sql = re.sub(
+            r'^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)', r'\1IF NOT EXISTS ',
+            idx_row[0], count=1, flags=re.IGNORECASE)
+        conn.execute(idx_sql)
 
 
 def _pk_cols(conn, table: str) -> list[str]:
@@ -155,6 +194,20 @@ def main():  # pragma: no cover
                         help='Delete source file after successful merge')
     args = parser.parse_args()
 
+    if not os.path.exists(args.source):
+        # ATTACH would silently create an empty database for a missing path,
+        # turning a typo into a "0 rows inserted" non-merge.
+        print(f'Error: source file {args.source} does not exist',
+              file=sys.stderr)
+        sys.exit(1)
+
+    target_existed = os.path.exists(args.target)
+    if not target_existed:
+        action = ('a new cache would be created' if args.dry_run
+                  else 'creating a new cache')
+        print(f'Target {args.target} does not exist — {action} '
+              f'with the schema copied from the source.')
+
     conn = sqlite3.connect(args.target, timeout=30.0, isolation_level=None)
     try:
         conn.execute('PRAGMA journal_mode=WAL')
@@ -170,6 +223,13 @@ def main():  # pragma: no cover
                 continue
 
             if args.dry_run:
+                if not _target_has_table(conn, table):
+                    n = conn.execute(
+                        f'SELECT COUNT(*) FROM src.{table}').fetchone()[0]
+                    print(f'  {table}: {n:,} rows would be inserted '
+                          f'(table would be created in target)')
+                    total_new += n
+                    continue
                 pks = _pk_cols(conn, table)
                 if pks:
                     join = ' AND '.join(
@@ -201,6 +261,10 @@ def main():  # pragma: no cover
                         msg += f' (+{up:,} tainted->untainted upgrades)'
                 print(msg)
             else:
+                if not _target_has_table(conn, table):
+                    _create_target_table_from_source(conn, table)
+                    print(f'  {table}: created in target '
+                          f'(schema copied from source)')
                 n = _copy_table_with_progress(conn, table)
 
             total_new += n
@@ -213,7 +277,6 @@ def main():  # pragma: no cover
             conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             print(f'Total: {total_new:,} rows inserted')
             if args.delete_source:
-                import os
                 for suffix in ('', '-shm', '-wal'):
                     p = args.source + suffix
                     if os.path.exists(p):
@@ -233,6 +296,13 @@ def main():  # pragma: no cover
         except Exception:
             pass
         conn.close()
+        if args.dry_run and not target_existed:
+            # Connecting created an empty shell where no target existed;
+            # a dry run must leave no trace.
+            for suffix in ('', '-shm', '-wal'):
+                p = args.target + suffix
+                if os.path.exists(p):
+                    os.remove(p)
 
 
 if __name__ == '__main__':
