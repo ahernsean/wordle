@@ -277,7 +277,7 @@ record the answer next to it when known.
 
 | # | Unknown / assumption | How to resolve | Blocks |
 |---|---|---|---|
-| U1 | NumPy version bundled in Pythonista on the owner's phone (§0 rule 3 assumes it may be years old). | Owner runs `import numpy; print(numpy.__version__)` in Pythonista, reports back. | §2 API choices if older than assumed |
+| U1 | **Resolved (Jul 4): Pythonista bundles NumPy 1.22.3.** That is far newer than the worst case Part II rule 3 assumed — every API on its original forbidden list exists in 1.22.3. The rule's floor is now 1.22; the conservative choices already baked into §2/§3 (and §4's `kind='mergesort'`) stand as written — no rework. | Done. | Nothing |
 | U2 | Pattern-matrix memory: the 41MB matrix itself (~12,972 × ~3,185 uint8) **plus the per-call transients of `counts_for_all_candidates`**, which recur at every solved node once §4 lands and dominate the matrix unless bounded. | §2 persists a `.npy` and workers load with `mmap_mode='r'` (one page-cached copy); the chunked kernel bounds transients at ~16MB/call. Confirm total and per-call-transient RSS with 6 workers running, including a large-n solve. | §4 deploy |
 | U3 | Monster-branch cost. **First hard data point (Jul 4):** a 208-word budget-4 ALIBI branch — a legitimate feasible solve, not a pathology — spent ~90h / 7.6B nodes on ~8.7% of its optimality certificate ⇒ ~43 days/node extrapolated, pure Python. That settles the headline schedule question (pure Python = years; kernel unconditional). The over-300-word regime is still unmeasured. | §7b calibration on the queued 841-word ALIBI all-gray branch, after §4 deploys; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | Schedule *refinement* only — the go/no-go answer is already in |
 | U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
@@ -303,12 +303,14 @@ record the answer next to it when known.
    (`pattern_matrix.available()`). The engine must import and pass its full
    test suite with NumPy absent. Pythonista bundles NumPy, but the fallback
    guarantees the phone and the tests never *require* it.
-3. **Old-NumPy-safe APIs only** (pending U1). Allowed: `np.frombuffer`,
-   `np.bincount`, `argsort(kind='mergesort')` (stable since ancient versions),
-   `np.add.at`, basic/fancy indexing, `np.nonzero`, 1-D `np.unique`,
-   `np.load(..., mmap_mode='r')`. Forbidden: `kind='stable'` (1.15+),
-   `np.unique(axis=...)` (1.13+ and slow), anything newer, anything from
-   `numpy.typing`.
+3. **NumPy 1.22 is the API floor** (U1 resolved: Pythonista bundles 1.22.3).
+   Anything present in 1.22 is allowed; anything newer is not. In practice
+   the code already targets a much older floor (`np.frombuffer`,
+   `np.bincount`, `argsort(kind='mergesort')`, `np.add.at`, fancy indexing,
+   `np.load(..., mmap_mode='r')`) and there is no reason to churn it. Prefer
+   `kind='mergesort'` over `kind='stable'` — they select the same algorithm,
+   but the explicit name states the determinism requirement (C2.2) rather
+   than delegating it to an alias.
 4. **No estimated value ever bounds the search** (same law as
    `adaptive_claim_packing.md` §3): `best_erd` is tightened only by exact
    solved costs or admissible lower bounds (`cost_lb`, `rest_lb`, the
