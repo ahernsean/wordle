@@ -63,13 +63,13 @@ class _TmpCacheMixin:
         return sc
 
     def _solve(self, branch_words, answer_words, guesses, budget,
-               pattern_matrix, ceiling=float("inf")):
+               pattern_matrix, ceiling=float("inf"), heartbeat=None):
         score_cache = self._fresh_score_cache(answer_words)
         cache = ResponseCache(answer_words, score_cache)
         result = _solve_subset(
             branch_words, cache, score_cache, budget,
             deadline=None, guesses=guesses, policy=ERD_ALL,
-            cancel_check=None, heartbeat=None, note_depth=None,
+            cancel_check=None, heartbeat=heartbeat, note_depth=None,
             progress_callback=None, subbranch_solver=None,
             ceiling=ceiling, pattern_matrix=pattern_matrix,
         )
@@ -144,6 +144,22 @@ class TestAllCandidatesErdPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
         # branch and writing a false loss row instead of reporting a cutoff.
         self.assertEqual(loss_rows, [])
         self.assertEqual(best_rows, [])
+
+    def test_heartbeat_still_ticks_once_per_erd_pruned_candidate(self):
+        # evaluate_candidate's own heartbeat call is the swarm's node counter
+        # (erd_swarm.py's _BranchWorker._nodes), documented to count every
+        # candidate considered, gated or not. ERD-pruning must not silently
+        # skip it, or nodes_spent telemetry undercounts whenever a
+        # PatternMatrix is active. Total ticks = one from _solve_subset's own
+        # node-entry heartbeat, plus one per candidate in the loop (all of
+        # them ERD-pruned here, per this class's docstring).
+        branch_words = sorted(random.Random(2).sample(self.answer_words, 20))
+        ticks = [0]
+        self._solve(
+            branch_words, self.answer_words, self.guess_words,
+            budget=None, pattern_matrix=self.pattern_matrix, ceiling=1.5,
+            heartbeat=lambda: ticks.__setitem__(0, ticks[0] + 1))
+        self.assertEqual(ticks[0], 1 + len(self.guess_words))
 
 
 @unittest.skipUnless(pattern_matrix_module.available(), "NumPy not available")

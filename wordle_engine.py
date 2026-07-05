@@ -1335,6 +1335,14 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             # the status == OVER_ERD_LIMIT check just below still sets
             # cutoff_occurred, so a node where every candidate is ERD-pruned
             # is never mistaken for a proven loss.
+            #
+            # The heartbeat tick mirrors evaluate_candidate's own unconditional
+            # first action: the node counter it drives (erd_swarm.py's
+            # _BranchWorker._nodes) is documented to count every candidate
+            # considered, gated or not, and the swarm's cost-model calibration
+            # (nodes_spent) depends on that count staying exact.
+            if heartbeat is not None:
+                heartbeat()
             status, cost, max_remaining_depth, budget_tainted = (
                 OVER_ERD_LIMIT, None, None, False)
         else:
