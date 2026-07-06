@@ -3,7 +3,7 @@
 - liveness-gated candidate claim reclaim (a slow-but-alive worker is never
   reclaimed; a dead worker's claim is freed),
 - per-worker claim reclaim used by the supervisor on respawn,
-- merge_cache preferring an untainted entry over a tainted one,
+- import_cache preferring an untainted entry over a tainted one,
 - backfill_max_depth not clobbering a worker's fresh solve_budget,
 - _multistep_stats keying response groups consistently with/without a cache.
 """
@@ -16,7 +16,7 @@ import unittest
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle_engine import ResponseCache, ERD_ALL, Solution
 from erd_queue import ERDQueue
-import merge_cache
+import import_cache
 
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
@@ -104,9 +104,9 @@ class TestMergeUntaintedWins(_TmpDB, unittest.TestCase):
     def _merge(self, target, source):
         conn = sqlite3.connect(self.path(target), isolation_level=None)
         conn.execute(f"ATTACH DATABASE '{self.path(source)}' AS src")
-        cols = merge_cache._all_cols(conn, "branch_best_by_policy")
+        cols = import_cache._all_cols(conn, "branch_best_by_policy")
         col_list = ", ".join(cols)
-        insert_sql = merge_cache._insert_sql("branch_best_by_policy", cols)
+        insert_sql = import_cache._insert_sql("branch_best_by_policy", cols)
         rows = conn.execute(
             f"SELECT {col_list} FROM src.branch_best_by_policy").fetchall()
         conn.executemany(insert_sql, rows)

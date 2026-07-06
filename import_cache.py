@@ -1,14 +1,25 @@
 #!/usr/bin/env python3.13
-"""merge_cache.py — Merge a source wordle_cache.sqlite3 into the local one.
+"""import_cache.py — Import a source wordle_cache.sqlite3 into the local one.
 
 Usage
 -----
-  python3.13 merge_cache.py <source_db> [--target PATH] [--dry-run]
+  python3.13 import_cache.py <source_db> [--target PATH] [--dry-run]
 
-Adds rows from <source_db> not already present in --target across all four
-cache tables.  Three of them (answer_list, response_decomposition, candidate_scores)
-are deterministic given the same answer-word universe — matching keys imply
-identical values — so INSERT OR IGNORE is exact.
+Creates the target cache if it doesn't exist yet, or merges into it if it
+already does — adding rows from <source_db> not already present in
+--target across all four cache tables. Three of them (answer_list,
+response_decomposition, candidate_scores) are deterministic given the same
+answer-word universe — matching keys imply identical values — so INSERT OR
+IGNORE is exact.
+
+A missing target restores a working cache rather than erroring: before any
+row is merged, the target is opened once through ScoreCache itself (the
+same construction path every normal cache open uses), so a target built
+here is schema-identical to one that has always been managed by
+ScoreCache — a table under a pre-rename legacy name gets migrated in
+place, schema_migrations is populated, and all of this happens before the
+target holds any of the merged rows, not after. Merging into an
+already-current target is a fast no-op bootstrap.
 
 branch_best_by_policy is the exception: its primary key
 (branch_key, policy, answer_list_id) does NOT include solve_budget, so two caches
@@ -27,10 +38,15 @@ for the SQLite write lock, though the 30s timeout makes concurrent use safe.
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 import time
 
+from cache_sqlite import ScoreCache
+from wordle_engine import load_word_list
+
+ANSWER_FILE = 'NYT_wordlist.txt'
 BATCH = 20000   # rows per progress step / commit
 
 TABLES = [
@@ -72,6 +88,61 @@ def _insert_sql(table: str, cols: list[str]) -> str:
         """
     return (f'INSERT OR IGNORE INTO main.{table} ({col_list}) '
             f'VALUES ({placeholders})')
+
+
+def _target_has_table(conn, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone() is not None
+
+
+def _droppable_indexes(conn, table: str):
+    """[(name, create_sql), ...] for main.{table}'s explicit, non-PK indexes.
+
+    An index backing a PRIMARY KEY constraint has no `sql` (SQLite tracks it
+    as an automatic index), so filtering on `sql IS NOT NULL` naturally
+    excludes it — dropping it would break the ON CONFLICT/INSERT OR IGNORE
+    the merge relies on for correctness.
+    """
+    return conn.execute(
+        "SELECT name, sql FROM main.sqlite_master "
+        "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+        (table,)).fetchall()
+
+
+def _bootstrap_target_schema(target_path: str) -> None:
+    """Ensure target_path has a fully current, migrated schema.
+
+    Opens it once through ScoreCache itself -- the same construction path
+    every normal cache open uses -- before any row is merged into it. A
+    table hiding under a pre-rename legacy name (word_scores, universe,
+    subgroup_best_by_policy) is migrated to its current name here; without
+    this, a later ScoreCache open would find that legacy table still
+    present, "helpfully" migrate over it, and drop everything a merge had
+    just written into the current-named table. A no-op on an
+    already-current target.
+    """
+    ScoreCache(target_path, load_word_list(ANSWER_FILE)).close()
+
+
+def _merge_table(conn, table: str) -> int:
+    """Merge src.table into main.table, returning rows inserted/upgraded.
+
+    Defers a from-scratch table's secondary indexes until after the bulk
+    copy (dropped before, recreated after) so a multi-million-row disaster
+    recovery doesn't pay incremental B-tree maintenance on every insert;
+    an incremental merge into an already-populated table is untouched.
+    """
+    row_count = conn.execute(f'SELECT COUNT(*) FROM main.{table}').fetchone()[0]
+    deferred_indexes = []
+    if row_count == 0:
+        deferred_indexes = _droppable_indexes(conn, table)
+        for name, _ in deferred_indexes:
+            conn.execute(f'DROP INDEX IF EXISTS {name}')
+    n = _copy_table_with_progress(conn, table)
+    for _, create_sql in deferred_indexes:
+        conn.execute(create_sql)
+    return n
 
 
 def _pk_cols(conn, table: str) -> list[str]:
@@ -155,6 +226,23 @@ def main():  # pragma: no cover
                         help='Delete source file after successful merge')
     args = parser.parse_args()
 
+    if not os.path.exists(args.source):
+        # ATTACH would silently create an empty database for a missing path,
+        # turning a typo into a "0 rows inserted" non-merge.
+        print(f'Error: source file {args.source} does not exist',
+              file=sys.stderr)
+        sys.exit(1)
+
+    target_existed = os.path.exists(args.target)
+    if not target_existed:
+        action = ('a new cache would be created' if args.dry_run
+                  else 'creating a new cache')
+        print(f'Target {args.target} does not exist — {action} '
+              f'with a fully migrated schema.')
+
+    if not args.dry_run:
+        _bootstrap_target_schema(args.target)
+
     conn = sqlite3.connect(args.target, timeout=30.0, isolation_level=None)
     try:
         conn.execute('PRAGMA journal_mode=WAL')
@@ -170,6 +258,13 @@ def main():  # pragma: no cover
                 continue
 
             if args.dry_run:
+                if not _target_has_table(conn, table):
+                    n = conn.execute(
+                        f'SELECT COUNT(*) FROM src.{table}').fetchone()[0]
+                    print(f'  {table}: {n:,} rows would be inserted '
+                          f'(table would be created in target)')
+                    total_new += n
+                    continue
                 pks = _pk_cols(conn, table)
                 if pks:
                     join = ' AND '.join(
@@ -201,7 +296,7 @@ def main():  # pragma: no cover
                         msg += f' (+{up:,} tainted->untainted upgrades)'
                 print(msg)
             else:
-                n = _copy_table_with_progress(conn, table)
+                n = _merge_table(conn, table)
 
             total_new += n
 
@@ -213,7 +308,6 @@ def main():  # pragma: no cover
             conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             print(f'Total: {total_new:,} rows inserted')
             if args.delete_source:
-                import os
                 for suffix in ('', '-shm', '-wal'):
                     p = args.source + suffix
                     if os.path.exists(p):
@@ -233,6 +327,13 @@ def main():  # pragma: no cover
         except Exception:
             pass
         conn.close()
+        if args.dry_run and not target_existed:
+            # Connecting created an empty shell where no target existed;
+            # a dry run must leave no trace.
+            for suffix in ('', '-shm', '-wal'):
+                p = args.target + suffix
+                if os.path.exists(p):
+                    os.remove(p)
 
 
 if __name__ == '__main__':

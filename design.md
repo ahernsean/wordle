@@ -18,7 +18,8 @@ Five layers:
 | `cache_sqlite.py` | SQLite-backed `ScoreCache`: ERD results, candidate scores, response decompositions. |
 | `erd_swarm.py` / `erd_queue.py` / `erd_search.py` | Parallel precache workers: branch assignment, candidate claiming, cooperative ERD solving. |
 
-Support files: `merge_cache.py` (merge two `.sqlite3` files), `backfill_max_depth.py`
+Support files: `export_cache.py` / `import_cache.py` (sync a trimmed cache
+snapshot between machines — create, merge, or import), `backfill_max_depth.py`
 (populate `max_depth` for legacy rows), diagnostic scripts (`diag_*.py`).
 
 ---
