@@ -226,11 +226,12 @@ python3.13 export_cache.py --output wordle_erd_export.sqlite3
 ```
 
 Creates a trimmed snapshot (`wordle_erd_export.sqlite3`) containing
-`answer_list`, `response_decomposition`, `branch_best_by_policy`, and the
-root position's `candidate_scores` (that table is too bulky to export in
-full, but the root position — the full answer list, before any guess — is
-the one every game hits).  Safe to run while workers are active.  Re-running
-is incremental (INSERT OR IGNORE skips rows already present).
+`answer_list`, `response_decomposition`, `branch_best_by_policy`, and
+`candidate_scores` — a phone without a cached ERD result for its current
+position still needs `candidate_scores`' entropy/max-group-size numbers to
+rank candidates, and that isn't limited to the opening guess, so the whole
+table is carried.  Safe to run while workers are active.  Re-running is
+incremental (INSERT OR IGNORE skips rows already present).
 
 ### Import a cache from another machine
 
@@ -238,14 +239,16 @@ is incremental (INSERT OR IGNORE skips rows already present).
 python3.13 import_cache.py <source_db> [--target wordle_cache.sqlite3] [--dry-run]
 ```
 
-Creates the target cache if it doesn't exist yet (schema copied from the
-source — e.g. importing an export_cache.py snapshot straight onto a fresh
-device), or merges into it if it already exists: adds rows from
-`<source_db>` not already present in the local cache.  An incoming
-unconstrained (untainted) entry replaces an existing tainted (depth-limited)
-one for the same branch, since the unconstrained result is strictly more
-reusable.  Run `--dry-run` first to preview row counts.  Prefer to run while
-workers are stopped.
+Creates the target cache if it doesn't exist yet, or merges into it if it
+already exists: adds rows from `<source_db>` not already present in the
+local cache.  Before merging, the target is opened once through
+`ScoreCache` itself, so a table under a pre-rename legacy name is migrated
+in place first — e.g. importing an `export_cache.py` snapshot straight onto
+a fresh device produces a cache schema-identical to one that's always been
+managed normally.  An incoming unconstrained (untainted) entry replaces an
+existing tainted (depth-limited) one for the same branch, since the
+unconstrained result is strictly more reusable.  Run `--dry-run` first to
+preview row counts.  Prefer to run while workers are stopped.
 
 ---
 

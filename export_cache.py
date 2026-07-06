@@ -6,15 +6,11 @@ Usage
   python3.13 export_cache.py [--cache PATH] [--output PATH]
 
 Creates a trimmed export file with only the iPhone-useful tables:
-answer_list, response_decomposition, branch_best_by_policy, and the root
-position's candidate_scores.
-
-candidate_scores holds a row per candidate per scoring method for every
-branch position the swarm has ever touched — far too bulky to export in
-full. The root position (the full answer list, before any guess) is the
-one spot every game hits, and the one place a phone missing an ERD lookup
-still wants entropy/max-group-size scores to rank candidates by, so only
-its rows are exported.
+answer_list, response_decomposition, branch_best_by_policy, and
+candidate_scores. A phone without a cached ERD result for its current
+position still needs candidate_scores' entropy/max-group-size numbers to
+rank candidates, and that need isn't limited to the opening guess, so the
+whole table is carried, not just one position's rows.
 
 Safe to run while workers are active: WAL mode allows concurrent reads, so
 the export sees a consistent snapshot without stopping anything. Re-running
@@ -31,27 +27,17 @@ import os
 import re
 import sqlite3
 
-from cache_sqlite import ScoreCache
-from wordle_engine import load_word_list
-
-ANSWER_FILE = 'NYT_wordlist.txt'
 DEFAULT_CACHE = 'wordle_cache.sqlite3'
 DEFAULT_EXPORT = 'wordle_erd_export.sqlite3'
 
 EXPORT_TABLES = ['answer_list', 'response_decomposition',
                   'branch_best_by_policy', 'candidate_scores']
 
-_ROOT_SCOPED_TABLES = {'candidate_scores'}
-
 
 def cmd_export(args):
     export_path = args.output or DEFAULT_EXPORT
     cache_path = os.path.abspath(args.cache)
     export_path = os.path.abspath(export_path)
-
-    all_answers = load_word_list(ANSWER_FILE)
-    root_subset_hash = ScoreCache._subset_hash(
-        ScoreCache.encode_subset(all_answers))
 
     print(f'Source : {cache_path}')
     print(f'Export : {export_path}')
@@ -100,16 +86,10 @@ def cmd_export(args):
 
             cols = [r[1] for r in conn.execute(f'PRAGMA table_info({table})')]
             col_list = ', '.join(cols)
-            where_clause = ''
-            params = ()
-            if table in _ROOT_SCOPED_TABLES:
-                where_clause = 'WHERE subset_hash = ?'
-                params = (root_subset_hash,)
             conn.execute(f"""
                 INSERT OR IGNORE INTO main.{table} ({col_list})
                 SELECT {col_list} FROM src.{table}
-                {where_clause}
-            """, params)
+            """)
             n = conn.execute('SELECT changes()').fetchone()[0]
             total = conn.execute(
                 f'SELECT COUNT(*) FROM {table}').fetchone()[0]
