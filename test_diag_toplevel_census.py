@@ -8,18 +8,12 @@ at this scale), and byte-identical reports across two runs.
 import random
 import unittest
 
-try:
-    import numpy as np
-    _NUMPY_AVAILABLE = True
-except ImportError:
-    _NUMPY_AVAILABLE = False
+import numpy as np
 
+import diag_toplevel_census
 from erd_queue import cost_size_bucket
+from pattern_matrix import PatternMatrix
 from wordle_engine import calculate_response, _encode_response, load_word_list
-
-if _NUMPY_AVAILABLE:
-    import diag_toplevel_census
-    from pattern_matrix import PatternMatrix
 
 
 def _reference_distinct_branches(opener_words, answer_words):
@@ -38,7 +32,6 @@ def _reference_distinct_branches(opener_words, answer_words):
     return distinct_branches, instance_count
 
 
-@unittest.skipUnless(_NUMPY_AVAILABLE, 'NumPy required for the pattern matrix')
 class CensusTest(unittest.TestCase):
 
     @classmethod
@@ -58,6 +51,10 @@ class CensusTest(unittest.TestCase):
             self.opener_words, self.answer_words)
         self.assertEqual(result.distinct_count, len(distinct_branches))
         self.assertEqual(result.instance_count, instance_count)
+        # Pins that the fixture actually exercises cross-opener dedupe --
+        # without a duplicate branch present, the digest-dedupe path below
+        # would never be differentially tested by the equality checks above.
+        self.assertGreater(result.instance_count, result.distinct_count)
         self.assertEqual(result.largest_branch_size,
                          max(len(branch) for branch in distinct_branches))
         self.assertEqual(

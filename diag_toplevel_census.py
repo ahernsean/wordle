@@ -32,6 +32,8 @@ import hashlib
 import random
 import sys
 
+import numpy as np
+
 import pattern_matrix
 from erd_queue import cost_size_bucket
 from wordle_engine import load_word_list
@@ -47,11 +49,6 @@ HISTOGRAM_BUCKETS = [
 ]
 
 OVER_WORD_COUNT = 300
-
-try:
-    import numpy as np
-except ImportError:
-    np = None
 
 
 class CensusResult:
@@ -107,13 +104,13 @@ def branch_segments(pattern_values):
     """Yield the sorted answer-column indices (int32 array) of every response
     group with >= 2 words in one opener's pattern row.
 
-    A stable argsort groups equal patterns into contiguous segments while
+    A mergesort argsort groups equal patterns into contiguous segments while
     preserving ascending column order within each, so every segment is
     already the sorted index list the branch digest is keyed on. The
     all-green self group has at most 1 word (the opener itself) and falls
     out of the >= 2 filter without special-casing.
     """
-    sorted_order = np.argsort(pattern_values, kind='stable').astype(np.int32)
+    sorted_order = np.argsort(pattern_values, kind='mergesort').astype(np.int32)
     sorted_patterns = pattern_values[sorted_order]
     change_points = np.flatnonzero(sorted_patterns[1:] != sorted_patterns[:-1]) + 1
     segment_starts = [0] + change_points.tolist()
@@ -215,8 +212,6 @@ def main(argv=None):
                         help='seed for --vocab-sample')
     arguments = parser.parse_args(argv)
 
-    if np is None:
-        sys.exit('NumPy unavailable -- the census requires the pattern matrix.')
     if arguments.vocab_sample and arguments.cache:
         # A sampled answer universe would register a new answer_list_id in
         # the database on open; the census must not touch it beyond warm
