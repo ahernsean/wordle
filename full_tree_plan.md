@@ -670,6 +670,15 @@ subtleties below.
 still dominates. If §4 leaves `group_words` under ~30% of node time, skip
 this section — the complexity is not free.
 
+**Measurement verdict (2026-07-06): GO.** The §4 deploy bench
+(`diag_kernel_bench.py`, 900s deadline, epoch-1 box) puts the matrix-on
+`group_words` share at 90.3–99.7% for branch sizes 30/81/146 — decomposition
+of surviving candidates is the node cost. Corroborated in production: the
+208-word calibration branch advances only ~1.4× faster under §4 because
+almost none of its candidates are ERD-prunable at n=208 (pruning needs ≤ 21
+response groups), so each takes a full multi-million-node evaluation that is
+pure-Python decomposition throughout.
+
 **Current behaviour.** Each `evaluate_candidate` call that survives
 ERD-lower-bound pruning builds `{pattern: [words]}` with a Python loop over
 the branch (`wordle_engine.py:1013`). After §4 this is the main surviving
@@ -804,11 +813,20 @@ go/no-go call on "weeks", plus the §5/§6 scope decision. No code.
 
 ## §8. Phone export: reachable-only filter, plus the opener report
 
-**Read first:** `erd_search.py export` (`cmd_export`); `verify_erd_cache`'s
+**Read first:** `export_cache.py` (standalone since PR #88); `verify_erd_cache`'s
 best-guess walk (`wordle_engine.py:1329-1360`) — the BFS to imitate; C4 (all
 three modes); §7a census output for size projection.
-**Prerequisites:** PR #76 merged (touches `erd_search.py`) — satisfied. §2
-useful but optional (decomposition blobs suffice for seeds).
+**Prerequisites:** PR #76 merged — satisfied. PR #88 merged — satisfied (see
+note below). §2 useful but optional (decomposition blobs suffice for seeds).
+
+**PR #88 landed part of this section's groundwork independently.** Export and
+import are no longer `erd_search.py` subcommands: `export_cache.py` produces
+the phone snapshot (four tables — `answer_list`, `response_decomposition`,
+`branch_best_by_policy`, and the whole of `candidate_scores`, which the phone
+needs for ranking at uncached positions), and `import_cache.py` (renamed from
+`merge_cache.py`) ingests it. Export is safe against a live swarm (WAL
+snapshot) and incremental (INSERT OR IGNORE). What remains of §8 is exactly
+8a's reachable-only filter and 8b's opener report.
 
 **Problem.** `branch_best_by_policy` holds 3M+ rows already
 (`cache_sqlite.py:220` comment) and a full run adds tens of millions; most
@@ -816,7 +834,7 @@ rows are search memoization (sub-branches of *losing* candidates) that Mode
 A/C lookups never touch. Syncing multi-GB SQLite over iCloud to Pythonista is
 the bottleneck the phone does not need.
 
-**8a. `export --reachable-only`.**
+**8a. `export_cache.py --reachable-only`.**
 - **Seed set:** every (opener, pattern) branch with ≥ 2 answer words, for
   **every opener in `wordle.txt`** — this is what makes Mode C's "any first
   guess" work (C4). Enumerate via decomposition blobs (or the §2 matrix);
@@ -826,10 +844,11 @@ the bottleneck the phone does not need.
   every ≥ 2-word response group, and export every visited row. A node absent
   from the cache terminates its path silently — export is best-effort on a
   partial cache and re-runnable as coverage grows.
-- Export the same three tables as today (`answer_list`,
-  `response_decomposition`, `branch_best_by_policy`), row-filtered on the
-  third. `--reachable-only` is a new flag; default behaviour unchanged.
-  Existing incremental semantics (INSERT OR IGNORE) unchanged.
+- Export the same four tables as today, row-filtered on
+  `branch_best_by_policy` only; `candidate_scores` stays whole-table (PR
+  #88's documented phone need is not position-bound). `--reachable-only` is
+  a new flag; default behaviour unchanged. Existing incremental semantics
+  (INSERT OR IGNORE) unchanged.
 - Also export `branch_loss_by_policy` rows for visited keys if the phone
   code reads losses (verify; if it never does, say so in the PR and skip).
 
@@ -847,9 +866,10 @@ group (w itself, when w is a possible answer) contributes 0 beyond the
 initial 1. If any ≥ 2-word branch of w is uncached, report the partial sum
 **as a lower bound, clearly labeled** — never as the ERD (the same honesty
 rule as everywhere else: a bound is honest, a guess is not).
-- Linux CLI: `erd_search.py opener-erd --word alibi` printing root ERD, the
-  per-pattern table (pattern, group size, cached best guess, ERD), and
-  coverage (branches cached / total).
+- Linux CLI: a standalone `opener_erd.py --word alibi` (following PR #88's
+  one-script-per-tool pattern; do not grow `erd_search.py`) printing root
+  ERD, the per-pattern table (pattern, group size, cached best guess, ERD),
+  and coverage (branches cached / total).
 - Phone: same computation exposed in the interactive tool (natural home: the
   `t` analyse-word command, which already aggregates per-word views), so
   "how awful was ALIBI, exactly" is answerable at the dinner table:
@@ -910,23 +930,31 @@ pruned" throughout this document; the identifiers should follow. Proposed:
 # Sequencing
 
 ```
-already done      §1 (issue #77 / PR #80, merged to main)
-                  §2 (PR #84) and §3 (PR #85), merged into this branch
-                  epoch-0 run complete; packer go/no-go decided (U6)
-next              §4 — implement on this branch; deploy = one worker restart
-                      + one epoch bump (box pulls PR #80's code in the same
-                      deploy)
-then              §7a census → §7b calibration (841-word ALIBI branch,
-                      already queued) → §7c schedule memo
-then              §5 and/or §6 per §7's numbers            §8 before first full-tree sync
-anytime           §9a design.md fix (still open)
-                  §9b rename (unblocked once the epoch-0 corpus is archived)
+already done      §1 (issue #77 / PR #80) · §2 (PR #84) · §3 (PR #85) ·
+                  §4 (PR #86) — all merged to main (PR #78)
+                  §4 DEPLOYED 2026-07-05: epoch 1 "numpy-kernel"
+                  (git e1ab50f), 6 workers restarted on it
+                  §7a census run 2026-07-06 (U7 resolved: 569,132 distinct
+                  branches; 20,219 over 300 words; largest 1,955)
+                  §9a doc fixes; epoch-0 run complete; packer go/no-go
+                  decided (U6); export/import split (PR #88, part of §8's
+                  groundwork)
+in progress       §7b calibration — the 841-word ALIBI branch is queued but
+                  waits behind the 208-word branch's certificate, which is
+                  decomposition-bound (~9.7% done as of 2026-07-06); at §4
+                  speeds that is weeks away, so §7b/§7c effectively wait
+                  on §5
+next              §5 — measurement verdict GO (see §5); THE critical path
+then              §7b drain → §7c schedule memo → §6 per its numbers
+then              §8 (8a reachable-only + 8b opener report) before first
+                  full-tree sync
+anytime           §9b rename (unblocked once the epoch-0 corpus is archived)
 parallel track    claim packing per adaptive_claim_packing.md — binary scheme
                   (exact ERD-lower-bound pruning + count-bundling +
                   republish-on-overrun); that document still needs revision
                   to the scheme
 ```
 
-Dependency summary: §4→§5; §2→§6 (§2 done); §4 deployed→§7; §8 independent;
-§9a independent; §9b last. The packing lever multiplies with all of it and is
-managed by its own document.
+Dependency summary: §5 unblocks §7b in practice; §2→§6 (§2 done); §8
+independent (base landed via PR #88); §9b last. The packing lever multiplies
+with all of it and is managed by its own document.
