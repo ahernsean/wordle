@@ -422,8 +422,19 @@ class ResponseCache:
                 counts[_encode_response(resp)] += 1
         return counts
 
-    def group_words(self, guess, subset):
-        """Return {pattern_int: [words]} for guess vs subset."""
+    def group_words(self, guess, subset, *, pattern_matrix=None, branch_indices=None):
+        """Return {pattern_int: [words]} for guess vs subset.
+
+        When pattern_matrix and branch_indices are both supplied (branch_indices
+        index-aligned with subset via pattern_matrix.answer_indices), delegates
+        to PatternMatrix.group_words for an identical dict — same keys, values,
+        and iteration order — computed by one matrix row read plus a stable
+        argsort instead of the per-word loop below. Interactive-mode words
+        outside the answer universe can't be expressed as branch_indices, so
+        those callers pass neither and take the loop.
+        """
+        if pattern_matrix is not None and branch_indices is not None:
+            return pattern_matrix.group_words(guess, subset, branch_indices)
         self._ensure(guess)
         blob = self._cache[guess]
         groups = defaultdict(list)
@@ -1072,7 +1083,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    note_depth=None, budget=None,
                    subbranch_solver=None, bound_provider=None,
                    mid_loop_publisher=None, metric_observer=None,
-                   pattern_matrix=None):
+                   pattern_matrix=None, branch_indices=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1088,6 +1099,14 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     Called once before evaluation starts and once per sub-branch to tighten
     the alpha-beta bound dynamically, so a worker mid-evaluation benefits from
     improvements found by other workers without waiting for the next candidate.
+
+    branch_indices: optional, branch_words expressed as pattern_matrix column
+    indices (pattern_matrix.answer_indices(branch_words)). Callers that already
+    hold this for `branch_words` (the _solve_subset candidate loop) should pass
+    it to avoid recomputing it once per candidate; a caller that only has
+    pattern_matrix (a single-candidate claim) may leave it None and this
+    function derives it, falling back to None when branch_words contains a
+    word outside the answer universe (the interactive fallback mode).
 
     Returns (status, cost, max_depth, floor_hit):
       ('ok', cost, max_remaining_depth, floor)  fully evaluated; cost < best_erd; max_remaining_depth is this
@@ -1108,7 +1127,14 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     if heartbeat is not None:
         heartbeat()
     if cache:
-        groups = cache.group_words(candidate, branch_words)
+        if pattern_matrix is not None and branch_indices is None:
+            try:
+                branch_indices = pattern_matrix.answer_indices(branch_words)
+            except KeyError:
+                branch_indices = None  # exotic interactive word: loop below
+        groups = cache.group_words(candidate, branch_words,
+                                   pattern_matrix=pattern_matrix,
+                                   branch_indices=branch_indices)
     else:
         groups = defaultdict(list)
         for answer in branch_words:
@@ -1289,15 +1315,25 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # evaluate_candidate's own admissible cost_lb bound (C2.1), aligned
     # index-for-index with the (already reordered) candidate_list — see the
     # ERD-pruning check in the candidate loop below.
+    # branch_indices lets both the ordering below and every evaluate_candidate
+    # call in the loop use the group_words fast path without each recomputing
+    # branch_words' column indices — None when pattern_matrix is absent or a
+    # branch word falls outside the answer universe (interactive fallback).
+    branch_indices = None
+    if pattern_matrix is not None:
+        try:
+            branch_indices = pattern_matrix.answer_indices(branch_words)
+        except KeyError:
+            branch_indices = None
+
     candidate_cost_lower_bounds = None
     if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:
         vectorized = False
-        if pattern_matrix is not None:
+        if branch_indices is not None:
             try:
-                branch_indices = pattern_matrix.answer_indices(branch_words)
                 candidate_rows = [pattern_matrix.guess_index(c) for c in candidate_list]
             except KeyError:
-                candidate_rows = None  # exotic interactive word: fall back below
+                candidate_rows = None  # exotic interactive candidate: fall back below
             if candidate_rows is not None:
                 stats = pattern_matrix.candidate_stats(branch_indices)
                 # Python's sort is stable, so this reproduces exactly the order
@@ -1357,6 +1393,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                 subbranch_solver=subbranch_solver,
                 mid_loop_publisher=mid_loop_publisher,
                 pattern_matrix=pattern_matrix,
+                branch_indices=branch_indices,
             )
         if status in _ABORT_STATUSES:
             return status

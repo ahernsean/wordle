@@ -1,4 +1,4 @@
-"""Tests for pattern_matrix.py — §2 and §3 acceptance criteria.
+"""Tests for pattern_matrix.py — §2, §3, and §5 acceptance criteria.
 
 Acceptance bullets:
   (a) ~200 random (guess, answer) pairs: matrix[g, a] matches _encode_response.
@@ -9,6 +9,9 @@ Acceptance bullets:
   (d) §3 candidate_stats: for branch sizes {8, 30, 100, 500}, every field matches
       the per-candidate pure-Python computation — integers exactly,
       cost_lower_bound exactly, entropy within 1e-12.
+  (e) §5 group_words fast path: ~50 random (guess, branch) pairs across varied
+      sizes match ResponseCache.group_words in keys, values, and iteration
+      order (list(d.items()), not just dict equality).
 """
 import math
 import os
@@ -577,6 +580,73 @@ class TestCandidateStats(unittest.TestCase):
         self.assertEqual(stats.sum_squared_group_sizes.dtype, np.int64)
         # All values must be non-negative integers.
         self.assertTrue(np.all(stats.sum_squared_group_sizes >= 0))
+
+
+class TestGroupWordsFastPath(unittest.TestCase):
+    """§5 acceptance: PatternMatrix.group_words (the vectorized fast path) is
+    identical to ResponseCache.group_words (the pure-Python reference) in
+    keys, values, and iteration order — not just as sets/dicts, since
+    iteration order determines evaluate_candidate's float accumulation order
+    (full_tree_plan.md §5).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rng = random.Random(500)
+        cls.answer_words = sorted(rng.sample(_ALL_ANSWER_WORDS, 200))
+        extra_guesses = rng.sample(
+            [w for w in _ALL_GUESS_WORDS if w not in set(cls.answer_words)], 100)
+        cls.guess_words = sorted(set(cls.answer_words) | set(extra_guesses))
+        cls.pm = PatternMatrix.build(cls.guess_words, cls.answer_words)
+        cls.rc = ResponseCache(cls.answer_words)
+
+    def test_50_random_guess_branch_pairs(self):
+        rng = random.Random(501)
+        sizes = [2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 200]
+        for trial in range(50):
+            size = rng.choice(sizes)
+            branch_words = sorted(rng.sample(self.answer_words, size))
+            guess = rng.choice(self.guess_words)
+            branch_indices = self.pm.answer_indices(branch_words)
+            slow = self.rc.group_words(guess, branch_words)
+            fast = self.pm.group_words(guess, branch_words, branch_indices)
+            with self.subTest(trial=trial, size=size, guess=guess):
+                self.assertEqual(list(fast.items()), list(slow.items()))
+
+    def test_iteration_order_with_many_ties(self):
+        """A branch over few distinct letters produces many equal-size
+        response groups (e.g. several singletons) against a strong
+        splitter — exactly the case where emitting in ascending-pattern
+        order (the canonical wrong answer) would diverge from the
+        Python loop's first-appearance order.
+        """
+        rng = random.Random(502)
+        branch_words = sorted(rng.sample(self.answer_words, 60))
+        for guess in rng.sample(self.guess_words, 15):
+            branch_indices = self.pm.answer_indices(branch_words)
+            slow = self.rc.group_words(guess, branch_words)
+            fast = self.pm.group_words(guess, branch_words, branch_indices)
+            with self.subTest(guess=guess):
+                self.assertEqual(list(fast.items()), list(slow.items()))
+
+    def test_response_cache_delegates_only_with_both_supplied(self):
+        """ResponseCache.group_words takes the fast path only when both
+        pattern_matrix and branch_indices are supplied; either alone falls
+        through to the loop (the interactive-fallback contract)."""
+        branch_words = sorted(random.Random(503).sample(self.answer_words, 10))
+        guess = self.guess_words[0]
+        branch_indices = self.pm.answer_indices(branch_words)
+        loop_only = self.rc.group_words(guess, branch_words)
+        matrix_without_indices = self.rc.group_words(
+            guess, branch_words, pattern_matrix=self.pm)
+        indices_without_matrix = self.rc.group_words(
+            guess, branch_words, branch_indices=branch_indices)
+        both = self.rc.group_words(
+            guess, branch_words, pattern_matrix=self.pm,
+            branch_indices=branch_indices)
+        self.assertEqual(list(matrix_without_indices.items()), list(loop_only.items()))
+        self.assertEqual(list(indices_without_matrix.items()), list(loop_only.items()))
+        self.assertEqual(list(both.items()), list(loop_only.items()))
 
 
 class TestAnswerListId(unittest.TestCase):

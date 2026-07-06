@@ -198,6 +198,41 @@ class PatternMatrix:
         rows = np.asarray(candidate_indices, dtype=np.int32)
         return self.matrix[rows][:, branch_indices]
 
+    def group_words(self, guess, branch_words, branch_indices):
+        """{pattern_int: [words]} for guess against branch_words — the
+        vectorized twin of ResponseCache.group_words, identical in keys,
+        values, and iteration order.
+
+        branch_indices must be index-aligned with branch_words (as returned
+        by answer_indices(branch_words)). One matrix row read plus a stable
+        argsort replaces the per-word Python loop; a stable sort on the
+        already-ascending-by-pattern boundaries preserves branch order
+        within each group, so each present pattern's first sorted position
+        is also its first-appearance position while walking branch_words —
+        exactly the insertion order the Python loop produces.
+        """
+        guess_row = self.guess_index(guess)
+        branch_patterns = self.matrix[guess_row, branch_indices]
+        order = np.argsort(branch_patterns, kind='mergesort')
+        sorted_patterns = branch_patterns[order]
+
+        # Ascending sort means every diff is >= 0, so uint8 subtraction
+        # never wraps around here.
+        boundaries = np.flatnonzero(np.diff(sorted_patterns)) + 1
+        starts = np.concatenate(([0], boundaries))
+        ends = np.concatenate((boundaries, [len(order)]))
+
+        segments = []
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            segment_order = order[start:end]
+            pattern = int(sorted_patterns[start])
+            first_index = int(segment_order[0])
+            words = [branch_words[i] for i in segment_order.tolist()]
+            segments.append((first_index, pattern, words))
+        segments.sort(key=lambda segment: segment[0])
+
+        return {pattern: words for _, pattern, words in segments}
+
     def candidate_stats(self, branch_indices):
         """Vectorized per-candidate statistics for every guess word against one branch.
 
