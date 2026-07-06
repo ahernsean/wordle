@@ -18,6 +18,8 @@ verify_erd_cache.log
 wordle_erd_export.sqlite3
 wordle_erd_export.sqlite3-shm
 wordle_erd_export.sqlite3-wal
+pattern_matrix_*.npy
+pattern_matrix_*.npy.*
 
 # Coverage artifacts
 .coverage
