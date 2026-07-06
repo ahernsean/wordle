@@ -431,10 +431,14 @@ class ResponseCache:
         and iteration order — computed by one matrix row read plus a stable
         argsort instead of the per-word loop below. Interactive-mode words
         outside the answer universe can't be expressed as branch_indices, so
-        those callers pass neither and take the loop.
+        those callers pass neither and take the loop; a guess outside the
+        matrix's guess vocabulary falls through to the loop the same way.
         """
         if pattern_matrix is not None and branch_indices is not None:
-            return pattern_matrix.group_words(guess, subset, branch_indices)
+            try:
+                return pattern_matrix.group_words(guess, subset, branch_indices)
+            except KeyError:
+                pass  # guess outside the matrix vocabulary: the loop handles any word
         self._ensure(guess)
         blob = self._cache[guess]
         groups = defaultdict(list)

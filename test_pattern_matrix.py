@@ -648,6 +648,39 @@ class TestGroupWordsFastPath(unittest.TestCase):
         self.assertEqual(list(indices_without_matrix.items()), list(loop_only.items()))
         self.assertEqual(list(both.items()), list(loop_only.items()))
 
+    def test_empty_branch_returns_empty_dict(self):
+        """PatternMatrix.group_words matches the loop on an empty branch
+        instead of indexing into an empty sorted-patterns array."""
+        branch_words = []
+        branch_indices = self.pm.answer_indices(branch_words)
+        slow = self.rc.group_words(self.guess_words[0], branch_words)
+        fast = self.pm.group_words(self.guess_words[0], branch_words, branch_indices)
+        self.assertEqual(fast, {})
+        self.assertEqual(list(fast.items()), list(slow.items()))
+
+    def test_size_one_branch(self):
+        branch_words = [self.answer_words[0]]
+        branch_indices = self.pm.answer_indices(branch_words)
+        for guess in (self.answer_words[0], self.guess_words[1]):
+            slow = self.rc.group_words(guess, branch_words)
+            fast = self.pm.group_words(guess, branch_words, branch_indices)
+            with self.subTest(guess=guess):
+                self.assertEqual(list(fast.items()), list(slow.items()))
+
+    def test_out_of_vocabulary_guess_falls_back_to_loop(self):
+        """ResponseCache.group_words with both pattern_matrix and
+        branch_indices supplied must still fall back to the loop for a
+        guess outside the matrix's guess vocabulary, not raise."""
+        branch_words = sorted(random.Random(504).sample(self.answer_words, 10))
+        branch_indices = self.pm.answer_indices(branch_words)
+        out_of_vocab_guess = next(
+            w for w in _ALL_GUESS_WORDS if w not in set(self.guess_words))
+        expected = self.rc.group_words(out_of_vocab_guess, branch_words)
+        actual = self.rc.group_words(
+            out_of_vocab_guess, branch_words,
+            pattern_matrix=self.pm, branch_indices=branch_indices)
+        self.assertEqual(list(actual.items()), list(expected.items()))
+
 
 class TestAnswerListId(unittest.TestCase):
     def test_matches_score_cache_id(self):

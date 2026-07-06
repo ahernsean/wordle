@@ -211,6 +211,8 @@ class PatternMatrix:
         is also its first-appearance position while walking branch_words —
         exactly the insertion order the Python loop produces.
         """
+        if len(branch_words) == 0:
+            return {}
         guess_row = self.guess_index(guess)
         branch_patterns = self.matrix[guess_row, branch_indices]
         order = np.argsort(branch_patterns, kind='mergesort')
