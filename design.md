@@ -8,11 +8,12 @@ with a live Wordle game by tracking remaining possible answers and
 recommending guesses, and also supports multi-board variants
 (Quordle, Dordle, etc.).
 
-Four layers:
+Five layers:
 
 | File | Role |
 |------|------|
 | `wordle_engine.py` | All algorithms: scoring, ERD search, response simulation. No I/O. |
+| `pattern_matrix.py` | NumPy pattern matrix + vectorized candidate statistics. Sole (guarded) NumPy import point; optional at runtime. |
 | `wordle.py` | REPL, display, all command handlers. |
 | `cache_sqlite.py` | SQLite-backed `ScoreCache`: ERD results, candidate scores, response decompositions. |
 | `erd_swarm.py` / `erd_queue.py` / `erd_search.py` | Parallel precache workers: branch assignment, candidate claiming, cooperative ERD solving. |
@@ -361,8 +362,31 @@ prefer joining in-flight depth over starting fresh top-level branches.
 
 ### Budget
 
-Workers solve branches under `ROOT_BUDGET = 5` (six total guesses minus the opener). A branch
-unsolvable in 5 guesses gets `cost = inf` — not a finite expected depth.
+`ROOT_BUDGET = GAME_GUESSES` (= 6, the whole game). Each queued branch is solved at
+`ROOT_BUDGET − guess_depth`, where `guess_depth` counts the guesses already played on the
+branch's spine — so a branch queued after the opener (`guess_depth` 1) is solved at budget 5.
+A branch unsolvable within its budget gets `cost = inf` — not a finite expected depth.
+
+### Pattern matrix (vectorized kernel)
+
+`pattern_matrix.py` owns one uint8 matrix — `matrix[g, a]` is the encoded response of guess
+word g against answer word a, exactly `ResponseCache`'s decomposition blobs stacked — persisted
+as `.npy` beside the cache and mmap-shared across worker processes. From one vectorized pass,
+`candidate_stats()` derives every candidate's response-group count, admissible cost lower
+bound, Σk² sort key, max group size, and entropy gain against a branch.
+
+Engine paths that consult it (via the optional `pattern_matrix` parameter threaded down from
+`min_expected_guesses`): the best-first candidate sort in `_solve_subset`, and the
+ERD-lower-bound pruning check in its candidate loop — skipping `evaluate_candidate` for any
+candidate whose admissible bound already meets `best_erd`, decision-identical to the check
+`evaluate_candidate` itself applies. Results are bit-identical to the pure-Python path by
+construction and by test (`test_kernel_equivalence.py`).
+
+NumPy is a hard requirement on every deployment target. The pure-Python implementations stay
+permanently — not as a runtime fallback but as the reference implementation the vectorized
+path is tested against; they are prohibited from calling NumPy, and selecting them is a
+caller choice (`pattern_matrix=None`). The phone (Pythonista bundles NumPy 1.22.3) sets the
+API floor — nothing newer than 1.22.
 
 ---
 

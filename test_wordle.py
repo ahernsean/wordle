@@ -2845,7 +2845,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
                                 guesses=None, policy=None,
                                 progress_callback=None,
                                 cancel_check=None, heartbeat=None,
-                                budget=None):
+                                budget=None, pattern_matrix=None):
             solver.stop()  # e.g. the user moved on; a fresh solver supersedes this one
             return 1.8
 
@@ -3001,7 +3001,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
                                progress_callback=None, cancel_check=None,
-                               heartbeat=None, budget=None):
+                               heartbeat=None, budget=None,
+                               pattern_matrix=None):
             if 'pass' not in snapshot:
                 snapshot['pass'] = 1
                 progress_callback(1, len(words), words[0], 1.5)
@@ -3065,7 +3066,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
                                progress_callback=None, cancel_check=None,
-                               heartbeat=None, budget=None):
+                               heartbeat=None, budget=None,
+                               pattern_matrix=None):
             heartbeat()
             return 1.5
 
@@ -3112,7 +3114,8 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
         def fake_min_expected(remaining, cache, sc, deadline=None,
                                guesses=None, policy=None,
                                progress_callback=None, cancel_check=None,
-                               heartbeat=None, budget=None):
+                               heartbeat=None, budget=None,
+                               pattern_matrix=None):
             heartbeat()
             return 1.5
 

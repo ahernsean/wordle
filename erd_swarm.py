@@ -23,6 +23,7 @@ import os
 import signal
 import time
 
+import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, mem_cache_limit
 from wordle_engine import (
     ERD_ALL,
@@ -320,6 +321,8 @@ class _BranchWorker:
         self.score_cache = ScoreCache(cache_path, self.all_answers,
                                       max_mem_entries=max_entries)
         self.rcache = ResponseCache(self.all_answers, self.score_cache)
+        self.pattern_matrix = pattern_matrix_module.PatternMatrix.load_or_build(
+            cache_path, self.all_words, self.all_answers, self.score_cache)
         self.queue = ERDQueue(queue_path)
 
         self.started = int(time.time())
@@ -754,6 +757,7 @@ class _BranchWorker:
             bound_provider=_bound_provider,
             mid_loop_publisher=self._mid_loop_publisher,
             metric_observer=_metric_observer if self._adaptive else None,
+            pattern_matrix=self.pattern_matrix,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound(),

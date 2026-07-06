@@ -272,9 +272,12 @@ class TestCutoffMetric(unittest.TestCase):
         work = estimate_candidate_work_cutoff(sizes, False, n, 3.0, 4, self._warm(5.0))
         self.assertGreater(work, 5.0 * 5)   # many groups counted, not just one
 
-    def test_cutoff_never_underestimates_reached_groups(self):
-        # Lower-bound accumulation => cutoff fires no earlier than the engine's,
-        # so cutoff work is an UPPER bound on the truly-reached groups: <= uncut.
+    def test_cutoff_no_greater_than_uncut(self):
+        # The cutoff estimate stops at the modeled bound-trip, so it can only
+        # drop groups the uncut sum includes: cutoff work <= uncut work.  (It is
+        # NOT a bound on the engine's truly-reached groups — the 3 - 2/k proxy
+        # accumulates faster than the admissible 2 - 1/k, so the modeled cutoff
+        # can fire earlier than the engine's.  See the docstring.)
         sizes, n = [10, 8, 6, 4, 2], 41
         cut = estimate_candidate_work_cutoff(sizes, False, n, 2.9, 4, self._warm(7.0))
         uncut = estimate_candidate_work(sizes, False, n, 2.9, 4, self._warm(7.0))

@@ -2,8 +2,9 @@
 
 ## Project structure
 
-A Wordle solver with four layers:
+A Wordle solver with five layers:
 - **Engine** (`wordle_engine.py`): core ERD search, scoring, response simulation
+- **Kernel** (`pattern_matrix.py`): NumPy response-pattern matrix and vectorized candidate statistics; the engine's sole NumPy import point. NumPy is a hard requirement on every target; the pure-Python engine paths remain permanently as the reference implementation (they never call NumPy), selected by passing `pattern_matrix=None`
 - **Cache** (`cache_sqlite.py`): SQLite-backed persistence of branch results and candidate scores
 - **Swarm** (`erd_swarm.py`, `erd_queue.py`, `erd_search.py`): parallel ERD precache workers
 - **CLI** (`wordle.py`): interactive game interface and all user-facing commands
@@ -165,3 +166,15 @@ The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any 
 3. Never require manual SQL — migrations run automatically on first open
 
 The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in `ERDQueue._migrate()`.
+
+---
+
+## Session token usage
+
+To check remaining session token budget and reset time, run:
+
+```
+claude -p /usage
+```
+
+There is no in-session tool that exposes this — it is the only way to see the limits.
