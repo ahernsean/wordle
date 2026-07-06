@@ -75,6 +75,26 @@ class TestPkCols(_TmpDB):
         self.assertIn("answer_list_id", pks)
 
 
+class TestTargetHasTable(_TmpDB):
+    def test_true_for_a_table_that_exists(self):
+        sc = self._cache("c.sqlite3")
+        sc.close()
+        conn = sqlite3.connect(self.path("c.sqlite3"))
+        try:
+            self.assertTrue(
+                import_cache._target_has_table(conn, "branch_best_by_policy"))
+        finally:
+            conn.close()
+
+    def test_false_for_a_table_that_does_not_exist(self):
+        conn = sqlite3.connect(self.path("empty.sqlite3"))
+        try:
+            self.assertFalse(
+                import_cache._target_has_table(conn, "branch_best_by_policy"))
+        finally:
+            conn.close()
+
+
 class TestInsertSql(unittest.TestCase):
     def _all_erd_cols(self):
         return list(import_cache._ERD_UPSERT_COLS) + ["extra_col"]

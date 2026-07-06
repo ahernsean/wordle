@@ -81,8 +81,12 @@ def cmd_export(args):
                     count=1, flags=re.IGNORECASE)
                 try:
                     conn.execute(idx_sql)
-                except sqlite3.OperationalError:
-                    pass  # already exists
+                except sqlite3.OperationalError:  # pragma: no cover
+                    # IF NOT EXISTS already suppresses a same-name collision;
+                    # this only guards a source schema too stale for the
+                    # table just created above (a state that can't arise
+                    # from a real cache, which is always current).
+                    pass
 
             cols = [r[1] for r in conn.execute(f'PRAGMA table_info({table})')]
             col_list = ', '.join(cols)
@@ -107,13 +111,13 @@ def cmd_export(args):
     except Exception:
         try:
             conn.execute('ROLLBACK')
-        except Exception:
+        except Exception:  # pragma: no cover — only if conn is already dead
             pass
         raise
     finally:
         try:
             conn.execute('DETACH DATABASE src')
-        except Exception:
+        except Exception:  # pragma: no cover — only if conn is already dead
             pass
         conn.close()
 

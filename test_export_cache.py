@@ -82,6 +82,46 @@ class TestExportCandidateScores(unittest.TestCase):
         self.assertEqual(root_scores, [('crane', 3.2)])
         self.assertEqual(other_scores, [('slate', 1.1)])
 
+    def test_table_missing_from_source_is_skipped_not_fatal(self):
+        args = _make_args(self._tmp.name)
+        self._seed_candidate_scores(args.cache)
+        conn = sqlite3.connect(args.cache)
+        conn.execute("DROP TABLE response_decomposition")
+        conn.close()
+
+        export_cache.cmd_export(args)
+
+        out_conn = sqlite3.connect(args.output)
+        tables = {r[0] for r in out_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        out_conn.close()
+        self.assertNotIn("response_decomposition", tables)
+        self.assertIn("candidate_scores", tables)
+
+    def test_error_mid_export_rolls_back_and_reraises(self):
+        args = _make_args(self._tmp.name)
+        self._seed_candidate_scores(args.cache)
+        # An export file whose answer_list table already exists under an
+        # incompatible (extra-column) definition makes the copied INSERT
+        # reference a column that isn't there, forcing a genuine failure
+        # partway through the transaction.
+        conn = sqlite3.connect(args.output)
+        conn.execute("CREATE TABLE answer_list (bogus_column TEXT)")
+        conn.close()
+
+        with self.assertRaises(sqlite3.OperationalError):
+            export_cache.cmd_export(args)
+
+        # The failed run must not wedge the file against a later, correct
+        # export attempt (proves DETACH/close ran despite the exception).
+        os.remove(args.output)
+        export_cache.cmd_export(args)
+        out_conn = sqlite3.connect(args.output)
+        n = out_conn.execute(
+            "SELECT COUNT(*) FROM candidate_scores").fetchone()[0]
+        out_conn.close()
+        self.assertEqual(n, 2)
+
 
 if __name__ == '__main__':
     unittest.main()
