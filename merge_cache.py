@@ -13,8 +13,9 @@ identical values — so INSERT OR IGNORE is exact.
 A missing target is not an error: it is created and any table the target
 lacks is built from the source's schema before merging, so merging an export
 into a fresh device restores a working cache.  ScoreCache._ensure_schema
-fills in whatever the source didn't carry (e.g. candidate_scores is absent
-from exports) the first time the app opens the merged cache.
+fills in whatever the source didn't carry (an export's candidate_scores only
+covers the root position, so a phone will still compute the rest itself as
+positions recur) the first time the app opens the merged cache.
 
 branch_best_by_policy is the exception: its primary key
 (branch_key, policy, answer_list_id) does NOT include solve_budget, so two caches
