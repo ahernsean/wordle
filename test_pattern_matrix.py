@@ -6,25 +6,18 @@ Acceptance bullets:
       counts_for_all_candidates match ResponseCache.group_counts — including
       branches that exercise multiple guess-row chunks and the final partial chunk.
   (c) Save/load round-trip equals the built matrix; shape mismatch → None.
-  (d) With NumPy absent, available() is False and import still succeeds.
-  (e) §3 candidate_stats: for branch sizes {8, 30, 100, 500}, every field matches
+  (d) §3 candidate_stats: for branch sizes {8, 30, 100, 500}, every field matches
       the per-candidate pure-Python computation — integers exactly,
       cost_lower_bound exactly, entropy within 1e-12.
 """
-import importlib
 import math
 import os
 import random
-import sys
 import tempfile
 import unittest
 from unittest import mock
 
-try:
-    import numpy as np
-    _NUMPY_AVAILABLE = True
-except ImportError:
-    _NUMPY_AVAILABLE = False
+import numpy as np
 
 import pattern_matrix
 from pattern_matrix import (
@@ -44,13 +37,6 @@ _ALL_GUESS_WORDS = _load_words(os.path.join(_REPO_DIR, "wordle.txt"))
 _ALL_ANSWER_WORDS = _load_words(os.path.join(_REPO_DIR, "NYT_wordlist.txt"))
 
 
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
-class TestAvailable(unittest.TestCase):
-    def test_available_true_with_numpy(self):
-        self.assertTrue(pattern_matrix.available())
-
-
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestMatrixCorrectness(unittest.TestCase):
     """Acceptance (a): matrix[g, a] == _encode_response(calculate_response(g, a))."""
 
@@ -89,7 +75,6 @@ class TestMatrixCorrectness(unittest.TestCase):
         np.testing.assert_array_equal(indices, [0, 1, 2, 3, 4])
 
 
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestCountsForAllCandidates(unittest.TestCase):
     """Acceptance (b): counts match ResponseCache.group_counts for ~20 random pairs.
 
@@ -183,7 +168,6 @@ class TestCountsForAllCandidates(unittest.TestCase):
                         f"row sums not all {len(branch_words)}: {row_sums[row_sums != len(branch_words)]}")
 
 
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestPatternsForCandidates(unittest.TestCase):
     """patterns_for_candidates returns the correct uint8 slice."""
 
@@ -210,7 +194,6 @@ class TestPatternsForCandidates(unittest.TestCase):
             np.testing.assert_array_equal(result[out_row], expected)
 
 
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestSaveLoad(unittest.TestCase):
     """Acceptance (c): save/load round-trip; shape mismatch → None."""
 
@@ -277,7 +260,6 @@ class TestSaveLoad(unittest.TestCase):
                 pm2.matrix[0, 0] = 0
 
 
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestBuildWithScoreCache(unittest.TestCase):
     """build() reads from score_cache when available and writes back misses."""
 
@@ -317,7 +299,6 @@ class TestBuildWithScoreCache(unittest.TestCase):
         self.assertEqual(pm.matrix.dtype, np.uint8)
 
 
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestLoadOrBuild(unittest.TestCase):
     """load_or_build(): the one path erd_swarm.py and wordle.py both use —
     load a cached matrix, or build and atomically persist one on a miss."""
@@ -424,14 +405,6 @@ class TestLoadOrBuild(unittest.TestCase):
         self.assertEqual(self._leftover_tmp_files(), [])
 
 
-class TestLoadOrBuildNumpyAbsent(unittest.TestCase):
-    def test_returns_none_when_numpy_unavailable(self):
-        with mock.patch.object(pattern_matrix, "_NUMPY_AVAILABLE", False):
-            self.assertIsNone(PatternMatrix.load_or_build(
-                "/nonexistent/cache.sqlite3", [], [], None))
-
-
-@unittest.skipUnless(_NUMPY_AVAILABLE, "NumPy not available")
 class TestCandidateStats(unittest.TestCase):
     """Acceptance §3: candidate_stats returns correct parallel arrays for all branch sizes.
 
@@ -604,55 +577,6 @@ class TestCandidateStats(unittest.TestCase):
         self.assertEqual(stats.sum_squared_group_sizes.dtype, np.int64)
         # All values must be non-negative integers.
         self.assertTrue(np.all(stats.sum_squared_group_sizes >= 0))
-
-
-class TestNumpyAbsent(unittest.TestCase):
-    """Acceptance (d): available() False and imports succeed without NumPy."""
-
-    def test_available_false_and_import_succeeds_without_numpy(self):
-        orig_numpy = sys.modules.get("numpy")
-        orig_pm = sys.modules.get("pattern_matrix")
-        try:
-            # None in sys.modules causes ImportError when the module executes
-            # 'import numpy' — the documented sentinel for a failed import.
-            sys.modules["numpy"] = None
-            # Remove pattern_matrix so it reimports fresh without numpy.
-            sys.modules.pop("pattern_matrix", None)
-            import pattern_matrix as pm_no_numpy
-            self.assertFalse(pm_no_numpy.available(),
-                             "available() must be False when numpy is absent")
-        finally:
-            # Restore original state.
-            if orig_numpy is not None:
-                sys.modules["numpy"] = orig_numpy
-            elif sys.modules.get("numpy") is None:
-                del sys.modules["numpy"]
-            if orig_pm is not None:
-                sys.modules["pattern_matrix"] = orig_pm
-            else:
-                sys.modules.pop("pattern_matrix", None)
-            # Reload the real pattern_matrix so subsequent tests work.
-            importlib.reload(pattern_matrix)
-
-    def test_engine_imports_without_numpy(self):
-        # wordle_engine does not import numpy, so it always loads cleanly.
-        # This verifies that engine import is independent of numpy availability.
-        orig_numpy = sys.modules.get("numpy")
-        orig_wm = sys.modules.get("wordle_engine")
-        try:
-            sys.modules["numpy"] = None
-            sys.modules.pop("wordle_engine", None)
-            import wordle_engine  # noqa: F401 — import succeeds is the assertion
-        finally:
-            if orig_numpy is not None:
-                sys.modules["numpy"] = orig_numpy
-            elif sys.modules.get("numpy") is None:
-                del sys.modules["numpy"]
-            if orig_wm is not None:
-                sys.modules["wordle_engine"] = orig_wm
-            else:
-                sys.modules.pop("wordle_engine", None)
-            importlib.reload(pattern_matrix)
 
 
 class TestAnswerListId(unittest.TestCase):

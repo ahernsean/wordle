@@ -301,11 +301,14 @@ record the answer next to it when known.
    cache writes. Identical ordering ⇒ identical float summation order ⇒
    bit-identical results. If a test needs a tolerance, the implementation is
    wrong (see C2.2's tie-order note and U8).
-2. **The pure-Python path stays, permanently.** Every vectorized function has
-   the existing implementation as its fallback, selected once at import
-   (`pattern_matrix.available()`). The engine must import and pass its full
-   test suite with NumPy absent. Pythonista bundles NumPy, but the fallback
-   guarantees the phone and the tests never *require* it.
+2. **The pure-Python path stays, permanently — as the reference
+   implementation, not a runtime fallback.** NumPy is a hard requirement on
+   every deployment target (Linux, CI, and Pythonista all have it — U1).
+   The pure-Python implementations are prohibited from calling NumPy and
+   exist so the equivalence tests (rule 1) always have an independent
+   oracle; selecting them is a caller choice (`pattern_matrix=None`), never
+   an availability check. There is no NumPy-absent configuration to support
+   or test.
 3. **NumPy 1.22 is the API floor** (U1 resolved: Pythonista bundles 1.22.3).
    Anything present in 1.22 is allowed; anything newer is not. In practice
    the code already targets a much older floor (`np.frombuffer`,
@@ -361,9 +364,11 @@ taken after U3 is known.
 ## §2. Pattern matrix module — new file `pattern_matrix.py` — **DONE (PR #84, merged)**
 
 Implemented as specified: `pattern_matrix.py` + `test_pattern_matrix.py`
-landed via PR #84, and CI now installs NumPy so both the NumPy-present and
-NumPy-absent paths are exercised. The spec below stands as the module's
-reference documentation.
+landed via PR #84, and CI installs NumPy. The spec below stands as the
+module's reference documentation, with one later policy change (Jul 5):
+the NumPy import guard and `available()` were removed — NumPy is a hard
+requirement (Part II rule 2), so the acceptance items about a NumPy-absent
+import no longer apply.
 
 **Read first:** `ResponseCache` (`wordle_engine.py:352-435`) — the matrix is
 its data, reshaped; `ScoreCache.read_decomposition` / `write_decomposition`
@@ -400,9 +405,8 @@ Shape (~12,972 × ~3,185) ≈ 41MB. Rows are byte-for-byte the
   The filename embeds `answer_list_id` (and the guess-list length) so a
   stale file for a different universe can never be loaded; on any shape or
   identity mismatch, rebuild.
-- `pattern_matrix.available() -> bool`: True iff NumPy imported successfully.
-  This module is the **only** place the engine imports NumPy, and the import
-  is guarded.
+- This module is the **only** place the engine imports NumPy — a hard,
+  unguarded dependency (NumPy is present on every deployment target; U1).
 
 **Index plumbing.**
 - `guess_index(word) -> int` (KeyError on unknown — callers decide fallback).
@@ -461,8 +465,6 @@ transients, not the shared matrix, are the dominant allocation (U2).
     including at least one branch larger than `_COUNT_CHUNK_ROWS` worth of
     work and one that exercises the final partial chunk.
   - Save/load round-trip equals the built matrix; identity mismatch rebuilds.
-  - With NumPy absent (simulated via import guard), `available()` is False
-    and importing the module (and the engine) still succeeds.
 - No file outside `pattern_matrix.py` + its test file is modified.
 
 ## §3. Vectorized candidate statistics — extends `pattern_matrix.py` — **DONE (PR #85, merged)**
@@ -626,7 +628,7 @@ Three invariants to preserve, each already load-bearing today:
   every existing caller is unchanged.
 - `erd_swarm.py`: `_BranchWorker` loads (mmap) or builds the matrix once per
   process, alongside its `ResponseCache`, and passes it down.
-- `wordle.py`: build lazily at session start when `available()`; interactive
+- `wordle.py`: build lazily at session start; interactive
   commands that rank the full vocabulary (`s`, `b`) may use §3 stats in a
   follow-up commit — optional, not part of this section's acceptance.
 
@@ -656,7 +658,7 @@ count, and the per-node share still spent in `group_words` (that share is
   order — chosen so that ERD-pruning any candidate against a misaligned bound
   changes the recorded winner or ERD, making the equivalence assertion catch
   an unpermuted or half-permuted bound array.
-- Full suite green with NumPy present and absent.
+- Full suite green.
 - PR description states the `metric_observer` choice (invariant 3).
 
 ## §5. Vectorized group partitioning (`group_words` fast path) — only if §4's measurement justifies it
@@ -765,7 +767,7 @@ shrink; this number decides how much §6 matters below the promotion threshold.
   solve with it off — byte-identical across all recorded values and cache
   writes.
 - `test_kernel_equivalence.py` fixtures re-run with dedupe on: identical.
-- Suite green with NumPy absent (dedupe silently off).
+- Full suite green.
 
 ## §7. Monster-branch calibration and top-level census — operational
 

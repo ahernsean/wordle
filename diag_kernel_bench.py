@@ -43,9 +43,7 @@ if VOCAB_SAMPLE:
     answers = sorted(rng.sample(answers, min(VOCAB_SAMPLE, len(answers))))
     vocab = sorted(set(rng.sample(vocab, min(VOCAB_SAMPLE, len(vocab)))) | set(answers))
 
-pm = pattern_matrix.PatternMatrix.build(vocab, answers) if pattern_matrix.available() else None
-if pm is None:
-    print('NumPy unavailable -- matrix-on path skipped.', flush=True)
+pm = pattern_matrix.PatternMatrix.build(vocab, answers)
 
 
 def _fresh_cache():
@@ -100,25 +98,22 @@ for size in BRANCH_SIZES:
     print(f'\n=== branch n={size} ===', flush=True)
     results = {}
     for tag, matrix in (('off', None), ('on', pm)):
-        if tag == 'on' and matrix is None:
-            continue
         wall, erd, nodes, group_words_seconds = solve(branch_words, matrix)
         share = (group_words_seconds / wall * 100) if wall > 0 else 0.0
         erd_s = 'abort' if erd is None else f'{erd:.5f}'
         print(f'  {tag:>3}: wall {wall:7.2f}s  erd {erd_s}  nodes {nodes:7d}  '
               f'group_words {share:5.1f}%', flush=True)
         results[tag] = erd
-    if 'on' in results and 'off' in results:
-        # Exact equality, per Part II rule 1: the matrix-on and matrix-off
-        # paths must produce bit-identical results, never "close enough" —
-        # a tolerance here would hide the exact bug this bench exists to
-        # catch. `==` also covers the both-aborted (None) case correctly.
-        expected, actual = results['off'], results['on']
-        if expected == actual:
-            print('  -> ERD MATCH', flush=True)
-        else:
-            print(f'  -> *** ERD DIFF *** off={expected!r} on={actual!r}', flush=True)
-            mismatches.append((size, expected, actual))
+    # Exact equality, per Part II rule 1: the matrix-on and matrix-off
+    # paths must produce bit-identical results, never "close enough" —
+    # a tolerance here would hide the exact bug this bench exists to
+    # catch. `==` also covers the both-aborted (None) case correctly.
+    expected, actual = results['off'], results['on']
+    if expected == actual:
+        print('  -> ERD MATCH', flush=True)
+    else:
+        print(f'  -> *** ERD DIFF *** off={expected!r} on={actual!r}', flush=True)
+        mismatches.append((size, expected, actual))
 
 print('\ndone', flush=True)
 if mismatches:

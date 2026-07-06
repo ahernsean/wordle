@@ -15,7 +15,6 @@ import random
 import tempfile
 import unittest
 
-import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache
 from pattern_matrix import PatternMatrix
 from wordle_engine import (
@@ -76,7 +75,6 @@ class _TmpCacheMixin:
         return result, _dump_cache_tables(score_cache)
 
 
-@unittest.skipUnless(pattern_matrix_module.available(), "NumPy not available")
 class TestKernelEquivalence(_TmpCacheMixin, unittest.TestCase):
     """The core §4 deliverable: matrix-on and matrix-off solves agree exactly."""
 
@@ -113,7 +111,6 @@ class TestKernelEquivalence(_TmpCacheMixin, unittest.TestCase):
                     self.assertEqual(dump_on, dump_off)
 
 
-@unittest.skipUnless(pattern_matrix_module.available(), "NumPy not available")
 class TestAllCandidatesERDPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
     """§4b invariant 2: a node where every candidate is ERD-pruned returns a
     cutoff, not a loss.
@@ -162,7 +159,6 @@ class TestAllCandidatesERDPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
         self.assertEqual(ticks[0], 1 + len(self.guess_words))
 
 
-@unittest.skipUnless(pattern_matrix_module.available(), "NumPy not available")
 class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
     """§4a: the sort-key and cost-lower-bound arrays must be permuted by BOTH
     candidate_rows and the sort order. This fixture makes a candidate's raw

@@ -4,7 +4,7 @@
 
 A Wordle solver with five layers:
 - **Engine** (`wordle_engine.py`): core ERD search, scoring, response simulation
-- **Kernel** (`pattern_matrix.py`): NumPy response-pattern matrix and vectorized candidate statistics; the engine's sole (guarded) NumPy import point — every consumer falls back to pure Python when NumPy is absent
+- **Kernel** (`pattern_matrix.py`): NumPy response-pattern matrix and vectorized candidate statistics; the engine's sole NumPy import point. NumPy is a hard requirement on every target; the pure-Python engine paths remain permanently as the reference implementation (they never call NumPy), selected by passing `pattern_matrix=None`
 - **Cache** (`cache_sqlite.py`): SQLite-backed persistence of branch results and candidate scores
 - **Swarm** (`erd_swarm.py`, `erd_queue.py`, `erd_search.py`): parallel ERD precache workers
 - **CLI** (`wordle.py`): interactive game interface and all user-facing commands
