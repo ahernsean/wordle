@@ -33,16 +33,15 @@ queue-remove    Remove a pending branch from the queue.  Use --force to also
 queue-priority  Change the priority of a queued branch.  Higher numbers are
                 worked sooner; 0 is the default.
 
-export          Create a trimmed snapshot of the cache for the iPhone
-                (answer_list, response_decomposition, branch_best_by_policy,
-                and the root position's candidate_scores).
-                Safe while workers are active; re-running is incremental.
-
 cache-status    Show ERD cache coverage for a given word: which response
                 patterns are cached and which are missing.
 
 queue-status    Show swarm queue coverage for a given word: which response
                 patterns are pending, in progress, done, or not yet queued.
+
+For exporting a trimmed cache snapshot to sync to the iPhone, or importing
+one from another machine, see export_cache.py and import_cache.py — the
+cache is shared with interactive play (wordle.py), not swarm-specific.
 """
 
 from __future__ import annotations
@@ -1439,127 +1438,6 @@ def _fmt_duration(seconds: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# export
-# ---------------------------------------------------------------------------
-
-EXPORT_TABLES = ['answer_list', 'response_decomposition',
-                  'branch_best_by_policy', 'candidate_scores']
-DEFAULT_EXPORT = 'wordle_erd_export.sqlite3'
-
-# candidate_scores holds a row per candidate per scoring method for every
-# branch position the swarm has ever touched — far too bulky to export in
-# full. The root position (the full answer list, before any guess) is the
-# one spot every game hits, and the one place a phone missing an ERD lookup
-# still wants entropy/max-group-size scores to rank candidates by, so only
-# its rows are exported.
-_ROOT_SCOPED_TABLES = {'candidate_scores'}
-
-
-def cmd_export(args):
-    """Create a trimmed export file with only the iPhone-useful tables.
-
-    Safe to run while workers are active: WAL mode allows concurrent reads,
-    so the export sees a consistent snapshot without stopping anything.
-    Re-running is incremental: INSERT OR IGNORE skips rows already present,
-    so you can refresh the export file at any time.
-    """
-    import sqlite3 as _sqlite3
-    import re
-
-    export_path = args.output or DEFAULT_EXPORT
-    cache_path = os.path.abspath(args.cache)
-    export_path = os.path.abspath(export_path)
-
-    all_answers = load_word_list(ANSWER_FILE)
-    root_subset_hash = ScoreCache._subset_hash(
-        ScoreCache.encode_subset(all_answers))
-
-    print(f'Source : {cache_path}')
-    print(f'Export : {export_path}')
-    print()
-
-    conn = _sqlite3.connect(export_path, timeout=30.0, isolation_level=None)
-    conn.row_factory = _sqlite3.Row
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA synchronous=NORMAL')
-    conn.execute(f"ATTACH DATABASE '{cache_path}' AS src")
-
-    try:
-        conn.execute('BEGIN')
-
-        total_new = 0
-        for table in EXPORT_TABLES:
-            # Copy CREATE TABLE statement from source, adding IF NOT EXISTS.
-            schema_row = conn.execute(
-                "SELECT sql FROM src.sqlite_master "
-                "WHERE type='table' AND name=?", (table,)).fetchone()
-            if schema_row is None:
-                print(f'  {table}: not found in source, skipping')
-                continue
-
-            create_sql = re.sub(
-                r'^(CREATE\s+TABLE\s+)',
-                r'\1IF NOT EXISTS ',
-                schema_row[0],
-                count=1, flags=re.IGNORECASE)
-            conn.execute(create_sql)
-
-            # Copy indexes.
-            for idx_row in conn.execute(
-                    "SELECT sql FROM src.sqlite_master "
-                    "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
-                    (table,)):
-                idx_sql = re.sub(
-                    r'^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)',
-                    r'\1IF NOT EXISTS ',
-                    idx_row[0],
-                    count=1, flags=re.IGNORECASE)
-                try:
-                    conn.execute(idx_sql)
-                except _sqlite3.OperationalError:
-                    pass  # already exists
-
-            cols = [r[1] for r in conn.execute(f'PRAGMA table_info({table})')]
-            col_list = ', '.join(cols)
-            where_clause = ''
-            params = ()
-            if table in _ROOT_SCOPED_TABLES:
-                where_clause = 'WHERE subset_hash = ?'
-                params = (root_subset_hash,)
-            conn.execute(f"""
-                INSERT OR IGNORE INTO main.{table} ({col_list})
-                SELECT {col_list} FROM src.{table}
-                {where_clause}
-            """, params)
-            n = conn.execute('SELECT changes()').fetchone()[0]
-            total = conn.execute(
-                f'SELECT COUNT(*) FROM {table}').fetchone()[0]
-            print(f'  {table}: +{n:,} new rows  ({total:,} total)')
-            total_new += n
-
-        conn.execute('COMMIT')
-        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-
-        size_mb = os.path.getsize(export_path) / 1e6
-        print(f'\nDone.  {export_path}  ({size_mb:.0f} MB)')
-        if total_new == 0:
-            print('(Already up to date.)')
-
-    except Exception:
-        try:
-            conn.execute('ROLLBACK')
-        except Exception:
-            pass
-        raise
-    finally:
-        try:
-            conn.execute('DETACH DATABASE src')
-        except Exception:
-            pass
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
 # reset-stale
 # ---------------------------------------------------------------------------
 
@@ -1722,14 +1600,6 @@ def main():
                             help='Reset in_progress rows to pending')
     p_rst.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
 
-    # -- export --
-    p_exp = sub.add_parser('export',
-                            help='Create a trimmed iPhone-ready cache snapshot')
-    p_exp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH',
-                       help=f'Source cache (default: {DEFAULT_CACHE})')
-    p_exp.add_argument('--output', default=DEFAULT_EXPORT, metavar='PATH',
-                       help=f'Output file (default: {DEFAULT_EXPORT})')
-
     args = parser.parse_args()
 
     dispatch = {
@@ -1746,7 +1616,6 @@ def main():
         'run': cmd_run,
         'status': cmd_status,
         'reset-stale': cmd_reset_stale,
-        'export': cmd_export,
     }
     dispatch[args.cmd](args)
 

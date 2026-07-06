@@ -221,26 +221,31 @@ ERD.
 ### Export for the iPhone
 
 ```bash
-python3.13 erd_search.py export
-python3.13 erd_search.py export --output wordle_erd_export.sqlite3
+python3.13 export_cache.py
+python3.13 export_cache.py --output wordle_erd_export.sqlite3
 ```
 
-Creates a trimmed snapshot (`wordle_erd_export.sqlite3`) containing only the
-three iPhone-relevant tables: `answer_list`, `response_decomposition`,
-`branch_best_by_policy`.  Safe to run while workers are active.  Re-running is
-incremental (INSERT OR IGNORE skips rows already present).
+Creates a trimmed snapshot (`wordle_erd_export.sqlite3`) containing
+`answer_list`, `response_decomposition`, `branch_best_by_policy`, and the
+root position's `candidate_scores` (that table is too bulky to export in
+full, but the root position — the full answer list, before any guess — is
+the one every game hits).  Safe to run while workers are active.  Re-running
+is incremental (INSERT OR IGNORE skips rows already present).
 
-### Merge a cache from another machine
+### Import a cache from another machine
 
 ```bash
-python3.13 merge_cache.py <source_db> [--target wordle_cache.sqlite3] [--dry-run]
+python3.13 import_cache.py <source_db> [--target wordle_cache.sqlite3] [--dry-run]
 ```
 
-Adds rows from `<source_db>` not already present in the local cache.  An
-incoming unconstrained (untainted) entry replaces an existing tainted
-(depth-limited) one for the same branch, since the unconstrained result is
-strictly more reusable.  Run `--dry-run` first to preview row counts.  Prefer
-to run while workers are stopped.
+Creates the target cache if it doesn't exist yet (schema copied from the
+source — e.g. importing an export_cache.py snapshot straight onto a fresh
+device), or merges into it if it already exists: adds rows from
+`<source_db>` not already present in the local cache.  An incoming
+unconstrained (untainted) entry replaces an existing tainted (depth-limited)
+one for the same branch, since the unconstrained result is strictly more
+reusable.  Run `--dry-run` first to preview row counts.  Prefer to run while
+workers are stopped.
 
 ---
 

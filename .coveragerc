@@ -2,7 +2,7 @@
 #
 # Scope: application core (wordle.py, wordle_engine.py, cache_sqlite.py),
 # parallel ERD precache coordination (erd_swarm.py, erd_queue.py), and the
-# cache merge utility (merge_cache.py).
+# cache sync utilities (export_cache.py, import_cache.py).
 # Out of scope: erd_search.py (supervisor/process-spawn/terminal CLI layer),
 # verify_erd_cache.py, and the one-off diagnostic and dataset scripts.
 [run]
@@ -13,7 +13,8 @@ source =
     cache_sqlite
     erd_swarm
     erd_queue
-    merge_cache
+    export_cache
+    import_cache
 
 [report]
 # Schema migrations are deliberately uncovered: they run once against legacy

@@ -1,21 +1,24 @@
 #!/usr/bin/env python3.13
-"""merge_cache.py — Merge a source wordle_cache.sqlite3 into the local one.
+"""import_cache.py — Import a source wordle_cache.sqlite3 into the local one.
 
 Usage
 -----
-  python3.13 merge_cache.py <source_db> [--target PATH] [--dry-run]
+  python3.13 import_cache.py <source_db> [--target PATH] [--dry-run]
 
-Adds rows from <source_db> not already present in --target across all four
-cache tables.  Three of them (answer_list, response_decomposition, candidate_scores)
+Creates the target cache if it doesn't exist yet (schema copied from the
+source), or merges into it if it already does — adding rows from
+<source_db> not already present in --target across all four cache tables.
+Three of them (answer_list, response_decomposition, candidate_scores)
 are deterministic given the same answer-word universe — matching keys imply
 identical values — so INSERT OR IGNORE is exact.
 
-A missing target is not an error: it is created and any table the target
-lacks is built from the source's schema before merging, so merging an export
-into a fresh device restores a working cache.  ScoreCache._ensure_schema
-fills in whatever the source didn't carry (an export's candidate_scores only
-covers the root position, so a phone will still compute the rest itself as
-positions recur) the first time the app opens the merged cache.
+A missing target restores a working cache rather than erroring: any table
+the target lacks is built from the source's schema before merging, so
+importing an export_cache.py snapshot onto a fresh device just works.
+ScoreCache._ensure_schema fills in whatever the source didn't carry (an
+export's candidate_scores only covers the root position, so a phone will
+still compute the rest itself as positions recur) the first time the app
+opens the merged cache.
 
 branch_best_by_policy is the exception: its primary key
 (branch_key, policy, answer_list_id) does NOT include solve_budget, so two caches

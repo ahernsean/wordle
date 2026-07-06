@@ -1,6 +1,6 @@
-"""Unit tests for merge_cache.py utility functions.
+"""Unit tests for import_cache.py utility functions.
 
-The merge_cache module is a CLI tool (main() is # pragma: no cover), but its
+The import_cache module is a CLI tool (main() is # pragma: no cover), but its
 utility functions — _fmt_eta, _all_cols, _pk_cols, _insert_sql, and
 _copy_table_with_progress — contain real logic worth pinning.
 
@@ -16,7 +16,7 @@ import unittest
 
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL
-import merge_cache
+import import_cache
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
 
@@ -35,13 +35,13 @@ class _TmpDB(unittest.TestCase):
 
 class TestFmtEta(unittest.TestCase):
     def test_seconds_only(self):
-        self.assertEqual(merge_cache._fmt_eta(45), "45s")
+        self.assertEqual(import_cache._fmt_eta(45), "45s")
 
     def test_minutes_and_seconds(self):
-        self.assertEqual(merge_cache._fmt_eta(75), "1m15s")
+        self.assertEqual(import_cache._fmt_eta(75), "1m15s")
 
     def test_hours_and_minutes(self):
-        self.assertEqual(merge_cache._fmt_eta(3661), "1h01m")
+        self.assertEqual(import_cache._fmt_eta(3661), "1h01m")
 
 
 class TestAllCols(_TmpDB):
@@ -50,7 +50,7 @@ class TestAllCols(_TmpDB):
         sc.close()
         conn = sqlite3.connect(self.path("c.sqlite3"))
         try:
-            cols = merge_cache._all_cols(conn, "branch_best_by_policy")
+            cols = import_cache._all_cols(conn, "branch_best_by_policy")
         finally:
             conn.close()
         self.assertIn("branch_key", cols)
@@ -65,7 +65,7 @@ class TestPkCols(_TmpDB):
         sc.close()
         conn = sqlite3.connect(self.path("c.sqlite3"))
         try:
-            pks = merge_cache._pk_cols(conn, "branch_best_by_policy")
+            pks = import_cache._pk_cols(conn, "branch_best_by_policy")
         finally:
             conn.close()
         self.assertIn("branch_key", pks)
@@ -75,22 +75,22 @@ class TestPkCols(_TmpDB):
 
 class TestInsertSql(unittest.TestCase):
     def _all_erd_cols(self):
-        return list(merge_cache._ERD_UPSERT_COLS) + ["extra_col"]
+        return list(import_cache._ERD_UPSERT_COLS) + ["extra_col"]
 
     def test_branch_best_with_all_required_cols_returns_upsert(self):
-        sql = merge_cache._insert_sql("branch_best_by_policy", self._all_erd_cols())
+        sql = import_cache._insert_sql("branch_best_by_policy", self._all_erd_cols())
         self.assertIn("DO UPDATE", sql)
         self.assertIn("solve_budget IS NOT NULL", sql)
 
     def test_other_table_returns_insert_or_ignore(self):
-        sql = merge_cache._insert_sql("response_decomposition", ["guess", "patterns"])
+        sql = import_cache._insert_sql("response_decomposition", ["guess", "patterns"])
         self.assertIn("INSERT OR IGNORE", sql)
         self.assertNotIn("DO UPDATE", sql)
 
     def test_branch_best_missing_required_col_falls_back_to_insert_or_ignore(self):
         # Without solve_budget the tainted-vs-untainted rule cannot be applied.
-        cols = [c for c in merge_cache._ERD_UPSERT_COLS if c != "solve_budget"]
-        sql = merge_cache._insert_sql("branch_best_by_policy", cols)
+        cols = [c for c in import_cache._ERD_UPSERT_COLS if c != "solve_budget"]
+        sql = import_cache._insert_sql("branch_best_by_policy", cols)
         self.assertIn("INSERT OR IGNORE", sql)
         self.assertNotIn("DO UPDATE", sql)
 
@@ -107,7 +107,7 @@ class TestCopyTableWithProgress(_TmpDB):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"ATTACH DATABASE '{self.path('source.sqlite3')}' AS src")
         try:
-            return merge_cache._copy_table_with_progress(conn, table)
+            return import_cache._copy_table_with_progress(conn, table)
         finally:
             conn.execute("DETACH DATABASE src")
             conn.close()
@@ -170,11 +170,11 @@ class TestCreateTargetTableFromSource(_TmpDB):
         conn = self._connect_empty_target()
         try:
             self.assertFalse(
-                merge_cache._target_has_table(conn, "branch_best_by_policy"))
-            merge_cache._create_target_table_from_source(
+                import_cache._target_has_table(conn, "branch_best_by_policy"))
+            import_cache._create_target_table_from_source(
                 conn, "branch_best_by_policy")
             self.assertTrue(
-                merge_cache._target_has_table(conn, "branch_best_by_policy"))
+                import_cache._target_has_table(conn, "branch_best_by_policy"))
         finally:
             conn.execute("DETACH DATABASE src")
             conn.close()
@@ -183,10 +183,10 @@ class TestCreateTargetTableFromSource(_TmpDB):
         self._make_src_with_entry()
         conn = self._connect_empty_target()
         try:
-            merge_cache._create_target_table_from_source(
+            import_cache._create_target_table_from_source(
                 conn, "branch_best_by_policy")
             self.assertEqual(
-                merge_cache._all_cols(conn, "branch_best_by_policy"),
+                import_cache._all_cols(conn, "branch_best_by_policy"),
                 [r[1] for r in conn.execute(
                     "PRAGMA src.table_info(branch_best_by_policy)")])
             src_indexes = {r[0] for r in conn.execute(
@@ -206,9 +206,9 @@ class TestCreateTargetTableFromSource(_TmpDB):
         self._make_src_with_entry()
         conn = self._connect_empty_target()
         try:
-            merge_cache._create_target_table_from_source(
+            import_cache._create_target_table_from_source(
                 conn, "branch_best_by_policy")
-            n = merge_cache._copy_table_with_progress(
+            n = import_cache._copy_table_with_progress(
                 conn, "branch_best_by_policy")
         finally:
             conn.execute("DETACH DATABASE src")

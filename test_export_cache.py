@@ -1,4 +1,4 @@
-"""Unit tests for erd_search.cmd_export.
+"""Unit tests for export_cache.cmd_export.
 
 Covers the root-scoped candidate_scores export: the table is far too bulky
 to export in full (a row per candidate per method for every branch position
@@ -12,7 +12,7 @@ import tempfile
 import types
 import unittest
 
-import erd_search
+import export_cache
 from cache_sqlite import ScoreCache
 from wordle_engine import load_word_list
 
@@ -33,7 +33,7 @@ class TestExportCandidateScores(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.all_answers = load_word_list(erd_search.ANSWER_FILE)
+        self.all_answers = load_word_list(export_cache.ANSWER_FILE)
 
     def _seed_candidate_scores(self, cache_path):
         sc = ScoreCache(cache_path, self.all_answers)
@@ -47,7 +47,7 @@ class TestExportCandidateScores(unittest.TestCase):
         args = _make_args(self._tmp.name)
         self._seed_candidate_scores(args.cache)
 
-        erd_search.cmd_export(args)
+        export_cache.cmd_export(args)
 
         conn = sqlite3.connect(args.output)
         rows = conn.execute(
@@ -62,8 +62,8 @@ class TestExportCandidateScores(unittest.TestCase):
         args = _make_args(self._tmp.name)
         self._seed_candidate_scores(args.cache)
 
-        erd_search.cmd_export(args)
-        erd_search.cmd_export(args)
+        export_cache.cmd_export(args)
+        export_cache.cmd_export(args)
 
         conn = sqlite3.connect(args.output)
         n = conn.execute(
@@ -75,7 +75,7 @@ class TestExportCandidateScores(unittest.TestCase):
         args = _make_args(self._tmp.name)
         self._seed_candidate_scores(args.cache)
 
-        erd_search.cmd_export(args)
+        export_cache.cmd_export(args)
 
         sc = ScoreCache(args.output, self.all_answers,
                         checkpoint_on_close=False)
