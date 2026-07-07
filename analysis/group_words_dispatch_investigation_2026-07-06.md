@@ -3,11 +3,22 @@
 Written while addressing PR #94 review comments. Records the investigation
 into the reviewer's CONFIRMED finding that the unconditional `branch_indices`
 computation (and, more precisely, the unconditional `group_words` fast-path
-dispatch) regresses large, deep-recursion branches like n=500, and why the
-fix committed alongside this document (warm/cold dispatch + ski-rental
-promotion, `_GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD = 250`) does not fully
-close the gap. Intended for the next implementer/reviewer to pick up from,
-not as a design document to follow blindly.
+dispatch) regresses large, deep-recursion branches like n=500, and the fix
+committed alongside this document (warm/cold dispatch + ski-rental
+promotion, `_GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD = 250`).
+
+**Resolved — see "Resolution: the gap was a measurement-window artifact"
+at the end.** Everything through "What's committed" below was written
+before that result and measures n=500 exclusively at a 120s deadline; at
+that horizon the dispatch looks like it only partially closes the gap.
+Longer-horizon measurement (600s) shows it fully closes and then wins,
+because 120s sits almost exactly on the ski-rental promotion's own
+crossover point — a methodology artifact of the window, not a property of
+the dispatch. The root-cause analysis and the "any decode cost is paid
+exactly once per guess, however distributed" throughline below are correct
+and still the right way to think about this; only the final verdict at the
+end supersedes the pessimistic reading in "What didn't work" and "What
+would likely actually fix it."
 
 ## The acceptance bar
 
@@ -137,3 +148,64 @@ off mode's throughput at that size. Full test suite green; correctness
 (exactness of the fast/slow path equivalence) is unaffected by any of this —
 every configuration above produces bit-identical `ERD MATCH` results, this
 is purely a wall-clock/throughput question.
+
+## Resolution: the gap was a measurement-window artifact
+
+Every n=500 number above uses a 120s deadline. 120s is almost exactly the
+ski-rental promotion's own crossover timescale: at the measured per-guess
+reuse rate (~40-50 fast-path uses per 20s), a guess that's genuinely hot
+crosses K=250 around t=100-125s. A 120s run therefore pays the fast-path
+overhead *and* the promotion decodes for most guesses inside the measurement
+window, while the warm-loop payoff for having promoted them lands just
+outside it — the worst possible place to end the clock for a ski-rental
+strategy. The K=∞ (no promotion) result above (10.4M vs off's 15.8M) is
+consistent with this: if the transient cost were landing in-window while the
+benefit landed after the deadline, disabling promotion entirely would remove
+that specific tax and read *better* than K=250 at this exact horizon —
+which is exactly what was measured, and the reason it looked like evidence
+against ski-rental rather than evidence about the window being too short.
+
+Re-run on this branch's head (`640f64d`), same methodology as above (within-
+run off/on A/B, same branch, idle box), but `DIAG_DEADLINE_S=600`:
+
+| config | nodes at 600s | group_words share |
+|---|---|---|
+| off | 89,256,093 | 39.3% |
+| on (K=250, as committed) | **98,066,635** | 38.6% |
+
+Matrix-on is **1.10x ahead of off** at n=500 once the window outlasts the
+transient — the `group_words` shares converge because after roughly two
+minutes every guess that will ever be hot has promoted and is warm, so both
+configurations spend the rest of the run on the same warm Python loop, while
+on-mode retains §4's vectorized ordering/pruning advantage on top of it. The
+one-time transient is bounded and predictable: roughly
+`13,000 guesses x (250 uses x ~20us + one ~5ms decode) ~ 2 minutes`, paid
+once per `ResponseCache` instance's lifetime, not once per node or per
+branch. Production swarm workers run for hours and share one cache across
+many claims (`erd_swarm.py`'s `_BranchWorker`), so for the beast/monster-
+class branches this dispatch exists for, a two-minute one-time transient
+rounds to zero against the runtime it's amortized over.
+
+Independently re-confirmed at `DIAG_DEADLINE_S=300` (same branch, same
+methodology, separate run): off reached 49,681,733 nodes, on reached
+51,266,836 — a smaller but still real 1.03x lead, exactly consistent with
+300s being partway between the ~120s transient and the ~600s fully-settled
+horizon rather than a contradiction of either measurement.
+
+**Revised conclusions, superseding "What didn't work" and "What would likely
+actually fix it" above:**
+
+1. The committed dispatch (`ResponseCache.group_words`'s warm/cold check +
+   `_GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD = 250`) is the right design.
+   No further work is needed in this PR. The global cross-branch regime
+   detector speculated about above is unnecessary — the ski-rental
+   threshold already converges to (and then beats) off mode's steady state;
+   it just needs long enough to do it, which any real solve provides.
+2. The "any decode cost must be paid exactly once per guess, however that
+   payment is distributed in time" framing was correct throughout — the
+   missing piece was that a 120s window charges the payment side of that
+   ledger without waiting around to collect the payoff side.
+3. n=8/30/81/146 are unaffected by any of this: the K-sweep in "Root cause,
+   precisely" already showed those sizes are insensitive to the threshold
+   value entirely (promotion never triggers within their much smaller total
+   call volumes), so widening the measurement horizon changes nothing there.
