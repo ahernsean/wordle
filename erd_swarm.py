@@ -1280,7 +1280,7 @@ class _BranchWorker:
         }
         # claim can be None only if another worker grabbed every candidate
         # between create and claim — rare; treat as "nothing for me right now".
-        if claim is None:
+        if claim is None:  # pragma: no cover
             return None
         bundle_id, indices, forced = claim
         return branch, bundle_id, indices, forced

@@ -863,7 +863,7 @@ class ERDQueue:
                     break
                 except sqlite3.OperationalError:
                     if time.perf_counter() - _acquire_t0 > self._timeout:
-                        raise
+                        raise  # pragma: no cover — total lock starvation
                     retries += 1
         finally:
             self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
@@ -883,13 +883,15 @@ class ERDQueue:
             bound = br["best_erd"] if br["best_erd"] is not None else float("inf")
             cursor = br["pack_cursor"]
             if cursor < n_candidates:
+                # start < len(candidate_order) and count_cap >= 1 together
+                # guarantee _pack_bundle takes at least one candidate, so the
+                # forward path's bundle is never empty here.
                 bundle, new_cursor = _pack_bundle(
                     candidate_order, cursor, cost_lower_bound, bound,
                     small_count, count_cap)
-                if bundle:
-                    self._conn.execute(
-                        "UPDATE active_branches SET pack_cursor = ? "
-                        "WHERE branch_key = ?", (new_cursor, branch_key))
+                self._conn.execute(
+                    "UPDATE active_branches SET pack_cursor = ? "
+                    "WHERE branch_key = ?", (new_cursor, branch_key))
             else:
                 claimed = {r["idx"] for r in self._conn.execute(
                     "SELECT idx FROM candidate_claims WHERE branch_key = ?",
@@ -908,15 +910,13 @@ class ERDQueue:
                     (branch_key, idx, claimed_by, claimed_at, done, bundle_id)
                 VALUES (?, ?, ?, ?, 0, ?)
             """, [(branch_key, idx, worker_id, now, bundle_id) for idx in bundle])
-            forced = frozenset()
-            if republish_limit is not None:
-                placeholders = ",".join("?" * len(bundle))
-                rows = self._conn.execute(
-                    f"SELECT idx FROM candidate_republish "
-                    f"WHERE branch_key = ? AND count >= ? "
-                    f"AND idx IN ({placeholders})",
-                    (branch_key, republish_limit, *bundle)).fetchall()
-                forced = frozenset(r["idx"] for r in rows)
+            placeholders = ",".join("?" * len(bundle))
+            rows = self._conn.execute(
+                f"SELECT idx FROM candidate_republish "
+                f"WHERE branch_key = ? AND count >= ? "
+                f"AND idx IN ({placeholders})",
+                (branch_key, republish_limit, *bundle)).fetchall()
+            forced = frozenset(r["idx"] for r in rows)
             self._conn.execute("COMMIT")
             return (bundle_id, bundle, forced)
         except Exception:  # pragma: no cover

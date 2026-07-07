@@ -71,6 +71,12 @@ def _bare_worker():
     w._node_time_ema = erd_swarm._LogEMA()
     w._mid_loop_publisher = erd_swarm._MidLoopPublisher(w)
     w.n_workers = 1
+    w.small_count = erd_swarm.BUNDLE_SMALL_COUNT
+    w.count_cap = erd_swarm.BUNDLE_COUNT_CAP
+    w.bundle_node_cap = erd_swarm.BUNDLE_NODE_CAP
+    w.bundle_wall_cap_seconds = erd_swarm.BUNDLE_WALL_CAP_SECONDS
+    w.republish_limit = erd_swarm.BUNDLE_REPUBLISH_LIMIT
+    w._packing_stats_cache = {}
     w.rcache = mock.MagicMock()
     w.pattern_matrix = None
     w.score_cache = mock.MagicMock()
@@ -223,6 +229,29 @@ class TestCancelPath(unittest.TestCase):
         w.request_stop()
         self.assertTrue(w.cancel())
         self.assertIsNone(w.stop_event)
+
+    def test_evaluate_bundle_returns_false_and_records_censored_bundle_on_cancel(self):
+        # Cancelled before the first candidate in the bundle is even attempted.
+        w = self._make_cancel_worker()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        result = w.evaluate_bundle(branch_key, BRANCH, len(BRANCH), "bundle-1",
+                                   [0, 1], frozenset())
+        self.assertFalse(result)
+        w.queue.record_bundle_stats.assert_called_once_with(
+            branch_key, "bundle-1", 0, mock.ANY, censored=True)
+
+    def test_evaluate_bundle_returns_false_when_evaluate_claim_fails_mid_bundle(self):
+        # Not cancelled at the loop level, but evaluate_claim itself reports
+        # cancellation (or an abort status) partway through the bundle.
+        w = _bare_worker()
+        w.evaluate_claim = mock.MagicMock(return_value=False)
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        result = w.evaluate_bundle(branch_key, BRANCH, len(BRANCH), "bundle-2",
+                                   [0, 1], frozenset())
+        self.assertFalse(result)
+        w.evaluate_claim.assert_called_once()
+        w.queue.record_bundle_stats.assert_called_once_with(
+            branch_key, "bundle-2", 0, mock.ANY, censored=True)
 
 
 class TestEvaluateClaimPatternMatrix(unittest.TestCase):
@@ -486,6 +515,85 @@ class TestSolveBranchFocusedPrecompletedCandidates(unittest.TestCase):
         q.close()
 
 
+class TestSolveBranchFocusedMultiBundleDrain(unittest.TestCase):
+    """solve_branch_focused loops back for another bundle when the branch
+    isn't yet fully covered — a small_count/count_cap forcing several bundles
+    to drain len(CANDIDATES) exercises that loop-continuation path, not just
+    the single-bundle and precompleted-candidates cases covered elsewhere."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def test_drains_all_candidates_across_several_bundles(self):
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.create_branch(branch_key, len(BRANCH), len(CANDIDATES), budget=ROOT_BUDGET)
+        q.close()
+
+        # small_count=2, count_cap=2: len(CANDIDATES)=10 needs >= 5 bundles,
+        # so the loop must claim, evaluate, and loop back repeatedly before
+        # coverage is complete and it finalizes.
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None,
+                          small_count=2, count_cap=2)
+        try:
+            w.solve_branch_focused(branch_key)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        self.assertIsNone(q.get_branch(branch_key))   # finalized + deleted
+        q.close()
+        sc = ScoreCache(self.cache_path, BRANCH, checkpoint_on_close=False)
+        cached = sc.read(branch_key, ERD_ALL)
+        sc.close()
+        self.assertIsNotNone(cached)
+
+    def test_stops_without_finalizing_when_evaluate_bundle_reports_cancellation(self):
+        # evaluate_bundle returning False (cancelled mid-evaluation) must stop
+        # the drain loop without finalizing, exactly like a single-bundle
+        # cancellation — this is the multi-bundle loop's own cancel exit, not
+        # evaluate_claim's.
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.create_branch(branch_key, len(BRANCH), len(CANDIDATES), budget=ROOT_BUDGET)
+        q.close()
+
+        stop = multiprocessing.Event()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, stop)
+
+        def fake_evaluate_bundle(*args, **kwargs):
+            stop.set()
+            return False
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate_bundle)
+        try:
+            w.solve_branch_focused(branch_key)
+        finally:
+            w.close()
+
+        w.evaluate_bundle.assert_called_once()
+        q = ERDQueue(self.queue_path)
+        self.assertIsNotNone(q.get_branch(branch_key))   # not finalized
+        q.close()
+
+
 class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
     """claim_one() joins a branch that is already in-progress (created by
     another worker) rather than promoting a new one from the pending queue."""
@@ -639,6 +747,63 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertAlmostEqual(cached[1], cost, places=6)
 
+    def test_does_not_finalize_when_evaluate_bundle_reports_cancellation(self):
+        words = BRANCH
+        branch_key = ScoreCache.encode_subset(words)
+        stop = multiprocessing.Event()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, stop)
+
+        def fake_evaluate_bundle(*args, **kwargs):
+            stop.set()
+            return False
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate_bundle)
+        try:
+            w.cooperative_solve(words, ROOT_BUDGET)
+        finally:
+            w.close()
+
+        w.evaluate_bundle.assert_called_once()
+        from erd_queue import ERDQueue
+        q = ERDQueue(self.queue_path)
+        self.assertIsNotNone(q.get_branch(branch_key))   # not finalized
+        q.close()
+
+    def test_finalizes_when_all_candidates_already_done_by_other_workers(self):
+        # Mirrors solve_branch_focused's precompleted-candidates case: another
+        # cooperative worker already evaluated every candidate before this
+        # worker joins, so _claim_bundle returns None but coverage is already
+        # complete — cooperative_solve must finalize from that branch, not
+        # via evaluate_bundle.
+        from erd_queue import ERDQueue
+        words = BRANCH
+        branch_key = ScoreCache.encode_subset(words)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        q.create_branch(branch_key, len(words), n_candidates,
+                        budget=ROOT_BUDGET, priority=erd_swarm.PROMOTED_PRIORITY)
+        order = list(range(n_candidates))
+        cost_lower_bound = [0.0] * n_candidates
+        bundle_id, indices, _forced = q.claim_next_bundle(
+            branch_key, "other", n_candidates, order, cost_lower_bound,
+            small_count=n_candidates, count_cap=n_candidates)
+        for idx in indices:
+            q.complete_candidate(branch_key, idx)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            result = w.cooperative_solve(words, ROOT_BUDGET)
+        finally:
+            w.close()
+
+        # No feasible guess was ever recorded, so this finalizes as a proven
+        # loss: the branch is gone, but there is no cache entry to read.
+        self.assertIsNotNone(result)
+        q = ERDQueue(self.queue_path)
+        self.assertIsNone(q.get_branch(branch_key))
+        q.close()
+
 
 class TestHelpOtherBranch(unittest.TestCase):
     """_help_other_branch claims and evaluates one candidate from a branch other
@@ -691,6 +856,34 @@ class TestHelpOtherBranch(unittest.TestCase):
 
         # Should have evaluated a candidate and returned True.
         self.assertTrue(result)
+
+    def test_returns_true_without_finalizing_when_evaluate_bundle_reports_cancellation(self):
+        # _help_other_branch reports True (a bundle WAS claimed) even when
+        # evaluation itself was cancelled — it never finalizes in that case.
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        key_a = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(key_a, len(BRANCH), n_candidates,
+                        budget=ROOT_BUDGET, priority=0)
+        words_b = BRANCH[:4]
+        key_b = ScoreCache.encode_subset(words_b)
+        q.create_branch(key_b, len(words_b), n_candidates,
+                        budget=ROOT_BUDGET, priority=1)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w.evaluate_bundle = mock.MagicMock(return_value=False)
+        try:
+            result = w._help_other_branch(key_a)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        q = ERDQueue(self.queue_path)
+        self.assertIsNotNone(q.get_branch(key_b))   # not finalized
+        q.close()
 
     def test_help_other_branch_returns_false_when_no_candidates_available(self):
         """When no other branches have available candidate claims, help_other_branch

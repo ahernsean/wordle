@@ -10,8 +10,10 @@ predate the packer.  This file covers the packer itself.
 """
 import inspect
 import os
+import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -136,6 +138,33 @@ class TestClaimNextBundle(_TmpQueue):
         with self.assertRaises(ValueError):
             self.q.claim_next_bundle(self.key, "w0", N_CANDIDATES, [0, 1, 2],
                                      _ZERO_LOWER_BOUND)
+
+    def test_counts_real_busy_retries_under_write_lock_contention(self):
+        # Hold the write lock from a second connection just long enough that
+        # claim_next_bundle's short per-attempt busy_timeout
+        # (_BUNDLE_CLAIM_RETRY_MILLIS) must fail and retry at least once
+        # before the lock is released.
+        # check_same_thread=False: released from the timer thread below, not
+        # the thread that opened it — sqlite3 forbids that by default.
+        blocker = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute("SELECT 1")
+
+        def release():
+            time.sleep(0.25)
+            blocker.commit()
+            blocker.close()
+        t = threading.Thread(target=release)
+        t.start()
+        try:
+            claim = self.q.claim_next_bundle(
+                self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+                small_count=5, count_cap=5)
+        finally:
+            t.join(timeout=5)
+        self.assertIsNotNone(claim)
+        self.assertGreater(self.q._last_claim_retries, 0)
+        self.assertGreater(self.q._last_claim_busy_millis, 0)
 
     def test_no_two_calls_return_overlapping_indices(self):
         seen = set()
