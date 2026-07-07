@@ -15,7 +15,7 @@ Three checks:
    complete_chunk) that thread-based tests cannot exercise.
 
 3. Cooperative drain timing (fork only): spawn 1 vs 4 swarm_workers, drain 80
-   disjoint branches from a shared queue, and assert 4 workers finish in < 80%
+   disjoint branches from a shared queue, and assert 4 workers finish in < 90%
    of 1-worker time.  Key design constraints that make the comparison
    meaningful are documented on TestCooperativeDrainSmoke.
 """
