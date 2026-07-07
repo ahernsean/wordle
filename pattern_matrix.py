@@ -42,6 +42,25 @@ def _compute_guess_vocabulary_id(guess_words):
     return hashlib.sha256("\n".join(guess_words).encode()).hexdigest()
 
 
+def _stable_pattern_segments(pattern_values):
+    """Split pattern_values into contiguous same-value runs via a stable
+    mergesort argsort, returning (sorted_order, sorted_patterns, segment_starts,
+    segment_stops).
+
+    A mergesort argsort groups equal pattern values into contiguous segments
+    while preserving original-index order within each (the stable-sort
+    invariant), so every segment's sorted_order slice is already ascending by
+    original position — the first element is that pattern's first-appearance
+    position among pattern_values.
+    """
+    sorted_order = np.argsort(pattern_values, kind='mergesort').astype(np.int32)
+    sorted_patterns = pattern_values[sorted_order]
+    change_points = np.flatnonzero(sorted_patterns[1:] != sorted_patterns[:-1]) + 1
+    segment_starts = [0] + change_points.tolist()
+    segment_stops = change_points.tolist() + [len(sorted_order)]
+    return sorted_order, sorted_patterns, segment_starts, segment_stops
+
+
 class PatternMatrix:
     """Response patterns for every (guess, answer) pair.
 
@@ -171,6 +190,15 @@ class PatternMatrix:
         """
         return np.array([self._answer_index[w] for w in words], dtype=np.int32)
 
+    def answer_indices_or_none(self, words):
+        """answer_indices(words), or None if any word is outside the answer
+        universe (the interactive fallback mode), matching load()'s
+        return-None-on-incompatibility convention instead of raising."""
+        try:
+            return self.answer_indices(words)
+        except KeyError:
+            return None
+
     def counts_for_all_candidates(self, branch_indices):
         """(n_guesses, 243) int32: counts[g, p] = number of branch words whose
         response to guess-word g encodes to pattern p.
@@ -197,6 +225,42 @@ class PatternMatrix:
         """Raw (len(candidate_indices), n) uint8 slice of response pattern values."""
         rows = np.asarray(candidate_indices, dtype=np.int32)
         return self.matrix[rows][:, branch_indices]
+
+    def group_words(self, guess, branch_words, branch_indices):
+        """{pattern_int: [words]} for guess against branch_words — the
+        vectorized twin of ResponseCache.group_words, identical in keys,
+        values, and iteration order.
+
+        branch_indices must be index-aligned with branch_words (as returned
+        by answer_indices(branch_words)) and the same length; a mismatch
+        indicates the caller derived branch_indices from a different word
+        list and would otherwise silently group the wrong words. One matrix
+        row read plus a stable argsort replaces the per-word Python loop;
+        each present pattern's first sorted position is also its
+        first-appearance position while walking branch_words — exactly the
+        insertion order the Python loop produces.
+        """
+        if len(branch_indices) != len(branch_words):
+            raise ValueError(
+                f"branch_indices length {len(branch_indices)} does not match "
+                f"branch_words length {len(branch_words)}")
+        if len(branch_words) == 0:
+            return {}
+        guess_row = self.guess_index(guess)
+        branch_patterns = self.matrix[guess_row, branch_indices]
+        sorted_order, sorted_patterns, segment_starts, segment_stops = (
+            _stable_pattern_segments(branch_patterns))
+
+        segments = []
+        for start, stop in zip(segment_starts, segment_stops):
+            segment_order = sorted_order[start:stop]
+            pattern = int(sorted_patterns[start])
+            first_index = int(segment_order[0])
+            words = [branch_words[i] for i in segment_order.tolist()]
+            segments.append((first_index, pattern, words))
+        segments.sort(key=lambda segment: segment[0])
+
+        return {pattern: words for _, pattern, words in segments}
 
     def candidate_stats(self, branch_indices):
         """Vectorized per-candidate statistics for every guess word against one branch.
