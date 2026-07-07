@@ -75,14 +75,14 @@ Additional identifiers used throughout this plan:
 | `G` | int | `len(groups)` — number of non-empty response groups, including the self group when present. |
 | `has_self` | bool/int | Whether the all-green pattern is present, i.e. the candidate itself is in `branch_words`. |
 | `best_erd` | float | The running branch-and-bound bound at a node: the best exact candidate cost found so far (or the alpha-beta `ceiling` it was seeded with). |
-| `cost_lb` | float | Admissible lower bound on one candidate's cost — see C2.1. |
-| `rest_lb` | list[float] | Admissible lower bound on the weighted cost of the response groups after position i (`wordle_engine.py:1050`). |
+| `candidate_cost_lower_bound` | float | Admissible lower bound on one candidate's cost — see C2.1. |
+| `remaining_groups_cost_lower_bound` | list[float] | Admissible lower bound on the weighted cost of the response groups after position i (`wordle_engine.py:1233`). |
 | `branch_indices` | np.ndarray[int32] | New in this plan: a branch expressed as indices into the canonical answer-word list (column indices of the pattern matrix). Full words per CLAUDE.md — not `subset_idx` (both halves would be wrong: "subset" is the retired vocabulary for branch, and `idx` is an abbreviation). |
 | `counts` | np.ndarray[int32] (G_vocab × 243) | New in this plan: response-group sizes of every candidate against one branch, one row per candidate. |
 | `answer_list_id` | str | SHA-256 identity of the answer universe; keys every cache table. |
 | `branch_key` | bytes | `ScoreCache.encode_subset(branch_words)`: sorted words concatenated, 5 bytes/word. |
 | epoch | int | Telemetry era from PR #76 (`telemetry_epoch` table, `run_meta.epoch`). Epoch 0 = single-candidate-claim baseline. |
-| ERD-lower-bound pruned | — | A candidate discarded because its admissible ERD lower bound (`cost_lb`, C2.1) already meets `best_erd`. Sanctioned short form: **"ERD-pruned"**. Never a bare "pruned" (the engine has other prunes: `rest_lb` partial-sum cutoffs, ceiling cutoffs) and never "gate/gated/pre-gated" (legacy vocabulary — §9b). |
+| ERD-lower-bound pruned | — | A candidate discarded because its admissible ERD lower bound (`candidate_cost_lower_bound`, C2.1) already meets `best_erd`. Sanctioned short form: **"ERD-pruned"**. Never a bare "pruned" (the engine has other prunes: `remaining_groups_cost_lower_bound` partial-sum cutoffs, ceiling cutoffs) and never "gate/gated/pre-gated" (legacy vocabulary, renamed away by §9b). |
 
 ## C2. The two quantities every implementer must understand
 
@@ -90,12 +90,12 @@ Both are exact, derived quantities — not heuristics. Getting either subtly
 wrong corrupts pruning decisions or evaluation order, which corrupts cached
 results.
 
-### C2.1 `cost_lb` — the candidate cost lower bound
+### C2.1 `candidate_cost_lower_bound` — the candidate cost lower bound
 
-Defined at `wordle_engine.py:1026`:
+Defined at `wordle_engine.py:1031` (`_candidate_cost_lower_bound`):
 
 ```python
-cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+candidate_cost_lower_bound = 3.0 - (len(groups) + (1 if has_self else 0)) / n
 ```
 
 **Meaning:** the lowest ERD this candidate could possibly achieve on this
@@ -116,12 +116,14 @@ each additional response group moves one more answer word from the
 `1/n`. More groups ⇒ lower bound ⇒ stronger candidate.
 
 **Why it is safe to prune with:** it is *admissible* — never higher than the
-candidate's true cost — so `cost_lb >= best_erd` proves the candidate cannot
-beat the current best and can be discarded with zero recursion. This one-line
-ERD-lower-bound pruning test is why 99.4% of measured claims cost <10 nodes.
+candidate's true cost — so `candidate_cost_lower_bound >= best_erd` proves
+the candidate cannot beat the current best and can be discarded with zero
+recursion. This one-line ERD-lower-bound pruning test is why 99.4% of
+epoch-0 claims (99.8% of epoch-2 claims) cost <10 nodes.
 
-**Naming:** `cost_lb` violates the no-abbreviations rule; §9 proposes the
-rename (`candidate_cost_lower_bound`) and when it is safe to do.
+**Naming:** the legacy names `cost_lb` and `gated` survive only in
+`ERDQueue._migrate` (the idempotent column rename) and in migration
+comments — never introduce them elsewhere (§9b, landed in PR #96).
 
 ### C2.2 `Σk²` — the sum of squared response-group sizes
 
@@ -158,8 +160,8 @@ this plan relies on. Hence the stable-sort requirements in §4/§5.
 **Final state (Jul 4):** PR #76 is merged to `main`, the epoch-0 baseline
 run is complete, and the swarm is stopped. The final corpus
 (`analyze_swarm_telemetry.py`, epoch 0) is ~10.7M `candidate_accuracy` rows,
-33.8% of them ERD-lower-bound pruned (the telemetry's legacy `gated` flag —
-§9b) — much larger and differently mixed than the mid-run snapshot (6.8M
+33.8% of them ERD-lower-bound pruned (the telemetry's
+`erd_lower_bound_pruned` flag) — much larger and differently mixed than the mid-run snapshot (6.8M
 rows, 4.7% ERD-pruned), and the verdict held across both, so it is robust to
 corpus composition:
 
@@ -174,9 +176,12 @@ corpus composition:
   Measured claim-count reduction from count-bundling alone: 44× / 82× /
   144× / 231× at small-bundle caps of 8 / 16 / 32 / 64.
 
-Consequence unchanged: the **vectorized kernel (§2–§5) is the critical
-path**. The packing track proceeds per `adaptive_claim_packing.md`, which
-still needs its revision to the binary scheme.
+Consequence unchanged at the time: the **vectorized kernel (§2–§5) was the
+critical path**; it is now done and deployed (epoch 2). The packing track
+proceeds per `adaptive_claim_packing.md`, revised to the binary scheme —
+and the epoch-2 measurements (§7d) show its prize *grew* under the fast
+kernel (claim-count reduction 105× at `small_count=8`, up from 44× on
+epoch 0), making packing the next critical path.
 
 Rules 1–3 below are satisfied and kept only because later sections cite
 them by number; rules 4–5 remain binding on every deploy.
@@ -205,10 +210,10 @@ them by number; rules 4–5 remain binding on every deploy.
 
 | When | What |
 |---|---|
-| Done | §2 (PR #84) and §3 (PR #85) merged into this branch; epoch-0 run complete; packer go/no-go decided (U6). |
-| Next | §4 implemented and reviewed on this branch; deploy = one worker restart, one epoch bump (the box pulls PR #80's uncapped `queue-add` in the same deploy). |
-| After §4 deploys | §7a census, then §7b calibration (the queued 841-word ALIBI branch), then §7c schedule memo. |
-| After §7 numbers | Decide §5/§6 scope; §8 lands before the first full-tree phone sync. |
+| Done | §1–§5 merged and deployed (epoch 2); §7a census; §9; M0/M1 measurements (§7d) — §6 dead, packing priced. |
+| Next | Claim packing per `adaptive_claim_packing.md` (binary scheme), deployed as epoch 3. |
+| After packing deploys | The §7b designed calibration run (fills cost-model buckets 17–28, bounded monster sample, validates packing), then the §7c schedule memo. |
+| After §7 numbers | §8 lands before the first full-tree phone sync. |
 
 ## C4. The phone usage model — three modes the plan must serve
 
@@ -285,7 +290,7 @@ record the answer next to it when known.
 | U3 | Monster-branch cost. **First hard data point (Jul 4):** a 208-word budget-4 ALIBI branch — a legitimate feasible solve, not a pathology — spent ~90h / 7.6B nodes on ~8.7% of its optimality certificate ⇒ ~43 days/node extrapolated, pure Python. That settles the headline schedule question (pure Python = years; kernel unconditional). The over-300-word regime is still unmeasured. | §7b calibration on the queued 841-word ALIBI all-gray branch, after §4 deploys; sum `branch_finalize_log` over the branch and its promoted descendants (censoring-aware). | Schedule *refinement* only — the go/no-go answer is already in |
 | U4 | Warm-cache average nodes per branch (early cold sample: ~3.7M). | Trend of `branch_finalize_log.nodes_spent` as coverage grows, per epoch. | Schedule refinement |
 | U5 | Phone live-solve latency on off-tree branches (Modes B/C) with a reachable-only cache. | Timed `ERDSolver` runs in Pythonista at n ≈ 10 / 40 / 100. | Whether Mode C needs the out-of-scope lookup service |
-| U6 | **Resolved (final epoch-0 analysis, ~10.7M rows).** Pruning half exact — 100% of ERD-lower-bound-pruned rows (the telemetry's legacy `gated` flag, §9b) ≤ 1 node (PASS). Magnitude half dead — 81.1% false-expensive, Pearson-log 0.191 (FAIL). Packer design: exact ERD-lower-bound pruning + count-bundling + republish-on-overrun, no work-magnitude model; measured claim reduction 44–231× by bundle cap. | Done. Remaining: revise `adaptive_claim_packing.md` to this scheme (its own track). | Nothing in this plan's sections |
+| U6 | **Resolved (final epoch-0 analysis, ~10.7M rows).** Pruning half exact — 100% of ERD-lower-bound-pruned rows (the telemetry's `erd_lower_bound_pruned` flag) ≤ 1 node (PASS). Magnitude half dead — 81.1% false-expensive, Pearson-log 0.191 (FAIL). Packer design: exact ERD-lower-bound pruning + count-bundling + republish-on-overrun, no work-magnitude model; measured claim reduction 44–231× on epoch 0, 105–346× on epoch 2 (§7d). | Done; `adaptive_claim_packing.md` revised to this scheme. | Nothing in this plan's sections |
 | U7 | Top-level branch count: estimated 1.5–2M distinct (opener, pattern) subsets with ≥ 2 words. | §7's census script computes it exactly (cheap once §2 exists). | Schedule precision; §8 export size projection |
 | U8 | Exact-equality equivalence between pure-Python and vectorized paths is achievable (stable ordering everywhere). | §4/§5/§6 acceptance tests enforce it; any failure is a design bug to fix, not a tolerance to widen. | §4, §5, §6 |
 
@@ -319,7 +324,8 @@ record the answer next to it when known.
    than delegating it to an alias.
 4. **No estimated value ever bounds the search** (same law as
    `adaptive_claim_packing.md` §3): `best_erd` is tightened only by exact
-   solved costs or admissible lower bounds (`cost_lb`, `rest_lb`, the
+   solved costs or admissible lower bounds (`candidate_cost_lower_bound`,
+   `remaining_groups_cost_lower_bound`, the
    `_CEIL_EPS`-padded ceiling). Nothing in this plan introduces a new bound;
    reviewers verify each section preserves this.
 5. **Deployment discipline.** Sections that change worker behaviour follow
@@ -477,7 +483,7 @@ raise), and the entropy computation routes zero counts through a
 double-`np.where` so `log2` never sees zero.
 
 **Read first:** §2; C2 (both derivations); `score_groups`
-(`wordle_engine.py:441-477`); the `cost_lb` line (`wordle_engine.py:1026`).
+(`wordle_engine.py:441-477`); `_candidate_cost_lower_bound` (`wordle_engine.py:1031`).
 **Prerequisite:** §2.
 
 **What it is.** `candidate_stats(branch_indices)`: from one
@@ -491,7 +497,7 @@ order:
 |---|---|---|---|
 | `group_count` | int32 | `(counts[c] > 0).sum()` | `len(groups)` |
 | `has_self` | bool | `counts[c, 242] > 0` (all-green ⇔ candidate ∈ branch) | `_ALL_GREEN_PATTERN in groups` |
-| `cost_lower_bound` | float64 | `3.0 - (group_count + has_self) / n` | `cost_lb`, `wordle_engine.py:1026` |
+| `cost_lower_bound` | float64 | `3.0 - (group_count + has_self) / n` | `_candidate_cost_lower_bound`, `wordle_engine.py:1031` |
 | `sum_squared_group_sizes` | int64 | `(counts[c] ** 2).sum(dtype=int64)` | sort key, `wordle_engine.py:1184` |
 | `max_group_size` | int32 | `counts[c].max()` | `score_groups` MAX_GROUP_SIZE |
 | `entropy_gain` | float64 | `-Σ p·log2(p)` over nonzero sizes, `p = k/n` | `score_groups` ENTROPY_GAIN |
@@ -615,7 +621,7 @@ Three invariants to preserve, each already load-bearing today:
    introduce).
 3. **`metric_observer`:** on merged `main`, decide per its actual contract:
    either the observer receives the same observation it would have received
-   from `evaluate_candidate` (~0 nodes, its legacy `gated` flag set — §9b),
+   from `evaluate_candidate` (~0 nodes, its `erd_lower_bound_pruned` flag set),
    or the ERD-pruning check is disabled when an observer is attached (observers
    ride swarm claims, where the claim loop — not this inline loop —
    dominates; disabling there costs little). State the choice in the PR
@@ -735,7 +741,24 @@ The fast path must reproduce exactly that:
 - `test_kernel_equivalence.py` re-run with §5 enabled: still byte-identical.
 - `diag_kernel_bench.py` before/after numbers in the PR description.
 
-## §6. Candidate equivalence-class dedupe
+## §6. Candidate equivalence-class dedupe — **DEAD (M0 measurement, 2026-07-07; do not implement)**
+
+**Measured outcome.** The M0 measurement (§7d) answered "What to measure"
+below directly, on real branches, before any implementation: the dedupe
+factor (candidates ÷ distinct restricted rows) is **1.01×–1.15× flat across
+n = 46…1,909**, with no growth in either direction — calibration branches at
+n=208 and n=841 measure 1.15× and 1.13×; the largest census branch (n=1,909)
+measures 1.01×. The premise below is *correct* (identical restricted rows
+are interchangeable to the recurrence) but the collapse it predicts does not
+occur: nearly every candidate induces a unique partition on any branch of
+this universe. In-branch candidates can never dedupe at all — each carries
+its self-membership pattern (242) in a different column, so member rows are
+pairwise distinct by construction (measured: 208 distinct rows from 208
+members, factor exactly 1.00×). A ≤15% evaluation saving does not justify
+the added candidate-loop complexity or the equivalence-test surface. The
+section is retained for the correctness argument, which the measurement did
+not refute; only the payoff assumption failed. The §7c memo drops its §6
+scenario arm accordingly.
 
 **Read first:** C2, §4 (reuses its cached frame data); the winner-tie
 argument below — it is the whole correctness case.
@@ -782,8 +805,8 @@ equivalent.
   §4a — reuse it; do not re-slice.
 
 **What to measure.** Class-count vs candidate-count distribution by branch
-size (log in `diag_kernel_bench.py`): expect collapse to grow as branches
-shrink; this number decides how much §6 matters below the promotion threshold.
+size: this number decides how much §6 matters. *Measured 2026-07-07 (§7d,
+M0) — the answer is "not enough", see the outcome block above.*
 
 **Acceptance.**
 - Unit test: a small branch over few distinct letters yields far fewer
@@ -807,24 +830,68 @@ list; count distinct `branch_key`s with ≥ 2 words across all openers, the
 size histogram, and specifically the count above 300 words (the never-queued
 regime). Resolves U7 exactly and sizes §8's export. Read-only; runs anywhere.
 
-**7b. Calibration solve.** The calibration branch is **already queued**:
-ALIBI's all-gray branch (841 answer words, priority 100,000, pending in
-`erd_queue.sqlite3`). ALIBI is the right choice: the epoch-0 run solved most
-of its smaller branches (so its subtree cache is warm and the marginal cost
-measured is the monster's own), and its all-gray branch is simultaneously
-the missing piece of the Mode C root-ERD answer (C4). Do **not** start it
-before §4 deploys — calibrating the pure-Python kernel mismeasures the plan,
-and the U3 data point already shows that regime is ~43 days/node. Once the
-swarm restarts on the new kernel, let it drain the branch; sub-branch
-promotion fans it out. Then aggregate cost from
-`branch_finalize_log` over the branch and its promoted descendants (join by
-spine), **treating censored rows as lower bounds** (PR #76's §9.7 semantics),
-plus wall-clock span.
+**7b. Designed calibration run (one intentional run, after packing
+deploys).** The swarm is stopped and stays stopped except for intentional
+measurement runs (owner policy, 2026-07-07): background "progress" on a
+years-scale backlog is not worth the tokens or the wall-clock, and every
+run must answer a question. This run answers two:
+
+- **Fill cost-model buckets 17–28.** Epoch-2 data (§7d, M1b) seeds
+  `c(size)` for buckets 2–16 only (n ≤ 86); every bucket above that —
+  including both calibration branches — has zero fast-kernel samples.
+  Queue a curated slice of real census branches spanning n ≈ 100–1,000
+  (a few per bucket), drain it, and read per-bucket cost from
+  `branch_finalize_log`.
+- **Bounded monster sample.** ALIBI's all-gray branch (841 words, priority
+  100,000, still pending) is the top-end anchor: let workers complete
+  ~20–40 full (non-ERD-pruned) candidate evaluations at n=841, then stop —
+  enough for a cost-vs-n scaling point against the 208-word branch's
+  measured ~2,700s medians, without committing to the full drain.
+
+Run it **after** the packing deploy (epoch 3): calibrating the
+single-candidate claim path would price an architecture we are about to
+replace, and the same run then doubles as packing's production validation
+(`adaptive_claim_packing.md` §11). Aggregate cost from
+`branch_finalize_log` over each branch and its promoted descendants (join
+by spine), **treating censored rows as lower bounds** (PR #76's §9.7
+semantics), plus wall-clock span.
 
 **7c. The schedule memo.** Extrapolate: census counts × measured per-regime
-costs, adjusted by the U4 warm-cache trend ⇒ the revised whole-job estimate.
-Deliverable: a dated section appended to this file with the numbers and the
-go/no-go call on "weeks", plus the §5/§6 scope decision. No code.
+costs, adjusted by the U4 warm-cache trend ⇒ the revised whole-job estimate,
+under the two live scenarios: **{status quo, +packing}** (the §6 arm is
+dead, §7d M0). Deliverable: a dated section appended to this file with the
+numbers and the go/no-go call on "weeks". No code.
+
+**7d. M0/M1 measurement results (2026-07-07).** Two offline measurements
+(read-only; no swarm) taken to price §6 and the packing track before
+committing to either:
+
+- **M0 — §6 dedupe prize.** For nine real branches (both calibration
+  branches plus a size ladder from census-style response groups,
+  n = 46…1,909): restrict the pattern matrix to the branch columns and
+  count distinct rows over all 12,972 candidates. Dedupe factor
+  1.01×–1.15×, flat in n; in-branch candidates 1.00× (self-membership
+  makes member rows pairwise distinct). **§6 is dead** — see its outcome
+  block.
+- **M1 — packing prize under the fast kernel.** Epoch-2 telemetry
+  (7.5h, 4.61M claims, 356 finalized branches, all n ≤ 86):
+  ERD-pruned rate 93.7% (epoch 0: 33.8%), median `work_nodes` 1 (was 2),
+  99.8% of claims <10 nodes, mean coordination ~35ms/claim — aggregate
+  coordination/compute overhead ~42× (epoch 0: ~6×), tiny-claim overhead
+  ~2,200× (epoch 0: ~720×). The cross-epoch comparison carries a
+  workload-mix confound (the epoch-2 window drained only small branches),
+  but the cleaner instrument agrees: median branch wall is nearly flat at
+  ~430–655s across buckets 2–16 while median nodes spans 13k→2.2M — a
+  170× compute range moving wall by 1.5×. Small-branch wall is almost
+  pure coordination. Modeled claim-count reduction under the binary
+  packer: **105× / 174× / 261× / 346×** at `small_count` 8/16/32/64
+  (epoch 0: 44×/82×/144×/231×). §4/§5 shrank the compute denominator and
+  left the coordination numerator untouched, so **packing's prize grew**;
+  it is the next critical path.
+- **M1b — cost-model seed.** Per-bucket `c(size)` from
+  `branch_finalize_log WHERE epoch=2`: buckets 2–16 seeded (medians,
+  heavy right-skew — fit on medians, not means); **buckets 17–28 empty**,
+  which is exactly what 7b's designed run fills.
 
 ## §8. Phone export: reachable-only filter, plus the opener report
 
@@ -912,7 +979,16 @@ findings, not code changes.
   real cache.
 - SWARM.md export section updated.
 
-## §9. Naming and documentation sync
+## §9. Naming and documentation sync — **DONE (PR #96, merged)**
+
+**Landed.** 9a's design.md fixes and 9b's renames are on `main`:
+`cost_lb` → `candidate_cost_lower_bound`, `rest_lb` →
+`remaining_groups_cost_lower_bound`, and the `gated` family → the
+`erd_lower_bound_pruned` family, across the engine, swarm, queue, analyzer,
+and tests. The `candidate_accuracy.cost_lb`/`.gated` SQLite columns are
+renamed by an idempotent `ERDQueue._migrate()` step; the legacy names
+survive only there, as migration comments describing what old databases
+look like. The original section text follows for the record.
 
 **Read first:** CLAUDE.md naming rules; C2.1; C3 rule 2.
 
@@ -953,29 +1029,30 @@ pruned" throughout this document; the identifiers should follow. Proposed:
 
 ```
 already done      §1 (issue #77 / PR #80) · §2 (PR #84) · §3 (PR #85) ·
-                  §4 (PR #86) — all merged to main (PR #78)
+                  §4 (PR #86) · §5 (PR #94) · §9 (PR #96) — all merged
                   §4 DEPLOYED 2026-07-05: epoch 1 "numpy-kernel"
-                  (git e1ab50f), 6 workers restarted on it
+                  §5 DEPLOYED 2026-07-07: epoch 2 "s5-group-words-dispatch"
                   §7a census run 2026-07-06 (U7 resolved: 569,132 distinct
                   branches; 20,219 over 300 words; largest 1,955)
-                  §9a doc fixes; epoch-0 run complete; packer go/no-go
-                  decided (U6); export/import split (PR #88, part of §8's
-                  groundwork)
-in progress       §7b calibration — the 841-word ALIBI branch is queued
-                  behind the 208-word branch's certificate; §5 (merged
-                  PR #94, deployed epoch 2 on 2026-07-07) vectorizes the
-                  decomposition wall that was holding it to ~weeks — the
-                  epoch-2 drain rate is the next thing to measure
-next              §7b drain → §7c schedule memo → §6 per its numbers
-then              §8 (8a reachable-only + 8b opener report) before first
-                  full-tree sync
-anytime           §9b rename (unblocked once the epoch-0 corpus is archived)
-parallel track    claim packing per adaptive_claim_packing.md — binary scheme
-                  (exact ERD-lower-bound pruning + count-bundling +
-                  republish-on-overrun); that document still needs revision
-                  to the scheme
+                  §7d M0/M1 measurements 2026-07-07: §6 DEAD (dedupe
+                  1.01–1.15×, flat); packing prize grown under the fast
+                  kernel (modeled 105× claim reduction at small_count=8)
+                  epoch-0 run complete; packer go/no-go decided (U6);
+                  export/import split (PR #88, part of §8's groundwork)
+dead              §6 — measured payoff ≤1.15×, see its outcome block
+next              claim packing per adaptive_claim_packing.md (binary
+                  scheme: exact ERD-lower-bound elimination +
+                  count-bundling + republish-on-overrun) → deploy as
+                  epoch 3
+then              §7b designed calibration run (buckets 17–28 + bounded
+                  monster sample + packing validation) → §7c schedule
+                  memo → §8 (8a reachable-only + 8b opener report) before
+                  first full-tree sync
+policy            the swarm runs only for intentional measurement; no
+                  background drain of the years-scale backlog
 ```
 
-Dependency summary: §5 unblocks §7b in practice; §2→§6 (§2 done); §8
-independent (base landed via PR #88); §9b last. The packing lever multiplies
-with all of it and is managed by its own document.
+Dependency summary: packing precedes §7b (calibrating the claim path we
+are replacing would mismeasure); §7b feeds §7c; §8 independent (base
+landed via PR #88). The packing lever multiplies with the kernel work and
+is managed by its own document.
