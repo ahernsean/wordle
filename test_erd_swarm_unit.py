@@ -429,9 +429,9 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
 
 class TestSolveBranchFocusedPrecompletedCandidates(unittest.TestCase):
     """solve_branch_focused finalizes correctly when all candidates are already
-    done by other workers: claim_candidate returns None,
+    done by other workers: claim_next_bundle returns None,
     branch_done_candidates >= n_candidates, so the worker finalizes from the
-    idx-is-None path (not via evaluate_claim)."""
+    claim-is-None path (not via evaluate_bundle)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -461,15 +461,19 @@ class TestSolveBranchFocusedPrecompletedCandidates(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
         q.create_branch(branch_key, len(BRANCH), n_candidates)
-        for cand_idx in range(n_candidates):
-            q.claim_candidate(branch_key, f"other-{cand_idx}", n_candidates)
-            q.complete_candidate(branch_key, cand_idx)
+        order = list(range(n_candidates))
+        cost_lower_bound = [0.0] * n_candidates
+        bundle_id, indices, _forced = q.claim_next_bundle(
+            branch_key, "other", n_candidates, order, cost_lower_bound,
+            small_count=n_candidates, count_cap=n_candidates)
+        for idx in indices:
+            q.complete_candidate(branch_key, idx)
         q.close()
 
-        # Our worker enters solve_branch_focused: claim_candidate → None (all done),
-        # branch_done_candidates >= n_candidates → maybe_finalize.  Since no
-        # best_guess was set, maybe_finalize treats it as a loss and deletes the
-        # branch without writing a cache entry.
+        # Our worker enters solve_branch_focused: claim_next_bundle → None (all
+        # done), branch_done_candidates >= n_candidates → maybe_finalize.  Since
+        # no best_guess was set, maybe_finalize treats it as a loss and deletes
+        # the branch without writing a cache entry.
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             w.solve_branch_focused(branch_key)
@@ -527,8 +531,11 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         key_a = ScoreCache.encode_subset(BRANCH)
         q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
-        for i in range(n_candidates):
-            q.claim_candidate(key_a, "other-worker", n_candidates)
+        order = list(range(n_candidates))
+        cost_lower_bound = [0.0] * n_candidates
+        q.claim_next_bundle(key_a, "other-worker", n_candidates, order,
+                           cost_lower_bound, small_count=n_candidates,
+                           count_cap=n_candidates)
 
         # Branch B: has a free candidate for our worker to claim.
         words_b = BRANCH[:4]
@@ -545,9 +552,9 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         # Worker must have skipped branch A (fully claimed) and joined branch B.
         self.assertIsNotNone(result)
-        branch, idx = result
+        branch, bundle_id, indices, forced = result
         self.assertEqual(branch['branch_key'], key_b)
-        self.assertIsNotNone(idx)
+        self.assertTrue(indices)
 
     def test_claim_one_joins_existing_in_progress_branch(self):
         from erd_queue import ERDQueue
@@ -566,11 +573,12 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
             w.close()
 
         # claim_one should have joined the in-progress branch via
-        # branches_in_progress() → claim_candidate() → return (branch, idx).
+        # branches_in_progress() → claim_next_bundle() → return
+        # (branch, bundle_id, indices, forced).
         self.assertIsNotNone(result)
-        branch, idx = result
+        branch, bundle_id, indices, forced = result
         self.assertEqual(branch['branch_key'], branch_key)
-        self.assertIsNotNone(idx)
+        self.assertTrue(indices)
 
 
 class TestCooperativeSolveFullPath(unittest.TestCase):
@@ -696,8 +704,11 @@ class TestHelpOtherBranch(unittest.TestCase):
         key_a = ScoreCache.encode_subset(BRANCH)
         q.create_branch(key_a, len(BRANCH), n_candidates,
                         budget=ROOT_BUDGET, priority=0)
-        for i in range(n_candidates):
-            q.claim_candidate(key_a, "other-worker", n_candidates)
+        order = list(range(n_candidates))
+        cost_lower_bound = [0.0] * n_candidates
+        q.claim_next_bundle(key_a, "other-worker", n_candidates, order,
+                           cost_lower_bound, small_count=n_candidates,
+                           count_cap=n_candidates)
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)

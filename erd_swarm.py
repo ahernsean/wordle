@@ -42,7 +42,9 @@ from wordle_engine import (
     _cache_reuse,
 )
 from erd_queue import (ERDQueue, decode_subset, encode_subset,
-                       guess_depth_from_spine)
+                       guess_depth_from_spine,
+                       DEFAULT_SMALL_COUNT, DEFAULT_COUNT_CAP,
+                       DEFAULT_REPUBLISH_LIMIT)
 from wordle_ui import fmt_pattern
 
 ANSWER_FILE = 'NYT_wordlist.txt'
@@ -109,6 +111,36 @@ PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 # so a queued position after the opener (guess_depth 1) is solved at ROOT_BUDGET
 # - 1.  Depth-limited ERD: a branch unsolvable within its budget is a loss.
 ROOT_BUDGET = GAME_GUESSES
+
+# Binary claim packing (issue #67, adaptive_claim_packing.md).  small_count
+# and count_cap default to erd_queue's DEFAULT_* (see there for the
+# amortization/crash-reclaim-window reasoning behind 8 and 500).
+#
+# bundle_node_cap bounds how much genuinely-heavy search a small bundle's
+# strong-splitter head can accumulate before the rest of the bundle is
+# handed back for re-packing against a tighter B (§7a cross-candidate
+# overrun) — large enough that ordinary multi-thousand-node candidates
+# finish without a spurious republish, small enough that a real heavy
+# candidate hands off its siblings within seconds rather than stalling a
+# whole bundle.  A bulk bundle's members are each O(1) (§3 monotonicity), so
+# this cap essentially never fires for one.
+BUNDLE_NODE_CAP = int(os.environ.get('BUNDLE_NODE_CAP', '50000'))
+# bundle_wall_cap_seconds is the only cap a bulk bundle can hit, since its
+# members can't cost nodes: it exists purely to bound the crash-reclaim
+# window (HB_TIMEOUT_SECONDS) a dead worker's held bundle would otherwise
+# widen, not to catch misprediction — there is no prediction anywhere in
+# this design (§3).
+BUNDLE_WALL_CAP_SECONDS = float(os.environ.get('BUNDLE_WALL_CAP_SECONDS', '60'))
+# republish_limit: how many times the cross-candidate mechanism may bounce
+# the same candidate before it is evaluated "forced" — exempt from the
+# bundle caps so its own within-candidate sub-branch promotion (always
+# active) absorbs any real depth instead of the candidate thrashing the
+# pool indefinitely.
+BUNDLE_REPUBLISH_LIMIT = int(
+    os.environ.get('BUNDLE_REPUBLISH_LIMIT', str(DEFAULT_REPUBLISH_LIMIT)))
+BUNDLE_SMALL_COUNT = int(
+    os.environ.get('BUNDLE_SMALL_COUNT', str(DEFAULT_SMALL_COUNT)))
+BUNDLE_COUNT_CAP = int(os.environ.get('BUNDLE_COUNT_CAP', str(DEFAULT_COUNT_CAP)))
 
 logger = logging.getLogger('wordle')
 
@@ -296,7 +328,11 @@ class _BranchWorker:
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
                  root_budget=ROOT_BUDGET, n_workers=1,
-                 enable_adaptive_decomposition=True):
+                 enable_adaptive_decomposition=True,
+                 small_count=BUNDLE_SMALL_COUNT, count_cap=BUNDLE_COUNT_CAP,
+                 bundle_node_cap=BUNDLE_NODE_CAP,
+                 bundle_wall_cap_seconds=BUNDLE_WALL_CAP_SECONDS,
+                 republish_limit=BUNDLE_REPUBLISH_LIMIT):
         self.name = f'worker-{worker_id}'
         self.stop_event = stop_event
         # Process-local stop request, set by this worker's own SIGTERM/SIGINT
@@ -305,6 +341,16 @@ class _BranchWorker:
         self._stop_requested = False
         self.root_budget = root_budget
         self.n_workers = n_workers
+        # Binary claim packing dials (see the BUNDLE_* module constants).
+        self.small_count = small_count
+        self.count_cap = count_cap
+        self.bundle_node_cap = bundle_node_cap
+        self.bundle_wall_cap_seconds = bundle_wall_cap_seconds
+        self.republish_limit = republish_limit
+        # Per-branch best-first order + cost_lower_bound array
+        # (_packing_stats), cached for the life of this worker process and
+        # evicted when the branch finalizes.
+        self._packing_stats_cache = {}
         # The adaptive-decomposition layer — cost model, entry-gate publish
         # threshold, and the mid-loop overrun escape hatch with its wall-clock
         # backstop.
@@ -679,6 +725,47 @@ class _BranchWorker:
                             self.name, self._eval_seconds, eval_pct,
                             coord_seconds, 100.0 - eval_pct, elapsed)
 
+    # -- claim packing --------------------------------------------------------
+
+    def _packing_stats(self, branch_key, words):
+        """(order, cost_lower_bound) for `words`, cached per branch for the
+        life of this worker process.
+
+        order is the branch's best-first candidate order (a permutation of
+        range(n_candidates), Σk² ascending, C2.2); cost_lower_bound is
+        candidate_cost_lower_bound indexed by idx (C2.1).  Both come from one
+        vectorized candidate_stats pass (pattern_matrix.py §3) over the whole
+        guess vocabulary — idx IS the matrix row here, since self.all_words is
+        both the ERD_ALL candidate list and the pattern matrix's guess
+        vocabulary, in the same order.
+
+        This is a pure function of branch_indices (the pattern matrix, which
+        is immutable shared data, plus the branch's words), so every worker
+        process computes a bit-identical array independently: the queue DB
+        only has to hold the shared cursor and best_erd (claim_next_bundle),
+        never this vector (adaptive_claim_packing.md §12).
+        """
+        cached = self._packing_stats_cache.get(branch_key)
+        if cached is not None:
+            return cached
+        branch_indices = self.pattern_matrix.answer_indices(words)
+        stats = self.pattern_matrix.candidate_stats(branch_indices)
+        order = sorted(range(self.n_candidates),
+                       key=lambda idx: stats.sum_squared_group_sizes[idx])
+        result = (order, stats.cost_lower_bound)
+        self._packing_stats_cache[branch_key] = result
+        return result
+
+    def _claim_bundle(self, branch_key, n_candidates, words):
+        """claim_next_bundle for `branch_key`, supplying this worker's
+        (cached) packing stats.  Returns (bundle_id, indices, forced) or None
+        — see ERDQueue.claim_next_bundle."""
+        order, cost_lower_bound = self._packing_stats(branch_key, words)
+        return self.queue.claim_next_bundle(
+            branch_key, self.name, n_candidates, order, cost_lower_bound,
+            small_count=self.small_count, count_cap=self.count_cap,
+            republish_limit=self.republish_limit)
+
     # -- evaluate one candidate claim ---------------------------------------
 
     def evaluate_claim(self, branch_key, words, n_words, idx, budget=None):
@@ -806,7 +893,9 @@ class _BranchWorker:
             # the narrow in-evaluate_claim coordination window (the ratio is
             # unit-free).  The outbound claim_telemetry row instead telescopes from
             # the previous claim's completion, so its coordination figure also
-            # includes claim acquisition (the claim_candidate scan) and any
+            # includes claim acquisition (claim_next_bundle's packer transaction,
+            # paid once per bundle rather than once per candidate — a candidate
+            # evaluated mid-bundle sees this figure collapse to ~0) and any
             # inter-claim overhead; this is the offline-diagnostic span and is not
             # fed back into control.
             now_complete = time.time()
@@ -840,6 +929,82 @@ class _BranchWorker:
                         local_candidate, local_best, bound_erd=_eff_bound(),
                         force=True)
         return True
+
+    # -- evaluate a packer-issued bundle of candidate claims -----------------
+
+    def evaluate_bundle(self, branch_key, words, n_words, bundle_id, indices,
+                        forced, budget=None):
+        """Evaluate a claim_next_bundle bundle, folding each candidate's
+        result into the branch's shared best as it goes (evaluate_claim per
+        idx, in the bundle's best-first order).
+
+        Sequential-sibling pruning is preserved exactly as a single-candidate
+        sweep: each evaluate_claim call re-reads the branch's shared best,
+        already updated by any earlier member of this same bundle
+        (adaptive_claim_packing.md §8 invariant 2) — no extra state needs to
+        be threaded between iterations for this.
+
+        Tracks cumulative nodes and wall time since the bundle started.  When
+        either exceeds this worker's bundle_node_cap / bundle_wall_cap_seconds
+        (§7a cross-candidate overrun), the unfinished remainder is republished
+        (returned to the unclaimed pool for re-packing) rather than driven to
+        completion inline — never re-claimed as `len(remainder)` individual
+        claims.  A bulk bundle's members are each O(1) (§3 monotonicity), so
+        in practice only the wall cap ever fires for one; the node cap is
+        what protects a small bundle's strong-splitter head from stranding
+        its siblings.
+
+        A candidate in `forced` (its candidate_republish count already hit
+        republish_limit, §7's bounded-republish-depth guardrail) is evaluated
+        without its own contribution counting toward either cap, so the
+        cross-candidate mechanism never cuts it off again — any real depth in
+        its subtree is left to the always-active within-candidate sub-branch
+        promotion (mid_loop_publisher) instead.
+
+        Returns True if the bundle was fully handled — every candidate either
+        evaluated to completion or handed back via republish; False if
+        cancelled mid-evaluation, leaving the unfinished remainder's claims
+        done=0 for reclaim (same contract as evaluate_claim).
+        """
+        nodes_at_bundle_start = self._nodes
+        wall_t0 = time.time()
+        for pos, idx in enumerate(indices):
+            if self.cancel():
+                self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
+                                    wall_t0, censored=True)
+                return False
+            if not self.evaluate_claim(branch_key, words, n_words, idx,
+                                       budget=budget):
+                self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
+                                    wall_t0, censored=True)
+                return False
+            if idx in forced:
+                continue
+            nodes_delta = self._nodes - nodes_at_bundle_start
+            wall_delta = time.time() - wall_t0
+            if (nodes_delta > self.bundle_node_cap
+                    or wall_delta > self.bundle_wall_cap_seconds):
+                remainder = indices[pos + 1:]
+                if remainder:
+                    self.queue.republish_remainder(branch_key, remainder)
+                self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
+                                    wall_t0, censored=bool(remainder))
+                return True
+        self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
+                            wall_t0, censored=False)
+        return True
+
+    def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
+                       censored):
+        """Record a completed/censored bundle's actual cost, if this claim
+        went through the packer (bundle_id is None for a bare evaluate_claim
+        call outside the bundle path)."""
+        if bundle_id is None or not self._adaptive:
+            return
+        nodes = self._nodes - nodes_at_start
+        coord_millis = int((time.time() - wall_t0) * 1000)
+        self.queue.record_bundle_stats(branch_key, bundle_id, nodes,
+                                       coord_millis, censored=censored)
 
     # -- finalize -----------------------------------------------------------
 
@@ -893,20 +1058,30 @@ class _BranchWorker:
                            branch_key[:25])
         # Persist the branch's timing/cost before delete_branch destroys it, so
         # "how long / how much did branch X cost" stays answerable offline.
+        # finalize_bundle_stats aggregates and clears this branch's bundle_stats
+        # rows; (None, None, None, None) when it never claimed a bundle (fully
+        # solved from reused cache entries).
+        n_bundles, max_bundle_nodes, total_coord_millis, censored_units = (
+            self.queue.finalize_bundle_stats(branch_key))
         self.queue.add_branch_finalize_log(
             branch_key, spine, len(words), budget, created_at, finalized_at,
-            nodes_spent, n_claims)
+            nodes_spent, n_claims, n_bundles=n_bundles,
+            max_bundle_nodes=max_bundle_nodes,
+            total_coord_millis=total_coord_millis,
+            censored_units=censored_units)
         self.queue.mark_done(branch_key)        # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
+        self._packing_stats_cache.pop(branch_key, None)
 
     # -- recursive cooperative solving --------------------------------------
 
     def _help_other_branch(self, exclude_branch_key: bytes) -> bool:
-        """Evaluate one candidate claim from any open branch other than exclude_branch_key.
+        """Evaluate one bundle of candidate claims from any open branch other
+        than exclude_branch_key.
 
         Called when the worker is waiting on a dependency branch whose remaining
         candidates are all held by other workers.  Instead of sleeping, the
-        worker drains useful work from the queue.  Returns True if a candidate
+        worker drains useful work from the queue.  Returns True if a bundle
         was evaluated, False if there was nothing to claim.
         """
         for branch in self.queue.branches_in_progress():
@@ -914,18 +1089,19 @@ class _BranchWorker:
             if other_key == bytes(exclude_branch_key):
                 continue
             n_candidates = branch['n_candidates']
-            idx = self.queue.claim_candidate(other_key, self.name, n_candidates)
-            if idx is None:
-                continue
             words = decode_subset(other_key)
+            claim = self._claim_bundle(other_key, n_candidates, words)
+            if claim is None:
+                continue
+            bundle_id, indices, forced = claim
             budget = self._branch_budget(branch)
             # Promotions while helping must base off the helped branch's spine.
             saved_spine = self._claimed_branch_spine
             self._claimed_branch_spine = branch['spine'] if 'spine' in branch.keys() \
                 else None
             try:
-                if self.evaluate_claim(other_key, words, branch['n_words'], idx,
-                                       budget=budget):
+                if self.evaluate_bundle(other_key, words, branch['n_words'],
+                                        bundle_id, indices, forced, budget=budget):
                     self.maybe_finalize(other_key, words, n_candidates)
             finally:
                 self._claimed_branch_spine = saved_spine
@@ -1021,11 +1197,11 @@ class _BranchWorker:
                     return (SOLVED, *reuse)
                 if self.queue.get_branch(branch_key) is None:
                     break                       # finalized as a loss + deleted
-                idx = self.queue.claim_candidate(branch_key, self.name,
-                                                 self.n_candidates)
-                if idx is not None:
-                    if self.evaluate_claim(branch_key, words, n_words, idx,
-                                           budget=budget):
+                claim = self._claim_bundle(branch_key, self.n_candidates, words)
+                if claim is not None:
+                    bundle_id, indices, forced = claim
+                    if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
+                                            indices, forced, budget=budget):
                         self.maybe_finalize(branch_key, words, self.n_candidates)
                     self._maybe_checkpoint()    # drain WAL during deep solving
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
@@ -1053,8 +1229,9 @@ class _BranchWorker:
     # -- scheduling: claim one candidate from the best available branch ------
 
     def claim_one(self):
-        """Return (branch_row_dict, claim_idx) for the next candidate to work,
-        or None if there is nothing to do right now.
+        """Return (branch_row_dict, bundle_id, indices, forced) for the next
+        bundle of candidates to work, or None if there is nothing to do right
+        now.
 
         Prefers JOINING an in-progress branch (to finish branches already
         underway, concentrating workers) over PROMOTING a new one from the
@@ -1064,10 +1241,12 @@ class _BranchWorker:
         no candidate work is needed.
         """
         for b in self.queue.branches_in_progress():
-            idx = self.queue.claim_candidate(b['branch_key'], self.name,
-                                             b['n_candidates'])
-            if idx is not None:
-                return dict(b), idx
+            branch_key = bytes(b['branch_key'])
+            words = decode_subset(branch_key)
+            claim = self._claim_bundle(branch_key, b['n_candidates'], words)
+            if claim is not None:
+                bundle_id, indices, forced = claim
+                return dict(b), bundle_id, indices, forced
 
         while True:
             claimed = self.queue.claim_next(self.name)
@@ -1089,8 +1268,8 @@ class _BranchWorker:
             priority=claimed['priority'], source_word=claimed['source_word'],
             source_pattern=claimed['source_pattern'], budget=budget,
             spine=root_spine, root_budget=self.root_budget)
-        idx = self.queue.claim_candidate(claimed['branch_key'], self.name,
-                                         self.n_candidates)
+        words = decode_subset(claimed['branch_key'])
+        claim = self._claim_bundle(claimed['branch_key'], self.n_candidates, words)
         branch = {
             'branch_key': claimed['branch_key'], 'n_words': n_words,
             'n_candidates': self.n_candidates,
@@ -1099,9 +1278,12 @@ class _BranchWorker:
             'spine': root_spine,
             'budget': budget,
         }
-        # idx can be None only if another worker grabbed every candidate between
-        # create and claim — rare; treat as "nothing for me right now".
-        return (branch, idx) if idx is not None else None
+        # claim can be None only if another worker grabbed every candidate
+        # between create and claim — rare; treat as "nothing for me right now".
+        if claim is None:
+            return None
+        bundle_id, indices, forced = claim
+        return branch, bundle_id, indices, forced
 
     # -- main loop ----------------------------------------------------------
 
@@ -1118,7 +1300,7 @@ class _BranchWorker:
                 time.sleep(0.5)
                 continue
             idle_since = None
-            branch, idx = work
+            branch, bundle_id, indices, forced = work
             branch_key = branch['branch_key']
             # Attribute any sub-branches this worker promotes to the tree it is
             # descending (best-effort; for status display).
@@ -1132,8 +1314,8 @@ class _BranchWorker:
             n_candidates = branch['n_candidates']
             if self.cancel():
                 break
-            completed = self.evaluate_claim(
-                branch_key, words, branch['n_words'], idx,
+            completed = self.evaluate_bundle(
+                branch_key, words, branch['n_words'], bundle_id, indices, forced,
                 budget=self._branch_budget(branch))
             if completed:
                 self.maybe_finalize(branch_key, words, n_candidates)
@@ -1154,13 +1336,14 @@ class _BranchWorker:
         n_candidates = branch['n_candidates']
         while not self.cancel():
             # Stop the moment the branch is finalized (and its rows deleted) by
-            # any worker: otherwise claim_candidate, seeing no claim rows for the
-            # now-deleted branch, would re-create them and redo the whole branch
-            # from scratch — doubling (or worse) the work for a large branch.
+            # any worker: otherwise claim_next_bundle, seeing no claim rows for
+            # the now-deleted branch, would re-create them and redo the whole
+            # branch from scratch — doubling (or worse) the work for a large
+            # branch.
             if self.queue.get_branch(branch_key) is None:
                 break
-            idx = self.queue.claim_candidate(branch_key, self.name, n_candidates)
-            if idx is None:
+            claim = self._claim_bundle(branch_key, n_candidates, words)
+            if claim is None:
                 # Every candidate is claimed.  If coverage is complete, finalize
                 # and stop.  Otherwise some claims are held by siblings — there is
                 # NO supervisor in this path, so free any whose holder has died and
@@ -1174,8 +1357,9 @@ class _BranchWorker:
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                 time.sleep(0.1)
                 continue
-            if self.evaluate_claim(branch_key, words, branch['n_words'], idx,
-                                   budget=budget):
+            bundle_id, indices, forced = claim
+            if self.evaluate_bundle(branch_key, words, branch['n_words'], bundle_id,
+                                    indices, forced, budget=budget):
                 if self.queue.branch_done_candidates(branch_key) >= n_candidates:
                     self.maybe_finalize(branch_key, words, n_candidates)
                     break

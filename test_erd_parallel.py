@@ -186,9 +186,9 @@ class TestClaimSkipsCachedBranch(unittest.TestCase):
 
         self.assertIsNotNone(result,
                              "branch should have been promoted for real work")
-        branch, idx = result
+        branch, bundle_id, indices, forced = result
         self.assertEqual(branch["branch_key"], self.branch_key)
-        self.assertIsNotNone(idx)
+        self.assertTrue(indices)
 
 
 class TestReportingInvariants(unittest.TestCase):
