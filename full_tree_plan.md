@@ -661,7 +661,7 @@ count, and the per-node share still spent in `group_words` (that share is
 - Full suite green.
 - PR description states the `metric_observer` choice (invariant 3).
 
-## §5. Vectorized group partitioning (`group_words` fast path) — only if §4's measurement justifies it
+## §5. Vectorized group partitioning (`group_words` fast path) — **DONE (PR #94, merged)**
 
 **Read first:** §4's `diag_kernel_bench.py` output (the `group_words` share);
 `ResponseCache.group_words` (`wordle_engine.py:418-430`); the group-ordering
@@ -669,6 +669,21 @@ subtleties below.
 **Prerequisites:** §2, §4 deployed, and a measured `group_words` share that
 still dominates. If §4 leaves `group_words` under ~30% of node time, skip
 this section — the complexity is not free.
+
+**Landed (PR #94, merged 2026-07-07; deployed with telemetry epoch 2).**
+Implemented as specified below (stable argsort + first-appearance emission,
+`list(d.items())` property tests, `test_kernel_equivalence.py` byte-identical),
+plus one addition the review round forced: `ResponseCache.group_words`
+dispatches on guess warmth with a ski-rental promotion threshold
+(`_GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD = 250`) — an unconditional fast
+path regressed deep-recursion branches 2.2× because a warm Python loop beats
+the fast path per-call at every branch size; the fast path's true win is
+skipping the one-time per-guess decode. With dispatch: ~75× at n=30, ~2.1× at
+n=81, ~1.6× at n=146, and 1.10× ahead of matrix-off at n=500 past the
+~2-minute promotion transient (paid once per `ResponseCache` lifetime, so
+long-lived swarm workers amortize it to zero). Full methodology, including
+why a 120s bench window initially misread the transient as an unclosable
+gap: `analysis/group_words_dispatch_investigation_2026-07-06.md`.
 
 **Measurement verdict (2026-07-06): GO.** The §4 deploy bench
 (`diag_kernel_bench.py`, 900s deadline, epoch-1 box) puts the matrix-on
@@ -939,13 +954,12 @@ already done      §1 (issue #77 / PR #80) · §2 (PR #84) · §3 (PR #85) ·
                   §9a doc fixes; epoch-0 run complete; packer go/no-go
                   decided (U6); export/import split (PR #88, part of §8's
                   groundwork)
-in progress       §7b calibration — the 841-word ALIBI branch is queued but
-                  waits behind the 208-word branch's certificate, which is
-                  decomposition-bound (~9.7% done as of 2026-07-06); at §4
-                  speeds that is weeks away, so §7b/§7c effectively wait
-                  on §5
-next              §5 — measurement verdict GO (see §5); THE critical path
-then              §7b drain → §7c schedule memo → §6 per its numbers
+in progress       §7b calibration — the 841-word ALIBI branch is queued
+                  behind the 208-word branch's certificate; §5 (merged
+                  PR #94, deployed epoch 2 on 2026-07-07) vectorizes the
+                  decomposition wall that was holding it to ~weeks — the
+                  epoch-2 drain rate is the next thing to measure
+next              §7b drain → §7c schedule memo → §6 per its numbers
 then              §8 (8a reachable-only + 8b opener report) before first
                   full-tree sync
 anytime           §9b rename (unblocked once the epoch-0 corpus is archived)
