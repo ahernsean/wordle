@@ -175,36 +175,40 @@ class TestTelemetryInserts(_TmpQueue):
     def test_candidate_accuracy_records_prediction_point(self):
         self.q.add_candidate_accuracy(
             b"key", 30, 4, predicted_work=820.0, bound_erd=3.41,
-            cost_lb=2.9, gated=False, actual_nodes=771)
+            candidate_cost_lower_bound=2.9, erd_lower_bound_pruned=False,
+            actual_nodes=771)
         self.q.add_candidate_accuracy(
             b"key", 30, 4, predicted_work=0.0, bound_erd=3.41,
-            cost_lb=3.5, gated=True, actual_nodes=4)
+            candidate_cost_lower_bound=3.5, erd_lower_bound_pruned=True,
+            actual_nodes=4)
         rows = self.q._conn.execute(
-            "SELECT predicted_work, gated, actual_nodes, epoch "
+            "SELECT predicted_work, erd_lower_bound_pruned, actual_nodes, epoch "
             "FROM candidate_accuracy ORDER BY id").fetchall()
-        self.assertEqual(rows[0]["gated"], 0)
+        self.assertEqual(rows[0]["erd_lower_bound_pruned"], 0)
         self.assertAlmostEqual(rows[0]["predicted_work"], 820.0)
-        self.assertEqual(rows[1]["gated"], 1)
+        self.assertEqual(rows[1]["erd_lower_bound_pruned"], 1)
         self.assertEqual(rows[1]["actual_nodes"], 4)
         self.assertEqual(rows[0]["epoch"], 0)
 
 
 class TestEstimateCandidateWork(unittest.TestCase):
-    """estimate_candidate_work: gated -> 0, else sum typical over recursed groups."""
+    """estimate_candidate_work: ERD-pruned -> 0, else sum typical over recursed groups."""
 
     @staticmethod
     def _warm(value):
         return lambda k, budget: value
 
-    def test_gated_candidate_predicts_zero(self):
-        # cost_lb = 3 - (2+0)/7 ~= 2.714; best_erd below it -> provably gated.
+    def test_erd_pruned_candidate_predicts_zero(self):
+        # candidate_cost_lower_bound = 3 - (2+0)/7 ~= 2.714; best_erd below it
+        # -> provably ERD-pruned.
         work = estimate_candidate_work(
             [4, 3], has_self=False, n=7, best_erd=2.0, budget=4,
             typical=self._warm(10.0))
         self.assertEqual(work, 0.0)
 
-    def test_non_gated_sums_typical_over_recursed_groups(self):
-        # cost_lb = 3 - (4+1)/7 ~= 2.286 < best_erd 3.0 -> not gated.
+    def test_non_erd_pruned_sums_typical_over_recursed_groups(self):
+        # candidate_cost_lower_bound = 3 - (4+1)/7 ~= 2.286 < best_erd 3.0 ->
+        # not ERD-pruned.
         # Groups [2,3,1,1]: singletons skipped, two recursed -> 10 + 10.
         work = estimate_candidate_work(
             [2, 3, 1, 1], has_self=True, n=7, best_erd=3.0, budget=4,
@@ -243,8 +247,8 @@ class TestCutoffMetric(unittest.TestCase):
     def _warm(value):
         return lambda k, budget: value
 
-    def test_gated_predicts_zero(self):
-        # cost_lb = 3 - (2)/7 ~= 2.71; bound below it -> gated.
+    def test_erd_pruned_predicts_zero(self):
+        # candidate_cost_lower_bound = 3 - (2)/7 ~= 2.71; bound below it -> ERD-pruned.
         self.assertEqual(
             estimate_candidate_work_cutoff([4, 3], False, 7, 2.0, 4, self._warm(99.0)),
             0.0)
@@ -256,8 +260,9 @@ class TestCutoffMetric(unittest.TestCase):
             estimate_candidate_work(sizes, False, n, float("inf"), 4, self._warm(10.0)))
 
     def test_weak_splitter_cut_early_predicts_far_less_than_uncut(self):
-        # Several large groups, cost_lb just under the bound: the estimated ERD
-        # accumulation busts the bound after the first couple of groups, so later
+        # Several large groups, candidate_cost_lower_bound just under the
+        # bound: the estimated ERD accumulation busts the bound after the
+        # first couple of groups, so later
         # groups are never reached and not counted — far below the uncut sum.
         sizes, n, bound = [40, 30, 20, 10], 80, 2.96
         cut = estimate_candidate_work_cutoff(sizes, False, n, bound, 4, self._warm(1000.0))
@@ -265,7 +270,8 @@ class TestCutoffMetric(unittest.TestCase):
         self.assertLess(cut, uncut)
 
     def test_strong_splitter_reaches_many_groups(self):
-        # Many small groups, cost_lb far below the bound: the cutoff is not reached
+        # Many small groups, candidate_cost_lower_bound far below the bound:
+        # the cutoff is not reached
         # early, so most groups contribute -> a large estimate.
         sizes = [2] * 20
         n = 41
@@ -287,7 +293,8 @@ class TestCutoffMetric(unittest.TestCase):
         # A group of size n gains no information; the engine rejects it, so the
         # cutoff metric skips it and only the genuine sub-branches contribute.
         sizes, n = [10, 3, 2], 10
-        # cost_lb = 3 - 3/10 = 2.7 < bound -> not gated; the k==n group is skipped.
+        # candidate_cost_lower_bound = 3 - 3/10 = 2.7 < bound -> not
+        # ERD-pruned; the k==n group is skipped.
         work = estimate_candidate_work_cutoff(sizes, False, n, 5.0, 4, self._warm(4.0))
         self.assertEqual(work, 4.0 * 2)   # only the size-3 and size-2 groups counted
 
@@ -296,7 +303,8 @@ class TestCutoffMetric(unittest.TestCase):
         # further guesses), the second is a non-self singleton (~0 search).  Neither
         # contributes search work, so the estimate is just the one real sub-branch.
         sizes, n = [3, 1, 1], 5
-        # cost_lb = 3 - (3+1)/5 = 2.2 < bound -> not gated; loop reaches both 1s.
+        # candidate_cost_lower_bound = 3 - (3+1)/5 = 2.2 < bound -> not
+        # ERD-pruned; loop reaches both 1s.
         work = estimate_candidate_work_cutoff(sizes, True, n, 3.0, 4, self._warm(1.0))
         self.assertEqual(work, 1.0)       # only the size-3 group contributes
 
@@ -304,23 +312,24 @@ class TestCutoffMetric(unittest.TestCase):
 class TestCandidateAccuracyGroupSizes(_TmpQueue):
     def test_group_sizes_persisted(self):
         self.q.add_candidate_accuracy(
-            b"k", 30, 4, 820.0, 3.41, 2.9, gated=False, actual_nodes=771,
-            group_sizes="12-8-5-3-1")
+            b"k", 30, 4, 820.0, 3.41, 2.9, erd_lower_bound_pruned=False,
+            actual_nodes=771, group_sizes="12-8-5-3-1")
         row = self.q._conn.execute(
             "SELECT group_sizes FROM candidate_accuracy").fetchone()
         self.assertEqual(row["group_sizes"], "12-8-5-3-1")
 
     def test_group_sizes_optional_defaults_null(self):
         self.q.add_candidate_accuracy(
-            b"k", 30, 4, 0.0, 3.41, 3.5, gated=True, actual_nodes=4)
+            b"k", 30, 4, 0.0, 3.41, 3.5, erd_lower_bound_pruned=True,
+            actual_nodes=4)
         row = self.q._conn.execute(
             "SELECT group_sizes FROM candidate_accuracy").fetchone()
         self.assertIsNone(row["group_sizes"])
 
     def test_source_word_persisted_for_per_opener_segmentation(self):
         self.q.add_candidate_accuracy(
-            b"k", 30, 4, 820.0, 3.41, 2.9, gated=False, actual_nodes=771,
-            group_sizes="12-8-5", source_word="salet")
+            b"k", 30, 4, 820.0, 3.41, 2.9, erd_lower_bound_pruned=False,
+            actual_nodes=771, group_sizes="12-8-5", source_word="salet")
         row = self.q._conn.execute(
             "SELECT source_word FROM candidate_accuracy").fetchone()
         self.assertEqual(row["source_word"], "salet")
@@ -329,31 +338,36 @@ class TestCandidateAccuracyGroupSizes(_TmpQueue):
 class TestMetricObserverHook(unittest.TestCase):
     """evaluate_candidate reports the work-metric inputs exactly once per call."""
 
-    def test_observer_called_with_costlb_groups_bound(self):
+    def test_observer_called_with_cost_lower_bound_groups_bound(self):
         remaining = ["crane", "slate", "trace", "stale", "tales"]
         seen = []
 
-        def observer(group_sizes, has_self, cost_lb, bound, gated):
-            seen.append((group_sizes, has_self, cost_lb, bound, gated))
+        def observer(group_sizes, has_self, candidate_cost_lower_bound, bound,
+                     erd_lower_bound_pruned):
+            seen.append((group_sizes, has_self, candidate_cost_lower_bound,
+                        bound, erd_lower_bound_pruned))
 
         evaluate_candidate(remaining, "crane", None, None,
                            guesses=remaining, policy=ERD_ANSWERS,
                            best_erd=float('inf'), metric_observer=observer)
         self.assertEqual(len(seen), 1)
-        group_sizes, has_self, cost_lb, bound, gated = seen[0]
+        (group_sizes, has_self, candidate_cost_lower_bound, bound,
+         erd_lower_bound_pruned) = seen[0]
         self.assertEqual(sum(group_sizes), len(remaining))
-        # Loose (inf) bound never gates: cost_lb >= inf is impossible.
-        self.assertFalse(gated)
+        # Loose (inf) bound never ERD-prunes: candidate_cost_lower_bound >= inf
+        # is impossible.
+        self.assertFalse(erd_lower_bound_pruned)
         self.assertEqual(bound, float('inf'))
 
-    def test_observer_reports_gated_under_tight_bound(self):
+    def test_observer_reports_erd_lower_bound_pruned_under_tight_bound(self):
         remaining = ["crane", "slate", "trace", "stale", "tales"]
         seen = []
 
-        def observer(group_sizes, has_self, cost_lb, bound, gated):
-            seen.append(gated)
+        def observer(group_sizes, has_self, candidate_cost_lower_bound, bound,
+                     erd_lower_bound_pruned):
+            seen.append(erd_lower_bound_pruned)
 
-        # A bound at the cost-floor (1.0) gates every candidate immediately.
+        # A bound at the cost-floor (1.0) ERD-prunes every candidate immediately.
         evaluate_candidate(remaining, "crane", None, None,
                            guesses=remaining, policy=ERD_ANSWERS,
                            best_erd=1.0, metric_observer=observer)

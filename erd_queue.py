@@ -256,28 +256,29 @@ CREATE TABLE IF NOT EXISTS branch_finalize_log (
 -- Per-candidate predicted-vs-actual work, collected under single-candidate
 -- claiming (epoch 0) where one claim == one candidate so actual_nodes IS that
 -- candidate's true cost.  Validates the packer's work metric: predicted_work is
--- estimate_candidate_work(c | bound_erd); gated = (cost_lb >= bound_erd) means
--- the candidate was provably cut for free (predicted_work 0).  bound_erd and
--- cost_lb are logged so a gated candidate's near-zero cost reads as a correct
+-- estimate_candidate_work(c | bound_erd); erd_lower_bound_pruned =
+-- (candidate_cost_lower_bound >= bound_erd) means the candidate was provably
+-- cut for free (predicted_work 0).  bound_erd and candidate_cost_lower_bound
+-- are logged so an ERD-pruned candidate's near-zero cost reads as a correct
 -- prediction, not a wild miss.  The §10 go/no-go gate is computed from this.
 -- group_sizes is the candidate's response-group sizes ('-'-joined), the
 -- sufficient statistic to recompute ANY work metric offline (uncut, cutoff-aware,
 -- ...) against the logged bound_erd without re-running the swarm.  Written only
--- for non-gated rows (a gated row's predicted work is exactly 0).
+-- for non-ERD-pruned rows (an ERD-pruned row's predicted work is exactly 0).
 CREATE TABLE IF NOT EXISTS candidate_accuracy (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    branch_key     BLOB,
-    n_words        INTEGER NOT NULL,
-    budget         INTEGER,
-    predicted_work REAL,
-    bound_erd      REAL,
-    cost_lb        REAL,
-    gated          INTEGER NOT NULL,
-    actual_nodes   INTEGER NOT NULL,
-    group_sizes    TEXT,
-    source_word    TEXT,
-    epoch          INTEGER NOT NULL DEFAULT 0,
-    recorded_at    INTEGER NOT NULL
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_key                 BLOB,
+    n_words                    INTEGER NOT NULL,
+    budget                     INTEGER,
+    predicted_work             REAL,
+    bound_erd                  REAL,
+    candidate_cost_lower_bound REAL,
+    erd_lower_bound_pruned     INTEGER NOT NULL,
+    actual_nodes               INTEGER NOT NULL,
+    group_sizes                TEXT,
+    source_word                TEXT,
+    epoch                      INTEGER NOT NULL DEFAULT 0,
+    recorded_at                INTEGER NOT NULL
 );
 
 -- One row per wall-clock backstop firing: a frame handed off its remainder
@@ -420,6 +421,23 @@ class ERDQueue:
             "group_sizes": "TEXT",
             "source_word": "TEXT",
         })
+
+        # candidate_accuracy.cost_lb / .gated are legacy column names from
+        # before the ERD-lower-bound-pruning rename (§9b): cost_lb was the
+        # candidate cost lower bound now called candidate_cost_lower_bound,
+        # and gated was the erd_lower_bound_pruned flag.  RENAME COLUMN
+        # (3.25+) is available on this box (see the backstop_telemetry
+        # depth->budget migration above).
+        ca_cols = {r["name"] for r in
+                   self._conn.execute("PRAGMA table_info(candidate_accuracy)")}
+        if "cost_lb" in ca_cols and "candidate_cost_lower_bound" not in ca_cols:
+            self._conn.execute(
+                "ALTER TABLE candidate_accuracy "
+                "RENAME COLUMN cost_lb TO candidate_cost_lower_bound")
+        if "gated" in ca_cols and "erd_lower_bound_pruned" not in ca_cols:
+            self._conn.execute(
+                "ALTER TABLE candidate_accuracy "
+                "RENAME COLUMN gated TO erd_lower_bound_pruned")
 
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
@@ -1230,26 +1248,29 @@ class ERDQueue:
               finalized_at, nodes_spent, n_claims, now))
 
     def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
-                               bound_erd, cost_lb, gated, actual_nodes,
+                               bound_erd, candidate_cost_lower_bound,
+                               erd_lower_bound_pruned, actual_nodes,
                                group_sizes=None, source_word=None):
         """Log one predicted-vs-actual work point for the §10 metric-validation gate.
 
         Under single-candidate claiming a claim is exactly one candidate, so
         actual_nodes is that candidate's true cost.  group_sizes ('-'-joined
         response-group sizes) is the sufficient statistic for recomputing any work
-        metric offline; logged only for non-gated rows.  source_word is the root
-        opener of the branch's spine, so a multi-day corpus can be segmented per
-        opener (different openers reach differently-shaped answer sets).
+        metric offline; logged only for non-ERD-pruned rows.  source_word is the
+        root opener of the branch's spine, so a multi-day corpus can be
+        segmented per opener (different openers reach differently-shaped
+        answer sets).
         """
         now = int(time.time())
         self._conn.execute("""
             INSERT INTO candidate_accuracy
-                (branch_key, n_words, budget, predicted_work, bound_erd, cost_lb,
-                 gated, actual_nodes, group_sizes, source_word, epoch, recorded_at)
+                (branch_key, n_words, budget, predicted_work, bound_erd,
+                 candidate_cost_lower_bound, erd_lower_bound_pruned,
+                 actual_nodes, group_sizes, source_word, epoch, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (branch_key, n_words, budget, predicted_work, bound_erd, cost_lb,
-              1 if gated else 0, actual_nodes, group_sizes, source_word,
-              self.epoch, now))
+        """, (branch_key, n_words, budget, predicted_work, bound_erd,
+              candidate_cost_lower_bound, 1 if erd_lower_bound_pruned else 0,
+              actual_nodes, group_sizes, source_word, self.epoch, now))
 
     def set_epoch(self, epoch: int, label: str = None, git_sha: str = None,
                   notes: str = None):

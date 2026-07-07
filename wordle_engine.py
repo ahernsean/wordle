@@ -1028,7 +1028,7 @@ def _by_group_size(item):
     return len(item[1])
 
 
-def _candidate_cost_lb(group_sizes, has_self, n):
+def _candidate_cost_lower_bound(group_sizes, has_self, n):
     """The engine's admissible lower bound on a candidate's ERD, shared by
     evaluate_candidate and the cost-estimator functions below: cost >=
     3 - (number_of_groups + has_self) / n. group_sizes need only support
@@ -1040,9 +1040,10 @@ def _candidate_cost_lb(group_sizes, has_self, n):
 def estimate_candidate_work(group_sizes, has_self, n, best_erd, budget, typical):
     """Predicted search work (in nodes), UNCUT sum over recursed groups.
 
-    Returns 0.0 when the candidate is provably gated (cost_lb >= best_erd): the
-    engine cuts it for free, so this is exact.  Otherwise it sums the cost model's
-    typical node count for EVERY response group the candidate could recurse into.
+    Returns 0.0 when the candidate is provably ERD-pruned
+    (candidate_cost_lower_bound >= best_erd): the engine cuts it for free, so
+    this is exact.  Otherwise it sums the cost model's typical node count for
+    EVERY response group the candidate could recurse into.
 
     This is the naive estimate §4 warns about: it ignores the accumulated-cost
     cutoff, so it over-predicts weak splitters that pass the entry gate but are cut
@@ -1053,7 +1054,8 @@ def estimate_candidate_work(group_sizes, has_self, n, best_erd, budget, typical)
     sub-branch of size k at the given budget, or None when cold; a cold size falls
     back to k itself.  A scheduling estimate only — it never sets a pruning bound.
     """
-    if best_erd is not None and _candidate_cost_lb(group_sizes, has_self, n) >= best_erd:
+    if (best_erd is not None
+            and _candidate_cost_lower_bound(group_sizes, has_self, n) >= best_erd):
         return 0.0
     sub_budget = None if budget is None else budget - 1
     total = 0.0
@@ -1073,23 +1075,24 @@ def estimate_candidate_work_cutoff(group_sizes, has_self, n, best_erd, budget,
     accumulating a per-group ERD proxy (3 - 2/k), and sum the cost model's node
     estimate only for the groups reached before the accumulated cost meets
     best_erd.  The proxy deliberately exceeds the admissible lower bound
-    (2 - 1/k): the admissible bound sums to ~cost_lb, which by construction
-    never reaches best_erd for a non-gated candidate, so a cutoff built on it
-    would never fire.  The price is that this modeled cutoff can fire EARLIER
-    than the engine's, under-counting reached groups — acceptable for a
-    scheduling estimate.
+    (2 - 1/k): the admissible bound sums to ~candidate_cost_lower_bound, which
+    by construction never reaches best_erd for a non-ERD-pruned candidate, so
+    a cutoff built on it would never fire.  The price is that this modeled
+    cutoff can fire EARLIER than the engine's, under-counting reached groups —
+    acceptable for a scheduling estimate.
 
-    The effect: a weak splitter (few large groups, cost_lb just under best_erd)
-    busts the bound after one or two groups and predicts ~0; a strong splitter
-    (cost_lb far below best_erd) reaches many groups and predicts large.  This is
-    the direction the uncut estimate gets backwards.  Scheduling only; never a bound.
+    The effect: a weak splitter (few large groups, candidate_cost_lower_bound
+    just under best_erd) busts the bound after one or two groups and predicts
+    ~0; a strong splitter (candidate_cost_lower_bound far below best_erd)
+    reaches many groups and predicts large.  This is the direction the uncut
+    estimate gets backwards.  Scheduling only; never a bound.
     """
     if best_erd is None or best_erd == float('inf'):
         # No real bound yet: nothing is provably cut, so fall back to the uncut
         # sum (the conservative, finer-granularity direction per §4).
         return estimate_candidate_work(group_sizes, has_self, n, best_erd, budget,
                                        typical)
-    if _candidate_cost_lb(group_sizes, has_self, n) >= best_erd:
+    if _candidate_cost_lower_bound(group_sizes, has_self, n) >= best_erd:
         return 0.0
     sub_budget = None if budget is None else budget - 1
     cost = 1.0                      # the candidate's own guess
@@ -1107,9 +1110,10 @@ def estimate_candidate_work_cutoff(group_sizes, has_self, n, best_erd, budget,
             t = typical(k, sub_budget)
             total += t if t is not None else float(k)
             # Accumulate an ESTIMATE of the sub-branch's real ERD, not its
-            # admissible lower bound: the lower bound (2 - 1/k) ~= cost_lb summed,
-            # so it never trips for a non-gated candidate and the cutoff would
-            # never fire.  `3 - 2/k` is a monotone imperfect-split proxy in [2, 3)
+            # admissible lower bound: the lower bound (2 - 1/k) ~=
+            # candidate_cost_lower_bound summed, so it never trips for a
+            # non-ERD-pruned candidate and the cutoff would never fire.
+            # `3 - 2/k` is a monotone imperfect-split proxy in [2, 3)
             # — bigger groups cost more — and is the dial to calibrate offline
             # against the group_sizes corpus.
             cost += (k / n) * (3.0 - 2.0 / k)
@@ -1190,16 +1194,19 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 
     # Admissible lower bound on this candidate's cost — cost >= 3 - (G + has_self)/n.
     has_self = _ALL_GREEN_PATTERN in groups
-    cost_lb = _candidate_cost_lb(groups.values(), has_self, n)
-    gated = cost_lb >= best_erd
-    # Report the work-metric inputs the moment they are known (cost_lb, group
-    # sizes, the bound actually in force after any external tightening) so a
-    # measurement layer can log predicted-vs-actual without recomputing them.
-    # gated candidates are reported too — their near-zero cost is the signal.
+    candidate_cost_lower_bound = _candidate_cost_lower_bound(
+        groups.values(), has_self, n)
+    erd_lower_bound_pruned = candidate_cost_lower_bound >= best_erd
+    # Report the work-metric inputs the moment they are known
+    # (candidate_cost_lower_bound, group sizes, the bound actually in force
+    # after any external tightening) so a measurement layer can log
+    # predicted-vs-actual without recomputing them. ERD-pruned candidates are
+    # reported too — their near-zero cost is the signal.
     if metric_observer is not None:
         metric_observer([len(g) for g in groups.values()], has_self,
-                        cost_lb, best_erd, gated)
-    if gated:
+                        candidate_cost_lower_bound, best_erd,
+                        erd_lower_bound_pruned)
+    if erd_lower_bound_pruned:
         # Provably can't beat the bound (but may well be feasible) — a cutoff,
         # not infeasibility.  See OVER_ERD_LIMIT in _solve_subset.
         return (OVER_ERD_LIMIT, None, None, False)
@@ -1213,19 +1220,22 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     ordered = sorted(groups.items(), key=_by_group_size, reverse=True)
 
     # Alpha-beta: solve each sub-branch under a derived ceiling so a deep node
-    # prunes from a tight bound instead of inf.  rest_lb[i] is an admissible
-    # lower bound on the weighted cost of the sub-branches *after* position i
-    # (each sub-branch of size k costs >= lb(k); the all-singletons split attains
-    # it, so it never over-counts).  The self singleton contributes 0.
+    # prunes from a tight bound instead of inf.  remaining_groups_cost_lower_bound[i]
+    # is an admissible lower bound on the weighted cost of the sub-branches
+    # *after* position i (each sub-branch of size k costs >= lb(k); the
+    # all-singletons split attains it, so it never over-counts).  The self
+    # singleton contributes 0.
     def _sub_lb(sg):
         if len(sg) == 1:
             return 0.0 if sg[0] == candidate else 1.0
         return 2.0 - 1.0 / len(sg)
 
-    rest_lb = [0.0] * (len(ordered) + 1)
+    remaining_groups_cost_lower_bound = [0.0] * (len(ordered) + 1)
     for i in range(len(ordered) - 1, -1, -1):
         sub_i = ordered[i][1]
-        rest_lb[i] = rest_lb[i + 1] + (len(sub_i) / n) * _sub_lb(sub_i)
+        remaining_groups_cost_lower_bound[i] = (
+            remaining_groups_cost_lower_bound[i + 1]
+            + (len(sub_i) / n) * _sub_lb(sub_i))
 
     for i, (pattern_code, sub_branch) in enumerate(ordered):
         # Tighten the bound from any inter-worker improvement before computing
@@ -1242,7 +1252,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         if best_erd == float('inf'):
             sub_ceiling = float('inf')
         else:
-            sub_ceiling = (best_erd - cost - rest_lb[i + 1]) * (n / k) + _CEIL_EPS
+            sub_ceiling = (best_erd - cost
+                          - remaining_groups_cost_lower_bound[i + 1]) * (n / k) + _CEIL_EPS
         sub = _solve_subset(
             sub_branch, cache, score_cache, sub_budget, deadline, guesses,
             policy, cancel_check, heartbeat, note_depth, None,
@@ -1355,7 +1366,8 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # minimum, and therefore every cached result, is unchanged.
     #
     # candidate_cost_lower_bounds, when set, is the vectorized twin of
-    # evaluate_candidate's own admissible cost_lb bound (C2.1), aligned
+    # evaluate_candidate's own admissible candidate_cost_lower_bound bound
+    # (C2.1), aligned
     # index-for-index with the (already reordered) candidate_list — see the
     # ERD-pruning check in the candidate loop below.
     # branch_indices lets both the ordering below and every evaluate_candidate

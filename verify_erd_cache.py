@@ -62,8 +62,8 @@ def _erd_from_cache(branch_words, candidate, rcache, sc, n, best_erd):
 
     # Admissible lower bound: 3 - (# groups + has_self) / n
     has_self = _ALL_GREEN_PATTERN in groups
-    cost_lb = 3.0 - (len(groups) + (1 if has_self else 0)) / n
-    if cost_lb >= best_erd:
+    candidate_cost_lower_bound = 3.0 - (len(groups) + (1 if has_self else 0)) / n
+    if candidate_cost_lower_bound >= best_erd:
         return None  # provably can't beat bound
 
     # Sort largest sub-branches first so cost accumulates fast (early pruning).

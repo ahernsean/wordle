@@ -289,7 +289,8 @@ class PatternMatrix:
         # Candidate is in the branch iff the all-green pattern (242) is non-empty.
         has_self = counts[:, 242] > 0
 
-        # Admissible lower bound: same formula as evaluate_candidate's cost_lb.
+        # Admissible lower bound: same formula as evaluate_candidate's
+        # candidate_cost_lower_bound.
         # Integer numerator cast to float64 before division so the result is
         # bit-identical to the scalar computation 3.0 - (G + s) / branch_size.
         cost_lower_bound = (

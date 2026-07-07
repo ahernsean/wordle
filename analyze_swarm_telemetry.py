@@ -6,16 +6,17 @@ Reads erd_queue.sqlite3 (read-only) and evaluates, on one telemetry epoch's clai
 corpus (--epoch, default 0 = the single-candidate baseline), whether a candidate
 work metric is sound enough to build the packer on.
 
-Because candidate_accuracy logs each non-gated candidate's `group_sizes` (the
-sufficient statistic) and the bound it saw, this recomputes EVERY metric offline
-against a cost-model snapshot — so the uncut estimate, the cutoff-aware §4 metric,
-and any future variant are compared from one collection without re-running the
-swarm.
+Because candidate_accuracy logs each non-ERD-pruned candidate's `group_sizes`
+(the sufficient statistic) and the bound it saw, this recomputes EVERY metric
+offline against a cost-model snapshot — so the uncut estimate, the cutoff-aware
+§4 metric, and any future variant are compared from one collection without
+re-running the swarm.
 
 Three checks per metric:
-  1. Gating split (exact): cost_lb >= B candidates are cut for free, so gated rows
-     must have near-zero actual_nodes.  Metric-independent; reported once.
-  2. §4 trap: a sound metric must NOT predict the cheap non-gated mass as
+  1. ERD-pruning split (exact): candidate_cost_lower_bound >= B candidates are
+     cut for free, so ERD-pruned rows must have near-zero actual_nodes.
+     Metric-independent; reported once.
+  2. §4 trap: a sound metric must NOT predict the cheap non-ERD-pruned mass as
      expensive (weak splitters cut by the accumulated-cost cutoff).
   3. Load-bearing rank: among the few claims holding nearly all node work — the
      ones that drive packer balance — predicted must rank actual (Spearman).
@@ -133,7 +134,7 @@ METRICS = {
 
 
 def evaluate_metric(name, fn, rows, typical, args):
-    """rows: non-gated (n_words, budget, bound_erd, actual, sizes-list, has_self).
+    """rows: non-ERD-pruned (n_words, budget, bound_erd, actual, sizes-list, has_self).
     Returns (false_expensive_frac, tail_spearman, overall_spearman, slope,
     pearson_log)."""
     preds, acts = [], []
@@ -150,7 +151,7 @@ def evaluate_metric(name, fn, rows, typical, args):
     rho_all = spearman(preds, acts)
     tail = [(p, a) for p, a in zip(preds, acts) if a >= args.tail_nodes]
     rho_tail = spearman([p for p, _ in tail], [a for _, a in tail]) if len(tail) > 2 else float("nan")
-    print(f"\n--- metric '{name}' (non-gated, n={len(rows):,}) ---")
+    print(f"\n--- metric '{name}' (non-ERD-pruned, n={len(rows):,}) ---")
     print(f"  median predicted = {statistics.median(preds):,.1f}   "
           f"§4 false-expensive (pred>{args.false_pred:g}, actual<{args.small_nodes}) "
           f"= {100*false_expensive_frac:.1f}%")
@@ -165,13 +166,14 @@ def evaluate_metric(name, fn, rows, typical, args):
 def estimate_claim_reduction(conn, epoch, small_count, count_cap):
     """The reframed §11 gate: claim transactions to drain a branch under the
     binary/coarse packing scheme vs single-candidate claiming — which needs only
-    exact gating, not a good magnitude estimate.
+    exact ERD-lower-bound pruning, not a good magnitude estimate.
 
-    Per finalized branch of `total` candidates with `N` non-gated: the non-gated
-    pack into ceil(N/small_count) small fixed-count bundles and the gated
-    G = total - N coalesce into ceil(G/count_cap) count-capped bulk bundles.
-    reduction = total / bundles.  Gating is exact, so a wrong work estimate cannot
-    change this — it only decides which non-gated candidates share a small bundle.
+    Per finalized branch of `total` candidates with `N` non-ERD-pruned: the
+    non-ERD-pruned pack into ceil(N/small_count) small fixed-count bundles and
+    the ERD-pruned G = total - N coalesce into ceil(G/count_cap) count-capped
+    bulk bundles.  reduction = total / bundles.  ERD-lower-bound pruning is
+    exact, so a wrong work estimate cannot change this — it only decides which
+    non-ERD-pruned candidates share a small bundle.
     """
     import math
     total_by = {bytes(r[0]): r[1] for r in conn.execute(
@@ -180,7 +182,8 @@ def estimate_claim_reduction(conn, epoch, small_count, count_cap):
     ng_by = {}
     for bk, cnt in conn.execute(
         "SELECT branch_key, COUNT(*) FROM candidate_accuracy "
-        "WHERE epoch = ? AND gated = 0 GROUP BY branch_key", (epoch,)):
+        "WHERE epoch = ? AND erd_lower_bound_pruned = 0 GROUP BY branch_key",
+        (epoch,)):
         ng_by[bytes(bk)] = cnt
     tot_claims = tot_bundles = 0
     per = []
@@ -206,13 +209,13 @@ def main():
     ap.add_argument("--max-false", type=float, default=0.20)
     ap.add_argument("--tail-nodes", type=int, default=100)
     ap.add_argument("--min-bounded", type=int, default=2000,
-                    help="min bounded non-gated rows before the verdict uses the "
-                         "bounded subset instead of the full set (default 2000)")
+                    help="min bounded non-ERD-pruned rows before the verdict uses "
+                         "the bounded subset instead of the full set (default 2000)")
     ap.add_argument("--gate-metric", default="cutoff", choices=list(METRICS))
     ap.add_argument("--small-count", type=int, default=8,
-                    help="non-gated candidates per small bundle (binary scheme)")
+                    help="non-ERD-pruned candidates per small bundle (binary scheme)")
     ap.add_argument("--count-cap", type=int, default=512,
-                    help="gated candidates per count-capped bulk bundle")
+                    help="ERD-pruned candidates per count-capped bulk bundle")
     ap.add_argument("--min-reduction", type=float, default=50.0,
                     help="claim-count reduction the reframed gate requires (x)")
     args = ap.parse_args()
@@ -220,8 +223,8 @@ def main():
     conn = sqlite3.connect(f"file:{args.queue}?mode=ro", uri=True)
     typical = load_cost_model(conn)
     all_rows = conn.execute("""
-        SELECT n_words, budget, bound_erd, gated, actual_nodes, group_sizes,
-               source_word, cost_lb
+        SELECT n_words, budget, bound_erd, erd_lower_bound_pruned, actual_nodes,
+               group_sizes, source_word, candidate_cost_lower_bound
         FROM candidate_accuracy WHERE epoch = ?
     """, (args.epoch,)).fetchall()
 
@@ -232,51 +235,56 @@ def main():
         print("NO DATA — run the swarm on the new code to populate candidate_accuracy.")
         return
 
-    gated = [r for r in all_rows if r[3]]
-    nongated_raw = [r for r in all_rows if not r[3]]
+    erd_pruned = [r for r in all_rows if r[3]]
+    non_erd_pruned_raw = [r for r in all_rows if not r[3]]
     # by-opener counts (segmentation for the per-opener split)
     from collections import Counter
-    opener_counts = Counter(r[6] for r in nongated_raw)
-    print(f"gated: {len(gated):,} ({100*len(gated)/n:.1f}%)   "
-          f"non-gated: {len(nongated_raw):,} ({100*len(nongated_raw)/n:.1f}%)")
+    opener_counts = Counter(r[6] for r in non_erd_pruned_raw)
+    print(f"ERD-pruned: {len(erd_pruned):,} ({100*len(erd_pruned)/n:.1f}%)   "
+          f"non-ERD-pruned: {len(non_erd_pruned_raw):,} "
+          f"({100*len(non_erd_pruned_raw)/n:.1f}%)")
 
-    # Check 1: gating split (metric-independent)
-    print("\n=== Gating split: actual_nodes by class ===")
-    _describe("gated", [r[4] for r in gated])
-    _describe("non-gated", [r[4] for r in nongated_raw])
-    gsmall = sum(1 for r in gated if r[4] < args.small_nodes)
-    gfrac = gsmall / len(gated) if gated else float("nan")
-    print(f"  gated rows with actual < {args.small_nodes}: {gsmall:,}/{len(gated):,} "
-          f"= {100*gfrac:.2f}%")
+    # Check 1: ERD-pruning split (metric-independent)
+    print("\n=== ERD-pruning split: actual_nodes by class ===")
+    _describe("erd-pruned", [r[4] for r in erd_pruned])
+    _describe("non-erd-pruned", [r[4] for r in non_erd_pruned_raw])
+    gsmall = sum(1 for r in erd_pruned if r[4] < args.small_nodes)
+    gfrac = gsmall / len(erd_pruned) if erd_pruned else float("nan")
+    print(f"  ERD-pruned rows with actual < {args.small_nodes}: "
+          f"{gsmall:,}/{len(erd_pruned):,} = {100*gfrac:.2f}%")
 
     # Parse group sizes once; drop rows missing them (older rows before the column)
     rows = []
     rows_by_opener = {}
     skipped = 0
-    for n_words, budget, bound, _g, actual, gs, opener, cost_lb in nongated_raw:
+    for (n_words, budget, bound, _g, actual, gs, opener,
+         candidate_cost_lower_bound) in non_erd_pruned_raw:
         if not gs:
             skipped += 1
             continue
         sizes = [int(x) for x in gs.split("-") if x]
-        # has_self is not logged directly, but the runtime cost_lb is, and
-        # cost_lb = 3 - (G + has_self)/n with G = len(sizes) — so it is
-        # recoverable exactly.
-        has_self = (cost_lb is not None
-                    and round(n_words * (3.0 - cost_lb)) - len(sizes) == 1)
+        # has_self is not logged directly, but the runtime
+        # candidate_cost_lower_bound is, and candidate_cost_lower_bound =
+        # 3 - (G + has_self)/n with G = len(sizes) — so it is recoverable
+        # exactly.
+        has_self = (candidate_cost_lower_bound is not None
+                    and round(n_words * (3.0 - candidate_cost_lower_bound))
+                    - len(sizes) == 1)
         row = (n_words, budget, bound, actual, sizes, has_self)
         rows.append(row)
         rows_by_opener.setdefault(opener, []).append(row)
     have_bound = sum(1 for r in rows if r[2] is not None)
-    print(f"\nnon-gated with group_sizes: {len(rows):,}  "
+    print(f"\nnon-ERD-pruned with group_sizes: {len(rows):,}  "
           f"(skipped {skipped:,} pre-column rows); with a known bound: "
           f"{have_bound:,} ({100*have_bound/max(1,len(rows)):.1f}%)")
 
-    # Checks 2 & 3: every metric, recomputed offline.  Report the full non-gated
-    # set AND the bounded-only subset: the cutoff metric is identical to uncut on
-    # unbounded rows (no bound to cut against), so its value shows ONLY on bounded
-    # rows.  The verdict keys on the bounded subset when it is large enough.
+    # Checks 2 & 3: every metric, recomputed offline.  Report the full
+    # non-ERD-pruned set AND the bounded-only subset: the cutoff metric is
+    # identical to uncut on unbounded rows (no bound to cut against), so its
+    # value shows ONLY on bounded rows.  The verdict keys on the bounded
+    # subset when it is large enough.
     bounded = [r for r in rows if r[2] is not None]
-    print("\n=== Metric comparison: ALL non-gated (mostly unbounded) ===")
+    print("\n=== Metric comparison: ALL non-ERD-pruned (mostly unbounded) ===")
     results_all = {name: evaluate_metric(name, fn, rows, typical, args)
                    for name, fn in METRICS.items()}
     print(f"\n=== Metric comparison: BOUNDED-only subset (n={len(bounded):,}) — "
@@ -324,12 +332,12 @@ def main():
     # ERD-lower-bound elimination, and a searched mass that is overwhelmingly cheap.
     results = results_bounded or results_all
     false_expensive_frac, rho_tail, _, slope, r_log = results[args.gate_metric]
-    used = "bounded subset" if results_bounded else "full non-gated set"
-    elim_ok = (not gated) or gfrac >= 0.95
+    used = "bounded subset" if results_bounded else "full non-ERD-pruned set"
+    elim_ok = (not erd_pruned) or gfrac >= 0.95
     print(f"\n=== Packer decision ===")
     print(f"  [{'PASS' if elim_ok else 'FAIL'}] ERD-lower-bound elimination is exact "
           f"({100*gfrac:.1f}% of eliminated candidates < {args.small_nodes} nodes)"
-          if gated else "  [n/a ] elimination split (no eliminated rows)")
+          if erd_pruned else "  [n/a ] elimination split (no eliminated rows)")
     print(f"  Magnitude estimate (metric '{args.gate_metric}', {used}): "
           f"log-log slope {slope:.3f}, Pearson(log) {r_log:.3f}, "
           f"false-expensive {100*false_expensive_frac:.1f}%, "

@@ -82,12 +82,13 @@ OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publ
 COLD_BACKSTOP_SECONDS = 600
 MIN_HANDOFF_CANDIDATES = 4   # minimum remaining candidates to bother handing off
 
-# candidate_accuracy logs every non-gated claim (the metric-design signal, rare in
-# the deep regime) but only 1-in-N gated claims (~1 node each, redundant) so a
-# multi-day corpus stays bounded.  1 = log all (the validation-gate default);
-# raise it (e.g. ERD_ACCURACY_GATED_SAMPLE_EVERY=100) for a long production run.
-ACCURACY_GATED_SAMPLE_EVERY = max(
-    1, int(os.environ.get('ERD_ACCURACY_GATED_SAMPLE_EVERY', '1')))
+# candidate_accuracy logs every non-ERD-pruned claim (the metric-design signal,
+# rare in the deep regime) but only 1-in-N ERD-pruned claims (~1 node each,
+# redundant) so a multi-day corpus stays bounded.  1 = log all (the
+# validation-gate default); raise it (e.g.
+# ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY=100) for a long production run.
+ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY = max(
+    1, int(os.environ.get('ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY', '1')))
 MIN_PUBLISH_BRANCH_WORDS = 2  # frames with fewer answer words are base cases, never
                               # worth tracking for overrun (the candidate loop on a
                               # 1-word branch never even runs)
@@ -357,8 +358,8 @@ class _BranchWorker:
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
-        # Counts gated candidate_accuracy claims for 1-in-N down-sampling.
-        self._gated_accuracy_n = 0
+        # Counts ERD-pruned candidate_accuracy claims for 1-in-N down-sampling.
+        self._erd_lower_bound_pruned_accuracy_n = 0
         # Absolute root -> branch spine of the branch the worker is currently
         # descending (its claimed branch): the guesses played, space-joined as
         # "GUESS pattern".  Promotion composes a child branch's spine as this base
@@ -736,16 +737,18 @@ class _BranchWorker:
         # against; the accuracy row is written below once actual_nodes is known.
         metric = {}
 
-        def _metric_observer(group_sizes, has_self, cost_lb, bound, gated):
+        def _metric_observer(group_sizes, has_self, candidate_cost_lower_bound,
+                             bound, erd_lower_bound_pruned):
             metric['predicted'] = estimate_candidate_work(
                 group_sizes, has_self, n_words, bound, budget, self._typical)
             metric['bound'] = None if bound == float('inf') else bound
-            metric['cost_lb'] = cost_lb
-            metric['gated'] = gated
-            # Persist the group-size multiset for non-gated rows: the sufficient
-            # statistic to recompute any candidate work metric offline.  Gated
-            # rows are exactly 0, so their sizes carry no metric-design signal.
-            metric['group_sizes'] = (None if gated else
+            metric['candidate_cost_lower_bound'] = candidate_cost_lower_bound
+            metric['erd_lower_bound_pruned'] = erd_lower_bound_pruned
+            # Persist the group-size multiset for non-ERD-pruned rows: the
+            # sufficient statistic to recompute any candidate work metric
+            # offline.  ERD-pruned rows are exactly 0, so their sizes carry no
+            # metric-design signal.
+            metric['group_sizes'] = (None if erd_lower_bound_pruned else
                                      '-'.join(str(k) for k in group_sizes))
 
         status, cost, cand_md, budget_tainted = evaluate_candidate(
@@ -814,17 +817,20 @@ class _BranchWorker:
             if nodes_delta > 0 and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
             if metric:
-                # Log every non-gated claim; down-sample the redundant gated mass
-                # so a multi-day corpus stays bounded (see ACCURACY_GATED_SAMPLE_EVERY).
-                if metric['gated']:
-                    log_it = (self._gated_accuracy_n % ACCURACY_GATED_SAMPLE_EVERY) == 0
-                    self._gated_accuracy_n += 1
+                # Log every non-ERD-pruned claim; down-sample the redundant
+                # ERD-pruned mass so a multi-day corpus stays bounded (see
+                # ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY).
+                if metric['erd_lower_bound_pruned']:
+                    log_it = (self._erd_lower_bound_pruned_accuracy_n
+                             % ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY) == 0
+                    self._erd_lower_bound_pruned_accuracy_n += 1
                 else:
                     log_it = True
                 if log_it:
                     self.queue.add_candidate_accuracy(
                         branch_key, n_words, budget, metric['predicted'],
-                        metric['bound'], metric['cost_lb'], metric['gated'],
+                        metric['bound'], metric['candidate_cost_lower_bound'],
+                        metric['erd_lower_bound_pruned'],
                         nodes_delta, group_sizes=metric['group_sizes'],
                         source_word=self._top_source_word)
             self.queue.add_claim_telemetry(
