@@ -115,7 +115,7 @@ class TestAllCandidatesERDPrunedInvariant(_TmpCacheMixin, unittest.TestCase):
     """§4b invariant 2: a node where every candidate is ERD-pruned returns a
     cutoff, not a loss.
 
-    3 - (n+1)/n is the lowest cost_lb any candidate can possibly achieve
+    3 - (n+1)/n is the lowest candidate_cost_lower_bound any candidate can possibly achieve
     (C2.1: G <= n non-self-inclusive groups, plus has_self) — so seeding the
     ceiling below that floor (here 1.5, valid for every n >= 2) guarantees
     every candidate is ERD-pruned, regardless of branch content.
@@ -183,12 +183,13 @@ class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
         for word in pool:
             counts = probe_cache.group_counts(word, cls.branch_words)
             has_self = word in cls.branch_words
-            cost_lb = 3.0 - (len(counts) + (1 if has_self else 0)) / len(cls.branch_words)
-            scored.append((cost_lb, word))
+            candidate_cost_lower_bound = (
+                3.0 - (len(counts) + (1 if has_self else 0)) / len(cls.branch_words))
+            scored.append((candidate_cost_lower_bound, word))
         scored.sort(key=lambda item: item[0])
         cls.strong = scored[0][1]
         cls.weak = scored[-1][1]
-        weak_cost_lb = scored[-1][0]
+        weak_candidate_cost_lower_bound = scored[-1][0]
 
         status, strong_cost, _, _ = evaluate_candidate(
             cls.branch_words, cls.strong, probe_cache, None,
@@ -197,11 +198,11 @@ class TestIndexAlignmentHazard(_TmpCacheMixin, unittest.TestCase):
             raise RuntimeError("fixture precondition: strong must be solvable")
         cls.strong_cost = strong_cost
         cls.ceiling = strong_cost + 1e-6
-        if weak_cost_lb < cls.ceiling:
+        if weak_candidate_cost_lower_bound < cls.ceiling:
             raise RuntimeError(
-                "fixture precondition failed: weak's cost_lb must dominate "
-                "the ceiling seeded from strong's true cost — widen the "
-                "candidate pool if this ever breaks")
+                "fixture precondition failed: weak's candidate_cost_lower_bound "
+                "must dominate the ceiling seeded from strong's true cost — "
+                "widen the candidate pool if this ever breaks")
         # candidate_list in raw (pre-sort) order: weak first, strong last —
         # the opposite of best-first order, which is exactly what an
         # unpermuted or half-permuted bound array would misalign.

@@ -1691,7 +1691,8 @@ class TestMinExpectedGuesses(unittest.TestCase):
 
         # Pin best-first ordering OFF for this test.  Timeout propagation is
         # independent of candidate ordering, but ordering can solve a tiny set
-        # in one ply (all-singleton split, then cost_lb prunes the rest),
+        # in one ply (all-singleton split, then ERD-lower-bound pruning
+        # removes the rest),
         # leaving no deeper recursive call for the deadline to interrupt.  With
         # ordering off the set deterministically recurses, exercising the path
         # under test regardless of how ORDER_MIN_N is later tuned.
@@ -1952,13 +1953,13 @@ class TestCacheReuseRule(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# min_expected_guesses: cost_lb admissible-bound pruning
+# min_expected_guesses: candidate_cost_lower_bound admissible-bound pruning
 # ---------------------------------------------------------------------------
 
 def _brute_force_erd(branch_words, cache, candidate_list):
     """Reference ERD computation with NO pruning of any kind: every candidate
-    and every sub-branch is evaluated, with no cost_lb check and no
-    cost >= best_erd branch-and-bound break. Mirrors the base-case and
+    and every sub-branch is evaluated, with no candidate_cost_lower_bound
+    check and no cost >= best_erd branch-and-bound break. Mirrors the base-case and
     skip-candidate handling of min_expected_guesses exactly so the two can be
     compared directly."""
     n = len(branch_words)
@@ -1984,7 +1985,8 @@ def _brute_force_erd(branch_words, cache, candidate_list):
 
 
 class TestMinExpectedGuessesLowerBoundPruning(unittest.TestCase):
-    """The cost_lb admissible lower bound (cost_lb = 3 - (G + has_self) / n,
+    """The candidate_cost_lower_bound admissible lower bound
+    (candidate_cost_lower_bound = 3 - (G + has_self) / n,
     derived from sub_erd(k) >= 2 - 1/k for any subgroup of size k) lets
     min_expected_guesses skip a candidate guess without recursing into any
     of its subgroups. Since the bound never overestimates the guess's true
@@ -2078,8 +2080,9 @@ class TestVerifyERDCache(unittest.TestCase):
             self.assertAlmostEqual(r['reconstructed'], r['best_score'])
 
     def test_uncached_subgroups_report_incomplete(self):
-        # Root entry whose g1/g2 subgroups were never cached — e.g. pruned
-        # away entirely by cost_lb (b95) without recursing into them.
+        # Root entry whose g1/g2 subgroups were never cached — e.g. ERD-pruned
+        # away entirely by candidate_cost_lower_bound (b95) without recursing
+        # into them.
         sc = MemoryScoreCache()
         sc.set_scope('test')
         sc.write(ScoreCache.encode_subset(self.WORDS), ERD_ALL, 'alpha', 10.0)
@@ -2697,9 +2700,10 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
         (the bug was that _erd_solve_scores only ever scored answer words).
 
         Assert that *some* non-answer appears — not a specific one.  Candidate
-        ordering / cost_lb pruning may legitimately drop any individual weak
-        guess from the ranking (a pruned candidate's subgroups are never cached,
-        so it is skipped), and that is orthogonal to the invariant under test.
+        ordering / ERD-lower-bound pruning may legitimately drop any individual
+        weak guess from the ranking (an ERD-pruned candidate's subgroups are
+        never cached, so it is skipped), and that is orthogonal to the
+        invariant under test.
         """
         answers = ANSWERS[:5]
 
@@ -2742,9 +2746,9 @@ class TestERDSolveScoresNonAnswerCandidates(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Regression: cost_lb pruning (b95) means min_expected_guesses no longer
-# recurses into every candidate's subgroups, so the cache can be missing
-# subgroup entries for answer-word candidates that were pruned outright.
+# Regression: ERD-lower-bound pruning (b95) means min_expected_guesses no
+# longer recurses into every candidate's subgroups, so the cache can be
+# missing subgroup entries for answer-word candidates that were pruned outright.
 # _erd_solve_scores must skip those candidates rather than aborting the
 # whole ranking.
 # ---------------------------------------------------------------------------
@@ -2753,7 +2757,7 @@ class _FixedPartitionCache:
     """Stub for soln.cache: every word partitions current_words the same
     way (`full_groups`), except `split_word`, which produces a single
     oversized group (`split_groups`) whose ERD was never cached — as if
-    cost_lb pruning skipped recursing into it entirely."""
+    ERD-lower-bound pruning skipped recursing into it entirely."""
 
     def __init__(self, answer_words, full_groups, split_word, split_groups):
         self.answer_words = answer_words
@@ -3297,7 +3301,7 @@ class TestBranchPrecacheSolver(unittest.TestCase):
     def test_periodic_print_reports_culled_and_current_candidate(self):
         """The periodic print (driven by either the per-candidate progress
         callback or the per-subgroup heartbeat) must report how many
-        top-level candidates were culled by cost_lb pruning and the
+        top-level candidates were culled by ERD-lower-bound pruning and the
         in-progress candidate's elapsed time and cache hit/miss counts —
         the signal that's missing while a single top-level candidate's deep
         recursion is still running."""

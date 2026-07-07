@@ -1085,7 +1085,8 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     Rank candidates by ERD using only cached branch values.
     Returns sorted (word, erd_cost) list, lowest first, for every candidate
     whose branches are all cached. Candidates with an uncached branch
-    (e.g. pruned by cost_lb in min_expected_guesses, so never recursed into)
+    (e.g. ERD-pruned by candidate_cost_lower_bound in min_expected_guesses,
+    so never recursed into)
     are skipped rather than failing the whole ranking — the chosen ERD
     winner is always fully cached, since it can't have been pruned. Returns
     None only if not a single candidate could be scored.
@@ -2740,7 +2741,7 @@ class ERDSolver(threading.Thread):
                 self.word_stats.append(
                     (done, evaluated, wall_elapsed, cpu_elapsed, hits, misses))
                 # done counts every top-level candidate considered, including
-                # ones cost_lb-pruned with no recursion at all (so no
+                # ones ERD-pruned with no recursion at all (so no
                 # _progress call); word_stats only counts ones that ran to
                 # completion. The gap is candidates culled before recursing.
                 self.culled = done - len(self.word_stats)
@@ -3002,7 +3003,7 @@ class BranchPrecacheSolver(threading.Thread):
                     self.root_best = (best_guess, best_erd)
                     progress_calls[0] += 1
                     # done counts every top-level candidate considered,
-                    # including ones cost_lb-pruned with no recursion at
+                    # including ones ERD-pruned with no recursion at
                     # all; progress_calls only counts ones that ran to
                     # completion. The gap between them is candidates culled
                     # by the admissible lower bound before recursing.

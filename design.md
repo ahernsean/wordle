@@ -13,7 +13,7 @@ Five layers:
 | File | Role |
 |------|------|
 | `wordle_engine.py` | All algorithms: scoring, ERD search, response simulation. No I/O. |
-| `pattern_matrix.py` | NumPy pattern matrix + vectorized candidate statistics. Sole (guarded) NumPy import point; optional at runtime. |
+| `pattern_matrix.py` | NumPy pattern matrix + vectorized candidate statistics. The engine's sole NumPy import point; NumPy is a hard requirement on every target. |
 | `wordle.py` | REPL, display, all command handlers. |
 | `cache_sqlite.py` | SQLite-backed `ScoreCache`: ERD results, candidate scores, response decompositions. |
 | `erd_swarm.py` / `erd_queue.py` / `erd_search.py` | Parallel precache workers: branch assignment, candidate claiming, cooperative ERD solving. |
@@ -167,8 +167,8 @@ for the same branch. A candidate that provably can't beat `best_erd` is pruned i
 
 **Alpha-beta per sub-branch:** within one candidate's evaluation, each sub-branch is
 solved under a derived ceiling so deep nodes prune from tight values rather than `inf`.
-`rest_lb[i]` is an admissible lower bound on the weighted cost of all sub-branches after
-position `i` (each sub-branch of k answers costs ≥ 2 − 1/k).
+`remaining_groups_cost_lower_bound[i]` is an admissible lower bound on the weighted cost
+of all sub-branches after position `i` (each sub-branch of k answers costs ≥ 2 − 1/k).
 
 ### Candidate ordering
 

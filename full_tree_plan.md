@@ -520,7 +520,7 @@ Notes for the implementer:
 every field matches the per-candidate Python computation — integers exactly,
 `cost_lower_bound` exactly, entropy within 1e-12.
 
-## §4. Engine integration: vectorized ranking and ERD-lower-bound pruning
+## §4. Engine integration: vectorized ranking and ERD-lower-bound pruning — **DONE (PR #86, merged)**
 
 **Read first:** `_solve_subset` in full (`wordle_engine.py:1097-1259`);
 `evaluate_candidate` (`wordle_engine.py:971-1094`); C2.2's tie-order warning;
@@ -848,6 +848,13 @@ snapshot) and incremental (INSERT OR IGNORE). What remains of §8 is exactly
 rows are search memoization (sub-branches of *losing* candidates) that Mode
 A/C lookups never touch. Syncing multi-GB SQLite over iCloud to Pythonista is
 the bottleneck the phone does not need.
+
+**Deployment constraint.** The phone has ~160GB free, and the full Linux
+cache is already 12GB and growing — nowhere near that ceiling itself, but the
+margin is not unlimited and a full-cache sync is not the plan. The
+reachable-only export must measure O(10GB): 8a's size report (full vs
+reachable row counts and file bytes) is the check that confirms this, and it
+must run before any sync to the phone.
 
 **8a. `export_cache.py --reachable-only`.**
 - **Seed set:** every (opener, pattern) branch with ≥ 2 answer words, for
