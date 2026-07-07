@@ -356,6 +356,21 @@ def calculate_group_counts(test_word, words):
 # Response cache
 # ---------------------------------------------------------------------------
 
+# ResponseCache.group_words's fast-path promotion threshold: a cold guess (no
+# decoded blob yet) reused this many times via the fast path pays the one-time
+# decode cost and switches to the warm loop for good. Derived from the ratio
+# of a decode's one-time cost (~5ms) to the fast path's per-call NumPy
+# overhead over an already-decoded guess (~15-25us): a threshold near that
+# ratio bounds the worst case (single-use vs. heavily-reused guesses) at
+# roughly twice the cost either extreme would incur alone (a ski-rental
+# problem). Verified against diag_kernel_bench.py at both small (n=30, low
+# per-guess reuse) and large, deep-recursion (n=500, extremely high per-guess
+# reuse) branch sizes — controlled A/B sweeps across 40-1000 and an uncapped
+# fast path all perform equivalently in both regimes, so this sits
+# comfortably in that range without needing finer tuning.
+_GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD = 250
+
+
 class ResponseCache:
     """Lazily caches word-to-pattern mappings for each guess word.
 
@@ -378,6 +393,7 @@ class ResponseCache:
         self.score_cache = score_cache
         self._answer_index = {word: i for i, word in enumerate(answer_words)}
         self._cache = {}   # guess → bytes (pattern_int per answer, canonical order)
+        self._fast_path_use_counts = defaultdict(int)  # cold guess → group_words fast-path tally
 
     def _ensure(self, guess):
         """Build the mapping for guess if not cached, persisting/reloading via SQLite.
@@ -426,19 +442,35 @@ class ResponseCache:
         """Return {pattern_int: [words]} for guess vs subset.
 
         When pattern_matrix and branch_indices are both supplied (branch_indices
-        index-aligned with subset via pattern_matrix.answer_indices), delegates
-        to PatternMatrix.group_words for an identical dict — same keys, values,
-        and iteration order — computed by one matrix row read plus a stable
-        argsort instead of the per-word loop below. Interactive-mode words
-        outside the answer universe can't be expressed as branch_indices, so
-        those callers pass neither and take the loop; a guess outside the
-        matrix's guess vocabulary falls through to the loop the same way.
+        index-aligned with subset via pattern_matrix.answer_indices) and guess
+        is not already warm (is_cached), takes PatternMatrix.group_words's fast
+        path — one matrix row read plus a stable argsort — for a dict identical
+        to the loop below in keys, values, and iteration order. A warm guess
+        always takes the loop instead: its decode cost is already sunk, so the
+        loop beats the fast path's per-call NumPy overhead at every branch
+        size. A cold guess reused past
+        _GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD fast-path calls is promoted
+        — decoded once via _ensure, then warm (and on the loop) for every
+        subsequent call — so a guess genuinely used only a handful of times
+        (the common case) keeps the fast path's full ~250x edge over a cold
+        decode, while a guess deep recursion reuses thousands of times across
+        many small sub-branches doesn't keep paying the fast path's per-call
+        overhead indefinitely (see PR #94 review).
+
+        Interactive-mode words outside the answer universe can't be expressed
+        as branch_indices, so those callers pass neither and take the loop; a
+        guess outside the matrix's guess vocabulary falls through to the loop
+        the same way.
         """
-        if pattern_matrix is not None and branch_indices is not None:
-            try:
-                return pattern_matrix.group_words(guess, subset, branch_indices)
-            except KeyError:
-                pass  # guess outside the matrix vocabulary: the loop handles any word
+        if (pattern_matrix is not None and branch_indices is not None
+                and guess not in self._cache):
+            self._fast_path_use_counts[guess] += 1
+            if (self._fast_path_use_counts[guess]
+                    <= _GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD):
+                try:
+                    return pattern_matrix.group_words(guess, subset, branch_indices)
+                except KeyError:
+                    pass  # guess outside the matrix vocabulary: the loop handles any word
         self._ensure(guess)
         blob = self._cache[guess]
         groups = defaultdict(list)
@@ -452,7 +484,13 @@ class ResponseCache:
         return groups
 
     def is_cached(self, guess):
-        """Check if a guess word is already cached."""
+        """Check if a guess word's decoded response blob is already cached.
+
+        This is group_words's own warm/cold dispatch predicate: a guess
+        resolved so far entirely through group_words's fast path (see
+        _GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD) does not populate
+        self._cache and so is not "cached" by this method until it warms.
+        """
         return guess in self._cache
 
 
@@ -1131,11 +1169,12 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     if heartbeat is not None:
         heartbeat()
     if cache:
-        if pattern_matrix is not None and branch_indices is None:
-            try:
-                branch_indices = pattern_matrix.answer_indices(branch_words)
-            except KeyError:
-                branch_indices = None  # exotic interactive word: loop below
+        # A warm candidate always dispatches to the loop (group_words's own
+        # warm/cold check), so deriving branch_indices for it would be wasted
+        # work — skip it only when the caller didn't already supply one.
+        if (pattern_matrix is not None and branch_indices is None
+                and not cache.is_cached(candidate)):
+            branch_indices = pattern_matrix.answer_indices_or_none(branch_words)
         groups = cache.group_words(candidate, branch_words,
                                    pattern_matrix=pattern_matrix,
                                    branch_indices=branch_indices)
@@ -1325,10 +1364,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # branch word falls outside the answer universe (interactive fallback).
     branch_indices = None
     if pattern_matrix is not None:
-        try:
-            branch_indices = pattern_matrix.answer_indices(branch_words)
-        except KeyError:
-            branch_indices = None
+        branch_indices = pattern_matrix.answer_indices_or_none(branch_words)
 
     candidate_cost_lower_bounds = None
     if cache and n >= ORDER_MIN_N and len(candidate_list) > 1:

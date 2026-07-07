@@ -104,17 +104,13 @@ def branch_segments(pattern_values):
     """Yield the sorted answer-column indices (int32 array) of every response
     group with >= 2 words in one opener's pattern row.
 
-    A mergesort argsort groups equal patterns into contiguous segments while
-    preserving ascending column order within each, so every segment is
-    already the sorted index list the branch digest is keyed on. The
-    all-green self group has at most 1 word (the opener itself) and falls
-    out of the >= 2 filter without special-casing.
+    Segments come from pattern_matrix._stable_pattern_segments, already the
+    sorted index list the branch digest is keyed on. The all-green self group
+    has at most 1 word (the opener itself) and falls out of the >= 2 filter
+    without special-casing.
     """
-    sorted_order = np.argsort(pattern_values, kind='mergesort').astype(np.int32)
-    sorted_patterns = pattern_values[sorted_order]
-    change_points = np.flatnonzero(sorted_patterns[1:] != sorted_patterns[:-1]) + 1
-    segment_starts = [0] + change_points.tolist()
-    segment_stops = change_points.tolist() + [len(sorted_order)]
+    sorted_order, _, segment_starts, segment_stops = (
+        pattern_matrix._stable_pattern_segments(pattern_values))
     for start, stop in zip(segment_starts, segment_stops):
         if stop - start >= 2:
             yield sorted_order[start:stop]
