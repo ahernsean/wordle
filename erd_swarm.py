@@ -932,6 +932,22 @@ class _BranchWorker:
 
     # -- evaluate a packer-issued bundle of candidate claims -----------------
 
+    def _evaluate_bundle_member(self, branch_key, words, n_words, idx, budget,
+                                bundle_id, nodes_at_bundle_start, wall_t0):
+        """evaluate_claim for one bundle member; on cancellation/abort,
+        records the bundle as censored.  Returns True to keep going, False
+        for the caller to abort evaluate_bundle immediately."""
+        if self.cancel():
+            self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
+                                wall_t0, censored=True)
+            return False
+        if not self.evaluate_claim(branch_key, words, n_words, idx,
+                                   budget=budget):
+            self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
+                                wall_t0, censored=True)
+            return False
+        return True
+
     def evaluate_bundle(self, branch_key, words, n_words, bundle_id, indices,
                         forced, budget=None):
         """Evaluate a claim_next_bundle bundle, folding each candidate's
@@ -955,11 +971,15 @@ class _BranchWorker:
         its siblings.
 
         A candidate in `forced` (its candidate_republish count already hit
-        republish_limit, §7's bounded-republish-depth guardrail) is evaluated
-        without its own contribution counting toward either cap, so the
-        cross-candidate mechanism never cuts it off again — any real depth in
-        its subtree is left to the always-active within-candidate sub-branch
-        promotion (mid_loop_publisher) instead.
+        republish_limit, §7's bounded-republish-depth guardrail) is always
+        evaluated in this bundle — it is never swept into a republished
+        remainder, since republishing it again is exactly the thrash the
+        guardrail exists to stop.  Its own cost never counts toward either
+        cap for itself OR for later siblings: the cumulative counters are
+        re-baselined immediately after it runs, so any real depth in its
+        subtree is absorbed by the always-active within-candidate sub-branch
+        promotion (mid_loop_publisher) instead of cutting off unrelated
+        candidates that happen to follow it in best-first order.
 
         Returns True if the bundle was fully handled — every candidate either
         evaluated to completion or handed back via republish; False if
@@ -969,22 +989,27 @@ class _BranchWorker:
         nodes_at_bundle_start = self._nodes
         wall_t0 = time.time()
         for pos, idx in enumerate(indices):
-            if self.cancel():
-                self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
-                                    wall_t0, censored=True)
-                return False
-            if not self.evaluate_claim(branch_key, words, n_words, idx,
-                                       budget=budget):
-                self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
-                                    wall_t0, censored=True)
+            if not self._evaluate_bundle_member(
+                    branch_key, words, n_words, idx, budget, bundle_id,
+                    nodes_at_bundle_start, wall_t0):
                 return False
             if idx in forced:
+                nodes_at_bundle_start = self._nodes
+                wall_t0 = time.time()
                 continue
             nodes_delta = self._nodes - nodes_at_bundle_start
             wall_delta = time.time() - wall_t0
             if (nodes_delta > self.bundle_node_cap
                     or wall_delta > self.bundle_wall_cap_seconds):
-                remainder = indices[pos + 1:]
+                remainder = []
+                for later_idx in indices[pos + 1:]:
+                    if later_idx in forced:
+                        if not self._evaluate_bundle_member(
+                                branch_key, words, n_words, later_idx, budget,
+                                bundle_id, nodes_at_bundle_start, wall_t0):
+                            return False
+                    else:
+                        remainder.append(later_idx)
                 if remainder:
                     self.queue.republish_remainder(branch_key, remainder)
                 self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,

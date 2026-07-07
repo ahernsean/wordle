@@ -8,6 +8,7 @@ the high-volume ERD result writes in the main cache.
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 import time
 
@@ -215,9 +216,10 @@ CREATE TABLE IF NOT EXISTS candidate_claims (
     bundle_id  TEXT,
     PRIMARY KEY (branch_key, idx)
 );
-
-CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle
-    ON candidate_claims(branch_key, bundle_id);
+-- idx_candidate_claims_bundle is created in _migrate(), after the bundle_id
+-- column is guaranteed to exist on an upgraded database: this CREATE TABLE
+-- is a no-op against a pre-existing (pre-bundle_id) table, so an index on
+-- bundle_id here would fail on any database that predates this column.
 
 -- One row per bundle a worker has reported on: the nodes actually spent and
 -- the coordination overhead of handing it out, aggregated into
@@ -438,8 +440,13 @@ class ERDQueue:
         self._last_claim_busy_millis = 0
         self._last_claim_retries = 0
         # Monotonic per-connection counter for bundle_id generation: paired
-        # with worker_id it is unique without a timestamp-collision risk
-        # (two bundles claimed by the same worker within the same second).
+        # with worker_id and this process's pid, it is unique without a
+        # timestamp-collision risk (two bundles claimed by the same worker
+        # within the same second) AND without a cross-restart collision risk
+        # (a crashed-and-respawned worker reuses its fixed worker_id slot,
+        # but never its old pid, so a fresh process can never re-mint a
+        # bundle_id a still-open branch's bundle_stats already used).
+        self._pid = os.getpid()
         self._bundle_seq = 0
 
     def _migrate(self):
@@ -555,6 +562,14 @@ class ERDQueue:
         self._add_columns("candidate_claims", {
             "bundle_id": "TEXT",
         })
+        # Must run after the ADD COLUMN above: on a fresh database the
+        # CREATE TABLE in _SCHEMA_SQL already has bundle_id, but on an
+        # upgraded database that CREATE TABLE is a no-op against the
+        # pre-existing table, so creating this index any earlier (e.g. in
+        # _SCHEMA_SQL itself) would fail with "no such column: bundle_id".
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
+            "ON candidate_claims(branch_key, bundle_id)")
 
         # candidate_accuracy.cost_lb / .gated are legacy column names from
         # before the ERD-lower-bound-pruning rename (§9b): cost_lb was the
@@ -902,14 +917,37 @@ class ERDQueue:
             if not bundle:
                 self._conn.execute("COMMIT")
                 return None
-            bundle_id = f"{worker_id}:{self._bundle_seq}"
+            bundle_id = f"{worker_id}:{self._pid}:{self._bundle_seq}"
             self._bundle_seq += 1
             now = int(time.time())
+            # INSERT OR IGNORE, not a plain INSERT: on the forward path,
+            # cursor < n_candidates only proves these positions have never
+            # been *packed* before, not that no row exists at that idx yet.
+            # mark_claims_done (within-candidate overrun promotion) can
+            # insert done=1 rows for a fresh branch's best-first prefix
+            # before the packer ever runs over it, landing on exactly the
+            # positions the forward path is about to pack. A plain INSERT
+            # would collide on the (branch_key, idx) primary key; IGNORE
+            # skips those rows, and the SELECT below discovers which of
+            # `bundle` were actually claimed by this call, via the
+            # bundle_id just stamped on them (idx_candidate_claims_bundle
+            # makes this an indexed lookup, not a rescan).
             self._conn.executemany("""
-                INSERT INTO candidate_claims
+                INSERT OR IGNORE INTO candidate_claims
                     (branch_key, idx, claimed_by, claimed_at, done, bundle_id)
                 VALUES (?, ?, ?, ?, 0, ?)
             """, [(branch_key, idx, worker_id, now, bundle_id) for idx in bundle])
+            actually_claimed = {r["idx"] for r in self._conn.execute(
+                "SELECT idx FROM candidate_claims "
+                "WHERE branch_key = ? AND bundle_id = ?",
+                (branch_key, bundle_id))}
+            bundle = [idx for idx in bundle if idx in actually_claimed]
+            if not bundle:
+                # Every packed position already had a row (e.g. mark_claims_
+                # done beat us to the whole prefix): the cursor still
+                # advanced past them, so the caller should just retry.
+                self._conn.execute("COMMIT")
+                return None
             placeholders = ",".join("?" * len(bundle))
             rows = self._conn.execute(
                 f"SELECT idx FROM candidate_republish "
@@ -970,12 +1008,24 @@ class ERDQueue:
         nodes is then a lower bound on what the bundle's original member set
         would have cost.  A republished remainder re-packs under a new
         bundle_id, which gets its own independent row here.
+
+        The bundle's last candidate can be marked done (making
+        branch_done_candidates cover the branch) before this call runs, so
+        another worker's maybe_finalize can win try_finalize_branch and
+        delete_branch/finalize_bundle_stats out from under this INSERT.  The
+        WHERE EXISTS guard makes the insert a no-op in that race instead of
+        writing an orphaned row for an already-gone branch: SQLite evaluates
+        the SELECT and the INSERT as one atomic statement, so there is no
+        window between the existence check and the write for a concurrent
+        DELETE to land in.
         """
         self._conn.execute("""
             INSERT OR REPLACE INTO bundle_stats
                 (branch_key, bundle_id, nodes, coord_millis, censored)
-            VALUES (?, ?, ?, ?, ?)
-        """, (branch_key, bundle_id, nodes, coord_millis, 1 if censored else 0))
+            SELECT ?, ?, ?, ?, ?
+            WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_key = ?)
+        """, (branch_key, bundle_id, nodes, coord_millis,
+              1 if censored else 0, branch_key))
 
     def finalize_bundle_stats(self, branch_key):
         """Aggregate and clear a branch's bundle_stats rows at finalize.
@@ -1509,6 +1559,16 @@ class ERDQueue:
         claim_retries / busy_wait_millis come from the most recent claim path on
         this connection (set by claim_next_bundle), the direct lock-contention
         signal; the row is stamped with the active epoch.
+
+        Consumed values are reset to 0 immediately after this INSERT reads
+        them, so they are attributed to exactly the next telemetry row and
+        never repeat on a later, unrelated candidate's row.  This matters
+        under bundling: a candidate's own within-candidate sub-branch
+        promotion can trigger a nested claim_next_bundle call on this same
+        connection before this candidate's own add_claim_telemetry call —
+        without the reset, that nested claim's contention numbers would
+        otherwise still be sitting here (unconsumed) for whichever LATER,
+        unrelated bundle member logs telemetry next.
         """
         now = int(time.time())
         self._conn.execute("""
@@ -1518,6 +1578,8 @@ class ERDQueue:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, work_nodes, self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, self.epoch, now))
+        self._last_claim_retries = 0
+        self._last_claim_busy_millis = 0
 
     def add_branch_finalize_log(self, branch_key, spine, n_words, budget,
                                 created_at, finalized_at, nodes_spent, n_claims,

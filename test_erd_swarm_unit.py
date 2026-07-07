@@ -253,6 +253,79 @@ class TestCancelPath(unittest.TestCase):
         w.queue.record_bundle_stats.assert_called_once_with(
             branch_key, "bundle-2", 0, mock.ANY, censored=True)
 
+    def test_forced_candidate_cost_does_not_leak_into_sibling_cap_check(self):
+        # A (forced) does 5000 nodes of work; B (not forced) does 1. The
+        # bundle_node_cap is small enough that B's own cost would never trip
+        # it alone -- if A's cost leaked into the cumulative counter, B would
+        # be spuriously treated as having overrun.
+        w = _bare_worker()
+        w.bundle_node_cap = 100
+        w.bundle_wall_cap_seconds = 999
+        seen = []
+
+        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None):
+            seen.append(idx)
+            w._nodes += 5000 if idx == 0 else 1
+            return True
+        w.evaluate_claim = fake_evaluate_claim
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        result = w.evaluate_bundle(branch_key, BRANCH, len(BRANCH), "bundle-3",
+                                   [0, 1], frozenset({0}))
+        self.assertTrue(result)
+        self.assertEqual(seen, [0, 1])   # both evaluated
+        w.queue.republish_remainder.assert_not_called()
+
+    def test_forced_candidate_after_overrun_is_evaluated_not_republished(self):
+        # X (not forced) overruns the cap; Y (forced) sits right after it in
+        # best-first order. Y must still be evaluated in this bundle, not
+        # swept into the republished remainder -- bouncing an already-
+        # republish-limited candidate through another cycle is exactly what
+        # `forced` exists to prevent.
+        w = _bare_worker()
+        w.bundle_node_cap = 100
+        w.bundle_wall_cap_seconds = 999
+        seen = []
+
+        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None):
+            seen.append(idx)
+            w._nodes += 5000 if idx == 0 else 1
+            return True
+        w.evaluate_claim = fake_evaluate_claim
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        result = w.evaluate_bundle(branch_key, BRANCH, len(BRANCH), "bundle-4",
+                                   [0, 1, 2], forced=frozenset({1}))
+        self.assertTrue(result)
+        self.assertEqual(seen, [0, 1])   # 1 (forced) evaluated despite the overrun at 0
+        w.queue.republish_remainder.assert_called_once_with(branch_key, [2])
+
+    def test_cancel_during_forced_remainder_evaluation_aborts_bundle(self):
+        # X overruns; Y (forced) is evaluated in the post-overrun sweep, but
+        # cancellation fires during that sweep -- evaluate_bundle must abort
+        # (not silently finish the bundle) exactly as it would mid-main-loop.
+        w = _bare_worker()
+        w.bundle_node_cap = 100
+        w.bundle_wall_cap_seconds = 999
+        seen = []
+
+        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None):
+            seen.append(idx)
+            if idx == 0:
+                w._nodes += 5000
+            return True
+        w.evaluate_claim = fake_evaluate_claim
+        w.cancel = mock.MagicMock(side_effect=[False, True])
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        result = w.evaluate_bundle(branch_key, BRANCH, len(BRANCH), "bundle-5",
+                                   [0, 1, 2], forced=frozenset({1}))
+        self.assertFalse(result)
+        self.assertEqual(seen, [0])   # cancelled before forced candidate 1 runs
+        w.queue.republish_remainder.assert_not_called()
+        w.queue.record_bundle_stats.assert_called_once_with(
+            branch_key, "bundle-5", 5000, mock.ANY, censored=True)
+
 
 class TestEvaluateClaimPatternMatrix(unittest.TestCase):
     """evaluate_claim threads self.pattern_matrix into evaluate_candidate.

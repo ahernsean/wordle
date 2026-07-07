@@ -86,6 +86,54 @@ class TestPackBundle(unittest.TestCase):
         self.assertEqual(next_pos, 2)
 
 
+class TestSchemaMigration(unittest.TestCase):
+    """Opening a pre-existing (pre-packer) queue.sqlite3 must migrate
+    cleanly, not crash — CLAUDE.md requires every schema change to be an
+    idempotent migration, never a manual-SQL requirement."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, "old_queue.sqlite3")
+        # The pre-PR candidate_claims shape: no bundle_id column.  CREATE
+        # TABLE IF NOT EXISTS in a fresh ERDQueue() is a no-op against this,
+        # so any statement assuming bundle_id already exists (e.g. an index
+        # on it) must not run before _migrate() adds the column.
+        conn = sqlite3.connect(self.path)
+        conn.executescript("""
+            CREATE TABLE candidate_claims (
+                branch_key BLOB    NOT NULL,
+                idx        INTEGER NOT NULL,
+                claimed_by TEXT,
+                claimed_at INTEGER,
+                done       INTEGER NOT NULL DEFAULT 0,
+                done_at    INTEGER,
+                PRIMARY KEY (branch_key, idx)
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+    def test_opening_pre_bundle_id_database_does_not_raise(self):
+        q = ERDQueue(self.path)
+        try:
+            cols = {r["name"] for r in
+                   q._conn.execute("PRAGMA table_info(candidate_claims)")}
+            self.assertIn("bundle_id", cols)
+            index_rows = q._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'idx_candidate_claims_bundle'"
+            ).fetchall()
+            self.assertEqual(len(index_rows), 1)
+        finally:
+            q.close()
+
+    def test_migration_is_idempotent_on_reopen(self):
+        ERDQueue(self.path).close()
+        q = ERDQueue(self.path)   # second open must not fail or double-create
+        q.close()
+
+
 N_CANDIDATES = 40
 _ORDER = list(range(N_CANDIDATES))
 _ZERO_LOWER_BOUND = [0.0] * N_CANDIDATES
@@ -179,6 +227,48 @@ class TestClaimNextBundle(_TmpQueue):
             seen.update(indices)
         self.assertEqual(seen, set(range(N_CANDIDATES)))
 
+    def test_forward_path_does_not_collide_with_mark_claims_done(self):
+        # mark_claims_done (within-candidate overrun promotion, erd_swarm.py's
+        # _MidLoopPublisher) can insert done=1 rows for a fresh branch's
+        # best-first prefix before the packer's cursor ever advances past
+        # them -- the forward path must not try to re-INSERT those same
+        # positions.
+        self.q.mark_claims_done(self.key, [0, 1, 2])
+        claim = self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=5, count_cap=5)
+        self.assertIsNotNone(claim)
+        _bundle_id, indices, _forced = claim
+        self.assertTrue(set(indices).isdisjoint({0, 1, 2}),
+                        "must not re-claim positions mark_claims_done already covered")
+
+    def test_forward_path_returns_none_when_whole_packed_bundle_already_done(self):
+        # mark_claims_done covers positions 0..N_CANDIDATES-1 entirely (the
+        # whole branch was evaluated inline before overrun fired): the
+        # forward path's packed bundle filters down to empty, and the call
+        # must report "nothing claimed" rather than a bundle of size 0.
+        self.q.mark_claims_done(self.key, list(range(N_CANDIDATES)))
+        claim = self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=5, count_cap=5)
+        self.assertIsNone(claim)
+
+    def test_full_drain_with_mark_claims_done_prefix_has_unique_coverage(self):
+        self.q.mark_claims_done(self.key, [0, 1, 2])
+        done = {0, 1, 2}
+        while True:
+            claim = self.q.claim_next_bundle(
+                self.key, "worker-0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+                small_count=5, count_cap=5)
+            if claim is None:
+                break
+            _bundle_id, indices, _forced = claim
+            self.assertTrue(done.isdisjoint(indices), "overlapping/duplicate claim")
+            for idx in indices:
+                self.q.complete_candidate(self.key, idx)
+                done.add(idx)
+        self.assertEqual(done, set(range(N_CANDIDATES)))
+
 
 class TestRepublishRemainder(_TmpQueue):
     def test_republish_deletes_done0_rows_and_bumps_count(self):
@@ -243,6 +333,63 @@ class TestBundleStatsAndFinalizeLog(_TmpQueue):
     def test_finalize_bundle_stats_empty_when_branch_never_claimed_a_bundle(self):
         self.assertEqual(self.q.finalize_bundle_stats(self.key),
                          (None, None, None, None))
+
+    def test_record_bundle_stats_is_a_noop_once_branch_is_deleted(self):
+        # A worker's own record_bundle_stats call can race behind another
+        # worker's finalize_bundle_stats + delete_branch for the same
+        # branch: the insert must not resurrect an orphaned row.
+        self.q.delete_branch(self.key)
+        self.q.record_bundle_stats(self.key, "late-bundle", nodes=99, coord_millis=1)
+        row = self.q._conn.execute(
+            "SELECT * FROM bundle_stats WHERE branch_key = ?", (self.key,)).fetchone()
+        self.assertIsNone(row)
+
+
+class TestBundleIdUniqueAcrossRespawn(unittest.TestCase):
+    """A crashed-and-respawned worker reuses its fixed worker_id slot but
+    never its pid, so record_bundle_stats can never silently clobber a
+    still-open branch's earlier bundle under the same bundle_id."""
+
+    def test_same_worker_id_different_pid_never_collide(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "q.sqlite3")
+        key = encode_subset(["crane", "slate", "trace", "stale", "tales"])
+        order = list(range(N_CANDIDATES))
+        lb = [0.0] * N_CANDIDATES
+
+        with mock.patch("os.getpid", return_value=1111):
+            q1 = ERDQueue(path)
+            q1.create_branch(key, 5, N_CANDIDATES)
+            bundle_id_1, _indices, _forced = q1.claim_next_bundle(
+                key, "worker-0", N_CANDIDATES, order, lb, small_count=5, count_cap=5)
+            q1.close()
+
+        with mock.patch("os.getpid", return_value=2222):
+            q2 = ERDQueue(path)   # simulates a respawned worker-0 process
+            bundle_id_2, _indices, _forced = q2.claim_next_bundle(
+                key, "worker-0", N_CANDIDATES, order, lb, small_count=5, count_cap=5)
+            q2.close()
+
+        self.assertNotEqual(bundle_id_1, bundle_id_2)
+
+
+class TestClaimTelemetryContentionAttribution(_TmpQueue):
+    """claim_retries/busy_wait_millis must attribute to exactly the claim
+    that produced them, never repeat on a later, unrelated candidate's row
+    -- the failure mode a nested claim_next_bundle call (within-candidate
+    sub-branch promotion, on the same connection) can otherwise trigger."""
+
+    def test_contention_values_reset_after_being_logged_once(self):
+        self.q._last_claim_busy_millis = 250
+        self.q._last_claim_retries = 3
+        self.q.add_claim_telemetry(10, 5, 1, 4)
+        self.q.add_claim_telemetry(10, 1, 1, 4)   # a later, unrelated candidate
+        rows = self.q._conn.execute(
+            "SELECT busy_wait_millis, claim_retries FROM claim_telemetry "
+            "ORDER BY id").fetchall()
+        self.assertEqual((rows[0]["busy_wait_millis"], rows[0]["claim_retries"]), (250, 3))
+        self.assertEqual((rows[1]["busy_wait_millis"], rows[1]["claim_retries"]), (0, 0))
 
 
 class TestMultiWorkerNoOverlap(unittest.TestCase):
