@@ -57,9 +57,9 @@ def _timed_group_words(rcache):
     acc = [0.0]
     original = rcache.group_words
 
-    def wrapped(guess, subset):
+    def wrapped(guess, subset, **kwargs):
         t0 = time.perf_counter()
-        result = original(guess, subset)
+        result = original(guess, subset, **kwargs)
         acc[0] += time.perf_counter() - t0
         return result
 
