@@ -383,6 +383,21 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
 
     def test_Nworkers_faster_than_1worker(self):
         n = min(4, os.cpu_count() or 1)
+        # A speedup assertion is only meaningful on a box that can actually
+        # run the workers in parallel. CI (the CI env var, set by GitHub
+        # Actions) always runs it — catching algorithmic scalability
+        # regressions is this test's purpose — but on a shared dev box an
+        # external load (e.g. the production swarm) turns the assertion into
+        # a load measurement, so it skips with a reason instead of failing.
+        # Load average is a trailing signal, which suits the loads that
+        # matter here: a swarm that runs for hours, not a momentary spike.
+        if not os.environ.get('CI'):
+            idle_cores = (os.cpu_count() or 1) - os.getloadavg()[0]
+            if idle_cores < n + 1:
+                self.skipTest(
+                    f'insufficient idle cores for a parallel speedup '
+                    f'measurement ({idle_cores:.1f} idle of '
+                    f'{os.cpu_count()}, need {n + 1}); set CI=1 to force')
         r1 = self._drain(1, "w1")
         rN = self._drain(n, f"w{n}")
         t1, tN = r1['drain'], rN['drain']
