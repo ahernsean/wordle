@@ -1347,5 +1347,47 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         w.queue.mark_claims_done.assert_not_called()
 
 
+class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
+    """A failing finalize-telemetry write must not kill the worker or skip
+    cleanup: the branch result is published to the score cache before the
+    telemetry calls, and mark_done/delete_branch must run regardless, or the
+    branch's claim rows leak and its pending row is never retired."""
+
+    def _finalizing_worker(self):
+        w = _bare_worker()
+        w.queue.branch_done_candidates.return_value = len(BRANCH)
+        w.queue.try_finalize_branch.return_value = True
+        w.queue.read_branch_meta.return_value = ("crane", 1.8, 2, False, 4)
+        w.queue.get_branch.return_value = {
+            "nodes_spent": 0, "created_at": 100, "finalized_at": 200,
+            "spine": "SALET -g-g-",
+        }
+        w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
+        return w
+
+    def test_telemetry_insert_failure_still_runs_cleanup(self):
+        w = self._finalizing_worker()
+        w.queue.add_branch_finalize_log.side_effect = RuntimeError(
+            "no column named total_bundle_wall_millis")
+        key = b"branch-key"
+        w._packing_stats_cache[key] = object()
+        with mock.patch.object(erd_swarm, "cache_all_scores"):
+            w.maybe_finalize(key, BRANCH, len(BRANCH))
+        w.score_cache.write.assert_called_once()
+        w.queue.mark_done.assert_called_once_with(key)
+        w.queue.delete_branch.assert_called_once_with(key)
+        self.assertNotIn(key, w._packing_stats_cache)
+
+    def test_bundle_stats_aggregation_failure_still_runs_cleanup(self):
+        w = self._finalizing_worker()
+        w.queue.finalize_bundle_stats.side_effect = RuntimeError("boom")
+        key = b"branch-key"
+        with mock.patch.object(erd_swarm, "cache_all_scores"):
+            w.maybe_finalize(key, BRANCH, len(BRANCH))
+        w.queue.add_branch_finalize_log.assert_not_called()
+        w.queue.mark_done.assert_called_once_with(key)
+        w.queue.delete_branch.assert_called_once_with(key)
+
+
 if __name__ == "__main__":
     unittest.main()

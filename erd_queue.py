@@ -606,6 +606,20 @@ class ERDQueue:
                 "ALTER TABLE candidate_accuracy "
                 "RENAME COLUMN gated TO erd_lower_bound_pruned")
 
+        # branch_finalize_log.total_coord_millis is a legacy column name: it
+        # holds the branch's summed bundle evaluation wall spans, now called
+        # total_bundle_wall_millis.  A database whose table carries the old
+        # name makes the CREATE TABLE IF NOT EXISTS in _SCHEMA_SQL a no-op,
+        # and every finalize INSERT then fails with "no column named
+        # total_bundle_wall_millis".
+        bfl_cols = {r["name"] for r in
+                    self._conn.execute("PRAGMA table_info(branch_finalize_log)")}
+        if ("total_coord_millis" in bfl_cols
+                and "total_bundle_wall_millis" not in bfl_cols):
+            self._conn.execute(
+                "ALTER TABLE branch_finalize_log "
+                "RENAME COLUMN total_coord_millis TO total_bundle_wall_millis")
+
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
         now = int(time.time())
