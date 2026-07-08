@@ -3,6 +3,14 @@
 Lives in erd_queue.sqlite3, separate from wordle_cache.sqlite3, so the
 high-frequency coordination writes (claim/heartbeat/done) don't contend with
 the high-volume ERD result writes in the main cache.
+
+SQLite version floor: this module must run on SQLite 3.34 (the production
+box's bundled version) — do not use a feature newer than that (e.g.
+RETURNING needs 3.35+; ALTER TABLE DROP COLUMN needs 3.35+, worked around
+in _migrate() by rebuilding the table).  RENAME COLUMN (3.25+) and
+INSERT ... ON CONFLICT (3.24+) are both safely below the floor and already
+in use.  CI's bundled SQLite is newer than 3.34 and will not catch a
+version violation — check the target version by hand, or on the box itself.
 """
 
 from __future__ import annotations
@@ -984,10 +992,15 @@ class ERDQueue:
         worker's packer legitimately re-claim some of those idx under a NEW
         bundle_id before this worker finally overruns — an unscoped delete
         would remove that other worker's live claim rows and spuriously
-        bump their republish counts.  DELETE ... RETURNING reports exactly
-        which idx this call actually deleted (only rows still claimed under
-        THIS bundle_id), so the count bump — and the returned {idx: count}
-        map — covers only those; an idx that already got reclaimed under a
+        bump their republish counts.  A SELECT identifies exactly which idx
+        are still claimed under THIS bundle_id before the DELETE removes
+        them — both run inside the same BEGIN IMMEDIATE transaction, so no
+        other writer can change candidate_claims between the two (the write
+        lock is held for the whole method, same as a DELETE ... RETURNING
+        would give; RETURNING itself needs SQLite 3.35+, and the production
+        box runs 3.34.1 — see the module-level SQLite version note).  The
+        count bump — and the returned {idx: count} map — covers only the
+        idx the SELECT found; one that already got reclaimed under a
         different bundle_id is silently left alone here.
         """
         if not indices:
@@ -996,19 +1009,22 @@ class ERDQueue:
         try:
             placeholders = ",".join("?" * len(indices))
             deleted = [r["idx"] for r in self._conn.execute(
-                f"DELETE FROM candidate_claims WHERE branch_key = ? "
-                f"AND done = 0 AND bundle_id = ? AND idx IN ({placeholders}) "
-                f"RETURNING idx",
+                f"SELECT idx FROM candidate_claims WHERE branch_key = ? "
+                f"AND done = 0 AND bundle_id = ? AND idx IN ({placeholders})",
                 (branch_key, bundle_id, *indices))]
             if not deleted:
                 self._conn.execute("COMMIT")
                 return {}
+            deleted_placeholders = ",".join("?" * len(deleted))
+            self._conn.execute(
+                f"DELETE FROM candidate_claims WHERE branch_key = ? "
+                f"AND bundle_id = ? AND idx IN ({deleted_placeholders})",
+                (branch_key, bundle_id, *deleted))
             self._conn.executemany("""
                 INSERT INTO candidate_republish (branch_key, idx, count)
                 VALUES (?, ?, 1)
                 ON CONFLICT(branch_key, idx) DO UPDATE SET count = count + 1
             """, [(branch_key, idx) for idx in deleted])
-            deleted_placeholders = ",".join("?" * len(deleted))
             rows = self._conn.execute(
                 f"SELECT idx, count FROM candidate_republish "
                 f"WHERE branch_key = ? AND idx IN ({deleted_placeholders})",
