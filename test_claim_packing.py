@@ -133,6 +133,36 @@ class TestSchemaMigration(unittest.TestCase):
         q = ERDQueue(self.path)   # second open must not fail or double-create
         q.close()
 
+    def test_unmigratable_missing_column_refuses_to_open(self):
+        # A pre-existing table missing a column that no _migrate() rule adds:
+        # CREATE TABLE IF NOT EXISTS is a no-op against it, so without the
+        # schema assertion the mismatch would surface only at the first
+        # statement naming the column — long after open, killing a worker.
+        conn = sqlite3.connect(self.path)
+        conn.execute("""
+            CREATE TABLE claim_telemetry (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at INTEGER
+            )
+        """)
+        conn.commit()
+        conn.close()
+        with self.assertRaises(RuntimeError) as raised:
+            ERDQueue(self.path)
+        self.assertIn("claim_telemetry", str(raised.exception))
+        self.assertIn("n_words", str(raised.exception))
+
+    def test_extra_column_warns_but_opens(self):
+        ERDQueue(self.path).close()
+        conn = sqlite3.connect(self.path)
+        conn.execute("ALTER TABLE claim_telemetry ADD COLUMN stray INTEGER")
+        conn.commit()
+        conn.close()
+        with self.assertLogs("erd_queue", level="WARNING") as captured:
+            q = ERDQueue(self.path)
+            q.close()
+        self.assertTrue(any("stray" in message for message in captured.output))
+
 
 N_CANDIDATES = 40
 _ORDER = list(range(N_CANDIDATES))

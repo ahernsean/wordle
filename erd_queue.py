@@ -15,12 +15,15 @@ version violation — check the target version by hand, or on the box itself.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sqlite3
 import time
 
 from cache_sqlite import ScoreCache
+
+logger = logging.getLogger(__name__)
 
 # Time-weighted geometric mean EMA: half-life for the cost model.
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
@@ -392,6 +395,7 @@ CREATE TABLE IF NOT EXISTS backstop_telemetry (
     nodes                INTEGER NOT NULL,   -- nodes spent in frame at fire
     predicted_nodes      REAL,               -- typical(n) at entry; NULL = cold model
     remaining_candidates INTEGER NOT NULL,   -- candidates handed off
+    epoch                INTEGER NOT NULL DEFAULT 0,
     recorded_at          INTEGER NOT NULL
 );
 """
@@ -444,6 +448,7 @@ class ERDQueue:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate()
+        self._assert_schema()
         # Active epoch, read once: workers open the queue after the supervisor has
         # stamped run_meta.epoch, and are restarted across a cutover, so caching
         # here is safe and keeps every telemetry insert off a per-row SELECT.
@@ -609,6 +614,53 @@ class ERDQueue:
             "VALUES (0, 'single-candidate atom baseline', ?)", (now,))
         self._conn.execute(
             "INSERT OR IGNORE INTO run_meta (key, value) VALUES ('epoch', '0')")
+
+    def _assert_schema(self):
+        """Refuse to run against a database whose migrated schema disagrees
+        with _SCHEMA_SQL.
+
+        Invariant: after _migrate(), every table must be column-identical to
+        what _SCHEMA_SQL creates on a fresh database.  A table that predates
+        the current code makes CREATE TABLE IF NOT EXISTS a no-op, so a
+        column _migrate() has no rule for stays wrong silently and fails
+        later and less clearly (e.g. mid-finalize, killing the worker).
+        Tests verify the code against databases the current code creates;
+        this verifies the actual database, so drift from any origin —
+        including a database touched by code from an unmerged commit —
+        refuses at open instead.
+
+        Missing columns raise; extra columns only warn, since they cannot
+        break the code's own reads and writes (every statement names its
+        columns) but are still drift worth surfacing.
+        """
+        expected_conn = sqlite3.connect(":memory:")
+        try:
+            expected_conn.executescript(_SCHEMA_SQL)
+            tables = [name for (name,) in expected_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%'")]
+            for table in tables:
+                expected = {r[1] for r in expected_conn.execute(
+                    f"PRAGMA table_info({table})")}
+                actual = {r["name"] for r in self._conn.execute(
+                    f"PRAGMA table_info({table})")}
+                missing = expected - actual
+                if missing:
+                    raise RuntimeError(
+                        f"queue database schema mismatch: table {table!r} "
+                        f"is missing column(s) {sorted(missing)} after "
+                        f"migration. The table was likely created by code "
+                        f"from a different commit; add a rule to "
+                        f"ERDQueue._migrate() for its shape instead of "
+                        f"opening it with mismatched code.")
+                extra = actual - expected
+                if extra:
+                    logger.warning(
+                        "queue database table %r has unexpected column(s) "
+                        "%s — schema drift, harmless to current statements",
+                        table, sorted(extra))
+        finally:
+            expected_conn.close()
 
     def _add_columns(self, table: str, columns: dict):
         """Idempotently ALTER TABLE ADD COLUMN for any of `columns` not present.
