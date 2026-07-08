@@ -298,7 +298,7 @@ class TestCancelPath(unittest.TestCase):
                                    [0, 1, 2], forced=frozenset({1}))
         self.assertTrue(result)
         self.assertEqual(seen, [0, 1])   # 1 (forced) evaluated despite the overrun at 0
-        w.queue.republish_remainder.assert_called_once_with(branch_key, [2])
+        w.queue.republish_remainder.assert_called_once_with(branch_key, "bundle-4", [2])
 
     def test_cancel_during_forced_remainder_evaluation_aborts_bundle(self):
         # X overruns; Y (forced) is evaluated in the post-overrun sweep, but

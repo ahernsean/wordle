@@ -272,25 +272,70 @@ class TestClaimNextBundle(_TmpQueue):
 
 class TestRepublishRemainder(_TmpQueue):
     def test_republish_deletes_done0_rows_and_bumps_count(self):
-        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
             small_count=5, count_cap=5)
-        counts = self.q.republish_remainder(self.key, indices)
+        counts = self.q.republish_remainder(self.key, bundle_id, indices)
         self.assertEqual(set(counts), set(indices))
         self.assertTrue(all(c == 1 for c in counts.values()))
         rows = self.q.claims_for_branch(self.key)
         self.assertEqual([r for r in rows if r["idx"] in indices], [])
 
     def test_republished_candidates_are_reclaimable_via_holes_pass(self):
-        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
             small_count=N_CANDIDATES, count_cap=N_CANDIDATES)
         self.assertEqual(len(indices), N_CANDIDATES)   # cursor now == N_CANDIDATES
-        self.q.republish_remainder(self.key, indices[:3])
+        self.q.republish_remainder(self.key, bundle_id, indices[:3])
         _bundle_id, reclaimed, _forced = self.q.claim_next_bundle(
             self.key, "w1", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
             small_count=5, count_cap=5)
         self.assertEqual(set(reclaimed), set(indices[:3]))
+
+    def test_republish_only_deletes_rows_still_claimed_under_its_own_bundle_id(self):
+        # A candidate reclaimed (or re-claimed by another worker) under a
+        # DIFFERENT bundle_id after this bundle's claim must survive an
+        # unrelated republish_remainder call for the stale bundle_id -- and
+        # must not have its republish count bumped.
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=5, count_cap=5)
+        stolen_idx = indices[0]
+        # Simulate reclaim_stale_claims freeing it, then another worker's
+        # packer legitimately re-claiming it under a fresh bundle_id.
+        self.q._conn.execute(
+            "DELETE FROM candidate_claims WHERE branch_key = ? AND idx = ?",
+            (self.key, stolen_idx))
+        self.q._conn.execute("""
+            INSERT INTO candidate_claims
+                (branch_key, idx, claimed_by, claimed_at, done, bundle_id)
+            VALUES (?, ?, 'other-worker', 0, 0, 'other-bundle')
+        """, (self.key, stolen_idx))
+
+        counts = self.q.republish_remainder(self.key, bundle_id, indices)
+        self.assertNotIn(stolen_idx, counts)   # not bumped: not deleted by this call
+        row = self.q._conn.execute(
+            "SELECT bundle_id FROM candidate_claims WHERE branch_key = ? AND idx = ?",
+            (self.key, stolen_idx)).fetchone()
+        self.assertEqual(row["bundle_id"], "other-bundle")   # untouched
+        republish_row = self.q._conn.execute(
+            "SELECT count FROM candidate_republish WHERE branch_key = ? AND idx = ?",
+            (self.key, stolen_idx)).fetchone()
+        self.assertIsNone(republish_row)   # no spurious count bump
+
+    def test_republish_returns_empty_when_nothing_still_claimed_under_bundle_id(self):
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=5, count_cap=5)
+        # Every one of this bundle's rows already moved to a different
+        # bundle_id (e.g. reclaimed and re-claimed elsewhere) before this
+        # worker's own republish call runs.
+        self.q._conn.executemany(
+            "UPDATE candidate_claims SET bundle_id = 'elsewhere' "
+            "WHERE branch_key = ? AND idx = ?",
+            [(self.key, idx) for idx in indices])
+        counts = self.q.republish_remainder(self.key, bundle_id, indices)
+        self.assertEqual(counts, {})
 
     def test_forced_set_after_republish_limit_reached(self):
         # Drain the whole order in one bundle so pack_cursor reaches
@@ -298,33 +343,33 @@ class TestRepublishRemainder(_TmpQueue):
         # which re-surfaces a republished subset as the same indices each
         # time (the forward path would instead hand out fresh, never-seen
         # positions and never re-visit the republished ones).
-        self.q.claim_next_bundle(
+        bundle_id, _indices, _forced = self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
             small_count=N_CANDIDATES, count_cap=N_CANDIDATES)
         target = [3, 4, 5]
         forced = frozenset()
         for i in range(3):
-            self.q.republish_remainder(self.key, target)
-            _bundle_id, indices, forced = self.q.claim_next_bundle(
+            self.q.republish_remainder(self.key, bundle_id, target)
+            bundle_id, indices, forced = self.q.claim_next_bundle(
                 self.key, f"w{i + 1}", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
                 small_count=5, count_cap=5, republish_limit=3)
             self.assertEqual(set(indices), set(target))
         self.assertEqual(forced, frozenset(target))
 
     def test_republish_of_empty_indices_is_noop(self):
-        self.assertEqual(self.q.republish_remainder(self.key, []), {})
+        self.assertEqual(self.q.republish_remainder(self.key, "b0", []), {})
 
 
 class TestBundleStatsAndFinalizeLog(_TmpQueue):
     def test_finalize_bundle_stats_aggregates_and_clears(self):
-        self.q.record_bundle_stats(self.key, "b1", nodes=10, coord_millis=5)
-        self.q.record_bundle_stats(self.key, "b2", nodes=40, coord_millis=7,
+        self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_millis=5)
+        self.q.record_bundle_stats(self.key, "b2", nodes=40, wall_millis=7,
                                    censored=True)
-        n_bundles, max_bundle_nodes, total_coord_millis, censored_units = (
+        n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units = (
             self.q.finalize_bundle_stats(self.key))
         self.assertEqual(n_bundles, 2)
         self.assertEqual(max_bundle_nodes, 40)
-        self.assertEqual(total_coord_millis, 12)
+        self.assertEqual(total_bundle_wall_millis, 12)
         self.assertEqual(censored_units, 1)
         # Cleared: a second call sees nothing.
         self.assertEqual(self.q.finalize_bundle_stats(self.key),
@@ -339,7 +384,7 @@ class TestBundleStatsAndFinalizeLog(_TmpQueue):
         # worker's finalize_bundle_stats + delete_branch for the same
         # branch: the insert must not resurrect an orphaned row.
         self.q.delete_branch(self.key)
-        self.q.record_bundle_stats(self.key, "late-bundle", nodes=99, coord_millis=1)
+        self.q.record_bundle_stats(self.key, "late-bundle", nodes=99, wall_millis=1)
         row = self.q._conn.execute(
             "SELECT * FROM bundle_stats WHERE branch_key = ?", (self.key,)).fetchone()
         self.assertIsNone(row)

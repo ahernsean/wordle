@@ -1011,7 +1011,7 @@ class _BranchWorker:
                     else:
                         remainder.append(later_idx)
                 if remainder:
-                    self.queue.republish_remainder(branch_key, remainder)
+                    self.queue.republish_remainder(branch_key, bundle_id, remainder)
                 self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
                                     wall_t0, censored=bool(remainder))
                 return True
@@ -1023,13 +1023,20 @@ class _BranchWorker:
                        censored):
         """Record a completed/censored bundle's actual cost, if this claim
         went through the packer (bundle_id is None for a bare evaluate_claim
-        call outside the bundle path)."""
+        call outside the bundle path).
+
+        wall_t0 is the bundle's own evaluation start (re-baselined past any
+        forced member — see evaluate_bundle), so the elapsed time here is
+        this bundle's evaluation wall span, not claim-handout coordination
+        overhead (that is claim_telemetry's busy_wait_millis, measured in
+        claim_next_bundle).
+        """
         if bundle_id is None or not self._adaptive:
             return
         nodes = self._nodes - nodes_at_start
-        coord_millis = int((time.time() - wall_t0) * 1000)
+        wall_millis = int((time.time() - wall_t0) * 1000)
         self.queue.record_bundle_stats(branch_key, bundle_id, nodes,
-                                       coord_millis, censored=censored)
+                                       wall_millis, censored=censored)
 
     # -- finalize -----------------------------------------------------------
 
@@ -1086,13 +1093,13 @@ class _BranchWorker:
         # finalize_bundle_stats aggregates and clears this branch's bundle_stats
         # rows; (None, None, None, None) when it never claimed a bundle (fully
         # solved from reused cache entries).
-        n_bundles, max_bundle_nodes, total_coord_millis, censored_units = (
+        n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units = (
             self.queue.finalize_bundle_stats(branch_key))
         self.queue.add_branch_finalize_log(
             branch_key, spine, len(words), budget, created_at, finalized_at,
             nodes_spent, n_claims, n_bundles=n_bundles,
             max_bundle_nodes=max_bundle_nodes,
-            total_coord_millis=total_coord_millis,
+            total_bundle_wall_millis=total_bundle_wall_millis,
             censored_units=censored_units)
         self.queue.mark_done(branch_key)        # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
