@@ -133,6 +133,52 @@ class TestSchemaMigration(unittest.TestCase):
         q = ERDQueue(self.path)   # second open must not fail or double-create
         q.close()
 
+    def test_legacy_total_coord_millis_column_is_renamed(self):
+        # A branch_finalize_log created with the legacy total_coord_millis
+        # column name: CREATE TABLE IF NOT EXISTS is a no-op against it, so
+        # only the _migrate() rename makes add_branch_finalize_log's INSERT
+        # (which names total_bundle_wall_millis) succeed.
+        conn = sqlite3.connect(self.path)
+        conn.executescript("""
+            CREATE TABLE branch_finalize_log (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                branch_key         BLOB,
+                spine              TEXT,
+                n_words            INTEGER,
+                budget             INTEGER,
+                epoch              INTEGER NOT NULL DEFAULT 0,
+                created_at         INTEGER,
+                finalized_at       INTEGER,
+                nodes_spent        INTEGER,
+                n_claims           INTEGER,
+                n_bundles          INTEGER,
+                max_bundle_nodes   INTEGER,
+                total_coord_millis INTEGER,
+                censored_units     INTEGER,
+                recorded_at        INTEGER NOT NULL
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+        q = ERDQueue(self.path)
+        try:
+            cols = {r["name"] for r in
+                    q._conn.execute("PRAGMA table_info(branch_finalize_log)")}
+            self.assertIn("total_bundle_wall_millis", cols)
+            self.assertNotIn("total_coord_millis", cols)
+            q.add_branch_finalize_log(
+                b"key", "SALET -g-g-", 87, 4, 100, 200, 12345, 87,
+                n_bundles=3, max_bundle_nodes=999,
+                total_bundle_wall_millis=5000, censored_units=0)
+            row = q._conn.execute(
+                "SELECT total_bundle_wall_millis FROM branch_finalize_log"
+            ).fetchone()
+            self.assertEqual(row["total_bundle_wall_millis"], 5000)
+            q._migrate()   # second run must not raise
+        finally:
+            q.close()
+
 
 N_CANDIDATES = 40
 _ORDER = list(range(N_CANDIDATES))

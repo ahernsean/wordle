@@ -1093,14 +1093,24 @@ class _BranchWorker:
         # finalize_bundle_stats aggregates and clears this branch's bundle_stats
         # rows; (None, None, None, None) when it never claimed a bundle (fully
         # solved from reused cache entries).
-        n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units = (
-            self.queue.finalize_bundle_stats(branch_key))
-        self.queue.add_branch_finalize_log(
-            branch_key, spine, len(words), budget, created_at, finalized_at,
-            nodes_spent, n_claims, n_bundles=n_bundles,
-            max_bundle_nodes=max_bundle_nodes,
-            total_bundle_wall_millis=total_bundle_wall_millis,
-            censored_units=censored_units)
+        # Telemetry failure must not kill the worker or skip the cleanup
+        # below: the branch result is already published to the score cache,
+        # and without mark_done/delete_branch the branch's claim rows leak
+        # and the pending row is never retired.
+        try:
+            (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
+             censored_units) = self.queue.finalize_bundle_stats(branch_key)
+            self.queue.add_branch_finalize_log(
+                branch_key, spine, len(words), budget, created_at,
+                finalized_at, nodes_spent, n_claims, n_bundles=n_bundles,
+                max_bundle_nodes=max_bundle_nodes,
+                total_bundle_wall_millis=total_bundle_wall_millis,
+                censored_units=censored_units)
+        except Exception:
+            logger.exception(
+                '%s finalize telemetry failed for branch %s -- result '
+                'already published; continuing to cleanup', self.name,
+                branch_key[:25])
         self.queue.mark_done(branch_key)        # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
