@@ -3,11 +3,20 @@
 Lives in erd_queue.sqlite3, separate from wordle_cache.sqlite3, so the
 high-frequency coordination writes (claim/heartbeat/done) don't contend with
 the high-volume ERD result writes in the main cache.
+
+SQLite version floor: this module must run on SQLite 3.34 (the production
+box's bundled version) — do not use a feature newer than that (e.g.
+RETURNING needs 3.35+; ALTER TABLE DROP COLUMN needs 3.35+, worked around
+in _migrate() by rebuilding the table).  RENAME COLUMN (3.25+) and
+INSERT ... ON CONFLICT (3.24+) are both safely below the floor and already
+in use.  CI's bundled SQLite is newer than 3.34 and will not catch a
+version violation — check the target version by hand, or on the box itself.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 import time
 
@@ -35,6 +44,39 @@ def cost_size_bucket(n_words: int) -> int:
     if n_words < 1:
         return 0
     return int(math.log(n_words) / _LOG_BUCKET_BASE)
+
+# Binary claim packing (adaptive_claim_packing.md §12 tuning dials).  All three
+# are constructor/call parameters on the worker side (erd_swarm.py), not buried
+# constants; these are only the defaults.
+#
+# small_count: how many not-yet-eliminated candidates a "small" bundle packs.
+# Trades coordination amortization against republish waste — at most
+# small_count - 1 candidates can be stranded behind a heavy head before an
+# overrun republishes them.  8 is the spec's conservative anchor (the
+# epoch-2 claim-count-reduction model already gives ~105x there; larger
+# values buy diminishing returns per §1's table).
+DEFAULT_SMALL_COUNT = 8
+# count_cap: the max size of any bundle (bulk or small).  Bounds a bulk
+# bundle's wall time and its crash-reclaim window (a dead worker's whole
+# bundle is redone).  A provably-eliminated candidate completes in O(1)
+# (§3 monotonicity) but is not exactly free, so 500 keeps a bulk claim's
+# worst-case redo bounded to a few hundred near-instant re-evaluations —
+# comfortably inside HB_TIMEOUT_SECONDS — while still collapsing a
+# multi-thousand-candidate eliminated tail into a handful of claims.
+DEFAULT_COUNT_CAP = 500
+# republish_limit: how many times the same candidate may be republished
+# (adaptive_claim_packing.md §7's bounded-republish-depth guardrail) before
+# claim_next_bundle marks it `forced` so the caller stops applying the
+# bundle overrun cap to it and lets within-candidate sub-branch promotion
+# absorb its cost instead.  3 rounds is enough for a transient pile-up
+# (other bundle members happened to be heavy too) to resolve itself without
+# letting a genuinely pathological candidate thrash the pool indefinitely.
+DEFAULT_REPUBLISH_LIMIT = 3
+# Per-attempt busy_timeout (ms) while probing for claim_next_bundle's write
+# lock.  Short enough that each failed attempt is a real, countable retry
+# (claim_telemetry.claim_retries) rather than one long internal SQLite wait
+# indistinguishable from a single slow claim.
+_BUNDLE_CLAIM_RETRY_MILLIS = 100
 
 # Re-export so callers don't need to import cache_sqlite directly.
 encode_subset = ScoreCache.encode_subset
@@ -144,7 +186,16 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- "GUESS pattern" (e.g. "SALET -g-g- CRANE bb-y-").  guess_depth is the
     -- count of these guesses.  NULL = no spine recorded (a row predating spine
     -- capture).
-    spine          TEXT
+    spine          TEXT,
+    -- claim_next_bundle's forward cursor: count of best-first positions that
+    -- have been packed into a bundle at least once.  Positions
+    -- [0, pack_cursor) may hold holes (reclaimed/republished, no current
+    -- candidate_claims row) picked up by holes_pass once the cursor reaches
+    -- n_candidates; positions [pack_cursor, n_candidates) are virgin and
+    -- packed by the O(1)-amortized forward path.  Lives here (not
+    -- worker-local memory) so concurrent claim_next_bundle calls never pack
+    -- overlapping bundles.
+    pack_cursor    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
@@ -155,8 +206,14 @@ CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
 -- done=1 is AUTHORITATIVE ("fully evaluated and folded into best_erd").
 -- Coverage = all n_candidates slots with done=1.  A crashed worker leaves a
 -- done=0 row that stale-reclaim deletes, turning it back into an unclaimed
--- gap to be redone — never skipped.
+-- gap to be redone — never skipped.  Republish-on-overrun deletes the
+-- done=0 rows of a bundle's unfinished remainder the same way, so a
+-- reclaimed hole and a republished hole are indistinguishable to the packer.
 -- idx = index into the policy-canonical candidate list (all_words for ERD_ALL).
+-- bundle_id groups the rows one claim_next_bundle call hands out together
+-- (a worker evaluates its bundle in one best-first sweep); NULL for a row
+-- inserted outside the packer (e.g. mark_claims_done's within-candidate
+-- overrun promotion).
 CREATE TABLE IF NOT EXISTS candidate_claims (
     branch_key BLOB    NOT NULL,
     idx        INTEGER NOT NULL,
@@ -164,6 +221,46 @@ CREATE TABLE IF NOT EXISTS candidate_claims (
     claimed_at INTEGER,
     done       INTEGER NOT NULL DEFAULT 0,
     done_at    INTEGER,
+    bundle_id  TEXT,
+    PRIMARY KEY (branch_key, idx)
+);
+-- idx_candidate_claims_bundle is created in _migrate(), after the bundle_id
+-- column is guaranteed to exist on an upgraded database: this CREATE TABLE
+-- is a no-op against a pre-existing (pre-bundle_id) table, so an index on
+-- bundle_id here would fail on any database that predates this column.
+
+-- One row per bundle a worker has reported on: the nodes actually spent and
+-- the wall-clock span of evaluating it (straggler/reclaim-window diagnostic
+-- — NOT claim-handout coordination overhead, which is claim_telemetry's
+-- busy_wait_millis), aggregated into branch_finalize_log at finalize and
+-- dropped with the rest of the branch's transient state by delete_branch.
+-- censored=1 marks a bundle that hit its node/wall cap and republished an
+-- unfinished remainder (see ERDQueue.republish_remainder) — nodes is then a
+-- lower bound on what the bundle's original member set would have cost.
+-- Both nodes and wall_millis exclude any `forced` member's own span (see
+-- evaluate_bundle): a forced candidate's real cost lands in its promoted
+-- sub-branches' own finalize-log rows instead, so this bundle's row is not
+-- a straggler diagnostic for bundles containing one.
+CREATE TABLE IF NOT EXISTS bundle_stats (
+    branch_key   BLOB    NOT NULL,
+    bundle_id    TEXT    NOT NULL,
+    nodes        INTEGER NOT NULL,
+    wall_millis  INTEGER NOT NULL,
+    censored     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (branch_key, bundle_id)
+);
+
+-- Per-candidate republish count: how many times a candidate's cross-candidate
+-- bundle has overrun before this candidate finished (see
+-- adaptive_claim_packing.md §7's bounded-republish-depth guardrail).  Survives
+-- the delete/re-insert cycle a republished candidate's candidate_claims row
+-- goes through, so the packer can tell a chronically-stranded candidate apart
+-- from one republished for the first time.  Dropped with the rest of the
+-- branch's transient state by delete_branch.
+CREATE TABLE IF NOT EXISTS candidate_republish (
+    branch_key BLOB    NOT NULL,
+    idx        INTEGER NOT NULL,
+    count      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (branch_key, idx)
 );
 
@@ -233,24 +330,24 @@ CREATE TABLE IF NOT EXISTS telemetry_epoch (
 -- copies the otherwise-destroyed active_branches.created_at/finalized_at/
 -- nodes_spent out of the transient row.  Subbranches finalize as first-class
 -- branches under recursive promotion, so each gets one row here.  The packer-era
--- columns (n_bundles, max_bundle_nodes, total_coord_millis, censored_units) are
--- NULL under single-candidate claiming and populated once bundling lands.
+-- columns (n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units)
+-- are NULL under single-candidate claiming and populated once bundling lands.
 CREATE TABLE IF NOT EXISTS branch_finalize_log (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    branch_key         BLOB,
-    spine              TEXT,
-    n_words            INTEGER,
-    budget             INTEGER,
-    epoch              INTEGER NOT NULL DEFAULT 0,
-    created_at         INTEGER,
-    finalized_at       INTEGER,
-    nodes_spent        INTEGER,
-    n_claims           INTEGER,
-    n_bundles          INTEGER,
-    max_bundle_nodes   INTEGER,
-    total_coord_millis INTEGER,
-    censored_units     INTEGER,
-    recorded_at        INTEGER NOT NULL
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_key              BLOB,
+    spine                   TEXT,
+    n_words                 INTEGER,
+    budget                  INTEGER,
+    epoch                   INTEGER NOT NULL DEFAULT 0,
+    created_at              INTEGER,
+    finalized_at            INTEGER,
+    nodes_spent             INTEGER,
+    n_claims                INTEGER,
+    n_bundles               INTEGER,
+    max_bundle_nodes        INTEGER,
+    total_bundle_wall_millis INTEGER,
+    censored_units          INTEGER,
+    recorded_at             INTEGER NOT NULL
 );
 
 -- Per-candidate predicted-vs-actual work, collected under single-candidate
@@ -300,10 +397,48 @@ CREATE TABLE IF NOT EXISTS backstop_telemetry (
 """
 
 
+def _pack_bundle(order, start, cost_lower_bound, bound, small_count, count_cap):
+    """The exact-elimination packer (adaptive_claim_packing.md §5).
+
+    Walks `order` — a sequence of candidate idx values in best-first (Σk²
+    ascending) order — from position `start`, classifying each idx by the
+    exact test `cost_lower_bound[idx] >= bound`.  If the first candidate is
+    eliminated, absorbs consecutive eliminated candidates up to count_cap (a
+    bulk bundle).  Otherwise absorbs candidates — including any eliminated
+    ones interleaved among them — until small_count not-yet-eliminated
+    ("survivor") candidates have been taken or count_cap is reached (a small
+    bundle).
+
+    Returns (bundle, next_position): bundle is the list of idx taken, in the
+    order they appear in `order`; next_position is the position in `order`
+    just past the last one taken (== len(order) if `order` was exhausted).
+    start >= len(order) returns ([], start).
+    """
+    n = len(order)
+    if start >= n:
+        return [], start
+    i = start
+    bundle = []
+    if cost_lower_bound[order[i]] >= bound:
+        while i < n and len(bundle) < count_cap and cost_lower_bound[order[i]] >= bound:
+            bundle.append(order[i])
+            i += 1
+    else:
+        survivors = 0
+        while i < n and len(bundle) < count_cap and survivors < small_count:
+            idx = order[i]
+            bundle.append(idx)
+            if cost_lower_bound[idx] < bound:
+                survivors += 1
+            i += 1
+    return bundle, i
+
+
 class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
     def __init__(self, db_path: str, timeout: float = 30.0):
+        self._timeout = timeout
         self._conn = sqlite3.connect(db_path, timeout=timeout,
                                      isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -317,6 +452,15 @@ class ERDQueue:
         # the next add_claim_telemetry without changing claim_* return shapes.
         self._last_claim_busy_millis = 0
         self._last_claim_retries = 0
+        # Monotonic per-connection counter for bundle_id generation: paired
+        # with worker_id and this process's pid, it is unique without a
+        # timestamp-collision risk (two bundles claimed by the same worker
+        # within the same second) AND without a cross-restart collision risk
+        # (a crashed-and-respawned worker reuses its fixed worker_id slot,
+        # but never its old pid, so a fresh process can never re-mint a
+        # bundle_id a still-open branch's bundle_stats already used).
+        self._pid = os.getpid()
+        self._bundle_seq = 0
 
     def _migrate(self):
         # active_branches.spine: additive, nullable, no backfill.  Existing rows
@@ -421,6 +565,24 @@ class ERDQueue:
             "group_sizes": "TEXT",
             "source_word": "TEXT",
         })
+        # Binary claim packing (issue #67): the packer's cursor and bundle
+        # grouping.  Additive/nullable-default, so an existing (transient,
+        # normally-empty-between-deploys) active_branches/candidate_claims row
+        # just starts participating in bundled claiming going forward.
+        self._add_columns("active_branches", {
+            "pack_cursor": "INTEGER NOT NULL DEFAULT 0",
+        })
+        self._add_columns("candidate_claims", {
+            "bundle_id": "TEXT",
+        })
+        # Must run after the ADD COLUMN above: on a fresh database the
+        # CREATE TABLE in _SCHEMA_SQL already has bundle_id, but on an
+        # upgraded database that CREATE TABLE is a no-op against the
+        # pre-existing table, so creating this index any earlier (e.g. in
+        # _SCHEMA_SQL itself) would fail with "no such column: bundle_id".
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
+            "ON candidate_claims(branch_key, bundle_id)")
 
         # candidate_accuracy.cost_lb / .gated are legacy column names from
         # before the ERD-lower-bound-pruning rename (§9b): cost_lb was the
@@ -668,64 +830,266 @@ class ERDQueue:
             "SELECT * FROM active_branches WHERE branch_key = ?",
             (branch_key,)).fetchone()
 
-    def claim_candidate(self, branch_key, worker_id, n_candidates):
-        """Atomically claim the lowest-indexed candidate slot that has no row yet.
+    def claim_next_bundle(self, branch_key, worker_id, n_candidates,
+                          candidate_order, cost_lower_bound,
+                          small_count=DEFAULT_SMALL_COUNT,
+                          count_cap=DEFAULT_COUNT_CAP,
+                          republish_limit=DEFAULT_REPUBLISH_LIMIT):
+        """Atomically pack and claim the next bundle of unclaimed candidates.
 
-        A slot with an existing row is either in-flight (done=0) or complete
-        (done=1); either way it isn't re-handed-out here.  Stale done=0 rows
-        are freed by reclaim_stale_claims, which deletes them so they reappear
-        as gaps.  Returns the claimed idx (= index into the policy-canonical
-        candidate list), or None if every slot already has a row (fully claimed
-        — the worker should look elsewhere, NEVER block).
+        Runs the exact-elimination packer (_pack_bundle,
+        adaptive_claim_packing.md §5) inside one BEGIN IMMEDIATE transaction:
+        every unclaimed candidate is classified by
+        `candidate_cost_lower_bound(c) >= B` against the branch's current real
+        best_erd (B), read from active_branches in this same transaction so
+        two concurrent callers never pack overlapping bundles (adaptive_claim_
+        packing.md §12).  candidate_order is the branch's best-first order (a
+        permutation of range(n_candidates), Σk² ascending) and
+        cost_lower_bound is indexed by idx (not by position in
+        candidate_order); both are supplied by the caller — see
+        _BranchWorker._packing_stats — so this module never imports numpy or
+        the engine directly.
+
+        The forward cursor (active_branches.pack_cursor) tracks how much of
+        candidate_order has been packed at least once; once it reaches
+        n_candidates every further call falls back to a holes pass (idx with
+        no current candidate_claims row — reclaimed or republished slots),
+        packed the same way over the filtered best-first order.
+
+        Returns (bundle_id, indices, forced), or None if nothing is claimable
+        (branch not open or missing, or every slot already has a row).
+        indices is the claimed idx list in best-first (evaluation) order.
+        forced is the frozenset of indices whose candidate_republish count has
+        already reached republish_limit: the caller must evaluate those
+        without applying the bundle's own overrun cap (adaptive_claim_
+        packing.md §7's bounded-republish-depth guardrail), letting
+        within-candidate sub-branch promotion absorb the cost instead of
+        bouncing the candidate through another republish cycle.
+
+        Every source of work — fresh handout, a dead worker's reclaimed
+        slots, and a republished overrun remainder — flows through this one
+        method, so no path ever hands out a single candidate alone (a bundle
+        of size 1 can still occur, e.g. the last candidate in a branch, but
+        only as an emergent packer outcome).
         """
-        # Time the write-lock acquisition: under contention BEGIN IMMEDIATE blocks
-        # on the busy timeout, so this wall span is the direct lock-contention
-        # signal (busy_wait_millis).  No application-level retry loop, so the retry
-        # count is 0 — the wait, not a retry, is what contention costs here.
+        if len(candidate_order) != n_candidates:
+            raise ValueError(
+                f"candidate_order length {len(candidate_order)} != "
+                f"n_candidates {n_candidates}")
+        # Probe for the write lock with a short per-attempt busy_timeout so a
+        # failed attempt is a real, countable retry rather than one long
+        # internal SQLite wait indistinguishable from a single slow claim;
+        # restore the connection's normal timeout once the lock is held (or
+        # the overall budget is exhausted).
         _acquire_t0 = time.perf_counter()
-        self._conn.execute("BEGIN IMMEDIATE")
+        retries = 0
+        self._conn.execute(f"PRAGMA busy_timeout = {_BUNDLE_CLAIM_RETRY_MILLIS}")
+        try:
+            while True:
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError:
+                    if time.perf_counter() - _acquire_t0 > self._timeout:
+                        raise  # pragma: no cover — total lock starvation
+                    retries += 1
+        finally:
+            self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
         self._last_claim_busy_millis = int((time.perf_counter() - _acquire_t0) * 1e3)
-        self._last_claim_retries = 0
+        self._last_claim_retries = retries
         try:
             # Never hand out a claim for a branch that has been finalized and
-            # deleted: a worker still looping would otherwise redo it from scratch.
-            # Checked inside the write transaction so it can't race finalize+delete.
+            # deleted: a worker still looping would otherwise redo it from
+            # scratch.  Checked inside the write transaction so it can't race
+            # finalize+delete.
             br = self._conn.execute(
-                "SELECT status FROM active_branches WHERE branch_key = ?",
-                (branch_key,)).fetchone()
+                "SELECT status, best_erd, pack_cursor FROM active_branches "
+                "WHERE branch_key = ?", (branch_key,)).fetchone()
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
                 return None
-            # Lowest index in [0, n_candidates) with no row yet, computed by the
-            # database instead of materialising every claimed index per call.
-            # The virtual -1 row lets index 0 be chosen when it is free; both
-            # references to candidate_claims are answered from the (branch_key,
-            # idx) primary key.  A reclaimed slot is a deleted row, so it
-            # reappears as the lowest gap and is re-handed-out here.
-            idx = self._conn.execute("""
-                SELECT MIN(slot) + 1 AS idx FROM (
-                    SELECT -1 AS slot
-                    UNION ALL
-                    SELECT idx AS slot FROM candidate_claims WHERE branch_key = ?
-                )
-                WHERE slot + 1 < ?
-                  AND slot + 1 NOT IN (
-                      SELECT idx FROM candidate_claims WHERE branch_key = ?)
-            """, (branch_key, n_candidates, branch_key)).fetchone()["idx"]
-            if idx is None:
+            bound = br["best_erd"] if br["best_erd"] is not None else float("inf")
+            cursor = br["pack_cursor"]
+            if cursor < n_candidates:
+                # start < len(candidate_order) and count_cap >= 1 together
+                # guarantee _pack_bundle takes at least one candidate, so the
+                # forward path's bundle is never empty here.
+                bundle, new_cursor = _pack_bundle(
+                    candidate_order, cursor, cost_lower_bound, bound,
+                    small_count, count_cap)
+                self._conn.execute(
+                    "UPDATE active_branches SET pack_cursor = ? "
+                    "WHERE branch_key = ?", (new_cursor, branch_key))
+            else:
+                claimed = {r["idx"] for r in self._conn.execute(
+                    "SELECT idx FROM candidate_claims WHERE branch_key = ?",
+                    (branch_key,))}
+                holes = [idx for idx in candidate_order if idx not in claimed]
+                bundle, _ = _pack_bundle(holes, 0, cost_lower_bound, bound,
+                                         small_count, count_cap)
+            if not bundle:
                 self._conn.execute("COMMIT")
                 return None
+            bundle_id = f"{worker_id}:{self._pid}:{self._bundle_seq}"
+            self._bundle_seq += 1
             now = int(time.time())
-            self._conn.execute("""
-                INSERT INTO candidate_claims
-                    (branch_key, idx, claimed_by, claimed_at, done)
-                VALUES (?, ?, ?, ?, 0)
-            """, (branch_key, idx, worker_id, now))
+            # INSERT OR IGNORE, not a plain INSERT: on the forward path,
+            # cursor < n_candidates only proves these positions have never
+            # been *packed* before, not that no row exists at that idx yet.
+            # mark_claims_done (within-candidate overrun promotion) can
+            # insert done=1 rows for a fresh branch's best-first prefix
+            # before the packer ever runs over it, landing on exactly the
+            # positions the forward path is about to pack. A plain INSERT
+            # would collide on the (branch_key, idx) primary key; IGNORE
+            # skips those rows, and the SELECT below discovers which of
+            # `bundle` were actually claimed by this call, via the
+            # bundle_id just stamped on them (idx_candidate_claims_bundle
+            # makes this an indexed lookup, not a rescan).
+            self._conn.executemany("""
+                INSERT OR IGNORE INTO candidate_claims
+                    (branch_key, idx, claimed_by, claimed_at, done, bundle_id)
+                VALUES (?, ?, ?, ?, 0, ?)
+            """, [(branch_key, idx, worker_id, now, bundle_id) for idx in bundle])
+            actually_claimed = {r["idx"] for r in self._conn.execute(
+                "SELECT idx FROM candidate_claims "
+                "WHERE branch_key = ? AND bundle_id = ?",
+                (branch_key, bundle_id))}
+            bundle = [idx for idx in bundle if idx in actually_claimed]
+            if not bundle:
+                # Every packed position already had a row (e.g. mark_claims_
+                # done beat us to the whole prefix): the cursor still
+                # advanced past them, so the caller should just retry.
+                self._conn.execute("COMMIT")
+                return None
+            placeholders = ",".join("?" * len(bundle))
+            rows = self._conn.execute(
+                f"SELECT idx FROM candidate_republish "
+                f"WHERE branch_key = ? AND count >= ? "
+                f"AND idx IN ({placeholders})",
+                (branch_key, republish_limit, *bundle)).fetchall()
+            forced = frozenset(r["idx"] for r in rows)
             self._conn.execute("COMMIT")
-            return idx
+            return (bundle_id, bundle, forced)
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
+
+    def republish_remainder(self, branch_key, bundle_id, indices):
+        """Return an overrun bundle's unfinished remainder to the unclaimed pool.
+
+        adaptive_claim_packing.md §7a: deletes the done=0 candidate_claims
+        rows for `indices` so they re-enter as holes, re-packed by the next
+        claim_next_bundle against a B that is at least as tight as when they
+        were first packed — never re-inserted as `len(indices)` individual
+        claims.  Also bumps each candidate's persistent republish count
+        (candidate_republish), which survives this delete/re-insert cycle so
+        a chronically-stranded candidate is distinguishable from one
+        republished for the first time.
+
+        The delete is scoped to `bundle_id`, not just (branch_key, idx): a
+        worker can stall past the heartbeat timeout on a heavy candidate,
+        have reclaim_stale_claims free its done=0 rows, and have another
+        worker's packer legitimately re-claim some of those idx under a NEW
+        bundle_id before this worker finally overruns — an unscoped delete
+        would remove that other worker's live claim rows and spuriously
+        bump their republish counts.  A SELECT identifies exactly which idx
+        are still claimed under THIS bundle_id before the DELETE removes
+        them — both run inside the same BEGIN IMMEDIATE transaction, so no
+        other writer can change candidate_claims between the two (the write
+        lock is held for the whole method, same as a DELETE ... RETURNING
+        would give; RETURNING itself needs SQLite 3.35+, and the production
+        box runs 3.34.1 — see the module-level SQLite version note).  The
+        count bump — and the returned {idx: count} map — covers only the
+        idx the SELECT found; one that already got reclaimed under a
+        different bundle_id is silently left alone here.
+        """
+        if not indices:
+            return {}
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            placeholders = ",".join("?" * len(indices))
+            deleted = [r["idx"] for r in self._conn.execute(
+                f"SELECT idx FROM candidate_claims WHERE branch_key = ? "
+                f"AND done = 0 AND bundle_id = ? AND idx IN ({placeholders})",
+                (branch_key, bundle_id, *indices))]
+            if not deleted:
+                self._conn.execute("COMMIT")
+                return {}
+            deleted_placeholders = ",".join("?" * len(deleted))
+            self._conn.execute(
+                f"DELETE FROM candidate_claims WHERE branch_key = ? "
+                f"AND bundle_id = ? AND idx IN ({deleted_placeholders})",
+                (branch_key, bundle_id, *deleted))
+            self._conn.executemany("""
+                INSERT INTO candidate_republish (branch_key, idx, count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(branch_key, idx) DO UPDATE SET count = count + 1
+            """, [(branch_key, idx) for idx in deleted])
+            rows = self._conn.execute(
+                f"SELECT idx, count FROM candidate_republish "
+                f"WHERE branch_key = ? AND idx IN ({deleted_placeholders})",
+                (branch_key, *deleted)).fetchall()
+            self._conn.execute("COMMIT")
+            return {r["idx"]: r["count"] for r in rows}
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def record_bundle_stats(self, branch_key, bundle_id, nodes, wall_millis,
+                            censored=False):
+        """Record one bundle's actual node cost and evaluation wall span.
+
+        wall_millis is the bundle's own evaluation wall time (straggler/
+        reclaim-window diagnostic) — NOT claim-handout coordination overhead;
+        that is claim_telemetry's busy_wait_millis, measured separately in
+        claim_next_bundle.  Aggregated into branch_finalize_log at finalize
+        (see finalize_bundle_stats) and dropped along with the rest of the
+        branch's transient state by delete_branch.  censored=1 marks a bundle
+        that hit its node/wall cap and republished an unfinished remainder —
+        nodes is then a lower bound on what the bundle's original member set
+        would have cost.  A republished remainder re-packs under a new
+        bundle_id, which gets its own independent row here.
+
+        The bundle's last candidate can be marked done (making
+        branch_done_candidates cover the branch) before this call runs, so
+        another worker's maybe_finalize can win try_finalize_branch and
+        delete_branch/finalize_bundle_stats out from under this INSERT.  The
+        WHERE EXISTS guard makes the insert a no-op in that race instead of
+        writing an orphaned row for an already-gone branch: SQLite evaluates
+        the SELECT and the INSERT as one atomic statement, so there is no
+        window between the existence check and the write for a concurrent
+        DELETE to land in.
+        """
+        self._conn.execute("""
+            INSERT OR REPLACE INTO bundle_stats
+                (branch_key, bundle_id, nodes, wall_millis, censored)
+            SELECT ?, ?, ?, ?, ?
+            WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_key = ?)
+        """, (branch_key, bundle_id, nodes, wall_millis,
+              1 if censored else 0, branch_key))
+
+    def finalize_bundle_stats(self, branch_key):
+        """Aggregate and clear a branch's bundle_stats rows at finalize.
+
+        Returns (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
+        censored_units) for branch_finalize_log — all None if no bundle
+        recorded any stats (e.g. a branch solved entirely from reused cache
+        entries).  Deletes the rows so bundle_stats stays bounded to
+        currently-open branches, matching delete_branch's candidate_claims
+        cleanup.
+        """
+        row = self._conn.execute("""
+            SELECT COUNT(*) AS n_bundles, MAX(nodes) AS max_bundle_nodes,
+                   SUM(wall_millis) AS total_bundle_wall_millis,
+                   SUM(censored) AS censored_units
+            FROM bundle_stats WHERE branch_key = ?
+        """, (branch_key,)).fetchone()
+        self._conn.execute(
+            "DELETE FROM bundle_stats WHERE branch_key = ?", (branch_key,))
+        if row["n_bundles"] == 0:
+            return (None, None, None, None)
+        return (row["n_bundles"], row["max_bundle_nodes"],
+                row["total_bundle_wall_millis"], row["censored_units"])
 
     def complete_candidate(self, branch_key, idx):
         """Mark a candidate claim authoritatively complete (done=1)."""
@@ -798,9 +1162,18 @@ class ERDQueue:
         return cur.rowcount == 1
 
     def delete_branch(self, branch_key):
-        """Remove a finished branch and its claim rows to bound the queue DB."""
+        """Remove a finished branch and its claim/packer rows to bound the queue DB.
+
+        finalize_bundle_stats already clears bundle_stats before this is
+        called; candidate_republish is cleared here alongside candidate_claims
+        since neither is meaningful once the branch is gone.
+        """
         self._conn.execute(
             "DELETE FROM candidate_claims WHERE branch_key = ?", (branch_key,))
+        self._conn.execute(
+            "DELETE FROM candidate_republish WHERE branch_key = ?", (branch_key,))
+        self._conn.execute(
+            "DELETE FROM bundle_stats WHERE branch_key = ?", (branch_key,))
         self._conn.execute(
             "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
 
@@ -880,6 +1253,8 @@ class ERDQueue:
         nc = self._conn.execute(
             f"SELECT COUNT(*) FROM candidate_claims WHERE {member}").fetchone()[0]
         self._conn.execute(f"DELETE FROM candidate_claims WHERE {member}")
+        self._conn.execute(f"DELETE FROM candidate_republish WHERE {member}")
+        self._conn.execute(f"DELETE FROM bundle_stats WHERE {member}")
         self._conn.execute(f"DELETE FROM active_branches WHERE {member}")
         # Free stale in-flight claims on cooperative branches so their
         # remaining candidates are reclaimable as gaps.
@@ -1001,6 +1376,10 @@ class ERDQueue:
         try:
             self._conn.execute(
                 "DELETE FROM candidate_claims WHERE branch_key = ?", (branch_key,))
+            self._conn.execute(
+                "DELETE FROM candidate_republish WHERE branch_key = ?", (branch_key,))
+            self._conn.execute(
+                "DELETE FROM bundle_stats WHERE branch_key = ?", (branch_key,))
             self._conn.execute(
                 "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
             if remove_from_queue:
@@ -1219,8 +1598,18 @@ class ERDQueue:
         """Append a claim coordination record to claim_telemetry for offline analysis.
 
         claim_retries / busy_wait_millis come from the most recent claim path on
-        this connection (set by claim_candidate), the direct lock-contention
+        this connection (set by claim_next_bundle), the direct lock-contention
         signal; the row is stamped with the active epoch.
+
+        Consumed values are reset to 0 immediately after this INSERT reads
+        them, so they are attributed to exactly the next telemetry row and
+        never repeat on a later, unrelated candidate's row.  This matters
+        under bundling: a candidate's own within-candidate sub-branch
+        promotion can trigger a nested claim_next_bundle call on this same
+        connection before this candidate's own add_claim_telemetry call —
+        without the reset, that nested claim's contention numbers would
+        otherwise still be sitting here (unconsumed) for whichever LATER,
+        unrelated bundle member logs telemetry next.
         """
         now = int(time.time())
         self._conn.execute("""
@@ -1230,22 +1619,32 @@ class ERDQueue:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, work_nodes, self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, self.epoch, now))
+        self._last_claim_retries = 0
+        self._last_claim_busy_millis = 0
 
     def add_branch_finalize_log(self, branch_key, spine, n_words, budget,
-                                created_at, finalized_at, nodes_spent, n_claims):
+                                created_at, finalized_at, nodes_spent, n_claims,
+                                n_bundles=None, max_bundle_nodes=None,
+                                total_bundle_wall_millis=None, censored_units=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
-        Packer-era columns (n_bundles, max_bundle_nodes, total_coord_millis,
-        censored_units) are left NULL under single-candidate claiming.
+        The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
+        total_bundle_wall_millis, censored_units) come from
+        finalize_bundle_stats; they stay NULL when the caller doesn't pass
+        them (a branch solved entirely from reused cache entries never
+        claims a bundle).
         """
         now = int(time.time())
         self._conn.execute("""
             INSERT INTO branch_finalize_log
                 (branch_key, spine, n_words, budget, epoch, created_at,
-                 finalized_at, nodes_spent, n_claims, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 finalized_at, nodes_spent, n_claims, n_bundles,
+                 max_bundle_nodes, total_bundle_wall_millis, censored_units,
+                 recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
-              finalized_at, nodes_spent, n_claims, now))
+              finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
+              total_bundle_wall_millis, censored_units, now))
 
     def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
                                bound_erd, candidate_cost_lower_bound,

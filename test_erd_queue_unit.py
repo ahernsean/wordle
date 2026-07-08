@@ -2,7 +2,7 @@
 
 The integration tests (test_erd_parallel, test_erd_scaling, test_erd_fixes)
 exercise ERDQueue through _BranchWorker, which reaches claim_next,
-claim_candidate, complete_candidate, update_branch_best, read_branch_best,
+claim_next_bundle, complete_candidate, update_branch_best, read_branch_best,
 mark_branch_tainted, read_branch_meta, branch_done_candidates,
 try_finalize_branch, delete_branch, and branches_in_progress.  What they do
 NOT reach are the operator/supervisor methods only called from erd_search.py:
@@ -24,6 +24,15 @@ WORDS = ["crane", "slate", "trace", "stale", "tales"]
 N_CANDIDATES = 20
 
 
+# Identity best-first order with a uniform cost_lower_bound: nothing is ever
+# ERD-pruned (cost_lower_bound 0.0 never meets any real bound), so
+# claim_next_bundle(small_count=1, count_cap=1) hands out exactly one idx per
+# call, in ascending order — the single-candidate-claim contract these tests
+# were written against.
+_IDENTITY_ORDER = list(range(N_CANDIDATES))
+_ZERO_LOWER_BOUND = [0.0] * N_CANDIDATES
+
+
 class _TmpQueue(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -31,6 +40,15 @@ class _TmpQueue(unittest.TestCase):
         self.q = ERDQueue(os.path.join(self._tmp.name, "q.sqlite3"))
         self.addCleanup(self.q.close)
         self.key = ScoreCache.encode_subset(WORDS)
+
+    def _claim_one_idx(self, branch_key, worker_id="worker-0"):
+        """claim_next_bundle(small_count=1, count_cap=1) unwrapped to a bare
+        idx (or None) — the old claim_candidate single-index contract, for
+        tests exercising something other than the packer itself."""
+        claim = self.q.claim_next_bundle(
+            branch_key, worker_id, N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1)
+        return claim[1][0] if claim is not None else None
 
 
 class TestBranchLifecycle(_TmpQueue):
@@ -133,52 +151,67 @@ class TestCandidateClaiming(_TmpQueue):
         super().setUp()
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
 
-    def test_claim_candidate_returns_none_for_finalized_branch(self):
+    def test_claim_returns_none_for_finalized_branch(self):
         self.q.try_finalize_branch(self.key)  # transitions status to 'finalized'
-        idx = self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, "worker-0")
         self.assertIsNone(idx)
 
-    def test_claim_candidate_returns_none_for_missing_branch(self):
+    def test_claim_returns_none_for_missing_branch(self):
         # Branch doesn't exist at all (never created).
         key2 = ScoreCache.encode_subset(WORDS[:2])
-        idx = self.q.claim_candidate(key2, "worker-0", N_CANDIDATES)
+        idx = self._claim_one_idx(key2, "worker-0")
         self.assertIsNone(idx)
 
-    def test_claim_candidate_returns_each_index_exactly_once(self):
+    def test_claim_returns_each_index_exactly_once(self):
         claimed = set()
         for _ in range(N_CANDIDATES):
-            idx = self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+            idx = self._claim_one_idx(self.key, "worker-0")
             self.assertIsNotNone(idx)
             claimed.add(idx)
         self.assertEqual(len(claimed), N_CANDIDATES)
         # All candidates claimed — next call returns None.
-        self.assertIsNone(self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES))
+        self.assertIsNone(self._claim_one_idx(self.key, "worker-0"))
 
-    def test_claim_candidate_refills_lowest_reclaimed_hole(self):
+    def test_forward_path_does_not_rewind_for_holes_before_exhaustion(self):
         # Claim the first three slots, then free the middle one the way
         # reclaim_stale_claims does: the row is deleted, reopening a gap.
         for _ in range(3):
-            self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+            self._claim_one_idx(self.key, "worker-0")
         self.q._conn.execute(
             "DELETE FROM candidate_claims WHERE branch_key = ? AND idx = 1",
             (self.key,))
-        # The next claim fills the lowest gap (1), not the next fresh slot (3).
-        idx = self.q.claim_candidate(self.key, "worker-1", N_CANDIDATES)
-        self.assertEqual(idx, 1)
+        # pack_cursor is at 3 (< N_CANDIDATES): the forward path claims the
+        # next fresh slot (3), not the hole at idx 1 — holes are picked up
+        # only once the cursor exhausts the full best-first order
+        # (adaptive_claim_packing.md §5), the O(1)-amortized common path.
+        idx = self._claim_one_idx(self.key, "worker-1")
+        self.assertEqual(idx, 3)
+
+    def test_holes_pass_refills_reclaimed_hole_after_cursor_exhausted(self):
+        claimed = [self._claim_one_idx(self.key, "worker-0")
+                  for _ in range(N_CANDIDATES)]
+        hole = claimed[5]
+        self.q._conn.execute(
+            "DELETE FROM candidate_claims WHERE branch_key = ? AND idx = ?",
+            (self.key, hole))
+        # pack_cursor == N_CANDIDATES now, so this call falls back to
+        # holes_pass and picks the freed slot back up.
+        idx = self._claim_one_idx(self.key, "worker-1")
+        self.assertEqual(idx, hole)
 
     def test_complete_candidate_marks_done(self):
-        idx = self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, "worker-0")
         self.q.complete_candidate(self.key, idx)
         self.assertEqual(self.q.branch_done_candidates(self.key), 1)
 
     def test_claims_for_branch_returns_rows(self):
-        self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+        self._claim_one_idx(self.key, "worker-0")
         rows = self.q.claims_for_branch(self.key)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["idx"], 0)
 
     def test_claims_for_branch_empty_after_delete(self):
-        self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+        self._claim_one_idx(self.key, "worker-0")
         self.q.delete_branch(self.key)
         self.assertEqual(self.q.claims_for_branch(self.key), [])
 
@@ -200,7 +233,7 @@ class TestStartupRecovery(_TmpQueue):
         # A user-queued branch is identified by its pending_branches row.
         self.q.add_pending_many([(self.key, len(WORDS), 0, None, None)])
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
-        self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+        self._claim_one_idx(self.key, "worker-0")
         n_b, n_c = self.q.reset_active_branches()
         self.assertEqual(n_b, 1)
         self.assertGreaterEqual(n_c, 1)
@@ -218,9 +251,9 @@ class TestStartupRecovery(_TmpQueue):
         coop_key = ScoreCache.encode_subset(coop_words)
         self.q.create_branch(coop_key, len(coop_words), N_CANDIDATES)
         # Simulate two claims: idx 0 completed, idx 1 stale in-flight.
-        idx0 = self.q.claim_candidate(coop_key, "worker-0", N_CANDIDATES)
+        idx0 = self._claim_one_idx(coop_key, "worker-0")
         self.q.complete_candidate(coop_key, idx0)
-        idx1 = self.q.claim_candidate(coop_key, "worker-0", N_CANDIDATES)
+        idx1 = self._claim_one_idx(coop_key, "worker-0")
         self.assertIsNotNone(idx1)
 
         n_b, n_c = self.q.reset_active_branches()
@@ -243,15 +276,20 @@ class TestStartupRecovery(_TmpQueue):
         inflight_claims = [c for c in claims if c["done"] == 0]
         self.assertEqual(inflight_claims, [])
 
-        # The freed gap is claimable again.
-        reclaimed = self.q.claim_candidate(coop_key, "worker-1", N_CANDIDATES)
-        self.assertEqual(reclaimed, idx1)
+        # The freed gap is not lost, but it isn't immediately reclaimable
+        # either: pack_cursor is past it (2), and holes below the cursor are
+        # only picked up by holes_pass once the cursor exhausts the full
+        # best-first order (adaptive_claim_packing.md §5) — so the next claim
+        # takes the next fresh slot instead.
+        next_idx = self._claim_one_idx(coop_key, "worker-1")
+        self.assertNotEqual(next_idx, idx1)
+        self.assertEqual(next_idx, 2)
 
 
 class TestCancelAndInspection(_TmpQueue):
     def test_cancel_active_branch_removes_branch_and_claims(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
-        self.q.claim_candidate(self.key, "worker-0", N_CANDIDATES)
+        self._claim_one_idx(self.key, "worker-0")
         self.q.add_pending_many([(self.key, len(WORDS), 0, "crane", 0)])
         self.q.cancel_active_branch(self.key, remove_from_queue=False)
         self.assertIsNone(self.q.get_branch(self.key))
