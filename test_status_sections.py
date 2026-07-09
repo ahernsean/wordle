@@ -58,6 +58,72 @@ class BranchIdAndSpineHelperTest(unittest.TestCase):
         self.assertEqual(out, 'SALET -g-g-')
 
 
+class BranchDisplayOrderTest(unittest.TestCase):
+    """The watch display keeps branch rows stable across refreshes."""
+
+    def _branch(self, key, spine=None, source_word='salet',
+                source_pattern=0, n_words=0):
+        return {
+            'branch_key': key,
+            'spine': spine,
+            'source_word': source_word,
+            'source_pattern': source_pattern,
+            'n_words': n_words,
+        }
+
+    def _bid(self, branch):
+        return erd_search._branch_id(branch['branch_key'])
+
+    def test_existing_branches_keep_previous_display_order(self):
+        first = self._branch(
+            b'first-branch',
+            spine='SALET bb--- CRANE bby--',
+            n_words=20)
+        second = self._branch(
+            b'second-branch',
+            spine='SALET bb--- PRONE bby--',
+            n_words=200)
+        new = self._branch(
+            b'new-branch',
+            spine='SALET bb--- BLEND bbby-',
+            n_words=1000)
+        previous = [self._bid(second), self._bid(first)]
+
+        ordered, order_state = erd_search._stable_branch_display_order(
+            [new, first, second], previous)
+
+        self.assertEqual(ordered, [second, first, new])
+        self.assertEqual(order_state,
+                         [self._bid(second), self._bid(first), self._bid(new)])
+
+    def test_disappeared_branches_are_pruned_from_order_state(self):
+        first = self._branch(b'first-branch')
+        second = self._branch(b'second-branch')
+        gone = self._branch(b'gone-branch')
+        previous = [self._bid(second), self._bid(gone), self._bid(first)]
+
+        ordered, order_state = erd_search._stable_branch_display_order(
+            [first, second], previous)
+
+        self.assertEqual(ordered, [second, first])
+        self.assertEqual(order_state, [self._bid(second), self._bid(first)])
+
+    def test_new_branches_use_stable_topology_order_not_size_order(self):
+        later = self._branch(
+            b'later-branch',
+            spine='SALET bb--- CRANE yyyyy',
+            n_words=1000)
+        earlier = self._branch(
+            b'earlier-branch',
+            spine='SALET bb--- CRANE bbbbb',
+            n_words=1)
+
+        ordered, _ = erd_search._stable_branch_display_order(
+            [later, earlier], [])
+
+        self.assertEqual(ordered, [earlier, later])
+
+
 class ParseSpineTest(unittest.TestCase):
     """_parse_spine handles both old-format and new depth-tagged tokens."""
 
