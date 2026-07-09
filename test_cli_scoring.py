@@ -11,6 +11,12 @@ def _second_solution(gs):
         gs.all_answers, gs.all_words, gs.cache, gs.score_cache)
 
 
+def _apply_incompatible_patterns(soln):
+    soln.apply_guess("crane", wordle.parse_response("ggggg"))
+    soln.apply_guess("slate", wordle.parse_response("ggggg"))
+    soln.apply_guess("trace", wordle.parse_response("ggggg"))
+
+
 class TestCmdSolve(CliTestCase):
     # Menu (single board): 1-4 are scoring methods, 5 is ERD.
 
@@ -102,6 +108,12 @@ class TestCmdSolve(CliTestCase):
         self.assertIn("(cached)", out)
         self.assertNotIn("max entropy", out)
 
+    def test_incompatible_patterns_do_not_crash_solve(self):
+        _apply_incompatible_patterns(self.soln())
+        self.assertEqual(len(self.soln().current_words), 0)
+        out = self.run_cmd(wordle.cmd_solve)
+        self.assertIn("No words remaining", out)
+
 
 class TestCmdGrid(CliTestCase):
     def test_single_happy_path(self):
@@ -129,6 +141,12 @@ class TestCmdGrid(CliTestCase):
         self.gs.solutions = [self.soln(), _second_solution(self.gs)]
         out = self.run_cmd(wordle.cmd_grid, inputs=["1", "zzz"])
         self.assertIn("Invalid choice.", out)
+
+    def test_incompatible_patterns_do_not_crash_grid(self):
+        _apply_incompatible_patterns(self.soln())
+        self.assertEqual(len(self.soln().current_words), 0)
+        out = self.run_cmd(wordle.cmd_grid)
+        self.assertIn("No words remaining", out)
 
 
 class TestComputePareto(unittest.TestCase):

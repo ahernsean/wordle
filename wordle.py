@@ -549,6 +549,14 @@ def set_display_context(soln):
         _display_max_ent = 0.0
 
 
+def _has_remaining_words(soln):
+    """Return False after contradictory clues leave no candidate answers."""
+    if len(soln.current_words) == 0:
+        print_error("No words remaining. Undo to fix feedback.")
+        return False
+    return True
+
+
 def _mark(word):
     """Return '*' if word is in the current answer set, ' ' otherwise."""
     return '*' if word in _display_answer_set else ' '
@@ -1150,6 +1158,8 @@ def cmd_solve(gs):
             soln = val
 
     set_display_context(soln)
+    if not _has_remaining_words(soln):
+        return
 
     # ERD option: available when the full tree for this position is cached
     # for the current input mode.
@@ -1282,6 +1292,8 @@ def cmd_grid(gs):
             soln = val
 
     set_display_context(soln)
+    if not _has_remaining_words(soln):
+        return
 
     wordlist = _resolve_candidate_wordlist(gs, soln)
     if wordlist is None:
@@ -1837,6 +1849,9 @@ def cmd_test(gs, inline=''):
     _, soln = result
 
     set_display_context(soln)
+    if not _has_remaining_words(soln):
+        return
+
     if inline:
         line = inline
     else:

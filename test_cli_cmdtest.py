@@ -195,6 +195,17 @@ class TestCmdTestMidGame(CliTestCase):
         self.assertNotIn("Multi-step lookahead", out)
         self.assertIn("Groups:", out)
 
+    def test_incompatible_patterns_do_not_crash_stats(self):
+        soln = self.soln()
+        soln.apply_guess("crane", wordle.parse_response("ggggg"))
+        soln.apply_guess("slate", wordle.parse_response("ggggg"))
+        soln.apply_guess("trace", wordle.parse_response("ggggg"))
+        self.assertEqual(len(soln.current_words), 0)
+
+        out = self.run_cmd(cmd_test, inputs=["crane"])
+
+        self.assertIn("No words remaining", out)
+
 
 class TestExplainConflict(CliTestCase):
     def test_conflict_all_branches(self):
