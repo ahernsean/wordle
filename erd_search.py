@@ -953,6 +953,31 @@ def _parse_spine(path):
     return result
 
 
+def _worker_guess_depth_label(parent_guess_depth, current_max_guess_depth,
+                              current_path, current_candidate):
+    """Return the compact worker-row guess_depth label.
+
+    Any rendered dN is an absolute guess_depth from the root.  Unknown live
+    descent below a known branch is rendered as dN+?.
+    """
+    parsed_path = _parse_spine(current_path)
+    explicit_guess_depths = [depth for depth, _guess, _pattern, _size in parsed_path
+                             if depth is not None]
+    if explicit_guess_depths:
+        return f'd{max(explicit_guess_depths)}'
+
+    if current_max_guess_depth and current_max_guess_depth > parent_guess_depth:
+        return f'd{current_max_guess_depth}'
+
+    if parsed_path:
+        return f'd{parent_guess_depth + len(parsed_path)}'
+
+    if current_candidate:
+        return f'd{parent_guess_depth + 1}'
+
+    return f'd{parent_guess_depth}+?'
+
+
 def _sweep_progress_bar(n_candidates, done_indices, worker_positions,
                         width=40):
     """Render compressed candidate completion and worker positions.
@@ -1259,15 +1284,16 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         wid = h['worker_id']
         return wid.split('-')[-1] if '-' in wid else wid
 
-    def _print_worker_row(h):
+    def _print_worker_row(h, parent_guess_depth):
         # One nested row, kept within 59 cols: worker, sweep index, current
-        # candidate, deepest guess_depth reached, node rate, then the descent
+        # candidate, absolute guess_depth reached, node rate, then the descent
         # sizes truncated to whatever width remains.
         age = now_ts - h['updated_at']
         flag = ' !!' if age > WORKER_LIVENESS_SECONDS else ''
         claim_idx_str = str(h['claim_idx']) if h['claim_idx'] is not None else '-'
         cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
-        mdepth = (h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
+        current_max_guess_depth = (
+            h['cur_max_depth'] if 'cur_max_depth' in h.keys() else None) or 0
         nodes = (h['cur_nodes'] if 'cur_nodes' in h.keys() else None) or 0
         nrate = (h['node_rate'] if 'node_rate' in h.keys() else None) or 0.0
         path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
@@ -1278,8 +1304,10 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             flag += ' ~?'
         cur_disp = (cur.upper() + ('*' if cur.lower() in answer_set else ' ')) if cur else '-----'
         krate = f'{int(nrate / 1000)}k/s' if nrate else ''
+        guess_depth_label = _worker_guess_depth_label(
+            parent_guess_depth, current_max_guess_depth, path, cur)
         head = (f' W{_worker_num(h):<2} {claim_idx_str:>5} {cur_disp:<6} '
-                f'd{mdepth} {krate:>6}')
+                f'{guess_depth_label} {krate:>6}')
         tail = f' {age}s{flag}'
         sizes = _spine_sizes(path)
         room = 59 - len(head) - len(tail) - 1
@@ -1364,7 +1392,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         for h in sorted(workers_by_branch.get(key, []),
                         key=lambda r: int(_worker_num(r)) if _worker_num(r).isdigit()
                         else 0):
-            _print_worker_row(h)
+            _print_worker_row(h, guess_depth)
 
     # Workers attached to a branch no longer in the in-progress list (just
     # finalized) or idle between claims.
