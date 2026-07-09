@@ -171,6 +171,40 @@ class ParseSpineTest(unittest.TestCase):
         self.assertEqual(result, [(None, None, None, '•')])
 
 
+class WorkerGuessDepthLabelTest(unittest.TestCase):
+    """Compact worker rows render only absolute guess_depth labels."""
+
+    def test_explicit_path_depth_is_already_absolute(self):
+        label = erd_search._worker_guess_depth_label(
+            3, 0, '4:KHAKI:--y--/33→5:NURDY:---y-/17', 'nurdy')
+        self.assertEqual(label, 'd5')
+
+    def test_current_max_deeper_than_parent_is_absolute(self):
+        label = erd_search._worker_guess_depth_label(
+            3, 5, '', 'nurdy')
+        self.assertEqual(label, 'd5')
+
+    def test_old_format_path_is_rebased_from_parent(self):
+        label = erd_search._worker_guess_depth_label(
+            3, 0, 'KHAKI:--y--/33→NURDY:---y-/17', 'nurdy')
+        self.assertEqual(label, 'd5')
+
+    def test_current_candidate_is_next_guess_below_parent(self):
+        label = erd_search._worker_guess_depth_label(
+            3, 0, '', 'tzars')
+        self.assertEqual(label, 'd4')
+
+    def test_unknown_descent_keeps_parent_context(self):
+        label = erd_search._worker_guess_depth_label(
+            3, 0, '', '')
+        self.assertEqual(label, 'd3+?')
+
+    def test_non_deeper_current_max_does_not_render_as_absolute(self):
+        label = erd_search._worker_guess_depth_label(
+            3, 3, '', '')
+        self.assertEqual(label, 'd3+?')
+
+
 class SplitSectionsTest(unittest.TestCase):
     def test_splits_on_markers(self):
         lines = [
