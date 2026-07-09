@@ -1486,13 +1486,20 @@ def _print_status(args, selected_worker=None, selected_branch=None,
 
     if selected_branch is not None:
         _section_break('branchdetail', interactive)
+        selected_branch_letter = next(
+            (lt for lt, bid
+             in getattr(_print_status, '_branch_hotkeys', {}).items()
+             if bid == selected_branch), None)
+        selected_branch_ref = (f'[{selected_branch_letter}] #{selected_branch}'
+                               if selected_branch_letter
+                               else f'#{selected_branch}')
         target = next((b for b in detail_branches
                        if _branch_id(b['branch_key']) == selected_branch), None)
         print()
         if target is None:
             snap = snapshots.get(selected_branch)
             if snap is None:
-                print(f'Branch #{selected_branch} not found')
+                print(f'Branch {selected_branch_ref} not found')
             else:
                 key = snap['branch_key']
                 n_cands = snap['n_candidates']
@@ -1503,7 +1510,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                      and bytes(h['current_branch_key']) == key],
                     key=lambda r: (r['claim_idx'] if r['claim_idx'] is not None else -1))
                 state = 'finalizing' if workers_here else 'finished'
-                print(f'Branch #{selected_branch}: {snap["n_words"]} words: '
+                print(f'Branch {selected_branch_ref}: {snap["n_words"]} words: '
                       f'depth {guess_depth}  {state}')
                 full = _fmt_spine_path(snap['spine'])
                 if full:
@@ -1536,11 +1543,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             if interactive:
                 # The branch's letter is held reserved while it stays selected, so
                 # re-pressing it still toggles the (now finalized) panel closed.
-                letter = next((lt for lt, bid
-                               in getattr(_print_status, '_branch_hotkeys', {}).items()
-                               if bid == selected_branch), None)
-                if letter:
-                    print(f'[press {letter} to dismiss]')
+                if selected_branch_letter:
+                    print(f'[press {selected_branch_letter} to dismiss]')
         else:
             key = bytes(target['branch_key'])
             n_cands = target['n_candidates'] or 0
@@ -1559,7 +1563,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                 'best_erd': target['best_erd'],
             }
             _print_status._branch_detail_snapshots = snapshots
-            print(f'Branch #{selected_branch}: {target["n_words"] or 0} words: '
+            print(f'Branch {selected_branch_ref}: {target["n_words"] or 0} words: '
                   f'depth {guess_depth}')
             # Full spine, one guess per line: the first guess is d1 (the root,
             # before any guess, is guess_depth 0 and has no guess to show).
@@ -1609,11 +1613,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                 print(f'W{_worker_num(h):<2} idx {h["claim_idx"]}  {cur_disp:<6} '
                       f'{_spine_sizes(path)}')
             if interactive:
-                letter = next((lt for lt, bid
-                               in getattr(_print_status, '_branch_hotkeys', {}).items()
-                               if bid == selected_branch), None)
-                if letter:
-                    print(f'[press {letter} to dismiss]')
+                if selected_branch_letter:
+                    print(f'[press {selected_branch_letter} to dismiss]')
 
 
 def _fmt_duration(seconds: int) -> str:
