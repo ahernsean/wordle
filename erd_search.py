@@ -953,6 +953,52 @@ def _parse_spine(path):
     return result
 
 
+def _sweep_progress_bar(n_candidates, done_indices, worker_positions,
+                        width=40):
+    """Render compressed candidate completion and worker positions.
+
+    Each cell covers a range of candidate indices.  Unicode block heights show
+    how much of the cell is done; worker labels overlay that conceptual
+    completion map at their current claim positions.
+    """
+    if n_candidates <= 0 or width <= 0:
+        return ''
+    done_counts = [0] * width
+    done_seen = set()
+    for idx in done_indices or ():
+        if idx is None or idx < 0:
+            continue
+        if idx in done_seen:
+            continue
+        done_seen.add(idx)
+        pos = min(width - 1, int(width * idx / n_candidates))
+        done_counts[pos] += 1
+    ramp = ' ▁▂▃▄▅▆▇█'
+    marks = [' '] * width
+    for pos, done_count in enumerate(done_counts):
+        if done_count == 0:
+            continue
+        start = (pos * n_candidates + width - 1) // width
+        end = ((pos + 1) * n_candidates + width - 1) // width
+        cell_size = end - start
+        level = min(len(ramp) - 1,
+                    (done_count * (len(ramp) - 1) + cell_size - 1) // cell_size)
+        marks[pos] = ramp[level]
+    for idx, label in worker_positions or ():
+        if idx is None or idx < 0:
+            continue
+        pos = min(width - 1, int(width * idx / n_candidates))
+        # Preserve multiple adjacent worker digits where possible, while still
+        # allowing a worker to replace a progress marker in its approximate
+        # bucket.
+        while pos < width and marks[pos].isdigit():
+            pos += 1
+        if pos >= width:
+            pos = width - 1
+        marks[pos] = str(label)[-1]
+    return ''.join(marks)
+
+
 # Sentinel prefix for section-boundary markers emitted by _print_status in
 # interactive mode.  A marker line is '<prefix><section name>'.  The NUL byte
 # guarantees the prefix never collides with real status output.
@@ -1071,6 +1117,16 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             bytes(b['branch_key']): queue.branch_done_candidates(b['branch_key'])
             for b in detail_branches
         }
+        selected_done_indices = {}
+        if selected_branch is not None:
+            for b in detail_branches:
+                bkey = bytes(b['branch_key'])
+                if _branch_id(bkey) == selected_branch:
+                    selected_done_indices[bkey] = [
+                        c['idx'] for c in queue.claims_for_branch(bkey)
+                        if c['done']
+                    ]
+                    break
         queue.close()
         queue_ok = True
     except Exception as e:
@@ -1083,6 +1139,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         hbs = []
         worker_counts = {}
         done_candidates = {}
+        selected_done_indices = {}
 
     # Cache throughput
     try:
@@ -1535,23 +1592,14 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                 [h for h in hbs if h['current_branch_key']
                  and bytes(h['current_branch_key']) == key],
                 key=lambda r: (r['claim_idx'] if r['claim_idx'] is not None else -1))
-            if workers_here and n_cands:
-                bar_w = 40
-                marks = [' '] * bar_w
-                for h in workers_here:
-                    idx = h['claim_idx']
-                    if idx is not None:
-                        pos = min(bar_w - 1, int(bar_w * idx / n_cands))
-                        # Workers on adjacent candidates can map to the same cell;
-                        # nudge right to the next free one so both digits stay
-                        # visible.  The bar is approximate, so showing every worker
-                        # matters more than the exact cell.
-                        while pos < bar_w and marks[pos] != ' ':
-                            pos += 1
-                        if pos >= bar_w:
-                            pos = bar_w - 1
-                        marks[pos] = _worker_num(h)[-1]
-                print(f'[{"".join(marks)}] (worker by pos)')
+            if n_cands and (workers_here or selected_done_indices.get(key)):
+                worker_positions = [
+                    (h['claim_idx'], _worker_num(h)) for h in workers_here
+                ]
+                bar = _sweep_progress_bar(
+                    n_cands, selected_done_indices.get(key, ()),
+                    worker_positions)
+                print(f'[{bar}]')
             # Each cooperating worker's downward exploration spine, stacked.
             for h in workers_here:
                 path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''

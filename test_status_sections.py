@@ -57,6 +57,23 @@ class BranchIdAndSpineHelperTest(unittest.TestCase):
             None, 'salet', 0, lambda p: '-g-g-', 0)
         self.assertEqual(out, 'SALET -g-g-')
 
+    def test_sweep_progress_bar_marks_partial_buckets_by_density(self):
+        out = erd_search._sweep_progress_bar(
+            100, done_indices=[0, 20, 21, 22, 23, 24, 50, 99],
+            worker_positions=[], width=10)
+        self.assertEqual(out, '▁ ▄  ▁   ▁')
+
+    def test_sweep_progress_bar_marks_full_buckets(self):
+        out = erd_search._sweep_progress_bar(
+            10, done_indices=[0, 1, 2, 6], worker_positions=[], width=5)
+        self.assertEqual(out, '█▄ ▄ ')
+
+    def test_sweep_progress_bar_overlays_workers_on_done_map(self):
+        out = erd_search._sweep_progress_bar(
+            100, done_indices=[10, 20, 30],
+            worker_positions=[(20, '2'), (21, '3')], width=10)
+        self.assertEqual(out, ' ▁23      ')
+
 
 class BranchDisplayOrderTest(unittest.TestCase):
     """The watch display keeps branch rows stable across refreshes."""
