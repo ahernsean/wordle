@@ -808,7 +808,7 @@ def _branch_id(branch_key):
     """Stable 4-hex-char label for a branch, derived from its key.
 
     Same branch_key always yields the same id, so a branch keeps its identity
-    across refreshes even as its display position (and hotkey letter) shifts.
+    across refreshes even as its other live display fields change.
     Collisions among the few dozen simultaneously-active branches are vanishingly
     unlikely over a 16-bit space.
     """
@@ -818,6 +818,62 @@ def _branch_id(branch_key):
 # Hotkey letters offered for branch drill-down, in display order.  'q' is the
 # quit key and is skipped; digits stay reserved for worker selection.
 _BRANCH_HOTKEYS = 'abcdefghijklmnoprstuvwxyz'
+
+
+def _row_get(row, key, default=None):
+    """Small adapter for sqlite3.Row and dict-like test rows."""
+    try:
+        if hasattr(row, 'keys') and key not in row.keys():
+            return default
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _branch_display_sort_key(branch):
+    """Stable topology key for branches that are new to the status display.
+
+    This intentionally ignores volatile progress fields such as workers, percent
+    done, ETA, best ERD, and updated timestamps.  Existing visible branches keep
+    their sticky order; this key only decides the order among branches first seen
+    on the same refresh.
+    """
+    spine = _row_get(branch, 'spine')
+    source_word = (_row_get(branch, 'source_word') or '').upper()
+    source_pattern = _row_get(branch, 'source_pattern')
+    if spine:
+        toks = spine.split()
+        parent = ' '.join(toks[:-2])
+        last_guess = toks[-2].upper() if len(toks) >= 2 else ''
+        last_pattern = toks[-1] if len(toks) >= 2 else ''
+        depth = len(toks) // 2
+    else:
+        parent = source_word
+        last_guess = source_word
+        last_pattern = '' if source_pattern is None else f'{source_pattern:03d}'
+        depth = 1 if source_word and source_pattern is not None else 0
+    return (parent, depth, last_pattern, last_guess,
+            _branch_id(_row_get(branch, 'branch_key', b'')))
+
+
+def _stable_branch_display_order(branches, previous_order):
+    """Return branches in watch-stable display order plus the next order state."""
+    by_bid = {_branch_id(_row_get(b, 'branch_key', b'')): b for b in branches}
+    ordered_bids = []
+    seen = set()
+
+    for bid in previous_order or []:
+        if bid in by_bid and bid not in seen:
+            ordered_bids.append(bid)
+            seen.add(bid)
+
+    new_branches = [b for bid, b in by_bid.items() if bid not in seen]
+    for b in sorted(new_branches, key=_branch_display_sort_key):
+        bid = _branch_id(_row_get(b, 'branch_key', b''))
+        ordered_bids.append(bid)
+        seen.add(bid)
+
+    return [by_bid[bid] for bid in ordered_bids], ordered_bids
 
 
 def _fmt_spine_path(spine):
@@ -1168,6 +1224,9 @@ def _print_status(args, selected_worker=None, selected_branch=None,
     # blocks.  No-worker branches stay accounted for in the "Branches:" counts.
     active = [b for b in branches
               if workers_by_branch.get(bytes(b['branch_key']))]
+    active, branch_display_order = _stable_branch_display_order(
+        active, getattr(_print_status, '_branch_display_order', []))
+    _print_status._branch_display_order = branch_display_order
     if not active:
         print('(no branches being worked)')
     # Stable per-branch hotkey letters: a branch keeps its letter across refreshes,
