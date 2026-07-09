@@ -1056,9 +1056,21 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         branches = queue.branches_in_progress()
         hbs = queue.heartbeats_with_branch()
         worker_counts = queue.worker_counts_by_branch()
-        # Per-branch done-candidate counts for the in-progress branches.
-        done_candidates = {bytes(b['branch_key']): queue.branch_done_candidates(b['branch_key'])
-                       for b in branches}
+        open_branch_keys = {bytes(b['branch_key']) for b in branches}
+        hb_branch_keys = {
+            bytes(h['current_branch_key'])
+            for h in hbs
+            if h['current_branch_key']
+        }
+        finalizing_branch_rows = queue.active_branches_by_keys(
+            list(hb_branch_keys - open_branch_keys))
+        detail_branches = branches + list(finalizing_branch_rows.values())
+        # Per-branch done-candidate counts for branches the status display can
+        # inspect, including finalized rows still referenced by worker heartbeats.
+        done_candidates = {
+            bytes(b['branch_key']): queue.branch_done_candidates(b['branch_key'])
+            for b in detail_branches
+        }
         queue.close()
         queue_ok = True
     except Exception as e:
@@ -1066,6 +1078,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         queue_ok = False
         counts = {}
         branches = []
+        detail_branches = []
+        finalizing_branch_rows = {}
         hbs = []
         worker_counts = {}
         done_candidates = {}
@@ -1172,7 +1186,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         return 1 if (b['source_word'] and b['source_pattern'] is not None) else 0
 
     branch_guess_depth = {bytes(b['branch_key']): _branch_guess_depth(b)
-                          for b in branches}
+                          for b in detail_branches}
 
     # Group live heartbeats under the branch each worker is contributing to.
     workers_by_branch = defaultdict(list)
@@ -1227,13 +1241,23 @@ def _print_status(args, selected_worker=None, selected_branch=None,
     active, branch_display_order = _stable_branch_display_order(
         active, getattr(_print_status, '_branch_display_order', []))
     _print_status._branch_display_order = branch_display_order
+    branch_keys = {bytes(b['branch_key']) for b in branches}
+    detached = [h for k, hs in workers_by_branch.items() if k not in branch_keys
+                for h in hs]
     if not active:
         print('(no branches being worked)')
     # Stable per-branch hotkey letters: a branch keeps its letter across refreshes,
     # and a selected branch keeps it even after it finalizes, so its detail panel's
     # "press X to dismiss" stays valid and letters don't shuffle under the user.
     prev_letter_by_bid = getattr(_print_status, '_branch_letter_by_bid', {})
+    snapshots = getattr(_print_status, '_branch_detail_snapshots', {})
     keep_bids = [_branch_id(bytes(b['branch_key'])) for b in active]
+    for h in detached:
+        if h['current_branch_key']:
+            bkey = bytes(h['current_branch_key'])
+            bid = _branch_id(bkey)
+            if (bkey in finalizing_branch_rows or bid in snapshots) and bid not in keep_bids:
+                keep_bids.append(bid)
     if selected_branch is not None and selected_branch not in keep_bids:
         keep_bids.append(selected_branch)
     branch_hotkeys = {}      # letter -> bid, consumed by the interactive input loop
@@ -1287,9 +1311,6 @@ def _print_status(args, selected_worker=None, selected_branch=None,
 
     # Workers attached to a branch no longer in the in-progress list (just
     # finalized) or idle between claims.
-    branch_keys = {bytes(b['branch_key']) for b in branches}
-    detached = [h for k, hs in workers_by_branch.items() if k not in branch_keys
-                for h in hs]
     if idle_workers or detached:
         print()
         for h in sorted(idle_workers, key=lambda r: _worker_num(r)):
@@ -1300,7 +1321,9 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             age = now_ts - h['updated_at']
             bkey = bytes(h['current_branch_key']) if h['current_branch_key'] else None
             bid = _branch_id(bkey) if bkey else '????'
-            print(f'W{_worker_num(h):<2} (branch #{bid} finalizing)  {age}s')
+            letter = letter_by_bid.get(bid, ' ')
+            prefix = f'[{letter}] ' if letter != ' ' else ''
+            print(f'W{_worker_num(h):<2} {prefix}(branch #{bid} finalizing)  {age}s')
 
     _print_status._branch_hotkeys = branch_hotkeys
     _print_status._branch_letter_by_bid = letter_by_bid
@@ -1323,7 +1346,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                   f'#{_branch_id(bkey) if bkey else "?"}, depth {base_k}')
             # Path to the worker's branch: its absolute spine, one guess per line
             # (d1..dK).  The first guess is d1; the bare root is d0 with no guess.
-            branch_info = next((b for b in branches
+            branch_info = next((b for b in detail_branches
                                 if bkey and bytes(b['branch_key']) == bkey), None)
             branch_spine = (branch_info['spine']
                             if branch_info and 'spine' in branch_info.keys() else None)
@@ -1376,7 +1399,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                 bkey = bytes(detail_hb['current_branch_key']) if detail_hb['current_branch_key'] else None
                 w_guess_depth = branch_guess_depth.get(bkey, 0) if bkey else 0
                 if w_guess_depth > 1 and bkey:
-                    branch_info = next((b for b in branches
+                    branch_info = next((b for b in detail_branches
                                         if bytes(b['branch_key']) == bkey), None)
                     if branch_info:
                         n_cands = branch_info['n_candidates'] or 0
@@ -1404,9 +1427,8 @@ def _print_status(args, selected_worker=None, selected_branch=None,
 
     if selected_branch is not None:
         _section_break('branchdetail', interactive)
-        target = next((b for b in branches
+        target = next((b for b in detail_branches
                        if _branch_id(b['branch_key']) == selected_branch), None)
-        snapshots = getattr(_print_status, '_branch_detail_snapshots', {})
         print()
         if target is None:
             snap = snapshots.get(selected_branch)
