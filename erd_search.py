@@ -1342,8 +1342,10 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         else:
             bkey = bytes(detail_hb['current_branch_key']) if detail_hb['current_branch_key'] else None
             base_k = branch_guess_depth.get(bkey, 1) if bkey else 1
-            print(f'Worker {selected_worker}: branch '
-                  f'#{_branch_id(bkey) if bkey else "?"}, depth {base_k}')
+            bid = _branch_id(bkey) if bkey else None
+            letter = letter_by_bid.get(bid) if bid else None
+            branch_ref = f'[{letter}] #{bid}' if letter else f'#{bid or "?"}'
+            print(f'Worker {selected_worker}: branch {branch_ref}, depth {base_k}')
             # Path to the worker's branch: its absolute spine, one guess per line
             # (d1..dK).  The first guess is d1; the bare root is d0 with no guess.
             branch_info = next((b for b in detail_branches
