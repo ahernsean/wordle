@@ -1298,7 +1298,9 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             print(f'W{_worker_num(h):<2} (idle)  {age}s{flag}')
         for h in sorted(detached, key=lambda r: _worker_num(r)):
             age = now_ts - h['updated_at']
-            print(f'W{_worker_num(h):<2} (branch finalizing)  {age}s')
+            bkey = bytes(h['current_branch_key']) if h['current_branch_key'] else None
+            bid = _branch_id(bkey) if bkey else '????'
+            print(f'W{_worker_num(h):<2} (branch #{bid} finalizing)  {age}s')
 
     _print_status._branch_hotkeys = branch_hotkeys
     _print_status._branch_letter_by_bid = letter_by_bid
@@ -1404,9 +1406,52 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         _section_break('branchdetail', interactive)
         target = next((b for b in branches
                        if _branch_id(b['branch_key']) == selected_branch), None)
+        snapshots = getattr(_print_status, '_branch_detail_snapshots', {})
         print()
         if target is None:
-            print(f'Branch #{selected_branch} not found')
+            snap = snapshots.get(selected_branch)
+            if snap is None:
+                print(f'Branch #{selected_branch} not found')
+            else:
+                key = snap['branch_key']
+                n_cands = snap['n_candidates']
+                done = max(snap['done'], done_candidates.get(key, 0))
+                guess_depth = snap['guess_depth']
+                workers_here = sorted(
+                    [h for h in hbs if h['current_branch_key']
+                     and bytes(h['current_branch_key']) == key],
+                    key=lambda r: (r['claim_idx'] if r['claim_idx'] is not None else -1))
+                state = 'finalizing' if workers_here else 'finished'
+                print(f'Branch #{selected_branch}: {snap["n_words"]} words: '
+                      f'depth {guess_depth}  {state}')
+                full = _fmt_spine_path(snap['spine'])
+                if full:
+                    for di, guess_step in enumerate(full.split(' ▸ '), start=1):
+                        parts = guess_step.split()
+                        word = parts[0] if parts else ''
+                        rest = ' '.join(parts[1:])
+                        star = '*' if word.lower() in answer_set else ' '
+                        print(f'{f"d{di}":<4} {word}{star} {rest}')
+                else:
+                    src = (f'{snap["source_word"].upper()} '
+                           f'{fmt_pattern(snap["source_pattern"])}'
+                           if snap['source_word'] and snap['source_pattern'] is not None
+                           else '?????')
+                    print(f'{"d1":<4} {src}')
+                    if guess_depth > 1:
+                        print(f'd2..d{guess_depth}  (intermediate guesses not recorded)')
+                best_disp = (f'{(snap["best_guess"] or "-----").upper()} '
+                             f'{snap["best_erd"]:.3f}'
+                             if snap['best_erd'] is not None else 'none yet')
+                print(f'{f"d{guess_depth + 1}":<4} sweep {done}/{n_cands}  '
+                      f'best {best_disp}')
+                for h in workers_here:
+                    path = (h['cur_path'] if 'cur_path' in h.keys() else None) or ''
+                    path = path.replace('>', '→')
+                    cur = (h['cur_candidate'] if 'cur_candidate' in h.keys() else None) or ''
+                    cur_disp = cur.upper() if cur else '-----'
+                    print(f'W{_worker_num(h):<2} idx {h["claim_idx"]}  {cur_disp:<6} '
+                          f'{_spine_sizes(path)}')
             if interactive:
                 # The branch's letter is held reserved while it stays selected, so
                 # re-pressing it still toggles the (now finalized) panel closed.
@@ -1420,6 +1465,19 @@ def _print_status(args, selected_worker=None, selected_branch=None,
             n_cands = target['n_candidates'] or 0
             done = done_candidates.get(key, 0)
             guess_depth = branch_guess_depth.get(key, 0)
+            snapshots[selected_branch] = {
+                'branch_key': key,
+                'n_words': target['n_words'] or 0,
+                'n_candidates': n_cands,
+                'done': done,
+                'guess_depth': guess_depth,
+                'spine': target['spine'] if 'spine' in target.keys() else None,
+                'source_word': target['source_word'],
+                'source_pattern': target['source_pattern'],
+                'best_guess': target['best_guess'],
+                'best_erd': target['best_erd'],
+            }
+            _print_status._branch_detail_snapshots = snapshots
             print(f'Branch #{selected_branch}: {target["n_words"] or 0} words: '
                   f'depth {guess_depth}')
             # Full spine, one guess per line: the first guess is d1 (the root,
