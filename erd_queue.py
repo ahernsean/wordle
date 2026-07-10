@@ -23,6 +23,7 @@ import sqlite3
 import time
 
 from cache_sqlite import ScoreCache
+from wordle_ui import fmt_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -98,18 +99,6 @@ def guess_depth_from_spine(spine) -> int:
     guess count is the token count halved.  An empty/NULL spine is the root: 0.
     """
     return len(spine.split()) // 2 if spine else 0
-
-
-def _fmt_response_code(code) -> str | None:
-    if code is None:
-        return None
-    chars = {0: '-', 1: 'y', 2: 'g'}
-    digits = []
-    code = int(code)
-    for _ in range(5):
-        digits.append(code % 3)
-        code //= 3
-    return ''.join(chars[d] for d in reversed(digits))
 
 
 _SCHEMA_SQL = """
@@ -1381,10 +1370,12 @@ class ERDQueue:
             "source_pattern": ((a["source_pattern"] if a is not None else None)
                                if a is not None and a["source_pattern"] is not None
                                else (p["source_pattern"] if p is not None else None)),
-            "source_pattern_text": _fmt_response_code(
-                ((a["source_pattern"] if a is not None else None)
-                 if a is not None and a["source_pattern"] is not None
-                 else (p["source_pattern"] if p is not None else None))),
+            "source_pattern_text": (
+                fmt_pattern(a["source_pattern"])
+                if a is not None and a["source_pattern"] is not None
+                else (fmt_pattern(p["source_pattern"])
+                      if p is not None and p["source_pattern"] is not None
+                      else None)),
             "spine": a["spine"] if a is not None else None,
             "created_at": a["created_at"] if a is not None else None,
             "updated_at": ((p["completed_at"] or p["claimed_at"])
