@@ -14,29 +14,30 @@ status          Read-only progress snapshot: queue counts, cache throughput,
 run             Start the supervisor directly (without systemd), for
                 development or one-shot use.  All output goes to erd_search.log.
 
-queue-add       Add branches for a word or word list to the work queue.
+queue           Queue dashboard and nested queue operations.
+queue add       Add branches for a word or word list to the work queue.
                 Idempotent: existing branches are never duplicated; priority
                 is upgraded if the new request is higher.  With --word-list,
                 --priority-words marks a subset of the list's words as
                 higher priority.  --delete-erd-cache forces a recompute of
                 branches that are already cached.
 
-queue-clear     Wipe all queue state (pending branches, active state, candidate
+queue clear     Wipe all queue state (pending branches, active state, candidate
                 claims, heartbeats).  Does not touch the ERD cache.
 
-queue-inspect   Show queue and worker detail for a specific branch.
+queue show      Show queue and worker detail for a specific branch.
 
-queue-remove    Remove a pending branch from the queue.  Use --force to also
+queue remove    Remove a pending branch from the queue.  Use --force to also
                 cancel an in-progress branch (workers move on after their
                 current candidate evaluation completes).
 
-queue-priority  Change the priority of a queued branch.  Higher numbers are
+queue priority  Change the priority of a queued branch.  Higher numbers are
                 worked sooner; 0 is the default.
 
 cache-status    Show ERD cache coverage for a given word: which response
                 patterns are cached and which are missing.
 
-queue-status    Show swarm queue coverage for a given word: which response
+queue coverage  Show swarm queue coverage for a given word/path: which response
                 patterns are pending, in progress, done, or not yet queued.
 
 For exporting a trimmed cache snapshot to sync to the iPhone, or importing
@@ -49,6 +50,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 import logging
 import multiprocessing
 import os
@@ -152,11 +154,310 @@ def cmd_cache_status(args):
 
 
 # ---------------------------------------------------------------------------
-# queue-status
+# queue visibility
 # ---------------------------------------------------------------------------
 
+class QueueRefError(ValueError):
+    pass
+
+
+def normalize_queue_pattern(token: str) -> str:
+    """Normalize a response token to canonical g/y/- syntax."""
+    from wordle_ui import fmt_pattern, parse_pattern
+    try:
+        return fmt_pattern(parse_pattern(token))
+    except ValueError as e:
+        raise QueueRefError(str(e)) from e
+
+
+def parse_queue_branch_ref(text) -> list[tuple[str, str | None]]:
+    """Parse WORD [PATTERN] ... refs used by queue visibility commands."""
+    if isinstance(text, (list, tuple)):
+        text = ' '.join(text)
+    text = (text or '').strip()
+    if not text:
+        raise QueueRefError('empty branch reference')
+    raw = text.split()
+    tokens = []
+    i = 0
+    while i < len(raw):
+        word = raw[i].strip().upper()
+        if len(word) != 5 or not word.isalpha():
+            raise QueueRefError(
+                'malformed branch ref: expected alternating WORD [PATTERN] tokens')
+        pat = None
+        if i + 1 < len(raw):
+            nxt = raw[i + 1]
+            try:
+                pat = normalize_queue_pattern(nxt)
+                i += 1
+            except QueueRefError:
+                if len(nxt) != 5:
+                    raise QueueRefError(
+                        'malformed branch ref: expected alternating WORD [PATTERN] tokens')
+                # A five-letter token that is not a valid response pattern is
+                # interpreted as the next word, then validated by the final
+                # alternating-token check below.
+                pass
+            if pat is None and len(nxt) != 5:
+                raise QueueRefError(
+                    'malformed branch ref: expected alternating WORD [PATTERN] tokens')
+        tokens.append((word, pat))
+        i += 1
+    if any(pat is None for _word, pat in tokens[:-1]):
+        raise QueueRefError(
+            'malformed branch ref: expected alternating WORD [PATTERN] tokens')
+    return tokens
+
+
+def spine_prefix_sql(tokens) -> str:
+    parts = []
+    for word, pat in tokens:
+        parts.append(word.upper())
+        if pat is not None:
+            parts.append(pat)
+    return ' '.join(parts)
+
+
+def _parse_optional_queue_ref(parts):
+    if not parts:
+        return None
+    return parse_queue_branch_ref(parts)
+
+
+def _json_safe(value):
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _print_json(value):
+    print(json.dumps(_json_safe(value), indent=2, sort_keys=True))
+
+
+def _branch_ref_to_key(tokens, all_answers, cache_path):
+    """Resolve a fully-patterned path to its answer subset branch key."""
+    from wordle_ui import parse_pattern
+    sc = ScoreCache(cache_path, all_answers)
+    rcache = ResponseCache(all_answers, sc)
+    branch = list(all_answers)
+    try:
+        for word, pat in tokens:
+            if pat is None:
+                break
+            code = parse_pattern(pat)
+            groups = rcache.group_words(word.lower(), branch)
+            branch = groups.get(code, [])
+        return encode_subset(branch) if len(branch) >= 2 else None, branch
+    finally:
+        sc.close()
+
+
+def _row_path(row):
+    if row.get('spine'):
+        return _fmt_spine_path(row['spine'])
+    if row.get('source_word') and row.get('source_pattern_text'):
+        return f'{row["source_word"].upper()} {row["source_pattern_text"]}'
+    if row.get('source_word'):
+        return row['source_word'].upper()
+    return ''
+
+
+def _print_queue_table(rows, title=None):
+    if title:
+        print(title)
+    if not rows:
+        print('  (none)')
+        return
+    print(f'{"ID":<4} {"Kind":<4} {"Status":<11} {"Pri":>7} {"Words":>6} '
+          f'{"Done":>9} {"W":>2} {"Nodes":>9}  Spine')
+    for r in rows:
+        bid = _branch_id(r['branch_key'])
+        done = (f'{r["done_candidates"]}/{r["n_candidates"]}'
+                if r.get('n_candidates') else '---')
+        pri = 'COOP' if (r.get('priority') or 0) >= 1_000_000 else str(r.get('priority') or 0)
+        print(f'{bid:<4} {r["kind"]:<4} {r["status"]:<11} {pri:>7} '
+              f'{r["n_words"]:6d} {done:>9} {r.get("worker_count", 0):2d} '
+              f'{(r.get("nodes_spent") or 0):9d}  {_row_path(r)}')
+
+
+def cmd_queue_dashboard(args):
+    queue = ERDQueue(args.queue)
+    try:
+        data = queue.queue_dashboard(args.limit)
+    finally:
+        queue.close()
+    if args.json:
+        _print_json(data)
+        return
+    s = data['summary']
+    status = '  '.join(f'{k} {v:,}' for k, v in sorted(s['by_status'].items()))
+    kind = '  '.join(f'{k} {v:,}' for k, v in sorted(s['by_kind'].items()))
+    print(f'Queue: {s["total"]:,} branches')
+    print(f'Status: {status or "none"}')
+    print(f'Kind: {kind or "none"}')
+    print()
+    _print_queue_table(data['active'], 'Active')
+    print()
+    _print_queue_table(data['pending'], 'Top pending')
+
+
+def cmd_queue_ls(args):
+    filters = {
+        'status': args.status,
+        'min_words': args.min_words,
+        'max_words': args.max_words,
+        'budget': args.budget,
+        'priority': args.priority,
+        'source_word': args.source_word,
+    }
+    if args.prefix:
+        filters['prefix'] = spine_prefix_sql(parse_queue_branch_ref(args.prefix))
+    queue = ERDQueue(args.queue)
+    try:
+        rows = queue.list_queue_rows(filters, limit=args.limit)
+    finally:
+        queue.close()
+    if args.json:
+        _print_json(rows)
+    else:
+        _print_queue_table(rows)
+
+
+def cmd_queue_tree(args):
+    try:
+        tokens = _parse_optional_queue_ref(args.prefix)
+        prefix = spine_prefix_sql(tokens) if tokens else None
+    except QueueRefError as e:
+        print(f'Invalid branch ref: {e}')
+        return
+    queue = ERDQueue(args.queue)
+    try:
+        rows = queue.queue_tree_rows(
+            prefix, active_only=args.active_only,
+            max_depth=args.max_depth, limit=args.limit)
+    finally:
+        queue.close()
+    if args.json:
+        _print_json(rows)
+        return
+    if not rows:
+        print('(none)')
+        return
+    for r in rows:
+        depth = guess_depth_from_spine(r['spine'])
+        if not r['spine'] and r.get('source_word'):
+            depth = 1
+        indent = '  ' * max(0, depth - 1)
+        print(f'{indent}{_branch_id(r["branch_key"])} {r["status"]} '
+              f'{r["n_words"]}w {_row_path(r)}')
+
+
+def cmd_queue_summary(args):
+    queue = ERDQueue(args.queue)
+    try:
+        summary = queue.queue_summary()
+    finally:
+        queue.close()
+    if args.json:
+        _print_json(summary)
+        return
+    print(f'Total: {summary["total"]:,}')
+    for label, key in [('Status', 'by_status'), ('Kind', 'by_kind'),
+                       ('Budget', 'by_budget'), ('Priority', 'by_priority'),
+                       ('Size', 'by_size')]:
+        parts = '  '.join(f'{k} {v:,}' for k, v in sorted(summary[key].items()))
+        print(f'{label}: {parts or "none"}')
+    for label in ('largest_pending', 'oldest_pending',
+                  'largest_active', 'oldest_active'):
+        row = summary[label]
+        if row:
+            print(f'{label.replace("_", " ").title()}: '
+                  f'{_branch_id(row["branch_key"])} {row["n_words"]}w {_row_path(row)}')
+
+
+def cmd_queue_top(args):
+    try:
+        tokens = _parse_optional_queue_ref(args.prefix)
+        prefix = spine_prefix_sql(tokens) if tokens else None
+    except QueueRefError as e:
+        print(f'Invalid branch ref: {e}')
+        return
+    queue = ERDQueue(args.queue)
+    try:
+        rows = queue.queue_top_rows(args.by, args.limit, prefix)
+    finally:
+        queue.close()
+    if args.json:
+        _print_json(rows)
+    else:
+        _print_queue_table(rows)
+
+
+def cmd_queue_show(args):
+    ref_text = ' '.join(args.branch_ref)
+    queue = ERDQueue(args.queue)
+    try:
+        try:
+            tokens = parse_queue_branch_ref(ref_text)
+            ref = spine_prefix_sql(tokens)
+        except QueueRefError:
+            ref = ref_text.strip()
+            tokens = []
+        matches = queue.resolve_branch_ref(ref)
+        if not matches and tokens and tokens[-1][1] is not None:
+            all_answers = load_word_list(ANSWER_FILE)
+            key, _branch = _branch_ref_to_key(tokens, all_answers, args.cache)
+            matches = queue.resolve_branch_ref(key.hex() if key else '')
+        if len(matches) != 1:
+            if args.json:
+                _print_json(matches)
+            elif not matches:
+                print(f'{ref_text}: no matching branch.')
+            else:
+                print(f'{ref_text}: {len(matches)} matching branches. '
+                      f'Narrow the spine/pattern or use ID.')
+                _print_queue_table(matches)
+            return
+        detail = queue.branch_detail(matches[0]['branch_key'], args.claims)
+    finally:
+        queue.close()
+    if args.json:
+        _print_json(detail)
+        return
+    print(f'{_branch_id(detail["branch_key"])} {detail["branch_key_hex"][:20]}...')
+    print(f'  Kind/status : {detail["kind"]} / {detail["status"]}')
+    print(f'  Spine       : {_row_path(detail) or "---"}')
+    print(f'  Words       : {detail["n_words"]}')
+    print(f'  Priority    : {detail["priority"]}')
+    print(f'  Budget      : {detail["budget"] if detail["budget"] is not None else "---"}')
+    if detail.get('n_candidates'):
+        print(f'  Candidates  : {detail["done_candidates"]}/{detail["n_candidates"]}')
+    best = (f'{detail["best_guess"].upper()} {detail["best_erd"]:.4f}'
+            if detail.get('best_guess') and detail.get('best_erd') is not None
+            else '---')
+    print(f'  Best        : {best}')
+    print(f'  Workers     : {len(detail["workers"])}')
+    print(f'  Nodes spent : {detail["nodes_spent"]}')
+    print(f'  Tainted     : {"yes" if detail["tainted"] else "no"}')
+    if detail['bundle_stats']:
+        print(f'  Bundles     : {len(detail["bundle_stats"])}')
+    if detail['republish']:
+        print(f'  Republish   : {len(detail["republish"])} candidate(s)')
+    if detail['finalize_log']:
+        print(f'  Finalized   : {len(detail["finalize_log"])} logged run(s)')
+    if args.claims and detail['claims']:
+        print('  Claims:')
+        for c in detail['claims']:
+            status = 'done' if c['done'] else f'held by {c["claimed_by"] or "---"}'
+            print(f'    {c["idx"]:5d} {status}')
+
 def cmd_queue_status(args):
-    """Show swarm queue coverage for a given word.
+    """Show swarm queue coverage for a given word or partial path.
 
     For each of the 242 possible response patterns for WORD, reports the
     branch's status in the queue (pending_branches): pending, in_progress,
@@ -165,11 +466,33 @@ def cmd_queue_status(args):
     from wordle_ui import fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
-    word = args.word.strip().lower()
+    try:
+        tokens = parse_queue_branch_ref(getattr(args, 'branch_ref', None)
+                                        or getattr(args, 'word', ''))
+    except QueueRefError as e:
+        print(f'Invalid branch ref: {e}')
+        return
+    if tokens[-1][1] is not None:
+        # Fully-patterned refs are interpreted as "coverage at the last guess",
+        # matching the old word/pattern mental model as closely as possible.
+        path_tokens = tokens[:-1]
+        word = tokens[-1][0].lower()
+    else:
+        path_tokens = tokens[:-1]
+        word = tokens[-1][0].lower()
 
     sc = ScoreCache(args.cache, all_answers)
     rcache = ResponseCache(all_answers, sc)
-    groups = rcache.group_words(word, all_answers)
+    answer_branch = list(all_answers)
+    for prev_word, prev_pat in path_tokens:
+        if prev_pat is None:
+            print('Invalid branch ref: a non-final word must include a pattern')
+            sc.close()
+            return
+        from wordle_ui import parse_pattern
+        answer_branch = rcache.group_words(
+            prev_word.lower(), answer_branch).get(parse_pattern(prev_pat), [])
+    groups = rcache.group_words(word, answer_branch)
     sc.close()
 
     branches = {code: branch for code, branch in groups.items() if len(branch) >= 2}
@@ -203,6 +526,19 @@ def cmd_queue_status(args):
 
     n_trivial = len(groups) - len(branches)
 
+    if getattr(args, 'json', False):
+        _print_json({
+            'word': word.upper(),
+            'prefix': spine_prefix_sql(path_tokens) if path_tokens else '',
+            'n_branches': len(branches),
+            'n_trivial': n_trivial,
+            'pending': pending,
+            'in_progress': in_progress,
+            'done': done,
+            'unqueued': unqueued,
+        })
+        return
+
     print(f'{word.upper()}:  {len(branches)} branches with ≥2 answers  '
           f'({n_trivial} trivial patterns skipped)')
     print(f'  Pending    : {len(pending):4d}')
@@ -211,7 +547,7 @@ def cmd_queue_status(args):
     print(f'  Not queued : {len(unqueued):4d}')
     print()
 
-    if in_progress:
+    if in_progress and not getattr(args, 'missing_only', False):
         _COOP_PRI = 1_000_000
         print(f'{"Pattern":<8}  {"Ans":>4}  {"Pri":>4}  Claimed by')
         for pat, n, priority, claimed_by in in_progress:
@@ -219,7 +555,7 @@ def cmd_queue_status(args):
             print(f'  {pat:<8}  {n:4d}  {pri_str:>4}  {claimed_by or "---"}')
         print()
 
-    if pending:
+    if pending and not getattr(args, 'missing_only', False):
         print(f'{"Pattern":<8}  {"Ans":>4}  {"Pri":>4}')
         for pat, n, priority in pending:
             print(f'  {pat:<8}  {n:4d}  {priority:4d}')
@@ -232,7 +568,7 @@ def cmd_queue_status(args):
 
 
 # ---------------------------------------------------------------------------
-# queue-add
+# queue add
 # ---------------------------------------------------------------------------
 
 def cmd_queue_add(args):
@@ -324,7 +660,7 @@ def cmd_queue_add(args):
 
 
 # ---------------------------------------------------------------------------
-# queue-clear
+# queue clear
 # ---------------------------------------------------------------------------
 
 def cmd_queue_clear(args):
@@ -354,7 +690,7 @@ def cmd_queue_clear(args):
 
 
 # ---------------------------------------------------------------------------
-# queue-inspect
+# legacy word/pattern queue inspection helper
 # ---------------------------------------------------------------------------
 
 def cmd_queue_inspect(args):
@@ -409,7 +745,7 @@ def cmd_queue_inspect(args):
 
 
 # ---------------------------------------------------------------------------
-# queue-remove
+# queue remove
 # ---------------------------------------------------------------------------
 
 def cmd_queue_remove(args):
@@ -470,7 +806,7 @@ def cmd_queue_remove(args):
 
 
 # ---------------------------------------------------------------------------
-# queue-priority
+# queue priority
 # ---------------------------------------------------------------------------
 
 def cmd_queue_priority(args):
@@ -604,7 +940,7 @@ def cmd_run(args):
     counts = queue.counts_by_status()
     if not counts.get('pending') and not counts.get('in_progress'):
         print('Warning: queue appears empty.  '
-              'Run queue-add to load branches before starting workers.',
+              'Run queue add to load branches before starting workers.',
               file=sys.stderr)
     # Telemetry epoch the workers will stamp their rows with.  Epoch 0 is the
     # single-candidate-atom baseline; a claiming-regime change calls set_epoch.
@@ -1666,6 +2002,29 @@ def cmd_reset_stale(args):
     print(f'Reset {n} in_progress row(s) to pending.')
 
 
+def _normalize_queue_cli_args(args):
+    """Apply queue-level options to nested queue commands.
+
+    Nested parsers use SUPPRESS defaults for duplicated options so they do not
+    overwrite queue-level values parsed before the subcommand.
+    """
+    if args.cmd != 'queue':
+        return
+    if not hasattr(args, 'queue'):
+        args.queue = args.queue_path or DEFAULT_QUEUE
+    if not hasattr(args, 'json'):
+        args.json = bool(args.queue_json)
+    if not hasattr(args, 'limit'):
+        if args.queue_limit is not None:
+            args.limit = args.queue_limit
+        elif args.queue_cmd is None:
+            args.limit = 8
+        elif args.queue_cmd == 'top':
+            args.limit = 10
+        else:
+            args.limit = None
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -1719,19 +2078,68 @@ def main():
                       help='Only list patterns whose branches are not yet cached')
     p_cs.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
 
-    # -- queue-status --
-    p_qs = sub.add_parser('queue-status',
-                           help='Show swarm queue coverage for a word')
-    p_qs.add_argument('--word', required=True, metavar='WORD',
-                      help='Guess word to inspect (e.g. salet)')
-    p_qs.add_argument('--queued-only', action='store_true',
-                      help='Only list patterns that are pending or in progress')
-    p_qs.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qs.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    # -- queue --
+    p_queue = sub.add_parser('queue', help='Inspect and manage queue work')
+    p_queue.add_argument('--queue', dest='queue_path', default=None, metavar='PATH')
+    p_queue.add_argument('--limit', dest='queue_limit', type=int, default=None,
+                         metavar='N')
+    p_queue.add_argument('--json', dest='queue_json', action='store_true')
+    qsub = p_queue.add_subparsers(dest='queue_cmd')
 
-    # -- queue-add --
-    p_qa = sub.add_parser('queue-add',
-                          help='Add branches for a word (or word list) to the queue')
+    p_qls = qsub.add_parser('ls', help='List queue rows')
+    p_qls.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qls.add_argument('--status', choices=['pending', 'in_progress', 'done', 'open'])
+    p_qls.add_argument('--min-words', type=int, metavar='N')
+    p_qls.add_argument('--max-words', type=int, metavar='N')
+    p_qls.add_argument('--budget', type=int, metavar='N')
+    p_qls.add_argument('--priority', type=int, metavar='N')
+    p_qls.add_argument('--source-word', metavar='WORD')
+    p_qls.add_argument('--prefix', metavar='SPINE')
+    p_qls.add_argument('--limit', type=int, default=argparse.SUPPRESS, metavar='N')
+    p_qls.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
+
+    p_qtree = qsub.add_parser('tree', help='Show queue rows grouped by spine')
+    p_qtree.add_argument('prefix', nargs='*', metavar='SPINE')
+    p_qtree.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qtree.add_argument('--active-only', action='store_true')
+    p_qtree.add_argument('--max-depth', type=int, metavar='N')
+    p_qtree.add_argument('--limit', type=int, default=argparse.SUPPRESS, metavar='N')
+    p_qtree.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
+
+    p_qshow = qsub.add_parser('show', help='Show detail for a branch')
+    p_qshow.add_argument('branch_ref', nargs='+', metavar='BRANCH_REF')
+    p_qshow.add_argument('--claims', action='store_true')
+    p_qshow.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_qshow.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qshow.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
+
+    p_qsum = qsub.add_parser('summary', help='Show aggregate queue counts')
+    p_qsum.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qsum.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
+
+    p_qtop = qsub.add_parser('top', help='Show queue hotspots')
+    p_qtop.add_argument('prefix', nargs='*', metavar='SPINE')
+    p_qtop.add_argument('--by', choices=['nodes', 'age', 'size', 'workers',
+                                         'priority', 'slowest'],
+                        default='nodes')
+    p_qtop.add_argument('--limit', type=int, default=argparse.SUPPRESS, metavar='N')
+    p_qtop.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qtop.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
+
+    p_qcov = qsub.add_parser('coverage',
+                             help='Show swarm queue coverage for a spine prefix')
+    p_qcov.add_argument('branch_ref', nargs='+', metavar='BRANCH_REF')
+    p_qcov.add_argument('--queued-only', action='store_true',
+                        help='Only list patterns that are pending or in progress')
+    p_qcov.add_argument('--missing-only', action='store_true',
+                        help='Only list patterns not yet queued')
+    p_qcov.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_qcov.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qcov.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
+
+    # -- queue add --
+    p_qa = qsub.add_parser('add',
+                           help='Add branches for a word (or word list) to the queue')
     qa_word = p_qa.add_mutually_exclusive_group(required=True)
     qa_word.add_argument('--word', metavar='WORD',
                          help='Single guess word (e.g. salet)')
@@ -1756,27 +2164,18 @@ def main():
                            'queued branch first, so it is recomputed instead '
                            'of being skipped as already-cached')
     p_qa.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qa.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qa.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
-    # -- queue-clear --
-    p_qc = sub.add_parser('queue-clear',
-                           help='Wipe all queue state (does not touch the ERD cache)')
-    p_qc.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    # -- queue clear --
+    p_qc = qsub.add_parser('clear',
+                            help='Wipe all queue state (does not touch the ERD cache)')
+    p_qc.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
     p_qc.add_argument('--yes', action='store_true',
                       help='Skip confirmation prompt')
 
-    # -- queue-inspect --
-    p_qi = sub.add_parser('queue-inspect',
-                           help='Show queue detail for a specific branch')
-    p_qi.add_argument('--word', required=True, metavar='WORD')
-    p_qi.add_argument('--pattern', required=True, metavar='PAT',
-                      help='Response pattern (5 chars: g=green y=yellow -=gray)')
-    p_qi.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qi.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-
-    # -- queue-remove --
-    p_qr = sub.add_parser('queue-remove',
-                           help='Remove a pending branch from the queue')
+    # -- queue remove --
+    p_qr = qsub.add_parser('remove',
+                            help='Remove a pending branch from the queue')
     p_qr.add_argument('--word', required=True, metavar='WORD')
     p_qr.add_argument('--pattern', required=True, metavar='PAT',
                       help='Response pattern (5 chars: g=green y=yellow -=gray)')
@@ -1784,11 +2183,11 @@ def main():
                       help='Also cancel an in-progress branch (clears active '
                            'state so the worker moves on after its current candidate)')
     p_qr.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qr.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qr.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
-    # -- queue-priority --
-    p_qp = sub.add_parser('queue-priority',
-                           help='Set the priority of a queued branch')
+    # -- queue priority --
+    p_qp = qsub.add_parser('priority',
+                            help='Set the priority of a queued branch')
     p_qp.add_argument('--word', required=True, metavar='WORD')
     p_qp.add_argument('--pattern', required=True, metavar='PAT',
                       help='Response pattern (5 chars: g=green y=yellow -=gray)')
@@ -1796,7 +2195,7 @@ def main():
                       help='New priority (higher = worked sooner; '
                            'use values 0–999 for normal work)')
     p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qp.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     # -- start --
     sub.add_parser('start',
@@ -1813,27 +2212,39 @@ def main():
                    help='Restart the supervisor via systemd '
                         '(systemctl --user restart wordle-erd)')
 
-    # -- reset-stale --
-    p_rst = sub.add_parser('reset-stale',
-                            help='Reset in_progress rows to pending')
-    p_rst.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    # -- queue reset-stale --
+    p_rst = qsub.add_parser('reset-stale',
+                             help='Reset in_progress rows to pending')
+    p_rst.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     args = parser.parse_args()
+    _normalize_queue_cli_args(args)
+
+    if args.cmd == 'queue':
+        qdispatch = {
+            None: cmd_queue_dashboard,
+            'ls': cmd_queue_ls,
+            'tree': cmd_queue_tree,
+            'show': cmd_queue_show,
+            'summary': cmd_queue_summary,
+            'top': cmd_queue_top,
+            'coverage': cmd_queue_status,
+            'add': cmd_queue_add,
+            'clear': cmd_queue_clear,
+            'remove': cmd_queue_remove,
+            'priority': cmd_queue_priority,
+            'reset-stale': cmd_reset_stale,
+        }
+        qdispatch[args.queue_cmd](args)
+        return
 
     dispatch = {
         'cache-status': cmd_cache_status,
-        'queue-status': cmd_queue_status,
-        'queue-add': cmd_queue_add,
-        'queue-clear': cmd_queue_clear,
-        'queue-inspect': cmd_queue_inspect,
-        'queue-remove': cmd_queue_remove,
-        'queue-priority': cmd_queue_priority,
         'start': cmd_start,
         'stop': cmd_stop,
         'restart': cmd_restart,
         'run': cmd_run,
         'status': cmd_status,
-        'reset-stale': cmd_reset_stale,
     }
     dispatch[args.cmd](args)
 
