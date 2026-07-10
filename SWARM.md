@@ -149,6 +149,112 @@ python3.13 erd_search.py queue coverage CRANE
 key prefix, a word/pattern pair, or a partial/full spine. If a reference matches
 multiple branches, it prints a disambiguation table.
 
+#### `queue`: dashboard
+
+```bash
+python3.13 erd_search.py queue
+python3.13 erd_search.py queue --limit 20
+python3.13 erd_search.py queue --json
+```
+
+The dashboard is the default read-only entry point. It shows aggregate queue
+counts, active branches, top pending branches, and stale/held work when present.
+Use it before you know which word or branch you care about.
+
+#### `queue ls`: inventory
+
+```bash
+python3.13 erd_search.py queue ls
+python3.13 erd_search.py queue ls --status pending --min-words 100
+python3.13 erd_search.py queue ls --source-word crane --limit 50
+python3.13 erd_search.py queue ls --prefix "CRANE -y--g" --json
+```
+
+Lists queue rows without requiring a word first. Rows include the stable 4-hex
+branch id, kind (`user` or `coop`), status, priority, answer count, candidate
+progress, live worker count, nodes spent, and spine/source path.
+
+Useful filters:
+
+| Filter | Meaning |
+|---|---|
+| `--status pending|in_progress|done|open` | Limit by pending-row or active-row status |
+| `--min-words N`, `--max-words N` | Limit by answer count |
+| `--budget N` | Limit by active solve budget |
+| `--priority N` | Limit by exact priority |
+| `--source-word WORD` | Limit to branches first queued from that word |
+| `--prefix SPINE` | Limit to descendants of a partial spine |
+| `--limit N` | Cap displayed rows |
+| `--json` | Emit machine-readable rows |
+
+Default sort is active work first, then priority descending, then branch size
+descending.
+
+#### `queue tree`: spine view
+
+```bash
+python3.13 erd_search.py queue tree
+python3.13 erd_search.py queue tree CRANE
+python3.13 erd_search.py queue tree "CRANE -y--g ALIBI"
+python3.13 erd_search.py queue tree --active-only --max-depth 3
+```
+
+Groups work by recorded spine so promoted cooperative children are easier to
+understand. Use this when a branch has spawned sub-work and `queue ls` is too
+flat. `--active-only`, `--max-depth`, `--limit`, and `--json` are supported.
+
+#### `queue show`: branch drill-down
+
+```bash
+python3.13 erd_search.py queue show 04d6
+python3.13 erd_search.py queue show "CRANE -----"
+python3.13 erd_search.py queue show "CRANE -y--g ALIBI"
+python3.13 erd_search.py queue show --claims 04d6
+```
+
+Shows one branch’s pending row, active row, candidate progress, workers, bundle
+stats, republish count, current best guess/ERD, budget, taint flag, nodes spent,
+and spine. `--claims` includes detailed candidate claim rows. If the reference
+is ambiguous, it prints matching rows and asks for a more specific spine/pattern
+or branch id.
+
+#### `queue summary`: aggregate view
+
+```bash
+python3.13 erd_search.py queue summary
+python3.13 erd_search.py queue summary --json
+```
+
+Reports counts by status, kind, budget, priority bucket, and answer-count
+bucket, plus largest/oldest pending and active branches. This is the quickest
+way to see queue shape without row-level detail.
+
+#### `queue top`: hotspots
+
+```bash
+python3.13 erd_search.py queue top --by nodes
+python3.13 erd_search.py queue top --by workers "CRANE -y--g"
+python3.13 erd_search.py queue top --by size --limit 25
+```
+
+Ranks active/open work. `--by` accepts `nodes`, `age`, `size`, `workers`,
+`priority`, or `slowest`. A trailing partial spine filters to descendants.
+
+#### `queue coverage`: response-pattern coverage
+
+```bash
+python3.13 erd_search.py queue coverage CRANE
+python3.13 erd_search.py queue coverage "CRANE -y--g ALIBI"
+python3.13 erd_search.py queue coverage CRANE --queued-only
+python3.13 erd_search.py queue coverage CRANE --missing-only
+```
+
+This is the old word-centric coverage question under the new queue group. It
+answers “for the next guess at this path, which response branches are pending,
+in progress, done, cooperative-active, or not queued?” Use it when checking
+whether a word/path has complete queue coverage rather than when looking for
+unknown work.
+
 ### Add branches to the queue
 
 ```bash
