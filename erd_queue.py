@@ -16,6 +16,7 @@ version violation — check the target version by hand, or on the box itself.
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
 import os
 import sqlite3
@@ -97,6 +98,18 @@ def guess_depth_from_spine(spine) -> int:
     guess count is the token count halved.  An empty/NULL spine is the root: 0.
     """
     return len(spine.split()) // 2 if spine else 0
+
+
+def _fmt_response_code(code) -> str | None:
+    if code is None:
+        return None
+    chars = {0: '-', 1: 'y', 2: 'g'}
+    digits = []
+    code = int(code)
+    for _ in range(5):
+        digits.append(code % 3)
+        code //= 3
+    return ''.join(chars[d] for d in reversed(digits))
 
 
 _SCHEMA_SQL = """
@@ -1338,6 +1351,241 @@ class ERDQueue:
             GROUP BY current_branch_key
         """, (cutoff,)).fetchall()
         return {bytes(r["k"]): r["c"] for r in rows}
+
+    def _branch_row_dict(self, pending=None, active=None) -> dict:
+        """Normalize pending/active branch state for queue visibility commands."""
+        p = pending
+        a = active
+        branch_key = bytes((a or p)["branch_key"])
+        claims_done = self.branch_done_candidates(branch_key) if a else 0
+        workers = self.worker_counts_by_branch().get(branch_key, 0)
+        return {
+            "branch_key": branch_key,
+            "branch_key_hex": branch_key.hex(),
+            "kind": "user" if p is not None else "coop",
+            "status": (p["status"] if p is not None
+                       else (a["status"] if a is not None else "unknown")),
+            "priority": (a["priority"] if a is not None else p["priority"]),
+            "n_words": (a["n_words"] if a is not None else p["n_words"]),
+            "budget": a["budget"] if a is not None else None,
+            "done_candidates": claims_done,
+            "n_candidates": a["n_candidates"] if a is not None else None,
+            "worker_count": workers,
+            "nodes_spent": a["nodes_spent"] if a is not None else 0,
+            "best_guess": a["best_guess"] if a is not None else None,
+            "best_erd": a["best_erd"] if a is not None else None,
+            "best_max_depth": a["best_max_depth"] if a is not None else None,
+            "tainted": bool(a["tainted"]) if a is not None else False,
+            "source_word": ((a["source_word"] if a is not None else None)
+                            or (p["source_word"] if p is not None else None)),
+            "source_pattern": ((a["source_pattern"] if a is not None else None)
+                               if a is not None and a["source_pattern"] is not None
+                               else (p["source_pattern"] if p is not None else None)),
+            "source_pattern_text": _fmt_response_code(
+                ((a["source_pattern"] if a is not None else None)
+                 if a is not None and a["source_pattern"] is not None
+                 else (p["source_pattern"] if p is not None else None))),
+            "spine": a["spine"] if a is not None else None,
+            "created_at": a["created_at"] if a is not None else None,
+            "updated_at": ((p["completed_at"] or p["claimed_at"])
+                           if p is not None else a["created_at"]),
+            "claimed_by": p["claimed_by"] if p is not None else None,
+            "claimed_at": p["claimed_at"] if p is not None else None,
+            "completed_at": p["completed_at"] if p is not None else None,
+        }
+
+    def list_queue_rows(self, filters=None, sort=None, limit=None):
+        """Return normalized pending/user and active/cooperative queue rows."""
+        filters = filters or {}
+        pending = {
+            bytes(r["branch_key"]): r
+            for r in self._conn.execute("SELECT * FROM pending_branches")
+        }
+        active = {
+            bytes(r["branch_key"]): r
+            for r in self._conn.execute("SELECT * FROM active_branches")
+        }
+        keys = set(pending) | set(active)
+        rows = [self._branch_row_dict(pending.get(k), active.get(k))
+                for k in keys]
+
+        def ok(row):
+            if filters.get("status") and row["status"] != filters["status"]:
+                return False
+            if filters.get("min_words") is not None and row["n_words"] < filters["min_words"]:
+                return False
+            if filters.get("max_words") is not None and row["n_words"] > filters["max_words"]:
+                return False
+            if filters.get("budget") is not None and row["budget"] != filters["budget"]:
+                return False
+            if filters.get("priority") is not None and row["priority"] != filters["priority"]:
+                return False
+            if filters.get("source_word"):
+                if (row["source_word"] or "").lower() != filters["source_word"].lower():
+                    return False
+            prefix = filters.get("prefix")
+            if prefix and not self._row_matches_spine_prefix(row, prefix):
+                return False
+            return True
+
+        rows = [r for r in rows if ok(r)]
+        rows.sort(key=self._queue_sort_key(sort))
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
+    def _queue_sort_key(self, sort):
+        if sort == "nodes":
+            return lambda r: (-(r["nodes_spent"] or 0), -r["n_words"], r["branch_key_hex"])
+        if sort == "age":
+            return lambda r: ((r["created_at"] or r["claimed_at"] or 0), r["branch_key_hex"])
+        if sort == "size":
+            return lambda r: (-r["n_words"], r["branch_key_hex"])
+        if sort == "workers":
+            return lambda r: (-r["worker_count"], -r["n_words"], r["branch_key_hex"])
+        if sort == "priority":
+            return lambda r: (-(r["priority"] or 0), -r["n_words"], r["branch_key_hex"])
+        if sort == "slowest":
+            return lambda r: (-(r["nodes_spent"] or 0), (r["created_at"] or 0),
+                              r["branch_key_hex"])
+        return lambda r: (0 if r["status"] in ("in_progress", "open") else 1,
+                          -(r["priority"] or 0), -r["n_words"], r["branch_key_hex"])
+
+    def _row_spine_text(self, row):
+        if row.get("spine"):
+            return row["spine"]
+        if row.get("source_word") and row.get("source_pattern_text"):
+            return f'{row["source_word"].upper()} {row["source_pattern_text"]}'
+        return ""
+
+    def _row_matches_spine_prefix(self, row, prefix):
+        spine = row.get("spine") or ""
+        if spine == prefix or spine.startswith(prefix + " "):
+            return True
+        fallback = ""
+        if row.get("source_word") and row.get("source_pattern_text"):
+            fallback = f'{row["source_word"].upper()} {row["source_pattern_text"]}'
+        elif row.get("source_word"):
+            fallback = row["source_word"].upper()
+        return fallback == prefix or fallback.startswith(prefix + " ")
+
+    def queue_dashboard(self, limit=8):
+        active = [r for r in self.list_queue_rows()
+                  if r["status"] in ("in_progress", "open")]
+        active.sort(key=self._queue_sort_key(None))
+        return {
+            "summary": self.queue_summary(),
+            "active": active[:limit],
+            "pending": self.list_queue_rows(
+                {"status": "pending"}, limit=limit),
+            "stale": [],
+        }
+
+    def queue_tree_rows(self, prefix=None, active_only=False, max_depth=None, limit=None):
+        filters = {"prefix": prefix} if prefix else {}
+        rows = self.list_queue_rows(filters)
+        if active_only:
+            rows = [r for r in rows if r["status"] in ("in_progress", "open")]
+        if max_depth is not None:
+            rows = [r for r in rows
+                    if guess_depth_from_spine(r["spine"]) <= max_depth
+                    or (not r["spine"] and r["source_word"])]
+        rows.sort(key=lambda r: (r["spine"] or r["source_word"] or "",
+                                 r["branch_key_hex"]))
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
+    def queue_top_rows(self, sort="nodes", limit=10, prefix=None):
+        rows = self.list_queue_rows({"prefix": prefix} if prefix else {}, sort=sort)
+        rows = [r for r in rows if r["status"] in ("in_progress", "open")]
+        return rows[:limit]
+
+    def queue_summary(self):
+        rows = self.list_queue_rows()
+        by_status = {}
+        by_kind = {}
+        by_budget = {}
+        by_priority = {"0": 0, "1-999": 0, "coop": 0}
+        by_size = {"2-9": 0, "10-99": 0, "100-999": 0, "1000+": 0}
+        for r in rows:
+            by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+            by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
+            b = "none" if r["budget"] is None else str(r["budget"])
+            by_budget[b] = by_budget.get(b, 0) + 1
+            pri = r["priority"] or 0
+            if pri >= 1_000_000:
+                by_priority["coop"] += 1
+            elif pri == 0:
+                by_priority["0"] += 1
+            else:
+                by_priority["1-999"] += 1
+            n = r["n_words"]
+            if n < 10:
+                by_size["2-9"] += 1
+            elif n < 100:
+                by_size["10-99"] += 1
+            elif n < 1000:
+                by_size["100-999"] += 1
+            else:
+                by_size["1000+"] += 1
+        pending = [r for r in rows if r["status"] == "pending"]
+        active = [r for r in rows if r["status"] in ("in_progress", "open")]
+        oldest = lambda xs: min(xs, key=lambda r: r["created_at"] or r["claimed_at"] or 0) if xs else None
+        largest = lambda xs: max(xs, key=lambda r: r["n_words"]) if xs else None
+        return {
+            "total": len(rows),
+            "by_status": by_status,
+            "by_kind": by_kind,
+            "by_budget": by_budget,
+            "by_priority": by_priority,
+            "by_size": by_size,
+            "largest_pending": largest(pending),
+            "oldest_pending": oldest(pending),
+            "largest_active": largest(active),
+            "oldest_active": oldest(active),
+            "stale_active": [],
+        }
+
+    def resolve_branch_ref(self, ref):
+        """Resolve a short id, full hex key, or normalized spine prefix."""
+        rows = self.list_queue_rows()
+        ref = (ref or "").strip()
+        if not ref:
+            return []
+        low = ref.lower()
+        matches = [
+            r for r in rows
+            if r["branch_key_hex"] == low or r["branch_key_hex"].startswith(low)
+            or hashlib.sha1(r["branch_key"]).hexdigest()[:4] == low
+        ]
+        if matches:
+            return matches
+        return [r for r in rows if self._row_matches_spine_prefix(r, ref)]
+
+    def branch_detail(self, branch_key, include_claims=False):
+        p = self.get_pending_branch(branch_key)
+        a = self.get_active_branch(branch_key)
+        if p is None and a is None:
+            return None
+        detail = self._branch_row_dict(p, a)
+        if include_claims:
+            detail["claims"] = [dict(r) for r in self.claims_for_branch(branch_key)]
+        else:
+            detail["claims"] = []
+        detail["bundle_stats"] = [dict(r) for r in self._conn.execute(
+            "SELECT * FROM bundle_stats WHERE branch_key = ? ORDER BY bundle_id",
+            (branch_key,))]
+        detail["republish"] = [dict(r) for r in self._conn.execute(
+            "SELECT * FROM candidate_republish WHERE branch_key = ? ORDER BY idx",
+            (branch_key,))]
+        detail["finalize_log"] = [dict(r) for r in self._conn.execute(
+            "SELECT * FROM branch_finalize_log WHERE branch_key = ? ORDER BY id DESC LIMIT 5",
+            (branch_key,))]
+        detail["workers"] = [dict(r) for r in self._conn.execute(
+            "SELECT * FROM worker_heartbeat WHERE current_branch_key = ? ORDER BY worker_id",
+            (branch_key,))]
+        return detail
 
     # ------------------------------------------------------------------
     # run_meta key-value store
