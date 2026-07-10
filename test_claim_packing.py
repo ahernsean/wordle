@@ -134,11 +134,35 @@ class TestSchemaMigration(unittest.TestCase):
         q.close()
 
     def test_unmigratable_missing_column_refuses_to_open(self):
-        # A pre-existing table missing a column that no _migrate() rule adds:
-        # CREATE TABLE IF NOT EXISTS is a no-op against it, so without the
-        # schema assertion the mismatch would surface only at the first
+        # A pre-existing queue table missing a column that no _migrate() rule
+        # adds: CREATE TABLE IF NOT EXISTS is a no-op against it, so without
+        # the schema assertion the mismatch would surface only at the first
         # statement naming the column — long after open, killing a worker.
+        # Keeps the columns the schema's index needs, so the failure lands in
+        # the assertion rather than in index creation.
         conn = sqlite3.connect(self.path)
+        conn.execute("""
+            CREATE TABLE pending_branches (
+                branch_key BLOB    NOT NULL,
+                n_words    INTEGER NOT NULL,
+                priority   INTEGER NOT NULL DEFAULT 0,
+                status     TEXT    NOT NULL DEFAULT 'pending',
+                PRIMARY KEY (branch_key)
+            )
+        """)
+        conn.commit()
+        conn.close()
+        with self.assertRaises(RuntimeError) as raised:
+            ERDQueue(self.path)
+        self.assertIn("pending_branches", str(raised.exception))
+        self.assertIn("source_word", str(raised.exception))
+
+    def test_unmigratable_telemetry_file_refuses_to_open(self):
+        # The assertion covers the telemetry file too: a bad-shaped table
+        # there refuses at open just like one in the queue file.
+        telemetry_path = os.path.join(self._tmp.name,
+                                      "old_queue_telemetry.sqlite3")
+        conn = sqlite3.connect(telemetry_path)
         conn.execute("""
             CREATE TABLE claim_telemetry (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,12 +173,14 @@ class TestSchemaMigration(unittest.TestCase):
         conn.close()
         with self.assertRaises(RuntimeError) as raised:
             ERDQueue(self.path)
-        self.assertIn("claim_telemetry", str(raised.exception))
+        self.assertIn("telemetry.claim_telemetry", str(raised.exception))
         self.assertIn("n_words", str(raised.exception))
 
     def test_extra_column_warns_but_opens(self):
         ERDQueue(self.path).close()
-        conn = sqlite3.connect(self.path)
+        telemetry_path = os.path.join(self._tmp.name,
+                                      "old_queue_telemetry.sqlite3")
+        conn = sqlite3.connect(telemetry_path)
         conn.execute("ALTER TABLE claim_telemetry ADD COLUMN stray INTEGER")
         conn.commit()
         conn.close()
@@ -163,51 +189,74 @@ class TestSchemaMigration(unittest.TestCase):
             q.close()
         self.assertTrue(any("stray" in message for message in captured.output))
 
-    def test_legacy_total_coord_millis_column_is_renamed(self):
-        # A branch_finalize_log created with the legacy total_coord_millis
-        # column name: CREATE TABLE IF NOT EXISTS is a no-op against it, so
-        # only the _migrate() rename makes add_branch_finalize_log's INSERT
-        # (which names total_bundle_wall_millis) succeed.
+    def test_pre_split_empty_telemetry_table_is_dropped(self):
+        # A queue file from before the telemetry split carries telemetry
+        # tables in the queue database, where the qualified telemetry.*
+        # statements would silently bypass them.  An empty one is dropped at
+        # open (with a warning) and the telemetry write path works normally.
         conn = sqlite3.connect(self.path)
-        conn.executescript("""
+        conn.execute("""
             CREATE TABLE branch_finalize_log (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                branch_key         BLOB,
-                spine              TEXT,
-                n_words            INTEGER,
-                budget             INTEGER,
-                epoch              INTEGER NOT NULL DEFAULT 0,
-                created_at         INTEGER,
-                finalized_at       INTEGER,
-                nodes_spent        INTEGER,
-                n_claims           INTEGER,
-                n_bundles          INTEGER,
-                max_bundle_nodes   INTEGER,
-                total_coord_millis INTEGER,
-                censored_units     INTEGER,
-                recorded_at        INTEGER NOT NULL
-            );
+                id INTEGER PRIMARY KEY AUTOINCREMENT
+            )
         """)
         conn.commit()
         conn.close()
 
-        q = ERDQueue(self.path)
+        with self.assertLogs("erd_queue", level="WARNING") as captured:
+            q = ERDQueue(self.path)
+        self.assertTrue(any("pre-split" in message
+                            for message in captured.output))
         try:
-            cols = {r["name"] for r in
-                    q._conn.execute("PRAGMA table_info(branch_finalize_log)")}
-            self.assertIn("total_bundle_wall_millis", cols)
-            self.assertNotIn("total_coord_millis", cols)
+            in_queue_file = q._conn.execute(
+                "SELECT 1 FROM main.sqlite_master "
+                "WHERE type = 'table' AND name = 'branch_finalize_log'"
+            ).fetchone()
+            self.assertIsNone(in_queue_file)
             q.add_branch_finalize_log(
                 b"key", "SALET -g-g-", 87, 4, 100, 200, 12345, 87,
                 n_bundles=3, max_bundle_nodes=999,
                 total_bundle_wall_millis=5000, censored_units=0)
             row = q._conn.execute(
-                "SELECT total_bundle_wall_millis FROM branch_finalize_log"
-            ).fetchone()
+                "SELECT total_bundle_wall_millis "
+                "FROM telemetry.branch_finalize_log").fetchone()
             self.assertEqual(row["total_bundle_wall_millis"], 5000)
-            q._migrate()   # second run must not raise
         finally:
             q.close()
+
+    def test_pre_split_populated_telemetry_table_refuses_to_open(self):
+        # A pre-split telemetry table that still holds rows refuses at open:
+        # its data must be archived deliberately, never ignored silently.
+        conn = sqlite3.connect(self.path)
+        conn.execute("""
+            CREATE TABLE claim_telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                n_words INTEGER
+            )
+        """)
+        conn.execute("INSERT INTO claim_telemetry (n_words) VALUES (42)")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaises(RuntimeError) as raised:
+            ERDQueue(self.path)
+        self.assertIn("predates the telemetry split", str(raised.exception))
+        self.assertIn("claim_telemetry", str(raised.exception))
+
+    def test_telemetry_file_is_created_alongside_queue(self):
+        ERDQueue(self.path).close()
+        telemetry_path = os.path.join(self._tmp.name,
+                                      "old_queue_telemetry.sqlite3")
+        self.assertTrue(os.path.exists(telemetry_path))
+        conn = sqlite3.connect(telemetry_path)
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'")}
+        conn.close()
+        self.assertEqual(names, {
+            "bundle_stats", "cost_samples", "claim_telemetry",
+            "branch_finalize_log", "candidate_accuracy",
+            "backstop_telemetry"})
 
 
 N_CANDIDATES = 40
