@@ -118,6 +118,19 @@ Never perform any of the following without explicit instruction from the user:
 - **Rewriting git history** — including rebase, amend, or any operation that changes existing commits.
 - **Force push**
 
+## Never commit directly to main — no exceptions
+
+Committing to `main` is forbidden, always. This rule has no override: not
+"just do it", not "no need for a PR", not any other phrasing. Such phrasing
+waives ceremony, not the branch — the work still goes on a branch with a PR
+for Sean to merge. If an instruction genuinely seems to require a direct
+commit to `main`, stop and ask; do not infer permission.
+
+Persist source changes; do not persist one-time operations. A migration or
+data movement that will only ever run once on this machine is executed
+here (from the scratchpad) and never committed. Only code that must keep
+working in the future belongs in the repository.
+
 These actions are hard or impossible to reverse and affect shared state. Always confirm before proceeding, no matter how obvious it seems.
 
 ---
