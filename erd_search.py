@@ -163,18 +163,11 @@ class QueueRefError(ValueError):
 
 def normalize_queue_pattern(token: str) -> str:
     """Normalize a response token to canonical g/y/- syntax."""
-    token = token.strip()
-    if len(token) != 5:
-        raise QueueRefError(f'pattern must be 5 characters, got {token!r}')
-    out = []
-    for ch in token.lower():
-        if ch == 'g':
-            out.append('g')
-        elif ch == 'y':
-            out.append('y')
-        else:
-            out.append('-')
-    return ''.join(out)
+    from wordle_ui import fmt_pattern, parse_pattern
+    try:
+        return fmt_pattern(parse_pattern(token))
+    except ValueError as e:
+        raise QueueRefError(str(e)) from e
 
 
 def parse_queue_branch_ref(text) -> list[tuple[str, str | None]]:
@@ -195,15 +188,18 @@ def parse_queue_branch_ref(text) -> list[tuple[str, str | None]]:
         pat = None
         if i + 1 < len(raw):
             nxt = raw[i + 1]
-            is_patternish = (
-                len(nxt) == 5
-                and (not nxt.isalpha()
-                     or all(ch.lower() in ('g', 'y', 'b') for ch in nxt))
-            )
-            if is_patternish:
+            try:
                 pat = normalize_queue_pattern(nxt)
                 i += 1
-            elif len(nxt) != 5:
+            except QueueRefError:
+                if len(nxt) != 5:
+                    raise QueueRefError(
+                        'malformed branch ref: expected alternating WORD [PATTERN] tokens')
+                # A five-letter token that is not a valid response pattern is
+                # interpreted as the next word, then validated by the final
+                # alternating-token check below.
+                pass
+            if pat is None and len(nxt) != 5:
                 raise QueueRefError(
                     'malformed branch ref: expected alternating WORD [PATTERN] tokens')
         tokens.append((word, pat))
@@ -2006,6 +2002,29 @@ def cmd_reset_stale(args):
     print(f'Reset {n} in_progress row(s) to pending.')
 
 
+def _normalize_queue_cli_args(args):
+    """Apply queue-level options to nested queue commands.
+
+    Nested parsers use SUPPRESS defaults for duplicated options so they do not
+    overwrite queue-level values parsed before the subcommand.
+    """
+    if args.cmd != 'queue':
+        return
+    if not hasattr(args, 'queue'):
+        args.queue = args.queue_path or DEFAULT_QUEUE
+    if not hasattr(args, 'json'):
+        args.json = bool(args.queue_json)
+    if not hasattr(args, 'limit'):
+        if args.queue_limit is not None:
+            args.limit = args.queue_limit
+        elif args.queue_cmd is None:
+            args.limit = 8
+        elif args.queue_cmd == 'top':
+            args.limit = 10
+        else:
+            args.limit = None
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -2061,13 +2080,14 @@ def main():
 
     # -- queue --
     p_queue = sub.add_parser('queue', help='Inspect and manage queue work')
-    p_queue.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_queue.add_argument('--limit', type=int, default=8, metavar='N')
-    p_queue.add_argument('--json', action='store_true')
+    p_queue.add_argument('--queue', dest='queue_path', default=None, metavar='PATH')
+    p_queue.add_argument('--limit', dest='queue_limit', type=int, default=None,
+                         metavar='N')
+    p_queue.add_argument('--json', dest='queue_json', action='store_true')
     qsub = p_queue.add_subparsers(dest='queue_cmd')
 
     p_qls = qsub.add_parser('ls', help='List queue rows')
-    p_qls.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qls.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
     p_qls.add_argument('--status', choices=['pending', 'in_progress', 'done', 'open'])
     p_qls.add_argument('--min-words', type=int, metavar='N')
     p_qls.add_argument('--max-words', type=int, metavar='N')
@@ -2075,36 +2095,36 @@ def main():
     p_qls.add_argument('--priority', type=int, metavar='N')
     p_qls.add_argument('--source-word', metavar='WORD')
     p_qls.add_argument('--prefix', metavar='SPINE')
-    p_qls.add_argument('--limit', type=int, default=None, metavar='N')
-    p_qls.add_argument('--json', action='store_true')
+    p_qls.add_argument('--limit', type=int, default=argparse.SUPPRESS, metavar='N')
+    p_qls.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
 
     p_qtree = qsub.add_parser('tree', help='Show queue rows grouped by spine')
     p_qtree.add_argument('prefix', nargs='*', metavar='SPINE')
-    p_qtree.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qtree.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
     p_qtree.add_argument('--active-only', action='store_true')
     p_qtree.add_argument('--max-depth', type=int, metavar='N')
-    p_qtree.add_argument('--limit', type=int, default=None, metavar='N')
-    p_qtree.add_argument('--json', action='store_true')
+    p_qtree.add_argument('--limit', type=int, default=argparse.SUPPRESS, metavar='N')
+    p_qtree.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
 
     p_qshow = qsub.add_parser('show', help='Show detail for a branch')
     p_qshow.add_argument('branch_ref', nargs='+', metavar='BRANCH_REF')
     p_qshow.add_argument('--claims', action='store_true')
     p_qshow.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qshow.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_qshow.add_argument('--json', action='store_true')
+    p_qshow.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qshow.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
 
     p_qsum = qsub.add_parser('summary', help='Show aggregate queue counts')
-    p_qsum.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_qsum.add_argument('--json', action='store_true')
+    p_qsum.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qsum.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
 
     p_qtop = qsub.add_parser('top', help='Show queue hotspots')
     p_qtop.add_argument('prefix', nargs='*', metavar='SPINE')
     p_qtop.add_argument('--by', choices=['nodes', 'age', 'size', 'workers',
                                          'priority', 'slowest'],
                         default='nodes')
-    p_qtop.add_argument('--limit', type=int, default=10, metavar='N')
-    p_qtop.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_qtop.add_argument('--json', action='store_true')
+    p_qtop.add_argument('--limit', type=int, default=argparse.SUPPRESS, metavar='N')
+    p_qtop.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qtop.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
 
     p_qcov = qsub.add_parser('coverage',
                              help='Show swarm queue coverage for a spine prefix')
@@ -2114,8 +2134,8 @@ def main():
     p_qcov.add_argument('--missing-only', action='store_true',
                         help='Only list patterns not yet queued')
     p_qcov.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qcov.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
-    p_qcov.add_argument('--json', action='store_true')
+    p_qcov.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+    p_qcov.add_argument('--json', action='store_true', default=argparse.SUPPRESS)
 
     # -- queue add --
     p_qa = qsub.add_parser('add',
@@ -2144,12 +2164,12 @@ def main():
                            'queued branch first, so it is recomputed instead '
                            'of being skipped as already-cached')
     p_qa.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qa.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qa.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     # -- queue clear --
     p_qc = qsub.add_parser('clear',
                             help='Wipe all queue state (does not touch the ERD cache)')
-    p_qc.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qc.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
     p_qc.add_argument('--yes', action='store_true',
                       help='Skip confirmation prompt')
 
@@ -2163,7 +2183,7 @@ def main():
                       help='Also cancel an in-progress branch (clears active '
                            'state so the worker moves on after its current candidate)')
     p_qr.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qr.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qr.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     # -- queue priority --
     p_qp = qsub.add_parser('priority',
@@ -2175,7 +2195,7 @@ def main():
                       help='New priority (higher = worked sooner; '
                            'use values 0–999 for normal work)')
     p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
-    p_qp.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     # -- start --
     sub.add_parser('start',
@@ -2195,9 +2215,10 @@ def main():
     # -- queue reset-stale --
     p_rst = qsub.add_parser('reset-stale',
                              help='Reset in_progress rows to pending')
-    p_rst.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_rst.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     args = parser.parse_args()
+    _normalize_queue_cli_args(args)
 
     if args.cmd == 'queue':
         qdispatch = {

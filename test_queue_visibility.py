@@ -1,6 +1,11 @@
+import io
+import json
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 import erd_search
 from cache_sqlite import ScoreCache
@@ -27,8 +32,11 @@ class TestQueueBranchRefParser(unittest.TestCase):
 
     def test_normalizes_lowercase_and_gray_chars(self):
         self.assertEqual(
-            erd_search.parse_queue_branch_ref("crane .yxxg alibi b-g--"),
-            [("CRANE", "-y--g"), ("ALIBI", "--g--")])
+            erd_search.parse_queue_branch_ref("crane .yxxg alibi 00000"),
+            [("CRANE", "-y--g"), ("ALIBI", "-----")])
+        self.assertEqual(
+            erd_search.parse_queue_branch_ref("CRANE xxxxx ALIBI gyxgg"),
+            [("CRANE", "-----"), ("ALIBI", "gy-gg")])
 
     def test_rejects_malformed_refs(self):
         bad = ["CRAN", "CRANE ALIBI", "CRANE -y--g DOG", "CRANE -y--"]
@@ -111,6 +119,48 @@ class QueueVisibilityTests(unittest.TestCase):
         rows = self.q.queue_top_rows("size", limit=10)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["branch_key"], self.coop_key)
+
+
+class QueueCliArgparseTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue_path = os.path.join(self._tmp.name, "q.sqlite3")
+        q = ERDQueue(self.queue_path)
+        try:
+            q.add_pending_many([
+                (ScoreCache.encode_subset(WORDS), len(WORDS), 0, "crane", 0),
+                (ScoreCache.encode_subset(WORDS[:3]), 3, 0, "slate", 0),
+            ])
+        finally:
+            q.close()
+
+    def _run_main(self, *argv):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv", ["erd_search.py", *argv]):
+            with redirect_stdout(buf):
+                erd_search.main()
+        return buf.getvalue()
+
+    def test_queue_global_json_applies_to_child_command(self):
+        out = self._run_main(
+            "queue", "--queue", self.queue_path, "--json", "ls")
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 2)
+
+    def test_queue_global_limit_applies_to_child_command(self):
+        out = self._run_main(
+            "queue", "--queue", self.queue_path, "--limit", "1", "ls", "--json")
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 1)
+
+    def test_child_queue_option_overrides_queue_global(self):
+        other_path = os.path.join(self._tmp.name, "other.sqlite3")
+        out = self._run_main(
+            "queue", "--queue", other_path, "ls",
+            "--queue", self.queue_path, "--json")
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 2)
 
 
 if __name__ == "__main__":
