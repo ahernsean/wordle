@@ -9,6 +9,12 @@ A Wordle solver with five layers:
 - **Swarm** (`erd_swarm.py`, `erd_queue.py`, `erd_search.py`): parallel ERD precache workers
 - **CLI** (`wordle.py`): interactive game interface and all user-facing commands
 
+Swarm queue operations are grouped under `python3.13 erd_search.py queue`.
+Start with `queue`, then use `queue ls`, `queue tree`, `queue show`,
+`queue summary`, `queue top`, or `queue coverage`; mutations are
+`queue add/remove/clear/priority/reset-stale`. Check `--help` on `queue` or
+any subcommand for current flags, and use `SWARM.md` for the operator guide.
+
 ---
 
 ## Anchored vocabulary
