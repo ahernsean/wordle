@@ -11,7 +11,7 @@ Two SQLite files are involved:
 | `wordle_cache.sqlite3` | Durable ERD results; shared with the iPhone |
 | `erd_queue.sqlite3` | Transient coordination only (queue, candidate claims, heartbeats) |
 
-`queue-clear` wipes only the queue file — the cache is never touched by any
+`queue clear` wipes only the queue file — the cache is never touched by any
 queue command.
 
 ---
@@ -110,33 +110,72 @@ claim N done: K nodes in T.1s (R.1/s)  ok=X pruned=Y useless=Z  best=WORD E.EEEE
 
 ## Queue operations
 
+Start with the queue dashboard when you do not already know the branch:
+
+```bash
+python3.13 erd_search.py queue
+```
+
+Use `queue ls` to find work, `queue tree <partial-spine>` to understand promoted
+children, `queue show <branch-ref>` to inspect one branch, and
+`queue coverage <partial-spine>` when asking which response branches under a
+path are queued.
+
+Branch references are queue-first spine fragments:
+
+```bash
+CRANE
+CRANE -y--g
+CRANE -y--g ALIBI
+CRANE -y--g ALIBI g-g--
+```
+
+The final word may omit a pattern, meaning "show branches below this guess."
+Pattern syntax is `g`=green, `y`=yellow, and any other character as gray; quote
+refs containing leading dashes so the shell does not treat them as options.
+
+### Find and inspect work
+
+```bash
+python3.13 erd_search.py queue ls
+python3.13 erd_search.py queue tree "CRANE -y--g"
+python3.13 erd_search.py queue show "CRANE -y--g ALIBI"
+python3.13 erd_search.py queue top --by nodes "CRANE -y--g"
+python3.13 erd_search.py queue summary
+python3.13 erd_search.py queue coverage CRANE
+```
+
+`queue show` accepts the 4-hex branch id printed by `queue ls`, a full branch
+key prefix, a word/pattern pair, or a partial/full spine. If a reference matches
+multiple branches, it prints a disambiguation table.
+
 ### Add branches to the queue
 
 ```bash
 # All branches for one opener word (every branch with >= 2 answer words):
-python3.13 erd_search.py queue-add --word salet
+python3.13 erd_search.py queue add --word salet
 
 # One specific branch (word + response pattern):
-python3.13 erd_search.py queue-add --word salet --pattern .....
+python3.13 erd_search.py queue add --word salet --pattern .....
 
 # All words in a file (queues every branch for every word, unbounded --
 # including each opener's monster all-gray branch; pass --max-branch-size
 # to bound a bulk run):
-python3.13 erd_search.py queue-add --word-list wordle.txt
+python3.13 erd_search.py queue add --word-list wordle.txt
 
 # All words in a file, with a subset prioritized (others queued at 0):
-python3.13 erd_search.py queue-add --word-list wordle.txt \
+python3.13 erd_search.py queue add --word-list wordle.txt \
     --priority-words salet crane --priority 1
 
 # Bound a deliberately limited run to branches of at most 300 answer words:
-python3.13 erd_search.py queue-add --word salet --max-branch-size 300
+python3.13 erd_search.py queue add --word salet --max-branch-size 300
 
 # Force a recompute of an already-cached branch:
-python3.13 erd_search.py queue-add --word salet --pattern ..... \
+python3.13 erd_search.py queue add --word salet --pattern ..... \
     --delete-erd-cache --priority 1000
 ```
 
-`queue-add` is idempotent: already-queued branches are never duplicated, and
+`queue add` is idempotent: already-queued branches are never duplicated, and
 priority is upgraded (never downgraded) if the new request is higher.  Setting
 a high priority on a large branch makes every idle worker in the running
 swarm converge on it: `claim_one` prefers joining any in-progress branch
@@ -152,20 +191,10 @@ Priority values: 0 = default; 1 = high; use 0–999 for normal work.  The swarm
 internally uses 1,000,000 for promoted sub-branches so they always drain before
 fresh top-level branches.
 
-### Inspect a branch
-
-```bash
-python3.13 erd_search.py queue-inspect --word salet --pattern .....
-```
-
-Shows the pending-queue status (pending / in_progress / done), priority, and
-— if the branch is currently active — the candidate claim table with which
-worker holds each claim.
-
 ### Change priority
 
 ```bash
-python3.13 erd_search.py queue-priority --word salet --pattern ..... --priority 1
+python3.13 erd_search.py queue priority --word salet --pattern ..... --priority 1
 ```
 
 Only affects branches with status `pending` (priority is read at claim time, so
@@ -175,17 +204,17 @@ changing it on an in-progress branch has no effect).
 
 ```bash
 # Remove from the pending queue (no-op if in-progress or done):
-python3.13 erd_search.py queue-remove --word salet --pattern .....
+python3.13 erd_search.py queue remove --word salet --pattern .....
 
 # Also cancel any in-progress work (workers move on after their current candidate):
-python3.13 erd_search.py queue-remove --word salet --pattern ..... --force
+python3.13 erd_search.py queue remove --word salet --pattern ..... --force
 ```
 
 ### Clear the entire queue
 
 ```bash
-python3.13 erd_search.py queue-clear       # prompts for confirmation
-python3.13 erd_search.py queue-clear --yes # skip prompt
+python3.13 erd_search.py queue clear       # prompts for confirmation
+python3.13 erd_search.py queue clear --yes # skip prompt
 ```
 
 Wipes pending, in-progress, done branches, candidate claims, heartbeats, and run
@@ -194,7 +223,7 @@ metadata.  The ERD cache (`wordle_cache.sqlite3`) is not touched.
 ### Reset stuck in-progress rows
 
 ```bash
-python3.13 erd_search.py reset-stale
+python3.13 erd_search.py queue reset-stale
 ```
 
 If a supervisor crash left `pending_branches` rows stuck in `in_progress`, this
