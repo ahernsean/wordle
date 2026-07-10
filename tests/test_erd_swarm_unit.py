@@ -1184,6 +1184,48 @@ class TestSubbranchSolverCostModel(unittest.TestCase):
         result = w._subbranch_solver(words, budget=5)
         self.assertEqual(result, expected)
 
+    def test_promotion_reads_budget_specific_cell_not_aggregate_inline_case(self):
+        # Budget-specific cell predicts below threshold (inline); the
+        # budget-aggregate cell (budget=None) predicts above threshold
+        # (promote).  A correct decision must read the budget-specific cell.
+        w = _bare_worker()
+        threshold = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP
+        budget_specific = threshold - 1
+        aggregate = threshold + 1
+
+        def fake_get_cost_typical(policy, n_words, budget=None):
+            return budget_specific if budget is not None else aggregate
+
+        w.queue.get_cost_typical.side_effect = fake_get_cost_typical
+        w.cooperative_solve = mock.MagicMock()
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertIsNone(result)
+        w.cooperative_solve.assert_not_called()
+        w.queue.get_cost_typical.assert_called_once_with(ERD_ALL, len(words), 5)
+
+    def test_promotion_reads_budget_specific_cell_not_aggregate_promote_case(self):
+        # Mirror case: budget-specific cell predicts above threshold
+        # (promote); the budget-aggregate cell predicts below threshold
+        # (inline).  A correct decision must still read the budget-specific
+        # cell and promote.
+        w = _bare_worker()
+        threshold = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP
+        budget_specific = threshold + 1
+        aggregate = threshold - 1
+
+        def fake_get_cost_typical(policy, n_words, budget=None):
+            return budget_specific if budget is not None else aggregate
+
+        w.queue.get_cost_typical.side_effect = fake_get_cost_typical
+        expected = (erd_swarm.SOLVED, 2.0, 3, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertEqual(result, expected)
+        w.queue.get_cost_typical.assert_called_once_with(ERD_ALL, len(words), 5)
+
+
 class TestLogEMA(unittest.TestCase):
     """_LogEMA: edge cases for add() and value()."""
 

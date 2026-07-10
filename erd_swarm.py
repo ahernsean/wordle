@@ -1183,7 +1183,7 @@ class _BranchWorker:
             # Plain size-based promotion: no cost model, no overrun.
             return self.cooperative_solve(words, budget) if n >= PROMOTE_MIN_SIZE \
                 else None
-        predicted = self._typical(n)
+        predicted = self._typical(n, budget)
         if predicted is None:
             # Cold model: promote large branches by size, inline small ones; the
             # wall-clock backstop bounds a cold inline tarpit.
