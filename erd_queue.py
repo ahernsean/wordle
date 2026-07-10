@@ -1589,13 +1589,15 @@ class ERDQueue:
         else:
             detail["claims"] = []
         detail["bundle_stats"] = [dict(r) for r in self._conn.execute(
-            "SELECT * FROM bundle_stats WHERE branch_key = ? ORDER BY bundle_id",
+            "SELECT * FROM telemetry.bundle_stats "
+            "WHERE branch_key = ? ORDER BY bundle_id",
             (branch_key,))]
         detail["republish"] = [dict(r) for r in self._conn.execute(
             "SELECT * FROM candidate_republish WHERE branch_key = ? ORDER BY idx",
             (branch_key,))]
         detail["finalize_log"] = [dict(r) for r in self._conn.execute(
-            "SELECT * FROM branch_finalize_log WHERE branch_key = ? ORDER BY id DESC LIMIT 5",
+            "SELECT * FROM telemetry.branch_finalize_log "
+            "WHERE branch_key = ? ORDER BY id DESC LIMIT 5",
             (branch_key,))]
         detail["workers"] = [dict(r) for r in self._conn.execute(
             "SELECT * FROM worker_heartbeat WHERE current_branch_key = ? ORDER BY worker_id",
