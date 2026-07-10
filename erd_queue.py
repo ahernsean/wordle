@@ -99,7 +99,16 @@ def guess_depth_from_spine(spine) -> int:
     return len(spine.split()) // 2 if spine else 0
 
 
-_SCHEMA_SQL = """
+# The queue spans two database files.  The main file (this schema) holds
+# operational state: what to work on, who is working on it, and the cost
+# model read on the promotion hot path.  Telemetry tables live in a second
+# file attached as `telemetry` (_TELEMETRY_SCHEMA_SQL): they outweigh queue
+# state by orders of magnitude, are written best-effort (a telemetry failure
+# must never affect queue operations), and are archived or pruned by moving
+# the file — never by deleting from a live queue.  Separate files also give
+# telemetry inserts their own write lock, so they never serialize against
+# claim transactions.
+_QUEUE_SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
@@ -232,27 +241,6 @@ CREATE TABLE IF NOT EXISTS candidate_claims (
 -- is a no-op against a pre-existing (pre-bundle_id) table, so an index on
 -- bundle_id here would fail on any database that predates this column.
 
--- One row per bundle a worker has reported on: the nodes actually spent and
--- the wall-clock span of evaluating it (straggler/reclaim-window diagnostic
--- — NOT claim-handout coordination overhead, which is claim_telemetry's
--- busy_wait_millis), aggregated into branch_finalize_log at finalize and
--- dropped with the rest of the branch's transient state by delete_branch.
--- censored=1 marks a bundle that hit its node/wall cap and republished an
--- unfinished remainder (see ERDQueue.republish_remainder) — nodes is then a
--- lower bound on what the bundle's original member set would have cost.
--- Both nodes and wall_millis exclude any `forced` member's own span (see
--- evaluate_bundle): a forced candidate's real cost lands in its promoted
--- sub-branches' own finalize-log rows instead, so this bundle's row is not
--- a straggler diagnostic for bundles containing one.
-CREATE TABLE IF NOT EXISTS bundle_stats (
-    branch_key   BLOB    NOT NULL,
-    bundle_id    TEXT    NOT NULL,
-    nodes        INTEGER NOT NULL,
-    wall_millis  INTEGER NOT NULL,
-    censored     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (branch_key, bundle_id)
-);
-
 -- Per-candidate republish count: how many times a candidate's cross-candidate
 -- bundle has overrun before this candidate finished (see
 -- adaptive_claim_packing.md §7's bounded-republish-depth guardrail).  Survives
@@ -285,11 +273,53 @@ CREATE TABLE IF NOT EXISTS cost_model (
     PRIMARY KEY (policy, size_bucket, budget)
 );
 
+-- One row per telemetry epoch: a contiguous run under one claiming regime.
+-- epoch 0 is the single-candidate-atom baseline; the packer deploy inserts a new
+-- row and bumps run_meta.epoch.  All offline comparisons filter on epoch.
+CREATE TABLE IF NOT EXISTS telemetry_epoch (
+    epoch      INTEGER PRIMARY KEY,
+    label      TEXT,
+    git_sha    TEXT,
+    started_at INTEGER,
+    notes      TEXT
+);
+"""
+
+# Telemetry tables, in the attached `telemetry` database file.  Every table
+# here is outbound measurement data: written best-effort, never read by any
+# runtime control path (bundle_stats is aggregated once at finalize, then
+# dropped).  All statements qualify these names as telemetry.* so a stray
+# same-named table in the queue file can never be read or written silently.
+_TELEMETRY_SCHEMA_SQL = """
+PRAGMA telemetry.journal_mode=WAL;
+PRAGMA telemetry.synchronous=NORMAL;
+
+-- One row per bundle a worker has reported on: the nodes actually spent and
+-- the wall-clock span of evaluating it (straggler/reclaim-window diagnostic
+-- — NOT claim-handout coordination overhead, which is claim_telemetry's
+-- busy_wait_millis), aggregated into branch_finalize_log at finalize and
+-- dropped with the rest of the branch's transient state by delete_branch.
+-- censored=1 marks a bundle that hit its node/wall cap and republished an
+-- unfinished remainder (see ERDQueue.republish_remainder) — nodes is then a
+-- lower bound on what the bundle's original member set would have cost.
+-- Both nodes and wall_millis exclude any `forced` member's own span (see
+-- evaluate_bundle): a forced candidate's real cost lands in its promoted
+-- sub-branches' own finalize-log rows instead, so this bundle's row is not
+-- a straggler diagnostic for bundles containing one.
+CREATE TABLE IF NOT EXISTS telemetry.bundle_stats (
+    branch_key   BLOB    NOT NULL,
+    bundle_id    TEXT    NOT NULL,
+    nodes        INTEGER NOT NULL,
+    wall_millis  INTEGER NOT NULL,
+    censored     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (branch_key, bundle_id)
+);
+
 -- Raw per-solve samples for offline distribution analysis and threshold tuning.
 -- censored = 1 marks a sample whose unit was handed off at the node/wall cap
 -- before it finished: `nodes` is then a LOWER BOUND on the true cost, and an
 -- offline survival fit must treat it as such rather than as an exact point.
-CREATE TABLE IF NOT EXISTS cost_samples (
+CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     policy      TEXT    NOT NULL,
     n_words     INTEGER NOT NULL,
@@ -306,7 +336,7 @@ CREATE TABLE IF NOT EXISTS cost_samples (
 -- Never read by any runtime control path; freely droppable.  busy_wait_millis is
 -- the wall time spent acquiring the claim's write lock (the direct contention
 -- signal); claim_retries counts application-level BEGIN IMMEDIATE retries.
-CREATE TABLE IF NOT EXISTS claim_telemetry (
+CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     n_words             INTEGER NOT NULL,
     coordination_millis INTEGER NOT NULL,
@@ -318,24 +348,13 @@ CREATE TABLE IF NOT EXISTS claim_telemetry (
     recorded_at        INTEGER NOT NULL
 );
 
--- One row per telemetry epoch: a contiguous run under one claiming regime.
--- epoch 0 is the single-candidate-atom baseline; the packer deploy inserts a new
--- row and bumps run_meta.epoch.  All offline comparisons filter on epoch.
-CREATE TABLE IF NOT EXISTS telemetry_epoch (
-    epoch      INTEGER PRIMARY KEY,
-    label      TEXT,
-    git_sha    TEXT,
-    started_at INTEGER,
-    notes      TEXT
-);
-
 -- Durable per-branch timing/cost record, written at finalize BEFORE delete_branch
 -- copies the otherwise-destroyed active_branches.created_at/finalized_at/
 -- nodes_spent out of the transient row.  Subbranches finalize as first-class
 -- branches under recursive promotion, so each gets one row here.  The packer-era
 -- columns (n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units)
 -- are NULL under single-candidate claiming and populated once bundling lands.
-CREATE TABLE IF NOT EXISTS branch_finalize_log (
+CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     branch_key              BLOB,
     spine                   TEXT,
@@ -365,7 +384,7 @@ CREATE TABLE IF NOT EXISTS branch_finalize_log (
 -- sufficient statistic to recompute ANY work metric offline (uncut, cutoff-aware,
 -- ...) against the logged bound_erd without re-running the swarm.  Written only
 -- for non-ERD-pruned rows (an ERD-pruned row's predicted work is exactly 0).
-CREATE TABLE IF NOT EXISTS candidate_accuracy (
+CREATE TABLE IF NOT EXISTS telemetry.candidate_accuracy (
     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
     branch_key                 BLOB,
     n_words                    INTEGER NOT NULL,
@@ -387,7 +406,7 @@ CREATE TABLE IF NOT EXISTS candidate_accuracy (
 -- offline: how often the time cap (not the node check) drives a handoff, at what
 -- frame sizes, and whether the cost model was cold (predicted_nodes NULL) or warm
 -- at the time.  Outbound-only; never read by any runtime control path.
-CREATE TABLE IF NOT EXISTS backstop_telemetry (
+CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     n_words              INTEGER NOT NULL,
     budget               INTEGER,            -- frame's remaining-guess budget at fire
@@ -399,6 +418,24 @@ CREATE TABLE IF NOT EXISTS backstop_telemetry (
     recorded_at          INTEGER NOT NULL
 );
 """
+
+# Every table _TELEMETRY_SCHEMA_SQL creates, used to detect a queue file that
+# predates the telemetry split (see _absorb_legacy_telemetry_tables).
+_TELEMETRY_TABLES = (
+    "bundle_stats", "cost_samples", "claim_telemetry",
+    "branch_finalize_log", "candidate_accuracy", "backstop_telemetry",
+)
+
+
+def _derive_telemetry_path(db_path: str) -> str:
+    """Default telemetry file path for a queue at db_path: the sibling file
+    <stem>_telemetry<ext> (erd_queue.sqlite3 -> erd_queue_telemetry.sqlite3).
+    ':memory:' maps to ':memory:', which attaches as an independent private
+    in-memory database."""
+    if db_path == ":memory:":
+        return ":memory:"
+    root, ext = os.path.splitext(db_path)
+    return f"{root}_telemetry{ext}"
 
 
 def _pack_bundle(order, start, cost_lower_bound, bound, small_count, count_cap):
@@ -441,12 +478,19 @@ def _pack_bundle(order, start, cost_lower_bound, bound, small_count, count_cap):
 class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
-    def __init__(self, db_path: str, timeout: float = 30.0):
+    def __init__(self, db_path: str, timeout: float = 30.0,
+                 telemetry_path: str = None):
         self._timeout = timeout
         self._conn = sqlite3.connect(db_path, timeout=timeout,
                                      isolation_level=None)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA_SQL)
+        if telemetry_path is None:
+            telemetry_path = _derive_telemetry_path(db_path)
+        self.telemetry_path = telemetry_path
+        self._conn.execute("ATTACH DATABASE ? AS telemetry", (telemetry_path,))
+        self._conn.executescript(_QUEUE_SCHEMA_SQL)
+        self._conn.executescript(_TELEMETRY_SCHEMA_SQL)
+        self._absorb_legacy_telemetry_tables()
         self._migrate()
         self._assert_schema()
         # Active epoch, read once: workers open the queue after the supervisor has
@@ -466,6 +510,37 @@ class ERDQueue:
         # bundle_id a still-open branch's bundle_stats already used).
         self._pid = os.getpid()
         self._bundle_seq = 0
+
+    def _absorb_legacy_telemetry_tables(self):
+        """Handle a queue file that carries telemetry tables in the queue
+        database itself (a file from before the telemetry split).
+
+        Qualified telemetry.* statements would silently bypass such tables,
+        so they must not be left in place: an empty one is dropped (with a
+        warning); one that still holds rows refuses to open, so its data is
+        archived deliberately instead of ignored silently.
+        """
+        for table in _TELEMETRY_TABLES:
+            present = self._conn.execute(
+                "SELECT 1 FROM main.sqlite_master "
+                "WHERE type = 'table' AND name = ?", (table,)).fetchone()
+            if present is None:
+                continue
+            has_rows = self._conn.execute(
+                f"SELECT 1 FROM main.{table} LIMIT 1").fetchone()
+            if has_rows is None:
+                self._conn.execute(f"DROP TABLE main.{table}")
+                logger.warning(
+                    "dropped empty pre-split telemetry table %r from the "
+                    "queue database (telemetry lives in %s)",
+                    table, self.telemetry_path)
+            else:
+                raise RuntimeError(
+                    f"queue database predates the telemetry split: table "
+                    f"{table!r} still holds rows in the queue file, where "
+                    f"current code would silently ignore them. Archive the "
+                    f"queue file (rename it) and start a fresh queue; "
+                    f"telemetry now lives in {self.telemetry_path!r}.")
 
     def _migrate(self):
         # active_branches.spine: additive, nullable, no backfill.  Existing rows
@@ -511,15 +586,6 @@ class ERDQueue:
                 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
                     ON active_branches(status, priority DESC, n_words DESC);
             """)
-        # backstop_telemetry.depth recorded the engine recursion level; it now
-        # records the frame's remaining-guess budget.  RENAME COLUMN (3.25+) is
-        # available on this box.
-        bt_cols = {r["name"] for r in
-                   self._conn.execute("PRAGMA table_info(backstop_telemetry)")}
-        if "depth" in bt_cols and "budget" not in bt_cols:
-            self._conn.execute(
-                "ALTER TABLE backstop_telemetry RENAME COLUMN depth TO budget")
-
         # cost_model re-key: (policy, size_bucket) -> (policy, size_bucket, budget).
         # The same word count costs very different node totals at different
         # budgets, so the old single-budget bucket conflated them.  Rebuild with
@@ -550,26 +616,6 @@ class ERDQueue:
                 ALTER TABLE cost_model_new RENAME TO cost_model;
             """)
 
-        # Epoch tagging: stamp every append-only telemetry table with the active
-        # epoch.  Existing rows default to epoch 0 (the single-candidate baseline).
-        # Additive columns the CREATE shape declares for fresh DBs but that an
-        # existing DB needs via ALTER.
-        self._add_columns("claim_telemetry", {
-            "busy_wait_millis": "INTEGER",
-            "epoch": "INTEGER NOT NULL DEFAULT 0",
-        })
-        self._add_columns("cost_samples", {
-            "budget": "INTEGER",
-            "censored": "INTEGER NOT NULL DEFAULT 0",
-            "epoch": "INTEGER NOT NULL DEFAULT 0",
-        })
-        self._add_columns("backstop_telemetry", {
-            "epoch": "INTEGER NOT NULL DEFAULT 0",
-        })
-        self._add_columns("candidate_accuracy", {
-            "group_sizes": "TEXT",
-            "source_word": "TEXT",
-        })
         # Binary claim packing (issue #67): the packer's cursor and bundle
         # grouping.  Additive/nullable-default, so an existing (transient,
         # normally-empty-between-deploys) active_branches/candidate_claims row
@@ -589,37 +635,6 @@ class ERDQueue:
             "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
             "ON candidate_claims(branch_key, bundle_id)")
 
-        # candidate_accuracy.cost_lb / .gated are legacy column names from
-        # before the ERD-lower-bound-pruning rename (§9b): cost_lb was the
-        # candidate cost lower bound now called candidate_cost_lower_bound,
-        # and gated was the erd_lower_bound_pruned flag.  RENAME COLUMN
-        # (3.25+) is available on this box (see the backstop_telemetry
-        # depth->budget migration above).
-        ca_cols = {r["name"] for r in
-                   self._conn.execute("PRAGMA table_info(candidate_accuracy)")}
-        if "cost_lb" in ca_cols and "candidate_cost_lower_bound" not in ca_cols:
-            self._conn.execute(
-                "ALTER TABLE candidate_accuracy "
-                "RENAME COLUMN cost_lb TO candidate_cost_lower_bound")
-        if "gated" in ca_cols and "erd_lower_bound_pruned" not in ca_cols:
-            self._conn.execute(
-                "ALTER TABLE candidate_accuracy "
-                "RENAME COLUMN gated TO erd_lower_bound_pruned")
-
-        # branch_finalize_log.total_coord_millis is a legacy column name: it
-        # holds the branch's summed bundle evaluation wall spans, now called
-        # total_bundle_wall_millis.  A database whose table carries the old
-        # name makes the CREATE TABLE IF NOT EXISTS in _SCHEMA_SQL a no-op,
-        # and every finalize INSERT then fails with "no column named
-        # total_bundle_wall_millis".
-        bfl_cols = {r["name"] for r in
-                    self._conn.execute("PRAGMA table_info(branch_finalize_log)")}
-        if ("total_coord_millis" in bfl_cols
-                and "total_bundle_wall_millis" not in bfl_cols):
-            self._conn.execute(
-                "ALTER TABLE branch_finalize_log "
-                "RENAME COLUMN total_coord_millis TO total_bundle_wall_millis")
-
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
         now = int(time.time())
@@ -631,17 +646,17 @@ class ERDQueue:
 
     def _assert_schema(self):
         """Refuse to run against a database whose migrated schema disagrees
-        with _SCHEMA_SQL.
+        with the schema SQL, checked per file (queue and telemetry).
 
         Invariant: after _migrate(), every table must be column-identical to
-        what _SCHEMA_SQL creates on a fresh database.  A table that predates
-        the current code makes CREATE TABLE IF NOT EXISTS a no-op, so a
-        column _migrate() has no rule for stays wrong silently and fails
-        later and less clearly (e.g. mid-finalize, killing the worker).
-        Tests verify the code against databases the current code creates;
-        this verifies the actual database, so drift from any origin —
-        including a database touched by code from an unmerged commit —
-        refuses at open instead.
+        what the schema SQL creates on a fresh database.  A table that
+        predates the current code makes CREATE TABLE IF NOT EXISTS a no-op,
+        so a column _migrate() has no rule for stays wrong silently and
+        fails later and less clearly (e.g. mid-finalize, killing the
+        worker).  Tests verify the code against databases the current code
+        creates; this verifies the actual databases, so drift from any
+        origin — including a database touched by code from an unmerged
+        commit — refuses at open instead.
 
         Missing columns raise; extra columns only warn, since they cannot
         break the code's own reads and writes (every statement names its
@@ -649,30 +664,35 @@ class ERDQueue:
         """
         expected_conn = sqlite3.connect(":memory:")
         try:
-            expected_conn.executescript(_SCHEMA_SQL)
-            tables = [name for (name,) in expected_conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name NOT LIKE 'sqlite_%'")]
-            for table in tables:
-                expected = {r[1] for r in expected_conn.execute(
-                    f"PRAGMA table_info({table})")}
-                actual = {r["name"] for r in self._conn.execute(
-                    f"PRAGMA table_info({table})")}
-                missing = expected - actual
-                if missing:
-                    raise RuntimeError(
-                        f"queue database schema mismatch: table {table!r} "
-                        f"is missing column(s) {sorted(missing)} after "
-                        f"migration. The table was likely created by code "
-                        f"from a different commit; add a rule to "
-                        f"ERDQueue._migrate() for its shape instead of "
-                        f"opening it with mismatched code.")
-                extra = actual - expected
-                if extra:
-                    logger.warning(
-                        "queue database table %r has unexpected column(s) "
-                        "%s — schema drift, harmless to current statements",
-                        table, sorted(extra))
+            expected_conn.execute("ATTACH DATABASE ':memory:' AS telemetry")
+            expected_conn.executescript(_QUEUE_SCHEMA_SQL)
+            expected_conn.executescript(_TELEMETRY_SCHEMA_SQL)
+            for schema in ("main", "telemetry"):
+                tables = [name for (name,) in expected_conn.execute(
+                    f"SELECT name FROM {schema}.sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")]
+                for table in tables:
+                    expected = {r[1] for r in expected_conn.execute(
+                        f"PRAGMA {schema}.table_info({table})")}
+                    actual = {r["name"] for r in self._conn.execute(
+                        f"PRAGMA {schema}.table_info({table})")}
+                    missing = expected - actual
+                    if missing:
+                        raise RuntimeError(
+                            f"queue database schema mismatch: table "
+                            f"{schema}.{table} is missing column(s) "
+                            f"{sorted(missing)} after migration. The table "
+                            f"was likely created by code from a different "
+                            f"commit; add a rule to ERDQueue._migrate() for "
+                            f"its shape instead of opening it with "
+                            f"mismatched code.")
+                    extra = actual - expected
+                    if extra:
+                        logger.warning(
+                            "queue database table %s.%s has unexpected "
+                            "column(s) %s — schema drift, harmless to "
+                            "current statements",
+                            schema, table, sorted(extra))
         finally:
             expected_conn.close()
 
@@ -1120,14 +1140,16 @@ class ERDQueue:
         branch_done_candidates cover the branch) before this call runs, so
         another worker's maybe_finalize can win try_finalize_branch and
         delete_branch/finalize_bundle_stats out from under this INSERT.  The
-        WHERE EXISTS guard makes the insert a no-op in that race instead of
-        writing an orphaned row for an already-gone branch: SQLite evaluates
-        the SELECT and the INSERT as one atomic statement, so there is no
-        window between the existence check and the write for a concurrent
-        DELETE to land in.
+        WHERE EXISTS guard suppresses the insert in that race.  The guard
+        reads active_branches in the queue file while inserting into the
+        telemetry file, so it is advisory rather than atomic: a concurrent
+        DELETE committing between the read and the write can still leave an
+        orphaned row.  An orphan is harmless — the table is a diagnostic
+        never read by any control path — and rare enough that finalize/
+        delete cleanup keeps the table bounded in practice.
         """
         self._conn.execute("""
-            INSERT OR REPLACE INTO bundle_stats
+            INSERT OR REPLACE INTO telemetry.bundle_stats
                 (branch_key, bundle_id, nodes, wall_millis, censored)
             SELECT ?, ?, ?, ?, ?
             WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_key = ?)
@@ -1148,10 +1170,11 @@ class ERDQueue:
             SELECT COUNT(*) AS n_bundles, MAX(nodes) AS max_bundle_nodes,
                    SUM(wall_millis) AS total_bundle_wall_millis,
                    SUM(censored) AS censored_units
-            FROM bundle_stats WHERE branch_key = ?
+            FROM telemetry.bundle_stats WHERE branch_key = ?
         """, (branch_key,)).fetchone()
         self._conn.execute(
-            "DELETE FROM bundle_stats WHERE branch_key = ?", (branch_key,))
+            "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
+            (branch_key,))
         if row["n_bundles"] == 0:
             return (None, None, None, None)
         return (row["n_bundles"], row["max_bundle_nodes"],
@@ -1239,7 +1262,8 @@ class ERDQueue:
         self._conn.execute(
             "DELETE FROM candidate_republish WHERE branch_key = ?", (branch_key,))
         self._conn.execute(
-            "DELETE FROM bundle_stats WHERE branch_key = ?", (branch_key,))
+            "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
+            (branch_key,))
         self._conn.execute(
             "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
 
@@ -1320,7 +1344,7 @@ class ERDQueue:
             f"SELECT COUNT(*) FROM candidate_claims WHERE {member}").fetchone()[0]
         self._conn.execute(f"DELETE FROM candidate_claims WHERE {member}")
         self._conn.execute(f"DELETE FROM candidate_republish WHERE {member}")
-        self._conn.execute(f"DELETE FROM bundle_stats WHERE {member}")
+        self._conn.execute(f"DELETE FROM telemetry.bundle_stats WHERE {member}")
         self._conn.execute(f"DELETE FROM active_branches WHERE {member}")
         # Free stale in-flight claims on cooperative branches so their
         # remaining candidates are reclaimable as gaps.
@@ -1431,8 +1455,12 @@ class ERDQueue:
                              remove_from_queue: bool = False):
         """Atomically remove a branch's candidate claims and active_branches row.
 
-        All DELETEs run in one transaction so a crash partway through cannot
-        leave orphaned candidate_claims rows or a dangling active_branches row.
+        All queue-file DELETEs run in one transaction so a crash partway
+        through cannot leave orphaned candidate_claims rows or a dangling
+        active_branches row.  The telemetry-file bundle_stats delete rides in
+        the same transaction but commits per-file under WAL: on a crash it can
+        survive or vanish independently, which is acceptable for a diagnostic
+        table no control path reads.
 
         With remove_from_queue=True, also deletes the pending_branches row
         (regardless of its status), fully removing the branch from the queue in
@@ -1445,7 +1473,8 @@ class ERDQueue:
             self._conn.execute(
                 "DELETE FROM candidate_republish WHERE branch_key = ?", (branch_key,))
             self._conn.execute(
-                "DELETE FROM bundle_stats WHERE branch_key = ?", (branch_key,))
+                "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
+                (branch_key,))
             self._conn.execute(
                 "DELETE FROM active_branches WHERE branch_key = ?", (branch_key,))
             if remove_from_queue:
@@ -1652,7 +1681,7 @@ class ERDQueue:
         """
         now = int(time.time())
         self._conn.execute("""
-            INSERT INTO cost_samples
+            INSERT INTO telemetry.cost_samples
                 (policy, n_words, nodes, wall_millis, budget, censored, source,
                  epoch, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1679,7 +1708,7 @@ class ERDQueue:
         """
         now = int(time.time())
         self._conn.execute("""
-            INSERT INTO claim_telemetry
+            INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, work_nodes, claim_retries,
                  busy_wait_millis, worker_count, epoch, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1702,7 +1731,7 @@ class ERDQueue:
         """
         now = int(time.time())
         self._conn.execute("""
-            INSERT INTO branch_finalize_log
+            INSERT INTO telemetry.branch_finalize_log
                 (branch_key, spine, n_words, budget, epoch, created_at,
                  finalized_at, nodes_spent, n_claims, n_bundles,
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
@@ -1728,7 +1757,7 @@ class ERDQueue:
         """
         now = int(time.time())
         self._conn.execute("""
-            INSERT INTO candidate_accuracy
+            INSERT INTO telemetry.candidate_accuracy
                 (branch_key, n_words, budget, predicted_work, bound_erd,
                  candidate_cost_lower_bound, erd_lower_bound_pruned,
                  actual_nodes, group_sizes, source_word, epoch, recorded_at)
@@ -1765,7 +1794,7 @@ class ERDQueue:
         this size at the time the backstop fired."""
         now = int(time.time())
         self._conn.execute("""
-            INSERT INTO backstop_telemetry
+            INSERT INTO telemetry.backstop_telemetry
                 (n_words, budget, elapsed_millis, nodes, predicted_nodes,
                  remaining_candidates, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
