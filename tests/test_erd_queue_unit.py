@@ -22,6 +22,9 @@ from erd_queue import ERDQueue, cost_size_bucket
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
 N_CANDIDATES = 20
+# Fixed remaining-guess budget for TestCostModel: those tests exercise
+# policy/size-bucket mechanics, which are independent of the budget value.
+COST_MODEL_BUDGET = 5
 
 
 # Identity best-first order with a uniform cost_lower_bound: nothing is ever
@@ -408,45 +411,45 @@ class TestCostModel(_TmpQueue):
     mark_claims_done, add_nodes_spent, add_claim_telemetry."""
 
     def test_cold_read_returns_none(self):
-        self.assertIsNone(self.q.get_cost_typical("erd_all", 10))
+        self.assertIsNone(self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET))
 
     def test_single_sample_round_trips(self):
         import math
-        self.q.update_cost_model("erd_all", 10, 1000)
-        result = self.q.get_cost_typical("erd_all", 10)
+        self.q.update_cost_model("erd_all", 10, 1000, budget=COST_MODEL_BUDGET)
+        result = self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET)
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result, 1000.0, delta=1.0)
 
     def test_geometric_mean_not_arithmetic(self):
         import math
         # Two samples: 100 and 10000.  Geometric mean = 1000; arithmetic = 5050.
-        self.q.update_cost_model("erd_all", 5, 100)
-        self.q.update_cost_model("erd_all", 5, 10000)
-        result = self.q.get_cost_typical("erd_all", 5)
+        self.q.update_cost_model("erd_all", 5, 100, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("erd_all", 5, 10000, budget=COST_MODEL_BUDGET)
+        result = self.q.get_cost_typical("erd_all", 5, budget=COST_MODEL_BUDGET)
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result, 1000.0, delta=50.0)
 
     def test_weighted_batch_update(self):
         # weight=3 is equivalent to adding the sample 3 times.
         import math
-        self.q.update_cost_model("erd_all", 8, 500, weight=3.0)
-        result = self.q.get_cost_typical("erd_all", 8)
+        self.q.update_cost_model("erd_all", 8, 500, weight=3.0, budget=COST_MODEL_BUDGET)
+        result = self.q.get_cost_typical("erd_all", 8, budget=COST_MODEL_BUDGET)
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result, 500.0, delta=5.0)
 
     def test_policy_isolation(self):
-        self.q.update_cost_model("erd_all", 12, 200)
-        self.q.update_cost_model("max_group_size", 12, 9999)
-        erd = self.q.get_cost_typical("erd_all", 12)
-        mgs = self.q.get_cost_typical("max_group_size", 12)
+        self.q.update_cost_model("erd_all", 12, 200, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("max_group_size", 12, 9999, budget=COST_MODEL_BUDGET)
+        erd = self.q.get_cost_typical("erd_all", 12, budget=COST_MODEL_BUDGET)
+        mgs = self.q.get_cost_typical("max_group_size", 12, budget=COST_MODEL_BUDGET)
         self.assertAlmostEqual(erd, 200.0, delta=5.0)
         self.assertAlmostEqual(mgs, 9999.0, delta=5.0)
 
     def test_size_bucket_isolation(self):
-        self.q.update_cost_model("erd_all", 10, 100)
-        self.q.update_cost_model("erd_all", 20, 999)
-        r10 = self.q.get_cost_typical("erd_all", 10)
-        r20 = self.q.get_cost_typical("erd_all", 20)
+        self.q.update_cost_model("erd_all", 10, 100, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("erd_all", 20, 999, budget=COST_MODEL_BUDGET)
+        r10 = self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET)
+        r20 = self.q.get_cost_typical("erd_all", 20, budget=COST_MODEL_BUDGET)
         self.assertAlmostEqual(r10, 100.0, delta=5.0)
         self.assertAlmostEqual(r20, 999.0, delta=5.0)
 
@@ -504,18 +507,18 @@ class TestCostModel(_TmpQueue):
 
     def test_update_cost_model_noop_for_nonpositive_nodes(self):
         from wordle_engine import ERD_ALL
-        self.q.update_cost_model(ERD_ALL, 10, 0)
-        self.q.update_cost_model(ERD_ALL, 10, -5)
-        self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 10))
+        self.q.update_cost_model(ERD_ALL, 10, 0, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model(ERD_ALL, 10, -5, budget=COST_MODEL_BUDGET)
+        self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 10, budget=COST_MODEL_BUDGET))
 
     def test_update_cost_model_logsums_noop_for_nonpositive_weight(self):
         from wordle_engine import ERD_ALL
-        self.q.update_cost_model_logsums(ERD_ALL, 10, 3.0, 9.0, 0.0)
-        self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 10))
+        self.q.update_cost_model_logsums(ERD_ALL, 10, 3.0, 9.0, 0.0, budget=COST_MODEL_BUDGET)
+        self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 10, budget=COST_MODEL_BUDGET))
 
     def test_get_cost_spread_returns_none_for_cold_bucket(self):
         from wordle_engine import ERD_ALL
-        result = self.q.get_cost_spread(ERD_ALL, 10)
+        result = self.q.get_cost_spread(ERD_ALL, 10, budget=COST_MODEL_BUDGET)
         self.assertIsNone(result)
 
     def test_cost_size_bucket_returns_zero_for_n_below_one(self):

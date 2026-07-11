@@ -1184,6 +1184,49 @@ class TestSubbranchSolverCostModel(unittest.TestCase):
         result = w._subbranch_solver(words, budget=5)
         self.assertEqual(result, expected)
 
+    def test_promotion_uses_frames_own_budget_inline_case(self):
+        # The frame's own budget (5) predicts below threshold (inline); a
+        # different budget (6) predicts above threshold (promote).  A correct
+        # decision must query the cell for the frame's actual budget, not any
+        # other budget's cell.
+        w = _bare_worker()
+        threshold = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP
+        cell_for_frame_budget = threshold - 1
+        cell_for_other_budget = threshold + 1
+
+        def fake_get_cost_typical(policy, n_words, budget):
+            return cell_for_frame_budget if budget == 5 else cell_for_other_budget
+
+        w.queue.get_cost_typical.side_effect = fake_get_cost_typical
+        w.cooperative_solve = mock.MagicMock()
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertIsNone(result)
+        w.cooperative_solve.assert_not_called()
+        w.queue.get_cost_typical.assert_called_once_with(ERD_ALL, len(words), 5)
+
+    def test_promotion_uses_frames_own_budget_promote_case(self):
+        # Mirror case: the frame's own budget (5) predicts above threshold
+        # (promote); a different budget (6) predicts below threshold
+        # (inline).  A correct decision must still query the frame's own
+        # budget cell and promote.
+        w = _bare_worker()
+        threshold = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP
+        cell_for_frame_budget = threshold + 1
+        cell_for_other_budget = threshold - 1
+
+        def fake_get_cost_typical(policy, n_words, budget):
+            return cell_for_frame_budget if budget == 5 else cell_for_other_budget
+
+        w.queue.get_cost_typical.side_effect = fake_get_cost_typical
+        expected = (erd_swarm.SOLVED, 2.0, 3, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (erd_swarm.PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, budget=5)
+        self.assertEqual(result, expected)
+        w.queue.get_cost_typical.assert_called_once_with(ERD_ALL, len(words), 5)
+
+
 class TestLogEMA(unittest.TestCase):
     """_LogEMA: edge cases for add() and value()."""
 

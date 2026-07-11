@@ -3,8 +3,9 @@
 Covers the telemetry/epoch instrumentation and the budget-keyed cost model that
 land before the packer:
   - cost_model re-key migration: an old (policy, size_bucket) DB carries its
-    accumulators forward as the budget-aggregate (-1) cell;
-  - budget-keyed reads with the specific-cell -> aggregate fallback;
+    accumulators forward at budget = -1, a placeholder no longer read;
+  - budget-keyed reads: each (size_bucket, budget) cell is isolated, with no
+    cross-budget fallback;
   - the new telemetry inserts (branch_finalize_log, candidate_accuracy) and the
     extended cost_samples / claim_telemetry columns;
   - epoch tagging (baseline epoch 0, set_epoch);
@@ -16,7 +17,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from erd_queue import ERDQueue, cost_size_bucket, _AGGREGATE_BUDGET
+from erd_queue import ERDQueue, cost_size_bucket
 from wordle_engine import (estimate_candidate_work, estimate_candidate_work_cutoff,
                            evaluate_candidate, ERD_ANSWERS, ERD_ALL)
 
@@ -58,31 +59,20 @@ class TestCostModelBudgetKey(_TmpQueue):
         self.assertAlmostEqual(
             self.q.get_cost_typical(ERD_ALL, 100, budget=5), 1_000_000, delta=1)
 
-    def test_cold_specific_cell_falls_back_to_aggregate(self):
-        # Warm budget=3 only; reading an unseen budget=4 falls back to the
-        # budget-aggregate, which every sample also feeds.
+    def test_cold_specific_cell_stays_cold(self):
+        # Warm budget=3 only; an unseen budget=4 has no fallback and reads cold.
         self.q.update_cost_model(ERD_ALL, 100, 1000, budget=3)
-        self.assertIsNotNone(self.q.get_cost_typical(ERD_ALL, 100, budget=4))
-        self.assertAlmostEqual(
-            self.q.get_cost_typical(ERD_ALL, 100, budget=4), 1000, delta=1)
+        self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 100, budget=4))
 
-    def test_budget_none_reads_aggregate(self):
-        self.q.update_cost_model(ERD_ALL, 100, 2000, budget=2)
-        # No budget arg == aggregate, warm because every sample feeds -1.
-        self.assertAlmostEqual(
-            self.q.get_cost_typical(ERD_ALL, 100), 2000, delta=1)
+    def test_budget_is_required(self):
+        with self.assertRaises(TypeError):
+            self.q.get_cost_typical(ERD_ALL, 100)
 
-    def test_aggregate_row_present_under_minus_one(self):
-        self.q.update_cost_model(ERD_ALL, 100, 1234, budget=2)
-        row = self.q._cost_bucket_row(ERD_ALL, 100, _AGGREGATE_BUDGET)
-        self.assertIsNotNone(row)
-        self.assertGreaterEqual(row["weight_sum"], 1.0)
-
-    def test_spread_falls_back_to_aggregate(self):
+    def test_spread_stays_cold_for_unseen_budget(self):
         for x in (100, 1000, 10000):
             self.q.update_cost_model(ERD_ALL, 100, x, budget=2)
-        # Unseen budget reads the aggregate spread rather than None.
-        self.assertIsNotNone(self.q.get_cost_spread(ERD_ALL, 100, budget=9))
+        # Unseen budget has no fallback and reads cold.
+        self.assertIsNone(self.q.get_cost_spread(ERD_ALL, 100, budget=9))
 
 
 class TestCostModelMigration(unittest.TestCase):
@@ -118,17 +108,23 @@ class TestCostModelMigration(unittest.TestCase):
         cols = {r["name"]
                 for r in q._conn.execute("PRAGMA table_info(cost_model)")}
         self.assertIn("budget", cols)
-        # The migrated accumulator is readable as the aggregate (and via any
-        # budget through the fallback), preserving the typical value (~1000).
-        self.assertAlmostEqual(q.get_cost_typical(ERD_ALL, 100), 1000, delta=1)
-        self.assertAlmostEqual(
-            q.get_cost_typical(ERD_ALL, 100, budget=4), 1000, delta=1)
+        # The migrated accumulator lands at budget = -1, preserving its raw
+        # values; no query reads that row again (no cross-budget fallback), so
+        # every real budget starts cold and re-warms from fresh samples.
+        row = q._conn.execute(
+            "SELECT weight_sum FROM cost_model WHERE budget = -1").fetchone()
+        self.assertIsNotNone(row)
+        self.assertGreaterEqual(row["weight_sum"], 1.0)
+        self.assertIsNone(q.get_cost_typical(ERD_ALL, 100, budget=4))
 
     def test_migration_is_idempotent(self):
         ERDQueue(self.path).close()
         q = ERDQueue(self.path)   # second open must not fail or double-rebuild
         self.addCleanup(q.close)
-        self.assertAlmostEqual(q.get_cost_typical(ERD_ALL, 100), 1000, delta=1)
+        rows = q._conn.execute(
+            "SELECT weight_sum FROM cost_model WHERE budget = -1").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0]["weight_sum"], 1.0)
 
 
 class TestTelemetryInserts(_TmpQueue):

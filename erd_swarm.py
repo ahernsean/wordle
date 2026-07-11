@@ -583,13 +583,13 @@ class _BranchWorker:
 
     # -- cost model ---------------------------------------------------------
 
-    def _typical(self, n, budget=None):
+    def _typical(self, n, budget):
         """Return the cost model's geometric-mean node count for sub-branches of
         size n at remaining-guess `budget`, or None when the model is cold.
 
-        The model is keyed on (size, budget); a cold (size, budget) cell falls
-        back to the budget-aggregate inside the queue.  Results are cached
-        in-memory keyed by (n, budget) for the life of the worker; entries are
+        The model is keyed on (size, budget); a cold (size, budget) cell reads
+        cold, with no cross-budget fallback.  Results are cached in-memory
+        keyed by (n, budget) for the life of the worker; entries are
         invalidated on cooperative finalize so new samples take effect without
         re-querying on every enter() call.
         """
@@ -600,12 +600,11 @@ class _BranchWorker:
         self._typical_cache[key] = result
         return result
 
-    def _update_cost_model(self, n_words, nodes, budget=None, wall_millis=None):
+    def _update_cost_model(self, n_words, nodes, budget, wall_millis=None):
         """Update the cost model with a finalized cooperative branch's node count.
 
-        budget keys the (size, budget) cell (and the aggregate); wall_millis is
-        the branch's wall span, the only per-solve wall figure, recorded on the
-        raw sample.
+        budget keys the (size, budget) cell; wall_millis is the branch's wall
+        span, the only per-solve wall figure, recorded on the raw sample.
         """
         self.queue.update_cost_model(ERD_ALL, n_words, nodes, budget=budget)
         self.queue.add_cost_sample(ERD_ALL, n_words, nodes, 'finalize',
@@ -1183,7 +1182,7 @@ class _BranchWorker:
             # Plain size-based promotion: no cost model, no overrun.
             return self.cooperative_solve(words, budget) if n >= PROMOTE_MIN_SIZE \
                 else None
-        predicted = self._typical(n)
+        predicted = self._typical(n, budget)
         if predicted is None:
             # Cold model: promote large branches by size, inline small ones; the
             # wall-clock backstop bounds a cold inline tarpit.
