@@ -37,18 +37,26 @@ populations (measured 2026-07-11):
 
 The June machinery cannot touch this class: there is no cached value to check
 for consistency, and no ceiling to seed.  A loss is verified by re-running the
-budget-capped solve with the fixed engine:
+budget-capped solve with the fixed engine, **to the exact optimum**:
 
 - **Refuted** (a winning strategy exists within the stored budget): delete the
-  loss row and write the found best through the normal cache path.
+  loss row and write the solve's exact best through the normal cache path.
+  A first-found feasibility witness is enough to *prove* the loss false, but
+  it must never be what gets written: a witness is not the optimum, and a
+  suboptimal durable best row is exactly the error class pass 2 exists to
+  clean — which pass 2 cannot reliably repair here, since it iterates
+  existing best rows and can only see improvements whose sub-branches happen
+  to be cached.  So the solve runs to completion before any write.  (A cheap
+  witness search may still serve as a pre-filter deciding *whether* the full
+  exact solve is needed; confirmed losses skip it entirely.)
 - **Confirmed** (exhaustive disproof succeeds again): keep the row.
 
 Scope: exactly the 8,850 suspect keys (loss ∩ finalize-log), processed
 leaves-first (ascending `n_words`) so a refuted child loss is corrected before
-any parent that may have inherited its poison is examined.  Refutation is the
-cheap direction (finding one feasible candidate ends the check); confirmation
-repeats the full disproof, which the budget cap keeps bounded — suspect losses
-are concentrated at small budgets.
+any parent that may have inherited its poison is examined.  Cost: a confirmed
+loss repeats the full disproof and a refuted one pays a full exact solve —
+both bounded by the budget cap, and suspect losses are concentrated at small
+budgets and sizes.
 
 Tool: `verify_erd_losses.py`, mirroring `verify_erd_cache.py`'s wave/resume
 structure.  Derive the suspect key list from `branch_finalize_log` in the
