@@ -1,68 +1,96 @@
-# ERD cache re-verification plan
+# ERD cache re-verification plan (v2)
 
 ## Problem
 
-The reclaim-while-alive bug (fixed in commit `774ac29`, Jun 15 2026) could write
-a permanently-cached ERD that is **suboptimal but not wrong in direction** — the
-stored value is ≥ the true optimum.  Any branch finalized before that fix is a
-candidate for a bad cache entry.  Rather than flushing and recomputing from
-scratch, we can exploit the bounded error.
+The mid-loop overrun publisher could hand off a frame that was still riding its
+entry alpha-beta ceiling (no achieved best yet), marking the frame's
+ceiling-priced prefix candidates as done in an **exact** cooperative branch.
+The published branch's finalize then judged only the remainder.  Fixed in
+PR #115 (ceilinged frames now publish ceilinged branches); any branch finalized
+by the swarm while the publisher was live (epochs 3–4, roughly 2026-07-08 to
+2026-07-10) is a candidate for two kinds of bad cache entry:
 
-## Key insight
+1. **Suboptimal best** — the remainder's winner was cached although a discarded
+   prefix candidate may have been better.  Same error class as the June
+   reclaim-while-alive bug: the stored value is **≥ the true optimum**, and it
+   is always the ERD of a real strategy (achievable, never fabricated).
+2. **False loss** — the remainder was all infeasible, so a loss was cached,
+   although a discarded prefix candidate (priced out ≥ ceiling, never proven
+   infeasible) may have been feasible.  This class did not exist in June: the
+   reclaim bug could not manufacture losses.  A false loss also poisons every
+   budget below the stored one, and can propagate upward — a parent that
+   trusted it may have discarded a feasible candidate and cached a value that
+   is (again) achievable but too high.
 
-Because the bug can only produce an ERD ≥ the true optimum, every cached value
-is a valid alpha-beta ceiling.  A verification pass seeded with those ceilings:
+Handoff events themselves were not durably recorded, so the exact victims
+cannot be enumerated.  What bounds the damage is the finalize log: every branch
+the swarm finalized in the affected epochs has a `branch_finalize_log` row.
+Intersecting its 32,926 distinct branch keys with the cache gives the suspect
+populations (measured 2026-07-11):
 
-- **Correct entry:** search hits the ceiling immediately, confirms with near-zero
-  work, moves on.
-- **Wrong entry (too high):** search finds the true optimum (which beats the
-  ceiling), updates the cache.
+- **8,850 loss entries** in `branch_loss_by_policy`
+- **30,570 best entries** in `branch_best_by_policy`
 
-Work done is proportional to how wrong the cache is, not to the size of the full
-search space.
+## Two passes, in this order
 
-## Scope
+### Pass 1 — refute suspect losses (new tool)
 
-Re-verify **every entry** in `branch_best_by_policy`.  SALET's root is the most
-important, but any branch solved before the fix is suspect.  A full pass costs
-little for correct entries and automatically self-limits.
+The June machinery cannot touch this class: there is no cached value to check
+for consistency, and no ceiling to seed.  A loss is verified by re-running the
+budget-capped solve with the fixed engine:
 
-## Implementation sketch
+- **Refuted** (a winning strategy exists within the stored budget): delete the
+  loss row and write the found best through the normal cache path.
+- **Confirmed** (exhaustive disproof succeeds again): keep the row.
 
-1. **New script `verify_erd_cache.py`** (or a `--verify` flag on an existing
-   tool):
-   - Iterate all `(policy, branch_key, universe_id)` rows in
-     `branch_best_by_policy`.
-   - For each row, read the cached `best_guess` ERD as the initial alpha-beta
-     ceiling.
-   - Submit a fresh solve via the existing `erd_search` path with that ceiling.
-   - If the solver finds a strictly better value: update the cache row and log
-     the correction.
-   - If not: no write, move on.
+Scope: exactly the 8,850 suspect keys (loss ∩ finalize-log), processed
+leaves-first (ascending `n_words`) so a refuted child loss is corrected before
+any parent that may have inherited its poison is examined.  Refutation is the
+cheap direction (finding one feasible candidate ends the check); confirmation
+repeats the full disproof, which the budget cap keeps bounded — suspect losses
+are concentrated at small budgets.
 
-2. **Parallelism:** the existing swarm machinery (`erd_queue` + workers) can be
-   reused.  Each branch is a unit of work; the ceiling is passed as the
-   `solve_budget` / alpha-beta parameter already threaded through
-   `ERDQueue.create_branch`.
+Tool: `verify_erd_losses.py`, mirroring `verify_erd_cache.py`'s wave/resume
+structure.  Derive the suspect key list from `branch_finalize_log` in the
+telemetry file at startup; no schema changes.
 
-3. **Idempotency:** the pass can be interrupted and resumed.  A branch that was
-   already verified (and not updated) is simply re-verified cheaply on the next
-   run.  A `verified_ts` column in `branch_best_by_policy` could skip already-
-   confirmed rows on resume, but is optional — the re-verify cost for confirmed
-   rows is negligible.
+### Pass 2 — value consistency sweep (existing tool)
 
-4. **Completion signal:** log a summary at the end: N branches checked, M
-   corrections written, total wall time.
+`verify_erd_cache.py` already implements the right check for the suboptimal
+best class, because the error direction is identical to June's: leaves-first
+waves, each entry re-verified against its sub-branches' *cached* values (cache
+arithmetic, no re-solving), corrections written in place, resumable.  Run it
+over the full `branch_best_by_policy` as before — the full sweep is
+self-limiting (correct entries confirm in near-zero work), automatically
+covers the 30,570 suspect keys and any upward propagation beyond them, and
+re-covers anything the June pass ran before later contamination.
+
+Before running: review the script against the current schema and engine
+interfaces — it last ran in June and the codebase has moved (tests/ layout,
+budget-keyed cost model, telemetry split).  Fix forward if bitrotted; the
+algorithm stands.
+
+Pass 1 must complete before pass 2 starts: pass 2 trusts cached sub-branch
+values, and a false child loss reads as "no strategy" to every parent above it.
 
 ## What this is NOT
 
-- A flush.  No rows are deleted before the pass starts.
-- A full recompute.  The ceiling prevents redundant search on correct entries.
-- Part of the rename PR.  This is a separate operational step, run after the
-  rename is deployed and the schema is migrated.
+- **Not a flush.**  No rows are deleted up front; corrections are surgical.
+- **Not the June pass.**  That pass (reclaim-while-alive bug, commit `774ac29`)
+  was executed to completion; this plan supersedes its document.  The
+  contamination window, the false-loss class, and pass 1 are new; pass 2
+  reuses the June tool unchanged in role.
+- **Not part of PR #115.**  The fix prevents new contamination; this is the
+  cleanup of what epochs 3–4 may have left behind.
 
 ## Sequencing
 
-1. Rename PR merges, schema migrated on Linux + phone.
-2. Run `verify_erd_cache.py` on Linux against the live cache.
-3. Export and sync to phone as normal after the pass completes.
+1. PR #115 (ceiling propagation) merges and deploys.
+2. With all swarm workers stopped (they are, since the 2026-07-10 shutdown):
+   run pass 1, then pass 2, on the Linux cache.
+3. Epoch-5 re-queue and swarm restart only after both passes complete — the
+   epoch-5 corpus (the shelved trap branches) sits exactly in the suspect
+   neighbourhoods, and solving on top of uncorrected entries would launder
+   them into new results.
+4. Export and sync to the phone only after the passes complete; the phone's
+   cache copy carries the same suspect entries until then.
