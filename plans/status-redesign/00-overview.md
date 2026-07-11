@@ -72,6 +72,12 @@ Design principles the plans enforce:
 - **The terminal display is untouched.** `_print_status` / `_redraw_status`
   keep working exactly as they do now; the browser client is additive. (The
   terminal path may be simplified later, but that is not part of these plans.)
+- **Current terminal interaction semantics are preserved.** Branch order is
+  sticky across refreshes, an expanded branch remains inspectable while it is
+  finalizing, worker depth labels are absolute guess depths, and sweep detail
+  shows completion density rather than pretending completed indices form a
+  contiguous prefix. The browser may implement these differently, but must
+  not regress the information those behaviors convey.
 - **No new dependencies in shipped code.** Python stdlib only on the server; a
   single self-contained HTML file with vanilla JavaScript on the client (no
   CDN, no build step — it must work on a LAN with no internet). Tests are the
