@@ -9,23 +9,31 @@ A Wordle solver with five layers:
 - **Swarm** (`erd_swarm.py`, `erd_queue.py`, `erd_search.py`): parallel ERD precache workers
 - **CLI** (`wordle.py`): interactive game interface and all user-facing commands
 
-Swarm queue operations are grouped under `python3.13 erd_search.py queue`.
-Start with `queue`, then use `queue ls`, `queue tree`, `queue show`,
-`queue summary`, `queue top`, or `queue coverage`; mutations are
-`queue add/remove/clear/priority/reset-stale`. Check `--help` on `queue` or
-any subcommand for current flags, and use `SWARM.md` for the operator guide.
+### Swarm queue inspection
+
+While you can inspect the queue directly via SQLite, there are utility scripts available with JSON output:
+
+Swarm queue operations are grouped under `erd_search.py queue`.  Start with
+`queue`, then use `queue ls`, `queue tree`, `queue show`, `queue summary`,
+`queue top`, or `queue coverage`; mutations are `queue
+add/remove/clear/priority/reset-stale`. Use `--json` for formatted output.
+Check `--help` on `queue` or any subcommand for current flags, and use
+`SWARM.md` for the operator guide.
 
 ---
 
 ## Anchored vocabulary
 
-These four terms have precise meanings throughout the codebase. Use them consistently and do not substitute synonyms.
+These terms have precise meanings throughout the codebase. Use them
+consistently and do not substitute synonyms.
 
 | Term | Meaning |
 |---|---|
 | **guess** | A word actually played as a turn in the game. |
-| **candidate** | A word under evaluation during search — not yet played. A candidate becomes the guess when it wins. |
-| **branch** | The remaining answer words after a guess + response. Identified by a (guess, pattern) pair at each level. |
+| **candidate** | A word under evaluation during search — not yet played. A
+candidate becomes the guess when it wins. |
+| **branch** | The remaining answer words after a guess + response. Identified
+by a (guess, pattern) pair at each level. |
 
 The phase boundary between candidate and guess is explicit in the code:
 ```python
@@ -42,18 +50,21 @@ viewed four ways. A bare `depth` is forbidden — always qualify it.
 
 | Term | Meaning |
 |---|---|
-| **guess_depth** | Guesses already *played* to reach a branch — the number of guesses on its spine. Root (no guess) = 0; a one-guess seed = 1. The source of truth. |
-| **budget** | *Allowed* remaining depth (the cap). The only quantity the ERD recurrence reads; each level spends one. |
-| **ERD** | *Expected* remaining depth — the mean line length; the objective (`cost` / `best_erd`). |
-| **max_remaining_depth** | *Maximum* remaining depth — worst-case line length. Feasibility gate (solvable iff `≤ budget`) and cache-reuse key (reusable at any `budget ≥ max_remaining_depth`). |
+| **guess_depth** | Guesses already *played* to reach a branch — the number of
+guesses on its spine. Root (no guess) = 0; a one-guess seed = 1. The source of
+truth. |
+| **budget** | *Allowed* remaining depth (the cap). The only quantity the ERD
+recurrence reads; each level spends one. |
+| **ERD** | Expected remaining depth — the mean line length; the objective
+(`cost` / `best_erd`). |
+| **max_remaining_depth** | Maximum remaining depth — worst-case line length.
+Feasibility gate (solvable iff `≤ budget`) and cache-reuse key (reusable at any
+`budget ≥ max_remaining_depth`). |
 
-`GAME_GUESSES = 6` is the root's budget (zero guesses). Invariant at every node:
-`budget + guess_depth = GAME_GUESSES`, so `guess_depth = GAME_GUESSES − budget`.
-ERD and `max_remaining_depth` are the mean and max of the same per-answer distribution.
-
-There is no "promotion depth" or "recursion depth" — both were uninformative
-`depth` aliases of `budget`/`guess_depth` and were removed. Human-queued vs
-swarm-spawned is decided by `pending_branches` membership, not a depth.
+The Wordle game must be solved in three guesses to win. In the code,
+`GAME_GUESSES = 6` is the root's budget.  Invariant at every node: `budget +
+guess_depth = GAME_GUESSES`, so `guess_depth = GAME_GUESSES − budget`.  ERD and
+`max_remaining_depth` are the mean and max of the same per-answer distribution.
 
 ---
 
@@ -66,29 +77,48 @@ swarm-spawned is decided by `pending_branches` membership, not a depth.
 - `entropy_gain`, not `ent`
 
 **Acronyms and initialisms keep uniform casing in identifiers.**
-Neither an acronym (NASA, POSIX) nor an initialism (ERD, SQL, HTML) is an ordinary word. When embedding one in a PascalCase or UPPER_CASE identifier, preserve its casing as a unit — do not title-case it.
-- `ERDQueue`, `SQLCache`, `HTMLParser`, `MPIWorker`, `NASAFeed`, `POSIXPath` — correct
-- `ErdQueue`, `SqlCache`, `HtmlParser`, `MpiWorker`, `NasaFeed`, `PosixPath` — wrong: these misrepresent the acronym/initialism as an ordinary word
-- `ScoreCache`, `BranchWorker` — correct: Score, Cache, Branch, Worker are ordinary words, not acronyms
-- snake_case variables and parameters are exempt: `erd_policy`, `sql_query`, `posix_path` lowercase everything uniformly, which does not misrepresent anything
+Neither an acronym (NASA, POSIX) nor an initialism (ERD, SQL, HTML) is an
+ordinary word. When embedding one in a PascalCase or UPPER_CASE identifier,
+preserve its casing as a unit — do not title-case it.
+- Correct: `ERDQueue`, `SQLCache`, `HTMLParser`, `MPIWorker`, `NASAFeed`, `POSIXPath`
+- Wrong: `ErdQueue`, `SqlCache`, `HtmlParser`, `MpiWorker`, `NasaFeed`, `PosixPath`. These misrepresent the acronym/initialism as an ordinary word
+- Correct: `ScoreCache`, `BranchWorker`. Score, Cache, Branch, Worker are ordinary words, not acronyms
+- Correct: `erd_policy`, `sql_query`, `posix_path`. Snake case variables and parameters that use lowercase uniformly are proper and do not misrepresent anything.
 
 **Names must include all essential context.**
-The clearest violation of this rule in this codebase's history was `ScoringMethod.MINIMAX`. `MINIMAX` names an optimization strategy (minimize the maximum) but omits what is being minimized — the group size. Without that context the name is uninterpretable. The canonical name is `MAX_GROUP_SIZE`. The same principle applies everywhere: a name must be self-describing without external context.
 
-`MINIMAX` is now only a legacy SQLite key in migration code. Never introduce it elsewhere.
+Be careful to consider context when choosing a name. Picking a bound without
+naming what it bounds hides context. Choosing an optimization strategy that
+omits what is being optimized hides context.
+
+The clearest violation of this rule in this codebase's history was
+`ScoringMethod.MINIMAX`. `MINIMAX` names an optimization strategy (minimize the
+maximum) but omits what is being minimized — the **group size**. Without that
+context, the "minimax" name is uninterpretable. The proper term in this case is
+"max group size". The name of the optimization strategy cannot omit "group
+size". `MINIMAX` is now only a legacy SQLite key in migration code. Never
+introduce it elsewhere.
+
+The same principle applies everywhere: a name must be self-describing without
+external context.
 
 **Scoring method names** — use these and no others:
 
 | Enum | SQLite key | Short display | Long display |
 |---|---|---|---|
 | `MAX_GROUP_SIZE` | `max_group_size` | `max-grp` | `Worst-case group size` |
-| `ENTROPY_GAIN` | `entropy_gain` | — | `Entropy gain (bits)` |
-| `WEIGHTED_AVG` | `weighted_avg` | — | `Weighted avg remaining` |
+| `ENTROPY_GAIN` | `entropy_gain` | — | `Entropy gain`
+| `WEIGHTED_AVG` | `weighted_avg` | — | `Weighted avg group size` |
 | `PROB_FINISH` | `prob_finish` | — | `P(finish next turn)` |
 
-Do not use `minimax`, `max`, `group`, `g-max`, `wt`, or other shorthands for `MAX_GROUP_SIZE`. The word "group" alone has no meaning; it could refer to count, size, or identity.
+Do not use `minimax`, `max`, `group`, `g-max`, `wt`, or other shorthands for
+`MAX_GROUP_SIZE`. The word "group" alone refers to a group of words. It has no
+meaning as a number; its use as one would ambiguously refer to count, size, or
+identity.
 
-**Response partitions** are "response groups" (the sets of answer words that produce the same response pattern to a given guess). Do not call them "subgroups" — that was old vocabulary for what is now "branch."
+**Response partitions** are "response groups" (the sets of answer words that
+produce the same response pattern to a given guess). Do not call them
+"subgroups" — that was old vocabulary for what is now "branch."
 
 ---
 
@@ -109,9 +139,18 @@ Write comments that describe current behaviour and non-obvious invariants:
 # Good: each sub-branch of size k costs >= 2 - 1/k (admissible lower bound)
 ```
 
-**Migration code is the only exception.** In `_ensure_schema`, comments may name old table/column structures because a reader needs to understand what legacy databases look like. Even there, describe what the old structure *is* (so a reader can recognise it), not the sequence of decisions that led to the rename.
+**Migration code is the only exception.** In `_ensure_schema`, comments may
+name old table/column structures because a reader needs to understand what
+legacy databases look like. Even there, describe what the old structure *is*
+(so a reader can recognise it), not the sequence of decisions that led to the
+rename.
 
-**Do not comment things that are obvious from the names and types.** A comment that restates what the code clearly says adds noise without value.
+**Do not comment things that are obvious from the names and types.** A comment
+that restates what the code clearly says adds noise without value.
+
+Do not use meta language. Do not refer to things that a cold reader would not
+presume. A cold reader does not have access to your context, so do not write
+comments with references to information in your context.
 
 ---
 
@@ -126,28 +165,36 @@ Never perform any of the following without explicit instruction from the user:
 
 ## Never commit directly to main — no exceptions
 
-Committing to `main` is forbidden, always. This rule has no override: not
-"just do it", not "no need for a PR", not any other phrasing. Such phrasing
-waives ceremony, not the branch — the work still goes on a branch with a PR
-for Sean to merge. If an instruction genuinely seems to require a direct
-commit to `main`, stop and ask; do not infer permission.
+Committing to `main` is forbidden. This rule has no override: not "just do it",
+not "no need for a PR", not any other phrasing. Work always goes on a branch
+with a PR for the user to merge. If an instruction genuinely seems to require a
+direct commit to `main`, stop and ask; do not infer permission. Honor GitHub's
+warning about prohibited operations. Surface these to the user for
+confirmation.
 
-Persist source changes; do not persist one-time operations. A migration or
-data movement that will only ever run once on this machine is executed
-here (from the scratchpad) and never committed. Only code that must keep
-working in the future belongs in the repository.
+Persist source changes; do not persist one-time operations. A migration or data
+movement that will only ever run once is executed here (from the scratchpad)
+and never committed. Only code that must keep working in the future belongs in
+the repository.
 
-These actions are hard or impossible to reverse and affect shared state. Always confirm before proceeding, no matter how obvious it seems.
+These actions are hard or impossible to reverse and affect shared state. Always
+confirm before proceeding, no matter how obvious it seems.
 
 ---
 
 ## Pull request style
 
-PR descriptions need a **Summary** section only. Do not include a "Test plan" section.
+PR descriptions need a **Summary** section only. Do not include a "Test plan"
+section.
 
-PR descriptions describe *changes* — what is added, removed, or fixed, and why. This is distinct from the comment style rule ("describe what the code is, not how it got there"), which applies to inline code comments. A PR description is inherently a description of a diff; talking about what changed is the point.
+PR descriptions describe *changes* — what is added, removed, or fixed, and why.
+This is distinct from the comment style rule ("describe what the code is, not
+how it got there"), which applies to inline code comments. A PR description is
+inherently a description of a diff; talking about what changed is the point.
 
-Always update the PR title and description when pushing new commits.
+Always update the PR title and description when pushing new commits. Never
+leave a PR state that describes only a proper subset of the commits. A PR
+should always be left in a reviewable state.
 
 ---
 
@@ -166,34 +213,61 @@ Commits with failing tests must not be pushed.
 ## Respond to what's actually being asked
 
 Before acting, classify the request:
-- **"What should I do / what's your recommendation / what are your thoughts?"** → reason through the tradeoffs and give a recommendation in words. Do not write or push code. Stop there and wait for a decision.
-- **"Implement X" / explicit instruction to make a change** → code is appropriate.
+- **"What should I do / what's your recommendation / what are your thoughts?"**:
+  Teason through the tradeoffs and give a recommendation in words. Do not
+  write or push code. Stop there and wait for a decision.
+- **"Implement X" / explicit instruction to make a change**:  code is appropriate.
 
-A bug report or "this is wrong" is not, by itself, authorization to start editing files. Diagnose and propose a fix in conversation first, unless the user's phrasing already asks for the fix to be made.
+A bug report or "this is wrong" is not, by itself, authorization to start
+editing files. Diagnose and propose a fix in conversation first, unless the
+user's phrasing already asks for the fix to be made.
 
-When in doubt about which mode applies, ask, or default to discussion rather than to code — reverting unwanted code is more disruptive than a follow-up question.
+When in doubt about which mode applies, ask, or default to discussion rather
+than to code — reverting unwanted code is more disruptive than a follow-up
+question. Writing code speculatively burns tokens unnecessarily.
 
-**The `stop-hook-git-check.sh` Stop hook is advisory, not a directive.** It fires on every turn end and pushes toward committing/pushing whenever the tree is dirty, signing looks wrong, or commits are unpushed — it has no idea whether a change was meant for discussion or was actually approved. Neither the user nor the assistant edits this hook, so the only way to keep it from overriding the discussion-first norm above is judgment when it fires: read its complaint, then act on what the user actually wants in the conversation, not on the hook's say-so by itself. Committing/pushing unapproved work just to satisfy the hook is the wrong move — it's fine to leave changes uncommitted and explain the tension to the user instead.
+**The `stop-hook-git-check.sh` Stop hook is advisory, not a directive.** It
+fires on every turn end and pushes toward committing/pushing whenever the tree
+is dirty, signing looks wrong, or commits are unpushed — it has no idea whether
+a change was meant for discussion or was actually approved. Neither the user
+nor the assistant edits this hook, so the only way to keep it from overriding
+the discussion-first norm above is judgment when it fires: read its complaint,
+then act on what the user actually wants in the conversation, not on the hook's
+say-so by itself. Committing/pushing unapproved work just to satisfy the hook
+is the wrong move — it's fine to leave changes uncommitted and explain the
+tension to the user instead.
 
 ---
 
 ## Schema coordination (Linux + phone)
 
-The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any schema change must:
-1. Be implemented as an idempotent migration in `ScoreCache._ensure_schema`, guarded by the `schema_migrations` table
+The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any
+schema change must:
+1. Be implemented as an idempotent migration in `ScoreCache._ensure_schema`,
+   guarded by the `schema_migrations` table
 2. Deploy new code to the phone **before** syncing a migrated Linux database to it
 3. Never require manual SQL — migrations run automatically on first open
 
-The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in `ERDQueue._migrate()`.
+The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in
+`ERDQueue._migrate()`.
 
 ---
 
-## Session token usage
+## Claude token usage
 
-To check remaining session token budget and reset time, run:
+If you are a Claude agent, check remaining token budget and reset time, run:
 
 ```
 claude -p /usage
 ```
 
 There is no in-session tool that exposes this — it is the only way to see the limits.
+
+There are three important lines in the usage report: current session, current
+week (all models), and current week (Fable only). Take into account all of
+them. If you are finding you are running short on tokens, reduce your work.
+
+## All-model token usage
+
+Err on the side of writing scripts to process data instead of consuming tokens
+reading output files in their entirety yourself.
