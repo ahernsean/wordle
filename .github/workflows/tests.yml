@@ -64,10 +64,11 @@ jobs:
                 f"threshold >={r['min_speedup']:.2f}x")
           if r['passed']:
               print('PASS')
-          elif r.get('known_open'):
-              print(f"KNOWN OPEN (issue #122): {r['speedup']:.2f}x is below the "
-                    f"{r['min_speedup']:.2f}x threshold — reported, not enforced, "
-                    f"until the claim-granularity redesign lands.")
+          elif r.get('scaling_currently_broken'):
+              print(f"SPEEDUP ASSERTION INTENTIONALLY DISABLED — SCALING IS "
+                    f"CURRENTLY BROKEN (issue #122): {r['speedup']:.2f}x is "
+                    f"below the {r['min_speedup']:.2f}x threshold — reported, "
+                    f"not enforced, until the claim-granularity redesign lands.")
           else:
               print(f"FAIL: {r['speedup']:.2f}x is below the {r['min_speedup']:.2f}x threshold")
               sys.exit(1)
