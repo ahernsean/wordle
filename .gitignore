@@ -30,6 +30,8 @@ pattern_matrix_*.npy.*
 coverage.xml
 htmlcov/
 
-# Scaling smoke-test result (written by test_erd_scaling, read by the CI
-# "Validate scaling" step)
-scaling_result.json
+# Performance-guard results (written by test_erd_scaling and
+# test_swarm_vs_engine_overhead, read by the CI validate steps)
+coordination_floor_result.json
+strong_scaling_result.json
+swarm_overhead_result.json
