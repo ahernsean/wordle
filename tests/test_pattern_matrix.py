@@ -34,8 +34,8 @@ def _load_words(path):
         return [line.strip() for line in fh if line.strip()]
 
 
-# Paths relative to the test file's directory (runner cwd is the repo root).
-_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+# Paths relative to the repo root (runner cwd is the repo root).
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ALL_GUESS_WORDS = _load_words(os.path.join(_REPO_DIR, "wordle.txt"))
 _ALL_ANSWER_WORDS = _load_words(os.path.join(_REPO_DIR, "NYT_wordlist.txt"))
 

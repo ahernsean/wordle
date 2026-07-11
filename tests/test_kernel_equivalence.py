@@ -26,7 +26,7 @@ from wordle_engine import (
     OVER_ERD_LIMIT,
 )
 
-_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _load_words(path):

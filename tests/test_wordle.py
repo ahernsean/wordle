@@ -1,6 +1,6 @@
 """
 Tests for Wordle engine correctness and cache behavior.
-Run with:  python test_wordle.py
+Run with:  python -m unittest discover -s tests -t . -p 'test_*.py'
 """
 import io
 import itertools
@@ -19,7 +19,7 @@ from contextlib import redirect_stdout
 from datetime import datetime
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache, GuessUniverse, ComplianceFilter,
