@@ -1903,11 +1903,12 @@ class TestSubbranchSolverHook(unittest.TestCase):
                                        guesses=GUESSES, budget=6)
 
         calls = []
-        def inline_solver(words, budget):
+        def inline_solver(words, budget, ceiling):
             calls.append(len(words))
             # Solve inline (no further delegation) -> identical to recursion.
             return _solve_subset(words, self.cache, None, budget, None, GUESSES,
-                                 ERD_ALL, None, None, None, None, None)
+                                 ERD_ALL, None, None, None, None, None,
+                                 ceiling=ceiling)
 
         with_hook = min_expected_guesses(subset, self.cache, None,
                                          guesses=GUESSES, budget=6,
@@ -1922,8 +1923,36 @@ class TestSubbranchSolverHook(unittest.TestCase):
         # A hook that always declines (returns None) must change nothing.
         with_decline = min_expected_guesses(
             subset, self.cache, None, guesses=GUESSES, budget=6,
-            subbranch_solver=lambda w, b: None)
+            subbranch_solver=lambda w, b, c: None)
         self.assertEqual(without, with_decline)
+
+    def test_hook_receives_frame_ceiling(self):
+        # The delegation offer carries the frame's alpha-beta ceiling: a frame
+        # entered with ceiling C offers (words, budget, C) to the solver, so a
+        # cooperative solve can prune exactly as the inline recursion would.
+        # (Inside the candidate loop the engine enters each sub-frame with the
+        # derived sub_ceiling via the same parameter, so forwarding the frame's
+        # own ceiling covers the whole path.)
+        subset = ANSWERS[:8]
+        offers = []
+        def declining_spy(words, budget, ceiling):
+            offers.append((tuple(words), budget, ceiling))
+            return None
+        _solve_subset(subset, self.cache, None, 6, None, GUESSES,
+                      ERD_ALL, None, None, None, None,
+                      subbranch_solver=declining_spy, ceiling=2.5)
+        self.assertEqual(offers[0], (tuple(subset), 6, 2.5))
+
+    def test_hook_receives_inf_ceiling_without_alpha_beta_pressure(self):
+        # The root frame has no ceiling above it: its own offer carries inf.
+        subset = ANSWERS[:8]
+        offers = []
+        def declining_spy(words, budget, ceiling):
+            offers.append((tuple(words), budget, ceiling))
+            return None
+        min_expected_guesses(subset, self.cache, None, guesses=GUESSES,
+                             budget=6, subbranch_solver=declining_spy)
+        self.assertEqual(offers[0], (tuple(subset), 6, float('inf')))
 
 
 class TestCacheReuseRule(unittest.TestCase):

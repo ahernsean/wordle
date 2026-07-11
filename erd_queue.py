@@ -198,6 +198,17 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- count of these guesses.  NULL = no spine recorded (a row predating spine
     -- capture).
     spine          TEXT,
+    -- Alpha-beta ceiling the branch is being solved under (NULL = exact solve).
+    -- Set once at create_branch and immutable for the branch's lifetime: every
+    -- claim prunes against it, so done=1 claims are only interpretable together
+    -- with this value (including across worker restarts, which keep done=1
+    -- claims).  A finalize that found no best_erd below the ceiling is a CUT
+    -- (lower bound only), never a loss and never written to the score cache.
+    ceiling        REAL,
+    -- Monotone flag: some candidate priced out at >= the bound rather than
+    -- being proven infeasible.  Only meaningful at finalize when best_guess is
+    -- NULL, where it distinguishes CUT (>= ceiling) from a proven loss.
+    cut_occurred   INTEGER NOT NULL DEFAULT 0,
     -- claim_next_bundle's forward cursor: count of best-first positions that
     -- have been packed into a bundle at least once.  Positions
     -- [0, pack_cursor) may hold holes (reclaimed/republished, no current
@@ -211,6 +222,20 @@ CREATE TABLE IF NOT EXISTS active_branches (
 
 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
     ON active_branches(status, priority DESC, n_words DESC);
+
+-- Result channel for ceilinged (alpha-beta) cooperative solves that CUT: the
+-- score cache only carries exact optima, so a cut — "every candidate priced
+-- out at >= bound; true ERD of this branch is >= bound" — is delivered to
+-- waiting parents through this table instead.  A cut proven at `budget` is
+-- valid at any budget <= it (fewer guesses cannot beat the bound), mirroring
+-- the score cache's loss-reuse rule.  Transient coordination data: cleared on
+-- supervisor restart (reset_active_branches), never synced anywhere.
+CREATE TABLE IF NOT EXISTS cut_results (
+    branch_key BLOB    PRIMARY KEY,
+    budget     INTEGER NOT NULL,
+    bound      REAL    NOT NULL,
+    created_at INTEGER NOT NULL
+);
 
 -- One row per claimed candidate of a branch.  A row's existence is an
 -- ADVISORY claim ("a worker is probably evaluating this candidate"); only
@@ -366,7 +391,32 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     max_bundle_nodes        INTEGER,
     total_bundle_wall_millis INTEGER,
     censored_units          INTEGER,
+    -- Alpha-beta ceiling the branch was solved under; NULL = exact solve.
+    ceiling                 REAL,
+    -- How the solve ended: 'exact' (true optimum found — the only outcome
+    -- written to the score cache), 'cut' (every candidate priced out at
+    -- >= ceiling; lower bound only), 'loss' (proven unsolvable within budget).
+    -- The exact/cut split per (n_words, budget) is the payoff measurement for
+    -- ceiling propagation.
+    outcome                 TEXT,
     recorded_at             INTEGER NOT NULL
+);
+
+-- One row per re-solve forced by a cut: a consumer needed branch_key but the
+-- only known result was a cut whose bound (or budget validity) could not
+-- satisfy it.  The cost side of the ceiling-propagation ledger — how often a
+-- ceilinged solve's non-cacheability makes someone redo work.  wanted_ceiling
+-- NULL = the consumer needed an exact value.
+CREATE TABLE IF NOT EXISTS telemetry.cut_reuse_misses (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_key      BLOB,
+    n_words         INTEGER NOT NULL,
+    budget          INTEGER NOT NULL,
+    wanted_ceiling  REAL,
+    available_bound REAL    NOT NULL,
+    available_budget INTEGER NOT NULL,
+    epoch           INTEGER NOT NULL DEFAULT 0,
+    recorded_at     INTEGER NOT NULL
 );
 
 -- Per-candidate predicted-vs-actual work, collected under single-candidate
@@ -421,6 +471,7 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
 _TELEMETRY_TABLES = (
     "bundle_stats", "cost_samples", "claim_telemetry",
     "branch_finalize_log", "candidate_accuracy", "backstop_telemetry",
+    "cut_reuse_misses",
 )
 
 
@@ -632,6 +683,20 @@ class ERDQueue:
             "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
             "ON candidate_claims(branch_key, bundle_id)")
 
+        # Alpha-beta ceiling propagation: additive/nullable-default on both
+        # files.  Existing active_branches rows keep NULL ceiling (exact solve,
+        # the only regime that produced them) and cut_occurred 0; existing
+        # finalize-log rows keep NULL ceiling/outcome (all pre-ceiling rows
+        # were exact or loss, distinguishable offline via the score cache).
+        self._add_columns("active_branches", {
+            "ceiling": "REAL",
+            "cut_occurred": "INTEGER NOT NULL DEFAULT 0",
+        })
+        self._add_columns("branch_finalize_log", {
+            "ceiling": "REAL",
+            "outcome": "TEXT",
+        }, schema="telemetry")
+
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
         now = int(time.time())
@@ -693,18 +758,19 @@ class ERDQueue:
         finally:
             expected_conn.close()
 
-    def _add_columns(self, table: str, columns: dict):
+    def _add_columns(self, table: str, columns: dict, schema: str = "main"):
         """Idempotently ALTER TABLE ADD COLUMN for any of `columns` not present.
 
         columns maps name -> SQL type/constraint.  A NOT NULL column must carry a
-        DEFAULT so the add is safe on a populated table.
+        DEFAULT so the add is safe on a populated table.  schema selects the
+        database file ('main' = queue, 'telemetry' = the attached telemetry file).
         """
         have = {r["name"] for r in
-                self._conn.execute(f"PRAGMA table_info({table})")}
+                self._conn.execute(f"PRAGMA {schema}.table_info({table})")}
         for name, decl in columns.items():
             if name not in have:
                 self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    f"ALTER TABLE {schema}.{table} ADD COLUMN {name} {decl}")
 
     def close(self):
         self._conn.close()
@@ -875,7 +941,8 @@ class ERDQueue:
 
     def create_branch(self, branch_key, n_words, n_candidates,
                       priority=0, source_word=None, source_pattern=None,
-                      budget=None, spine=None, root_budget=None) -> bool:
+                      budget=None, spine=None, root_budget=None,
+                      ceiling=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
@@ -885,6 +952,12 @@ class ERDQueue:
         list).  budget is the guess budget for depth-limited ERD.  spine is the
         guesses played from the root to this branch (see the active_branches.spine
         column); None leaves the display to fall back to the source word.
+
+        ceiling is the alpha-beta ceiling the branch is solved under (NULL =
+        exact).  Immutable once set: a racing creator whose ceiling differs
+        must check the surviving row's ceiling for joinability (see
+        cooperative_solve) — the row is never relaxed in place, because done=1
+        claims made under a tighter ceiling would be unsound under a looser one.
 
         When root_budget is supplied alongside both budget and spine, the
         invariant budget + guess_depth = root_budget is enforced: a spine whose
@@ -902,10 +975,11 @@ class ERDQueue:
             INSERT OR IGNORE INTO active_branches
                 (branch_key, n_words, n_candidates,
                  priority, source_word, source_pattern, status, created_at,
-                 budget, spine)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                 budget, spine, ceiling)
+            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
         """, (branch_key, n_words, n_candidates,
-              priority, source_word, source_pattern, now, budget, spine))
+              priority, source_word, source_pattern, now, budget, spine,
+              ceiling))
         return cur.rowcount == 1
 
     def get_branch(self, branch_key):
@@ -986,12 +1060,17 @@ class ERDQueue:
             # scratch.  Checked inside the write transaction so it can't race
             # finalize+delete.
             br = self._conn.execute(
-                "SELECT status, best_erd, pack_cursor FROM active_branches "
+                "SELECT status, best_erd, pack_cursor, ceiling FROM active_branches "
                 "WHERE branch_key = ?", (branch_key,)).fetchone()
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
                 return None
-            bound = br["best_erd"] if br["best_erd"] is not None else float("inf")
+            # The branch ceiling is a bound like any achieved best: candidates
+            # whose lower bound reaches it are provably pruned for free, so the
+            # packer classifies against the tighter of the two.
+            bound = min(
+                br["best_erd"] if br["best_erd"] is not None else float("inf"),
+                br["ceiling"] if br["ceiling"] is not None else float("inf"))
             cursor = br["pack_cursor"]
             if cursor < n_candidates:
                 # start < len(candidate_order) and count_cap >= 1 together
@@ -1200,13 +1279,17 @@ class ERDQueue:
         """, (best_erd, best_guess, max_depth, branch_key, best_erd))
 
     def read_branch_best(self, branch_key):
-        """Return (best_guess, best_erd) or (None, None)."""
+        """Return (best_guess, best_erd, ceiling) or (None, None, None).
+
+        ceiling is the branch's alpha-beta ceiling (None = exact solve): a
+        bound source alongside best_erd — a candidate priced out against it is
+        a cut, not a loss."""
         row = self._conn.execute(
-            "SELECT best_guess, best_erd FROM active_branches WHERE branch_key = ?",
-            (branch_key,)).fetchone()
+            "SELECT best_guess, best_erd, ceiling FROM active_branches "
+            "WHERE branch_key = ?", (branch_key,)).fetchone()
         if row is None:
-            return (None, None)
-        return (row["best_guess"], row["best_erd"])
+            return (None, None, None)
+        return (row["best_guess"], row["best_erd"], row["ceiling"])
 
     def mark_branch_tainted(self, branch_key):
         """Set the branch's taint flag (monotone OR): some candidate, in some
@@ -1216,16 +1299,72 @@ class ERDQueue:
             "UPDATE active_branches SET tainted = 1 WHERE branch_key = ?",
             (branch_key,))
 
+    def mark_branch_cut(self, branch_key):
+        """Set the branch's cut flag (monotone OR): some candidate priced out
+        at >= the bound rather than being proven infeasible.  At finalize with
+        no best_guess this distinguishes a CUT (>= ceiling) from a proven loss."""
+        self._conn.execute(
+            "UPDATE active_branches SET cut_occurred = 1 WHERE branch_key = ?",
+            (branch_key,))
+
     def read_branch_meta(self, branch_key):
-        """Return (best_guess, best_erd, best_max_depth, tainted, budget) or
-        None — everything finalize needs to write a depth-limited cache entry."""
+        """Return (best_guess, best_erd, best_max_depth, tainted, budget,
+        ceiling, cut_occurred) or None — everything finalize needs to triage
+        exact / cut / loss and write the exact case to the cache."""
         row = self._conn.execute(
-            "SELECT best_guess, best_erd, best_max_depth, tainted, budget "
+            "SELECT best_guess, best_erd, best_max_depth, tainted, budget, "
+            "ceiling, cut_occurred "
             "FROM active_branches WHERE branch_key = ?", (branch_key,)).fetchone()
         if row is None:
             return None
         return (row["best_guess"], row["best_erd"], row["best_max_depth"],
-                bool(row["tainted"]), row["budget"])
+                bool(row["tainted"]), row["budget"], row["ceiling"],
+                bool(row["cut_occurred"]))
+
+    def add_cut_result(self, branch_key, budget, bound):
+        """Publish a ceilinged solve's CUT: the branch's true ERD at `budget`
+        is proven >= bound.  INSERT OR REPLACE: a newer cut for the same branch
+        supersedes (bounds from different ceilings are all true; the latest is
+        the one current waiters are waiting for)."""
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT OR REPLACE INTO cut_results (branch_key, budget, bound, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (branch_key, budget, bound, now))
+
+    def read_cut_result(self, branch_key):
+        """Return (bound, budget) of the branch's recorded cut, or None.
+
+        The caller applies the validity rules: the bound holds at any budget
+        <= the recorded one (fewer guesses cannot beat it), and satisfies a
+        consumer whose ceiling is <= bound."""
+        row = self._conn.execute(
+            "SELECT bound, budget FROM cut_results WHERE branch_key = ?",
+            (branch_key,)).fetchone()
+        if row is None:
+            return None
+        return (row["bound"], row["budget"])
+
+    def has_pending_row(self, branch_key) -> bool:
+        """True if the branch is user-queued (has a pending_branches row in any
+        status).  A user-queued branch always has an exact-result consumer, so
+        it is never solved under a ceiling."""
+        return self._conn.execute(
+            "SELECT 1 FROM pending_branches WHERE branch_key = ? LIMIT 1",
+            (branch_key,)).fetchone() is not None
+
+    def requeue_pending(self, branch_key) -> bool:
+        """Flip an in-flight pending_branches row back to 'pending'.
+
+        Called instead of mark_done when a branch finalizes as a CUT: the cut
+        satisfies the promoting parent but a user-queued row wants an exact
+        result, which was not produced.  Returns True if a row was reset."""
+        cur = self._conn.execute("""
+            UPDATE pending_branches
+            SET status = 'pending', claimed_by = NULL, claimed_at = NULL
+            WHERE branch_key = ? AND status != 'done'
+        """, (branch_key,))
+        return cur.rowcount > 0
 
     def branch_done_candidates(self, branch_key) -> int:
         return self._conn.execute(
@@ -1343,6 +1482,11 @@ class ERDQueue:
         self._conn.execute(f"DELETE FROM candidate_republish WHERE {member}")
         self._conn.execute(f"DELETE FROM telemetry.bundle_stats WHERE {member}")
         self._conn.execute(f"DELETE FROM active_branches WHERE {member}")
+        # Cut results are a delivery channel to waiting parents, and a restart
+        # killed every waiter.  The bounds are still true, but stale rows would
+        # short-circuit future ceilinged solves against ceilings nobody asked
+        # for yet; drop them and let the new run derive its own.
+        self._conn.execute("DELETE FROM cut_results")
         # Free stale in-flight claims on cooperative branches so their
         # remaining candidates are reclaimable as gaps.
         self._conn.execute(
@@ -1937,14 +2081,16 @@ class ERDQueue:
     def add_branch_finalize_log(self, branch_key, spine, n_words, budget,
                                 created_at, finalized_at, nodes_spent, n_claims,
                                 n_bundles=None, max_bundle_nodes=None,
-                                total_bundle_wall_millis=None, censored_units=None):
+                                total_bundle_wall_millis=None, censored_units=None,
+                                ceiling=None, outcome=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
         total_bundle_wall_millis, censored_units) come from
         finalize_bundle_stats; they stay NULL when the caller doesn't pass
         them (a branch solved entirely from reused cache entries never
-        claims a bundle).
+        claims a bundle).  ceiling is the alpha-beta ceiling the branch was
+        solved under (NULL = exact solve); outcome is 'exact', 'cut', or 'loss'.
         """
         now = int(time.time())
         self._conn.execute("""
@@ -1952,11 +2098,26 @@ class ERDQueue:
                 (branch_key, spine, n_words, budget, epoch, created_at,
                  finalized_at, nodes_spent, n_claims, n_bundles,
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
-                 recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ceiling, outcome, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
-              total_bundle_wall_millis, censored_units, now))
+              total_bundle_wall_millis, censored_units, ceiling, outcome, now))
+
+    def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
+                           available_bound, available_budget):
+        """Log a re-solve forced by a cut: a consumer needed this branch but
+        the recorded cut could not satisfy it (bound too low for the consumer's
+        ceiling, or proven at a smaller budget than the consumer's).
+        wanted_ceiling None = the consumer needed an exact value."""
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO telemetry.cut_reuse_misses
+                (branch_key, n_words, budget, wanted_ceiling, available_bound,
+                 available_budget, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (branch_key, n_words, budget, wanted_ceiling, available_bound,
+              available_budget, self.epoch, now))
 
     def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
                                bound_erd, candidate_cost_lower_bound,
@@ -2013,7 +2174,7 @@ class ERDQueue:
         self._conn.execute("""
             INSERT INTO telemetry.backstop_telemetry
                 (n_words, budget, elapsed_millis, nodes, predicted_nodes,
-                 remaining_candidates, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 remaining_candidates, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, budget, elapsed_millis, nodes, predicted_nodes,
-              remaining_candidates, now))
+              remaining_candidates, self.epoch, now))

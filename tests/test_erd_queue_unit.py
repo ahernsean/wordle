@@ -103,7 +103,7 @@ class TestBranchLifecycle(_TmpQueue):
     def test_update_branch_best_sets_value(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self.q.update_branch_best(self.key, "crane", 2.0, max_depth=3)
-        guess, erd = self.q.read_branch_best(self.key)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
         self.assertEqual(guess, "crane")
         self.assertAlmostEqual(erd, 2.0)
 
@@ -111,12 +111,12 @@ class TestBranchLifecycle(_TmpQueue):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self.q.update_branch_best(self.key, "crane", 2.0)
         self.q.update_branch_best(self.key, "slate", 3.0)  # worse — must be rejected
-        guess, erd = self.q.read_branch_best(self.key)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
         self.assertEqual(guess, "crane")
         self.assertAlmostEqual(erd, 2.0)
 
     def test_read_branch_best_returns_none_none_for_missing_key(self):
-        self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None))
+        self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))
 
     def test_mark_branch_tainted_sets_flag(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
@@ -526,6 +526,166 @@ class TestCostModel(_TmpQueue):
         # so this guard is the only valid path for zero or negative inputs.
         self.assertEqual(cost_size_bucket(0), 0)
         self.assertEqual(cost_size_bucket(-5), 0)
+
+
+class TestBranchCeiling(_TmpQueue):
+    """The active_branches.ceiling column: stored at create, immutable, read
+    back by read_branch_best / read_branch_meta, and flagged by
+    mark_branch_cut."""
+
+    def test_create_branch_stores_ceiling(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=4,
+                             ceiling=2.5)
+        _, _, ceiling = self.q.read_branch_best(self.key)
+        self.assertAlmostEqual(ceiling, 2.5)
+
+    def test_create_branch_default_ceiling_is_null(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=4)
+        _, _, ceiling = self.q.read_branch_best(self.key)
+        self.assertIsNone(ceiling)
+
+    def test_racing_create_does_not_overwrite_ceiling(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=4,
+                             ceiling=2.5)
+        created = self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                                       budget=4, ceiling=9.0)
+        self.assertFalse(created)
+        _, _, ceiling = self.q.read_branch_best(self.key)
+        self.assertAlmostEqual(ceiling, 2.5)
+
+    def test_mark_branch_cut_sets_flag_in_meta(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=4,
+                             ceiling=2.5)
+        meta = self.q.read_branch_meta(self.key)
+        self.assertAlmostEqual(meta[5], 2.5)   # ceiling
+        self.assertFalse(meta[6])              # cut_occurred
+        self.q.mark_branch_cut(self.key)
+        self.q.mark_branch_cut(self.key)       # monotone — still set
+        self.assertTrue(self.q.read_branch_meta(self.key)[6])
+
+
+class TestCutResults(_TmpQueue):
+    """cut_results: the delivery channel for ceilinged solves that ended as a
+    lower bound instead of an exact optimum."""
+
+    def test_round_trip(self):
+        self.q.add_cut_result(self.key, budget=4, bound=2.5)
+        self.assertEqual(self.q.read_cut_result(self.key), (2.5, 4))
+
+    def test_missing_key_reads_none(self):
+        self.assertIsNone(self.q.read_cut_result(b"notakey"))
+
+    def test_replace_supersedes(self):
+        self.q.add_cut_result(self.key, budget=4, bound=2.5)
+        self.q.add_cut_result(self.key, budget=5, bound=3.0)
+        self.assertEqual(self.q.read_cut_result(self.key), (3.0, 5))
+
+    def test_reset_active_branches_clears_cut_results(self):
+        self.q.add_cut_result(self.key, budget=4, bound=2.5)
+        self.q.reset_active_branches()
+        self.assertIsNone(self.q.read_cut_result(self.key))
+
+
+class TestPendingRowHelpers(_TmpQueue):
+    """has_pending_row / requeue_pending: the user-queued (exact-consumer)
+    guards around ceilinged promotion."""
+
+    def _queue_pending(self):
+        self.q.add_pending_many(
+            [(self.key, len(WORDS), 1, "crane", 0)])
+
+    def test_has_pending_row(self):
+        self.assertFalse(self.q.has_pending_row(self.key))
+        self._queue_pending()
+        self.assertTrue(self.q.has_pending_row(self.key))
+
+    def test_requeue_pending_resets_in_progress(self):
+        self._queue_pending()
+        claimed = self.q.claim_next("worker-0")
+        self.assertEqual(bytes(claimed["branch_key"]), self.key)
+        self.assertIsNone(self.q.claim_next("worker-1"))  # in_progress: unclaimable
+        self.assertTrue(self.q.requeue_pending(self.key))
+        reclaimed = self.q.claim_next("worker-1")
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(bytes(reclaimed["branch_key"]), self.key)
+
+    def test_requeue_pending_leaves_done_rows(self):
+        self._queue_pending()
+        self.q.claim_next("worker-0")
+        self.q.mark_done(self.key)
+        self.assertFalse(self.q.requeue_pending(self.key))
+        self.assertIsNone(self.q.claim_next("worker-1"))
+
+    def test_requeue_pending_noop_without_row(self):
+        self.assertFalse(self.q.requeue_pending(self.key))
+
+
+class TestCeilingTelemetry(_TmpQueue):
+    """The ceiling/outcome columns on branch_finalize_log, the
+    cut_reuse_misses table, and the backstop epoch stamp."""
+
+    def test_finalize_log_records_ceiling_and_outcome(self):
+        self.q.add_branch_finalize_log(
+            self.key, "SALET -g-g-", len(WORDS), 4, 100, 200, 5000, 3,
+            ceiling=2.5, outcome="cut")
+        row = self.q._conn.execute(
+            "SELECT ceiling, outcome FROM telemetry.branch_finalize_log"
+        ).fetchone()
+        self.assertAlmostEqual(row["ceiling"], 2.5)
+        self.assertEqual(row["outcome"], "cut")
+
+    def test_cut_reuse_miss_row(self):
+        self.q.set_epoch(7)
+        self.q.add_cut_reuse_miss(self.key, len(WORDS), 4,
+                                  wanted_ceiling=None,
+                                  available_bound=2.5, available_budget=5)
+        row = self.q._conn.execute(
+            "SELECT n_words, budget, wanted_ceiling, available_bound, "
+            "available_budget, epoch FROM telemetry.cut_reuse_misses").fetchone()
+        self.assertEqual(row["n_words"], len(WORDS))
+        self.assertEqual(row["budget"], 4)
+        self.assertIsNone(row["wanted_ceiling"])
+        self.assertAlmostEqual(row["available_bound"], 2.5)
+        self.assertEqual(row["available_budget"], 5)
+        self.assertEqual(row["epoch"], 7)
+
+    def test_backstop_telemetry_stamps_epoch(self):
+        self.q.set_epoch(7)
+        self.q.add_backstop_telemetry(30, 4, 61000, 12345, None, 9)
+        row = self.q._conn.execute(
+            "SELECT epoch FROM telemetry.backstop_telemetry").fetchone()
+        self.assertEqual(row["epoch"], 7)
+
+
+class TestPackerUsesCeilingBound(_TmpQueue):
+    """claim_next_bundle classifies candidates against min(best_erd, ceiling):
+    on a fresh ceilinged branch with no achieved best, candidates whose lower
+    bound reaches the ceiling are provably-pruned freebies, so the first
+    bundle is a bulk sweep instead of a small_count-limited survivor bundle."""
+
+    def test_ceiling_packs_provably_pruned_candidates_together(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=4,
+                             ceiling=1.5)
+        lower_bounds = [2.0] * N_CANDIDATES
+        claim = self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER, lower_bounds,
+            small_count=2, count_cap=N_CANDIDATES)
+        self.assertIsNotNone(claim)
+        _, indices, _ = claim
+        self.assertEqual(len(indices), N_CANDIDATES)
+
+    def test_no_ceiling_same_bounds_pack_small_bundle(self):
+        # Contrast case: identical lower bounds but no ceiling — nothing is
+        # provably pruned against an infinite bound, so the packer stops at
+        # small_count survivors.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=4)
+        lower_bounds = [2.0] * N_CANDIDATES
+        claim = self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER, lower_bounds,
+            small_count=2, count_cap=N_CANDIDATES)
+        self.assertIsNotNone(claim)
+        _, indices, _ = claim
+        self.assertEqual(len(indices), 2)
 
 
 if __name__ == "__main__":

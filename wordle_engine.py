@@ -1351,9 +1351,13 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     # Recursive parallelism: on a cache miss, offer this sub-branch to the
     # swarm.  The solver decides (by size) whether to solve it cooperatively
     # across workers (returns a result) or decline (None) so we solve inline.
-    # Correctness-neutral: a solver that inlines yields the identical ERD.
+    # The frame's alpha-beta ceiling travels with the offer: a cooperative
+    # solve prunes against it exactly as this frame would inline, and may
+    # return a cut (OVER_ERD_LIMIT, bound, None, floor) — the same tuple an
+    # inline all-cutoff loop produces below.  Correctness-neutral either way:
+    # a solver that inlines yields the identical ERD.
     if subbranch_solver is not None:
-        delegated = subbranch_solver(branch_words, budget)
+        delegated = subbranch_solver(branch_words, budget, ceiling)
         if delegated is not None:
             if note_depth is not None:
                 note_depth(budget, -n, None, None)  # sentinel: this level was promoted
