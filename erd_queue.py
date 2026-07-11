@@ -31,9 +31,6 @@ logger = logging.getLogger(__name__)
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
 _COST_MODEL_MIN_WEIGHT = 1.0
-# Sentinel budget for the cost_model cell that aggregates samples across all
-# budgets — the warm cross-budget fallback for a still-cold (size, budget) cell.
-_AGGREGATE_BUDGET = -1
 
 # Geometric size bucketing.  Sub-branch sizes are sparse and heavy-tailed, so a
 # bucket per exact word-count would almost never accumulate enough samples to
@@ -260,10 +257,8 @@ CREATE TABLE IF NOT EXISTS candidate_republish (
 -- Per-size-bucket online cost model (time-weighted geometric mean of
 -- recursion-node cost).  Keyed by (policy, size_bucket, budget): the same word
 -- count costs very different node totals at different remaining-guess budgets,
--- so budget is part of the key.  budget = -1 is the budget-aggregate accumulator
--- (every sample also folds into it), read as a warm fallback when a specific
--- (size_bucket, budget) bucket is still cold.  policy keeps ERD_ALL and
--- ERD_ANSWERS models from cross-contaminating.
+-- so budget is part of the key.  policy keeps ERD_ALL and ERD_ANSWERS models
+-- from cross-contaminating.
 CREATE TABLE IF NOT EXISTS cost_model (
     policy           TEXT    NOT NULL,
     size_bucket      INTEGER NOT NULL,
@@ -591,9 +586,9 @@ class ERDQueue:
         # cost_model re-key: (policy, size_bucket) -> (policy, size_bucket, budget).
         # The same word count costs very different node totals at different
         # budgets, so the old single-budget bucket conflated them.  Rebuild with
-        # budget in the key; existing accumulators carry across as the budget = -1
-        # aggregate (every new sample still folds into -1, so the prior model
-        # stays warm as a fallback and packing is not cold at cutover).
+        # budget in the key; existing accumulators carry across at budget = -1,
+        # a placeholder value no longer read by any query — the pre-rekey model
+        # is retired and re-warms per budget from fresh samples.
         cm_cols = {r["name"] for r in
                    self._conn.execute("PRAGMA table_info(cost_model)")}
         if cm_cols and "budget" not in cm_cols:
@@ -1785,55 +1780,40 @@ class ERDQueue:
     # Cost model (online time-weighted geometric mean per size bucket)
     # ------------------------------------------------------------------
 
-    def _cost_bucket_row(self, policy: str, n_words: int, budget):
-        """The cost_model accumulators for one (policy, size_bucket, budget) cell.
-
-        budget = _AGGREGATE_BUDGET (-1) reads the budget-aggregate accumulator
-        every sample also folds into.
-        """
+    def _cost_bucket_row(self, policy: str, n_words: int, budget: int):
+        """The cost_model accumulators for one (policy, size_bucket, budget) cell."""
         return self._conn.execute(
             "SELECT weighted_log_sum, weight_sum, weighted_log_sq, last_updated "
             "FROM cost_model WHERE policy = ? AND size_bucket = ? AND budget = ?",
             (policy, cost_size_bucket(n_words), budget)).fetchone()
 
-    def _warm_bucket_row(self, policy: str, n_words: int, budget):
-        """Warm accumulators for n_words at `budget`, or None.
-
-        Reads the specific (size_bucket, budget) cell when budget is given and
-        falls back to the budget-aggregate (-1) cell when that cell is cold.
-        budget=None reads the aggregate directly.
-        """
-        if budget is not None:
-            row = self._cost_bucket_row(policy, n_words, budget)
-            if row is not None and row['weight_sum'] >= _COST_MODEL_MIN_WEIGHT:
-                return row
-        row = self._cost_bucket_row(policy, n_words, _AGGREGATE_BUDGET)
+    def _warm_bucket_row(self, policy: str, n_words: int, budget: int):
+        """Warm accumulators for n_words at `budget`, or None when cold."""
+        row = self._cost_bucket_row(policy, n_words, budget)
         if row is None or row['weight_sum'] < _COST_MODEL_MIN_WEIGHT:
             return None
         return row
 
-    def get_cost_typical(self, policy: str, n_words: int, budget=None):
+    def get_cost_typical(self, policy: str, n_words: int, budget: int):
         """Geometric-mean node count for n_words at `budget`, or None when cold.
 
-        The estimate is exp(weighted_log_sum / weight_sum).  budget keys the model
-        on remaining-guess budget; a cold (size_bucket, budget) cell falls back to
-        the budget-aggregate, and a cold aggregate returns None so the caller can
-        use a size-based heuristic.
+        The estimate is exp(weighted_log_sum / weight_sum).  budget keys the
+        model on remaining-guess budget; a cold (size_bucket, budget) cell
+        returns None so the caller can use a size-based heuristic.
         """
         row = self._warm_bucket_row(policy, n_words, budget)
         if row is None:
             return None
         return math.exp(row['weighted_log_sum'] / row['weight_sum'])
 
-    def get_cost_spread(self, policy: str, n_words: int, budget=None):
+    def get_cost_spread(self, policy: str, n_words: int, budget: int):
         """Std-dev of ln(nodes) for n_words at `budget` (log-normal sigma), or None.
 
         Recovered from the stored second log-moment:
             sigma^2 = weighted_log_sq/weight_sum - mu^2
         Round-off can make this marginally negative when every sample is equal;
-        clamp to 0.  Same (size_bucket, budget) -> aggregate fallback as
-        get_cost_typical.  Used for the over-promotion shade exp(mu - Z*sigma) and
-        for offline distribution analysis.
+        clamp to 0.  Used for the over-promotion shade exp(mu - Z*sigma) and for
+        offline distribution analysis.
         """
         row = self._warm_bucket_row(policy, n_words, budget)
         if row is None:
@@ -1842,15 +1822,15 @@ class ERDQueue:
         var = row['weighted_log_sq'] / row['weight_sum'] - mu * mu
         return math.sqrt(var) if var > 0 else 0.0
 
-    def update_cost_model(self, policy: str, n_words: int, nodes: int,
-                          weight: float = 1.0, now: int = None, budget=None):
-        """Fold one node-cost sample (value `nodes`, multiplicity `weight`).
+    def update_cost_model(self, policy: str, n_words: int, nodes: int, *,
+                          budget: int, weight: float = 1.0, now: int = None):
+        """Fold one node-cost sample (value `nodes`, multiplicity `weight`)
+        into the (policy, size_bucket, budget) cell.
 
         weight > 1 records `weight` identical samples of `nodes` in one call.
         For a batch of *distinct* samples whose individual magnitudes matter to
         the spread, use update_cost_model_logsums so each sample reaches the
-        second log-moment without a lossy pre-averaging collapse.  budget, when
-        given, also keys a (size_bucket, budget) cell in addition to the aggregate.
+        second log-moment without a lossy pre-averaging collapse.
         """
         if nodes <= 0 or weight <= 0:
             return
@@ -1860,8 +1840,9 @@ class ERDQueue:
 
     def update_cost_model_logsums(self, policy: str, n_words: int,
                                   log_sum: float, log_sq_sum: float,
-                                  weight: float, now: int = None, budget=None):
-        """Fold a pre-summed batch of log samples: (Σ ln x, Σ ln²x, count).
+                                  weight: float, *, budget: int, now: int = None):
+        """Fold a pre-summed batch of log samples: (Σ ln x, Σ ln²x, count) into
+        the (policy, size_bucket, budget) cell.
 
         The worker's inline-sample buffer accumulates these sums directly, so the
         batch contributes to weighted_log_sum and weighted_log_sq exactly as if
@@ -1877,13 +1858,8 @@ class ERDQueue:
         if now is None:
             now = int(time.time())
         bucket = cost_size_bucket(n_words)
-        # Every sample feeds the budget-aggregate (-1) cell so it stays a warm
-        # cross-budget fallback; a known budget additionally feeds its own cell.
-        self._fold_one(policy, bucket, _AGGREGATE_BUDGET,
+        self._fold_one(policy, bucket, budget,
                        d_log_sum, d_log_sq, d_weight, now)
-        if budget is not None and budget != _AGGREGATE_BUDGET:
-            self._fold_one(policy, bucket, budget,
-                           d_log_sum, d_log_sq, d_weight, now)
 
     def _fold_one(self, policy, bucket, budget, d_log_sum, d_log_sq, d_weight, now):
         row = self._conn.execute(
