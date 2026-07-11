@@ -271,3 +271,8 @@ them. If you are finding you are running short on tokens, reduce your work.
 
 Err on the side of writing scripts to process data instead of consuming tokens
 reading output files in their entirety yourself.
+
+## Other info
+If you are on the rocky machine, you can find other agent memory files in:
+
+/home/ahern/.claude/projects/-home-ahern-work-wordle/memory/
