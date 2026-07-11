@@ -85,9 +85,11 @@ values, and a false child loss reads as "no strategy" to every parent above it.
 
 - **Not a flush.**  No rows are deleted up front; corrections are surgical.
 - **Not the June pass.**  That pass (reclaim-while-alive bug, commit `774ac29`)
-  was executed to completion; this plan supersedes its document.  The
+  was executed to completion; its document (`erd_reverification_plan.md`) is
+  deleted alongside this file's introduction and lives on in git history.  The
   contamination window, the false-loss class, and pass 1 are new; pass 2
-  reuses the June tool unchanged in role.
+  reuses the June tool (`verify_erd_cache.py`) unchanged in role — the script
+  stays in the repository because this plan runs it again.
 - **Not part of PR #115.**  The fix prevents new contamination; this is the
   cleanup of what epochs 3–4 may have left behind.
 
