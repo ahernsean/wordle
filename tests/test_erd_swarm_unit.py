@@ -1521,26 +1521,45 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
     def test_join_refused_when_existing_ceiling_tighter(self):
         w = self._worker()
         w.queue.create_branch.return_value = False
-        w.queue.get_branch.return_value = {"ceiling": 2.0}
+        w.queue.get_branch.return_value = {"ceiling": 2.0, "budget": 4}
         self.assertIsNone(w.cooperative_solve(BRANCH, 4, ceiling=2.5))
 
     def test_join_refused_for_exact_consumer_on_ceilinged_branch(self):
         w = self._worker()
         w.queue.create_branch.return_value = False
-        w.queue.get_branch.return_value = {"ceiling": 2.0}
+        w.queue.get_branch.return_value = {"ceiling": 2.0, "budget": 4}
         self.assertIsNone(w.cooperative_solve(BRANCH, 4))
+
+    def test_join_refused_when_existing_budget_smaller(self):
+        # The waiter regression from review: a budget-5 consumer must not wait
+        # on a budget-4 branch — its cut or loss proves nothing at budget 5,
+        # and the deleted-branch exit would misreport a loss.
+        w = self._worker()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 4}
+        self.assertIsNone(w.cooperative_solve(BRANCH, 5, ceiling=2.5))
+        self.assertIsNone(w.cooperative_solve(BRANCH, 5))
+
+    def test_join_refused_when_existing_budget_larger(self):
+        # A tainted exact solved at budget 5 is not reusable at budget 4, so
+        # a budget-4 waiter on a budget-5 branch can also fall through the
+        # deleted-branch exit to a spurious loss.
+        w = self._worker()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
+        self.assertIsNone(w.cooperative_solve(BRANCH, 4, ceiling=2.5))
 
     def test_join_allowed_when_existing_ceiling_looser(self):
         w = self._worker()
         w.queue.create_branch.return_value = False
-        w.queue.get_branch.return_value = {"ceiling": 3.0}
+        w.queue.get_branch.return_value = {"ceiling": 3.0, "budget": 4}
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         self.assertIsNotNone(result)   # proceeded to the loop (cancelled out)
 
     def test_join_allowed_on_exact_branch(self):
         w = self._worker()
         w.queue.create_branch.return_value = False
-        w.queue.get_branch.return_value = {"ceiling": None}
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 4}
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         self.assertIsNotNone(result)
 
@@ -1661,14 +1680,25 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
     def test_race_to_exact_branch_skips_prefix_marks(self):
         pub, w, token = self._overrunning()
         w.queue.create_branch.return_value = False
-        w.queue.get_branch.return_value = {"ceiling": None}
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
         pub.check(token, CANDIDATES, 1, None, 2.5, 5)
         w.queue.mark_claims_done.assert_not_called()
+
+    def test_race_to_other_budget_skips_marks_and_seed(self):
+        # Everything the prefix proved, it proved at the frame's budget: a
+        # raced row at another budget takes neither the done-marks nor the
+        # achieved-best seed.
+        pub, w, token = self._overrunning()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": 2.5, "budget": 4}
+        pub.check(token, CANDIDATES, 1, "crane", 1.8, 5)
+        w.queue.mark_claims_done.assert_not_called()
+        w.queue.update_branch_best.assert_not_called()
 
     def test_race_to_tighter_ceiling_keeps_prefix_marks(self):
         pub, w, token = self._overrunning()
         w.queue.create_branch.return_value = False
-        w.queue.get_branch.return_value = {"ceiling": 2.0}
+        w.queue.get_branch.return_value = {"ceiling": 2.0, "budget": 5}
         pub.check(token, CANDIDATES, 1, None, 2.5, 5)
         w.queue.mark_claims_done.assert_called_once()
 

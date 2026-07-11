@@ -299,22 +299,29 @@ class _MidLoopPublisher:
         # slice is built here — only when an overrun actually fires — not on
         # every loop iteration.
         #
-        # Soundness of the marks depends on what the prefix was priced against:
-        # - an achieved best (best_guess set): sound for any branch — the seed
-        #   below caps the branch's final value at that best, and every marked
-        #   candidate is proven >= it;
+        # Everything the prefix proved, it proved at THIS frame's budget: a
+        # raced row at another budget can take neither the done-marks nor the
+        # best seed (feasibility and cost are budget-specific).  With the
+        # budget matched, soundness of the marks depends on what the prefix
+        # was priced against:
+        # - an achieved best (best_guess set): sound — the seed below caps the
+        #   branch's final value at that best, and every marked candidate is
+        #   proven >= it;
         # - nothing (best_erd == inf): the prefix was exhausted or infeasible,
         #   which no bound can manufacture — sound anywhere;
         # - the entry ceiling: sound only on a branch whose own ceiling is <=
         #   ours (its outcomes then never contradict a >= ours price-out).  A
         #   racing creator may have won with a looser or absent ceiling — skip
         #   the marks then and let the branch redo the prefix.
-        if frame_ceilinged:
-            if created:
-                row_ceiling = branch_ceiling
-            else:
-                row = self._worker.queue.get_branch(branch_key)
-                row_ceiling = row['ceiling'] if row is not None else None
+        if created:
+            row_budget, row_ceiling = budget, branch_ceiling
+        else:
+            row = self._worker.queue.get_branch(branch_key)
+            row_budget = row['budget'] if row is not None else None
+            row_ceiling = row['ceiling'] if row is not None else None
+        if row_budget != budget:
+            sound_to_mark = False
+        elif frame_ceilinged:
             sound_to_mark = row_ceiling is not None and row_ceiling <= best_erd
         else:
             sound_to_mark = True
@@ -325,10 +332,11 @@ class _MidLoopPublisher:
             if done_indices:
                 self._worker.queue.mark_claims_done(branch_key, done_indices)
 
-        # Seed the cooperative branch's bound only when we have an achieved cost —
-        # a None best_guess means no feasible candidate yet (the entry ceiling,
-        # if any, rides on the branch's ceiling column instead).
-        if best_guess is not None:
+        # Seed the cooperative branch's bound only when we have an achieved cost
+        # (a None best_guess means no feasible candidate yet — the entry
+        # ceiling, if any, rides on the branch's ceiling column instead), and
+        # only at the matching budget: the seed is a budget-specific value.
+        if best_guess is not None and row_budget == budget:
             self._worker.queue.update_branch_best(branch_key, best_guess, best_erd)
 
         return self._worker.cooperative_solve(
@@ -1361,13 +1369,22 @@ class _BranchWorker:
                 spine=child_spine, root_budget=self.root_budget,
                 ceiling=branch_ceiling)
             if not created:
-                # Raced or joined an existing branch: its ceiling decides
-                # joinability.  NULL (exact) or >= ours: every outcome it can
-                # produce satisfies us.  Tighter than ours (including any
-                # finite ceiling when we need exact): its cut would prove less
-                # than we need — decline, and the engine inlines this frame.
+                # Raced or joined an existing branch: its budget and ceiling
+                # decide joinability.  The budget must match exactly — every
+                # exit of the wait loop assumes the branch's outcome speaks
+                # for OUR budget: a cut or loss proven at a smaller budget
+                # says nothing at a larger one, and a tainted exact solved at
+                # a different budget is not reusable at ours; either way the
+                # deleted-branch exit below would misreport a loss.  The
+                # ceiling must be NULL (exact) or >= ours: every outcome such
+                # a branch can produce satisfies us, while a tighter one
+                # (including any finite ceiling when we need exact) could cut
+                # having proven less than we need.  Decline both — the engine
+                # inlines this frame, always correct, just unshared.
                 row = self.queue.get_branch(branch_key)
                 if row is not None:
+                    if row['budget'] != budget:
+                        return None
                     row_ceiling = row['ceiling']
                     ours = None if ceiling == float('inf') else ceiling
                     if row_ceiling is not None and (
