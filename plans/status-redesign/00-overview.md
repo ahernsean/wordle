@@ -19,7 +19,7 @@ with no other context.
    find in the code (a function is missing, a signature differs), **stop and
    report the discrepancy** — do not improvise a workaround.
 5. **Run the full test suite before committing**:
-   `python -m unittest discover -s . -p 'test_*.py'`
+   `python -m unittest discover -s tests -t . -p 'test_*.py'`
    All tests must pass, including the new ones the phase requires.
 6. A phase is done when every item in its "Acceptance checklist" is true.
 

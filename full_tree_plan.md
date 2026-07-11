@@ -332,7 +332,7 @@ record the answer next to it when known.
    SWARM.md: stop supervisor → verify workers gone → deploy → start. Sections
    that change node *timing* (§4, §5, §6) additionally bump the telemetry
    epoch (C3 rule 4). Never let old workers outlive an engine change.
-6. **Tests before push.** `python -m unittest discover -s . -p 'test_*.py'`
+6. **Tests before push.** `python -m unittest discover -s tests -t . -p 'test_*.py'`
    green before every pushed commit. New behaviour ⇒ new tests in the same
    commit.
 7. **Vocabulary and naming.** CLAUDE.md rules apply to every new identifier:

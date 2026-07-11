@@ -13,7 +13,7 @@ from collections import defaultdict
 from unittest import mock
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wordle_engine import (
     Solution, ScoringMethod, ResponseCache,

@@ -240,7 +240,7 @@ Required test cases:
 - [ ] `erd_search.py` no longer defines `_branch_id`, `_parse_spine`, or
       `WORKER_LIVENESS_SECONDS`; it imports them from `status_model` (with the
       underscore aliases shown above).
-- [ ] `python -m unittest discover -s . -p 'test_*.py'` passes, including the
+- [ ] `python -m unittest discover -s tests -t . -p 'test_*.py'` passes, including the
       untouched `test_status_sections.py` and the new `test_status_model.py`.
 - [ ] `python -c "import json, status_model; print(json.dumps(status_model.collect_status('erd_queue.sqlite3','wordle_cache.sqlite3'), indent=2)[:500])"`
       runs without error (with or without live databases present).

@@ -1184,7 +1184,6 @@ class TestSubbranchSolverCostModel(unittest.TestCase):
         result = w._subbranch_solver(words, budget=5)
         self.assertEqual(result, expected)
 
-
 class TestLogEMA(unittest.TestCase):
     """_LogEMA: edge cases for add() and value()."""
 

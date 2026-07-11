@@ -156,7 +156,7 @@ Always update the PR title and description when pushing new commits.
 Always run the test suite before committing and pushing:
 
 ```
-python -m unittest discover -s . -p 'test_*.py'
+python -m unittest discover -s tests -t . -p 'test_*.py'
 ```
 
 Commits with failing tests must not be pushed.
