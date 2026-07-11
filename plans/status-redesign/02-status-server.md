@@ -18,7 +18,7 @@ snapshot so the client can be developed and demoed without a live swarm.
 
 - `status_server.py` — new
 - `status_fixture.json` — new (hand-written sample snapshot)
-- `test_status_server.py` — new
+- `tests/test_status_server.py` — new
 - `status_client.html` — new, but as a **placeholder only** (single line of
   text such as `Status client arrives in phase 3.` inside a `<p>` tag); phase 3
   replaces it.
@@ -38,9 +38,11 @@ GET /api/status   The snapshot from status_model.collect_status(), as JSON.
                   With --fixture, the fixture file's contents verbatim instead.
 GET /             status_client.html, served from this file's directory.
 
-Each request opens fresh read-only SQLite connections (inside collect_status),
-so the threading server needs no shared state and WAL mode keeps concurrent
-reads safe while workers write.
+Each request opens fresh SQLite connections (inside collect_status) and issues
+only status reads after ERDQueue initialization. ERDQueue derives and attaches
+the queue's sibling telemetry database automatically; the status service does
+not need a separate telemetry option. The threading server keeps no shared
+database state, and WAL mode permits concurrent reads while workers write.
 """
 ```
 
@@ -92,9 +94,11 @@ must contain at least:
   `worker_totals`
 - one **user-queued** branch (`is_cooperative` false) at `guess_depth` 2 with a
   two-guess `spine`, 3 of 8 candidates done, `worker_count` 2, a `best_guess`
-  that is an answer
+  that is an answer, `status` `open`, and non-contiguous
+  `done_candidate_indices` matching the count
 - one **cooperative** branch (`priority` 1000000, `is_cooperative` true) with
-  an empty `spine` but `guess_depth` 1 (unrecorded-spine rendering path)
+  an empty `spine` but `guess_depth` 1 (unrecorded-spine rendering path),
+  `status` `open`, and its required `done_candidate_indices`
 - four workers: two live on the first branch (different `claim_idx`, non-empty
   `descent` including at least one entry with null `guess`/`pattern`), one
   **idle** (`branch_key_hex` null), one **dead** (`age_seconds` 120,
@@ -105,7 +109,7 @@ must contain at least:
 
 Verify validity: `python -m json.tool status_fixture.json` succeeds.
 
-## Step 3 — Tests: `test_status_server.py`
+## Step 3 — Tests: `tests/test_status_server.py`
 
 Start the real server in-process for each test class:
 
@@ -126,7 +130,7 @@ Required cases:
    and a body that parses to a dict with `schema_version == 1`, non-empty
    `branches` and `workers`.
 2. **Live mode**: with fixture unset and `queue_path`/`cache_path` pointing at
-   fresh temp databases (create them the same way `test_status_model.py`
+   fresh temp databases (create them the same way `tests/test_status_model.py`
    does), GET `/api/status` returns 200 and a dict whose `queue.ok` is true.
 3. **Client page**: GET `/` returns 200 with HTML content type and the
    placeholder body.
@@ -143,7 +147,7 @@ Required cases:
       response is still 200 with a complete snapshot).
 - [ ] `python -m json.tool status_fixture.json` succeeds and the fixture
       includes every element listed in Step 2.
-- [ ] Full test suite passes, including `test_status_server.py`.
+- [ ] Full test suite passes, including `tests/test_status_server.py`.
 - [ ] `status_server.py` imports nothing outside the Python stdlib and
       `status_model`.
 - [ ] No file outside the "Files touched" list is modified.

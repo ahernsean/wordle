@@ -19,7 +19,7 @@ Shared constraints for every item:
   flash.
 - Every drawing must degrade at phone width (390 px) without horizontal body
   scroll.
-- Every item extends `test_status_client.py` (phase 3's Playwright harness)
+- Every item extends `tests/test_status_client.py` (phase 3's Playwright harness)
   with cases for its new DOM: drive rendering via `applySnapshot` snapshot
   pairs, assert on elements/classes/computed styles, and add a screenshot
   artifact of the new visual at 390 px and 1200 px.
@@ -27,18 +27,22 @@ Shared constraints for every item:
 ## Item A — Candidate sweep bar with worker markers
 
 Replace the expanded card's `sweep done/total` text line with a horizontal
-bar (plain `div`s, no canvas):
+completion-density bar (plain `div`s, no canvas), matching the information in
+the current terminal `_sweep_progress_bar`:
 
-- Track = full candidate range `0..n_candidates`; filled portion =
-  `done_candidates / n_candidates`, in green.
+- Track = full candidate range `0..n_candidates`, divided into a fixed number
+  of visual buckets. Use `done_candidate_indices` to compute the completed
+  fraction within each bucket and render its green intensity/height. Do not
+  render one contiguous fill: candidate claims complete out of order.
 - One marker per worker on the branch, positioned at
   `claim_idx / n_candidates` of the track width, labeled with its
   `worker_number`. Markers that would overlap nudge right until free (mirror
   the terminal's nudge in `_print_status`'s branch-detail bar).
 - The un-expanded card header keeps its numeric `%` — the bar is
   detail-level only.
-- Acceptance: with the fixture, the bar shows the fill and both worker
-  markers; done-count increases flash the fill green per phase 3 rules.
+- Acceptance: with the fixture, the bar shows non-contiguous completion
+  density and both worker markers; newly completed buckets flash green per
+  phase 3 rules.
 
 ## Item B — Per-branch completion ring in the card header
 
@@ -108,7 +112,7 @@ Model/server extension (mirror the phase 1/2 style):
    worker-tinted (item C hue if merged, else amber) = in-flight, tile-gray =
    unclaimed. Tooltip per cell: `idx`, worker, state.
 5. Tests: unit tests for the queue method and `collect_branch_detail`
-   (fixtures as in `test_status_model.py`), server test for the new route.
+   (fixtures as in `tests/test_status_model.py`), server test for the new route.
 - Acceptance: expanding a fixture branch shows the grid; a
   `complete_candidate` call against a live queue flips its cell green on the
   next poll; full test suite passes.

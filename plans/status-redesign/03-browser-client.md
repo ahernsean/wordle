@@ -34,7 +34,7 @@ that polls `/api/status` and renders the snapshot with:
 ## Files touched
 
 - `status_client.html` — replaced
-- `test_status_client.py` — new (Playwright browser tests, skip-guarded)
+- `tests/test_status_client.py` — new (Playwright browser tests, skip-guarded)
 
 ## Data contract
 
@@ -49,7 +49,8 @@ The model sends raw data only; this client computes every derived value:
 | cache hit rate | `100 * hits / (hits + misses)` from `worker_totals`, blank when the denominator is 0 |
 | ERD-cutoff / depth-pruned rates | `n_cutoff / (n_ok + n_cutoff + n_pruned)` and `n_pruned / (...)` from `worker_totals`, blank when the denominator is 0 |
 | hang suspicion (`~?`) | `age <= 10 && !node_rate && cur_nodes > 0` — `!node_rate` (not `=== 0`) so a NULL `node_rate` counts as zero, mirroring the terminal's `or 0.0` coercion |
-| worker state label | `branch_key_hex === null` → "idle"; `branch_key_hex` not among `branches[].branch_key_hex` → "finalizing"; else on-branch |
+| worker state label | `branch_key_hex === null` → "idle"; matching branch has `status === 'finalized'`, or no matching branch exists → "finalizing"; else on-branch |
+| worker guess-depth label | Use the greatest non-null `descent[].guess_depth`; otherwise use `cur_max_depth` when greater than the parent branch's `guess_depth`; otherwise parent depth + descent length, or parent depth + 1 when a current candidate exists; otherwise `d{parent}+?`. Every concrete `dN` is absolute from the root, matching `_worker_guess_depth_label`. |
 | node rate display | `Math.round(node_rate / 1000) + 'k/s'` when non-zero |
 | duration display | `MMmSSs` under an hour, `HhMMm` above (mirrors `_fmt_duration`) |
 
@@ -90,9 +91,12 @@ Top to bottom:
      `N = guess_depth - spine.length` (unrecorded spine).
    - **worker rows table**: one row per worker whose `branch_key_hex` matches:
      `W{worker_number}`, `claim_idx`, current candidate (uppercase + `*` when
-     `cur_candidate_is_answer`), `d{cur_max_depth}`, node rate, descent sizes
+     `cur_candidate_is_answer`), the absolute worker guess-depth label above,
+     node rate, descent sizes
      (the `size` values of `descent` joined by `→`), age in seconds with
      staleness/hang badges per the rules below.
+   A card whose raw `status` is `finalized` gets a `finalizing` badge. It
+   remains eligible for expansion while its heartbeat is present.
 4. **Idle / finalizing / dead workers** — a single compact section listing
    workers not shown in any card, with their state label and age.
 5. **Empty state** — when no branch has workers: the line
@@ -124,6 +128,12 @@ headers and data flow through the same path and change classes cannot drift
 from values. Give the elements tests must find stable ids or data attributes:
 each branch card gets `data-branch="<branch_key_hex>"`, each worker row
 `data-worker="<worker_id>"`, and the connection chip `id="connection"`.
+
+Keep a second array for sticky branch display order. Existing branch keys
+retain their relative positions across snapshots; newly seen keys are
+appended in incoming order, and disappeared keys are removed. This is the
+browser equivalent of `_stable_branch_display_order`: volatile progress,
+worker movement, and query ordering must not make cards jump between polls.
 
 ## Change highlighting rules (normative)
 
@@ -184,7 +194,7 @@ must be at least 32 px tall on narrow screens.
   architecture for the `?poll=` override). When `document.hidden`, skip
   polls; poll immediately on `visibilitychange` back to visible.
 
-## Automated browser tests: `test_status_client.py`
+## Automated browser tests: `tests/test_status_client.py`
 
 Standard `unittest`, guarded so the suite stays green where Playwright is not
 installed:
@@ -203,7 +213,7 @@ class StatusClientTest(unittest.TestCase):
 
 Harness, once per test class (`setUpClass` / `tearDownClass`):
 
-- Start the real server exactly as `test_status_server.py` does
+- Start the real server exactly as `tests/test_status_server.py` does
   (`ThreadingHTTPServer(('127.0.0.1', 0), StatusRequestHandler)` in a daemon
   thread) with `StatusRequestHandler.fixture_path = 'status_fixture.json'`.
 - `playwright = sync_playwright().start()`;
@@ -249,7 +259,13 @@ Required cases:
     render, then `page.route('**/api/status', lambda route: route.abort())`;
     within a few polls `#connection` gains the disconnected class and the
     branch cards are still present. Unroute; it recovers.
-11. **Screenshot artifacts** (review aid, not an assertion): write
+11. **Sticky order and finalization**: reorder the fixture's branch array and
+    change volatile progress fields; existing cards keep their DOM order.
+    Then change an expanded branch's `status` to `finalized`; its card remains
+    expanded and is labeled finalizing while its worker still references it.
+12. **Absolute depth fallback**: cover an explicit descent depth and an
+    old-format/null-depth descent; assert both labels follow the formula above.
+13. **Screenshot artifacts** (review aid, not an assertion): write
     `page.screenshot(path=...)` at widths 390 and 1200 into a temp/scratch
     directory and print the paths, so a reviewer can eyeball the layout.
 
@@ -265,7 +281,7 @@ Required cases:
 
 - [ ] `status_client.html` is fully self-contained (grep it for `http://`,
       `https://`, `//` URLs — none may appear in `src`/`href` attributes).
-- [ ] `python -m unittest test_status_client` passes with Playwright
+- [ ] `python -m unittest tests.test_status_client` passes with Playwright
       installed, and is cleanly SKIPPED (not failed) without it.
 - [ ] Full test suite passes.
 - [ ] Both manual checklist items pass.

@@ -19,9 +19,9 @@ presentation logic. This is the data source every later phase builds on.
 ## Files touched
 
 - `status_model.py` — new
-- `test_status_model.py` — new
+- `tests/test_status_model.py` — new
 - `erd_search.py` — remove three definitions, import them back (details below)
-- `test_status_sections.py` — must keep passing UNMODIFIED (it references
+- `tests/test_status_sections.py` — must keep passing UNMODIFIED (it references
   `erd_search._branch_id`, which the alias import preserves)
 
 ## Step 1 — Move shared helpers out of `erd_search.py`
@@ -96,13 +96,21 @@ the reference implementation. Concretely:
 3. **Queue data**, inside `try/except Exception as e`:
    - `queue = ERDQueue(queue_path)`
    - `counts = queue.counts_by_status()`
-   - `branches = queue.branches_in_progress()`
+   - `open_branches = queue.branches_in_progress()`
    - `heartbeats = queue.heartbeats_with_branch()`
    - `worker_counts = queue.worker_counts_by_branch()`
-   - `done_candidates = {bytes(b['branch_key']): queue.branch_done_candidates(b['branch_key']) for b in branches}`
+   - Find heartbeat branch keys absent from `open_branches`, then load them
+     with `queue.active_branches_by_keys(...)`. These are branches that have
+     finalized but are still referenced by a worker heartbeat. Append those
+     rows to form `branches`; this mirrors the current terminal display's
+     `detail_branches` behavior and lets a selected browser card survive the
+     finalization transition.
+   - For every row in `branches`, call `queue.claims_for_branch(branch_key)`
+     once. From those rows build both the done count and the sorted list of
+     done indices. Do not assume completed candidates are a contiguous prefix.
    - `queue.close()`
-   On exception: `queue_ok = False`, `queue_error = str(e)`, and all five
-   collections default to empty.
+   On exception: `queue_ok = False`, `queue_error = str(e)`, and every queue
+   collection/map above defaults to empty.
 4. **Cache data**, inside a separate `try/except Exception as e`:
    - `score_cache = ScoreCache(cache_path, list(answer_set_in_file_order), checkpoint_on_close=False)`
      — pass the *list* from `load_word_list(ANSWER_FILE)`, not the set.
@@ -127,9 +135,9 @@ Top level:
 | `worker_liveness_seconds` | int | `WORKER_LIVENESS_SECONDS` |
 | `queue` | object | `{"ok": bool, "error": str or null}` |
 | `cache` | object | `{"ok": bool, "error": str or null, "total_erd_branches": int, "recent_5m_branches": int}` |
-| `counts` | object | `{"pending": int, "in_progress": int, "done": int, "cooperative": int}` — first three from `counts_by_status()` (`.get(key, 0)`); `cooperative` = number of rows in `branches` with `(priority or 0) >= 1_000_000` |
+| `counts` | object | `{"pending": int, "in_progress": int, "done": int, "cooperative": int}` — first three from `counts_by_status()` (`.get(key, 0)`); `cooperative` = number of rows in `open_branches` with `(priority or 0) >= 1_000_000` (do not count retained finalized detail rows) |
 | `worker_totals` | object | `{"cache_hits", "cache_misses", "n_ok", "n_cutoff", "n_pruned"}` — each int, summed over **live** workers only (heartbeat age ≤ `WORKER_LIVENESS_SECONDS`), treating NULL columns as 0 |
-| `branches` | array | One object per row of `branches_in_progress()`, in query order (priority DESC, n_words DESC) |
+| `branches` | array | Open rows from `branches_in_progress()`, followed by finalized rows still referenced by a heartbeat. Rendering order is a client concern. |
 | `workers` | array | One object per row of `heartbeats_with_branch()`, sorted with the tuple key `(0, int(worker_number), '')` when `worker_number` is all digits, else `(1, 0, worker_id)` — digit-numbered workers first in numeric order, the rest after in `worker_id` order. (A bare conditional key of `int` vs `str` raises `TypeError` when the two kinds coexist.) |
 
 Each element of `branches`:
@@ -141,6 +149,8 @@ Each element of `branches`:
 | `n_words` | int | `row['n_words'] or 0` |
 | `n_candidates` | int | `row['n_candidates'] or 0` |
 | `done_candidates` | int | from the `done_candidates` map, default 0 |
+| `done_candidate_indices` | array[int] | Sorted `idx` values whose claim row has `done` truthy. This is raw sweep topology used for completion-density rendering. |
+| `status` | str | Raw `active_branches.status` value (normally `open` or `finalized`). |
 | `priority` | int | `row['priority'] or 0` |
 | `is_cooperative` | bool | `priority >= 1_000_000` |
 | `source_word` | str/null | `row['source_word']` (as stored, lowercase) |
@@ -183,9 +193,9 @@ Each element of `workers` (heartbeat row `h`; guard optional columns with
 | `best_erd` | float/null | `h['best_erd']` |
 | `bound_erd` | float/null | `h['bound_erd']` |
 
-## Step 3 — Tests: `test_status_model.py`
+## Step 3 — Tests: `tests/test_status_model.py`
 
-Model the fixtures on `test_erd_queue_unit.py` (temp directory via
+Model the fixtures on `tests/test_erd_queue_unit.py` (temp directory via
 `tempfile.TemporaryDirectory`, `ERDQueue(os.path.join(tmp, 'q.sqlite3'))`).
 For the cache, `ScoreCache(os.path.join(tmp, 'c.sqlite3'), answers, checkpoint_on_close=False)`
 with a small answer list creates a valid empty cache. NOTE: `collect_status`
@@ -214,6 +224,7 @@ Required test cases:
    Assert on the snapshot:
    - one branch: correct `branch_id` (equal to `branch_id(branch_key)`),
      `branch_key_hex`, `n_candidates == 3`, `done_candidates == 1`,
+     `done_candidate_indices == [<the completed index>]`, `status == 'open'`,
      `guess_depth == 1`, `spine == [{"guess": "CRANE", "pattern": "-----", "guess_is_answer": True}]`,
      `is_cooperative is False`, `worker_count == 1`
    - one worker: `worker_number == '3'`, `is_live is True`,
@@ -230,7 +241,11 @@ Required test cases:
    snapshot (dict equality).
 7. **Helper stability**: `status_model.branch_id(b'key')` returns the same
    4-char value on repeated calls and differs for a different key (mirrors the
-   existing `test_status_sections.py` assertions, now against the public name).
+   existing `tests/test_status_sections.py` assertions, now against the public
+   name).
+8. **Finalizing branch retention**: finalize a branch while leaving a worker
+   heartbeat pointing at it; assert the branch remains in `branches` with
+   `status == 'finalized'` and retains its done indices.
 
 ## Acceptance checklist
 
@@ -241,7 +256,8 @@ Required test cases:
       `WORKER_LIVENESS_SECONDS`; it imports them from `status_model` (with the
       underscore aliases shown above).
 - [ ] `python -m unittest discover -s tests -t . -p 'test_*.py'` passes, including the
-      untouched `test_status_sections.py` and the new `test_status_model.py`.
+      untouched `tests/test_status_sections.py` and the new
+      `tests/test_status_model.py`.
 - [ ] `python -c "import json, status_model; print(json.dumps(status_model.collect_status('erd_queue.sqlite3','wordle_cache.sqlite3'), indent=2)[:500])"`
       runs without error (with or without live databases present).
 - [ ] No file outside the "Files touched" list is modified.
