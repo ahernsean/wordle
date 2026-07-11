@@ -83,7 +83,7 @@ def _bare_worker():
     w.score_cache.read_hits = 0
     w.score_cache.read_misses = 0
     w.queue = mock.MagicMock()
-    w.queue.read_branch_best.return_value = (None, None)
+    w.queue.read_branch_best.return_value = (None, None, None)
     w.queue.get_cost_typical.return_value = None  # cold model by default
     return w
 
@@ -372,7 +372,7 @@ class TestSubbranchSolver(unittest.TestCase):
         w.cooperative_solve = mock.MagicMock(return_value=expected)
         words = ["crane"] * (PROMOTE_MIN_SIZE + 1)
         result = w._subbranch_solver(words, budget=5)
-        w.cooperative_solve.assert_called_once_with(words, 5)
+        w.cooperative_solve.assert_called_once_with(words, 5, float('inf'))
         self.assertEqual(result, expected)
 
 
@@ -1399,7 +1399,7 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
         w = _bare_worker()
         w.queue.branch_done_candidates.return_value = len(BRANCH)
         w.queue.try_finalize_branch.return_value = True
-        w.queue.read_branch_meta.return_value = ("crane", 1.8, 2, False, 4)
+        w.queue.read_branch_meta.return_value = ("crane", 1.8, 2, False, 4, None, False)
         w.queue.get_branch.return_value = {
             "nodes_spent": 0, "created_at": 100, "finalized_at": 200,
             "spine": "SALET -g-g-",
@@ -1429,6 +1429,330 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
         w.queue.add_branch_finalize_log.assert_not_called()
         w.queue.mark_done.assert_called_once_with(key)
         w.queue.delete_branch.assert_called_once_with(key)
+
+
+class TestSubbranchSolverForwardsCeiling(unittest.TestCase):
+    """_subbranch_solver passes the frame's ceiling through to
+    cooperative_solve on every promotion path."""
+
+    def test_size_promotion_forwards_ceiling(self):
+        w = _bare_worker()
+        w._adaptive = False
+        expected = (SOLVED, 2.0, 3, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, 5, 2.5)
+        self.assertEqual(result, expected)
+        w.cooperative_solve.assert_called_once_with(words, 5, 2.5)
+
+    def test_warm_model_promotion_forwards_ceiling(self):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = 1e12  # far above threshold
+        expected = (SOLVED, 2.0, 3, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (PROMOTE_MIN_SIZE + 1)
+        result = w._subbranch_solver(words, 5, 2.5)
+        self.assertEqual(result, expected)
+        w.cooperative_solve.assert_called_once_with(words, 5, 2.5)
+
+
+class TestCooperativeSolveCeiling(unittest.TestCase):
+    """cooperative_solve's ceiling handling: the cut_results fast path, the
+    reuse-miss ledger, the join rule, and pending-row ceiling suppression."""
+
+    def _worker(self):
+        w = _bare_worker()
+        w.score_cache = mock.MagicMock()
+        w.score_cache.read_with_depth.return_value = None
+        w.score_cache.read_loss.return_value = None
+        w.queue.read_cut_result.return_value = None
+        w.queue.has_pending_row.return_value = False
+        w.queue.create_branch.return_value = True
+        # Exit the help loop immediately wherever it is reached: these tests
+        # exercise the decisions before it, not the claim/evaluate cycle.
+        w._stop_requested = True
+        return w
+
+    def test_satisfying_cut_short_circuits(self):
+        w = self._worker()
+        w.queue.read_cut_result.return_value = (3.0, 5)
+        result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        self.assertEqual(result, (OVER_ERD_LIMIT, 3.0, None, False))
+        w.queue.create_branch.assert_not_called()
+        w.queue.add_cut_reuse_miss.assert_not_called()
+
+    def test_cut_at_smaller_budget_is_a_miss(self):
+        # The bound was proven at budget 3; at budget 4 more strategies exist,
+        # so it proves nothing — logged as a reuse miss and re-solved.
+        w = self._worker()
+        w.queue.read_cut_result.return_value = (3.0, 3)
+        w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        w.queue.add_cut_reuse_miss.assert_called_once_with(
+            mock.ANY, len(BRANCH), 4, 2.5, 3.0, 3)
+        w.queue.create_branch.assert_called_once()
+
+    def test_cut_below_wanted_ceiling_is_a_miss(self):
+        w = self._worker()
+        w.queue.read_cut_result.return_value = (2.0, 5)
+        w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        w.queue.add_cut_reuse_miss.assert_called_once_with(
+            mock.ANY, len(BRANCH), 4, 2.5, 2.0, 5)
+
+    def test_exact_consumer_never_satisfied_by_cut(self):
+        w = self._worker()
+        w.queue.read_cut_result.return_value = (3.0, 5)
+        w.cooperative_solve(BRANCH, 4)   # no ceiling: exact required
+        w.queue.add_cut_reuse_miss.assert_called_once_with(
+            mock.ANY, len(BRANCH), 4, None, 3.0, 5)
+        w.queue.create_branch.assert_called_once()
+
+    def test_ceiling_stored_on_created_branch(self):
+        w = self._worker()
+        w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        self.assertAlmostEqual(
+            w.queue.create_branch.call_args.kwargs["ceiling"], 2.5)
+
+    def test_pending_row_suppresses_ceiling(self):
+        w = self._worker()
+        w.queue.has_pending_row.return_value = True
+        w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
+
+    def test_join_refused_when_existing_ceiling_tighter(self):
+        w = self._worker()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": 2.0}
+        self.assertIsNone(w.cooperative_solve(BRANCH, 4, ceiling=2.5))
+
+    def test_join_refused_for_exact_consumer_on_ceilinged_branch(self):
+        w = self._worker()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": 2.0}
+        self.assertIsNone(w.cooperative_solve(BRANCH, 4))
+
+    def test_join_allowed_when_existing_ceiling_looser(self):
+        w = self._worker()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": 3.0}
+        result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        self.assertIsNotNone(result)   # proceeded to the loop (cancelled out)
+
+    def test_join_allowed_on_exact_branch(self):
+        w = self._worker()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None}
+        result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        self.assertIsNotNone(result)
+
+
+class TestMaybeFinalizeTriage(unittest.TestCase):
+    """maybe_finalize's exact / cut / loss triage from the branch meta."""
+
+    def _worker(self, meta, nodes_spent=500):
+        w = _bare_worker()
+        w.score_cache = mock.MagicMock()
+        w.rcache = mock.MagicMock()
+        w.queue.branch_done_candidates.return_value = len(CANDIDATES)
+        w.queue.try_finalize_branch.return_value = True
+        w.queue.read_branch_meta.return_value = meta
+        w.queue.get_branch.return_value = {
+            "nodes_spent": nodes_spent, "created_at": 100, "finalized_at": 200,
+            "spine": "SALET -g-g-",
+        }
+        w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
+        return w
+
+    def test_cut_publishes_bound_and_never_caches(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, False, 4, 2.5, True))
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.queue.add_cut_result.assert_called_once_with(key, 4, 2.5)
+        w.score_cache.write.assert_not_called()
+        w.score_cache.write_loss.assert_not_called()
+        w.queue.requeue_pending.assert_called_once_with(key)
+        w.queue.mark_done.assert_not_called()
+        w.queue.delete_branch.assert_called_once_with(key)
+        log_kwargs = w.queue.add_branch_finalize_log.call_args.kwargs
+        self.assertEqual(log_kwargs["outcome"], "cut")
+        self.assertAlmostEqual(log_kwargs["ceiling"], 2.5)
+        # The exact solve never ran: the node count is right-censored and must
+        # not fold into the completed-solve cost model.
+        w.queue.update_cost_model.assert_not_called()
+        sample = w.queue.add_cost_sample.call_args
+        self.assertEqual(sample.args[3], "cut")
+        self.assertEqual(sample.kwargs["censored"], 1)
+
+    def test_loss_path_unchanged_without_cut_flag(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, False, 4, None, False))
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write_loss.assert_called_once()
+        w.queue.add_cut_result.assert_not_called()
+        w.queue.mark_done.assert_called_once_with(key)
+        log_kwargs = w.queue.add_branch_finalize_log.call_args.kwargs
+        self.assertEqual(log_kwargs["outcome"], "loss")
+        self.assertIsNone(log_kwargs["ceiling"])
+
+    def test_exact_below_ceiling_caches_as_usual(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker(("crane", 1.8, 2, False, 4, 2.5, False))
+        with mock.patch.object(erd_swarm, "cache_all_scores"):
+            w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write.assert_called_once()
+        w.queue.add_cut_result.assert_not_called()
+        w.queue.mark_done.assert_called_once_with(key)
+        log_kwargs = w.queue.add_branch_finalize_log.call_args.kwargs
+        self.assertEqual(log_kwargs["outcome"], "exact")
+        self.assertAlmostEqual(log_kwargs["ceiling"], 2.5)
+
+
+class TestMidLoopPublisherCeiling(unittest.TestCase):
+    """check()'s ceiling handling on overrun handoff: a frame still riding its
+    entry ceiling publishes a ceilinged branch; prefix marks happen only when
+    the surviving row's ceiling makes them sound."""
+
+    def _overrunning(self, predicted=10):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = predicted
+        w.queue.has_pending_row.return_value = False
+        w.queue.create_branch.return_value = True
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(SOLVED, 2.0, 3, False))
+        pub = erd_swarm._MidLoopPublisher(w)
+        token = pub.enter(BRANCH[:6], budget=5)
+        w._nodes = erd_swarm.OVERRUN_K * predicted + 1
+        return pub, w, token
+
+    def test_ceilinged_frame_publishes_ceilinged_branch(self):
+        pub, w, token = self._overrunning()
+        pub.check(token, CANDIDATES, 1, None, 2.5, 5)
+        self.assertAlmostEqual(
+            w.queue.create_branch.call_args.kwargs["ceiling"], 2.5)
+        w.queue.mark_claims_done.assert_called_once()
+        w.cooperative_solve.assert_called_once_with(
+            BRANCH[:6], 5, ceiling=2.5)
+
+    def test_exact_frame_publishes_exact_branch(self):
+        pub, w, token = self._overrunning()
+        pub.check(token, CANDIDATES, 1, None, float('inf'), 5)
+        self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
+        w.queue.mark_claims_done.assert_called_once()
+        w.cooperative_solve.assert_called_once_with(
+            BRANCH[:6], 5, ceiling=float('inf'))
+
+    def test_achieved_best_seeds_and_publishes_exact(self):
+        pub, w, token = self._overrunning()
+        pub.check(token, CANDIDATES, 1, "crane", 1.8, 5)
+        self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
+        w.queue.update_branch_best.assert_called_once()
+        w.queue.mark_claims_done.assert_called_once()
+        w.cooperative_solve.assert_called_once_with(
+            BRANCH[:6], 5, ceiling=float('inf'))
+
+    def test_pending_row_suppresses_ceiling_and_prefix_marks(self):
+        pub, w, token = self._overrunning()
+        w.queue.has_pending_row.return_value = True
+        pub.check(token, CANDIDATES, 1, None, 2.5, 5)
+        self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
+        # The prefix was priced against the ceiling; in an exact branch those
+        # price-outs do not hold, so the marks are skipped and redone there.
+        w.queue.mark_claims_done.assert_not_called()
+
+    def test_race_to_exact_branch_skips_prefix_marks(self):
+        pub, w, token = self._overrunning()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None}
+        pub.check(token, CANDIDATES, 1, None, 2.5, 5)
+        w.queue.mark_claims_done.assert_not_called()
+
+    def test_race_to_tighter_ceiling_keeps_prefix_marks(self):
+        pub, w, token = self._overrunning()
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": 2.0}
+        pub.check(token, CANDIDATES, 1, None, 2.5, 5)
+        w.queue.mark_claims_done.assert_called_once()
+
+
+class TestCeilingFinalizeIntegration(unittest.TestCase):
+    """End-to-end triage against real queue/cache files: a ceilinged branch
+    whose candidates all priced out finalizes as a CUT (bound delivered via
+    cut_results, nothing cached); one with a best below the ceiling finalizes
+    exact (cached, no cut row)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        answer_file = os.path.join(self._tmp.name, "answers.txt")
+        words_file = os.path.join(self._tmp.name, "words.txt")
+        with open(answer_file, "w") as f:
+            f.write("\n".join(BRANCH) + "\n")
+        with open(words_file, "w") as f:
+            f.write("\n".join(CANDIDATES) + "\n")
+        for attr, path in [("ANSWER_FILE", answer_file),
+                           ("WORDS_FILE", words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+        self.key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+
+    def _complete_all(self, q, cut):
+        n = len(CANDIDATES)
+        q.create_branch(self.key, len(BRANCH), n, budget=4, ceiling=2.5)
+        order = list(range(n))
+        _, indices, _ = q.claim_next_bundle(
+            self.key, "other", n, order, [0.0] * n,
+            small_count=n, count_cap=n)
+        for idx in indices:
+            q.complete_candidate(self.key, idx)
+        if cut:
+            q.mark_branch_cut(self.key)
+
+    def test_all_priced_out_finalizes_as_cut(self):
+        q = ERDQueue(self.queue_path)
+        self._complete_all(q, cut=True)
+        q.close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w.maybe_finalize(self.key, BRANCH, len(CANDIDATES))
+        finally:
+            w.close()
+        q = ERDQueue(self.queue_path)
+        self.assertEqual(q.read_cut_result(self.key), (2.5, 4))
+        self.assertIsNone(q.get_branch(self.key))
+        row = q._conn.execute(
+            "SELECT outcome, ceiling FROM telemetry.branch_finalize_log"
+        ).fetchone()
+        self.assertEqual(row["outcome"], "cut")
+        q.close()
+        sc = ScoreCache(self.cache_path, BRANCH)
+        self.assertIsNone(sc.read_with_depth(self.key, ERD_ALL))
+        sc.close()
+
+    def test_best_below_ceiling_finalizes_exact(self):
+        q = ERDQueue(self.queue_path)
+        self._complete_all(q, cut=False)
+        q.update_branch_best(self.key, "crane", 1.5, max_depth=2)
+        q.close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w.maybe_finalize(self.key, BRANCH, len(CANDIDATES))
+        finally:
+            w.close()
+        q = ERDQueue(self.queue_path)
+        self.assertIsNone(q.read_cut_result(self.key))
+        row = q._conn.execute(
+            "SELECT outcome, ceiling FROM telemetry.branch_finalize_log"
+        ).fetchone()
+        self.assertEqual(row["outcome"], "exact")
+        self.assertAlmostEqual(row["ceiling"], 2.5)
+        q.close()
+        sc = ScoreCache(self.cache_path, BRANCH)
+        best = sc.read_with_depth(self.key, ERD_ALL)
+        self.assertIsNotNone(best)
+        sc.close()
 
 
 if __name__ == "__main__":

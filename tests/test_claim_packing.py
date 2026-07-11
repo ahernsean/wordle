@@ -256,7 +256,7 @@ class TestSchemaMigration(unittest.TestCase):
         self.assertEqual(names, {
             "bundle_stats", "cost_samples", "claim_telemetry",
             "branch_finalize_log", "candidate_accuracy",
-            "backstop_telemetry"})
+            "backstop_telemetry", "cut_reuse_misses"})
 
 
 N_CANDIDATES = 40
