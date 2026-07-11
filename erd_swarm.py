@@ -269,33 +269,79 @@ class _MidLoopPublisher:
         # Spine sentinel: mark this frame as handed off in the heartbeat display.
         self._worker._note_depth(entry_budget, -n, None, None)
 
+        # A frame with no achieved best whose bound is finite is still riding
+        # its entry alpha-beta ceiling (best_erd is only ever lowered from the
+        # ceiling by a real SOLVED candidate).  Its prefix candidates were
+        # priced out against that ceiling, so the handoff is sound only if the
+        # published branch carries the ceiling too — its finalize is then a CUT
+        # (never cached) unless someone lands below it.  A user-queued branch
+        # must stay exact, so the ceiling is suppressed for it (and the prefix
+        # marks are skipped below: their price-outs do not hold in an exact solve).
+        frame_ceilinged = (best_guess is None and best_erd is not None
+                           and best_erd != float('inf'))
+        pending = frame_ceilinged and self._worker.queue.has_pending_row(branch_key)
+        branch_ceiling = best_erd if (frame_ceilinged and not pending) else None
+
         # Create the cooperative branch; idempotent if another worker raced us.
         # First writer for this path, so the composed spine must be supplied here
         # (cooperative_solve's later create_branch is a no-op once this row exists).
-        self._worker.queue.create_branch(
+        created = self._worker.queue.create_branch(
             branch_key, n, self._worker.n_candidates,
             priority=PROMOTED_PRIORITY,
             source_word=self._worker._top_source_word,
             source_pattern=self._worker._top_source_pattern,
             budget=budget, spine=self._worker._promoted_spine(),
-            root_budget=self._worker.root_budget)
+            root_budget=self._worker.root_budget,
+            ceiling=branch_ceiling)
 
         # Mark the already-evaluated candidates done by their all_words index so
         # cooperative workers claim only the unevaluated remainder.  The prefix
         # slice is built here — only when an overrun actually fires — not on
         # every loop iteration.
-        word_idx = self._worker._word_idx
-        done_indices = [word_idx[w] for w in candidate_list[:last_index + 1]
-                        if w in word_idx]
-        if done_indices:
-            self._worker.queue.mark_claims_done(branch_key, done_indices)
+        #
+        # Everything the prefix proved, it proved at THIS frame's budget: a
+        # raced row at another budget can take neither the done-marks nor the
+        # best seed (feasibility and cost are budget-specific).  With the
+        # budget matched, soundness of the marks depends on what the prefix
+        # was priced against:
+        # - an achieved best (best_guess set): sound — the seed below caps the
+        #   branch's final value at that best, and every marked candidate is
+        #   proven >= it;
+        # - nothing (best_erd == inf): the prefix was exhausted or infeasible,
+        #   which no bound can manufacture — sound anywhere;
+        # - the entry ceiling: sound only on a branch whose own ceiling is <=
+        #   ours (its outcomes then never contradict a >= ours price-out).  A
+        #   racing creator may have won with a looser or absent ceiling — skip
+        #   the marks then and let the branch redo the prefix.
+        if created:
+            row_budget, row_ceiling = budget, branch_ceiling
+        else:
+            row = self._worker.queue.get_branch(branch_key)
+            row_budget = row['budget'] if row is not None else None
+            row_ceiling = row['ceiling'] if row is not None else None
+        if row_budget != budget:
+            sound_to_mark = False
+        elif frame_ceilinged:
+            sound_to_mark = row_ceiling is not None and row_ceiling <= best_erd
+        else:
+            sound_to_mark = True
+        if sound_to_mark:
+            word_idx = self._worker._word_idx
+            done_indices = [word_idx[w] for w in candidate_list[:last_index + 1]
+                            if w in word_idx]
+            if done_indices:
+                self._worker.queue.mark_claims_done(branch_key, done_indices)
 
-        # Seed the cooperative branch's bound only when we have an achieved cost —
-        # a None best_guess means no feasible candidate yet; seeding inf is a no-op.
-        if best_guess is not None:
+        # Seed the cooperative branch's bound only when we have an achieved cost
+        # (a None best_guess means no feasible candidate yet — the entry
+        # ceiling, if any, rides on the branch's ceiling column instead), and
+        # only at the matching budget: the seed is a budget-specific value.
+        if best_guess is not None and row_budget == budget:
             self._worker.queue.update_branch_best(branch_key, best_guess, best_erd)
 
-        return self._worker.cooperative_solve(branch_words, budget)
+        return self._worker.cooperative_solve(
+            branch_words, budget,
+            ceiling=best_erd if frame_ceilinged else float('inf'))
 
     def record_inline(self, token):
         """Called on the SOLVED return of each completed _solve_subset frame.
@@ -781,7 +827,8 @@ class _BranchWorker:
         candidate = self.all_words[idx]
         self._hb_max_spine = {}
         self._log_max_spine = {}
-        local_candidate, local_best = self.queue.read_branch_best(branch_key)
+        local_candidate, local_best, branch_ceiling = \
+            self.queue.read_branch_best(branch_key)
         local_md = None
         shared_best = local_best
         last_refresh = time.time()
@@ -792,15 +839,18 @@ class _BranchWorker:
             # Refreshes shared_best from the queue at most every
             # BEST_REFRESH_SECONDS, then returns the tightest known bound as a
             # float (inf when nothing is known yet).  Called by evaluate_candidate
-            # at each sub-branch level throughout the full recursion.
+            # at each sub-branch level throughout the full recursion.  The
+            # branch ceiling is a permanent bound source: pricing out against
+            # it makes the candidate a cut, recorded via mark_branch_cut below.
             nonlocal shared_best, last_refresh
             now = time.time()
             if now - last_refresh > BEST_REFRESH_SECONDS:
-                _, new = self.queue.read_branch_best(branch_key)
+                _, new, _ = self.queue.read_branch_best(branch_key)
                 if new is not None and (shared_best is None or new < shared_best):
                     shared_best = new
                 last_refresh = now
-            bests = [b for b in (local_best, shared_best) if b is not None]
+            bests = [b for b in (local_best, shared_best, branch_ceiling)
+                     if b is not None]
             return min(bests) if bests else float('inf')
 
         def _eff_bound():
@@ -879,6 +929,12 @@ class _BranchWorker:
                 shared_best = local_best
         elif status == OVER_ERD_LIMIT:
             self.n_cutoff += 1
+            if branch_ceiling is not None:
+                # Priced out on a ceilinged branch.  Only consulted at finalize
+                # when best_guess is NULL — where no real best ever existed, so
+                # every price-out was against the ceiling and the branch is a
+                # cut, not a proven loss.
+                self.queue.mark_branch_cut(branch_key)
         elif status == OVER_DEPTH_BUDGET:
             self.n_pruned += 1
         else:  # pragma: no cover
@@ -1046,7 +1102,8 @@ class _BranchWorker:
         if not self.queue.try_finalize_branch(branch_key):  # pragma: no cover
             return  # another worker won the finalize
         meta = self.queue.read_branch_meta(branch_key)
-        best_guess, best_erd, max_depth, tainted, budget = meta
+        (best_guess, best_erd, max_depth, tainted, budget,
+         ceiling, cut_occurred) = meta
         branch_row = self.queue.get_branch(branch_key)
         nodes_spent = branch_row['nodes_spent'] if branch_row else 0
         created_at = branch_row['created_at'] if branch_row else None
@@ -1058,7 +1115,11 @@ class _BranchWorker:
                        else max(0, (finalized_at - created_at) * 1000))
         # Claims drained to finalize, captured before delete_branch drops the rows.
         n_claims = self.queue.branch_done_candidates(branch_key)
+        cut = best_guess is None and cut_occurred
         if best_guess is not None:
+            # Exact optimum.  A ceiling (if any) only pruned candidates proven
+            # >= a value some candidate beat, so the result is universally
+            # valid — cacheable exactly like a ceiling-free solve.
             # Untainted => unconstrained optimum, reusable at any budget >=
             # max_depth (solve_budget NULL).  Tainted => valid only at this
             # budget (solve_budget = budget).  See cache_sqlite reuse rule.
@@ -1077,11 +1138,31 @@ class _BranchWorker:
                         'max_depth=%s budget=%s%s', self.name, len(words),
                         best_guess, best_erd, max_depth, budget,
                         ' TAINTED' if tainted else '')
+        elif cut:
+            # Every candidate priced out at >= the ceiling and none was proven
+            # infeasible: a lower bound only ("true ERD >= ceiling").  That is
+            # everything the promoting parent asked, but it is NOT an optimum:
+            # never written to the score cache, never a loss.  Delivered to
+            # waiters via cut_results (before delete_branch below, so a waiter
+            # that sees the branch vanish re-checks the channel and finds it).
+            # nodes_spent is right-censored (the exact solve was never run), so
+            # it must not fold into the cost model as a completed-solve sample;
+            # the raw sample is kept for offline survival analysis.
+            self.queue.add_cut_result(branch_key, budget, ceiling)
+            if self._adaptive and nodes_spent > 0:
+                self.queue.add_cost_sample(ERD_ALL, len(words), nodes_spent,
+                                           'cut', budget=budget, censored=1,
+                                           wall_millis=wall_millis)
+            logger.info('%s finalized branch (%d words) as CUT >= %.4f '
+                        'budget=%s nodes=%d', self.name, len(words), ceiling,
+                        budget, nodes_spent)
         else:  # pragma: no cover
             # No feasible guess within budget: this branch is a loss.  There is
             # no winning strategy to record in branch_best_by_policy, but the
             # loss itself is persisted so the branch is never re-swept at this
-            # (or any smaller) budget.
+            # (or any smaller) budget.  Sound even under a ceiling: cut_occurred
+            # is clear, so every candidate was individually PROVEN infeasible —
+            # a proof the ceiling cannot have manufactured.
             if budget is not None:
                 self.score_cache.write_loss(branch_key, ERD_ALL, budget)
             logger.warning('%s branch (%d words) UNSOLVABLE within budget %s '
@@ -1104,13 +1185,23 @@ class _BranchWorker:
                 finalized_at, nodes_spent, n_claims, n_bundles=n_bundles,
                 max_bundle_nodes=max_bundle_nodes,
                 total_bundle_wall_millis=total_bundle_wall_millis,
-                censored_units=censored_units)
+                censored_units=censored_units, ceiling=ceiling,
+                outcome='cut' if cut else
+                        ('exact' if best_guess is not None else 'loss'))
         except Exception:
             logger.exception(
                 '%s finalize telemetry failed for branch %s -- result '
                 'already published; continuing to cleanup', self.name,
                 branch_key[:25])
-        self.queue.mark_done(branch_key)        # pending_branches row -> done
+        if cut:
+            # A cut satisfies the promoting parent but is not an exact result:
+            # a user-queued row for this branch (normally impossible — pending
+            # membership suppresses the ceiling at promotion — but reachable if
+            # the row was queued mid-solve) must go back to 'pending' rather
+            # than be recorded done without a result.
+            self.queue.requeue_pending(branch_key)
+        else:
+            self.queue.mark_done(branch_key)    # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
 
@@ -1150,7 +1241,7 @@ class _BranchWorker:
             return True
         return False
 
-    def _subbranch_solver(self, words, budget):
+    def _subbranch_solver(self, words, budget, ceiling=float('inf')):
         """Engine hook: decide whether to solve a sub-branch cooperatively.
 
         budget <= 2 branches are always solved inline: at budget=2, each
@@ -1164,8 +1255,13 @@ class _BranchWorker:
         promote up front, small ones inline under the mid-loop publisher's
         wall-clock backstop — so a mispredicted small tarpit is bounded by
         COLD_BACKSTOP_SECONDS rather than by a size heuristic that can't see it.
-        Returns the engine's (status, cost, max_depth, floor) tuple, or None to
-        inline.  Cooperative results are always exact (no cutoff).
+
+        ceiling is the frame's alpha-beta ceiling; the cooperative solve prunes
+        against it exactly as the inline recursion would, so a promoted trap
+        family terminates in the cheap >= ceiling proof instead of grinding to
+        the exact optimum nobody asked for.  Returns the engine's (status, cost,
+        max_depth, floor) tuple — which may be a cut (OVER_ERD_LIMIT, bound,
+        None, floor) — or None to inline.
         """
         if budget is None:
             return None
@@ -1180,28 +1276,52 @@ class _BranchWorker:
         n = len(words)
         if not self._adaptive:
             # Plain size-based promotion: no cost model, no overrun.
-            return self.cooperative_solve(words, budget) if n >= PROMOTE_MIN_SIZE \
-                else None
+            return self.cooperative_solve(words, budget, ceiling) \
+                if n >= PROMOTE_MIN_SIZE else None
         predicted = self._typical(n, budget)
         if predicted is None:
             # Cold model: promote large branches by size, inline small ones; the
             # wall-clock backstop bounds a cold inline tarpit.
-            return self.cooperative_solve(words, budget) if n >= PROMOTE_MIN_SIZE \
-                else None
+            return self.cooperative_solve(words, budget, ceiling) \
+                if n >= PROMOTE_MIN_SIZE else None
         if predicted < self._publish_threshold():
             return None
-        return self.cooperative_solve(words, budget)
+        return self.cooperative_solve(words, budget, ceiling)
 
-    def cooperative_solve(self, words, budget):
+    def _read_satisfying_cut(self, branch_key, budget, ceiling):
+        """The engine tuple for a recorded cut that satisfies this consumer, or
+        None.  Satisfying = proven at a budget >= ours (the bound then holds at
+        ours) with a bound >= our ceiling (so it proves what the parent asked)."""
+        if ceiling == float('inf'):
+            return None
+        cut = self.queue.read_cut_result(branch_key)
+        if cut is None:
+            return None
+        cut_bound, cut_budget = cut
+        if budget <= cut_budget and cut_bound >= ceiling:
+            return (OVER_ERD_LIMIT, cut_bound, None, False)
+        return None
+
+    def cooperative_solve(self, words, budget, ceiling=float('inf')):
         """Solve sub-branch `words` at `budget` cooperatively, returning the
-        engine's (cost, max_depth, floor, cutoff) tuple (cutoff always False —
-        a cooperative solve runs to the exact optimum).
+        engine's (status, cost, max_depth, floor) tuple.
 
         Registers the sub-branch as a first-class swarm branch, then *helps*
         solve it — claiming and evaluating candidates alongside any other
         worker that needs it — until it is finalized, then reads the result
         from cache.  Never idle-blocks (the worker that needs it drives it),
         and deadlock-free (a waiting worker holds no claim).
+
+        ceiling is the caller's alpha-beta ceiling (inf = exact required).  A
+        finite ceiling is stored on the branch so every helper prunes against
+        it; the solve then ends either exact (best found below the ceiling —
+        cached and returned as SOLVED) or cut (everything priced out at >=
+        ceiling — returned as (OVER_ERD_LIMIT, bound, None, False) via the
+        cut_results channel, never cached).  A branch that already exists with
+        a TIGHTER ceiling than the caller's cannot serve this caller (its cut
+        would prove too little); this method then returns None and the engine
+        solves the frame inline under its own ceiling — always correct, just
+        unshared.
         """
         # Absolute spine of the branch being promoted, composed from the descent
         # that reached it before this frame's own work overwrites self._spine.
@@ -1209,6 +1329,7 @@ class _BranchWorker:
         saved_spine = self._claimed_branch_spine
         try:
             branch_key = encode_subset(words)
+            n_words = len(words)
             # Already solved by someone? reuse without re-promoting.
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
@@ -1219,13 +1340,56 @@ class _BranchWorker:
             loss_budget = self.score_cache.read_loss(branch_key, ERD_ALL)
             if loss_budget is not None and budget <= loss_budget:
                 return (OVER_DEPTH_BUDGET, float('inf'), None, True)
+            # Already cut at a bound this caller's ceiling accepts?  The bound
+            # was proven at the recorded budget, so it holds at any budget <=
+            # it; a satisfying row costs nothing to reuse.  An unsatisfying row
+            # means someone is about to redo this branch's work — the cost side
+            # of the ceiling ledger, logged for the reuse-payback question.
+            cut = self.queue.read_cut_result(branch_key)
+            if cut is not None:
+                cut_bound, cut_budget = cut
+                if (ceiling != float('inf') and budget <= cut_budget
+                        and cut_bound >= ceiling):
+                    return (OVER_ERD_LIMIT, cut_bound, None, False)
+                self.queue.add_cut_reuse_miss(
+                    branch_key, n_words, budget,
+                    None if ceiling == float('inf') else ceiling,
+                    cut_bound, cut_budget)
 
-            n_words = len(words)
-            self.queue.create_branch(
+            # A user-queued branch always has an exact-result consumer, so it
+            # is never solved under a ceiling: this parent shares the exact
+            # solve instead of forcing the queue's copy to be redone.
+            branch_ceiling = None
+            if ceiling != float('inf') and not self.queue.has_pending_row(branch_key):
+                branch_ceiling = ceiling
+            created = self.queue.create_branch(
                 branch_key, n_words, self.n_candidates,
                 priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
                 source_pattern=self._top_source_pattern, budget=budget,
-                spine=child_spine, root_budget=self.root_budget)
+                spine=child_spine, root_budget=self.root_budget,
+                ceiling=branch_ceiling)
+            if not created:
+                # Raced or joined an existing branch: its budget and ceiling
+                # decide joinability.  The budget must match exactly — every
+                # exit of the wait loop assumes the branch's outcome speaks
+                # for OUR budget: a cut or loss proven at a smaller budget
+                # says nothing at a larger one, and a tainted exact solved at
+                # a different budget is not reusable at ours; either way the
+                # deleted-branch exit below would misreport a loss.  The
+                # ceiling must be NULL (exact) or >= ours: every outcome such
+                # a branch can produce satisfies us, while a tighter one
+                # (including any finite ceiling when we need exact) could cut
+                # having proven less than we need.  Decline both — the engine
+                # inlines this frame, always correct, just unshared.
+                row = self.queue.get_branch(branch_key)
+                if row is not None:
+                    if row['budget'] != budget:
+                        return None
+                    row_ceiling = row['ceiling']
+                    ours = None if ceiling == float('inf') else ceiling
+                    if row_ceiling is not None and (
+                            ours is None or row_ceiling < ours):
+                        return None
             # Descents into this branch promote grandchildren relative to its spine.
             self._claimed_branch_spine = child_spine
 
@@ -1236,7 +1400,16 @@ class _BranchWorker:
                     self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
                 if reuse is not None:
                     return (SOLVED, *reuse)
+                cut = self._read_satisfying_cut(branch_key, budget, ceiling)
+                if cut is not None:
+                    return cut
                 if self.queue.get_branch(branch_key) is None:
+                    # Finalized + deleted: a cut lands in cut_results just
+                    # before the delete, so re-check once before concluding
+                    # the branch was a loss.
+                    cut = self._read_satisfying_cut(branch_key, budget, ceiling)
+                    if cut is not None:
+                        return cut
                     break                       # finalized as a loss + deleted
                 claim = self._claim_bundle(branch_key, self.n_candidates, words)
                 if claim is not None:
