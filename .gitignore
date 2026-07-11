@@ -12,6 +12,9 @@ wordle_debug.log
 erd_queue.sqlite3
 erd_queue.sqlite3-shm
 erd_queue.sqlite3-wal
+erd_queue_telemetry.sqlite3
+erd_queue_telemetry.sqlite3-shm
+erd_queue_telemetry.sqlite3-wal
 erd_search.log
 erd_worker_*.log
 verify_erd_cache.log
