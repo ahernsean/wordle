@@ -327,6 +327,10 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                 if not q.branches_in_progress():
                     break
                 time.sleep(0.05)
+            # A leg that hits the deadline must fail the test, never feed the
+            # ratio: a timed-out 1-worker leg would INFLATE the measured
+            # speedup.
+            drained = not q.branches_in_progress()
             t_drain = time.time() - t0
         finally:
             q.close()
@@ -342,6 +346,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         return {
             'wall':    t_total,
             'drain':   t_drain,
+            'drained': drained,
             'spawn':   t_spawn,
             'setup':   t_setup,
             'workers': n_workers,
@@ -423,6 +428,10 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
                     f'{os.cpu_count()}, need {n + 1}); set CI=1 to force')
         r1 = self._drain(1, "w1")
         rN = self._drain(n, f"w{n}")
+        for r, tag in [(r1, '1-worker'), (rN, f'{n}-worker')]:
+            self.assertTrue(r['drained'],
+                            f"{tag} leg did not drain within its deadline; "
+                            f"timing is meaningless")
         t1, tN = r1['drain'], rN['drain']
 
         for r, tag in [(r1, '1-worker'), (rN, f'{n}-worker')]:
@@ -549,6 +558,10 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
                 if not q.branches_in_progress():
                     break
                 time.sleep(0.1)
+            # A leg that hits the deadline must fail the test, never feed the
+            # ratio: a timed-out 1-worker leg would INFLATE the measured
+            # speedup.
+            drained = not q.branches_in_progress()
             t_drain = time.time() - t0
         finally:
             q.close()
@@ -559,7 +572,8 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             if p.is_alive():
                 p.kill()
                 p.join()
-        return {'drain': t_drain, 'workers': n_workers, 'cache': cache_path}
+        return {'drain': t_drain, 'drained': drained,
+                'workers': n_workers, 'cache': cache_path}
 
     @staticmethod
     def _publish(result):
@@ -602,6 +616,10 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
 
         r1 = self._drain(1, "strong1")
         rN = self._drain(n, f"strong{n}")
+        for r, tag in [(r1, '1-worker'), (rN, f'{n}-worker')]:
+            self.assertTrue(r['drained'],
+                            f"{tag} leg did not drain within its deadline; "
+                            f"timing is meaningless")
         t1, tN = r1['drain'], rN['drain']
         speedup = t1 / tN if tN > 0 else float('inf')
         min_speedup = self._MIN_SPEEDUP[n]
@@ -627,17 +645,19 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             f"1-worker: {t1:.3f}s  {n}-worker: {tN:.3f}s  "
             f"speedup {speedup:.2f}x (min {min_speedup:.2f}x)\n")
 
-        # Every root branch must have resolved to a best row or a proven
-        # loss; a drain that timed out with work outstanding must not pass
-        # on a fast-but-wrong technicality.
-        sc = ScoreCache(rN['cache'], self._pool, checkpoint_on_close=False)
-        unresolved = [
-            bw for bw in self._branches
-            if sc.read(encode_subset(bw), ERD_ALL) is None
-            and sc.read_loss(encode_subset(bw), ERD_ALL) is None]
-        sc.close()
-        self.assertEqual(unresolved, [],
-                         f"{len(unresolved)} branches never resolved")
+        # Every root branch, in BOTH legs, must have resolved to a best row
+        # or a proven loss; a drain that ended with work outstanding must not
+        # pass on a fast-but-wrong technicality.
+        for r, tag in [(r1, '1-worker'), (rN, f'{n}-worker')]:
+            sc = ScoreCache(r['cache'], self._pool, checkpoint_on_close=False)
+            unresolved = [
+                bw for bw in self._branches
+                if sc.read(encode_subset(bw), ERD_ALL) is None
+                and sc.read_loss(encode_subset(bw), ERD_ALL) is None]
+            sc.close()
+            self.assertEqual(unresolved, [],
+                             f"{len(unresolved)} branches never resolved "
+                             f"in the {tag} leg")
         if not passed and \
                 self._SPEEDUP_ASSERTION_INTENTIONALLY_DISABLED_BECAUSE_SCALING_IS_CURRENTLY_BROKEN:
             self.skipTest(
