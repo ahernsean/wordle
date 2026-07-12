@@ -273,16 +273,46 @@ def _print_queue_table(rows, title=None):
     if not rows:
         print('  (none)')
         return
-    print(f'{"ID":<4} {"Kind":<4} {"Status":<11} {"Pri":>7} {"Words":>6} '
-          f'{"Done":>9} {"W":>2} {"Nodes":>9}  Spine')
-    for r in rows:
-        bid = _branch_id(r['branch_key'])
-        done = (f'{r["done_candidates"]}/{r["n_candidates"]}'
-                if r.get('n_candidates') else '---')
-        pri = 'COOP' if (r.get('priority') or 0) >= 1_000_000 else str(r.get('priority') or 0)
-        print(f'{bid:<4} {r["kind"]:<4} {r["status"]:<11} {pri:>7} '
-              f'{r["n_words"]:6d} {done:>9} {r.get("worker_count", 0):2d} '
-              f'{(r.get("nodes_spent") or 0):9d}  {_row_path(r)}')
+    table_rows = []
+    for row in rows:
+        branch_id = _branch_id(row['branch_key'])
+        done_candidates = (f'{row["done_candidates"]}/{row["n_candidates"]}'
+                           if row.get('n_candidates') else '---')
+        priority = ('COOP' if (row.get('priority') or 0) >= 1_000_000
+                    else str(row.get('priority') or 0))
+        table_rows.append((
+            branch_id,
+            row['kind'],
+            row['status'],
+            priority,
+            str(row['n_words']),
+            done_candidates,
+            str(row.get('worker_count', 0)),
+            str(row.get('nodes_spent') or 0),
+            _row_path(row),
+        ))
+
+    headings = ('ID', 'Kind', 'Status', 'Pri', 'Words', 'Done', 'W', 'Nodes')
+    column_widths = [
+        max(len(heading), *(len(row[index]) for row in table_rows))
+        for index, heading in enumerate(headings)
+    ]
+
+    def format_table_row(row_values):
+        left = (
+            f'{row_values[0]:<{column_widths[0]}} '
+            f'{row_values[1]:<{column_widths[1]}} '
+            f'{row_values[2]:<{column_widths[2]}}'
+        )
+        right = ' '.join(
+            f'{row_values[index]:>{column_widths[index]}}'
+            for index in range(3, 8)
+        )
+        return f'{left} {right}  {row_values[8]}'
+
+    print(format_table_row((*headings, 'Spine')))
+    for table_row in table_rows:
+        print(format_table_row(table_row))
 
 
 def cmd_queue_dashboard(args):

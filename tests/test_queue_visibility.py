@@ -254,6 +254,50 @@ class QueueVisibilityTests(unittest.TestCase):
             "CRANE -----")
         self.assertEqual(self.q._row_spine_text({}), "")
 
+    def test_queue_table_columns_accommodate_rendered_values(self):
+        rows = [
+            {
+                "branch_key": b"first",
+                "kind": "coop",
+                "status": "open",
+                "priority": 1_000_000,
+                "n_words": 60,
+                "done_candidates": 12616,
+                "n_candidates": 12972,
+                "worker_count": 4,
+                "nodes_spent": 1732478,
+                "spine": "ALIBI -----",
+            },
+            {
+                "branch_key": b"second",
+                "kind": "user",
+                "status": "in_progress",
+                "priority": 170000,
+                "n_words": 841,
+                "done_candidates": 26,
+                "n_candidates": 12972,
+                "worker_count": 0,
+                "nodes_spent": 2748659,
+                "spine": "CRANE -----",
+            },
+        ]
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            erd_search._print_queue_table(rows)
+        lines = output.getvalue().splitlines()
+
+        self.assertEqual(
+            lines,
+            [
+                "ID   Kind Status         Pri Words        Done W   Nodes  Spine",
+                f"{erd_search._branch_id(b'first')} coop open          COOP    60 "
+                "12616/12972 4 1732478  ALIBI -----",
+                f"{erd_search._branch_id(b'second')} user in_progress 170000   841 "
+                "   26/12972 0 2748659  CRANE -----",
+            ],
+        )
+
 
 class QueueCliArgparseTests(unittest.TestCase):
     def setUp(self):
