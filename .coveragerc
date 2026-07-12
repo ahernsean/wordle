@@ -4,7 +4,8 @@
 # parallel ERD precache coordination (erd_swarm.py, erd_queue.py), and the
 # cache sync utilities (export_cache.py, import_cache.py).
 # Out of scope: erd_search.py (supervisor/process-spawn/terminal CLI layer),
-# verify_erd_cache.py, and the one-off diagnostic and dataset scripts.
+# the verify_erd_cache.py / verify_erd_losses.py re-verification passes, and
+# the one-off diagnostic and dataset scripts.
 [run]
 branch = True
 source =
