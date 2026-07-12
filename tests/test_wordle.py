@@ -30,7 +30,8 @@ from wordle_engine import (
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
     enumerate_branches, rank_candidates_by_max_group_size_then_entropy_gain, _cache_reuse,
-    _solve_subset, max_solvable_within,
+    _solve_subset, max_solvable_within, evaluate_candidate,
+    SOLVED, OVER_ERD_LIMIT,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -1942,6 +1943,54 @@ class TestSubbranchSolverHook(unittest.TestCase):
                       ERD_ALL, None, None, None, None,
                       subbranch_solver=declining_spy, ceiling=2.5)
         self.assertEqual(offers[0], (tuple(subset), 6, 2.5))
+
+    def test_dead_ceiling_refutes_without_recursing_or_offering(self):
+        # A sub-branch whose derived ceiling is at or below its admissible
+        # floor (every k-word branch costs >= 2 - 1/k) cannot save the
+        # candidate: the refutation is pure arithmetic.  evaluate_candidate
+        # must discard the candidate directly — never enter the sub-branch
+        # and never offer it for delegation.  Without the guard, such offers
+        # round-trip foregone conclusions through the swarm queue as
+        # instant nodes=0 cuts.
+        branch = ["bound", "found", "hound", "mound", "pound",
+                  "basic", "batch", "balms"]
+        # Against BOUND: FOUND/HOUND/MOUND/POUND respond -gggg (4 words),
+        # BASIC/BATCH/BALMS respond g---- (3 words), BOUND is self.
+        cache = ResponseCache(branch)
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            sc = ScoreCache(tmp.name, branch)
+            # Seed the 4-word group's exact cost above its 1.75 floor.  After
+            # it, the 3-word group's ceiling is (2.7 - 1 - 0.5*2.5) * 8/3 =
+            # 1.2, below its 5/3 floor — dead, so BOUND is refuted before the
+            # 3-word group is entered.
+            g1 = ["found", "hound", "mound", "pound"]
+            sc.write(ScoreCache.encode_subset(g1), ERD_ALL, 'found', 2.5,
+                     max_depth=3, solve_budget=None)
+            offers = []
+            def declining_spy(words, budget, ceiling):
+                offers.append((len(words), ceiling))
+                return None
+            status, _cost, _depth, _floor = evaluate_candidate(
+                branch, "bound", cache, sc, best_erd=2.7, guesses=branch,
+                budget=6, subbranch_solver=declining_spy)
+            self.assertEqual(status, OVER_ERD_LIMIT)
+            self.assertEqual(offers, [])
+            # Control: with slack (best_erd=3.5 the ceiling is 10/3, above
+            # the 5/3 floor) the 3-word group is a live question and must
+            # still be offered.
+            status2, *_ = evaluate_candidate(
+                branch, "bound", cache, sc, best_erd=3.5, guesses=branch,
+                budget=6, subbranch_solver=declining_spy)
+            self.assertEqual(status2, SOLVED)
+            self.assertEqual(offers[0][0], 3)
+            # The declined inline recursion offers its own sub-frames too;
+            # every offer, at every level, must be a live question.
+            for k, ceiling in offers:
+                self.assertGreater(ceiling, 2.0 - 1.0 / k)
+        finally:
+            os.unlink(tmp.name)
 
     def test_hook_receives_inf_ceiling_without_alpha_beta_pressure(self):
         # The root frame has no ceiling above it: its own offer carries inf.
