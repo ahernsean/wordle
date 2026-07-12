@@ -639,6 +639,20 @@ class ScoreCache:
                            policy, budget, exc)
         self._loss_mem_cache[(branch_key, policy)] = budget
 
+    def delete_loss(self, branch_key, policy):
+        """Remove a proven-loss row so the disproof gets re-established.
+
+        For invalidating a loss a verification pass has found suspect.  Also
+        drops the session mirror's entry (verdict or no-loss sentinel alike)
+        so the next read_loss falls through to SQLite instead of resurrecting
+        the deleted verdict from memory.
+        """
+        self._conn.execute("""
+            DELETE FROM branch_loss_by_policy
+            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+        """, (branch_key, policy, self.answer_list_id))
+        self._loss_mem_cache.pop((branch_key, policy), None)
+
     def read_detail(self, branch_key, policy):
         """Like read(), but also returns the unix timestamp of the last write.
 

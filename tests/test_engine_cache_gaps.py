@@ -230,6 +230,46 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
             sc.write_scores(key, [("crane", 1.0)], "entropy_gain")
 
 
+class TestDeleteLoss(unittest.TestCase):
+    """ScoreCache.delete_loss: removes the row AND the session mirror entry,
+    so a subsequent read_loss cannot resurrect the deleted verdict from
+    memory."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        try:
+            os.unlink(self.db)
+        except OSError:
+            pass
+
+    def test_delete_loss_removes_row_and_mirror(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.write_loss(key, ERD_ANSWERS, 3)
+        self.assertEqual(sc.read_loss(key, ERD_ANSWERS), 3)  # mirror now warm
+
+        sc.delete_loss(key, ERD_ANSWERS)
+        self.assertIsNone(sc.read_loss(key, ERD_ANSWERS))
+
+        # A second connection confirms the disk row itself is gone (not just
+        # this session's mirror).
+        sc2 = ScoreCache(self.db, ANSWERS)
+        self.assertIsNone(sc2.read_loss(key, ERD_ANSWERS))
+        sc2.close()
+        sc.close()
+
+    def test_delete_loss_missing_row_is_noop(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        key = ScoreCache.encode_subset(["crane", "slate"])
+        sc.delete_loss(key, ERD_ANSWERS)   # no row, no mirror: must not raise
+        self.assertIsNone(sc.read_loss(key, ERD_ANSWERS))
+        sc.close()
+
+
 class TestCacheSQLiteCloseAndMemory(unittest.TestCase):
 
     def setUp(self):
