@@ -212,6 +212,9 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- Candidates completed directly from the exact lower-bound elimination
     -- test, without a worker evaluation or per-candidate telemetry row.
     bulk_done_candidates INTEGER NOT NULL DEFAULT 0,
+    -- Tightest branch bound against which every candidate slot received a
+    -- bulk-elimination sweep.  NULL means no finite bound has been swept.
+    bulk_done_bound REAL,
     -- claim_next_bundle's forward cursor: count of best-first positions that
     -- have been covered or packed into a bundle at least once.  Positions
     -- [0, pack_cursor) may hold holes (reclaimed/republished, no current
@@ -698,6 +701,7 @@ class ERDQueue:
             "ceiling": "REAL",
             "cut_occurred": "INTEGER NOT NULL DEFAULT 0",
             "bulk_done_candidates": "INTEGER NOT NULL DEFAULT 0",
+            "bulk_done_bound": "REAL",
         })
         self._add_columns("branch_finalize_log", {
             "ceiling": "REAL",
@@ -1075,7 +1079,8 @@ class ERDQueue:
             # scratch.  Checked inside the write transaction so it can't race
             # finalize+delete.
             br = self._conn.execute(
-                "SELECT status, best_erd, pack_cursor, ceiling FROM active_branches "
+                "SELECT status, best_erd, pack_cursor, ceiling, bulk_done_bound "
+                "FROM active_branches "
                 "WHERE branch_key = ?", (branch_key,)).fetchone()
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
@@ -1086,14 +1091,21 @@ class ERDQueue:
             bound = min(
                 br["best_erd"] if br["best_erd"] is not None else float("inf"),
                 br["ceiling"] if br["ceiling"] is not None else float("inf"))
-            claim_rows = {row["idx"]: row for row in self._conn.execute(
-                "SELECT idx, done FROM candidate_claims WHERE branch_key = ?",
-                (branch_key,))}
-            eliminated_indices = [
-                idx for idx in candidate_order
-                if cost_lower_bound[idx] >= bound
-                and (idx not in claim_rows or not claim_rows[idx]["done"])
-            ]
+            swept_bound = br["bulk_done_bound"]
+            bound_tightened = (bound != float("inf")
+                               and (swept_bound is None or bound < swept_bound))
+            claim_rows = None
+            if bound_tightened:
+                claim_rows = {row["idx"]: row for row in self._conn.execute(
+                    "SELECT idx, done FROM candidate_claims WHERE branch_key = ?",
+                    (branch_key,))}
+                eliminated_indices = [
+                    idx for idx in candidate_order
+                    if cost_lower_bound[idx] >= bound
+                    and (idx not in claim_rows or not claim_rows[idx]["done"])
+                ]
+            else:
+                eliminated_indices = []
             if eliminated_indices:
                 now = int(time.time())
                 # best_erd only decreases and ceiling is immutable, so this
@@ -1116,25 +1128,52 @@ class ERDQueue:
                 """, (len(eliminated_indices), branch_key))
                 for idx in eliminated_indices:
                     claim_rows[idx] = {"idx": idx, "done": 1}
+            if bound_tightened:
+                self._conn.execute(
+                    "UPDATE active_branches SET bulk_done_bound = ? "
+                    "WHERE branch_key = ?", (bound, branch_key))
 
             cursor = br["pack_cursor"]
             if cursor < n_candidates:
-                available_positions = [
-                    position for position in range(cursor, n_candidates)
-                    if candidate_order[position] not in claim_rows
-                ]
-                selected_positions = available_positions[
-                    :min(small_count, count_cap)]
-                bundle = [candidate_order[position]
-                          for position in selected_positions]
-                new_cursor = (selected_positions[-1] + 1
-                              if selected_positions else n_candidates)
+                bundle = []
+                new_cursor = cursor
+                survivor_limit = min(small_count, count_cap)
+                while new_cursor < n_candidates and len(bundle) < survivor_limit:
+                    idx = candidate_order[new_cursor]
+                    new_cursor += 1
+                    if cost_lower_bound[idx] < bound:
+                        bundle.append(idx)
                 self._conn.execute(
                     "UPDATE active_branches SET pack_cursor = ? "
                     "WHERE branch_key = ?", (new_cursor, branch_key))
             else:
-                bundle = [idx for idx in candidate_order if idx not in claim_rows]
-                bundle = bundle[:min(small_count, count_cap)]
+                if claim_rows is None:
+                    claim_rows = {row["idx"]: row for row in self._conn.execute(
+                        "SELECT idx, done FROM candidate_claims "
+                        "WHERE branch_key = ?", (branch_key,))}
+                holes = [idx for idx in candidate_order if idx not in claim_rows]
+                eliminated_holes = [
+                    idx for idx in holes if cost_lower_bound[idx] >= bound]
+                if eliminated_holes:
+                    now = int(time.time())
+                    self._conn.executemany("""
+                        INSERT INTO candidate_claims
+                            (branch_key, idx, claimed_by, claimed_at, done,
+                             done_at, bundle_id)
+                        VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
+                    """, [(branch_key, idx, now, now)
+                          for idx in eliminated_holes])
+                    self._conn.execute("""
+                        UPDATE active_branches
+                        SET bulk_done_candidates = bulk_done_candidates + ?,
+                            cut_occurred = CASE
+                                WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
+                                ELSE cut_occurred END
+                        WHERE branch_key = ?
+                    """, (len(eliminated_holes), branch_key))
+                survivor_limit = min(small_count, count_cap)
+                bundle = [idx for idx in holes
+                          if cost_lower_bound[idx] < bound][:survivor_limit]
             if not bundle:
                 self._conn.execute("COMMIT")
                 return None

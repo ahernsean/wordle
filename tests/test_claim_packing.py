@@ -276,6 +276,34 @@ class _TmpQueue(unittest.TestCase):
 
 
 class TestClaimNextBundle(_TmpQueue):
+    def test_unchanged_bound_forward_claim_does_not_rescan_branch(self):
+        class CountingLowerBounds(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.read_count = 0
+
+            def __getitem__(self, index):
+                self.read_count += 1
+                return super().__getitem__(index)
+
+        lower_bounds = CountingLowerBounds([0.0] * N_CANDIDATES)
+        self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, lower_bounds,
+            small_count=5, count_cap=500)
+        lower_bounds.read_count = 0
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            self.q.claim_next_bundle(
+                self.key, "w0", N_CANDIDATES, _ORDER, lower_bounds,
+                small_count=5, count_cap=500)
+        finally:
+            self.q._conn.set_trace_callback(None)
+        self.assertEqual(lower_bounds.read_count, 5)
+        self.assertFalse(any(
+            "SELECT idx, done FROM candidate_claims" in statement
+            for statement in statements))
+
     def test_loose_bound_packs_small_bundles(self):
         # No best_erd set yet -> B reads as +inf -> nothing eliminated.
         bundle_id, indices, forced = self.q.claim_next_bundle(
