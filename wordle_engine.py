@@ -1254,6 +1254,13 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         else:
             sub_ceiling = (best_erd - cost
                           - remaining_groups_cost_lower_bound[i + 1]) * (n / k) + _CEIL_EPS
+            if sub_ceiling <= _sub_lb(sub_branch):
+                # Dead ceiling: every sub-branch of size k costs >= lb(k)
+                # (admissible lower bound), so even a floor-attaining sub-tree
+                # prices this candidate at >= best_erd.  The refutation is
+                # pure arithmetic — never recurse, and never offer a foregone
+                # conclusion to the swarm as a sub-branch.
+                return (OVER_ERD_LIMIT, None, cand_max_remaining_depth, floor)
         sub = _solve_subset(
             sub_branch, cache, score_cache, sub_budget, deadline, guesses,
             policy, cancel_check, heartbeat, note_depth, None,
