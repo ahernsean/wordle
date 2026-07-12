@@ -58,13 +58,9 @@ def cost_size_bucket(n_words: int) -> int:
 # epoch-2 claim-count-reduction model already gives ~105x there; larger
 # values buy diminishing returns per §1's table).
 DEFAULT_SMALL_COUNT = 8
-# count_cap: the max size of any bundle (bulk or small).  Bounds a bulk
-# bundle's wall time and its crash-reclaim window (a dead worker's whole
-# bundle is redone).  A provably-eliminated candidate completes in O(1)
-# (§3 monotonicity) but is not exactly free, so 500 keeps a bulk claim's
-# worst-case redo bounded to a few hundred near-instant re-evaluations —
-# comfortably inside HB_TIMEOUT_SECONDS — while still collapsing a
-# multi-thousand-candidate eliminated tail into a handful of claims.
+# count_cap: a backward-compatible hard upper bound on the survivor count in
+# a bundle.  Bulk-eliminated candidates are completed directly and never enter
+# a bundle, so small_count is the effective limit under the default settings.
 DEFAULT_COUNT_CAP = 500
 # republish_limit: how many times the same candidate may be republished
 # (adaptive_claim_packing.md §7's bounded-republish-depth guardrail) before
@@ -209,8 +205,14 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- being proven infeasible.  Only meaningful at finalize when best_guess is
     -- NULL, where it distinguishes CUT (>= ceiling) from a proven loss.
     cut_occurred   INTEGER NOT NULL DEFAULT 0,
+    -- Candidates completed directly from the exact lower-bound elimination
+    -- test, without a worker evaluation or per-candidate telemetry row.
+    bulk_done_candidates INTEGER NOT NULL DEFAULT 0,
+    -- Tightest branch bound against which every candidate slot received a
+    -- bulk-elimination sweep.  NULL means no finite bound has been swept.
+    bulk_done_bound REAL,
     -- claim_next_bundle's forward cursor: count of best-first positions that
-    -- have been packed into a bundle at least once.  Positions
+    -- have been covered or packed into a bundle at least once.  Positions
     -- [0, pack_cursor) may hold holes (reclaimed/republished, no current
     -- candidate_claims row) picked up by holes_pass once the cursor reaches
     -- n_candidates; positions [pack_cursor, n_candidates) are virgin and
@@ -386,7 +388,10 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     created_at              INTEGER,
     finalized_at            INTEGER,
     nodes_spent             INTEGER,
+    -- Candidates completed through worker evaluation; bulk lower-bound
+    -- proofs are counted separately.
     n_claims                INTEGER,
+    bulk_done_candidates    INTEGER,
     n_bundles               INTEGER,
     max_bundle_nodes        INTEGER,
     total_bundle_wall_millis INTEGER,
@@ -484,43 +489,6 @@ def _derive_telemetry_path(db_path: str) -> str:
         return ":memory:"
     root, ext = os.path.splitext(db_path)
     return f"{root}_telemetry{ext}"
-
-
-def _pack_bundle(order, start, cost_lower_bound, bound, small_count, count_cap):
-    """The exact-elimination packer (adaptive_claim_packing.md §5).
-
-    Walks `order` — a sequence of candidate idx values in best-first (Σk²
-    ascending) order — from position `start`, classifying each idx by the
-    exact test `cost_lower_bound[idx] >= bound`.  If the first candidate is
-    eliminated, absorbs consecutive eliminated candidates up to count_cap (a
-    bulk bundle).  Otherwise absorbs candidates — including any eliminated
-    ones interleaved among them — until small_count not-yet-eliminated
-    ("survivor") candidates have been taken or count_cap is reached (a small
-    bundle).
-
-    Returns (bundle, next_position): bundle is the list of idx taken, in the
-    order they appear in `order`; next_position is the position in `order`
-    just past the last one taken (== len(order) if `order` was exhausted).
-    start >= len(order) returns ([], start).
-    """
-    n = len(order)
-    if start >= n:
-        return [], start
-    i = start
-    bundle = []
-    if cost_lower_bound[order[i]] >= bound:
-        while i < n and len(bundle) < count_cap and cost_lower_bound[order[i]] >= bound:
-            bundle.append(order[i])
-            i += 1
-    else:
-        survivors = 0
-        while i < n and len(bundle) < count_cap and survivors < small_count:
-            idx = order[i]
-            bundle.append(idx)
-            if cost_lower_bound[idx] < bound:
-                survivors += 1
-            i += 1
-    return bundle, i
 
 
 class ERDQueue:
@@ -691,10 +659,13 @@ class ERDQueue:
         self._add_columns("active_branches", {
             "ceiling": "REAL",
             "cut_occurred": "INTEGER NOT NULL DEFAULT 0",
+            "bulk_done_candidates": "INTEGER NOT NULL DEFAULT 0",
+            "bulk_done_bound": "REAL",
         })
         self._add_columns("branch_finalize_log", {
             "ceiling": "REAL",
             "outcome": "TEXT",
+            "bulk_done_candidates": "INTEGER",
         }, schema="telemetry")
 
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
@@ -992,10 +963,10 @@ class ERDQueue:
                           small_count=DEFAULT_SMALL_COUNT,
                           count_cap=DEFAULT_COUNT_CAP,
                           republish_limit=DEFAULT_REPUBLISH_LIMIT):
-        """Atomically pack and claim the next bundle of unclaimed candidates.
+        """Atomically bulk-complete eliminations and claim a survivor bundle.
 
-        Runs the exact-elimination packer (_pack_bundle,
-        adaptive_claim_packing.md §5) inside one BEGIN IMMEDIATE transaction:
+        Runs the exact-elimination classification from
+        adaptive_claim_packing.md §5 inside one BEGIN IMMEDIATE transaction:
         every unclaimed candidate is classified by
         `candidate_cost_lower_bound(c) >= B` against the branch's current real
         best_erd (B), read from active_branches in this same transaction so
@@ -1012,6 +983,13 @@ class ERDQueue:
         n_candidates every further call falls back to a holes pass (idx with
         no current candidate_claims row — reclaimed or republished slots),
         packed the same way over the filtered best-first order.
+
+        Provably eliminated slots are completed authoritatively in this
+        transaction and never returned to a worker.  INSERT OR REPLACE
+        deliberately supersedes a racing done=0 claim: the admissible lower
+        bound is already a complete proof, while preserving the in-flight row
+        would spend engine work to establish the same fact.  Aggregate counts
+        are retained on the branch instead of emitting per-candidate telemetry.
 
         Returns (bundle_id, indices, forced), or None if nothing is claimable
         (branch not open or missing, or every slot already has a row).
@@ -1060,7 +1038,8 @@ class ERDQueue:
             # scratch.  Checked inside the write transaction so it can't race
             # finalize+delete.
             br = self._conn.execute(
-                "SELECT status, best_erd, pack_cursor, ceiling FROM active_branches "
+                "SELECT status, best_erd, pack_cursor, ceiling, bulk_done_bound "
+                "FROM active_branches "
                 "WHERE branch_key = ?", (branch_key,)).fetchone()
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
@@ -1071,24 +1050,89 @@ class ERDQueue:
             bound = min(
                 br["best_erd"] if br["best_erd"] is not None else float("inf"),
                 br["ceiling"] if br["ceiling"] is not None else float("inf"))
+            swept_bound = br["bulk_done_bound"]
+            bound_tightened = (bound != float("inf")
+                               and (swept_bound is None or bound < swept_bound))
+            claim_rows = None
+            if bound_tightened:
+                claim_rows = {row["idx"]: row for row in self._conn.execute(
+                    "SELECT idx, done FROM candidate_claims WHERE branch_key = ?",
+                    (branch_key,))}
+                eliminated_indices = [
+                    idx for idx in candidate_order
+                    if cost_lower_bound[idx] >= bound
+                    and (idx not in claim_rows or not claim_rows[idx]["done"])
+                ]
+            else:
+                eliminated_indices = []
+            if eliminated_indices:
+                now = int(time.time())
+                # best_erd only decreases and ceiling is immutable, so this
+                # bound only tightens; an eliminated candidate remains
+                # eliminated for the rest of the branch's lifetime.
+                self._conn.executemany("""
+                    INSERT OR REPLACE INTO candidate_claims
+                        (branch_key, idx, claimed_by, claimed_at, done, done_at,
+                         bundle_id)
+                    VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
+                """, [(branch_key, idx, now, now)
+                      for idx in eliminated_indices])
+                self._conn.execute("""
+                    UPDATE active_branches
+                    SET bulk_done_candidates = bulk_done_candidates + ?,
+                        cut_occurred = CASE
+                            WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
+                            ELSE cut_occurred END
+                    WHERE branch_key = ?
+                """, (len(eliminated_indices), branch_key))
+                for idx in eliminated_indices:
+                    claim_rows[idx] = {"idx": idx, "done": 1}
+            if bound_tightened:
+                self._conn.execute(
+                    "UPDATE active_branches SET bulk_done_bound = ? "
+                    "WHERE branch_key = ?", (bound, branch_key))
+
             cursor = br["pack_cursor"]
             if cursor < n_candidates:
-                # start < len(candidate_order) and count_cap >= 1 together
-                # guarantee _pack_bundle takes at least one candidate, so the
-                # forward path's bundle is never empty here.
-                bundle, new_cursor = _pack_bundle(
-                    candidate_order, cursor, cost_lower_bound, bound,
-                    small_count, count_cap)
+                bundle = []
+                new_cursor = cursor
+                survivor_limit = min(small_count, count_cap)
+                while new_cursor < n_candidates and len(bundle) < survivor_limit:
+                    idx = candidate_order[new_cursor]
+                    new_cursor += 1
+                    if cost_lower_bound[idx] < bound:
+                        bundle.append(idx)
                 self._conn.execute(
                     "UPDATE active_branches SET pack_cursor = ? "
                     "WHERE branch_key = ?", (new_cursor, branch_key))
             else:
-                claimed = {r["idx"] for r in self._conn.execute(
-                    "SELECT idx FROM candidate_claims WHERE branch_key = ?",
-                    (branch_key,))}
-                holes = [idx for idx in candidate_order if idx not in claimed]
-                bundle, _ = _pack_bundle(holes, 0, cost_lower_bound, bound,
-                                         small_count, count_cap)
+                if claim_rows is None:
+                    claim_rows = {row["idx"]: row for row in self._conn.execute(
+                        "SELECT idx, done FROM candidate_claims "
+                        "WHERE branch_key = ?", (branch_key,))}
+                holes = [idx for idx in candidate_order if idx not in claim_rows]
+                eliminated_holes = [
+                    idx for idx in holes if cost_lower_bound[idx] >= bound]
+                if eliminated_holes:
+                    now = int(time.time())
+                    self._conn.executemany("""
+                        INSERT INTO candidate_claims
+                            (branch_key, idx, claimed_by, claimed_at, done,
+                             done_at, bundle_id)
+                        VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
+                    """, [(branch_key, idx, now, now)
+                          for idx in eliminated_holes])
+                    self._conn.execute("""
+                        UPDATE active_branches
+                        SET bulk_done_candidates = bulk_done_candidates + ?,
+                            cut_occurred = CASE
+                                WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
+                                ELSE cut_occurred END
+                        WHERE branch_key = ?
+                    """, (len(eliminated_holes), branch_key))
+                survivor_limit = min(small_count, count_cap)
+                bundle = [idx for idx in holes
+                          if cost_lower_bound[idx] < bound][:survivor_limit]
             if not bundle:
                 self._conn.execute("COMMIT")
                 return None
@@ -1370,6 +1414,13 @@ class ERDQueue:
         return self._conn.execute(
             "SELECT COUNT(*) FROM candidate_claims WHERE branch_key = ? AND done = 1",
             (branch_key,)).fetchone()[0]
+
+    def branch_bulk_done_candidates(self, branch_key) -> int:
+        """Return the aggregate number completed by exact elimination."""
+        row = self._conn.execute(
+            "SELECT bulk_done_candidates FROM active_branches "
+            "WHERE branch_key = ?", (branch_key,)).fetchone()
+        return 0 if row is None else row[0]
 
     def try_finalize_branch(self, branch_key) -> bool:
         """Atomically transition a branch open -> finalized, exactly once.
@@ -2082,7 +2133,8 @@ class ERDQueue:
                                 created_at, finalized_at, nodes_spent, n_claims,
                                 n_bundles=None, max_bundle_nodes=None,
                                 total_bundle_wall_millis=None, censored_units=None,
-                                ceiling=None, outcome=None):
+                                ceiling=None, outcome=None,
+                                bulk_done_candidates=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -2091,6 +2143,10 @@ class ERDQueue:
         them (a branch solved entirely from reused cache entries never
         claims a bundle).  ceiling is the alpha-beta ceiling the branch was
         solved under (NULL = exact solve); outcome is 'exact', 'cut', or 'loss'.
+        bulk_done_candidates preserves the aggregate eliminated count without
+        restoring per-candidate telemetry writes.  If a bulk sweep supersedes
+        an in-flight claim that later finishes, n_claims excludes that overlap
+        even though its per-claim telemetry row still exists.
         """
         now = int(time.time())
         self._conn.execute("""
@@ -2098,11 +2154,12 @@ class ERDQueue:
                 (branch_key, spine, n_words, budget, epoch, created_at,
                  finalized_at, nodes_spent, n_claims, n_bundles,
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
-                 ceiling, outcome, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ceiling, outcome, bulk_done_candidates, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
-              total_bundle_wall_millis, censored_units, ceiling, outcome, now))
+              total_bundle_wall_millis, censored_units, ceiling, outcome,
+              bulk_done_candidates, now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

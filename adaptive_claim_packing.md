@@ -1,11 +1,11 @@
-# Binary claim packing with republish-on-overrun
+# Survivor claim packing with bulk elimination and republish-on-overrun
 
 This is the plan to replace the swarm's single-candidate claiming with
 count-bundled claim packing over an **exact binary split**: at handout time,
 every unclaimed candidate is either *provably ERD-lower-bound-eliminated*
 against the branch's current real bound (`candidate_cost_lower_bound >= B`,
-an exact test, not an estimate) or it is not. Eliminated candidates coalesce
-into large count-capped bundles; not-yet-eliminated candidates pack into
+an exact test, not an estimate) or it is not. Eliminated candidates are marked
+done directly in one transaction; not-yet-eliminated candidates pack into
 small fixed-count bundles in best-first order. A bundle that overruns its
 cap republishes its unfinished remainder for re-packing — never as
 one-candidate-per-claim.
@@ -24,8 +24,8 @@ things that *did* validate are the only two things the scheme relies on:
 2. **Claim count, not node cost, is the disease.** Coordination is a fixed
    ~27–35 ms per claim while the median claim does 1–2 nodes of work.
 
-The measured claim-count reduction from count-bundling alone (no magnitude
-model), per `analyze_swarm_telemetry.py estimate_claim_reduction`:
+The original measured claim-count reduction from survivor bundling alone (no
+magnitude model) was:
 
 | `small_count` | Epoch 0 aggregate | Epoch 2 aggregate |
 |---:|---:|---:|
@@ -33,6 +33,11 @@ model), per `analyze_swarm_telemetry.py estimate_claim_reduction`:
 | 16 | 82.3× | 174.2× |
 | 32 | 144.1× | 260.5× |
 | 64 | 230.9× | 346.0× |
+
+Direct bulk completion removes the eliminated candidates' claim transactions
+entirely. `analyze_swarm_telemetry.py estimate_claim_reduction` remains a
+historical estimator for pre-bulk-completion epochs; current claim reduction is
+measured directly by the swarm-overhead CI guard.
 
 ### Relationship to issues #67 and #68
 
@@ -145,20 +150,20 @@ it can never be wrong.
 
 Two pieces, one feedback loop:
 
-- **Packing (static scheduling on an exact signal).** Handing out a claim
-  selects a *bundle* of currently unclaimed candidate indices. Each
-  candidate is classified by the exact test
+- **Bulk elimination plus survivor packing.** When the branch bound tightens,
+  every incomplete candidate is classified by the exact test
   `candidate_cost_lower_bound(c) >= B`, where `B` is the branch's current
   real `best_erd` read inside the claim transaction. Provably-eliminated
-  candidates coalesce into bulk bundles of up to `count_cap`;
-  not-yet-eliminated candidates pack into small bundles of `small_count`,
-  front-to-back in best-first order.
+  candidates receive authoritative `done=1` rows in one batch;
+  not-yet-eliminated candidates pack into worker bundles of `small_count`,
+  front-to-back in best-first order. The last swept bound is persisted so an
+  unchanged-bound claim resumes its cursor walk without rescanning the branch.
 - **Republish-on-overrun (runtime correction).** A worker measures *actual*
   nodes as it evaluates its bundle. If the bundle overruns its node or
   wall cap before it is done, the worker stops, returns its unfinished
   candidates to the unclaimed pool, and they are re-packed on the next
   handout — with a tighter `B` than last time, so remainder mass tends to
-  re-pack into *bulk* bundles, not smaller ones.
+  become bulk-done rather than re-enter worker bundles.
 
 The division of labor:
 
@@ -166,14 +171,12 @@ The division of labor:
 > mass. **Republish-on-overrun** gets *balance* right for the searched
 > head, using measured nodes. Nothing anywhere predicts a magnitude.
 
-**Monotonicity (why the bulk path is safe).** `B` only ever tightens
+**Monotonicity (why bulk completion is safe).** `B` only ever tightens
 (solved results can only lower `best_erd`), and each candidate's
 `candidate_cost_lower_bound` is a constant of the (candidate, branch) pair.
-So *provably eliminated at handout* implies *still eliminated at
-evaluation*: every member of a bulk bundle completes in O(1) — the engine
-re-runs the same test against a `B` at least as tight and returns
-immediately. A bulk bundle cannot overrun on nodes; its caps exist for
-crash-reclaim windows (§7), not for misprediction.
+So a candidate proven eliminated during a sweep stays eliminated for the
+branch's lifetime. Its authoritative done row needs no engine evaluation,
+claim telemetry, bundle cap, or crash-reclaim window.
 
 ### Correctness principle (mandatory): only exact values bound
 
@@ -187,7 +190,7 @@ This is an absolute invariant, not a preference:
   cost. Extra computation is always acceptable; a bound that could be
   *better* than reality is never acceptable, because it could discard the
   real optimum.
-- The packer's classification uses only such exact/admissible quantities,
+- The claim path's classification uses only such exact/admissible quantities,
   so in this scheme scheduling *cannot* diverge from correctness: a stale
   `B` (read a moment before another worker tightened it) only
   under-classifies candidates as "not yet eliminated" — the safe
@@ -225,13 +228,13 @@ Properties that make it sufficient on its own:
   candidate is solved) `B` is only the seeded ceiling, so few candidates
   are provably eliminated and most pack into small bundles: more claims,
   never a wrong result. As real solved results tighten `B`, the tail
-  coalesces into bulk — where the coordination win is. No fabricated
+  completes in the batch sweep — where the coordination win is. No fabricated
   bound, no waiting rule, no starvation: workers always have claimable
   head work.
 - **It is already computed vectorized.** The §4a kernel pass
   (`candidate_stats`, full_tree_plan.md §3) produces the whole-vocabulary
   `cost_lower_bound` array in one shot when a branch is promoted; the
-  packer stores it per branch and only *reads* it inside the claim
+  claim path receives it per branch and only *reads* it inside the claim
   transaction (§12).
 
 The **ordering is the engine's existing best-first sort** (`Σk²`
@@ -248,51 +251,51 @@ is chosen from republish-safety, not from a cost model (§12).
 
 ---
 
-## 5. The packer
+## 5. Bulk elimination and survivor packing
 
 Candidates are kept in the engine's best-first order (`Σk²` ascending).
-The packer walks them front-to-back with a single monotonic cursor.
-`eliminated(c) := candidate_cost_lower_bound[c] >= B`, with `B` read once
-inside the claim transaction.
+The claim path walks them front-to-back with a single monotonic cursor.
+`eliminated(c) := candidate_cost_lower_bound[c] >= B`, with `B` read inside
+the claim transaction.
 
 ```
-def next_bundle(cursor, candidates_best_first, B, small_count, count_cap):
-    # cursor: lowest not-yet-claimed position in best-first order
-    if cursor past end: return holes_pass()        # §6: reclaimed/republished slots
-    if eliminated(candidates[cursor]):
-        # bulk bundle: absorb consecutive eliminated candidates
-        take while eliminated(c) and len(bundle) < count_cap
-    else:
-        # small bundle: fixed count of not-yet-eliminated candidates,
-        # absorbing any eliminated candidates interleaved among them
-        take until survivors_taken == small_count or end,
-             capped at count_cap total
-    return bundle
+def claim_next_bundle(cursor, candidates_best_first, B, last_swept_B,
+                      small_count):
+    if B < last_swept_B:
+        mark every incomplete eliminated candidate done in one batch
+        last_swept_B = B
+    if cursor past end:
+        return holes_pass()        # §6: reclaimed/republished slots
+    walk forward, skipping eliminated positions covered by the sweep
+    return the next small_count survivors and the advanced cursor
 ```
 
 Behaviour:
 
-- **Not-yet-eliminated head → small bundles.** While `B` is loose, the
+- **Bound tightening → one bulk-done sweep.** The sweep considers every
+  incomplete slot against the newly tighter bound and writes authoritative
+  done rows with one `executemany`. A racing done=0 claim is replaced because
+  the admissible lower bound is already a complete proof.
+- **Not-yet-eliminated head → survivor bundles.** While `B` is loose, the
   front candidates pack `small_count` per claim, so the strong splitters
   are evaluated first and in parallel, tightening `B` fast. Worst case
-  (nothing eliminated yet) claim count is `n / small_count` — already ≥ 8×
-  below single-candidate claiming.
-- **Eliminated tail → bulk bundles.** Once `B` is tight, long eliminated
-  runs absorb up to `count_cap` per claim — collapsing claim count where
-  the 93.7% live. Every member completes in O(1) (§3 monotonicity).
-- **The dials are counts, not work estimates.** `small_count` bounds how
-  much searched mass can be stranded behind a heavy candidate before an
-  overrun republishes it; `count_cap` bounds a bulk bundle's wall time and
-  its crash-reclaim window. Neither requires predicting anything.
+  (nothing eliminated yet) claim count is `n / small_count`.
+- **Unchanged bound → bounded cursor work.** No candidate-claim rows or full
+  candidate order are rescanned. The cursor advances only far enough to fill
+  the next survivor bundle, preserving O(n_candidates) total forward work.
+- **The dial is a count, not a work estimate.** `small_count` bounds how much
+  searched mass can be stranded behind a heavy candidate before an overrun
+  republishes it. `count_cap` remains a backward-compatible hard upper bound
+  on survivor bundle size; under the defaults, `small_count` is the effective
+  limit.
 
-**Cost of the walk (absorbs #68).** The cursor advances monotonically
-through best-first order, so the common (no-hole) path is O(1) amortized
-per candidate and a branch drains in O(n_candidates) total claim work —
-never #68's O(n²) per-call gap scan. Reclaimed or republished positions
-are picked up by `holes_pass()` once the forward cursor is exhausted (or
-on a periodic sweep), preserving #68's lazy end-of-sweep semantics. The
-O(n) bound is for the no-overrun path; republish (§7) re-admits positions
-and adds work proportional to the re-admitted count, not to n.
+**Cost of the walk (absorbs #68).** The cursor advances monotonically through
+best-first order, so the common (no-hole) path is O(1) amortized per candidate
+and a branch drains in O(n_candidates) total forward claim work — never #68's
+O(n²) per-call gap scan. Each strictly tighter bound adds one O(n_candidates)
+proof sweep; repeated claims at the same bound do not. Reclaimed or republished
+positions are picked up by `holes_pass()` once the forward cursor is exhausted,
+preserving #68's lazy end-of-sweep semantics.
 
 ---
 
@@ -303,8 +306,8 @@ and `claim_candidate` returns the single lowest unclaimed `idx`. The
 change:
 
 - **Replace `claim_candidate` with `claim_next_bundle`**, which runs the §5
-  packer *inside the `BEGIN IMMEDIATE` transaction* over the unclaimed
-  pool, inserts one `candidate_claims` row per chosen `idx` (all
+  classification and survivor packing *inside the `BEGIN IMMEDIATE`
+  transaction*, inserts one `candidate_claims` row per survivor `idx` (all
   `claimed_by` = this worker, same `claimed_at`), and returns the index
   list. One transaction per *bundle*, not per candidate — that is where
   the coordination win comes from.
@@ -316,15 +319,15 @@ change:
 - **Finalize coverage is unchanged**: a branch finalizes when all
   `n_candidates` rows are `done=1`, whoever observes full coverage.
 
-Crucially, because *handout itself is the packer*, **every** source of
-work-to-do flows through it and therefore produces count-bundled claims:
+Crucially, every source of work-to-do flows through `claim_next_bundle` and
+therefore is either bulk-completed or placed in a survivor bundle:
 
-- Fresh candidates → packer bundles them.
+- Fresh candidates → bulk completion or survivor bundles.
 - Reclaimed candidates from a dead worker (`reclaim_stale_claims` deletes
-  the `done=0` rows → they reappear in the unclaimed pool) → packer
-  **re-bundles** them.
-- Republished candidates from an overrun (§7) → packer **re-bundles**
-  them.
+  the `done=0` rows → they reappear in the unclaimed pool) → the claim path
+  bulk-completes or **re-bundles** them.
+- Republished candidates from an overrun (§7) → the claim path bulk-completes
+  or **re-bundles** them.
 
 There is no code path that hands out a lone candidate. This is the
 structural guarantee against the "1 candidate = 1 claim" trap.
@@ -349,8 +352,7 @@ cap and still has unfinished candidates `R`. The worker:
    §6) and re-packed — against a `B` that is at least as tight as when
    they were first packed, and usually tighter (the bundle head just
    solved). The common case: yesterday's "not yet eliminated" remainder
-   re-packs as provably-eliminated bulk. No estimate is scaled, because
-   there is no estimate.
+   becomes bulk-done. No estimate is scaled, because there is no estimate.
 
 **(b) Within-candidate overrun** — a *single* candidate's own recursive
 subtree exceeds the cap. This is not a packing problem; it is the existing
@@ -366,10 +368,9 @@ Guardrails:
 - **Bounded republish depth:** cap how many times the same candidate can
   be republished before it is forced through promotion (b) instead, so a
   pathological candidate converges instead of thrashing the pool.
-- **Cap a bundle's wall-time**, not just its nodes, so a worker cannot
-  sit on a bundle long enough to widen the reclaim window after a crash.
-  This is the only cap a bulk bundle can hit (§3 monotonicity — its
-  members cannot cost nodes).
+- **Cap a survivor bundle's wall-time**, not just its nodes, so a worker
+  cannot sit on a bundle long enough to widen the reclaim window after a
+  crash.
 
 ---
 
@@ -489,35 +490,26 @@ Remaining (PR2):
 
 ---
 
-## 12. Open questions
+## 12. Tuning and shared-state constraints
 
-- **Choosing `small_count` and `count_cap`.** `small_count` trades
+- **Choosing `small_count`.** `small_count` trades
   coordination amortization against republish waste: at most
   `small_count − 1` candidates can be stranded behind a heavy head until
   the overrun fires, so pick it from republish-safety (8 is the
-  conservative anchor; the model says 105× there, with diminishing
-  returns above). `count_cap` bounds a bulk bundle's wall time and
-  crash-reclaim window; a provably-eliminated candidate is nearly free
-  but not exactly free, so cap by count and wall, and confirm with
-  epoch-3 `branch_finalize_log` bundle diagnostics.
+  conservative anchor; the model says 105× there, with diminishing returns
+  above). `count_cap` remains a backward-compatible upper bound on survivor
+  bundle size and is not a separate production tuning dial while it exceeds
+  `small_count`.
 - **Cursor and bound state are shared across processes (correctness
   constraint, not optional).** Worker *processes* call `claim_next_bundle`
-  concurrently, so the best-first candidate order, the forward cursor,
-  and the `B` read must live in the queue DB and be advanced under the
-  same `BEGIN IMMEDIATE` that inserts the claim rows — never in
-  worker-local memory — or two workers pack overlapping bundles. Open
-  choice: store the cursor on `active_branches` (a `next_idx`-style
-  column, the one piece of #68 that survives) versus deriving the
-  frontier from `candidate_claims` each call. Holes from
-  reclaim/republish are handled by `holes_pass` once the forward cursor
-  is exhausted (or on a periodic sweep), never by rewinding on every
-  call — preserving #68's lazy end-of-sweep semantics and the
-  O(1)-amortized common path.
-- **Packer cost inside the lock.** The classification is one float
-  comparison per candidate against a per-branch `cost_lower_bound` vector
-  computed once at promotion (the §4a `candidate_stats` pass) — so the
-  in-lock work is a vector scan, far cheaper than the old
-  per-candidate-`group_counts` concern. Verify with §9.5-style
-  decomposed coordination timings on epoch 3; if the scan still shows up,
-  store the vector pre-sorted in best-first order so the scan is
-  sequential.
+  concurrently. `active_branches.pack_cursor` and `bulk_done_bound` are
+  advanced under the same `BEGIN IMMEDIATE` that inserts claim or done rows,
+  while the current `B` is read from that branch row in the transaction.
+  Holes from reclaim/republish are handled by `holes_pass` once the forward
+  cursor is exhausted, never by rewinding on every call — preserving #68's
+  lazy end-of-sweep semantics and the O(1)-amortized common path.
+- **Sweep cost inside the lock.** A full classification sweep runs only when
+  `B` strictly tightens, recorded by `active_branches.bulk_done_bound` in the
+  same transaction. Repeated claims at an unchanged bound resume the forward
+  cursor and stop after filling one survivor bundle; they never rescan all
+  claim rows or all candidate positions.

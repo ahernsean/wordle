@@ -1,12 +1,12 @@
 """Unit/integration tests for binary claim packing (issue #67,
-adaptive_claim_packing.md): the exact-elimination packer (_pack_bundle),
-ERDQueue.claim_next_bundle, republish-on-overrun, and the erd_swarm.py
+adaptive_claim_packing.md): ERDQueue.claim_next_bundle,
+republish-on-overrun, and the erd_swarm.py
 integration (evaluate_bundle, _BranchWorker._claim_bundle/_packing_stats).
 
 See test_erd_scaling.py for the pre-existing scaling/correctness guards
 (TestCooperativeDrainSmoke, TestWorkDoesNotAmplify, TestProcessScalingSmoke)
 and test_claim_packing_measurement.py for the measurement-layer tests that
-predate the packer.  This file covers the packer itself.
+predate claim packing.  This file covers the claim path itself.
 """
 import inspect
 import os
@@ -20,70 +20,9 @@ from unittest import mock
 import erd_queue
 import erd_swarm
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue, encode_subset, _pack_bundle
+from erd_queue import ERDQueue, encode_subset
 from erd_swarm import _BranchWorker, ROOT_BUDGET
 from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
-
-
-class TestPackBundle(unittest.TestCase):
-    """_pack_bundle: the exact-elimination packer (adaptive_claim_packing.md §5)."""
-
-    def test_bulk_bundle_coalesces_consecutive_eliminated(self):
-        order = list(range(10))
-        cost_lower_bound = [5.0] * 10   # all >= bound: provably eliminated
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=2, count_cap=4)
-        self.assertEqual(bundle, [0, 1, 2, 3])
-        self.assertEqual(next_pos, 4)
-
-    def test_bulk_bundle_stops_at_first_survivor(self):
-        order = list(range(10))
-        cost_lower_bound = [5.0, 5.0, 5.0, 0.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=2, count_cap=100)
-        self.assertEqual(bundle, [0, 1, 2])
-        self.assertEqual(next_pos, 3)
-
-    def test_small_bundle_absorbs_interleaved_eliminated_candidates(self):
-        # Survivors at 0, 2, 4; eliminated candidates at 1, 3 ride along free.
-        order = list(range(6))
-        cost_lower_bound = [0.0, 5.0, 0.0, 5.0, 0.0, 0.0]
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=3, count_cap=100)
-        self.assertEqual(bundle, [0, 1, 2, 3, 4])   # stops once 3 survivors taken
-        self.assertEqual(next_pos, 5)
-
-    def test_count_cap_bounds_small_bundle(self):
-        order = list(range(10))
-        cost_lower_bound = [0.0] * 10   # nothing eliminated
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=8, count_cap=3)
-        self.assertEqual(len(bundle), 3)
-        self.assertEqual(next_pos, 3)
-
-    def test_count_cap_bounds_bulk_bundle(self):
-        order = list(range(10))
-        cost_lower_bound = [5.0] * 10
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=2, count_cap=3)
-        self.assertEqual(len(bundle), 3)
-        self.assertEqual(next_pos, 3)
-
-    def test_start_past_end_returns_empty(self):
-        bundle, next_pos = _pack_bundle([0, 1, 2], 3, [0.0, 0.0, 0.0], 1.0, 2, 5)
-        self.assertEqual(bundle, [])
-        self.assertEqual(next_pos, 3)
-
-    def test_loose_bound_eliminates_nothing(self):
-        # An unset best_erd is passed as +inf: cost_lower_bound is always
-        # finite (<= 3.0), so `>= inf` is never true — every candidate packs
-        # as a survivor until small_count is reached.
-        order = list(range(5))
-        cost_lower_bound = [2.9] * 5
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound,
-                                        float('inf'), small_count=2, count_cap=100)
-        self.assertEqual(bundle, [0, 1])
-        self.assertEqual(next_pos, 2)
 
 
 class TestSchemaMigration(unittest.TestCase):
@@ -276,6 +215,34 @@ class _TmpQueue(unittest.TestCase):
 
 
 class TestClaimNextBundle(_TmpQueue):
+    def test_unchanged_bound_forward_claim_does_not_rescan_branch(self):
+        class CountingLowerBounds(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.read_count = 0
+
+            def __getitem__(self, index):
+                self.read_count += 1
+                return super().__getitem__(index)
+
+        lower_bounds = CountingLowerBounds([0.0] * N_CANDIDATES)
+        self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, lower_bounds,
+            small_count=5, count_cap=500)
+        lower_bounds.read_count = 0
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            self.q.claim_next_bundle(
+                self.key, "w0", N_CANDIDATES, _ORDER, lower_bounds,
+                small_count=5, count_cap=500)
+        finally:
+            self.q._conn.set_trace_callback(None)
+        self.assertEqual(lower_bounds.read_count, 5)
+        self.assertFalse(any(
+            "SELECT idx, done FROM candidate_claims" in statement
+            for statement in statements))
+
     def test_loose_bound_packs_small_bundles(self):
         # No best_erd set yet -> B reads as +inf -> nothing eliminated.
         bundle_id, indices, forced = self.q.claim_next_bundle(
@@ -284,12 +251,57 @@ class TestClaimNextBundle(_TmpQueue):
         self.assertEqual(len(indices), 5)
         self.assertEqual(forced, frozenset())
 
-    def test_tight_bound_packs_the_whole_eliminated_tail_in_one_bulk_bundle(self):
+    def test_tight_bound_completes_eliminated_candidates_without_bundle(self):
         self.q.update_branch_best(self.key, "salet", 1.0)
-        bundle_id, indices, forced = self.q.claim_next_bundle(
+        claim = self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES,
             small_count=5, count_cap=500)
-        self.assertEqual(len(indices), N_CANDIDATES)   # one bundle, whole branch
+        self.assertIsNone(claim)
+        self.assertEqual(self.q.branch_done_candidates(self.key), N_CANDIDATES)
+        self.assertEqual(self.q.branch_bulk_done_candidates(self.key),
+                         N_CANDIDATES)
+
+    def test_survivors_still_flow_through_normal_bundle(self):
+        self.q.update_branch_best(self.key, "salet", 2.0)
+        lower_bounds = [2.5] * N_CANDIDATES
+        survivor_indices = [1, 4, 9]
+        for idx in survivor_indices:
+            lower_bounds[idx] = 1.5
+        _bundle_id, indices, forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, lower_bounds,
+            small_count=5, count_cap=500)
+        self.assertEqual(indices, survivor_indices)
+        self.assertEqual(forced, frozenset())
+        self.assertEqual(self.q.branch_done_candidates(self.key),
+                         N_CANDIDATES - len(survivor_indices))
+
+    def test_holes_pass_bulk_completes_republished_eliminated_candidates(self):
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=N_CANDIDATES, count_cap=N_CANDIDATES)
+        holes = indices[:4]
+        for idx in indices[4:]:
+            self.q.complete_candidate(self.key, idx)
+        self.q.republish_remainder(self.key, bundle_id, holes)
+        self.q.update_branch_best(self.key, "salet", 1.0)
+        claim = self.q.claim_next_bundle(
+            self.key, "w1", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES)
+        self.assertIsNone(claim)
+        self.assertEqual(self.q.branch_done_candidates(self.key), N_CANDIDATES)
+        self.assertEqual(self.q.branch_bulk_done_candidates(self.key), len(holes))
+
+    def test_bulk_completion_supersedes_in_flight_claim(self):
+        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=5, count_cap=5)
+        self.q.update_branch_best(self.key, "salet", 1.0)
+        self.assertIsNone(self.q.claim_next_bundle(
+            self.key, "w1", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES))
+        rows = {row["idx"]: row for row in self.q.claims_for_branch(self.key)}
+        for idx in indices:
+            self.assertEqual(rows[idx]["done"], 1)
+            self.assertEqual(rows[idx]["claimed_by"], "bulk-elimination")
+        self.assertTrue(self.q.try_finalize_branch(self.key))
 
     def test_returns_none_for_finalized_branch(self):
         self.q.try_finalize_branch(self.key)
@@ -486,6 +498,16 @@ class TestRepublishRemainder(_TmpQueue):
 
 
 class TestBundleStatsAndFinalizeLog(_TmpQueue):
+    def test_finalize_log_preserves_aggregate_bulk_done_count(self):
+        self.q.add_branch_finalize_log(
+            self.key, None, 5, 4, 10, 20, 30, 3,
+            bulk_done_candidates=37)
+        row = self.q._conn.execute(
+            "SELECT n_claims, bulk_done_candidates "
+            "FROM telemetry.branch_finalize_log").fetchone()
+        self.assertEqual(row["n_claims"], 3)
+        self.assertEqual(row["bulk_done_candidates"], 37)
+
     def test_finalize_bundle_stats_aggregates_and_clears(self):
         self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_millis=5)
         self.q.record_bundle_stats(self.key, "b2", nodes=40, wall_millis=7,
@@ -622,7 +644,6 @@ class TestNoWorkEstimateInClaimPath(unittest.TestCase):
 
     def test_claim_path_functions_never_reference_the_work_estimator(self):
         functions = [
-            erd_queue._pack_bundle,
             erd_queue.ERDQueue.claim_next_bundle,
             erd_queue.ERDQueue.republish_remainder,
             _BranchWorker._claim_bundle,
@@ -788,9 +809,9 @@ class TestStructuralClaimReduction(_SwarmBase):
         n_bundles = len(bundle_sizes)
         self.assertGreater(n_bundles, 0)
         # Concrete reduction factor: this fixture (24 candidates, default
-        # small_count=8/count_cap=500) collapses the ERD-pruned tail into a
-        # single bulk bundle once the first candidate solves, so the claim
-        # count drops well below one-per-candidate.
+        # small_count=8/count_cap=500) bulk-completes the ERD-pruned tail once
+        # the first candidate solves, so the claim count drops well below
+        # one-per-candidate.
         self.assertLessEqual(n_bundles, n_candidates // 2,
                              f"{n_bundles} claims for {n_candidates} candidates "
                              f"— packing did not reduce claim count")

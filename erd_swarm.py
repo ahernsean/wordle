@@ -114,7 +114,7 @@ ROOT_BUDGET = GAME_GUESSES
 
 # Binary claim packing (issue #67, adaptive_claim_packing.md).  small_count
 # and count_cap default to erd_queue's DEFAULT_* (see there for the
-# amortization/crash-reclaim-window reasoning behind 8 and 500).
+# survivor-bundle amortization reasoning behind 8 and the compatibility cap).
 #
 # bundle_node_cap bounds how much genuinely-heavy search a small bundle's
 # strong-splitter head can accumulate before the rest of the bundle is
@@ -122,14 +122,11 @@ ROOT_BUDGET = GAME_GUESSES
 # overrun) — large enough that ordinary multi-thousand-node candidates
 # finish without a spurious republish, small enough that a real heavy
 # candidate hands off its siblings within seconds rather than stalling a
-# whole bundle.  A bulk bundle's members are each O(1) (§3 monotonicity), so
-# this cap essentially never fires for one.
+# whole survivor bundle.
 BUNDLE_NODE_CAP = int(os.environ.get('BUNDLE_NODE_CAP', '50000'))
-# bundle_wall_cap_seconds is the only cap a bulk bundle can hit, since its
-# members can't cost nodes: it exists purely to bound the crash-reclaim
-# window (HB_TIMEOUT_SECONDS) a dead worker's held bundle would otherwise
-# widen, not to catch misprediction — there is no prediction anywhere in
-# this design (§3).
+# bundle_wall_cap_seconds bounds the crash-reclaim window
+# (HB_TIMEOUT_SECONDS) a dead worker's held survivor bundle would otherwise
+# widen.
 BUNDLE_WALL_CAP_SECONDS = float(os.environ.get('BUNDLE_WALL_CAP_SECONDS', '60'))
 # republish_limit: how many times the cross-candidate mechanism may bounce
 # the same candidate before it is evaluated "forced" — exempt from the
@@ -1020,10 +1017,8 @@ class _BranchWorker:
         (§7a cross-candidate overrun), the unfinished remainder is republished
         (returned to the unclaimed pool for re-packing) rather than driven to
         completion inline — never re-claimed as `len(remainder)` individual
-        claims.  A bulk bundle's members are each O(1) (§3 monotonicity), so
-        in practice only the wall cap ever fires for one; the node cap is
-        what protects a small bundle's strong-splitter head from stranding
-        its siblings.
+        claims.  The node cap protects a survivor bundle's strong-splitter
+        head from stranding its siblings.
 
         A candidate in `forced` (its candidate_republish count already hit
         republish_limit, §7's bounded-republish-depth guardrail) is always
@@ -1114,7 +1109,9 @@ class _BranchWorker:
         wall_millis = (None if created_at is None or finalized_at is None
                        else max(0, (finalized_at - created_at) * 1000))
         # Claims drained to finalize, captured before delete_branch drops the rows.
-        n_claims = self.queue.branch_done_candidates(branch_key)
+        completed_candidates = self.queue.branch_done_candidates(branch_key)
+        bulk_done_candidates = self.queue.branch_bulk_done_candidates(branch_key)
+        n_claims = completed_candidates - bulk_done_candidates
         cut = best_guess is None and cut_occurred
         if best_guess is not None:
             # Exact optimum.  A ceiling (if any) only pruned candidates proven
@@ -1186,6 +1183,7 @@ class _BranchWorker:
                 max_bundle_nodes=max_bundle_nodes,
                 total_bundle_wall_millis=total_bundle_wall_millis,
                 censored_units=censored_units, ceiling=ceiling,
+                bulk_done_candidates=bulk_done_candidates,
                 outcome='cut' if cut else
                         ('exact' if best_guess is not None else 'loss'))
         except Exception:
@@ -1461,6 +1459,8 @@ class _BranchWorker:
             if claim is not None:
                 bundle_id, indices, forced = claim
                 return dict(b), bundle_id, indices, forced
+            if self.queue.branch_done_candidates(branch_key) >= b['n_candidates']:
+                self.maybe_finalize(branch_key, words, b['n_candidates'])
 
         while True:
             claimed = self.queue.claim_next(self.name)
@@ -1492,9 +1492,13 @@ class _BranchWorker:
             'spine': root_spine,
             'budget': budget,
         }
-        # claim can be None only if another worker grabbed every candidate
-        # between create and claim — rare; treat as "nothing for me right now".
-        if claim is None:  # pragma: no cover
+        # A bulk-elimination sweep can complete the branch without returning
+        # worker work; otherwise another worker grabbed every remaining slot.
+        if claim is None:
+            if (self.queue.branch_done_candidates(claimed['branch_key'])
+                    >= self.n_candidates):
+                self.maybe_finalize(claimed['branch_key'], words,
+                                    self.n_candidates)
             return None
         bundle_id, indices, forced = claim
         return branch, bundle_id, indices, forced
