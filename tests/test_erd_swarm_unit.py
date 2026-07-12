@@ -137,6 +137,55 @@ class TestPromotedSpine(unittest.TestCase):
         self.assertEqual(spine, 'SALET -g-g- ABORT y---- DOGMA y---y')
         self.assertEqual(guess_depth_from_spine(spine), 3)
 
+    def test_different_entry_at_base_depth_preserves_budget_invariant(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = (
+            'CRANE -yy-y SATED -g-g- DARGS -gy--')
+        w._note_depth(3, 5, 'gamps', '-g---')
+
+        spine = w._promoted_spine()
+
+        self.assertEqual(3 + guess_depth_from_spine(spine), ROOT_BUDGET)
+        self.assertEqual(spine, 'CRANE -yy-y SATED -g-g- DARGS -gy--')
+
+    def test_stale_entry_at_base_depth_dropped_but_descent_kept(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'ALIBI y---- EARNT yg---'
+        w._note_depth(4, 30, 'story', '-yy-y')
+        w._note_depth(3, 12, 'coups', '-----')
+
+        spine = w._promoted_spine()
+
+        self.assertEqual(spine, 'ALIBI y---- EARNT yg--- COUPS -----')
+        self.assertEqual(3 + guess_depth_from_spine(spine), ROOT_BUDGET)
+
+    def test_cooperative_entry_spines_match_promotion_budgets(self):
+        cases = (
+            (5, 'CRANE -yy-y', ((5, 'gamps', '-g---'),)),
+            (4, 'CRANE -yy-y', ((4, 'sated', '-g-g-'),)),
+            (3, 'CRANE -yy-y SATED -g-g-',
+             ((3, 'dargs', '-gy--'),)),
+        )
+        for budget, base_spine, descent_entries in cases:
+            with self.subTest(budget=budget):
+                w = _bare_worker()
+                w._claimed_branch_spine = base_spine
+                for entry_budget, guess, pattern in descent_entries:
+                    w._note_depth(entry_budget, 5, guess, pattern)
+                w.score_cache.read_with_depth.return_value = None
+                w.score_cache.read_loss.return_value = None
+                w.queue.read_cut_result.return_value = None
+                w.queue.has_pending_row.return_value = False
+                w.queue.create_branch.return_value = True
+                w.queue.get_branch.return_value = None
+
+                w.cooperative_solve(BRANCH, budget)
+
+                promoted_spine = w.queue.create_branch.call_args.kwargs['spine']
+                self.assertEqual(
+                    budget + guess_depth_from_spine(promoted_spine),
+                    ROOT_BUDGET)
+
     def test_pure_descent_below_base_is_appended(self):
         w = _bare_worker()
         w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
@@ -439,8 +488,8 @@ class TestSpineComposition(unittest.TestCase):
         w = _bare_worker()
         w._claimed_branch_spine = 'SALET -g-g-'
         # Pattern strings pass through unchanged (only ints are fmt_pattern'd).
-        w._note_depth(5, 50, 'crane', 'bb-y-')
-        w._note_depth(4, 12, 'pound', 'g--y-')
+        w._note_depth(4, 50, 'crane', 'bb-y-')
+        w._note_depth(3, 12, 'pound', 'g--y-')
         self.assertEqual(w._promoted_spine(),
                          'SALET -g-g- CRANE bb-y- POUND g--y-')
 
@@ -453,8 +502,8 @@ class TestSpineComposition(unittest.TestCase):
     def test_promoted_spine_skips_sentinel_and_size_only_levels(self):
         w = _bare_worker()
         w._claimed_branch_spine = 'SALET -g-g-'
-        w._note_depth(5, 50, 'crane', 'bb-y-')
-        w._note_depth(4, 12)            # size-only level: no guess/pattern
+        w._note_depth(4, 50, 'crane', 'bb-y-')
+        w._note_depth(3, 12)            # size-only level: no guess/pattern
         # Promotion sentinel preserves the guess but sets size to '•'; the edge
         # is still a real edge and must be kept.
         self.assertEqual(w._promoted_spine(), 'SALET -g-g- CRANE bb-y-')

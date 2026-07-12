@@ -607,20 +607,21 @@ class _BranchWorker:
         base = getattr(self, '_claimed_branch_spine', None)
         if not base:
             return None
-        # The live descent dict keeps a shallow entry until a shallower frame
-        # overwrites it, so after the base is advanced it still holds the guess
-        # that reached the base — whose edge then repeats the base's tail.  A
-        # real spine never replays a guess (a replay gains no information and is
-        # never selected), so an edge identical to the one before it is always
-        # that seam artifact.  Dropping it keeps budget + guess_depth = GAME_GUESSES.
+        # Entries at or shallower than the claimed branch's guess depth are
+        # never edges of the promoted branch: the base spine already carries
+        # the full path to the claimed branch.  They can be stale because the
+        # live descent persists across claim boundaries and a claim's top frame
+        # is not reported, so only entries strictly below the boundary belong
+        # to the current descent.
         edges = base.split()   # flat "GUESS pattern GUESS pattern ..." tokens
-        for d in sorted(getattr(self, '_spine', {})):
-            _size, guess, pattern = self._spine[d]
+        base_guess_depth = guess_depth_from_spine(base)
+        for guess_depth in sorted(getattr(self, '_spine', {})):
+            if guess_depth <= base_guess_depth:
+                continue
+            _size, guess, pattern = self._spine[guess_depth]
             if not (guess and guess != '•' and pattern):
                 continue
             guess = guess.upper()
-            if len(edges) >= 2 and edges[-2] == guess and edges[-1] == pattern:
-                continue
             edges.extend((guess, pattern))
         return ' '.join(edges)
 
