@@ -58,13 +58,9 @@ def cost_size_bucket(n_words: int) -> int:
 # epoch-2 claim-count-reduction model already gives ~105x there; larger
 # values buy diminishing returns per §1's table).
 DEFAULT_SMALL_COUNT = 8
-# count_cap: the max size of any bundle (bulk or small).  Bounds a bulk
-# bundle's wall time and its crash-reclaim window (a dead worker's whole
-# bundle is redone).  A provably-eliminated candidate completes in O(1)
-# (§3 monotonicity) but is not exactly free, so 500 keeps a bulk claim's
-# worst-case redo bounded to a few hundred near-instant re-evaluations —
-# comfortably inside HB_TIMEOUT_SECONDS — while still collapsing a
-# multi-thousand-candidate eliminated tail into a handful of claims.
+# count_cap: a backward-compatible hard upper bound on the survivor count in
+# a bundle.  Bulk-eliminated candidates are completed directly and never enter
+# a bundle, so small_count is the effective limit under the default settings.
 DEFAULT_COUNT_CAP = 500
 # republish_limit: how many times the same candidate may be republished
 # (adaptive_claim_packing.md §7's bounded-republish-depth guardrail) before
@@ -493,43 +489,6 @@ def _derive_telemetry_path(db_path: str) -> str:
         return ":memory:"
     root, ext = os.path.splitext(db_path)
     return f"{root}_telemetry{ext}"
-
-
-def _pack_bundle(order, start, cost_lower_bound, bound, small_count, count_cap):
-    """The exact-elimination packer (adaptive_claim_packing.md §5).
-
-    Walks `order` — a sequence of candidate idx values in best-first (Σk²
-    ascending) order — from position `start`, classifying each idx by the
-    exact test `cost_lower_bound[idx] >= bound`.  If the first candidate is
-    eliminated, absorbs consecutive eliminated candidates up to count_cap (a
-    bulk bundle).  Otherwise absorbs candidates — including any eliminated
-    ones interleaved among them — until small_count not-yet-eliminated
-    ("survivor") candidates have been taken or count_cap is reached (a small
-    bundle).
-
-    Returns (bundle, next_position): bundle is the list of idx taken, in the
-    order they appear in `order`; next_position is the position in `order`
-    just past the last one taken (== len(order) if `order` was exhausted).
-    start >= len(order) returns ([], start).
-    """
-    n = len(order)
-    if start >= n:
-        return [], start
-    i = start
-    bundle = []
-    if cost_lower_bound[order[i]] >= bound:
-        while i < n and len(bundle) < count_cap and cost_lower_bound[order[i]] >= bound:
-            bundle.append(order[i])
-            i += 1
-    else:
-        survivors = 0
-        while i < n and len(bundle) < count_cap and survivors < small_count:
-            idx = order[i]
-            bundle.append(idx)
-            if cost_lower_bound[idx] < bound:
-                survivors += 1
-            i += 1
-    return bundle, i
 
 
 class ERDQueue:
@@ -2185,7 +2144,9 @@ class ERDQueue:
         claims a bundle).  ceiling is the alpha-beta ceiling the branch was
         solved under (NULL = exact solve); outcome is 'exact', 'cut', or 'loss'.
         bulk_done_candidates preserves the aggregate eliminated count without
-        restoring per-candidate telemetry writes.
+        restoring per-candidate telemetry writes.  If a bulk sweep supersedes
+        an in-flight claim that later finishes, n_claims excludes that overlap
+        even though its per-claim telemetry row still exists.
         """
         now = int(time.time())
         self._conn.execute("""

@@ -1,12 +1,12 @@
 """Unit/integration tests for binary claim packing (issue #67,
-adaptive_claim_packing.md): the exact-elimination packer (_pack_bundle),
-ERDQueue.claim_next_bundle, republish-on-overrun, and the erd_swarm.py
+adaptive_claim_packing.md): ERDQueue.claim_next_bundle,
+republish-on-overrun, and the erd_swarm.py
 integration (evaluate_bundle, _BranchWorker._claim_bundle/_packing_stats).
 
 See test_erd_scaling.py for the pre-existing scaling/correctness guards
 (TestCooperativeDrainSmoke, TestWorkDoesNotAmplify, TestProcessScalingSmoke)
 and test_claim_packing_measurement.py for the measurement-layer tests that
-predate the packer.  This file covers the packer itself.
+predate claim packing.  This file covers the claim path itself.
 """
 import inspect
 import os
@@ -20,70 +20,9 @@ from unittest import mock
 import erd_queue
 import erd_swarm
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue, encode_subset, _pack_bundle
+from erd_queue import ERDQueue, encode_subset
 from erd_swarm import _BranchWorker, ROOT_BUDGET
 from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
-
-
-class TestPackBundle(unittest.TestCase):
-    """_pack_bundle: the exact-elimination packer (adaptive_claim_packing.md §5)."""
-
-    def test_bulk_bundle_coalesces_consecutive_eliminated(self):
-        order = list(range(10))
-        cost_lower_bound = [5.0] * 10   # all >= bound: provably eliminated
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=2, count_cap=4)
-        self.assertEqual(bundle, [0, 1, 2, 3])
-        self.assertEqual(next_pos, 4)
-
-    def test_bulk_bundle_stops_at_first_survivor(self):
-        order = list(range(10))
-        cost_lower_bound = [5.0, 5.0, 5.0, 0.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=2, count_cap=100)
-        self.assertEqual(bundle, [0, 1, 2])
-        self.assertEqual(next_pos, 3)
-
-    def test_small_bundle_absorbs_interleaved_eliminated_candidates(self):
-        # Survivors at 0, 2, 4; eliminated candidates at 1, 3 ride along free.
-        order = list(range(6))
-        cost_lower_bound = [0.0, 5.0, 0.0, 5.0, 0.0, 0.0]
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=3, count_cap=100)
-        self.assertEqual(bundle, [0, 1, 2, 3, 4])   # stops once 3 survivors taken
-        self.assertEqual(next_pos, 5)
-
-    def test_count_cap_bounds_small_bundle(self):
-        order = list(range(10))
-        cost_lower_bound = [0.0] * 10   # nothing eliminated
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=8, count_cap=3)
-        self.assertEqual(len(bundle), 3)
-        self.assertEqual(next_pos, 3)
-
-    def test_count_cap_bounds_bulk_bundle(self):
-        order = list(range(10))
-        cost_lower_bound = [5.0] * 10
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound, 1.0,
-                                        small_count=2, count_cap=3)
-        self.assertEqual(len(bundle), 3)
-        self.assertEqual(next_pos, 3)
-
-    def test_start_past_end_returns_empty(self):
-        bundle, next_pos = _pack_bundle([0, 1, 2], 3, [0.0, 0.0, 0.0], 1.0, 2, 5)
-        self.assertEqual(bundle, [])
-        self.assertEqual(next_pos, 3)
-
-    def test_loose_bound_eliminates_nothing(self):
-        # An unset best_erd is passed as +inf: cost_lower_bound is always
-        # finite (<= 3.0), so `>= inf` is never true — every candidate packs
-        # as a survivor until small_count is reached.
-        order = list(range(5))
-        cost_lower_bound = [2.9] * 5
-        bundle, next_pos = _pack_bundle(order, 0, cost_lower_bound,
-                                        float('inf'), small_count=2, count_cap=100)
-        self.assertEqual(bundle, [0, 1])
-        self.assertEqual(next_pos, 2)
 
 
 class TestSchemaMigration(unittest.TestCase):
@@ -705,7 +644,6 @@ class TestNoWorkEstimateInClaimPath(unittest.TestCase):
 
     def test_claim_path_functions_never_reference_the_work_estimator(self):
         functions = [
-            erd_queue._pack_bundle,
             erd_queue.ERDQueue.claim_next_bundle,
             erd_queue.ERDQueue.republish_remainder,
             _BranchWorker._claim_bundle,
@@ -871,9 +809,9 @@ class TestStructuralClaimReduction(_SwarmBase):
         n_bundles = len(bundle_sizes)
         self.assertGreater(n_bundles, 0)
         # Concrete reduction factor: this fixture (24 candidates, default
-        # small_count=8/count_cap=500) collapses the ERD-pruned tail into a
-        # single bulk bundle once the first candidate solves, so the claim
-        # count drops well below one-per-candidate.
+        # small_count=8/count_cap=500) bulk-completes the ERD-pruned tail once
+        # the first candidate solves, so the claim count drops well below
+        # one-per-candidate.
         self.assertLessEqual(n_bundles, n_candidates // 2,
                              f"{n_bundles} claims for {n_candidates} candidates "
                              f"— packing did not reduce claim count")

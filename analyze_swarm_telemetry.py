@@ -164,16 +164,14 @@ def evaluate_metric(name, fn, rows, typical, args):
 
 
 def estimate_claim_reduction(conn, epoch, small_count, count_cap):
-    """The reframed §11 gate: claim transactions to drain a branch under the
-    binary/coarse packing scheme vs single-candidate claiming — which needs only
-    exact ERD-lower-bound pruning, not a good magnitude estimate.
+    """Historical pre-bulk-completion claim-reduction estimate.
 
     Per finalized branch of `total` candidates with `N` non-ERD-pruned: the
     non-ERD-pruned pack into ceil(N/small_count) small fixed-count bundles and
     the ERD-pruned G = total - N coalesce into ceil(G/count_cap) count-capped
-    bulk bundles.  reduction = total / bundles.  ERD-lower-bound pruning is
-    exact, so a wrong work estimate cannot change this — it only decides which
-    non-ERD-pruned candidates share a small bundle.
+    bulk bundles.  This models epochs whose n_claims still meant total candidate
+    coverage; current epochs record worker-evaluated claims separately from
+    bulk-done candidates and are measured directly by the CI overhead guard.
     """
     import math
     total_by = {bytes(r[0]): r[1] for r in conn.execute(
@@ -215,7 +213,7 @@ def main():
     ap.add_argument("--small-count", type=int, default=8,
                     help="non-ERD-pruned candidates per small bundle (binary scheme)")
     ap.add_argument("--count-cap", type=int, default=512,
-                    help="ERD-pruned candidates per count-capped bulk bundle")
+                    help="historical ERD-pruned candidates per bulk bundle")
     ap.add_argument("--min-reduction", type=float, default=50.0,
                     help="claim-count reduction the reframed gate requires (x)")
     args = ap.parse_args()
@@ -312,7 +310,7 @@ def main():
     # ~95% trivial, so a larger bundle is safe and republish-on-overrun catches the
     # rare heavy member.  Report the whole curve rather than a pass/fail against an
     # arbitrary target.
-    print(f"\n=== Binary packer: claim-count reduction vs bundle size "
+    print(f"\n=== Historical binary packer: claim-count reduction "
           f"(count_cap={args.count_cap}) ===")
     print(f"  {'small_count':>11}  {'aggregate':>10}  {'median/branch':>14}")
     reduction_curve = []

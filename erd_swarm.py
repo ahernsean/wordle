@@ -114,7 +114,7 @@ ROOT_BUDGET = GAME_GUESSES
 
 # Binary claim packing (issue #67, adaptive_claim_packing.md).  small_count
 # and count_cap default to erd_queue's DEFAULT_* (see there for the
-# amortization/crash-reclaim-window reasoning behind 8 and 500).
+# survivor-bundle amortization reasoning behind 8 and the compatibility cap).
 #
 # bundle_node_cap bounds how much genuinely-heavy search a small bundle's
 # strong-splitter head can accumulate before the rest of the bundle is
@@ -122,14 +122,11 @@ ROOT_BUDGET = GAME_GUESSES
 # overrun) — large enough that ordinary multi-thousand-node candidates
 # finish without a spurious republish, small enough that a real heavy
 # candidate hands off its siblings within seconds rather than stalling a
-# whole bundle.  A bulk bundle's members are each O(1) (§3 monotonicity), so
-# this cap essentially never fires for one.
+# whole survivor bundle.
 BUNDLE_NODE_CAP = int(os.environ.get('BUNDLE_NODE_CAP', '50000'))
-# bundle_wall_cap_seconds is the only cap a bulk bundle can hit, since its
-# members can't cost nodes: it exists purely to bound the crash-reclaim
-# window (HB_TIMEOUT_SECONDS) a dead worker's held bundle would otherwise
-# widen, not to catch misprediction — there is no prediction anywhere in
-# this design (§3).
+# bundle_wall_cap_seconds bounds the crash-reclaim window
+# (HB_TIMEOUT_SECONDS) a dead worker's held survivor bundle would otherwise
+# widen.
 BUNDLE_WALL_CAP_SECONDS = float(os.environ.get('BUNDLE_WALL_CAP_SECONDS', '60'))
 # republish_limit: how many times the cross-candidate mechanism may bounce
 # the same candidate before it is evaluated "forced" — exempt from the
@@ -1020,10 +1017,8 @@ class _BranchWorker:
         (§7a cross-candidate overrun), the unfinished remainder is republished
         (returned to the unclaimed pool for re-packing) rather than driven to
         completion inline — never re-claimed as `len(remainder)` individual
-        claims.  A bulk bundle's members are each O(1) (§3 monotonicity), so
-        in practice only the wall cap ever fires for one; the node cap is
-        what protects a small bundle's strong-splitter head from stranding
-        its siblings.
+        claims.  The node cap protects a survivor bundle's strong-splitter
+        head from stranding its siblings.
 
         A candidate in `forced` (its candidate_republish count already hit
         republish_limit, §7's bounded-republish-depth guardrail) is always
