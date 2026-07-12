@@ -607,10 +607,12 @@ class _BranchWorker:
         base = getattr(self, '_claimed_branch_spine', None)
         if not base:
             return None
-        # Entries at or shallower than the claimed branch's guess depth belong
-        # to the outer descent.  They can persist while a cooperative solve
-        # advances the base spine, but only entries below that boundary describe
-        # edges from the claimed branch to the promoted branch.
+        # Entries at or shallower than the claimed branch's guess depth are
+        # never edges of the promoted branch: the base spine already carries
+        # the full path to the claimed branch.  They can be stale because the
+        # live descent persists across claim boundaries and a claim's top frame
+        # is not reported, so only entries strictly below the boundary belong
+        # to the current descent.
         edges = base.split()   # flat "GUESS pattern GUESS pattern ..." tokens
         base_guess_depth = guess_depth_from_spine(base)
         for guess_depth in sorted(getattr(self, '_spine', {})):

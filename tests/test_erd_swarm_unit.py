@@ -148,6 +148,17 @@ class TestPromotedSpine(unittest.TestCase):
         self.assertEqual(3 + guess_depth_from_spine(spine), ROOT_BUDGET)
         self.assertEqual(spine, 'CRANE -yy-y SATED -g-g- DARGS -gy--')
 
+    def test_stale_entry_at_base_depth_dropped_but_descent_kept(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'ALIBI y---- EARNT yg---'
+        w._note_depth(4, 30, 'story', '-yy-y')
+        w._note_depth(3, 12, 'coups', '-----')
+
+        spine = w._promoted_spine()
+
+        self.assertEqual(spine, 'ALIBI y---- EARNT yg--- COUPS -----')
+        self.assertEqual(3 + guess_depth_from_spine(spine), ROOT_BUDGET)
+
     def test_cooperative_entry_spines_match_promotion_budgets(self):
         cases = (
             (5, 'CRANE -yy-y', ((5, 'gamps', '-g---'),)),
