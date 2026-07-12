@@ -284,12 +284,57 @@ class TestClaimNextBundle(_TmpQueue):
         self.assertEqual(len(indices), 5)
         self.assertEqual(forced, frozenset())
 
-    def test_tight_bound_packs_the_whole_eliminated_tail_in_one_bulk_bundle(self):
+    def test_tight_bound_completes_eliminated_candidates_without_bundle(self):
         self.q.update_branch_best(self.key, "salet", 1.0)
-        bundle_id, indices, forced = self.q.claim_next_bundle(
+        claim = self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES,
             small_count=5, count_cap=500)
-        self.assertEqual(len(indices), N_CANDIDATES)   # one bundle, whole branch
+        self.assertIsNone(claim)
+        self.assertEqual(self.q.branch_done_candidates(self.key), N_CANDIDATES)
+        self.assertEqual(self.q.branch_bulk_done_candidates(self.key),
+                         N_CANDIDATES)
+
+    def test_survivors_still_flow_through_normal_bundle(self):
+        self.q.update_branch_best(self.key, "salet", 2.0)
+        lower_bounds = [2.5] * N_CANDIDATES
+        survivor_indices = [1, 4, 9]
+        for idx in survivor_indices:
+            lower_bounds[idx] = 1.5
+        _bundle_id, indices, forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, lower_bounds,
+            small_count=5, count_cap=500)
+        self.assertEqual(indices, survivor_indices)
+        self.assertEqual(forced, frozenset())
+        self.assertEqual(self.q.branch_done_candidates(self.key),
+                         N_CANDIDATES - len(survivor_indices))
+
+    def test_holes_pass_bulk_completes_republished_eliminated_candidates(self):
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=N_CANDIDATES, count_cap=N_CANDIDATES)
+        holes = indices[:4]
+        for idx in indices[4:]:
+            self.q.complete_candidate(self.key, idx)
+        self.q.republish_remainder(self.key, bundle_id, holes)
+        self.q.update_branch_best(self.key, "salet", 1.0)
+        claim = self.q.claim_next_bundle(
+            self.key, "w1", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES)
+        self.assertIsNone(claim)
+        self.assertEqual(self.q.branch_done_candidates(self.key), N_CANDIDATES)
+        self.assertEqual(self.q.branch_bulk_done_candidates(self.key), len(holes))
+
+    def test_bulk_completion_supersedes_in_flight_claim(self):
+        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=5, count_cap=5)
+        self.q.update_branch_best(self.key, "salet", 1.0)
+        self.assertIsNone(self.q.claim_next_bundle(
+            self.key, "w1", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES))
+        rows = {row["idx"]: row for row in self.q.claims_for_branch(self.key)}
+        for idx in indices:
+            self.assertEqual(rows[idx]["done"], 1)
+            self.assertEqual(rows[idx]["claimed_by"], "bulk-elimination")
+        self.assertTrue(self.q.try_finalize_branch(self.key))
 
     def test_returns_none_for_finalized_branch(self):
         self.q.try_finalize_branch(self.key)
@@ -486,6 +531,16 @@ class TestRepublishRemainder(_TmpQueue):
 
 
 class TestBundleStatsAndFinalizeLog(_TmpQueue):
+    def test_finalize_log_preserves_aggregate_bulk_done_count(self):
+        self.q.add_branch_finalize_log(
+            self.key, None, 5, 4, 10, 20, 30, 3,
+            bulk_done_candidates=37)
+        row = self.q._conn.execute(
+            "SELECT n_claims, bulk_done_candidates "
+            "FROM telemetry.branch_finalize_log").fetchone()
+        self.assertEqual(row["n_claims"], 3)
+        self.assertEqual(row["bulk_done_candidates"], 37)
+
     def test_finalize_bundle_stats_aggregates_and_clears(self):
         self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_millis=5)
         self.q.record_bundle_stats(self.key, "b2", nodes=40, wall_millis=7,

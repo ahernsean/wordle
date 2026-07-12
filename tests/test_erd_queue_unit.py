@@ -663,16 +663,18 @@ class TestPackerUsesCeilingBound(_TmpQueue):
     bound reaches the ceiling are provably-pruned freebies, so the first
     bundle is a bulk sweep instead of a small_count-limited survivor bundle."""
 
-    def test_ceiling_packs_provably_pruned_candidates_together(self):
+    def test_ceiling_bulk_completes_provably_pruned_candidates(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=4,
                              ceiling=1.5)
         lower_bounds = [2.0] * N_CANDIDATES
         claim = self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER, lower_bounds,
             small_count=2, count_cap=N_CANDIDATES)
-        self.assertIsNotNone(claim)
-        _, indices, _ = claim
-        self.assertEqual(len(indices), N_CANDIDATES)
+        self.assertIsNone(claim)
+        self.assertEqual(self.q.branch_done_candidates(self.key), N_CANDIDATES)
+        branch = self.q.get_branch(self.key)
+        self.assertEqual(branch["cut_occurred"], 1)
+        self.assertEqual(branch["pack_cursor"], N_CANDIDATES)
 
     def test_no_ceiling_same_bounds_pack_small_bundle(self):
         # Contrast case: identical lower bounds but no ceiling — nothing is

@@ -116,10 +116,8 @@ class TestWorkDoesNotAmplify(_Base):
         lock = threading.Lock()
 
         def worker(wid):
-            # Pure-partition path: the "each candidate evaluated exactly once"
-            # invariant holds only with adaptive decomposition off, since
-            # publishing a frame's remainder re-routes candidates through
-            # cooperative claims rather than this worker's own loop.
+            # Pure-partition path: adaptive publishing cannot re-route
+            # candidates through additional cooperative claims.
             w = _BranchWorker(wid, cache_path, queue_path, None,
                               enable_adaptive_decomposition=False)
             try:
@@ -146,13 +144,14 @@ class TestWorkDoesNotAmplify(_Base):
                 result, total_evaluated = self._solve_counting_work(nw)
                 self.assertIsNotNone(result, "branch did not finalize")
                 self.assertAlmostEqual(result[1], truth, places=6)
-                # The whole point: each candidate is evaluated exactly once in
-                # total, no matter how many workers cooperate.  More workers
-                # must not multiply the work.
-                self.assertEqual(
+                # Exact lower-bound proofs complete candidates without an
+                # evaluation; cooperation must never evaluate more than the
+                # complete candidate list.
+                self.assertLessEqual(
                     total_evaluated, len(CANDIDATES),
                     f"{nw} workers evaluated {total_evaluated} candidates, "
-                    f"expected {len(CANDIDATES)} (work amplification!)")
+                    f"more than the {len(CANDIDATES)} available "
+                    f"(work amplification!)")
 
 
 @unittest.skipUnless(SCALING_SMOKE_REQS_MET, SCALING_SMOKE_SKIP_REASON)
