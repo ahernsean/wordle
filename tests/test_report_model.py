@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -33,16 +34,16 @@ class ReportModelTest(unittest.TestCase):
         self.telemetry_path = os.path.join(directory, "telemetry.sqlite3")
         self.cache_path = os.path.join(directory, "cache.sqlite3")
         self.answer_list_path = os.path.join(directory, "answers.txt")
-        self.guess_list_path = os.path.join(directory, "guesses.txt")
+        self.candidate_list_path = os.path.join(directory, "candidates.txt")
         with open(self.answer_list_path, "w") as answer_file:
             answer_file.write("\n".join(ANSWERS) + "\n")
-        with open(self.guess_list_path, "w") as guess_file:
-            guess_file.write("\n".join(ANSWERS + ["raise"]) + "\n")
+        with open(self.candidate_list_path, "w") as candidate_file:
+            candidate_file.write("\n".join(ANSWERS + ["raise"]) + "\n")
         self.sources = ReportSources(
             queue_path=self.queue_path,
             cache_path=self.cache_path,
             answer_list_path=self.answer_list_path,
-            guess_list_path=self.guess_list_path,
+            candidate_list_path=self.candidate_list_path,
             telemetry_path=self.telemetry_path,
         )
 
@@ -100,7 +101,7 @@ class ReportModelTest(unittest.TestCase):
             queue_path=os.path.join(missing_directory, "queue.sqlite3"),
             cache_path=self.cache_path,
             answer_list_path=self.answer_list_path,
-            guess_list_path=self.guess_list_path,
+            candidate_list_path=self.candidate_list_path,
             telemetry_path=os.path.join(missing_directory, "telemetry.sqlite3"),
         )
         report = collect_overview_report(unavailable_queue)
@@ -112,12 +113,42 @@ class ReportModelTest(unittest.TestCase):
             queue_path=self.queue_path,
             cache_path=os.path.join(missing_directory, "cache.sqlite3"),
             answer_list_path=self.answer_list_path,
-            guess_list_path=self.guess_list_path,
+            candidate_list_path=self.candidate_list_path,
             telemetry_path=self.telemetry_path,
         )
         report = collect_overview_report(unavailable_cache)
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertFalse(report["sources"]["cache"]["ok"])
+
+    def test_answer_list_failure_skips_queue_and_cache_normalization(self):
+        with (
+            patch("report_model.load_word_list", side_effect=OSError("missing answers")),
+            patch("report_model.ERDQueue") as queue_class,
+        ):
+            report = collect_overview_report(self.sources)
+        queue_class.assert_not_called()
+        self.assertFalse(report["sources"]["queue"]["ok"])
+        self.assertIn("missing answers", report["sources"]["queue"]["error"])
+        self.assertFalse(report["sources"]["cache"]["ok"])
+        self.assertIn("missing answers", report["sources"]["cache"]["error"])
+        self.assertEqual(report["data"]["branches"], [])
+        self.assertEqual(report["data"]["workers"], [])
+
+    def test_queue_collection_error_does_not_relabel_attached_telemetry(self):
+        with patch.object(
+            ERDQueue, "counts_by_status",
+            side_effect=sqlite3.OperationalError("queue read failed"),
+        ):
+            report = collect_overview_report(self.sources)
+        self.assertFalse(report["sources"]["queue"]["ok"])
+        self.assertIn("queue read failed", report["sources"]["queue"]["error"])
+        self.assertTrue(report["sources"]["telemetry"]["ok"])
+        self.assertIsNone(report["sources"]["telemetry"]["error"])
+
+    def test_programming_error_in_queue_collection_is_not_masked(self):
+        with patch.object(ERDQueue, "counts_by_status", side_effect=KeyError("bug")):
+            with self.assertRaises(KeyError):
+                collect_overview_report(self.sources)
 
     def test_epoch_metadata_is_queue_source_metadata(self):
         queue = self._open_queue()
@@ -133,7 +164,9 @@ class ReportModelTest(unittest.TestCase):
 
     def test_custom_paths_are_retained_without_erd_search_ownership(self):
         self.assertEqual(self.sources.answer_list_path, self.answer_list_path)
-        self.assertEqual(self.sources.guess_list_path, self.guess_list_path)
+        self.assertEqual(
+            self.sources.candidate_list_path, self.candidate_list_path
+        )
         report = collect_overview_report(self.sources)
         self.assertEqual(report["sources"]["queue"]["path"], self.queue_path)
         self.assertEqual(report["sources"]["cache"]["path"], self.cache_path)
