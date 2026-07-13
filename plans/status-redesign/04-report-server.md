@@ -8,12 +8,7 @@ Expose every report request over a small read-only stdlib HTTP service and
 serve a placeholder browser client:
 
     GET /api/view
-    GET /api/view?selector=CRANE
-    GET /api/view?selector=CRANE%20-y--g&tree=1&active_only=1
-    GET /api/view/queue?active_only=1
-    GET /api/view/workers
-    GET /api/view/cache
-    GET /api/view/hotspots?by=coordination
+    GET /api/view/queue
     GET /
 
 The server parses transport parameters into the same `ReportRequest` used by

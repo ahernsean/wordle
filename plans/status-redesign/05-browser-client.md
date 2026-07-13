@@ -188,7 +188,9 @@ Bulk-eliminated candidates display as proofs, not worker activity.
 
 `tree=1` renders the report's flat topology as a collapsible nested DOM tree.
 It is a layout of the current root/word/branch selection, not its own
-navigation tab.
+navigation tab. Its nodes derive only from extant queue rows and their
+recorded spines; cache results may annotate queued nodes but never create
+nodes.
 
 - Each node shows guess/pattern tiles, `guess_depth`, lifecycle, answer count,
   progress, branch reference, and worker chips where available.
@@ -200,6 +202,8 @@ navigation tab.
 - Tree collapse state is keyed by stable `node_id` and survives polling.
 - Below 480 px, descendants begin collapsed but the context path remains
   visible.
+- If a selected semantic branch exists only in cache, show “No extant queue
+  topology” and keep branch detail available outside tree mode.
 
 ## Overview and object reports
 

@@ -1,4 +1,4 @@
-# Phase 3 — Inferred exploration and object reports
+# Phase 3 — Semantic exploration and object reports
 
 Read phases 00–02 and `AGENTS.md` first. Requires phase 2 merged.
 
@@ -6,10 +6,9 @@ Read phases 00–02 and `AGENTS.md` first. Requires phase 2 merged.
 
 Complete the terminal reporting system:
 
-- infer root, word, and branch reports from positional spine form;
-- make `--tree` a layout over the selection;
-- add queue, worker, cache, and hotspot report flags;
-- apply shared active/lifecycle filters;
+- add semantic work exploration and queue, worker, cache, and hotspot reports;
+- make live queue topology an optional layout over compatible reports;
+- provide consistent bounded collection controls;
 - add on-demand claims, answer words, bundle, finalization, and cut-reuse
   detail;
 - remove the legacy read-only command surfaces.
@@ -33,6 +32,88 @@ After this phase, all terminal inspection flows through `erd_search.py view`.
   coverage is present
 
 No engine or swarm-worker behavior changes in this phase.
+
+## Request, selector, and filter model
+
+Extend `report_model.py` with:
+
+    parse_report_selector(parts: list[str] | str | None) -> ReportSelector
+
+And these frozen dataclasses:
+
+    SpineStep(word: str, pattern: str)
+
+    ReportSelector(
+        kind: str,                    # root | word | branch | branch_reference
+        steps: tuple[SpineStep, ...],
+        trailing_word: str | None,
+        branch_reference: str | None,
+        input_text: str,
+    )
+
+    ReportSelector.root() -> ReportSelector
+
+    ReportFilters(
+        active_only: bool = False,
+        statuses: tuple[str, ...] = (),
+        minimum_answer_count: int | None = None,
+        maximum_answer_count: int | None = None,
+        budget: int | None = None,
+        priority: int | None = None,
+        sort: str | None = None,
+        limit: int | None = None,
+    )
+
+Extend the phase 1 request. A default request still produces the operational
+overview through automatic root inference:
+
+    ReportRequest(
+        report_kind: str = "auto",
+        selector: ReportSelector = ReportSelector.root(),
+        tree: bool = False,
+        filters: ReportFilters = ReportFilters(),
+        worker_id: str | None = None,
+        include_claims: bool = False,
+        include_answers: bool = False,
+        hotspot_field: str | None = None,
+        epoch: int | None = None,
+        since_seconds: int | None = None,
+        sample_size: int | None = None,
+    )
+
+Use `dataclasses.field(default_factory=...)` for dataclass instance defaults.
+`ReportSelector.root()` returns the normalized empty selector.
+
+### Selector grammar
+
+`parse_report_selector` accepts a string or already-tokenized parts. When
+given a list, join it with spaces before parsing so CLI and HTTP use identical
+behavior. Normalize words to lowercase and patterns to five characters using
+`g`/`y`/`-`; a dot normalizes to `-`.
+
+Rules:
+
+1. Empty input selects the root.
+2. A sole `@` token followed by 4–40 hexadecimal characters selects a queued
+   branch reference. Normalize the digest prefix to lowercase.
+3. Otherwise, tokens alternate a five-letter word and a five-character
+   response pattern.
+4. A final word without a pattern selects that word within the preceding
+   branch context.
+5. A final response pattern selects the branch reached by the complete spine.
+6. A missing pattern anywhere except after the final word is invalid.
+
+| Input | Inferred selection |
+|---|---|
+| empty | operational root |
+| `CRANE` | word CRANE at root |
+| `CRANE -y--g ALIBI` | word ALIBI within branch CRANE -y--g |
+| `CRANE -y--g ALIBI g-g--` | branch after both guesses |
+| `@8B31` | queued branch digest prefix |
+
+Reject malformed tokens with a message that identifies the token and expected
+form. Parsing never inspects a database; reference and semantic-spine
+resolution happen during collection.
 
 ## Final CLI
 
@@ -86,14 +167,16 @@ Extend `collect_report`:
 | none | root, no `--tree` | overview |
 | none | word | word |
 | none | branch/reference | branch |
-| none | any + `--tree` | tree-layout collector rooted at selection |
-| `--queue` | optional | queue inventory scoped by selector |
-| `--workers` / `--worker` | optional | workers scoped by selector |
+| none | any + `--tree` | live queue tree scoped by selection |
+| `--queue` | optional, with optional `--tree` | queue inventory scoped by selector |
+| `--workers` / `--worker` | optional, with optional `--tree` | workers scoped by selector or placed on live queue topology |
 | `--cache` | optional | cache summary/coverage scoped by selector |
 | `--hotspots` | optional | bounded hotspot report scoped where supported |
 
-The envelope's `report_kind` is the inferred domain kind. `filters.tree`
-records tree layout; there is no `tree` domain object.
+The envelope's `report_kind` is the inferred domain kind. The echoed request
+state records tree layout; there is no `tree` domain object.
+Reject `--tree` with `--cache` or `--hotspots`; neither report has live work
+topology to render.
 
 ## Selector resolution
 
@@ -127,17 +210,18 @@ is prohibited.
 Collection reports interpret selectors consistently:
 
 - root selector: the complete report population;
-- trailing-word selector: that word's nonempty response branches plus their
-  recorded queued descendants where the report includes descendants;
+- trailing-word selector: derived response branches for word coverage, or
+  only matching extant queue rows where a report includes descendants;
 - branch selector/reference: the selected branch plus recorded queued
   descendants.
 
 A singular inferred branch detail still describes only the selected branch.
-Scoping never claims that unrecorded cache rows have a known parent spine.
+Scoping never claims that unrecorded cache rows have a known parent spine or
+uses them to create descendants.
 
 ## Filter behavior
 
-Normalize raw queue status into the lifecycle table in phase 00 before
+Normalize raw queue status into the lifecycle table in phase 1 before
 filtering. Push filters into SQL wherever practical; do not load the whole
 queue and filter it in Python merely because the old helpers do.
 
@@ -147,9 +231,10 @@ Collection reports return:
     "rows": filtered, sorted, limited rows
     "matched_rows": count before limit
 
-The selected root/context row remains present in tree layout even when it
-does not match the row filter. Mark it `is_context=true` so renderers do not
-mistake it for a match.
+When the selected context is represented by queue-derived topology, retain it
+even when it does not match the row filter. Mark it `is_context=true` so
+renderers do not mistake it for a match. Selector context remains in the
+report's `root` metadata even when no queue-derived node is available.
 
 `--active-only` applies to:
 
@@ -326,11 +411,18 @@ may build cells client-side.
 ## Tree layout
 
 Tree collection is selected by `--tree`, not a separate report noun.
+Its authoritative topology is extant queue rows and their recorded spines.
+Nodes may represent queue rows or structural ancestors required by those
+spines. Cache rows never create nodes or edges. Cache state may annotate a
+queued branch, but a cache-only solution has no tree representation.
 
 The model returns a flat, identity-addressable node array:
 
     {
         "root": normalized selector context,
+        "topology_source": "queue",
+        "tree_available": bool,
+        "unavailable_reason": str | null,
         "nodes": [
             {
                 "node_id": stable semantic path string,
@@ -352,11 +444,15 @@ The model returns a flat, identity-addressable node array:
 Return flat nodes so terminal indentation and browser DOM/tree rendering use
 one topology without nesting large repeated structures.
 
-- Root selection: recorded queue spines form the tree.
-- Word selection: synthesize the trailing word node and its nonempty response
-  branches, then attach recorded queued descendants.
-- Branch selection: include the selected branch context, then recorded queued
-  descendants.
+- Root selection: extant queue rows and their recorded spines form the tree.
+- Word selection: the word is selector context; nodes contain only its extant
+  queued response branches and their recorded queued descendants.
+- Branch selection: include the selected branch as context when a matching
+  queue row exists or a descendant's recorded spine establishes that context,
+  then include recorded queued descendants.
+- A semantic branch with no matching queue row or recorded queued descendant
+  returns `tree_available=false`, `unavailable_reason="no extant queue
+  topology"`, and no nodes. Do not synthesize a root from its cached result.
 - Missing legacy spine segments appear as explicit unknown nodes at the
   known `guess_depth`; never fabricate guesses.
 
@@ -488,24 +584,29 @@ Required coverage includes:
    finalizing.
 7. Tree context survives active-only filtering while inactive descendants do
    not.
-8. Word, branch, and root tree topologies have stable parents and absolute
+8. Word, branch, and root tree topologies derive only from extant queue rows
+   and their recorded spines, have stable parents, and expose absolute
    `guess_depth`.
-9. Branch detail classifies bulk elimination without inventing a worker.
-10. Claims and answer words are absent unless explicitly requested.
-11. Cache state obeys existing budget and `max_remaining_depth` reuse rules.
-12. Coordination hotspots identify workload buckets and reject spine scope.
-13. Historical reports are bounded and label truncated samples.
-14. Queue filtering occurs before limit and summaries count the unpaginated
+9. A cache-only branch has normal branch detail but reports no available tree;
+   a word tree does not synthesize unqueued response groups.
+10. Branch detail classifies bulk elimination without inventing a worker.
+11. Claims and answer words are absent unless explicitly requested.
+12. Cache state obeys existing budget and `max_remaining_depth` reuse rules.
+13. Coordination hotspots identify workload buckets and reject spine scope.
+14. Historical reports are bounded and label truncated samples.
+15. Queue filtering occurs before limit and summaries count the unpaginated
     population.
-15. TTY navigation preserves branch identity through finalization.
-16. Removed commands fail argparse while all mutation commands still work.
-17. Every `SWARM.md` example parses.
+16. TTY navigation preserves branch identity through finalization.
+17. Removed commands fail argparse while all mutation commands still work.
+18. Every `SWARM.md` example parses.
 
 ## Acceptance checklist
 
-- [ ] The final CLI grammar from phase 00 is implemented.
+- [ ] The CLI grammar specified in this phase is implemented.
 - [ ] Users never specify `word` versus `branch`; selector form infers it.
 - [ ] `--tree` is a layout option at root, word, and branch selections.
+- [ ] Tree nodes derive only from extant queue rows and recorded spines;
+      cache-only branches are never reconstructed.
 - [ ] `--active-only` is available consistently.
 - [ ] Word reports join queue and cache coverage.
 - [ ] Branch detail includes current packing and cut/reuse semantics.

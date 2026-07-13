@@ -153,6 +153,6 @@ Acceptance:
 ## Out of scope
 
 - Historical sparklines or durable time-series storage.
-- Full explored-cache semantic zoom (phase 7).
+- Full live-work semantic zoom (phase 7).
 - Control actions.
 - New queue/cache schema added merely for decoration.

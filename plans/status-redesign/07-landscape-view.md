@@ -1,268 +1,173 @@
-# Phase 7 — Explored search landscape
+# Phase 7 — Live work landscape
 
 **Status: vision capture only; not implementable.**
 
-Do not create code from this document. It becomes an implementation plan only
-after the prerequisites at the end are met and the open data/layout questions
-are decided with the user.
+Do not create code from this document. Promote it to an implementation plan
+only after the prerequisites are met and the remaining layout and interaction
+questions are decided with the user.
 
 ## Vision
 
-A pinch-zoomable map of the explored search landscape:
+A pinch-zoomable map of the swarm's extant work:
 
-- zoomed out: density and concentration of cached/explored work;
-- closer: regions resolve into branch topology and lifecycle;
-- closer again: individual branches, workers, finalization outcomes, and
-  cache state;
-- finest useful level: a branch's candidate sweep—evaluated, bulk eliminated,
-  in flight, republished, cut, and remaining.
+- zoomed out: the shape and concentration of queued work;
+- closer: recorded spines resolve into branches and lifecycle;
+- closer again: workers, progress, finalization, and live descent become
+  visible;
+- finest useful level: a selected branch's current candidate sweep.
 
-This is semantic zoom: what an element represents changes with scale. It is a
-map sharing selectors and data semantics with the report system, not a giant
-version of the overview dashboard.
+This is semantic zoom over live operational topology. It is a map sharing the
+report system's identities and navigation, not a historical reconstruction of
+all solved ERD work.
 
-## Selector and filter continuity
+## Authoritative data boundary
 
-The landscape uses the same inferred selector grammar:
+The landscape contains only topology that exists in queue state:
 
-    CRANE
-    CRANE -y--g
-    CRANE -y--g ALIBI
-    CRANE -y--g ALIBI g-g--
-    @8b31f30d421a
+- user and cooperative queue rows provide branch nodes;
+- their recorded spines provide parent/child placement and any structural
+  ancestor nodes needed to connect them;
+- current heartbeats, claims, candidate progress, and bounded telemetry
+  provide live annotations;
+- incomplete legacy spines produce explicit unknown segments.
 
-Opening the map from a word report centers on that word's response branches.
-Opening it from branch detail centers on that branch. A copied URL preserves
-the selector and viewport.
+Cache data may annotate an extant queue node with its current exact, loss, or
+missing state. It never creates a node or edge. When a branch no longer has
+queue topology, it disappears from the landscape even if its result remains
+cached.
 
-`--tree` has no separate meaning here: the landscape is another
-representation of the same topology learned by the phase 5 tree layout and
-phase 6 item D.
+Consequences:
 
-`active-only` filters the live queue/worker overlay, not the cached terrain.
-An inactive selected context remains visible. Other filters may alter overlay
-or terrain styling only when their population is explicit.
+- no cache-parent schema or phone-coordinated cache migration is needed;
+- no cache-derived topology index or answer-subset DAG is needed;
+- no cached branch is reconstructed from best guesses;
+- the ordinary bounded queue-tree report is the starting data contract.
 
-## Context anchoring
+## Navigation continuity
 
-Zooming must not destroy situational awareness.
+Opening the landscape from a word, branch, queue, or worker report preserves
+the current semantic selector. The selected context remains anchored while
+the user pans and zooms, and a copied URL preserves selector and viewport.
+
+The shared collection filters continue to apply according to phase 3. They
+change which live rows are emphasized or included without changing branch
+identity or inventing missing topology.
 
 ### Minimap
 
-The main view shows detail; a small inset shows the whole available landscape:
+A small inset may show the complete extant queue landscape with:
 
-- viewport rectangle;
-- live worker markers;
-- active branch markers;
-- recent completion density within the reported window;
-- selected context.
+- the main viewport rectangle;
+- live worker and active-branch markers;
+- the selected context;
+- bounded recent completion activity where available.
 
-Tapping a marker recenters the main view.
+Selecting a marker recenters the main view.
 
 ### Loupe
 
-The main view remains broad while one magnified window follows a selected
-worker/branch. A leader line anchors it to its actual position. “Follow worker
-N” from the DOM tree becomes a loupe that moves by full branch identity.
+A focused view may follow one selected worker or branch while the main view
+retains broader context. A leader line anchors the loupe to its actual
+position. Worker following uses full branch identity so movement cannot be
+confused with row reordering.
 
-Minimap and loupe are composable forms of the same viewport-plus-scene
-function, not special one-off renderers.
+Minimap and loupe should share the same viewport and layout primitives as the
+main view.
 
-## Why canvas
+## Implementation direction
 
-The ordinary browser reports show tens or hundreds of entities and should
-remain DOM-based for accessibility, layout, hit testing, and testing.
+Start with accessible DOM/SVG using the bounded live queue population already
+returned by the tree report. Do not assume Canvas is necessary. Move painting
+to Canvas 2D only after measurement shows that DOM/SVG misses explicit
+interaction budgets on the actual target phone; consider WebGL only after a
+measured Canvas failure.
 
-The explored landscape may contain millions of cached branch results.
-DOM/SVG cannot hold that population, and semantic zoom requires rebuilding
-visible representation by scale. Use Canvas 2D first; consider WebGL only
-after measured Canvas failure.
-
-## Architecture commitments
-
-### Scene graph before painting
+If a retained scene abstraction proves useful, keep layout separate from
+painting:
 
     buildScene(data, viewport, filters) -> display list
 
-This pure function produces typed positioned drawables with semantic
-level-of-detail choices already made. A thin painter draws the list.
-Hit-testing uses the same display list.
+The same semantic display list should drive rendering, hit testing, minimap
+placement, and tests. Stable coordinates must derive from recorded spine and
+full identity, independent of input row order, current viewport, and display
+filtering.
 
-Playwright tests assert scene objects and hit-test results, not pixels.
-Screenshots remain review artifacts.
-
-### Tile-style data access
-
-The map cannot poll a complete report envelope containing the terrain. It
-needs cacheable on-demand tiles such as:
-
-    children/aggregates below this selector
-    within this guess_depth range
-    at this aggregation level
-    for this viewport/region
-
-This becomes a separate read-only route family beside `/api/view`. It reuses
-`ReportSources`, selector parsing, identity, lifecycle, and source health, but
-not the ordinary polling payload.
-
-### Static terrain plus live overlay
-
-- Terrain: explored/cache-derived branch structure and aggregates.
-- Overlay: ordinary lightweight queue/worker report data.
-
-The overlay continues polling by stable identity. Terrain tiles are
-client-cached and invalidated by explicit version/epoch metadata, not
-refetched every two seconds.
-
-### Stable coordinates
-
-Any semantic node must map to the same tree-space position from its durable
-identity/spine and layout parameters, independent of:
-
-- load order;
-- current filters;
-- current viewport;
-- which tiles happen to be cached;
-- active-only state.
-
-This allows minimaps and loupes to place activity without loading full detail.
-
-### Viewport composition
-
-`buildScene` takes center, scale, pixel dimensions, and filters. The main map,
-minimap, and each loupe call the same function with different viewports and
-share one client tile cache.
-
-### Palette
-
-Keep Wordle colors for pattern/completion semantics and alert colors for
-change/staleness. Exploration heat, exact/cut/loss, bulk elimination, and
-unexplored state need distinct shape/texture/opacity semantics decided before
-implementation and usable without color vision.
-
-## Fundamental data gap
-
-`branch_best_by_policy` is keyed by encoded answer subset and does not store a
-durable parent spine for every cached row. Therefore “draw the entire cached
-tree” is not a query the current cache can answer directly.
-
-Before implementation, choose and validate one source of terrain topology:
-
-1. reconstruct descendants on demand from a selected branch's best guess and
-   response decomposition;
-2. maintain an external Linux-only derived topology/index;
-3. extend persisted cache data with parent/edge information through the
-   required idempotent phone-coordinated migration;
-4. deliberately map answer-subset space rather than pretending it is a unique
-   guess tree.
-
-These choices have different correctness, storage, phone-deployment, and
-layout consequences. Do not pick one inside an implementation session.
+The ordinary `/api/view?tree=1` report is the initial transport. A specialized
+route is justified only if measured live queue size or payload cost exceeds a
+named budget. This phase does not assume cache tiles or a separate terrain
+service.
 
 ## Open design questions
 
-### Topology
+### Layout and aggregation
 
-A branch can be reached by multiple guess spines even when its answer subset
-is identical. Decide whether the landscape maps:
-
-- the optimal-policy tree;
-- every recorded queue spine;
-- unique answer-subset DAG nodes;
-- or a selected-root reconstruction.
-
-The choice determines identity and whether “parent” is even unique.
-
-### Layout
-
-Candidate layouts:
+Evaluate deterministic layouts using feedback from the phase 5 tree and
+phase 6 context navigator:
 
 - radial tree;
 - icicle/flame layout;
 - treemap weighted by answer count or measured work;
-- layered DAG;
 - hybrid overview density plus local tree.
 
-Phase 5 tree usage and phase 6 item D should provide evidence. Avoid
-force-directed layout unless deterministic stable coordinates can be proven.
+For each zoom level, define what a cluster summarizes and name its population
+and time window. Possible live measures include queued branch count,
+answer-count mass, nodes/wall, candidate progress, lifecycle, and worker
+activity. Avoid force-directed layout unless stable coordinates can be
+proven.
 
-### Aggregation
+### Candidate detail
 
-At each zoom level, define exactly what a region summarizes:
-
-- branch count;
-- answer-count mass;
-- nodes/wall;
-- exact/cut/loss outcomes;
-- bulk/evaluated work;
-- recency within a named window;
-- worker activity.
-
-Every aggregate needs an explicit population, epoch/window, and complete
-versus sampled label.
-
-### Pruning and candidate outcomes
-
-Worker heartbeats aggregate `n_ok`, `n_cutoff`, and `n_pruned`. They do not
-persist every candidate/branch outcome historically. The finest landscape
-must use only provenance that actually exists:
+Worker heartbeats aggregate evaluation outcomes and do not persist complete
+candidate history. The finest view may use only provenance that exists:
 
 - current sparse claim state;
-- bulk-elimination markers;
-- bounded finalization telemetry;
-- exact cache results;
-- transient cuts and recorded reuse misses.
+- evaluated and bulk-eliminated completion markers;
+- republished candidates;
+- bounded finalization and cut-reuse telemetry.
 
-Do not infer nonexistent per-candidate history from aggregate counters.
+Do not infer per-candidate history from aggregate counters.
 
-### Phone interaction
+### Phone interaction and accessibility
 
 Decide:
 
 - minimap always visible versus collapsible;
 - maximum one loupe versus several;
-- tap/long-press meanings;
-- pinch/pan with Pointer Events and `touch-action: none`;
-- desktop wheel/drag equivalents;
-- context breadcrumb and browser Back behavior.
+- tap, long-press, keyboard, and screen-reader behavior;
+- pinch/pan and desktop wheel/drag equivalents;
+- breadcrumb and browser Back behavior.
 
-Target 60 fps interaction on the actual iPhone before adding visual density.
+The map must retain a nonvisual semantic representation and usable focus
+order. Visual density cannot replace labels or report navigation.
 
 ### Performance
 
-Set measured budgets for:
-
-- display-list object count;
-- tile response bytes;
-- tile build/query time;
-- client tile-cache memory;
-- overlay polling cost;
-- paint time per frame.
-
-The system must degrade level of detail before missing interaction budgets.
+Set measured budgets for node count, response bytes, layout time, memory, and
+frame time. Test on the actual iPhone. The display should reduce level of
+detail before missing its interaction budget.
 
 ## Testing direction
 
-When promoted to a real plan:
+When promoted to an implementation plan:
 
-- unit-test selector-to-tile requests;
-- unit-test deterministic layout coordinates;
-- call `buildScene` through Playwright and assert semantic scene contents at
-  several scales;
-- test hit targets and navigation;
-- test active-only overlay without terrain movement;
-- test minimap/loupe coordinate agreement;
-- use screenshots only for review;
-- measure live iPhone frame time and memory.
+- unit-test deterministic coordinates from recorded queue spines;
+- verify filters do not change coordinates of retained identities;
+- assert semantic scene contents and hit tests at several scales;
+- test branch and worker navigation, Back, minimap, and loupe agreement;
+- verify cache-only branches never appear as landscape nodes;
+- test keyboard and screen-reader alternatives;
+- measure live phone frame time and memory;
+- use screenshots only as review artifacts.
 
 ## Prerequisites
 
 - Phase 5 is merged and used regularly.
-- Phase 6 item D is merged and has produced real tree-navigation feedback.
-- Candidate detail correctly distinguishes evaluated and bulk-eliminated work.
-- The terrain-topology data gap above is resolved in conversation.
-- Aggregation populations and persistence are decided.
-- Any cache schema change has an idempotent migration and phone-first
-  deployment plan under `AGENTS.md`.
+- Phase 6 item D has produced real tree-navigation feedback.
+- Candidate detail correctly distinguishes evaluated and bulk-eliminated
+  work.
+- The largest realistic live queue has been measured through the ordinary
+  tree report.
+- Layout, aggregation populations, interaction budgets, and accessibility
+  behavior are decided.
 - A small prototype proves stable coordinates and phone performance before
-  this becomes a numbered implementation phase.
+  this becomes an implementation phase.

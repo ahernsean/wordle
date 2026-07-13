@@ -8,10 +8,10 @@ references to that module have been updated to its actual public names.
 
 Create the presentation-neutral foundation used by every later client:
 
-- one inferred spine-selector parser;
-- one normalized request/filter representation;
 - one versioned report envelope;
+- one minimal overview request;
 - normalized branch and worker entities;
+- normalized lifecycle and identity semantics;
 - a lightweight operational overview collector.
 
 The model prints nothing and contains no terminal, HTTP, or HTML logic.
@@ -43,42 +43,14 @@ The model prints nothing and contains no terminal, HTTP, or HTML logic.
 
     branch_reference(branch_key: bytes) -> str
     parse_rich_spine(path: str | None) -> list[dict]
-    parse_report_selector(parts: list[str] | str | None) -> ReportSelector
     collect_overview_report(sources: ReportSources,
                             request: ReportRequest | None = None) -> dict
     collect_report(sources: ReportSources, request: ReportRequest) -> dict
 
 And these frozen dataclasses:
 
-    SpineStep(word: str, pattern: str)
-
-    ReportSelector(
-        kind: str,                    # root | word | branch | branch_reference
-        steps: tuple[SpineStep, ...],
-        trailing_word: str | None,
-        branch_reference: str | None,
-        input_text: str,
-    )
-
-    ReportSelector.root() -> ReportSelector
-
-    ReportFilters(
-        active_only: bool = False,
-        statuses: tuple[str, ...] = (),
-        minimum_answer_count: int | None = None,
-        maximum_answer_count: int | None = None,
-        budget: int | None = None,
-        priority: int | None = None,
-        sort: str | None = None,
-        limit: int | None = None,
-    )
-
     ReportRequest(
         report_kind: str = "overview",
-        selector: ReportSelector = ReportSelector.root(),
-        tree: bool = False,
-        filters: ReportFilters = ReportFilters(),
-        include_claims: bool = False,
     )
 
     ReportSources(
@@ -86,51 +58,9 @@ And these frozen dataclasses:
         cache_path: str,
     )
 
-Implement `ReportSelector.root` as a class method returning the normalized
-empty selector. Use `dataclasses.field(default_factory=...)` rather than
-constructing dataclass instances as function or field defaults. The types
-above describe the contract; spell the final definitions in valid Python.
-
 `collect_report` dispatches `overview` in this phase and raises
 `ValueError("unsupported report kind: ...")` for anything else. Later phases
 extend the dispatcher.
-
-## Selector grammar
-
-`parse_report_selector` accepts either a string or already-tokenized parts.
-When given a list, join it with spaces before parsing so CLI and HTTP inputs
-share identical behavior.
-
-Normalize words to lowercase and patterns to five characters using
-`g`/`y`/`-`. A dot normalizes to `-`. Reject malformed word and pattern
-tokens with a message that identifies the token and expected form.
-
-Rules:
-
-1. Empty input produces `kind="root"`.
-2. A sole token beginning with `@` produces `kind="branch_reference"`.
-   Require 4–40 hexadecimal characters after `@`. Store them lowercase.
-3. Otherwise, tokens alternate five-letter word and five-character response
-   pattern.
-4. If the final token is a word with no following pattern, produce
-   `kind="word"`, put all complete pairs in `steps`, and put that word in
-   `trailing_word`.
-5. If every word has a pattern, produce `kind="branch"` and put every pair in
-   `steps`.
-6. A missing pattern anywhere except after the final word is invalid.
-
-Required examples:
-
-| Input | Kind | Meaning |
-|---|---|---|
-| empty | root | operational root |
-| `CRANE` | word | inspect CRANE at root |
-| `CRANE -y--g ALIBI` | word | inspect ALIBI in branch CRANE -y--g |
-| `CRANE -y--g ALIBI g-g--` | branch | branch after both guesses |
-| `@8B31` | branch_reference | queued branch digest prefix |
-
-The parser does not inspect databases. Branch-reference resolution belongs to
-phase 3.
 
 ## Branch reference
 
@@ -178,6 +108,23 @@ The model does not calculate:
 `is_live` is a normalized lifecycle fact and may be included, calculated from
 `generated_at - updated_at <= WORKER_LIVENESS_SECONDS`. Keep `updated_at` so
 renderers can calculate the displayed age.
+
+### Lifecycle vocabulary
+
+SQLite uses different status values for user-queued and cooperative work.
+Normalize them before producing branch objects:
+
+| Report lifecycle | Source state |
+|---|---|
+| `pending` | `pending_branches.status = 'pending'` |
+| `active` | user `in_progress` or cooperative `active_branches.status = 'open'` |
+| `finalizing` | finalized branch still referenced by a live heartbeat |
+| `done` | `pending_branches.status = 'done'` |
+
+Phase 3 adds `unqueued` for a derived word response branch absent from queue
+state. Cache state is independent of lifecycle and uses `exact`, `loss`,
+`missing`, or `not_applicable`. A cut is transient telemetry/coordination
+state, not an exact cache state.
 
 ## Bounded queue helper
 
@@ -259,8 +206,8 @@ Return every top-level key even under partial failure:
         "schema_version": SCHEMA_VERSION,
         "report_kind": "overview",
         "generated_at": generated_at,
-        "selector": normalized root selector,
-        "filters": normalized filter dictionary,
+        "selector": null,
+        "filters": {},
         "sources": {
             "queue": {"path": ..., "ok": bool, "error": str | null},
             "telemetry": {
@@ -368,31 +315,26 @@ still a renderer concern.
 
 `tests/test_report_model.py` must cover:
 
-1. Selector inference for root, trailing word, complete branch, dot-pattern
-   normalization, and branch reference.
-2. `CACHE` and `QUEUE` as positional words both infer `kind="word"`.
-3. Invalid alternating forms and malformed patterns produce useful errors.
-4. Branch-reference stability, 12-character length, and distinct keys.
-5. Empty queue/cache produces a JSON-round-trippable overview with every
+1. Branch-reference stability, 12-character length, and distinct keys.
+2. Empty queue/cache produces a JSON-round-trippable overview with every
    envelope key.
-6. Unavailable queue and unavailable cache fail independently.
-7. One active branch and worker normalize spine, `guess_depth`, answer flags,
+3. Unavailable queue and unavailable cache fail independently.
+4. One active branch and worker normalize spine, `guess_depth`, answer flags,
    candidate progress, and renamed guess-axis fields correctly.
-8. All-gray pattern code 0 produces `guess_depth == 1` in the legacy-spine
+5. All-gray pattern code 0 produces `guess_depth == 1` in the legacy-spine
    fallback.
-9. A cooperative branch normalizes to `active` and contributes to
+6. A cooperative branch normalizes to `active` and contributes to
    `active_cooperative_branch_count`.
-10. A finalized branch referenced by a live heartbeat normalizes to
+7. A finalized branch referenced by a live heartbeat normalizes to
     `finalizing`; one referenced only by a dead heartbeat is not retained.
-11. Candidate progress batch lookup handles empty, missing, evaluated, and
+8. Candidate progress batch lookup handles empty, missing, evaluated, and
     bulk-eliminated candidates.
-12. No overview branch object contains `best_max_depth` and no worker object
+9. No overview branch object contains `best_max_depth` and no worker object
     contains `cur_max_depth`.
 
 ## Acceptance checklist
 
 - [ ] The public API and envelope above exist.
-- [ ] Selector inference is independent of CLI, HTTP, and database access.
 - [ ] Overview collection performs no per-branch claim-table query.
 - [ ] Overview contains no candidate index arrays or unbounded telemetry.
 - [ ] Queue/cache failure is partial and JSON serializable.
