@@ -36,16 +36,18 @@ class SemanticReportTest(unittest.TestCase):
         self.telemetry_path = os.path.join(directory, "telemetry.sqlite3")
         self.cache_path = os.path.join(directory, "cache.sqlite3")
         self.answer_list_path = os.path.join(directory, "answers.txt")
-        self.guess_list_path = os.path.join(directory, "guesses.txt")
+        self.candidate_list_path = os.path.join(directory, "candidates.txt")
         with open(self.answer_list_path, "w") as answer_file:
             answer_file.write("\n".join(ANSWERS) + "\n")
-        with open(self.guess_list_path, "w") as guess_file:
-            guess_file.write("\n".join(ANSWERS + ["raise", "queue", "cache"]) + "\n")
+        with open(self.candidate_list_path, "w") as candidate_file:
+            candidate_file.write(
+                "\n".join(ANSWERS + ["raise", "queue", "cache"]) + "\n"
+            )
         self.sources = ReportSources(
             self.queue_path,
             self.cache_path,
             self.answer_list_path,
-            self.guess_list_path,
+            self.candidate_list_path,
             self.telemetry_path,
         )
 
