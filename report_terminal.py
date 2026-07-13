@@ -640,7 +640,7 @@ class WatchSession:
             queue_path=self.args.queue_path,
             cache_path=self.args.cache_path,
             answer_list_path=defaults.answer_list_path,
-            guess_list_path=defaults.guess_list_path,
+            candidate_list_path=defaults.candidate_list_path,
             telemetry_path=(
                 defaults.telemetry_path
                 if self.args.queue_path == defaults.queue_path else None

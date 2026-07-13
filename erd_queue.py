@@ -2093,6 +2093,22 @@ class ERDQueue:
         ).fetchone()
         return row["value"] if row else None
 
+    def epoch_metadata(self):
+        """Return the active telemetry epoch and its descriptive metadata."""
+        epoch_text = self.get_meta("epoch")
+        if epoch_text is None:
+            return None
+        epoch = int(epoch_text)
+        row = self._conn.execute(
+            "SELECT label, git_sha FROM main.telemetry_epoch WHERE epoch = ?",
+            (epoch,),
+        ).fetchone()
+        return {
+            "epoch": epoch,
+            "label": row["label"] if row else None,
+            "git_sha": row["git_sha"] if row else None,
+        }
+
     # ------------------------------------------------------------------
     # Queue management
     # ------------------------------------------------------------------
