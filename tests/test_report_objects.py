@@ -340,6 +340,16 @@ class SemanticReportTest(unittest.TestCase):
         queue.create_branch(
             b"modelkarma", 2, 4, budget=5, spine="RAISE -----"
         )
+        fully_filtered = queue.report_queue_rows(ReportFilters(
+            statuses=("active",),
+            maximum_answer_count=2,
+            budget=5,
+            priority=0,
+        ))
+        self.assertEqual(
+            [row["branch_key"] for row in fully_filtered["rows"]],
+            [b"modelkarma"],
+        )
         scoped = queue.report_tree_rows(
             "RAISE -----", ReportFilters(sort="size", limit=1)
         )

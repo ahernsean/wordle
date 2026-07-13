@@ -1704,14 +1704,6 @@ class ERDQueue:
             return filters.get(name, default)
         return getattr(filters, name, default)
 
-    @staticmethod
-    def _report_lifecycle(row):
-        if row["status"] in ("in_progress", "open"):
-            return "active"
-        if row["status"] == "finalized":
-            return "finalizing"
-        return row["status"]
-
     def report_queue_rows(self, filters=None, sort=None, limit=None) -> dict:
         """Return normalized, filtered queue rows with pre-limit summaries."""
         statuses = tuple(self._report_filter_value(filters, "statuses", ()))
