@@ -117,8 +117,8 @@ completion kind, and republish count when known.
 The client requests `claims=1` only while the grid disclosure is expanded.
 At 12,972 candidates, use CSS grid and a bounded number of DOM buckets if
 individual cells do not meet the phone performance budget. If aggregation is
-needed, semantic zoom within the grid must still expose individual cells on
-selection; document and test the threshold.
+needed, each bucket must support drill-down to individual candidate cells;
+document and test the threshold.
 
 Acceptance:
 
