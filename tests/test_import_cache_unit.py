@@ -277,8 +277,10 @@ class TestMainSourceDeletion(_TmpDB):
             import_cache.main()
 
         self.assertEqual(raised.exception.code, 1)
-        self.assertIn("source and target refer to the same file",
-                      stderr.getvalue())
+        error = stderr.getvalue()
+        self.assertIn(f"source {cache_path!r}", error)
+        self.assertIn(f"target {cache_path!r}", error)
+        self.assertIn("refer to the same file", error)
         self.assertTrue(os.path.exists(cache_path))
 
 

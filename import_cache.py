@@ -241,8 +241,9 @@ def main():  # pragma: no cover
     if (not args.dry_run and not args.keep_source
             and os.path.exists(args.target)
             and os.path.samefile(args.source, args.target)):
-        print('Error: source and target refer to the same file; refusing to '
-              'delete the target', file=sys.stderr)
+        print(f'Error: source {args.source!r} and target {args.target!r} '
+              'refer to the same file; refusing to delete the target',
+              file=sys.stderr)
         sys.exit(1)
 
     target_existed = os.path.exists(args.target)
