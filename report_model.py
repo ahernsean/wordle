@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import sqlite3
 import time
 from typing import Optional, Tuple
 
@@ -12,7 +13,7 @@ from erd_queue import ERDQueue
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
     DEFAULT_CACHE_PATH,
-    DEFAULT_GUESS_LIST_PATH,
+    DEFAULT_CANDIDATE_LIST_PATH,
     DEFAULT_QUEUE_PATH,
     DEFAULT_TELEMETRY_PATH,
 )
@@ -21,6 +22,9 @@ from wordle_ui import fmt_pattern
 
 
 SCHEMA_VERSION = 1
+# Workers heartbeat about every two seconds. This threshold governs both claim
+# reclamation and report liveness, so a worker inside it is never reclaimed or
+# excluded from live-worker totals.
 WORKER_LIVENESS_SECONDS = 30
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
@@ -36,7 +40,7 @@ class ReportSources:
     queue_path: str
     cache_path: str
     answer_list_path: str
-    guess_list_path: str
+    candidate_list_path: str
     telemetry_path: str | None = None
 
     @classmethod
@@ -45,7 +49,7 @@ class ReportSources:
             queue_path=DEFAULT_QUEUE_PATH,
             cache_path=DEFAULT_CACHE_PATH,
             answer_list_path=DEFAULT_ANSWER_LIST_PATH,
-            guess_list_path=DEFAULT_GUESS_LIST_PATH,
+            candidate_list_path=DEFAULT_CANDIDATE_LIST_PATH,
             telemetry_path=DEFAULT_TELEMETRY_PATH,
         )
 
@@ -249,6 +253,7 @@ def _queue_overview(sources, generated_at, answer_set, report):
     queue = None
     try:
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        report["sources"]["telemetry"]["ok"] = True
         counts = queue.counts_by_status()
         open_rows = list(queue.branches_in_progress())
         heartbeats = list(queue.heartbeats_with_branch())
@@ -301,14 +306,7 @@ def _queue_overview(sources, generated_at, answer_set, report):
             key: sum(worker[key] for worker in workers if worker["is_live"])
             for key in worker_total_keys
         }
-        epoch_text = queue.get_meta("epoch")
-        epoch = int(epoch_text) if epoch_text is not None else None
-        epoch_row = None
-        if epoch is not None:
-            epoch_row = queue._conn.execute(
-                "SELECT label, git_sha FROM main.telemetry_epoch WHERE epoch = ?",
-                (epoch,),
-            ).fetchone()
+        epoch_metadata = queue.epoch_metadata()
 
         report["data"]["queue_counts"] = {
             "pending_branch_count": counts.get("pending", 0),
@@ -326,15 +324,15 @@ def _queue_overview(sources, generated_at, answer_set, report):
         report["data"]["workers"] = workers
         report["sources"]["queue"].update({
             "ok": True,
-            "epoch": epoch,
-            "label": _row_value(epoch_row, "label"),
-            "git_sha": _row_value(epoch_row, "git_sha"),
+            "epoch": _row_value(epoch_metadata, "epoch"),
+            "label": _row_value(epoch_metadata, "label"),
+            "git_sha": _row_value(epoch_metadata, "git_sha"),
         })
-        report["sources"]["telemetry"]["ok"] = True
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         message = str(error)
         report["sources"]["queue"]["error"] = message
-        report["sources"]["telemetry"]["error"] = message
+        if queue is None:
+            report["sources"]["telemetry"]["error"] = message
     finally:
         if queue is not None:
             queue.close()
@@ -350,7 +348,7 @@ def _cache_overview(sources, generated_at, answer_words, report):
             ERD_ALL, generated_at - 300
         )
         report["sources"]["cache"]["ok"] = True
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     finally:
         if cache is not None:
@@ -391,13 +389,12 @@ def collect_overview_report(
     try:
         answer_words = load_word_list(sources.answer_list_path)
         answer_set = set(answer_words)
-    except Exception as error:
-        answer_words = []
-        answer_set = set()
-        report["sources"]["cache"]["error"] = str(error)
-
-    _queue_overview(sources, generated_at, answer_set, report)
-    if report["sources"]["cache"]["error"] is None:
+    except OSError as error:
+        message = str(error)
+        report["sources"]["queue"]["error"] = message
+        report["sources"]["cache"]["error"] = message
+    else:
+        _queue_overview(sources, generated_at, answer_set, report)
         _cache_overview(sources, generated_at, answer_words, report)
     return report
 
