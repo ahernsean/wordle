@@ -9,6 +9,7 @@ from unittest.mock import patch
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue
 from report_model import (
+    ReportFilters,
     ReportRequest,
     ReportSources,
     branch_reference,
@@ -296,6 +297,200 @@ class SemanticReportTest(unittest.TestCase):
             "missing",
         )
         cache.close()
+
+    def test_queue_filters_precede_limit_and_do_not_duplicate_user_work(self):
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        user_key = b"cigarrebut"
+        queue.add_pending_many([
+            (user_key, 2, 5, "raise", 0),
+            (b"awakeblush", 20, 4, "crane", 1),
+            (b"focalserve", 200, 3, "stink", 2),
+        ])
+        queue.claim_next("worker-1")
+        queue.create_branch(user_key, 2, 10, priority=5)
+        result = queue.report_queue_rows(ReportFilters(
+            minimum_answer_count=10, limit=1, sort="size"
+        ))
+        self.assertEqual(result["matched_rows"], 2)
+        self.assertEqual(result["summary"]["branch_count"], 2)
+        self.assertEqual(len(result["rows"]), 1)
+        all_rows = queue.report_queue_rows()
+        self.assertEqual(
+            sum(row["branch_key_hex"] == user_key.hex() for row in all_rows["rows"]),
+            1,
+        )
+        queue.create_branch(
+            b"modelkarma", 2, 4, budget=5, spine="RAISE -----"
+        )
+        scoped = queue.report_tree_rows(
+            "RAISE -----", ReportFilters(sort="size", limit=1)
+        )
+        self.assertEqual(scoped["matched_rows"], 1)
+        self.assertEqual(scoped["rows"][0]["spine"], "RAISE -----")
+        queue.close()
+
+    def test_active_only_excludes_finalizing_lifecycle(self):
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        active_key = b"cigarrebut"
+        finalizing_key = b"awakeblush"
+        queue.create_branch(active_key, 2, 4)
+        queue.create_branch(finalizing_key, 2, 4)
+        queue.try_finalize_branch(finalizing_key)
+        result = queue.report_queue_rows(ReportFilters(active_only=True))
+        self.assertEqual([row["branch_key"] for row in result["rows"]], [active_key])
+        queue.close()
+
+    def test_root_word_and_branch_trees_use_only_queue_spines(self):
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(
+            b"cigarrebut", 2, 4, budget=5, spine="RAISE -----"
+        )
+        queue.create_branch(
+            b"awakeblush", 2, 4, budget=4,
+            spine="RAISE ----- CRANE y----",
+        )
+        queue.create_branch(
+            b"focalserve", 2, 4, budget=5, spine="STINK g----"
+        )
+        queue.close()
+        for selector_text, expected_word in (
+            ("", None), ("RAISE", "raise"), ("RAISE -----", "raise"),
+        ):
+            with self.subTest(selector=selector_text):
+                report = collect_report(self.sources, ReportRequest(
+                    selector=parse_report_selector(selector_text), tree=True
+                ))
+                self.assertTrue(report["data"]["tree_available"])
+                node_ids = {node["node_id"] for node in report["data"]["nodes"]}
+                for node in report["data"]["nodes"]:
+                    if node["parent_node_id"] is not None:
+                        self.assertIn(node["parent_node_id"], node_ids)
+                    self.assertGreaterEqual(node["guess_depth"], 0)
+                    if expected_word and node["step"] is not None:
+                        self.assertEqual(node["node_id"].split(":", 1)[0], expected_word)
+
+    def test_tree_keeps_filtered_context_and_drops_other_descendants(self):
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(
+            b"cigarrebut", 2, 4, budget=5, spine="RAISE -----"
+        )
+        queue.create_branch(
+            b"awakeblush", 150, 4, budget=4,
+            spine="RAISE ----- CRANE y----",
+        )
+        queue.create_branch(
+            b"focalserve", 3, 4, budget=4,
+            spine="RAISE ----- STINK g----",
+        )
+        queue.close()
+        report = collect_report(self.sources, ReportRequest(
+            selector=parse_report_selector("RAISE -----"),
+            tree=True,
+            filters=ReportFilters(minimum_answer_count=100),
+        ))
+        branch_nodes = [
+            node for node in report["data"]["nodes"]
+            if node["branch_key_hex"] is not None
+        ]
+        self.assertEqual(len(branch_nodes), 2)
+        self.assertTrue(any(node["is_context"] for node in branch_nodes))
+        self.assertTrue(any(node["answer_count"] == 150 for node in branch_nodes))
+        self.assertFalse(any(node["answer_count"] == 3 for node in branch_nodes))
+
+    def test_cache_only_tree_is_unavailable_and_legacy_spine_is_unknown(self):
+        pattern_code, answer_words, branch_key = self._largest_group()
+        selector = parse_report_selector(f"RAISE {fmt_pattern(pattern_code)}")
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(branch_key, ERD_ALL, "cigar", 2.0, max_depth=2)
+        cache.close()
+        report = collect_report(
+            self.sources, ReportRequest(selector=selector, tree=True)
+        )
+        self.assertFalse(report["data"]["tree_available"])
+        self.assertEqual(report["data"]["nodes"], [])
+
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(b"legacybranchkey", 3, 4, budget=3, spine=None)
+        queue.close()
+        legacy_tree = collect_report(
+            self.sources, ReportRequest(tree=True)
+        )
+        unknown_nodes = [
+            node for node in legacy_tree["data"]["nodes"]
+            if node["node_id"].startswith("unknown:")
+        ]
+        self.assertEqual(len(unknown_nodes), 3)
+        self.assertTrue(all(node["step"] is None for node in unknown_nodes))
+
+    def test_cache_distribution_helpers_name_reuse_axes(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(
+            ScoreCache.encode_subset(ANSWERS[:3]), ERD_ALL, "cigar", 2.0,
+            max_depth=3, solve_budget=None,
+        )
+        cache.write(
+            ScoreCache.encode_subset(ANSWERS[3:6]), ERD_ALL, "awake", 2.2,
+            max_depth=4, solve_budget=4,
+        )
+        cache.write_loss(ScoreCache.encode_subset(ANSWERS[6:9]), ERD_ALL, 3)
+        distributions = cache.report_cache_distributions(ERD_ALL)
+        self.assertEqual(
+            distributions["state_branch_counts"]["exact_branch_count"], 2
+        )
+        self.assertEqual(
+            distributions["exact_branch_count_by_taint"],
+            {"untainted": 1, "tainted": 1},
+        )
+        self.assertEqual(distributions["loss_branch_count_by_loss_budget"]["3"], 1)
+        cache.close()
+
+    def test_queue_worker_and_cache_collectors_dispatch(self):
+        now = int(time.time())
+        branch_key = b"cigarrebut"
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(
+            branch_key, 2, 4, budget=5, spine="RAISE -----"
+        )
+        queue.heartbeat("worker-2", 42, branch_key, 2, now, 0)
+        queue.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(branch_key, ERD_ALL, "cigar", 2.0, max_depth=2)
+        cache.close()
+
+        queue_report = collect_report(
+            self.sources, ReportRequest(report_kind="queue")
+        )
+        workers_report = collect_report(
+            self.sources, ReportRequest(report_kind="workers", worker_id="2")
+        )
+        cache_report = collect_report(
+            self.sources, ReportRequest(report_kind="cache")
+        )
+        self.assertEqual(queue_report["report_kind"], "queue")
+        self.assertEqual(queue_report["data"]["matched_rows"], 1)
+        self.assertEqual(workers_report["report_kind"], "workers")
+        self.assertEqual(workers_report["data"]["rows"][0]["worker_number"], "2")
+        self.assertEqual(cache_report["report_kind"], "cache")
+        self.assertEqual(cache_report["data"]["summary"]["exact_branch_count"], 1)
+
+    def test_active_only_has_same_meaning_for_word_groups(self):
+        pattern_code, answer_words, branch_key = self._largest_group()
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(
+            branch_key, len(answer_words), 4, source_word="raise",
+            source_pattern=pattern_code, budget=5,
+            spine=f"RAISE {fmt_pattern(pattern_code)}",
+        )
+        queue.close()
+        report = collect_report(self.sources, ReportRequest(
+            selector=parse_report_selector("RAISE"),
+            filters=ReportFilters(active_only=True),
+        ))
+        self.assertEqual(report["data"]["matched_rows"], 1)
+        self.assertTrue(all(
+            row["lifecycle"] == "active"
+            for row in report["data"]["response_groups"]
+        ))
 
 
 if __name__ == "__main__":

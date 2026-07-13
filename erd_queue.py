@@ -1679,6 +1679,232 @@ class ERDQueue:
             rows = rows[:limit]
         return rows
 
+    @staticmethod
+    def _report_filter_value(filters, name, default=None):
+        if filters is None:
+            return default
+        if isinstance(filters, dict):
+            return filters.get(name, default)
+        return getattr(filters, name, default)
+
+    @staticmethod
+    def _report_lifecycle(row):
+        if row["status"] in ("in_progress", "open"):
+            return "active"
+        if row["status"] == "finalized":
+            return "finalizing"
+        return row["status"]
+
+    def report_queue_rows(self, filters=None, sort=None, limit=None) -> dict:
+        """Return normalized, filtered queue rows with pre-limit summaries."""
+        statuses = tuple(self._report_filter_value(filters, "statuses", ()))
+        active_only = self._report_filter_value(filters, "active_only", False)
+        minimum_answer_count = self._report_filter_value(
+            filters, "minimum_answer_count"
+        )
+        maximum_answer_count = self._report_filter_value(
+            filters, "maximum_answer_count"
+        )
+        budget = self._report_filter_value(filters, "budget")
+        priority = self._report_filter_value(filters, "priority")
+        lifecycle_expression = """CASE
+            WHEN pending_status = 'pending' THEN 'pending'
+            WHEN pending_status = 'in_progress' THEN 'active'
+            WHEN pending_status = 'done' THEN 'done'
+            WHEN active_status = 'open' THEN 'active'
+            WHEN active_status = 'finalized' THEN 'finalizing'
+            ELSE 'unknown' END"""
+        base_query = f"""
+            WITH branch_keys AS (
+                SELECT branch_key FROM pending_branches
+                UNION
+                SELECT branch_key FROM active_branches
+            ),
+            completed AS (
+                SELECT branch_key, COUNT(*) AS completed_candidate_count
+                FROM candidate_claims WHERE done = 1 GROUP BY branch_key
+            ),
+            workers AS (
+                SELECT current_branch_key AS branch_key, COUNT(*) AS worker_count
+                FROM worker_heartbeat
+                WHERE current_branch_key IS NOT NULL AND updated_at >= ?
+                GROUP BY current_branch_key
+            ),
+            source_rows AS (
+                SELECT keys.branch_key,
+                       pending.status AS pending_status,
+                       active.status AS active_status,
+                       pending.priority AS pending_priority,
+                       active.priority AS active_priority,
+                       pending.n_words AS pending_answer_count,
+                       active.n_words AS active_answer_count,
+                       pending.source_word AS pending_source_word,
+                       active.source_word AS active_source_word,
+                       pending.source_pattern AS pending_source_pattern,
+                       active.source_pattern AS active_source_pattern,
+                       pending.claimed_at,
+                       pending.completed_at,
+                       active.n_candidates AS candidate_count,
+                       active.budget,
+                       active.best_guess,
+                       active.best_erd,
+                       active.best_max_depth,
+                       active.nodes_spent,
+                       active.spine,
+                       active.created_at,
+                       COALESCE(completed.completed_candidate_count, 0)
+                           AS completed_candidate_count,
+                       COALESCE(workers.worker_count, 0) AS worker_count
+                FROM branch_keys AS keys
+                LEFT JOIN pending_branches AS pending USING (branch_key)
+                LEFT JOIN active_branches AS active USING (branch_key)
+                LEFT JOIN completed USING (branch_key)
+                LEFT JOIN workers USING (branch_key)
+            ),
+            normalized AS (
+                SELECT *, {lifecycle_expression} AS lifecycle,
+                       COALESCE(active_priority, pending_priority, 0) AS priority,
+                       COALESCE(active_answer_count, pending_answer_count) AS answer_count,
+                       COALESCE(active_source_word, pending_source_word) AS source_word,
+                       COALESCE(active_source_pattern, pending_source_pattern) AS source_pattern
+                FROM source_rows
+            )
+        """
+        conditions = []
+        parameters = [int(time.time()) - 30]
+        if active_only:
+            conditions.append("lifecycle = 'active'")
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            conditions.append(f"lifecycle IN ({placeholders})")
+            parameters.extend(statuses)
+        if minimum_answer_count is not None:
+            conditions.append("answer_count >= ?")
+            parameters.append(minimum_answer_count)
+        if maximum_answer_count is not None:
+            conditions.append("answer_count <= ?")
+            parameters.append(maximum_answer_count)
+        if budget is not None:
+            conditions.append("budget = ?")
+            parameters.append(budget)
+        if priority is not None:
+            conditions.append("priority = ?")
+            parameters.append(priority)
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        summary_rows = self._conn.execute(
+            base_query
+            + " SELECT lifecycle, COUNT(*) AS branch_count FROM normalized"
+            + where_clause
+            + " GROUP BY lifecycle",
+            parameters,
+        ).fetchall()
+        by_lifecycle = {
+            row["lifecycle"]: row["branch_count"] for row in summary_rows
+        }
+        matched_rows = sum(by_lifecycle.values())
+        sort_name = sort or self._report_filter_value(filters, "sort") or "default"
+        order_by = {
+            "age": "COALESCE(created_at, claimed_at, 0), branch_key",
+            "size": "answer_count DESC, branch_key",
+            "workers": "worker_count DESC, answer_count DESC, branch_key",
+            "priority": "priority DESC, answer_count DESC, branch_key",
+            "nodes": "nodes_spent DESC, answer_count DESC, branch_key",
+            "slowest": "nodes_spent DESC, created_at, branch_key",
+            "default": (
+                "CASE lifecycle WHEN 'active' THEN 0 ELSE 1 END, "
+                "priority DESC, answer_count DESC, branch_key"
+            ),
+        }[sort_name]
+        effective_limit = (
+            limit if limit is not None
+            else self._report_filter_value(filters, "limit")
+        )
+        row_query = base_query + " SELECT * FROM normalized" + where_clause
+        row_query += " ORDER BY " + order_by
+        row_parameters = list(parameters)
+        if effective_limit is not None:
+            row_query += " LIMIT ?"
+            row_parameters.append(effective_limit)
+        source_rows = self._conn.execute(row_query, row_parameters).fetchall()
+        returned_rows = []
+        for row in source_rows:
+            source_pattern = row["source_pattern"]
+            returned_rows.append({
+                "branch_key": bytes(row["branch_key"]),
+                "branch_key_hex": bytes(row["branch_key"]).hex(),
+                "lifecycle": row["lifecycle"],
+                "raw_status": row["pending_status"] or row["active_status"],
+                "is_cooperative": row["pending_status"] is None,
+                "answer_count": row["answer_count"],
+                "priority": row["priority"],
+                "budget": row["budget"],
+                "candidate_count": row["candidate_count"],
+                "completed_candidate_count": row["completed_candidate_count"],
+                "worker_count": row["worker_count"],
+                "search_node_count": row["nodes_spent"] or 0,
+                "best_guess": row["best_guess"],
+                "best_erd": row["best_erd"],
+                "best_max_remaining_depth": row["best_max_depth"],
+                "source_word": row["source_word"],
+                "source_pattern": (
+                    fmt_pattern(source_pattern) if source_pattern is not None else None
+                ),
+                "spine": row["spine"],
+                "created_at": row["created_at"],
+                "updated_at": row["completed_at"] or row["claimed_at"] or row["created_at"],
+                "is_context": False,
+            })
+        return {
+            "summary": {
+                "branch_count": matched_rows,
+                "branch_count_by_lifecycle": by_lifecycle,
+            },
+            "matched_rows": matched_rows,
+            "rows": returned_rows,
+        }
+
+    def report_tree_rows(self, spine_prefix, filters=None, sort=None, limit=None) -> dict:
+        """Return report queue rows at or below a recorded spine prefix."""
+        unbounded_filters = {
+            "active_only": self._report_filter_value(filters, "active_only", False),
+            "statuses": self._report_filter_value(filters, "statuses", ()) or (),
+            "minimum_answer_count": self._report_filter_value(
+                filters, "minimum_answer_count"
+            ),
+            "maximum_answer_count": self._report_filter_value(
+                filters, "maximum_answer_count"
+            ),
+            "budget": self._report_filter_value(filters, "budget"),
+            "priority": self._report_filter_value(filters, "priority"),
+            "sort": self._report_filter_value(filters, "sort"),
+        }
+        result = self.report_queue_rows(unbounded_filters, sort, None)
+        prefix = (spine_prefix or "").strip()
+        rows = result["rows"]
+        if prefix:
+            rows = [
+                row for row in rows
+                if (row["spine"] or "") == prefix
+                or (row["spine"] or "").startswith(prefix + " ")
+            ]
+        matched_rows = len(rows)
+        by_lifecycle = {}
+        for row in rows:
+            lifecycle = row["lifecycle"]
+            by_lifecycle[lifecycle] = by_lifecycle.get(lifecycle, 0) + 1
+        effective_limit = limit if limit is not None else self._report_filter_value(
+            filters, "limit"
+        )
+        rows = rows[:effective_limit] if effective_limit else rows
+        return {
+            "summary": {
+                "branch_count": matched_rows,
+                "branch_count_by_lifecycle": by_lifecycle,
+            },
+            "matched_rows": matched_rows,
+            "rows": rows,
+        }
+
     def _queue_sort_key(self, sort):
         if sort == "nodes":
             return lambda r: (-(r["nodes_spent"] or 0), -r["n_words"], r["branch_key_hex"])

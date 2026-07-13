@@ -143,7 +143,12 @@ def _colorize(line, semantic_class, color):
 
 
 def _source_line(name, source, width):
-    health = "ok" if source["ok"] else f"unavailable: {source['error']}"
+    if source["ok"]:
+        health = "ok"
+    elif source["error"] is None:
+        health = "not used"
+    else:
+        health = f"unavailable: {source['error']}"
     if width >= 80:
         return _fit(f"  {name}: {health}  path={source['path']}", width)
     return _fit(f"  {name}: {health}", width)
@@ -482,7 +487,105 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     ]
 
 
+def _render_tree_sections(report, width):
+    data = report["data"]
+    header = _semantic_header(report, "Live queue tree", width)
+    lines = ["Topology: queue"]
+    if not data["tree_available"]:
+        lines.append(f"  unavailable: {data['unavailable_reason']}")
+    else:
+        for node in data["nodes"]:
+            indent = "  " * node["guess_depth"]
+            step = node["step"]
+            label = "root" if node["guess_depth"] == 0 else "unknown"
+            if step is not None:
+                label = f"{step['word'].upper()} {step['pattern']}"
+            detail = ""
+            if node["branch_reference"]:
+                detail = (
+                    f"  @{node['branch_reference']} {node['lifecycle']} "
+                    f"n={node['answer_count']} workers={node['worker_count']}"
+                )
+            if node["is_context"]:
+                detail += "  [context]"
+            lines.append(_fit(f"{indent}{label}{detail}", width))
+    return [("header", header), ("tree", lines)]
+
+
+def _render_queue_collection_sections(report, width):
+    data = report["data"]
+    header = _semantic_header(report, "Queue report", width)
+    summary = data.get("summary", {})
+    lines = [
+        f"Queue rows: {data.get('matched_rows', 0)} matched",
+        _fit(f"  lifecycle={summary.get('branch_count_by_lifecycle', {})}", width),
+    ]
+    for row in data.get("rows", []):
+        lines.append(_fit(
+            f"  @{row['branch_reference']} {row['lifecycle']} "
+            f"n={row['answer_count']} d={len((row.get('spine') or '').split()) // 2} "
+            f"priority={row['priority']} workers={row['worker_count']}",
+            width,
+        ))
+    return [("header", header), ("queue_rows", lines)]
+
+
+def _render_workers_collection_sections(report, previous_report, color, width, display_order):
+    data = report["data"]
+    header = _semantic_header(report, "Workers report", width)
+    workers = data.get("rows", [])
+    incoming_ids = [worker["worker_id"] for worker in workers]
+    display_order.worker_ids = DisplayOrder._update_identities(
+        display_order.worker_ids, incoming_ids, set()
+    )
+    by_id = {worker["worker_id"]: worker for worker in workers}
+    previous_by_id = {
+        worker["worker_id"]: worker
+        for worker in (previous_report or {}).get("data", {}).get("rows", [])
+    }
+    lines = [f"Workers: {data.get('matched_rows', 0)} matched"]
+    for worker_id in display_order.worker_ids:
+        worker = by_id.get(worker_id)
+        if worker is not None:
+            lines.append(_render_worker_line(
+                worker, previous_by_id.get(worker_id), report["generated_at"],
+                color, width, indent="  ",
+                state=None if worker["is_live"] else "dead",
+            ))
+    return [("header", header), ("worker_rows", lines)]
+
+
+def _render_cache_collection_sections(report, width):
+    data = report["data"]
+    header = _semantic_header(report, "Cache report", width)
+    lines = ["Cache"]
+    if "distributions" in data:
+        summary = data["summary"]
+        lines.append(_fit(
+            f"  exact={summary['exact_branch_count']} "
+            f"loss={summary['loss_branch_count']} "
+            f"recent={summary['recent_exact_branch_count']}",
+            width,
+        ))
+        lines.append(_fit(f"  {data['distributions']}", width))
+    elif "rows" in data:
+        for row in data["rows"]:
+            lines.append(_fit(
+                f"  {row['pattern']} n={row['answer_count']} "
+                f"{row['cache_state']} @{row['branch_reference']}",
+                width,
+            ))
+    elif "cache" in data:
+        lines.append(_fit(
+            f"  @{data['branch_reference']} {data['cache']['cache_state']}",
+            width,
+        ))
+    return [("header", header), ("cache_rows", lines)]
+
+
 def _report_sections(report, previous_report, color, width, display_order):
+    if report.get("tree"):
+        return _render_tree_sections(report, width)
     if report["report_kind"] == "overview":
         return _render_sections(
             report, previous_report, color, width, display_order
@@ -495,6 +598,14 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_branch_sections(
             report, previous_report, color, width, display_order
         )
+    if report["report_kind"] == "queue":
+        return _render_queue_collection_sections(report, width)
+    if report["report_kind"] == "workers":
+        return _render_workers_collection_sections(
+            report, previous_report, color, width, display_order
+        )
+    if report["report_kind"] == "cache":
+        return _render_cache_collection_sections(report, width)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 
@@ -539,9 +650,13 @@ class WatchSession:
     def _collect(self):
         selector = getattr(self.args, "selector", None)
         request = ReportRequest(
+            report_kind=getattr(self.args, "report_kind", "auto"),
             selector=selector if selector is not None else ReportRequest().selector,
             include_claims=getattr(self.args, "claims", False),
             include_answers=getattr(self.args, "answers", False),
+            tree=getattr(self.args, "tree", False),
+            filters=getattr(self.args, "filters", ReportRequest().filters),
+            worker_id=getattr(self.args, "worker", None),
         )
         return collect_report(self._sources(), request)
 

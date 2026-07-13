@@ -66,6 +66,7 @@ from datetime import datetime
 
 from cache_sqlite import ScoreCache
 from report_model import (
+    ReportFilters,
     WORKER_LIVENESS_SECONDS,
     parse_report_selector,
     parse_rich_spine as _parse_spine,
@@ -2098,6 +2099,25 @@ def main():
     p_view.add_argument('--cache-path', default=DEFAULT_CACHE, metavar='PATH')
     p_view.add_argument('--claims', action='store_true')
     p_view.add_argument('--answers', action='store_true')
+    p_view.add_argument('--tree', action='store_true')
+    view_kind = p_view.add_mutually_exclusive_group()
+    view_kind.add_argument('--queue', dest='view_queue', action='store_true')
+    view_kind.add_argument('--workers', action='store_true')
+    view_kind.add_argument('--worker', metavar='N')
+    view_kind.add_argument('--cache', dest='view_cache', action='store_true')
+    lifecycle_filter = p_view.add_mutually_exclusive_group()
+    lifecycle_filter.add_argument('--active-only', action='store_true')
+    lifecycle_filter.add_argument(
+        '--status', action='append', default=[],
+        choices=('pending', 'active', 'finalizing', 'done', 'unqueued'))
+    p_view.add_argument('--minimum-answer-count', type=int, metavar='N')
+    p_view.add_argument('--maximum-answer-count', type=int, metavar='N')
+    p_view.add_argument('--budget', type=int, metavar='N')
+    p_view.add_argument('--priority', type=int, metavar='N')
+    p_view.add_argument('--sort',
+                        choices=('default', 'age', 'size', 'workers',
+                                 'priority', 'nodes', 'slowest'))
+    p_view.add_argument('--limit', type=int, metavar='N')
     p_view.add_argument('spine', nargs='*', metavar='SPINE')
 
     # -- cache-status --
@@ -2256,6 +2276,37 @@ def main():
             args.selector = parse_report_selector(args.spine)
         except ValueError as error:
             parser.error(str(error))
+        if args.tree and args.view_cache:
+            parser.error('--tree cannot be used with --cache')
+        if args.limit is not None and args.limit < 1:
+            parser.error('--limit must be at least 1')
+        if (args.minimum_answer_count is not None
+                and args.maximum_answer_count is not None
+                and args.minimum_answer_count > args.maximum_answer_count):
+            parser.error('--minimum-answer-count cannot exceed --maximum-answer-count')
+        args.report_kind = (
+            'queue' if args.view_queue else
+            'workers' if args.workers or args.worker is not None else
+            'cache' if args.view_cache else 'auto'
+        )
+        if args.claims and (
+                args.report_kind != 'auto'
+                or args.selector.kind not in ('branch', 'branch_reference')):
+            parser.error('--claims requires a singular branch selector')
+        if args.answers and (
+                args.tree or args.report_kind in ('queue', 'workers')
+                or (args.report_kind == 'auto' and args.selector.kind == 'root')):
+            parser.error('--answers requires a word or branch report without --tree')
+        args.filters = ReportFilters(
+            active_only=args.active_only,
+            statuses=tuple(args.status),
+            minimum_answer_count=args.minimum_answer_count,
+            maximum_answer_count=args.maximum_answer_count,
+            budget=args.budget,
+            priority=args.priority,
+            sort=args.sort,
+            limit=args.limit,
+        )
     _normalize_queue_cli_args(args)
 
     if args.cmd == 'queue':

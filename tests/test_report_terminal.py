@@ -424,6 +424,38 @@ class ViewParserTest(unittest.TestCase):
                 self.assertEqual(selector.kind, "word")
                 self.assertEqual(selector.trailing_word, word.lower())
 
+    def test_collection_options_dispatch_explicit_kinds(self):
+        cases = [
+            (["--queue"], "queue", None),
+            (["--workers"], "workers", None),
+            (["--worker", "2"], "workers", "2"),
+            (["--cache"], "cache", None),
+        ]
+        for options, report_kind, worker_id in cases:
+            with self.subTest(options=options):
+                with (
+                    patch("sys.argv", ["erd_search.py", "view", *options]),
+                    patch("report_terminal.run_view") as run_view,
+                ):
+                    erd_search.main()
+                args = run_view.call_args.args[0]
+                self.assertEqual(args.report_kind, report_kind)
+                self.assertEqual(args.worker, worker_id)
+
+    def test_tree_cache_and_conflicting_lifecycle_filters_are_rejected(self):
+        invalid_arguments = [
+            ["erd_search.py", "view", "--cache", "--tree"],
+            ["erd_search.py", "view", "--active-only", "--status", "active"],
+            ["erd_search.py", "view", "--queue", "--claims"],
+            ["erd_search.py", "view", "--tree", "--answers"],
+        ]
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with patch("sys.argv", arguments), patch("sys.stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        erd_search.main()
+                self.assertEqual(raised.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
