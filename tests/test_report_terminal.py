@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 import erd_search
 import report_terminal
-from report_terminal import DisplayOrder, WatchSession, render_overview
+from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
 
 
 def overview_report():
@@ -198,6 +198,123 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("queue: unavailable: locked", output)
         self.assertIn("exact 200", output)
 
+    def test_watched_word_groups_preserve_full_identity_order(self):
+        first = overview_report()
+        first["report_kind"] = "word"
+        first["data"] = {
+            "word": "raise",
+            "word_is_answer": False,
+            "context": {
+                "branch_reference": "rootrootroot",
+                "branch_key_hex": "root",
+                "spine": [],
+                "guess_depth": 0,
+                "answer_count": 20,
+            },
+            "response_group_counts": {
+                "response_group_count": 2,
+                "trivial_response_group_count": 0,
+                "queued_response_group_count": 0,
+                "active_response_group_count": 0,
+                "exact_response_group_count": 0,
+                "loss_response_group_count": 0,
+                "missing_response_group_count": 2,
+            },
+            "response_groups": [
+                {
+                    "pattern": "-----", "answer_count": 8,
+                    "branch_reference": "aaaaaaaaaaaa", "branch_key_hex": "aa",
+                    "lifecycle": "unqueued", "priority": None, "worker_count": 0,
+                    "cache_state": "missing", "best_guess": None,
+                    "best_erd": None, "max_remaining_depth": None,
+                    "updated_at": None,
+                },
+                {
+                    "pattern": "y----", "answer_count": 4,
+                    "branch_reference": "bbbbbbbbbbbb", "branch_key_hex": "bb",
+                    "lifecycle": "unqueued", "priority": None, "worker_count": 0,
+                    "cache_state": "missing", "best_guess": None,
+                    "best_erd": None, "max_remaining_depth": None,
+                    "updated_at": None,
+                },
+            ],
+        }
+        display_order = DisplayOrder()
+        render_report(first, width=100, display_order=display_order)
+        second = deepcopy(first)
+        second["data"]["response_groups"].reverse()
+        output = render_report(
+            second, previous_report=first, width=100,
+            display_order=display_order,
+        )
+        self.assertLess(output.index("@aaaaaaaaaaaa"), output.index("@bbbbbbbbbbbb"))
+
+    def test_watched_branch_workers_preserve_worker_identity_order(self):
+        first = overview_report()
+        worker_two = first["data"]["workers"][0]
+        worker_one = deepcopy(worker_two)
+        worker_one.update({"worker_id": "worker-1", "worker_number": "1"})
+        first["report_kind"] = "branch"
+        first["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab",
+                "branch_key_hex": "010203",
+                "spine": [{"word": "raise", "pattern": "-----"}],
+                "guess_depth": 1,
+                "answer_count": 8,
+                "budget": 5,
+            },
+            "queue": None,
+            "cache": {
+                "cache_state": "missing", "best_guess": None,
+                "best_erd": None, "max_remaining_depth": None,
+            },
+            "workers": [worker_two, worker_one],
+            "republished_candidates": [],
+            "claims": None,
+            "provenance_unknown": False,
+        }
+        display_order = DisplayOrder()
+        render_report(first, width=100, display_order=display_order)
+        second = deepcopy(first)
+        second["data"]["workers"].reverse()
+        output = render_report(
+            second, previous_report=first, width=100,
+            display_order=display_order,
+        )
+        self.assertLess(output.index("W2"), output.index("W1"))
+
+    def test_watched_branch_claims_compare_by_candidate_index(self):
+        report = overview_report()
+        report["report_kind"] = "branch"
+        report["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
+            },
+            "queue": None,
+            "cache": {
+                "cache_state": "missing", "best_guess": None,
+                "best_erd": None, "max_remaining_depth": None,
+            },
+            "workers": [],
+            "republished_candidates": [],
+            "claims": [{
+                "candidate_index": 4, "state": "in_flight",
+                "completion_kind": None, "worker_id": "worker-2",
+                "bundle_id": None, "claimed_at": 900, "done_at": None,
+                "republish_count": 0,
+            }],
+            "provenance_unknown": False,
+        }
+        changed = deepcopy(report)
+        changed["data"]["claims"][0]["state"] = "done"
+        changed["data"]["claims"][0]["completion_kind"] = "evaluated"
+        output = render_report(
+            changed, previous_report=report, color=True, width=100
+        )
+        self.assertIn(report_terminal.RED + "  idx=4 done", output)
+
 
 class ViewSessionTest(unittest.TestCase):
     def test_json_output_round_trips_exact_report(self):
@@ -294,6 +411,18 @@ class ViewParserTest(unittest.TestCase):
         args = run_view.call_args.args[0]
         self.assertEqual(args.format, "jsonl")
         self.assertIsNone(args.watch)
+
+    def test_queue_and_cache_positionals_are_word_selectors(self):
+        for word in ("QUEUE", "CACHE"):
+            with self.subTest(word=word):
+                with (
+                    patch("sys.argv", ["erd_search.py", "view", word]),
+                    patch("report_terminal.run_view") as run_view,
+                ):
+                    erd_search.main()
+                selector = run_view.call_args.args[0].selector
+                self.assertEqual(selector.kind, "word")
+                self.assertEqual(selector.trailing_word, word.lower())
 
 
 if __name__ == "__main__":

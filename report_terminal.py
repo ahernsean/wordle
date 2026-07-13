@@ -322,6 +322,193 @@ def render_overview(
     return "\n\n".join("\n".join(lines) for _name, lines in sections)
 
 
+def _semantic_header(report, title, width):
+    header = [_fit(f"{title}  generated_at={report['generated_at']}", width)]
+    for source_name in ("queue", "telemetry", "cache"):
+        header.append(_source_line(source_name, report["sources"][source_name], width))
+    return header
+
+
+def _render_word_sections(report, previous_report, color, width, display_order):
+    data = report["data"]
+    response_groups = data["response_groups"]
+    incoming_keys = [row["branch_key_hex"] for row in response_groups]
+    display_order.branch_keys = DisplayOrder._update_identities(
+        display_order.branch_keys, incoming_keys, set()
+    )
+    by_key = {row["branch_key_hex"]: row for row in response_groups}
+    ordered_groups = [
+        by_key[key] for key in display_order.branch_keys if key in by_key
+    ]
+    previous_groups = {
+        row["branch_key_hex"]: row
+        for row in (previous_report or {}).get("data", {}).get("response_groups", [])
+    }
+    context = data["context"]
+    header = _semantic_header(
+        report,
+        f"Word {data['word'].upper()}  context=@{context['branch_reference']} "
+        f"n={context['answer_count']} d={context['guess_depth']}",
+        width,
+    )
+    counts = data["response_group_counts"]
+    summary = [
+        "Response groups",
+        _fit(
+            f"  total {counts['response_group_count']}  "
+            f"trivial {counts['trivial_response_group_count']}  "
+            f"queued {counts['queued_response_group_count']}  "
+            f"active {counts['active_response_group_count']}  "
+            f"exact {counts['exact_response_group_count']}  "
+            f"loss {counts['loss_response_group_count']}  "
+            f"missing {counts['missing_response_group_count']}",
+            width,
+        ),
+    ]
+    rows = ["Pattern  Answers  Queue       Cache           Best        Reference"]
+    for group in ordered_groups:
+        best = "—"
+        if group.get("best_guess"):
+            best = group["best_guess"].upper()
+            if group.get("best_erd") is not None:
+                best += f"/{group['best_erd']:.3f}"
+        line = (
+            f"{group['pattern']:<7}  {group['answer_count']:>7}  "
+            f"{group['lifecycle']:<10}  {group['cache_state']:<14}  "
+            f"{best:<10}  @{group['branch_reference']}"
+        )
+        previous_group = previous_groups.get(group["branch_key_hex"])
+        semantic_class = (
+            "green" if previous_group is None
+            else ("red" if group != previous_group else None)
+        )
+        rows.append(_colorize(_fit(line, width), semantic_class, color))
+        if group.get("answer_words"):
+            rows.append(_fit("  " + " ".join(group["answer_words"]), width))
+    if len(rows) == 1:
+        rows.append("none")
+    return [("header", header), ("summary", summary), ("response_groups", rows)]
+
+
+def _render_branch_sections(report, previous_report, color, width, display_order):
+    data = report["data"]
+    branch = data["branch"]
+    header = _semantic_header(
+        report,
+        f"Branch @{branch['branch_reference']}  n={branch['answer_count']} "
+        f"d={branch['guess_depth']} budget={branch['budget']}",
+        width,
+    )
+    if branch["spine"]:
+        header.append(_fit(
+            "  " + " ▸ ".join(
+                f"{step['word'].upper()} {step['pattern']}" for step in branch["spine"]
+            ),
+            width,
+        ))
+    if branch.get("answer_words"):
+        header.append(_fit("  answers: " + " ".join(branch["answer_words"]), width))
+    queue = data["queue"]
+    if queue is None:
+        queue_lines = ["Queue", "  unqueued"]
+    else:
+        progress = "—"
+        if queue["candidate_count"] is not None:
+            completed = queue["completed_candidate_count"]
+            progress = f"{completed}/{queue['candidate_count']}"
+        queue_lines = [
+            "Queue",
+            _fit(
+                f"  {queue['lifecycle']}  priority={queue['priority']}  "
+                f"progress={progress}  bulk={queue['bulk_completed_candidate_count']}  "
+                f"best={queue['best_guess'] or '—'}  nodes={_abbreviate_number(queue['search_node_count'])}",
+                width,
+            ),
+        ]
+    cache = data["cache"]
+    cache_line = f"  {cache['cache_state']}"
+    if cache.get("best_guess"):
+        cache_line += f"  best={cache['best_guess'].upper()}/{cache['best_erd']:.3f}"
+    if cache.get("max_remaining_depth") is not None:
+        cache_line += f"  max-d={cache['max_remaining_depth']}"
+    cache_lines = ["Cache", _fit(cache_line, width)]
+
+    incoming_worker_ids = [worker["worker_id"] for worker in data["workers"]]
+    display_order.worker_ids = DisplayOrder._update_identities(
+        display_order.worker_ids, incoming_worker_ids, set()
+    )
+    workers_by_id = {worker["worker_id"]: worker for worker in data["workers"]}
+    previous_workers = {
+        worker["worker_id"]: worker
+        for worker in (previous_report or {}).get("data", {}).get("workers", [])
+    }
+    worker_lines = ["Workers"]
+    for worker_id in display_order.worker_ids:
+        worker = workers_by_id.get(worker_id)
+        if worker is not None:
+            worker_lines.append(_render_worker_line(
+                worker, previous_workers.get(worker_id), report["generated_at"],
+                color, width, indent="  ",
+                state=None if worker["is_live"] else "dead",
+            ))
+    if len(worker_lines) == 1:
+        worker_lines.append("  none")
+
+    detail_lines = ["Candidate state"]
+    detail_lines.append(
+        f"  republished candidates: {len(data['republished_candidates'])}"
+    )
+    if data["claims"] is not None:
+        previous_claims = {
+            claim["candidate_index"]: claim
+            for claim in (previous_report or {}).get("data", {}).get("claims", []) or []
+        }
+        for claim in sorted(data["claims"], key=lambda row: row["candidate_index"]):
+            previous_claim = previous_claims.get(claim["candidate_index"])
+            semantic_class = (
+                "green" if previous_claim is None
+                else ("red" if claim != previous_claim else None)
+            )
+            detail_lines.append(_colorize(_fit(
+                f"  idx={claim['candidate_index']} {claim['state']} "
+                f"kind={claim['completion_kind'] or 'unknown'} "
+                f"worker={claim['worker_id'] or '—'} "
+                f"republished={claim['republish_count']}",
+                width,
+            ), semantic_class, color))
+    return [
+        ("header", header), ("queue", queue_lines), ("cache", cache_lines),
+        ("workers", worker_lines), ("candidate_state", detail_lines),
+    ]
+
+
+def _report_sections(report, previous_report, color, width, display_order):
+    if report["report_kind"] == "overview":
+        return _render_sections(
+            report, previous_report, color, width, display_order
+        )
+    if report["report_kind"] == "word":
+        return _render_word_sections(
+            report, previous_report, color, width, display_order
+        )
+    if report["report_kind"] == "branch":
+        return _render_branch_sections(
+            report, previous_report, color, width, display_order
+        )
+    raise ValueError(f"unsupported report kind: {report['report_kind']}")
+
+
+def render_report(
+    report, previous_report=None, *, color=False, width=None, display_order=None
+):
+    width = 80 if width is None else width
+    display_order = display_order or DisplayOrder()
+    sections = _report_sections(
+        report, previous_report, color, width, display_order
+    )
+    return "\n\n".join("\n".join(lines) for _name, lines in sections)
+
+
 class WatchSession:
     def __init__(self, args, input_stream=None, output_stream=None, error_stream=None):
         self.args = args
@@ -350,7 +537,13 @@ class WatchSession:
         )
 
     def _collect(self):
-        return collect_report(self._sources(), ReportRequest())
+        selector = getattr(self.args, "selector", None)
+        request = ReportRequest(
+            selector=selector if selector is not None else ReportRequest().selector,
+            include_claims=getattr(self.args, "claims", False),
+            include_answers=getattr(self.args, "answers", False),
+        )
+        return collect_report(self._sources(), request)
 
     def _width(self):
         return shutil.get_terminal_size((80, 24)).columns
@@ -382,7 +575,7 @@ class WatchSession:
         if self.args.format in ("json", "jsonl"):
             self.output_stream.write(json.dumps(report, sort_keys=True) + "\n")
         else:
-            self.output_stream.write(render_overview(
+            self.output_stream.write(render_report(
                 report, color=False, width=self._width(),
                 display_order=self.display_order,
             ) + "\n")
@@ -412,7 +605,7 @@ class WatchSession:
                     self.output_stream.write(
                         f"--- generated_at={report['generated_at']} ---\n"
                     )
-                    self.output_stream.write(render_overview(
+                    self.output_stream.write(render_report(
                         report, previous_report=self.previous_report,
                         color=False, width=self._width(),
                         display_order=self.display_order,
@@ -426,7 +619,7 @@ class WatchSession:
             return
 
     def _terminal_sections(self, report):
-        return _render_sections(
+        return _report_sections(
             report, self.previous_report, self._color(), self._width(),
             self.display_order,
         )

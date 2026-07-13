@@ -67,6 +67,7 @@ from datetime import datetime
 from cache_sqlite import ScoreCache
 from report_model import (
     WORKER_LIVENESS_SECONDS,
+    parse_report_selector,
     parse_rich_spine as _parse_spine,
 )
 from runtime_paths import (
@@ -2095,6 +2096,9 @@ def main():
     p_view.add_argument('--no-color', action='store_true')
     p_view.add_argument('--queue-path', default=DEFAULT_QUEUE, metavar='PATH')
     p_view.add_argument('--cache-path', default=DEFAULT_CACHE, metavar='PATH')
+    p_view.add_argument('--claims', action='store_true')
+    p_view.add_argument('--answers', action='store_true')
+    p_view.add_argument('spine', nargs='*', metavar='SPINE')
 
     # -- cache-status --
     p_cs = sub.add_parser('cache-status',
@@ -2247,6 +2251,11 @@ def main():
     args = parser.parse_args()
     if args.cmd == 'view' and args.format == 'json' and args.watch is not None:
         parser.error('--format json cannot be used with --watch; use jsonl')
+    if args.cmd == 'view':
+        try:
+            args.selector = parse_report_selector(args.spine)
+        except ValueError as error:
+            parser.error(str(error))
     _normalize_queue_cli_args(args)
 
     if args.cmd == 'queue':

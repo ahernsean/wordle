@@ -290,8 +290,9 @@ class ReportModelTest(unittest.TestCase):
         cache.close()
         report = collect_report(self.sources, ReportRequest())
         self.assertEqual(report["data"]["cache_summary"]["exact_branch_count"], 1)
-        with self.assertRaisesRegex(ValueError, "unsupported report kind: branch"):
-            collect_report(self.sources, ReportRequest("branch"))
+        self.assertEqual(ReportRequest().report_kind, "auto")
+        with self.assertRaisesRegex(ValueError, "unsupported report kind: hotspot"):
+            collect_report(self.sources, ReportRequest("hotspot"))
 
 
 if __name__ == "__main__":

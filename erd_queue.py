@@ -491,6 +491,11 @@ def _derive_telemetry_path(db_path: str) -> str:
     return f"{root}_telemetry{ext}"
 
 
+def derive_telemetry_path(db_path: str) -> str:
+    """Return the telemetry database path paired with a queue database path."""
+    return _derive_telemetry_path(db_path)
+
+
 class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
@@ -1802,6 +1807,24 @@ class ERDQueue:
         if matches:
             return matches
         return [r for r in rows if self._row_matches_spine_prefix(r, ref)]
+
+    def branch_rows_for_reference_prefix(self, digest_prefix) -> list[dict]:
+        """Return queue rows whose stable SHA-1 reference starts with a prefix."""
+        normalized_prefix = digest_prefix.lower()
+        return [
+            row for row in self.list_queue_rows()
+            if hashlib.sha1(bytes(row["branch_key"])).hexdigest().startswith(
+                normalized_prefix
+            )
+        ]
+
+    def candidate_republish_for_branch(self, branch_key) -> list[dict]:
+        """Return sparse candidate republish counts for one branch."""
+        return [dict(row) for row in self._conn.execute(
+            "SELECT idx, count FROM candidate_republish "
+            "WHERE branch_key = ? ORDER BY idx",
+            (branch_key,),
+        )]
 
     def branch_detail(self, branch_key, include_claims=False):
         p = self.get_pending_branch(branch_key)

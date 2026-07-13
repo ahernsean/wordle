@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
+import re
 import time
 from typing import Optional, Tuple
 
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue
+from erd_queue import ERDQueue, derive_telemetry_path
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
     DEFAULT_CACHE_PATH,
@@ -16,8 +17,8 @@ from runtime_paths import (
     DEFAULT_QUEUE_PATH,
     DEFAULT_TELEMETRY_PATH,
 )
-from wordle_engine import ERD_ALL, load_word_list
-from wordle_ui import fmt_pattern
+from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
+from wordle_ui import fmt_pattern, parse_pattern
 
 
 SCHEMA_VERSION = 1
@@ -27,8 +28,38 @@ RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
 
 @dataclass(frozen=True)
+class SpineStep:
+    word: str
+    pattern: str
+
+
+@dataclass(frozen=True)
+class ReportSelector:
+    kind: str
+    steps: tuple[SpineStep, ...]
+    trailing_word: str | None
+    branch_reference: str | None
+    input_text: str
+
+    @classmethod
+    def root(cls) -> "ReportSelector":
+        return cls("root", (), None, None, "")
+
+
+@dataclass(frozen=True)
+class ResolvedBranch:
+    answer_words: tuple[str, ...]
+    branch_key: bytes
+    steps: tuple[SpineStep, ...]
+    trailing_word: str | None = None
+
+
+@dataclass(frozen=True)
 class ReportRequest:
-    report_kind: str = "overview"
+    report_kind: str = "auto"
+    selector: ReportSelector = field(default_factory=ReportSelector.root)
+    include_claims: bool = False
+    include_answers: bool = False
 
 
 @dataclass(frozen=True)
@@ -48,6 +79,92 @@ class ReportSources:
             guess_list_path=DEFAULT_GUESS_LIST_PATH,
             telemetry_path=DEFAULT_TELEMETRY_PATH,
         )
+
+
+def parse_report_selector(parts: list[str] | str | None) -> ReportSelector:
+    if parts is None:
+        input_text = ""
+    elif isinstance(parts, str):
+        input_text = parts.strip()
+    else:
+        input_text = " ".join(parts).strip()
+    if not input_text:
+        return ReportSelector.root()
+    tokens = input_text.split()
+    if len(tokens) == 1 and tokens[0].startswith("@"):
+        digest_prefix = tokens[0][1:]
+        if not re.fullmatch(r"[0-9a-fA-F]{4,40}", digest_prefix):
+            raise ValueError(
+                f"invalid token {tokens[0]!r}: expected @ followed by 4-40 hexadecimal characters"
+            )
+        return ReportSelector(
+            "branch_reference", (), None, digest_prefix.lower(), input_text
+        )
+
+    normalized_words = []
+    normalized_patterns = []
+    for index, token in enumerate(tokens):
+        if index % 2 == 0:
+            if not re.fullmatch(r"[A-Za-z]{5}", token):
+                raise ValueError(
+                    f"invalid token {token!r}: expected a five-letter word"
+                )
+            normalized_words.append(token.lower())
+        else:
+            try:
+                normalized_patterns.append(fmt_pattern(parse_pattern(token)))
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid token {token!r}: expected a five-character response pattern"
+                ) from error
+
+    step_count = len(normalized_patterns)
+    steps = tuple(
+        SpineStep(normalized_words[index], normalized_patterns[index])
+        for index in range(step_count)
+    )
+    if len(normalized_words) == step_count + 1:
+        return ReportSelector(
+            "word", steps, normalized_words[-1], None, input_text
+        )
+    if len(normalized_words) == step_count:
+        return ReportSelector("branch", steps, None, None, input_text)
+    raise ValueError(
+        f"invalid selector {input_text!r}: expected alternating word and response pattern"
+    )
+
+
+def resolve_selector_branch(
+    selector: ReportSelector, all_answers
+) -> ResolvedBranch:
+    if selector.kind == "branch_reference":
+        raise ValueError("a branch reference requires queue resolution")
+    branch_words = list(all_answers)
+    response_cache = ResponseCache(list(all_answers), score_cache=None)
+    for step in selector.steps:
+        groups = response_cache.group_words(step.word, branch_words)
+        branch_words = groups.get(parse_pattern(step.pattern), [])
+    branch_key = ScoreCache.encode_subset(branch_words)
+    return ResolvedBranch(
+        tuple(branch_words), branch_key, selector.steps, selector.trailing_word
+    )
+
+
+def resolve_branch_reference(queue, digest_prefix) -> bytes:
+    matches = queue.branch_rows_for_reference_prefix(digest_prefix)
+    if not matches:
+        raise ValueError(f"branch reference @{digest_prefix} not found")
+    if len(matches) > 1:
+        descriptions = []
+        for row in matches:
+            reference = branch_reference(bytes(row["branch_key"]))
+            spine = row.get("spine") or row.get("source_word") or "unknown spine"
+            descriptions.append(f"@{reference} {spine}")
+        raise ValueError(
+            f"branch reference @{digest_prefix} is ambiguous: "
+            + "; ".join(descriptions)
+        )
+    return bytes(matches[0]["branch_key"])
 
 
 def branch_reference(branch_key: bytes) -> str:
@@ -357,11 +474,395 @@ def _cache_overview(sources, generated_at, answer_words, report):
             cache.close()
 
 
+def _selector_payload(selector):
+    return {
+        "kind": selector.kind,
+        "steps": [
+            {"word": step.word, "pattern": step.pattern}
+            for step in selector.steps
+        ],
+        "trailing_word": selector.trailing_word,
+        "branch_reference": selector.branch_reference,
+        "input_text": selector.input_text,
+    }
+
+
+def _semantic_report(report_kind, sources, selector, generated_at, data):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "report_kind": report_kind,
+        "generated_at": generated_at,
+        "selector": _selector_payload(selector),
+        "filters": {},
+        "sources": {
+            "queue": {
+                "path": sources.queue_path,
+                "ok": False,
+                "error": None,
+                "epoch": None,
+                "label": None,
+                "git_sha": None,
+            },
+            "telemetry": {
+                "path": (
+                    sources.telemetry_path
+                    if sources.telemetry_path is not None
+                    else derive_telemetry_path(sources.queue_path)
+                ),
+                "ok": False,
+                "error": None,
+            },
+            "cache": {"path": sources.cache_path, "ok": False, "error": None},
+        },
+        "data": data,
+    }
+
+
+def _resolved_branch_payload(resolved):
+    return {
+        "branch_reference": branch_reference(resolved.branch_key),
+        "branch_key_hex": resolved.branch_key.hex(),
+        "spine": [
+            {"word": step.word, "pattern": step.pattern}
+            for step in resolved.steps
+        ],
+        "guess_depth": len(resolved.steps),
+        "answer_count": len(resolved.answer_words),
+    }
+
+
+def _queue_lifecycle(pending_row, active_row, worker_count=0):
+    if pending_row is not None:
+        raw_status = pending_row["status"]
+        if raw_status == "pending":
+            return "pending"
+        if raw_status == "in_progress":
+            return "active"
+        if raw_status == "done":
+            return "done"
+    if active_row is not None:
+        if active_row["status"] == "open":
+            return "active"
+        if active_row["status"] == "finalized" and worker_count:
+            return "finalizing"
+    return "unqueued"
+
+
+def _mark_queue_source_ok(report):
+    report["sources"]["queue"]["ok"] = True
+    report["sources"]["telemetry"]["ok"] = True
+
+
+def _mark_queue_source_error(report, error):
+    message = str(error)
+    report["sources"]["queue"]["error"] = message
+    report["sources"]["telemetry"]["error"] = message
+
+
+def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
+    generated_at = int(time.time())
+    all_answers = load_word_list(sources.answer_list_path)
+    answer_set = set(all_answers)
+    resolved = resolve_selector_branch(request.selector, all_answers)
+    word = resolved.trailing_word
+    if word is None:
+        raise ValueError("word report requires a trailing word selector")
+    response_cache = ResponseCache(all_answers, score_cache=None)
+    groups = response_cache.group_words(word, list(resolved.answer_words))
+    group_rows = []
+    branch_keys = []
+    for pattern_code, answer_words in sorted(groups.items()):
+        if not answer_words:
+            continue
+        branch_key = ScoreCache.encode_subset(answer_words)
+        branch_keys.append(branch_key)
+        group_rows.append({
+            "pattern": fmt_pattern(pattern_code),
+            "answer_count": len(answer_words),
+            "branch_reference": branch_reference(branch_key),
+            "branch_key_hex": branch_key.hex(),
+            "branch_key": branch_key,
+            "answer_words": list(answer_words),
+        })
+    data = {
+        "word": word,
+        "word_is_answer": word in answer_set,
+        "context": _resolved_branch_payload(resolved),
+        "response_group_counts": {},
+        "response_groups": [],
+    }
+    report = _semantic_report("word", sources, request.selector, generated_at, data)
+
+    pending_rows = {}
+    active_rows = {}
+    worker_counts = {}
+    queue = None
+    try:
+        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        pending_rows = queue.status_by_branch_keys(branch_keys)
+        active_rows = queue.active_branches_by_keys(branch_keys)
+        worker_counts = queue.worker_counts_by_branch(WORKER_LIVENESS_SECONDS)
+        _mark_queue_source_ok(report)
+    except Exception as error:
+        _mark_queue_source_error(report, error)
+    finally:
+        if queue is not None:
+            queue.close()
+
+    group_budget = GAME_GUESSES - len(resolved.steps) - 1
+    cache_states = {
+        branch_key: ScoreCache._report_cache_state(branch_key, None, None, group_budget)
+        for branch_key in branch_keys
+    }
+    cache = None
+    try:
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+        cache_states = cache.report_branch_states(
+            branch_keys, ERD_ALL, group_budget
+        )
+        report["sources"]["cache"]["ok"] = True
+    except Exception as error:
+        report["sources"]["cache"]["error"] = str(error)
+    finally:
+        if cache is not None:
+            cache.close()
+
+    for group_row in group_rows:
+        branch_key = group_row.pop("branch_key")
+        answer_words = group_row.pop("answer_words")
+        pending_row = pending_rows.get(branch_key)
+        active_row = active_rows.get(branch_key)
+        lifecycle = _queue_lifecycle(
+            pending_row, active_row, worker_counts.get(branch_key, 0)
+        )
+        cache_state = cache_states[branch_key]
+        group_row.update({
+            "lifecycle": lifecycle,
+            "priority": _row_value(active_row, "priority", _row_value(pending_row, "priority")),
+            "worker_count": worker_counts.get(branch_key, 0),
+            "cache_state": cache_state["cache_state"],
+            "best_guess": cache_state["best_guess"],
+            "best_erd": cache_state["best_erd"],
+            "max_remaining_depth": cache_state["max_remaining_depth"],
+            "updated_at": cache_state["updated_at"],
+        })
+        if request.include_answers:
+            group_row["answer_words"] = answer_words
+        data["response_groups"].append(group_row)
+
+    response_groups = data["response_groups"]
+    data["response_group_counts"] = {
+        "response_group_count": len(response_groups),
+        "trivial_response_group_count": sum(
+            row["answer_count"] < 2 for row in response_groups
+        ),
+        "queued_response_group_count": sum(
+            row["lifecycle"] != "unqueued" for row in response_groups
+        ),
+        "active_response_group_count": sum(
+            row["lifecycle"] in ("active", "finalizing") for row in response_groups
+        ),
+        "exact_response_group_count": sum(
+            row["cache_state"] == "exact" for row in response_groups
+        ),
+        "loss_response_group_count": sum(
+            row["cache_state"] == "loss" for row in response_groups
+        ),
+        "missing_response_group_count": sum(
+            row["cache_state"] == "missing" for row in response_groups
+        ),
+    }
+    return report
+
+
+def _steps_from_queue_row(row):
+    spine = row.get("spine")
+    if spine:
+        tokens = spine.split()
+        return tuple(
+            SpineStep(tokens[index].lower(), _normalized_pattern(tokens[index + 1]))
+            for index in range(0, len(tokens) - 1, 2)
+        )
+    source_word = row.get("source_word")
+    source_pattern = row.get("source_pattern")
+    if source_word and source_pattern is not None:
+        return (SpineStep(source_word.lower(), _normalized_pattern(source_pattern)),)
+    return ()
+
+
+def _decode_branch_key(branch_key):
+    return tuple(
+        branch_key[index:index + 5].decode()
+        for index in range(0, len(branch_key), 5)
+    )
+
+
+def _normalize_claim(row, republish_count):
+    claimed_by = _row_value(row, "claimed_by")
+    done = bool(row["done"])
+    bulk_eliminated = claimed_by == "bulk-elimination"
+    sound_worker = bool(claimed_by and re.fullmatch(r"worker-[0-9]+", claimed_by))
+    if done and bulk_eliminated:
+        completion_kind = "bulk_eliminated"
+    elif done and sound_worker:
+        completion_kind = "evaluated"
+    else:
+        completion_kind = None
+    return {
+        "candidate_index": row["idx"],
+        "state": "done" if done else "in_flight",
+        "completion_kind": completion_kind,
+        "worker_id": claimed_by if sound_worker else None,
+        "bundle_id": _row_value(row, "bundle_id"),
+        "claimed_at": _row_value(row, "claimed_at"),
+        "done_at": _row_value(row, "done_at"),
+        "republish_count": republish_count,
+    }
+
+
+def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dict:
+    generated_at = int(time.time())
+    all_answers = load_word_list(sources.answer_list_path)
+    answer_set = set(all_answers)
+    queue = None
+    queue_rows = []
+    pending_row = None
+    active_row = None
+    heartbeat_rows = []
+    claim_rows = []
+    republish_rows = []
+    queue_error = None
+    referenced_row = None
+    try:
+        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        if request.selector.kind == "branch_reference":
+            branch_key = resolve_branch_reference(
+                queue, request.selector.branch_reference
+            )
+            referenced_row = next(
+                row for row in queue.branch_rows_for_reference_prefix(
+                    request.selector.branch_reference
+                )
+                if bytes(row["branch_key"]) == branch_key
+            )
+            resolved = ResolvedBranch(
+                _decode_branch_key(branch_key), branch_key,
+                _steps_from_queue_row(referenced_row), None,
+            )
+        else:
+            resolved = resolve_selector_branch(request.selector, all_answers)
+            branch_key = resolved.branch_key
+        queue_rows = [
+            row for row in queue.list_queue_rows()
+            if bytes(row["branch_key"]) == branch_key
+        ]
+        pending_row = queue.get_pending_branch(branch_key)
+        active_row = queue.get_active_branch(branch_key)
+        heartbeat_rows = [
+            row for row in queue.heartbeats_with_branch()
+            if row["current_branch_key"] is not None
+            and bytes(row["current_branch_key"]) == branch_key
+        ]
+        claim_rows = list(queue.claims_for_branch(branch_key))
+        republish_rows = queue.candidate_republish_for_branch(branch_key)
+    except Exception as error:
+        queue_error = error
+        if request.selector.kind == "branch_reference":
+            raise
+        resolved = resolve_selector_branch(request.selector, all_answers)
+        branch_key = resolved.branch_key
+    finally:
+        if queue is not None:
+            queue.close()
+
+    budget = _row_value(active_row, "budget", GAME_GUESSES - len(resolved.steps))
+    branch_payload = _resolved_branch_payload(resolved)
+    branch_payload["budget"] = budget
+    if request.include_answers:
+        branch_payload["answer_words"] = list(resolved.answer_words)
+    workers = [
+        _normalize_worker(row, generated_at, answer_set) for row in heartbeat_rows
+    ]
+    workers.sort(key=_worker_sort_key)
+    live_worker_count = sum(worker["is_live"] for worker in workers)
+    lifecycle = _queue_lifecycle(pending_row, active_row, live_worker_count)
+    progress = {
+        "completed_candidate_count": sum(bool(row["done"]) for row in claim_rows),
+        "bulk_completed_candidate_count": _row_value(
+            active_row, "bulk_done_candidates", 0
+        ),
+    }
+    queue_payload = None
+    if queue_rows or active_row is not None or pending_row is not None:
+        queue_payload = {
+            "lifecycle": lifecycle,
+            "pending_status": _row_value(pending_row, "status"),
+            "active_status": _row_value(active_row, "status"),
+            "priority": _row_value(active_row, "priority", _row_value(pending_row, "priority")),
+            "candidate_count": _row_value(active_row, "n_candidates"),
+            "completed_candidate_count": progress["completed_candidate_count"],
+            "bulk_completed_candidate_count": progress["bulk_completed_candidate_count"],
+            "best_guess": _row_value(active_row, "best_guess"),
+            "best_erd": _row_value(active_row, "best_erd"),
+            "best_max_remaining_depth": _row_value(active_row, "best_max_depth"),
+            "ceiling": _row_value(active_row, "ceiling"),
+            "budget": _row_value(active_row, "budget"),
+            "search_node_count": _row_value(active_row, "nodes_spent", 0),
+            "pack_cursor": _row_value(active_row, "pack_cursor"),
+            "tainted": bool(_row_value(active_row, "tainted", False)),
+            "created_at": _row_value(active_row, "created_at"),
+            "finalized_at": _row_value(active_row, "finalized_at"),
+            "completed_at": _row_value(pending_row, "completed_at"),
+        }
+    republish_by_index = {row["idx"]: row["count"] for row in republish_rows}
+    normalized_claims = [
+        _normalize_claim(row, republish_by_index.get(row["idx"], 0))
+        for row in claim_rows
+    ]
+    provenance_unknown = any(
+        claim["state"] == "done" and claim["completion_kind"] is None
+        for claim in normalized_claims
+    )
+    data = {
+        "branch": branch_payload,
+        "queue": queue_payload,
+        "cache": ScoreCache._report_cache_state(branch_key, None, None, budget),
+        "workers": workers,
+        "republished_candidates": [
+            {"candidate_index": row["idx"], "republish_count": row["count"]}
+            for row in republish_rows
+        ],
+        "claims": normalized_claims if request.include_claims else None,
+        "provenance_unknown": provenance_unknown,
+    }
+    report = _semantic_report("branch", sources, request.selector, generated_at, data)
+    if queue_error is None:
+        _mark_queue_source_ok(report)
+    else:
+        _mark_queue_source_error(report, queue_error)
+
+    cache = None
+    try:
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+        data["cache"] = cache.report_branch_state(branch_key, ERD_ALL, budget)
+        report["sources"]["cache"]["ok"] = True
+    except Exception as error:
+        report["sources"]["cache"]["error"] = str(error)
+    finally:
+        if cache is not None:
+            cache.close()
+    return report
+
+
 def collect_overview_report(
     sources: ReportSources,
     request: ReportRequest | None = None,
 ) -> dict:
-    if request is not None and request.report_kind != "overview":
+    if request is not None and request.report_kind not in ("auto", "overview"):
         raise ValueError(f"unsupported report kind: {request.report_kind}")
     generated_at = int(time.time())
     report = {
@@ -380,7 +881,11 @@ def collect_overview_report(
                 "git_sha": None,
             },
             "telemetry": {
-                "path": sources.telemetry_path,
+                "path": (
+                    sources.telemetry_path
+                    if sources.telemetry_path is not None
+                    else derive_telemetry_path(sources.queue_path)
+                ),
                 "ok": False,
                 "error": None,
             },
@@ -403,6 +908,18 @@ def collect_overview_report(
 
 
 def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
-    if request.report_kind == "overview":
+    report_kind = request.report_kind
+    if report_kind == "auto":
+        report_kind = {
+            "root": "overview",
+            "word": "word",
+            "branch": "branch",
+            "branch_reference": "branch",
+        }.get(request.selector.kind)
+    if report_kind == "overview":
         return collect_overview_report(sources, request)
+    if report_kind == "word":
+        return collect_word_report(sources, request)
+    if report_kind == "branch":
+        return collect_branch_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")
