@@ -1,112 +1,141 @@
-# Status display redesign — overview and index
+# Unified reporting system — overview and index
 
-This directory holds the implementation plans for replacing the terminal swarm
-status display with a client/server architecture: a status **model** (structured
-data), a small HTTP **server**, and a **browser client**. Each numbered plan is
-one self-contained phase, designed to be implemented by a fresh agent session
-with no other context.
+This directory specifies one read-only reporting system for the ERD swarm.
+It replaces separate terminal status, queue-inspection, and browser concepts
+with one report model served through three clients:
 
-## How to use these plans (instructions for implementer agents)
+- `erd_search.py view` for terminal use, structured output, and optional
+  refresh;
+- a small HTTP adapter over the same reports;
+- a responsive browser client for navigation and visual presentation.
 
-1. **Read `CLAUDE.md` at the repo root first.** Its naming rules, vocabulary,
-   and comment style are binding. The glossary below only adds terms CLAUDE.md
-   does not define.
-2. **Implement exactly one phase per session/PR**, in numeric order. Do not
-   start a phase until the previous phase is merged.
-3. **Touch only the files listed in the phase's "Files touched" section.**
-4. **Follow the plan literally.** Where the plan gives a name, signature,
-   JSON key, or constant, use it verbatim. If the plan contradicts what you
-   find in the code (a function is missing, a signature differs), **stop and
-   report the discrepancy** — do not improvise a workaround.
-5. **Run the full test suite before committing**:
-   `python -m unittest discover -s tests -t . -p 'test_*.py'`
-   All tests must pass, including the new ones the phase requires.
-6. A phase is done when every item in its "Acceptance checklist" is true.
+The terminal remains a direct client of the model and never requires the HTTP
+service. The browser is another presentation of the same report semantics,
+not a second monitoring implementation.
 
-## The phases
+## Product shape
+
+The finished system supports three kinds of use without making them separate
+products:
+
+1. an operational overview of swarm progress;
+2. exploration of work by semantic spine;
+3. focused reports for queue state, workers, cache coverage, and hotspots.
+
+Semantic input is inferred from spine form, so users do not have to choose a
+`word` or `branch` command before entering the work they want to inspect.
+Tree presentation is a layout option over extant queue topology, not another
+domain object. Exact command syntax, inference rules, and collection filters
+belong to phases 3a and 3b.
+
+Cache results remain flat reporting data. They may annotate a branch that
+still exists in queue state, but cached ERD results never create or
+reconstruct tree nodes after their queue topology is gone.
+
+## Architecture
+
+    erd_queue.sqlite3 ─────┐
+    queue telemetry DB ────┼─► report_model collectors ─► report envelope
+    wordle_cache.sqlite3 ──┘              │
+                                          ├─► report_terminal
+                                          │      └─ erd_search.py view
+                                          │
+                                          └─► report_server
+                                                   └─ report_client.html
+
+The report model owns normalized domain meaning, stable identities, source
+health, and bounded data assembly. Clients own layout, interaction, display
+formatting, and refresh sessions. The HTTP layer adapts transport parameters
+to the same request objects used by the terminal; it contains no parallel SQL
+or normalization logic.
+
+## System boundaries
+
+All reporting paths are read-only. Service lifecycle commands remain
+top-level, and queue mutations remain under `queue`. Once object reports ship,
+legacy read-only status and queue-inspection commands are removed; backward
+compatibility is not required.
+
+Reports are intentionally bounded:
+
+- overviews and inventories return summaries plus bounded rows;
+- expensive claims, telemetry, and candidate detail load only on demand;
+- watched terminal output and browser polling never scan complete history;
+- an unavailable queue, telemetry, or cache source yields a partial report
+  with source health rather than erasing available data.
+
+Tree and landscape views have an additional boundary: their hierarchy comes
+only from currently recorded queue spines. There is no cache topology index,
+cache-parent migration, or inferred historical tree in this plan.
+
+## Delivery phases
 
 | Plan | Deliverable | Depends on |
 |---|---|---|
-| `01-status-model.md` | `status_model.py`: `collect_status()` returns the full status as a JSON-serializable dict | — |
-| `02-status-server.md` | `status_server.py`: HTTP server for `/api/status` + static client, with a fixture mode; `status_fixture.json` | 01 |
-| `03-browser-client.md` | `status_client.html`: polling browser UI with semantic change highlighting and width-adaptive layout | 02 |
-| `04-visual-modalities.md` | Menu of independent visual upgrades: sweep bar (A), completion ring (B), worker chips (C), spine tree (D), candidate grid (E) | 03 |
-| `05-landscape-view.md` | PLACEHOLDER (not implementable): pinch-zoom semantic-zoom map of the explored search landscape | 03, 04 item D, and a design conversation |
+| `01-report-model.md` | shared path ownership, report envelope, normalized overview entities, lifecycle semantics, and overview collector | — |
+| `02-terminal-view.md` | terminal overview renderer with text, JSON, and optional watch | 01 |
+| `03a-semantic-reports.md` | selector model plus inferred word and branch reports | 02 |
+| `03b-collection-reports.md` | collection filters, queue/worker/cache reports, and live queue tree layout | 03a |
+| `03c-hotspot-reports.md` | bounded branch telemetry and hotspot reports | 03b |
+| `03d-terminal-transition.md` | TTY navigation, legacy read-command removal, and operator-documentation cutover | 03c |
+| `04-report-server.md` | stdlib HTTP adapter over all reports and per-report fixtures | 03d |
+| `05-browser-client.md` | navigable polling browser client over the shared reports | 04 |
+| `06-visual-modalities.md` | independent browser visual and interaction upgrades | 05 |
+| `07-landscape-view.md` | non-implementable live-work landscape vision and prerequisites | 05 plus relevant phase 06 items |
 
-## Architecture and rationale
+Phases 1, 2, 4, and 5 each use one branch and pull request. Phases 3a–3d each
+use one pull request and land in order. Phase 6 is a menu whose items use one
+pull request each and may land in any order after phase 5 unless an item says
+otherwise. Phase 7 is vision capture and produces no implementation pull
+request until it is promoted to an implementation plan.
 
-Today, `erd_search.py _print_status` interleaves data gathering and text
-rendering, and `_redraw_status` diffs the rendered **characters** between
-refreshes to color changes red. Two consequences:
+A phase or item starts only after its stated prerequisites are merged and is
+complete only when every acceptance item in its document is true.
 
-- Change detection cannot be semantic (e.g. "highlight a heartbeat only when
-  it is more than 5 s old"), and structural shifts (a worker moving between
-  branches) cascade into spurious all-red regions.
-- Layout cannot adapt to terminal width, because column widths and
-  abbreviations are baked into f-strings at assembly time.
+## Sequencing constraint
 
-The fix for both is the same separation the client/server split needs anyway:
+Phase 1 requires one importable owner for runtime and word-list paths. If
+issue #92 has not landed, phase 1 creates `runtime_paths.py` with the current
+locations, including answer-list and guess-list paths, without moving any
+files. Issue #92 can later change those values without changing the reporting
+stack. Report modules and the server import defaults from that owner rather
+than copying path strings.
 
-```
-erd_queue.sqlite3 ─┐
-                   ├─ status_model.collect_status() ──► snapshot dict
-wordle_cache.…  ───┘                                       │
-                                    ┌──────────────────────┤
-                                    ▼                      ▼
-                        status_server.py /api/status   (terminal display
-                                    │                   keeps its own path,
-                                    ▼                   unchanged)
-                        status_client.html  (browser, polls JSON,
-                        diffs snapshots by stable identity)
-```
+## Design principles
 
-Design principles the plans enforce:
+- One report model owns domain semantics for every client.
+- Semantic work selection is shared across CLI, HTTP, and browser.
+- The terminal is first-class and works without a server.
+- Optional refresh wraps the same one-shot report collection.
+- Full identities drive joins, navigation, and change detection.
+- Expensive detail is fetched only when requested.
+- Queue topology is live operational state; cache state is not historical
+  topology.
+- Shipped server and client code add no third-party runtime dependency.
+- Reports never mutate queue, telemetry, cache, or service state.
 
-- **The model carries raw data, never presentation.** No percentages, no
-  ETAs, no truncation, no abbreviations in the snapshot. Every derived value
-  (hit rate, % done, ETA, staleness) is computed by the renderer from raw
-  fields. This is what makes one model serve terminal, JSON, and browser.
-- **Identity is explicit.** Branches are keyed by `branch_key_hex`, workers by
-  `worker_id`. Clients diff consecutive snapshots by these keys, so a row
-  moving on screen is never itself a "change".
-- **The terminal display is untouched.** `_print_status` / `_redraw_status`
-  keep working exactly as they do now; the browser client is additive. (The
-  terminal path may be simplified later, but that is not part of these plans.)
-- **Current terminal interaction semantics are preserved.** Branch order is
-  sticky across refreshes, an expanded branch remains inspectable while it is
-  finalizing, worker depth labels are absolute guess depths, and sweep detail
-  shows completion density rather than pretending completed indices form a
-  contiguous prefix. The browser may implement these differently, but must
-  not regress the information those behaviors convey.
-- **No new dependencies in shipped code.** Python stdlib only on the server; a
-  single self-contained HTML file with vanilla JavaScript on the client (no
-  CDN, no build step — it must work on a LAN with no internet). Tests are the
-  one exception: browser behavior is verified with Playwright + headless
-  Chromium as a development-only dependency, skip-guarded so the suite still
-  passes where it isn't installed (see plan 03).
+## How to use these plans
 
-Remote access (Tailscale vs. tunnel) is deliberately **not** part of these
-plans. The server binds to the LAN; how it becomes reachable from elsewhere is
-an infrastructure decision independent of the code.
+Read the repository root `AGENTS.md` before implementation. Its vocabulary,
+naming, comment, testing, git, and pull-request rules are binding. Each phase
+is the normative implementation specification for its own level of detail;
+later phases may extend earlier public structures only where they say so.
 
-## Glossary (terms beyond CLAUDE.md's anchored vocabulary)
+Before every commit and push, run:
 
-CLAUDE.md defines **guess**, **candidate**, **branch**, **guess_depth**,
-**budget**, **ERD**, **max_remaining_depth**. These plans additionally use:
+    python -m unittest discover -s tests -t . -p 'test_*.py'
+
+If current code contradicts a phase specification, stop and report the
+discrepancy rather than improvising across phase boundaries.
+
+## Glossary
 
 | Term | Meaning |
 |---|---|
-| **snapshot** | The complete status of the swarm at one instant, as one JSON-serializable dict. Produced by `status_model.collect_status()`. Schema in plan 01. |
-| **spine** | The guesses played from the root to a branch, stored in `active_branches.spine` as space-joined `"GUESS pattern"` token pairs, e.g. `"SALET -g-g- CRANE bb-y-"`. |
-| **descent** | A worker's live recursion path *below* its claimed branch, from the heartbeat's `cur_path` column ("rich spine" format, parsed by `_parse_spine` / `parse_rich_spine`). |
-| **pattern string** | A response pattern as 5 characters of `g` (green), `y` (yellow), `-` (gray), e.g. `-g-g-`. Integer-coded patterns are converted with `wordle_ui.fmt_pattern`. |
-| **branch_id** | Stable 4-hex-character label derived by hashing `branch_key`; same key → same id across refreshes and processes. |
-| **branch_key_hex** | Full hex encoding of the `branch_key` bytes; the durable identity used for diffing between snapshots. |
-| **heartbeat** | A worker's row in `worker_heartbeat` (queue DB), rewritten every ~2 s while the worker runs. |
-| **live worker** | A worker whose heartbeat age ≤ `WORKER_LIVENESS_SECONDS` (30). Older heartbeats belong to dead workers. |
-| **stale** | Renderer term for a heartbeat old enough to warn about but not yet dead (> 5 s). |
-| **cooperative branch** | A sub-branch spawned by workers (priority ≥ 1,000,000) rather than queued by the user. Not counted in `pending_branches`. |
-| **sweep** | A branch's pass over its candidate list: each candidate is claimed by index (`claim_idx`) and marked done when fully evaluated. |
-| **idle worker** | A live worker whose heartbeat has `current_branch_key = NULL` (between claims). |
-| **detached worker** | A worker whose `current_branch_key` refers to a branch no longer in the open-branches list (the branch is finalizing). |
-| **answer flag** | A boolean marking a word that is a member of the NYT answer list (`NYT_wordlist.txt`); terminal shows it as a `*` suffix. |
+| report | One presentation-neutral, JSON-serializable result for a report request. |
+| report envelope | The shared top-level structure surrounding report-specific data. |
+| selector | Semantic input identifying the root, a word within branch context, a branch spine, or a queue branch reference. |
+| spine | Guesses played from the root to a branch, represented as word/pattern pairs. |
+| descent | A worker's live recursion path below its claimed branch. |
+| tree layout | Hierarchical presentation of extant queue rows and their recorded spines. |
+| snapshot | One report collected at one instant; successive snapshots feed watch or polling. |
