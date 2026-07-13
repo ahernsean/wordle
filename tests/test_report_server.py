@@ -184,10 +184,13 @@ class ReportServerTest(unittest.TestCase):
     def test_static_client_and_unknown_path(self):
         with running_server(fixture_configuration()) as base_url:
             status, headers, body = request(base_url, "/")
+            deep_link = request(base_url, "/?selector=CRANE&tree=1")
             missing = request(base_url, "/report_client.html")
         self.assertEqual(status, 200)
         self.assertEqual(headers.get_content_type(), "text/html")
         self.assertIn(b"<title>ERD swarm reports</title>", body)
+        self.assertEqual(deep_link[0], 200)
+        self.assertEqual(deep_link[2], body)
         self.assertEqual(missing[0], 404)
 
     def test_mutation_methods_are_rejected(self):

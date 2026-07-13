@@ -283,9 +283,6 @@ def make_handler(configuration):
                 return
             target = urlsplit(self.path)
             if target.path in ("/", "/index.html"):
-                if target.query:
-                    self._error(404, "not_found", "route not found")
-                    return
                 try:
                     with open(configuration.client_path, "rb") as client_file:
                         body = client_file.read()
