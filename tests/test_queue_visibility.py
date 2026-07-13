@@ -151,6 +151,74 @@ class QueueVisibilityTests(unittest.TestCase):
                 spine_prefix="CRANE -----",
             )
 
+    def test_current_hotspots_support_queue_and_tree_populations(self):
+        self.q.create_branch(
+            self.user_key, len(WORDS), 10, priority=7, budget=4,
+            spine="CRANE -----",
+        )
+        self.q.add_nodes_spent(self.user_key, 25)
+
+        queue_result = self.q.report_hotspots(
+            "nodes", epoch=0, since=0, sample_size=10, limit=1,
+        )
+        tree_result = self.q.report_hotspots(
+            "size", epoch=0, since=0, sample_size=10, limit=1,
+            spine_prefix="CRANE -----",
+        )
+
+        self.assertEqual(queue_result["population"], "current_queue_branches")
+        self.assertEqual(queue_result["sample_size"], None)
+        self.assertEqual(queue_result["rows"][0]["search_node_count"], 25)
+        self.assertEqual(tree_result["sampled_row_count"], 1)
+        self.assertEqual(tree_result["rows"][0]["spine"], "CRANE -----")
+
+    def test_cut_reuse_and_bulk_completion_hotspots_are_normalized(self):
+        now = int(time.time())
+        self.q.add_cut_reuse_miss(self.user_key, 5, 4, None, 2.5, 3)
+        self.q.add_branch_finalize_log(
+            self.user_key, "CRANE -----", 5, 4, now - 1, now,
+            100, 3, outcome="cut", bulk_done_candidates=9,
+        )
+
+        cut_reuse = self.q.report_hotspots(
+            "cut-reuse", epoch=0, since=now - 60,
+            sample_size=10, limit=1,
+        )
+        bulk_completion = self.q.report_hotspots(
+            "bulk-completed-candidates", epoch=0, since=now - 60,
+            sample_size=10, limit=1,
+        )
+
+        self.assertEqual(cut_reuse["population"], "recent_cut_reuse_misses")
+        self.assertEqual(cut_reuse["rows"][0]["cut_reuse_miss_count"], 1)
+        self.assertEqual(
+            bulk_completion["rows"][0]["bulk_completed_candidate_count"], 9
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported hotspot field"):
+            self.q.report_hotspots("unknown", 0, now - 60, 10, 1)
+
+    def test_report_queue_filters_accept_dicts_and_cover_each_bound(self):
+        self.q.create_branch(
+            self.user_key, len(WORDS), 10, priority=7, budget=4,
+            spine="CRANE -----",
+        )
+        result = self.q.report_queue_rows({
+            "statuses": ("active",),
+            "minimum_answer_count": len(WORDS),
+            "maximum_answer_count": len(WORDS),
+            "budget": 4,
+            "priority": 7,
+            "limit": 1,
+        })
+        self.assertEqual(result["matched_rows"], 1)
+        self.assertEqual(result["rows"][0]["lifecycle"], "active")
+        self.assertEqual(
+            self.q._report_lifecycle({"status": "finalized"}), "finalizing"
+        )
+        self.assertEqual(self.q._report_lifecycle({"status": "pending"}), "pending")
+        self.q._conn.execute("DELETE FROM run_meta WHERE key = 'epoch'")
+        self.assertIsNone(self.q.epoch_metadata())
+
     def test_finalization_hotspot_metadata_uses_the_scoped_population(self):
         now = int(time.time())
         for index, spine in enumerate((
