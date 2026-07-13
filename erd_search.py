@@ -2105,6 +2105,7 @@ def main():
     view_kind.add_argument('--workers', action='store_true')
     view_kind.add_argument('--worker', metavar='N')
     view_kind.add_argument('--cache', dest='view_cache', action='store_true')
+    view_kind.add_argument('--hotspots', action='store_true')
     lifecycle_filter = p_view.add_mutually_exclusive_group()
     lifecycle_filter.add_argument('--active-only', action='store_true')
     lifecycle_filter.add_argument(
@@ -2118,6 +2119,14 @@ def main():
                         choices=('default', 'age', 'size', 'workers',
                                  'priority', 'nodes', 'slowest'))
     p_view.add_argument('--limit', type=int, metavar='N')
+    p_view.add_argument(
+        '--by', choices=(
+            'nodes', 'age', 'size', 'workers', 'priority', 'slowest',
+            'evaluated-candidates', 'bulk-completed-candidates',
+            'cut-reuse', 'coordination'))
+    p_view.add_argument('--epoch', type=int, metavar='N')
+    p_view.add_argument('--since-seconds', type=int, metavar='N')
+    p_view.add_argument('--sample-size', type=int, metavar='N')
     p_view.add_argument('spine', nargs='*', metavar='SPINE')
 
     # -- cache-status --
@@ -2278,6 +2287,8 @@ def main():
             parser.error(str(error))
         if args.tree and args.view_cache:
             parser.error('--tree cannot be used with --cache')
+        if args.tree and args.hotspots:
+            parser.error('--tree cannot be used with --hotspots')
         if args.limit is not None and args.limit < 1:
             parser.error('--limit must be at least 1')
         if (args.minimum_answer_count is not None
@@ -2287,8 +2298,30 @@ def main():
         args.report_kind = (
             'queue' if args.view_queue else
             'workers' if args.workers or args.worker is not None else
-            'cache' if args.view_cache else 'auto'
+            'cache' if args.view_cache else
+            'hotspots' if args.hotspots else 'auto'
         )
+        if args.by is not None and not args.hotspots:
+            parser.error('--by requires --hotspots')
+        if not args.hotspots and any(
+                value is not None
+                for value in (args.epoch, args.since_seconds, args.sample_size)):
+            parser.error('--epoch, --since-seconds, and --sample-size require --hotspots')
+        if args.since_seconds is not None and args.since_seconds < 1:
+            parser.error('--since-seconds must be at least 1')
+        if args.sample_size is not None and args.sample_size < 1:
+            parser.error('--sample-size must be at least 1')
+        hotspot_field = args.by or 'nodes'
+        historical_hotspot = hotspot_field in (
+            'evaluated-candidates', 'bulk-completed-candidates',
+            'cut-reuse', 'coordination')
+        if args.hotspots and historical_hotspot and (args.active_only or args.status):
+            parser.error('historical hotspots cannot use lifecycle filters')
+        if (args.hotspots and hotspot_field == 'coordination'
+                and args.selector.kind != 'root'):
+            parser.error('coordination hotspots cannot use a spine selector')
+        if args.hotspots and args.limit is None:
+            args.limit = 10
         if args.claims and (
                 args.report_kind != 'auto'
                 or args.selector.kind not in ('branch', 'branch_reference')):
@@ -2307,6 +2340,9 @@ def main():
             sort=args.sort,
             limit=args.limit,
         )
+        args.hotspot_field = hotspot_field if args.hotspots else None
+        args.sample_size = min(args.sample_size or 50_000, 1_000_000)
+        args.since_seconds = args.since_seconds or 3600
     _normalize_queue_cli_args(args)
 
     if args.cmd == 'queue':

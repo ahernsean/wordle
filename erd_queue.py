@@ -672,6 +672,23 @@ class ERDQueue:
             "outcome": "TEXT",
             "bulk_done_candidates": "INTEGER",
         }, schema="telemetry")
+        report_indexes = (
+            ("branch_finalize_log", {"branch_key", "recorded_at"},
+             "idx_branch_finalize_log_branch_recorded_at",
+             "branch_key, recorded_at"),
+            ("cut_reuse_misses", {"branch_key", "recorded_at"},
+             "idx_cut_reuse_misses_branch_recorded_at",
+             "branch_key, recorded_at"),
+            ("claim_telemetry", {"epoch", "id"},
+             "idx_claim_telemetry_epoch_id", "epoch, id"),
+        )
+        for table, required_columns, index_name, indexed_columns in report_indexes:
+            columns = {row["name"] for row in self._conn.execute(
+                f"PRAGMA telemetry.table_info({table})")}
+            if required_columns <= columns:
+                self._conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS telemetry.{index_name} "
+                    f"ON {table}({indexed_columns})")
 
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
@@ -2077,6 +2094,215 @@ class ERDQueue:
             "SELECT * FROM worker_heartbeat WHERE current_branch_key = ? ORDER BY worker_id",
             (branch_key,))]
         return detail
+
+    @staticmethod
+    def _report_finalization_outcome(row):
+        outcome = row["outcome"]
+        if outcome in ("exact", "cut", "loss"):
+            return outcome
+        return "cut" if row["ceiling"] is not None else "exact"
+
+    def report_branch_telemetry(self, branch_key, limit) -> dict:
+        """Return bounded current and historical telemetry for one branch."""
+        bundle_row = self._conn.execute("""
+            SELECT COUNT(*) AS bundle_count,
+                   SUM(nodes) AS node_count,
+                   SUM(wall_millis) AS wall_millis,
+                   SUM(censored) AS censored_unit_count,
+                   MAX(nodes) AS maximum_bundle_node_count
+            FROM telemetry.bundle_stats WHERE branch_key = ?
+        """, (branch_key,)).fetchone()
+        bundle_summary = None
+        if bundle_row["bundle_count"]:
+            bundle_summary = dict(bundle_row)
+        finalization_rows = self._conn.execute("""
+            SELECT * FROM telemetry.branch_finalize_log
+            WHERE branch_key = ?
+            ORDER BY recorded_at DESC, id DESC LIMIT ?
+        """, (branch_key, limit)).fetchall()
+        finalizations = []
+        for row in finalization_rows:
+            finalizations.append({
+                "finalization_id": row["id"],
+                "outcome": self._report_finalization_outcome(row),
+                "ceiling": row["ceiling"],
+                "budget": row["budget"],
+                "answer_count": row["n_words"],
+                "search_node_count": row["nodes_spent"],
+                "created_at": row["created_at"],
+                "finalized_at": row["finalized_at"],
+                "wall_millis": row["total_bundle_wall_millis"],
+                "bundle_count": row["n_bundles"],
+                "maximum_bundle_node_count": row["max_bundle_nodes"],
+                "censored_unit_count": row["censored_units"],
+                "epoch": row["epoch"],
+                "evaluated_candidate_count": row["n_claims"],
+                "bulk_completed_candidate_count": row["bulk_done_candidates"],
+                "recorded_at": row["recorded_at"],
+            })
+        cut_rows = self._conn.execute("""
+            SELECT * FROM telemetry.cut_reuse_misses
+            WHERE branch_key = ?
+            ORDER BY recorded_at DESC, id DESC LIMIT ?
+        """, (branch_key, limit)).fetchall()
+        cut_reuse_misses = [{
+            "cut_reuse_miss_id": row["id"],
+            "answer_count": row["n_words"],
+            "budget": row["budget"],
+            "wanted_ceiling": row["wanted_ceiling"],
+            "available_bound": row["available_bound"],
+            "available_budget": row["available_budget"],
+            "epoch": row["epoch"],
+            "recorded_at": row["recorded_at"],
+        } for row in cut_rows]
+        return {
+            "bundle_summary": bundle_summary,
+            "recent_finalizations": finalizations,
+            "cut_reuse_misses": cut_reuse_misses,
+        }
+
+    def _bounded_sample_metadata(self, table, epoch, since, sample_size,
+                                 spine_prefix=None):
+        spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""
+        parameters = [epoch, since]
+        if spine_prefix:
+            parameters.extend((spine_prefix, spine_prefix + " %"))
+        parameters.append(sample_size + 1)
+        row = self._conn.execute(
+            f"""SELECT COUNT(*) AS sampled_row_count FROM (
+                    SELECT id FROM telemetry.{table}
+                    WHERE epoch = ? AND recorded_at >= ?
+                    {spine_condition}
+                    ORDER BY id DESC LIMIT ?
+                )""",
+            parameters,
+        ).fetchone()
+        sampled_with_probe = row["sampled_row_count"]
+        return min(sampled_with_probe, sample_size), sampled_with_probe > sample_size
+
+    def report_hotspots(self, field, epoch, since, sample_size, limit,
+                        spine_prefix=None) -> dict:
+        """Return an explicitly bounded current or historical hotspot ranking."""
+        current_fields = {"nodes", "age", "size", "workers", "priority", "slowest"}
+        if field in current_fields:
+            filters = {"sort": field, "limit": limit}
+            result = (
+                self.report_tree_rows(spine_prefix, filters, field, limit)
+                if spine_prefix else self.report_queue_rows(filters, field, limit)
+            )
+            return {
+                "population": "current_queue_branches",
+                "epoch": epoch,
+                "since": since,
+                "sample_size": None,
+                "sampled_row_count": result["matched_rows"],
+                "sample_truncated": result["matched_rows"] > len(result["rows"]),
+                "rows": result["rows"],
+            }
+        if field == "coordination" and spine_prefix:
+            raise ValueError("coordination hotspots cannot be attributed to a spine")
+        table = {
+            "evaluated-candidates": "branch_finalize_log",
+            "bulk-completed-candidates": "branch_finalize_log",
+            "cut-reuse": "cut_reuse_misses",
+            "coordination": "claim_telemetry",
+        }.get(field)
+        if table is None:
+            raise ValueError(f"unsupported hotspot field: {field}")
+        sample_spine_prefix = spine_prefix if table == "branch_finalize_log" else None
+        sampled_row_count, sample_truncated = self._bounded_sample_metadata(
+            table, epoch, since, sample_size, sample_spine_prefix
+        )
+        if field in ("evaluated-candidates", "bulk-completed-candidates"):
+            metric = "n_claims" if field == "evaluated-candidates" else "bulk_done_candidates"
+            spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""
+            parameters = [epoch, since]
+            if spine_prefix:
+                parameters.extend((spine_prefix, spine_prefix + " %"))
+            parameters.extend((sample_size, limit))
+            rows = self._conn.execute(f"""
+                WITH sample AS (
+                    SELECT * FROM telemetry.branch_finalize_log
+                    WHERE epoch = ? AND recorded_at >= ? {spine_condition}
+                    ORDER BY id DESC LIMIT ?
+                )
+                SELECT * FROM sample
+                ORDER BY COALESCE({metric}, 0) DESC, id DESC LIMIT ?
+            """, parameters).fetchall()
+            normalized_rows = [{
+                "row_id": f"finalization:{row['id']}",
+                "branch_key": bytes(row["branch_key"]) if row["branch_key"] else None,
+                "spine": row["spine"],
+                "answer_count": row["n_words"],
+                "budget": row["budget"],
+                "epoch": row["epoch"],
+                "outcome": self._report_finalization_outcome(row),
+                "evaluated_candidate_count": row["n_claims"] or 0,
+                "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
+                "search_node_count": row["nodes_spent"] or 0,
+                "recorded_at": row["recorded_at"],
+            } for row in rows]
+            population = "recent_branch_finalizations"
+        elif field == "cut-reuse":
+            rows = self._conn.execute("""
+                WITH sample AS (
+                    SELECT * FROM telemetry.cut_reuse_misses
+                    WHERE epoch = ? AND recorded_at >= ?
+                    ORDER BY id DESC LIMIT ?
+                )
+                SELECT branch_key, COUNT(*) AS miss_count,
+                       MAX(recorded_at) AS recorded_at,
+                       MAX(n_words) AS answer_count
+                FROM sample GROUP BY branch_key
+                ORDER BY miss_count DESC, branch_key LIMIT ?
+            """, (epoch, since, sample_size, limit)).fetchall()
+            normalized_rows = [{
+                "row_id": (
+                    f"cut-reuse:{bytes(row['branch_key']).hex()}"
+                    if row["branch_key"] is not None else "cut-reuse:unknown"
+                ),
+                "branch_key": (
+                    bytes(row["branch_key"])
+                    if row["branch_key"] is not None else None
+                ),
+                "answer_count": row["answer_count"],
+                "cut_reuse_miss_count": row["miss_count"],
+                "recorded_at": row["recorded_at"],
+            } for row in rows]
+            population = "recent_cut_reuse_misses"
+        else:
+            rows = self._conn.execute("""
+                WITH sample AS (
+                    SELECT * FROM telemetry.claim_telemetry
+                    WHERE epoch = ? AND recorded_at >= ?
+                    ORDER BY id DESC LIMIT ?
+                )
+                SELECT n_words, worker_count, COUNT(*) AS claim_count,
+                       SUM(coordination_millis) AS coordination_millis,
+                       SUM(COALESCE(claim_retries, 0)) AS claim_retry_count,
+                       SUM(COALESCE(busy_wait_millis, 0)) AS busy_wait_millis
+                FROM sample GROUP BY n_words, worker_count
+                ORDER BY coordination_millis DESC, n_words, worker_count LIMIT ?
+            """, (epoch, since, sample_size, limit)).fetchall()
+            normalized_rows = [{
+                "row_id": f"coordination:{row['n_words']}:{row['worker_count']}",
+                "answer_count": row["n_words"],
+                "worker_count": row["worker_count"],
+                "claim_count": row["claim_count"],
+                "coordination_millis": row["coordination_millis"],
+                "claim_retry_count": row["claim_retry_count"],
+                "busy_wait_millis": row["busy_wait_millis"],
+            } for row in rows]
+            population = "recent_claim_coordination_buckets"
+        return {
+            "population": population,
+            "epoch": epoch,
+            "since": since,
+            "sample_size": sample_size,
+            "sampled_row_count": sampled_row_count,
+            "sample_truncated": sample_truncated,
+            "rows": normalized_rows,
+        }
 
     # ------------------------------------------------------------------
     # run_meta key-value store

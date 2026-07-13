@@ -481,9 +481,30 @@ def _render_branch_sections(report, previous_report, color, width, display_order
                 f"republished={claim['republish_count']}",
                 width,
             ), semantic_class, color))
+    telemetry_lines = ["Telemetry"]
+    bundle_summary = data.get("bundle_summary")
+    if bundle_summary:
+        telemetry_lines.append(_fit(f"  active bundles: {bundle_summary}", width))
+    for finalization in data.get("recent_finalizations", []):
+        telemetry_lines.append(_fit(
+            f"  {finalization['outcome']} epoch={finalization['epoch']} "
+            f"nodes={_abbreviate_number(finalization['search_node_count'])} "
+            f"evaluated={finalization['evaluated_candidate_count']} "
+            f"bulk={finalization['bulk_completed_candidate_count']}",
+            width,
+        ))
+    for miss in data.get("cut_reuse_misses", []):
+        telemetry_lines.append(_fit(
+            f"  cut reuse miss epoch={miss['epoch']} budget={miss['budget']} "
+            f"available={miss['available_bound']}",
+            width,
+        ))
+    if len(telemetry_lines) == 1:
+        telemetry_lines.append("  none")
     return [
         ("header", header), ("queue", queue_lines), ("cache", cache_lines),
         ("workers", worker_lines), ("candidate_state", detail_lines),
+        ("telemetry", telemetry_lines),
     ]
 
 
@@ -583,6 +604,32 @@ def _render_cache_collection_sections(report, width):
     return [("header", header), ("cache_rows", lines)]
 
 
+def _render_hotspot_sections(report, width):
+    data = report["data"]
+    header = _semantic_header(report, f"Hotspots by {data['field']}", width)
+    lines = [
+        f"Population: {data['population']}",
+        _fit(
+            f"  epoch={data['epoch']} since-seconds={data['since_seconds']} "
+            f"sample-size={data['sample_size']} sampled={data['sampled_row_count']} "
+            f"truncated={str(data['sample_truncated']).lower()}",
+            width,
+        ),
+    ]
+    for row in data["rows"]:
+        identity = row.get("row_id") or (
+            "@" + row["branch_reference"] if row.get("branch_reference") else "bucket"
+        )
+        metrics = ", ".join(
+            f"{key}={value}" for key, value in row.items()
+            if key not in (
+                "row_id", "branch_key_hex", "branch_reference", "spine"
+            )
+        )
+        lines.append(_fit(f"  {identity}  {metrics}", width))
+    return [("header", header), ("hotspots", lines)]
+
+
 def _report_sections(report, previous_report, color, width, display_order):
     if report.get("tree"):
         return _render_tree_sections(report, width)
@@ -606,6 +653,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         )
     if report["report_kind"] == "cache":
         return _render_cache_collection_sections(report, width)
+    if report["report_kind"] == "hotspots":
+        return _render_hotspot_sections(report, width)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 
@@ -657,6 +706,10 @@ class WatchSession:
             tree=getattr(self.args, "tree", False),
             filters=getattr(self.args, "filters", ReportRequest().filters),
             worker_id=getattr(self.args, "worker", None),
+            hotspot_field=getattr(self.args, "hotspot_field", None),
+            epoch=getattr(self.args, "epoch", None),
+            since_seconds=getattr(self.args, "since_seconds", None),
+            sample_size=getattr(self.args, "sample_size", None),
         )
         return collect_report(self._sources(), request)
 

@@ -75,6 +75,10 @@ class ReportRequest:
     tree: bool = False
     filters: ReportFilters = field(default_factory=ReportFilters)
     worker_id: str | None = None
+    hotspot_field: str | None = None
+    epoch: int | None = None
+    since_seconds: int | None = None
+    sample_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -801,6 +805,11 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     heartbeat_rows = []
     claim_rows = []
     republish_rows = []
+    branch_telemetry = {
+        "bundle_summary": None,
+        "recent_finalizations": [],
+        "cut_reuse_misses": [],
+    }
     queue_error = None
     referenced_row = None
     try:
@@ -835,6 +844,9 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ]
         claim_rows = list(queue.claims_for_branch(branch_key))
         republish_rows = queue.candidate_republish_for_branch(branch_key)
+        branch_telemetry = queue.report_branch_telemetry(
+            branch_key, request.filters.limit or 5
+        )
     except Exception as error:
         queue_error = error
         if request.selector.kind == "branch_reference":
@@ -904,6 +916,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ],
         "claims": normalized_claims if request.include_claims else None,
         "provenance_unknown": provenance_unknown,
+        **branch_telemetry,
     }
     report = _semantic_report(
         "branch", sources, request.selector, generated_at, data, request
@@ -1317,6 +1330,77 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
     return report
 
 
+def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> dict:
+    generated_at = int(time.time())
+    field = request.hotspot_field or "nodes"
+    since_seconds = request.since_seconds or 3600
+    sample_size = min(request.sample_size or 50_000, 1_000_000)
+    limit = request.filters.limit or 10
+    data = {
+        "field": field,
+        "population": None,
+        "epoch": request.epoch,
+        "since_seconds": since_seconds,
+        "sample_size": sample_size,
+        "sampled_row_count": 0,
+        "sample_truncated": False,
+        "rows": [],
+    }
+    report = _semantic_report(
+        "hotspots", sources, request.selector, generated_at, data, request
+    )
+    queue = None
+    try:
+        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        epoch = queue.epoch if request.epoch is None else request.epoch
+        current_fields = {"nodes", "age", "size", "workers", "priority", "slowest"}
+        if field in current_fields:
+            hotspot_filters = replace(
+                request.filters, sort=field, limit=None
+            )
+            hotspot_request = replace(request, filters=hotspot_filters)
+            rows, _prefix = _scoped_queue_rows(queue, hotspot_request)
+            result = {
+                "population": "current_queue_branches",
+                "epoch": epoch,
+                "since": generated_at - since_seconds,
+                "sample_size": None,
+                "sampled_row_count": len(rows),
+                "sample_truncated": len(rows) > limit,
+                "rows": rows[:limit],
+            }
+        else:
+            prefix = _selector_prefix(request.selector, queue)
+            result = queue.report_hotspots(
+                field, epoch, generated_at - since_seconds,
+                sample_size, limit, prefix or None,
+            )
+        normalized_rows = []
+        for row in result["rows"]:
+            normalized = dict(row)
+            branch_key = normalized.pop("branch_key", None)
+            if branch_key is not None:
+                normalized["branch_key_hex"] = bytes(branch_key).hex()
+                normalized["branch_reference"] = branch_reference(bytes(branch_key))
+            normalized_rows.append(normalized)
+        data.update({
+            "population": result["population"],
+            "epoch": result["epoch"],
+            "window_started_at": result["since"],
+            "sample_size": result["sample_size"],
+            "sampled_row_count": result["sampled_row_count"],
+            "sample_truncated": result["sample_truncated"],
+            "rows": normalized_rows,
+        })
+        _mark_queue_source_ok(report)
+    except Exception as error:
+        _mark_queue_source_error(report, error)
+    finally:
+        if queue is not None:
+            queue.close()
+    return report
+
+
 def collect_overview_report(
     sources: ReportSources,
     request: ReportRequest | None = None,
@@ -1391,4 +1475,6 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
         return collect_workers_report(sources, request)
     if report_kind == "cache":
         return collect_cache_report(sources, request)
+    if report_kind == "hotspots":
+        return collect_hotspot_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")

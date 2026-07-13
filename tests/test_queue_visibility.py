@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -66,6 +67,136 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "user")
         self.assertEqual(rows[0]["status"], "pending")
         self.assertEqual(rows[0]["source_pattern_text"], "----y")
+
+    def test_report_telemetry_indexes_exist_and_are_idempotent(self):
+        expected = {
+            "idx_branch_finalize_log_branch_recorded_at",
+            "idx_cut_reuse_misses_branch_recorded_at",
+            "idx_claim_telemetry_epoch_id",
+        }
+        indexes = set()
+        for table in (
+            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry"
+        ):
+            indexes.update(
+                row["name"] for row in self.q._conn.execute(
+                    f"PRAGMA telemetry.index_list({table})"
+                )
+            )
+        self.assertTrue(expected.issubset(indexes))
+        self.q._migrate()
+        indexes_after = set()
+        for table in (
+            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry"
+        ):
+            indexes_after.update(
+                row["name"] for row in self.q._conn.execute(
+                    f"PRAGMA telemetry.index_list({table})"
+                )
+            )
+        self.assertEqual(indexes, indexes_after)
+
+    def test_branch_report_telemetry_is_bounded_and_preserves_outcomes(self):
+        self.q.create_branch(self.user_key, len(WORDS), 10)
+        self.q.record_bundle_stats(self.user_key, "bundle-1", 50, 20, censored=True)
+        for outcome, evaluated, bulk in (
+            ("exact", 7, 1), ("cut", 5, 2), ("loss", 3, 4),
+        ):
+            self.q.add_branch_finalize_log(
+                self.user_key, "CRANE -----", 5, 5,
+                10, 20, 100, evaluated,
+                n_bundles=2, max_bundle_nodes=60,
+                total_bundle_wall_millis=30, censored_units=1,
+                ceiling=2.5 if outcome == "cut" else None,
+                outcome=outcome, bulk_done_candidates=bulk,
+            )
+        self.q.add_cut_reuse_miss(self.user_key, 5, 4, None, 2.5, 3)
+        telemetry = self.q.report_branch_telemetry(self.user_key, limit=2)
+        self.assertEqual(telemetry["bundle_summary"]["bundle_count"], 1)
+        self.assertEqual(len(telemetry["recent_finalizations"]), 2)
+        self.assertEqual(
+            {row["outcome"] for row in telemetry["recent_finalizations"]},
+            {"cut", "loss"},
+        )
+        loss = telemetry["recent_finalizations"][0]
+        self.assertNotEqual(
+            loss["evaluated_candidate_count"],
+            loss["bulk_completed_candidate_count"],
+        )
+        self.assertEqual(len(telemetry["cut_reuse_misses"]), 1)
+
+    def test_historical_hotspots_are_bounded_and_coordination_is_bucketed(self):
+        now = int(time.time())
+        for index in range(5):
+            self.q._conn.execute("""
+                INSERT INTO telemetry.claim_telemetry
+                    (n_words, coordination_millis, work_nodes, claim_retries,
+                     busy_wait_millis, worker_count, epoch, recorded_at)
+                VALUES (?, ?, 100, 1, 2, ?, 0, ?)
+            """, (10 + index % 2, 20 + index, 2 + index % 2, now))
+        result = self.q.report_hotspots(
+            "coordination", epoch=0, since=now - 60,
+            sample_size=3, limit=2,
+        )
+        self.assertEqual(result["population"], "recent_claim_coordination_buckets")
+        self.assertEqual(result["sample_size"], 3)
+        self.assertEqual(result["sampled_row_count"], 3)
+        self.assertTrue(result["sample_truncated"])
+        self.assertLessEqual(len(result["rows"]), 2)
+        self.assertTrue(all(row["row_id"].startswith("coordination:")
+                            for row in result["rows"]))
+        with self.assertRaisesRegex(ValueError, "cannot be attributed"):
+            self.q.report_hotspots(
+                "coordination", 0, now - 60, 3, 2,
+                spine_prefix="CRANE -----",
+            )
+
+    def test_finalization_hotspot_metadata_uses_the_scoped_population(self):
+        now = int(time.time())
+        for index, spine in enumerate((
+            "RAISE -----", "RAISE -----", "RAISE -----", "CRANE -----",
+        )):
+            self.q.add_branch_finalize_log(
+                bytes([index]), spine, 5, 4, now - 10, now,
+                100 + index, index + 1,
+            )
+        result = self.q.report_hotspots(
+            "evaluated-candidates", epoch=0, since=now - 60,
+            sample_size=2, limit=2, spine_prefix="RAISE -----",
+        )
+        self.assertEqual(result["sampled_row_count"], 2)
+        self.assertTrue(result["sample_truncated"])
+        self.assertEqual(len(result["rows"]), 2)
+        self.assertTrue(all(row["spine"] == "RAISE -----"
+                            for row in result["rows"]))
+        self.assertTrue(all(row["outcome"] == "exact"
+                            for row in result["rows"]))
+
+    def test_historical_queries_use_bounded_report_indexes(self):
+        finalize_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.branch_finalize_log
+                WHERE branch_key = ? ORDER BY recorded_at DESC LIMIT 5
+            """, (self.user_key,))
+        )
+        cut_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.cut_reuse_misses
+                WHERE branch_key = ? ORDER BY recorded_at DESC LIMIT 5
+            """, (self.user_key,))
+        )
+        claim_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.claim_telemetry
+                WHERE epoch = ? ORDER BY id DESC LIMIT 5
+            """, (0,))
+        )
+        self.assertIn("idx_branch_finalize_log_branch_recorded_at", finalize_plan)
+        self.assertIn("idx_cut_reuse_misses_branch_recorded_at", cut_plan)
+        self.assertIn("idx_claim_telemetry_epoch_id", claim_plan)
 
     def test_user_in_progress_joins_pending_and_active_state(self):
         self.q.add_pending_many([(self.user_key, len(WORDS), 5, "crane", 1)])

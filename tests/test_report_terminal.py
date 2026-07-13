@@ -315,6 +315,32 @@ class OverviewRendererTest(unittest.TestCase):
         )
         self.assertIn(report_terminal.RED + "  idx=4 done", output)
 
+    def test_hotspot_render_labels_population_window_and_truncation(self):
+        report = overview_report()
+        report.update({"report_kind": "hotspots", "tree": False})
+        report["data"] = {
+            "field": "coordination",
+            "population": "recent_claim_coordination_buckets",
+            "epoch": 3,
+            "since_seconds": 3600,
+            "window_started_at": 100,
+            "sample_size": 50000,
+            "sampled_row_count": 50000,
+            "sample_truncated": True,
+            "rows": [{
+                "row_id": "coordination:20:4",
+                "answer_count": 20,
+                "worker_count": 4,
+                "coordination_millis": 900,
+            }],
+        }
+        output = render_report(report, width=100)
+        self.assertIn("Population: recent_claim_coordination_buckets", output)
+        self.assertIn("epoch=3", output)
+        self.assertIn("since-seconds=3600", output)
+        self.assertIn("sample-size=50000", output)
+        self.assertIn("truncated=true", output)
+
 
 class ViewSessionTest(unittest.TestCase):
     def test_json_output_round_trips_exact_report(self):
@@ -448,6 +474,13 @@ class ViewParserTest(unittest.TestCase):
             ["erd_search.py", "view", "--active-only", "--status", "active"],
             ["erd_search.py", "view", "--queue", "--claims"],
             ["erd_search.py", "view", "--tree", "--answers"],
+            ["erd_search.py", "view", "--hotspots", "--tree"],
+            ["erd_search.py", "view", "--hotspots", "--by", "cut-reuse",
+             "--active-only"],
+            ["erd_search.py", "view", "--hotspots", "--by", "coordination",
+             "RAISE"],
+            ["erd_search.py", "view", "--by", "nodes"],
+            ["erd_search.py", "view", "--epoch", "2"],
         ]
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
@@ -455,6 +488,22 @@ class ViewParserTest(unittest.TestCase):
                     with self.assertRaises(SystemExit) as raised:
                         erd_search.main()
                 self.assertEqual(raised.exception.code, 2)
+
+    def test_hotspot_defaults_and_sample_cap_are_normalized(self):
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "--hotspots", "--by", "coordination",
+                "--sample-size", "2000000",
+            ]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        args = run_view.call_args.args[0]
+        self.assertEqual(args.report_kind, "hotspots")
+        self.assertEqual(args.hotspot_field, "coordination")
+        self.assertEqual(args.since_seconds, 3600)
+        self.assertEqual(args.sample_size, 1_000_000)
+        self.assertEqual(args.limit, 10)
 
 
 if __name__ == "__main__":

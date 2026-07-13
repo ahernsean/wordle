@@ -235,6 +235,11 @@ class SemanticReportTest(unittest.TestCase):
             "INSERT INTO candidate_republish (branch_key, idx, count) "
             "VALUES (?, 2, 4)", (branch_key,),
         )
+        queue.add_branch_finalize_log(
+            branch_key, f"RAISE {pattern}", len(answer_words), 5,
+            now - 10, now, 500, 2, outcome="exact",
+            bulk_done_candidates=1,
+        )
         queue.close()
         selector = parse_report_selector(f"RAISE {pattern}")
         report = collect_report(
@@ -253,6 +258,17 @@ class SemanticReportTest(unittest.TestCase):
         self.assertNotIn("answer_words", report["data"]["branch"])
         self.assertEqual(
             report["data"]["queue"]["bulk_completed_candidate_count"], 1
+        )
+        self.assertEqual(
+            report["data"]["recent_finalizations"][0]["outcome"], "exact"
+        )
+        self.assertEqual(
+            report["data"]["recent_finalizations"][0]["evaluated_candidate_count"],
+            2,
+        )
+        self.assertEqual(
+            report["data"]["recent_finalizations"][0]["bulk_completed_candidate_count"],
+            1,
         )
 
     def test_cache_state_obeys_budget_reuse_rules(self):
@@ -491,6 +507,33 @@ class SemanticReportTest(unittest.TestCase):
             row["lifecycle"] == "active"
             for row in report["data"]["response_groups"]
         ))
+
+    def test_historical_hotspot_report_labels_bounded_population(self):
+        now = int(time.time())
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        for evaluated_count in (2, 9, 4):
+            queue.add_branch_finalize_log(
+                b"cigarrebut", "RAISE -----", 2, 5,
+                now - 20, now - 10, 100, evaluated_count,
+                outcome="exact", bulk_done_candidates=1,
+            )
+        queue.close()
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="hotspots",
+            hotspot_field="evaluated-candidates",
+            since_seconds=60,
+            sample_size=2,
+            filters=ReportFilters(limit=1),
+        ))
+        data = report["data"]
+        self.assertEqual(data["population"], "recent_branch_finalizations")
+        self.assertEqual(data["epoch"], 0)
+        self.assertEqual(data["since_seconds"], 60)
+        self.assertEqual(data["sample_size"], 2)
+        self.assertEqual(data["sampled_row_count"], 2)
+        self.assertTrue(data["sample_truncated"])
+        self.assertEqual(len(data["rows"]), 1)
+        self.assertEqual(data["rows"][0]["evaluated_candidate_count"], 9)
 
 
 if __name__ == "__main__":
