@@ -1,6 +1,6 @@
 # Phase 4 — HTTP report service
 
-Read phases 00–03 and `AGENTS.md` first. Requires phase 3 merged.
+Read phases 00–03d and `AGENTS.md` first. Requires phase 3d merged.
 
 ## Goal
 
@@ -31,7 +31,9 @@ normalization, or presentation derivation.
 - `tests/fixtures/reports/branch.json` — new
 - `tests/fixtures/reports/tree.json` — new
 - `tests/fixtures/reports/queue.json` — new
+- `tests/fixtures/reports/queue-tree.json` — new
 - `tests/fixtures/reports/workers.json` — new
+- `tests/fixtures/reports/workers-tree.json` — new
 - `tests/fixtures/reports/cache.json` — new
 - `tests/fixtures/reports/hotspots.json` — new
 - `tests/test_report_server.py` — new
@@ -47,7 +49,7 @@ normalization, or presentation derivation.
 
 Defaults:
 
-- bind `0.0.0.0`;
+- bind `127.0.0.1`;
 - port `8765`;
 - database paths imported from the shared runtime-path owner;
 - live collection when fixture directory is absent.
@@ -59,6 +61,22 @@ Print:
     Serving ERD reports on http://<bind>:<port>/
 
 Run `ThreadingHTTPServer` until Ctrl-C, then close it cleanly.
+
+### Deployment boundary
+
+The safe default is loopback. For private tailnet access on the Rocky host,
+keep the report server on `127.0.0.1:8765` and front it with Tailscale Serve.
+The current Tailscale CLI form for the short MagicDNS URL
+`http://rocky/` is:
+
+    tailscale serve --http=80 localhost:8765
+
+Tailscale configuration is an operator action, not something this repository
+installs or mutates. Confirm external CLI syntax with `tailscale serve --help`
+and the [official Tailscale Serve documentation](https://tailscale.com/docs/features/tailscale-serve)
+at deployment. A direct LAN deployment must opt in with
+`--bind 0.0.0.0` and use the explicit server port; it has no authentication or
+TLS. Do not bind the Python process directly to privileged port 80.
 
 ## Request handler construction
 
@@ -158,16 +176,24 @@ queue mutation methods.
 ## Fixture mode
 
 `--fixture-directory` makes API routes return canned envelopes without
-opening databases. Choose the fixture by request:
+opening databases. Fully parse, validate, and infer the request before
+choosing a fixture. Invalid combinations fail exactly as live requests do.
 
-- no selector/root: `overview.json`;
-- inferred word: `word.json`;
-- inferred branch: `branch.json`;
-- `tree=1`: `tree.json`;
-- explicit kinds: matching filename.
+Fixture selection is ordered:
 
-Still parse and validate the request before selecting a fixture. Read and
-`json.loads` each fixture at server startup, require its
+1. On `/api/view`, no selector/root uses `overview.json`, inferred word uses
+   `word.json`, and inferred branch uses `branch.json`; valid `tree=1` takes
+   precedence and uses `tree.json`.
+2. Explicit non-tree kinds use their matching filename.
+3. `queue?tree=1` uses `queue-tree.json`, and `workers?tree=1` uses
+   `workers-tree.json`.
+4. `cache?tree=1` and `hotspots?tree=1` are invalid and return 400 before
+   fixture lookup.
+
+Thus positional selectors `CACHE` and `QUEUE` are inferred as words before
+fixture selection and use `word.json`, never explicit-kind fixtures.
+
+Read and `json.loads` each fixture at server startup, require its
 `schema_version == SCHEMA_VERSION`, and serve the re-serialized object. A bad
 fixture prevents startup rather than failing later during a request.
 
@@ -200,23 +226,25 @@ Required cases:
 1. Live root view over temporary fresh databases equals a direct
    `collect_report` call in contract shape.
 2. Selector inference returns word and branch reports from the same endpoint.
-3. Tree and active-only parameters reach the normalized echoed filters.
+3. Tree and active-only parameters reach normalized request state.
 4. Every explicit report endpoint returns its kind.
 5. CACHE and QUEUE selector requests return word fixtures, never cache/queue
    report fixtures.
-6. Repeated status is accepted; repeated scalar and unknown parameters are
+6. Inferred tree, queue tree, and workers tree use distinct fixtures;
+   cache/hotspot tree requests return 400 before fixture lookup.
+7. Repeated status is accepted; repeated scalar and unknown parameters are
    rejected.
-7. Invalid booleans, integers, selector, limit, sample, and overlong target
+8. Invalid booleans, integers, selector, limit, sample, and overlong target
    return 400.
-8. Unknown branch reference returns 404.
-9. Fixture startup validates all files and fixture requests open no SQLite
+9. Unknown branch reference returns 404.
+10. Fixture startup validates all files and fixture requests open no SQLite
    path.
-10. `/` returns the placeholder; arbitrary paths return 404.
-11. POST/PUT/DELETE return 405.
-12. Headers and content lengths are correct.
-13. Two servers with different configurations do not share paths or fixtures.
-14. A partial source failure remains HTTP 200 with the report's source error.
-15. Unexpected collector failure returns sanitized 500 JSON.
+11. `/` returns the placeholder; arbitrary paths return 404.
+12. POST/PUT/DELETE return 405.
+13. Headers and content lengths are correct.
+14. Two servers with different configurations do not share paths or fixtures.
+15. A partial source failure remains HTTP 200 with the report's source error.
+16. Unexpected collector failure returns sanitized 500 JSON.
 
 ## Acceptance checklist
 

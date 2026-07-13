@@ -49,7 +49,7 @@ Opening the landscape from a word, branch, queue, or worker report preserves
 the current semantic selector. The selected context remains anchored while
 the user pans and zooms, and a copied URL preserves selector and viewport.
 
-The shared collection filters continue to apply according to phase 3. They
+The shared collection filters continue to apply according to phase 3b. They
 change which live rows are emphasized or included without changing branch
 identity or inventing missing topology.
 

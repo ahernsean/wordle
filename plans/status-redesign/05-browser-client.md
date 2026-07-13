@@ -1,6 +1,7 @@
 # Phase 5 — Navigable browser report client
 
-Read phases 00–04 and `AGENTS.md` first. Requires phase 4 merged.
+Read phases 00–04, including 3a–3d, and `AGENTS.md` first. Requires phase 4
+merged.
 
 ## Goal
 

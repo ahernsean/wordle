@@ -1,13 +1,15 @@
 # Phase 1 — Shared report model and overview
 
 Read `00-overview.md` and the repository root `AGENTS.md` before starting.
-Do not begin until issue #92's runtime-path owner is merged and this plan's
-references to that module have been updated to its actual public names.
+This phase requires the shared `runtime_paths.py` owner described in phase 00.
+If it does not exist yet, create it here with current paths; do not move
+runtime artifacts as part of this phase.
 
 ## Goal
 
 Create the presentation-neutral foundation used by every later client:
 
+- one importable owner for database and word-list paths;
 - one versioned report envelope;
 - one minimal overview request;
 - normalized branch and worker entities;
@@ -28,6 +30,7 @@ The model prints nothing and contains no terminal, HTTP, or HTML logic.
 ## Files touched
 
 - `report_model.py` — new
+- `runtime_paths.py` — new if the shared path owner does not already exist
 - `erd_queue.py` — bounded batch read helper described below
 - `cache_sqlite.py` — cache-summary read helper described below
 - `erd_search.py` — move and alias the two shared definitions below
@@ -42,7 +45,9 @@ The model prints nothing and contains no terminal, HTTP, or HTML logic.
     WORKER_LIVENESS_SECONDS = 30
 
     branch_reference(branch_key: bytes) -> str
-    parse_rich_spine(path: str | None) -> list[dict]
+    parse_rich_spine(path: str | None) -> list[RichSpineStep]
+    normalize_worker_descent(parsed_path: list[RichSpineStep],
+                             answer_set: set[str]) -> list[dict]
     collect_overview_report(sources: ReportSources,
                             request: ReportRequest | None = None) -> dict
     collect_report(sources: ReportSources, request: ReportRequest) -> dict
@@ -56,19 +61,39 @@ And these frozen dataclasses:
     ReportSources(
         queue_path: str,
         cache_path: str,
+        answer_list_path: str,
+        guess_list_path: str,
+        telemetry_path: str | None = None,
     )
+
+    ReportSources.defaults() -> ReportSources
 
 `collect_report` dispatches `overview` in this phase and raises
 `ValueError("unsupported report kind: ...")` for anything else. Later phases
 extend the dispatcher.
 
-## Branch reference
+`RichSpineStep` is the legacy-compatible tuple:
+
+    tuple[int | None, str | None, str | None, str]
+
+Its fields are `(guess_depth, word, pattern, answer_count_text)`. Keeping the
+four-tuple contract lets phase 1 alias the parser into the legacy renderer
+without adapting its call sites.
+
+`ReportSources.defaults()` reads all defaults from `runtime_paths.py`.
+`runtime_paths.py` owns current database, telemetry, answer-list, and
+guess-list paths. Export full names such as `DEFAULT_ANSWER_LIST_PATH` and
+`DEFAULT_GUESS_LIST_PATH`; `erd_search.py` may import those as its legacy
+module-level aliases so existing callers and tests continue to work. Phase 1
+does not move any of the files.
+
+## Branch reference and legacy transition helpers
 
 Implement `report_model.branch_reference` with the same SHA-1 input semantics
 as the existing `erd_search._branch_id`, but return the first 12 hexadecimal
 characters rather than four. Do not include `@` in the function result;
 renderers add it. Leave the legacy four-character `_branch_id` definition in
-`erd_search.py` until phase 3 removes the legacy status renderer; changing it
+`erd_search.py` until phase 3d removes the legacy status renderer; changing it
 now would alter an intentionally untouched client and its tests.
 
 In `erd_search.py` import:
@@ -80,7 +105,11 @@ In `erd_search.py` import:
 
 Move `WORKER_LIVENESS_SECONDS` and the body of `_parse_spine` into
 `report_model.py`. The aliases keep the legacy renderer working without
-duplicating these semantics. `report_model.py` must not import `erd_search`.
+duplicating these semantics. The moved `parse_rich_spine` retains the exact
+four-tuple return contract. `normalize_worker_descent` converts those tuples
+to presentation-neutral dictionaries for report worker objects; it is not
+aliased into the legacy renderer. `report_model.py` must not import
+`erd_search`.
 
 ## Presentation-neutral semantics
 
@@ -183,9 +212,9 @@ Using one `ERDQueue` connection:
    by a live heartbeat. These normalize to `finalizing`.
 5. Fetch candidate progress for all retained branch keys with the new batch
    helper.
-6. Read `run_meta.epoch` and its matching `telemetry.telemetry_epoch` row for
-   epoch label and Git revision. A missing row yields null fields, not source
-   failure.
+6. Read `run_meta.epoch` and its matching unqualified `telemetry_epoch` row
+   from the main queue database for epoch label and Git revision. A missing
+   row yields null fields, not source failure.
 7. Close in `finally`.
 
 The overview includes active and finalizing branches only. Pending/done work
@@ -194,8 +223,9 @@ rows.
 
 ### Cache collection
 
-Load the answer list once in file order and also retain a cached answer set.
-Open `ScoreCache(..., checkpoint_on_close=False)` and call
+Load the answer list from `sources.answer_list_path` once in file order and
+also retain a cached answer set. Open
+`ScoreCache(..., checkpoint_on_close=False)` and call
 `erd_report_summary(ERD_ALL, generated_at - 300)`. Close in `finally`.
 
 ### Report envelope
@@ -209,14 +239,18 @@ Return every top-level key even under partial failure:
         "selector": null,
         "filters": {},
         "sources": {
-            "queue": {"path": ..., "ok": bool, "error": str | null},
-            "telemetry": {
+            "queue": {
                 "path": ...,
                 "ok": bool,
                 "error": str | null,
                 "epoch": int | null,
                 "label": str | null,
                 "git_sha": str | null,
+            },
+            "telemetry": {
+                "path": ...,
+                "ok": bool,
+                "error": str | null,
             },
             "cache": {"path": ..., "ok": bool, "error": str | null},
         },
@@ -247,6 +281,12 @@ Return every top-level key even under partial failure:
 
 Only live workers contribute to `worker_totals`. All heartbeat rows remain in
 `workers` so dead/stale state can be shown.
+
+Queue epoch metadata lives under `sources.queue` because `run_meta` and
+`telemetry_epoch` are both main-queue tables. `sources.telemetry` describes
+only the health and path of the attached telemetry file. If attaching that
+file prevents the queue connection from opening, both source entries report
+the failure; epoch metadata is never read from the attached database.
 
 ## Normalized branch object
 
@@ -293,7 +333,7 @@ Every worker has:
 | `updated_at` | int |
 | `is_live` | bool |
 | `branch_reference` / `branch_key_hex` | str or null |
-| `claim_idx` | int or null |
+| `candidate_index` | int or null |
 | `claim_started_at` | int or null |
 | `completed_claim_count` | int |
 | `current_candidate` | lowercase str or null |
@@ -301,7 +341,7 @@ Every worker has:
 | `current_max_guess_depth` | int or null |
 | `current_node_count` | int or null |
 | `nodes_per_second` | float or null |
-| `descent` | normalized array from `parse_rich_spine` |
+| `descent` | normalized array from `normalize_worker_descent` |
 | `cache_hit_count` / `cache_miss_count` | int |
 | `solved_evaluation_count` / `erd_cutoff_evaluation_count` / `remaining_depth_pruned_evaluation_count` | int |
 | `best_guess` | lowercase str or null |
@@ -315,26 +355,40 @@ still a renderer concern.
 
 `tests/test_report_model.py` must cover:
 
-1. Branch-reference stability, 12-character length, and distinct keys.
-2. Empty queue/cache produces a JSON-round-trippable overview with every
+1. `parse_rich_spine` preserves the legacy four-tuple contract and the alias
+   keeps all legacy spine tests unchanged.
+2. `normalize_worker_descent` produces dictionaries without changing the
+   tuple parser.
+3. Branch-reference stability, 12-character length, and distinct keys.
+4. Empty queue/cache produces a JSON-round-trippable overview with every
    envelope key.
-3. Unavailable queue and unavailable cache fail independently.
-4. One active branch and worker normalize spine, `guess_depth`, answer flags,
+5. Unavailable queue and unavailable cache fail independently.
+6. Queue epoch metadata comes from the main queue database and is reported
+   under `sources.queue`; telemetry source health has no epoch fields.
+7. Custom answer-list and guess-list paths flow through `ReportSources`
+   without importing `erd_search`.
+8. One active branch and worker normalize spine, `guess_depth`, answer flags,
    candidate progress, and renamed guess-axis fields correctly.
-5. All-gray pattern code 0 produces `guess_depth == 1` in the legacy-spine
+9. The normalized worker uses `candidate_index`; no report worker key is
+   named `claim_idx`.
+10. All-gray pattern code 0 produces `guess_depth == 1` in the legacy-spine
    fallback.
-6. A cooperative branch normalizes to `active` and contributes to
+11. A cooperative branch normalizes to `active` and contributes to
    `active_cooperative_branch_count`.
-7. A finalized branch referenced by a live heartbeat normalizes to
+12. A finalized branch referenced by a live heartbeat normalizes to
     `finalizing`; one referenced only by a dead heartbeat is not retained.
-8. Candidate progress batch lookup handles empty, missing, evaluated, and
+13. Candidate progress batch lookup handles empty, missing, evaluated, and
     bulk-eliminated candidates.
-9. No overview branch object contains `best_max_depth` and no worker object
+14. No overview branch object contains `best_max_depth` and no worker object
     contains `cur_max_depth`.
 
 ## Acceptance checklist
 
 - [ ] The public API and envelope above exist.
+- [ ] All default paths have one importable owner; word-list sources are
+      explicit and no runtime artifact is moved by this phase.
+- [ ] Legacy rich-spine tuple callers remain compatible while report descent
+      is normalized separately.
 - [ ] Overview collection performs no per-branch claim-table query.
 - [ ] Overview contains no candidate index arrays or unbounded telemetry.
 - [ ] Queue/cache failure is partial and JSON serializable.

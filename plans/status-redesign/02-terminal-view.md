@@ -18,7 +18,7 @@ output, and refresh without the terminal owning any database assembly.
 
 ## Non-goals
 
-- No positional selector or object-report flags yet; phase 3 adds them.
+- No positional selector or object-report flags yet; phases 3a–3c add them.
 - Do not remove `status` or read-only `queue` commands yet.
 - No branch/worker drill-down hotkeys yet.
 - No HTTP or browser code.
@@ -56,7 +56,7 @@ order, and identities absent from both the new report and any pinned
 selection are removed.
 
 `WatchSession` owns the prior report, display order, terminal mode, selected
-identity state reserved for phase 3, and cursor restoration. No refresh state
+identity state reserved for phase 3d, and cursor restoration. No refresh state
 is stored on `render_overview` or `collect_report`.
 
 ## CLI parser

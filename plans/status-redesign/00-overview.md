@@ -26,7 +26,7 @@ Semantic input is inferred from spine form, so users do not have to choose a
 `word` or `branch` command before entering the work they want to inspect.
 Tree presentation is a layout option over extant queue topology, not another
 domain object. Exact command syntax, inference rules, and collection filters
-belong to phase 3.
+belong to phases 3a and 3b.
 
 Cache results remain flat reporting data. They may annotate a branch that
 still exists in queue state, but cached ERD results never create or
@@ -72,24 +72,34 @@ cache-parent migration, or inferred historical tree in this plan.
 
 | Plan | Deliverable | Depends on |
 |---|---|---|
-| `01-report-model.md` | shared envelope, normalized overview entities, lifecycle semantics, and overview collector | issue #92 path decision |
+| `01-report-model.md` | shared path ownership, report envelope, normalized overview entities, lifecycle semantics, and overview collector | — |
 | `02-terminal-view.md` | terminal overview renderer with text, JSON, and optional watch | 01 |
-| `03-object-reports.md` | semantic selection, collection filters, object reports, live queue tree layout, and legacy read-command removal | 02 |
-| `04-report-server.md` | stdlib HTTP adapter over all reports and per-report fixtures | 03 |
+| `03a-semantic-reports.md` | selector model plus inferred word and branch reports | 02 |
+| `03b-collection-reports.md` | collection filters, queue/worker/cache reports, and live queue tree layout | 03a |
+| `03c-hotspot-reports.md` | bounded branch telemetry and hotspot reports | 03b |
+| `03d-terminal-transition.md` | TTY navigation, legacy read-command removal, and operator-documentation cutover | 03c |
+| `04-report-server.md` | stdlib HTTP adapter over all reports and per-report fixtures | 03d |
 | `05-browser-client.md` | navigable polling browser client over the shared reports | 04 |
 | `06-visual-modalities.md` | independent browser visual and interaction upgrades | 05 |
 | `07-landscape-view.md` | non-implementable live-work landscape vision and prerequisites | 05 plus relevant phase 06 items |
 
-Implement one numbered phase per branch and pull request, in numeric order.
-A phase starts only after its prerequisites are merged and is complete only
-when every acceptance item in its document is true.
+Phases 1, 2, 4, and 5 each use one branch and pull request. Phases 3a–3d each
+use one pull request and land in order. Phase 6 is a menu whose items use one
+pull request each and may land in any order after phase 5 unless an item says
+otherwise. Phase 7 is vision capture and produces no implementation pull
+request until it is promoted to an implementation plan.
+
+A phase or item starts only after its stated prerequisites are merged and is
+complete only when every acceptance item in its document is true.
 
 ## Sequencing constraint
 
-Issue #92 proposes one owner for runtime paths. Phase 1 must start only after
-that issue's path/module decision is merged, or these plans must first be
-updated to name the actual shared path owner. Report modules and the server
-must import defaults from that owner rather than copying path strings.
+Phase 1 requires one importable owner for runtime and word-list paths. If
+issue #92 has not landed, phase 1 creates `runtime_paths.py` with the current
+locations, including answer-list and guess-list paths, without moving any
+files. Issue #92 can later change those values without changing the reporting
+stack. Report modules and the server import defaults from that owner rather
+than copying path strings.
 
 ## Design principles
 
