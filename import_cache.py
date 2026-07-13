@@ -238,6 +238,13 @@ def main():  # pragma: no cover
               file=sys.stderr)
         sys.exit(1)
 
+    if (not args.dry_run and not args.keep_source
+            and os.path.exists(args.target)
+            and os.path.samefile(args.source, args.target)):
+        print('Error: source and target refer to the same file; refusing to '
+              'delete the target', file=sys.stderr)
+        sys.exit(1)
+
     target_existed = os.path.exists(args.target)
     if not target_existed:
         action = ('a new cache would be created' if args.dry_run
