@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "report_kind": "branch",
+  "generated_at": 1000,
+  "selector": {"kind": "branch", "steps": [{"word": "raise", "pattern": "-----"}], "trailing_word": null, "branch_reference": null, "input_text": "RAISE -----"},
+  "filters": {},
+  "tree": false,
+  "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
+  "data": {
+    "branch": {"branch_reference": "111111111111", "branch_key_hex": "01", "spine": [{"word": "raise", "pattern": "-----", "word_is_answer": false}], "guess_depth": 1, "budget": 5, "answer_count": 8},
+    "queue": {"lifecycle": "active", "raw_pending_status": "in_progress", "raw_active_status": "open", "priority": 5, "candidate_count": 100, "completed_candidate_count": 25, "bulk_completed_candidate_count": 4, "best_guess": "crane", "best_erd": 2.1, "best_max_remaining_depth": 3, "ceiling": 2.4, "search_node_count": 12000, "created_at": 900, "finalized_at": null},
+    "cache": {"cache_state": "exact", "best_guess": "crane", "best_erd": 2.1, "max_remaining_depth": 3, "solve_budget": 5, "tainted": false, "updated_at": 990},
+    "workers": [],
+    "republished_candidates": [{"candidate_index": 7, "republish_count": 2}],
+    "claims": [
+      {"candidate_index": 3, "state": "done", "completion_kind": "evaluated", "worker_id": "worker-0", "bundle_id": "bundle-1", "claimed_at": 930, "done_at": 940, "republish_count": 0},
+      {"candidate_index": 4, "state": "done", "completion_kind": "bulk_eliminated", "worker_id": null, "bundle_id": null, "claimed_at": 940, "done_at": 940, "republish_count": 0}
+    ],
+    "provenance_unknown": false,
+    "bundle_summary": {"bundle_count": 3, "node_count": 9000, "wall_millis": 800, "censored_unit_count": 1, "maximum_bundle_node_count": 5000},
+    "recent_finalizations": [
+      {"finalization_id": 3, "outcome": "exact", "ceiling": null, "budget": 5, "answer_count": 8, "search_node_count": 12000, "created_at": 800, "finalized_at": 900, "wall_millis": 1000, "bundle_count": 3, "maximum_bundle_node_count": 5000, "censored_unit_count": 1, "epoch": 4, "evaluated_candidate_count": 20, "bulk_completed_candidate_count": 4, "recorded_at": 901},
+      {"finalization_id": 2, "outcome": "cut", "ceiling": 2.2, "budget": 5, "answer_count": 8, "search_node_count": 9000, "created_at": 700, "finalized_at": 790, "wall_millis": 800, "bundle_count": 2, "maximum_bundle_node_count": 4500, "censored_unit_count": 0, "epoch": 4, "evaluated_candidate_count": 15, "bulk_completed_candidate_count": 2, "recorded_at": 791},
+      {"finalization_id": 1, "outcome": "loss", "ceiling": null, "budget": 4, "answer_count": 8, "search_node_count": 6000, "created_at": 600, "finalized_at": 680, "wall_millis": 700, "bundle_count": 2, "maximum_bundle_node_count": 3500, "censored_unit_count": 0, "epoch": 3, "evaluated_candidate_count": 12, "bulk_completed_candidate_count": 1, "recorded_at": 681}
+    ],
+    "cut_reuse_misses": [{"cut_reuse_miss_id": 1, "answer_count": 8, "budget": 5, "wanted_ceiling": null, "available_bound": 2.2, "available_budget": 4, "epoch": 4, "recorded_at": 950}]
+  }
+}
