@@ -87,10 +87,7 @@ def _abbreviate_duration(seconds):
 
 
 def _branch_eta(branch, generated_at):
-    completed = (
-        branch["completed_candidate_count"]
-        + branch["bulk_completed_candidate_count"]
-    )
+    completed = branch["completed_candidate_count"]
     created_at = branch.get("created_at")
     candidate_count = branch["candidate_count"]
     if not created_at or completed <= 0 or completed >= candidate_count:
@@ -227,10 +224,7 @@ def _render_sections(report, previous_report, color, width, display_order):
         branch_key = branch["branch_key_hex"]
         if branch["lifecycle"] == "active":
             active_branch_keys.add(branch_key)
-        completed = (
-            branch["completed_candidate_count"]
-            + branch["bulk_completed_candidate_count"]
-        )
+        completed = branch["completed_candidate_count"]
         best = "—"
         if branch.get("best_guess"):
             best = branch["best_guess"].upper()

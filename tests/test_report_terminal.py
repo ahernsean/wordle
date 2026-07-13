@@ -140,6 +140,8 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("pending 12", output)
         self.assertIn("@0123456789ab", output)
         self.assertIn("d=2", output)
+        self.assertIn("25/100 (25.0%)", output)
+        self.assertNotIn("30/100", output)
         self.assertIn("max-d=3", output)
         self.assertIn("W2", output)
         self.assertNotIn("\033", output)
