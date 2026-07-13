@@ -3,12 +3,14 @@
 from copy import deepcopy
 import io
 import json
+import shlex
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import erd_search
 import report_terminal
+from report_model import ReportFilters, parse_report_selector
 from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
 
 
@@ -415,8 +417,132 @@ class ViewSessionTest(unittest.TestCase):
         self.assertIn("\033[?25h", output.getvalue())
         self.assertGreaterEqual(set_attributes.call_count, 2)
 
+    def test_tty_branch_and_worker_hotkeys_push_report_requests(self):
+        report = overview_report()
+        output = io.StringIO()
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput("a2", tty=True), output
+        )
+        session._update_navigation_targets(report)
+        with patch("report_terminal.select.select", return_value=([session.input_stream], [], [])):
+            self.assertTrue(session._wait_for_refresh())
+        branch_request = session.current_request
+        self.assertEqual(branch_request.report_kind, "auto")
+        self.assertEqual(branch_request.selector.kind, "branch")
+        self.assertEqual(len(branch_request.selector.steps), 2)
+
+        session._navigate_back()
+        session._update_navigation_targets(report)
+        with patch("report_terminal.select.select", return_value=([session.input_stream], [], [])):
+            self.assertTrue(session._wait_for_refresh())
+        worker_request = session.current_request
+        self.assertEqual(worker_request.report_kind, "workers")
+        self.assertEqual(worker_request.worker_id, "worker-2")
+
+    def test_back_restores_complete_prior_request(self):
+        filters = ReportFilters(
+            active_only=True, minimum_answer_count=10, sort="size", limit=4
+        )
+        session = WatchSession(view_args(
+            watch=1.0,
+            selector=parse_report_selector("CRANE"),
+            report_kind="queue",
+            tree=True,
+            filters=filters,
+        ), FakeInput(tty=True), io.StringIO())
+        original_request = session.current_request
+        session._update_navigation_targets(overview_report())
+        session._select_branch("010203")
+        self.assertNotEqual(session.current_request, original_request)
+        session._navigate_back()
+        self.assertEqual(session.current_request, original_request)
+
+    def test_branch_hotkey_stays_pinned_by_full_identity_during_finalization(self):
+        report = overview_report()
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), io.StringIO()
+        )
+        session._update_navigation_targets(report)
+        letter = session.branch_letter_by_key["010203"]
+        finalizing = deepcopy(report)
+        finalizing["data"]["branches"][0]["lifecycle"] = "finalizing"
+        session._update_navigation_targets(finalizing)
+        self.assertEqual(session.branch_hotkeys[letter], "010203")
+
 
 class ViewParserTest(unittest.TestCase):
+    def test_every_swarm_guide_command_example_parses(self):
+        with open("SWARM.md") as guide_file:
+            physical_lines = guide_file.readlines()
+        logical_lines = []
+        pending = ""
+        for physical_line in physical_lines:
+            stripped = physical_line.strip()
+            pending += stripped[:-1] + " " if stripped.endswith("\\") else stripped
+            if not stripped.endswith("\\"):
+                logical_lines.append(pending)
+                pending = ""
+        commands = [
+            shlex.split(line, comments=True)[2:]
+            for line in logical_lines
+            if line.startswith("python3.13 erd_search.py ")
+        ]
+        handler_names = (
+            "cmd_start", "cmd_stop", "cmd_restart", "cmd_run", "cmd_view",
+            "cmd_queue_add", "cmd_queue_clear", "cmd_queue_remove",
+            "cmd_queue_priority", "cmd_reset_stale",
+        )
+        patches = [patch.object(erd_search, name) for name in handler_names]
+        started_patches = [handler_patch.start() for handler_patch in patches]
+        self.addCleanup(lambda: [handler_patch.stop() for handler_patch in patches])
+        self.assertTrue(commands)
+        for arguments in commands:
+            with self.subTest(arguments=arguments):
+                with patch("sys.argv", ["erd_search.py", *arguments]):
+                    erd_search.main()
+        self.assertTrue(any(handler.called for handler in started_patches))
+
+    def test_removed_read_commands_fail_argparse(self):
+        removed_commands = [
+            ["status"],
+            ["cache-status", "--word", "raise"],
+        ] + [
+            ["queue", command]
+            for command in ("ls", "tree", "show", "summary", "top", "coverage")
+        ]
+        for arguments in removed_commands:
+            with self.subTest(arguments=arguments):
+                with (
+                    patch("sys.argv", ["erd_search.py", *arguments]),
+                    patch("sys.stderr", io.StringIO()),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    erd_search.main()
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_lifecycle_and_queue_mutation_commands_still_dispatch(self):
+        cases = [
+            (["start"], "cmd_start"),
+            (["stop"], "cmd_stop"),
+            (["restart"], "cmd_restart"),
+            (["run"], "cmd_run"),
+            (["queue", "add", "--word", "raise"], "cmd_queue_add"),
+            (["queue", "clear", "--yes"], "cmd_queue_clear"),
+            (["queue", "remove", "--word", "raise", "--pattern", "....."],
+             "cmd_queue_remove"),
+            (["queue", "priority", "--word", "raise", "--pattern", ".....",
+              "--priority", "3"], "cmd_queue_priority"),
+            (["queue", "reset-stale"], "cmd_reset_stale"),
+        ]
+        for arguments, handler_name in cases:
+            with self.subTest(arguments=arguments):
+                with (
+                    patch("sys.argv", ["erd_search.py", *arguments]),
+                    patch.object(erd_search, handler_name) as handler,
+                ):
+                    erd_search.main()
+                handler.assert_called_once()
+
     def test_invalid_json_watch_and_short_interval_are_argparse_errors(self):
         for arguments in (
             ["erd_search.py", "view", "--format", "json", "--watch"],

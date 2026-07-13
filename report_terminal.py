@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+import hashlib
 import json
 import select
 import shutil
@@ -11,7 +12,12 @@ import sys
 import termios
 import time
 
-from report_model import ReportRequest, ReportSources, collect_report
+from report_model import (
+    ReportRequest,
+    ReportSources,
+    collect_report,
+    parse_report_selector,
+)
 
 
 GREEN = "\033[32m"
@@ -19,6 +25,7 @@ RED = "\033[31m"
 AMBER = "\033[33m"
 RESET = "\033[0m"
 CLEAR_LINE = "\033[K"
+BRANCH_HOTKEYS = "abcdefghijklmnoprstuvwxyz"
 
 
 @dataclass
@@ -677,8 +684,11 @@ class WatchSession:
         self.error_stream = error_stream or sys.stderr
         self.previous_report = None
         self.display_order = DisplayOrder()
-        self.selected_branch_key = None
-        self.selected_worker_id = None
+        self.navigation_stack = [self._request_from_args()]
+        self.branch_hotkeys = {}
+        self.worker_hotkeys = {}
+        self.branch_letter_by_key = {}
+        self.branch_selectors = {}
         self.previous_sections = []
         self.terminal_settings = None
         self.cursor_hidden = False
@@ -696,9 +706,9 @@ class WatchSession:
             ),
         )
 
-    def _collect(self):
+    def _request_from_args(self):
         selector = getattr(self.args, "selector", None)
-        request = ReportRequest(
+        return ReportRequest(
             report_kind=getattr(self.args, "report_kind", "auto"),
             selector=selector if selector is not None else ReportRequest().selector,
             include_claims=getattr(self.args, "claims", False),
@@ -711,7 +721,155 @@ class WatchSession:
             since_seconds=getattr(self.args, "since_seconds", None),
             sample_size=getattr(self.args, "sample_size", None),
         )
-        return collect_report(self._sources(), request)
+
+    @property
+    def current_request(self):
+        return self.navigation_stack[-1]
+
+    def _collect(self):
+        return collect_report(self._sources(), self.current_request)
+
+    @staticmethod
+    def _identity_rows(report, identity_key):
+        data = report.get("data", {})
+        collections = [
+            data.get("branches", []),
+            data.get("workers", []),
+            data.get("response_groups", []),
+            data.get("rows", []),
+            data.get("nodes", []),
+        ]
+        branch = data.get("branch")
+        if isinstance(branch, dict):
+            collections.append([branch])
+        rows = []
+        seen = set()
+        for collection in collections:
+            for row in collection or []:
+                identity = row.get(identity_key)
+                if identity is not None and identity not in seen:
+                    rows.append(row)
+                    seen.add(identity)
+        return rows
+
+    def _update_navigation_targets(self, report):
+        branch_rows = self._identity_rows(report, "branch_key_hex")
+        branch_keys = [row["branch_key_hex"] for row in branch_rows]
+        self.branch_selectors = {
+            row["branch_key_hex"]: self._branch_selector(row)
+            for row in branch_rows
+        }
+        retained_letters = {
+            branch_key: letter
+            for branch_key, letter in self.branch_letter_by_key.items()
+            if branch_key in branch_keys
+        }
+        used_letters = set(retained_letters.values())
+        free_letters = iter(
+            letter for letter in BRANCH_HOTKEYS if letter not in used_letters
+        )
+        for branch_key in branch_keys:
+            if branch_key not in retained_letters:
+                letter = next(free_letters, None)
+                if letter is not None:
+                    retained_letters[branch_key] = letter
+        self.branch_letter_by_key = retained_letters
+        self.branch_hotkeys = {
+            letter: branch_key
+            for branch_key, letter in retained_letters.items()
+        }
+
+        self.worker_hotkeys = {}
+        for worker in self._identity_rows(report, "worker_id"):
+            worker_number = str(worker.get("worker_number") or "")
+            if len(worker_number) == 1 and worker_number.isdigit():
+                self.worker_hotkeys[worker_number] = worker["worker_id"]
+
+    def _branch_selector(self, row):
+        spine = row.get("spine")
+        if isinstance(spine, list):
+            selector_text = " ".join(
+                token
+                for step in spine
+                for token in (step["word"], step["pattern"])
+            )
+            if selector_text:
+                return parse_report_selector(selector_text)
+        if isinstance(spine, str) and spine.strip():
+            try:
+                selector = parse_report_selector(spine)
+                if selector.kind == "branch":
+                    return selector
+            except ValueError:
+                pass
+        if (
+            self.current_request.selector.kind == "word"
+            and row.get("pattern") is not None
+        ):
+            parts = [
+                token
+                for step in self.current_request.selector.steps
+                for token in (step.word, step.pattern)
+            ]
+            parts.extend((self.current_request.selector.trailing_word, row["pattern"]))
+            return parse_report_selector(parts)
+        branch_digest = hashlib.sha1(
+            bytes.fromhex(row["branch_key_hex"])
+        ).hexdigest()
+        return parse_report_selector("@" + branch_digest)
+
+    def _navigation_section(self):
+        targets = []
+        for letter, branch_key in self.branch_hotkeys.items():
+            targets.append(f"[{letter}] branch {branch_key[:12]}")
+        for digit, worker_id in self.worker_hotkeys.items():
+            targets.append(f"[{digit}] {worker_id}")
+        controls = "[space] refresh  [q] quit"
+        if len(self.navigation_stack) > 1:
+            controls = "[backspace/esc] back  " + controls
+        return [("navigation", ["Navigation", "  " + "  ".join(targets + [controls])])]
+
+    def _reset_navigation_display(self):
+        self.previous_report = None
+        self.previous_sections = []
+        self.display_order = DisplayOrder()
+        self.output_stream.write("\033[2J\033[H")
+        self.output_stream.flush()
+
+    def _select_branch(self, branch_key_hex):
+        request = replace(
+            self.current_request,
+            report_kind="auto",
+            selector=self.branch_selectors[branch_key_hex],
+            tree=False,
+            worker_id=None,
+            hotspot_field=None,
+            epoch=None,
+            since_seconds=None,
+            sample_size=None,
+        )
+        self.navigation_stack.append(request)
+        self._reset_navigation_display()
+
+    def _select_worker(self, worker_id):
+        request = replace(
+            self.current_request,
+            report_kind="workers",
+            selector=parse_report_selector(None),
+            tree=False,
+            worker_id=worker_id,
+            hotspot_field=None,
+            epoch=None,
+            since_seconds=None,
+            sample_size=None,
+        )
+        self.navigation_stack.append(request)
+        self._reset_navigation_display()
+
+    def _navigate_back(self):
+        if len(self.navigation_stack) > 1:
+            self.navigation_stack.pop()
+            self._reset_navigation_display()
 
     def _width(self):
         return shutil.get_terminal_size((80, 24)).columns
@@ -847,6 +1005,15 @@ class WatchSession:
                 return False
             if character == " ":
                 return True
+            if character in ("\x08", "\x7f", "\x1b"):
+                self._navigate_back()
+                return True
+            if character in self.branch_hotkeys:
+                self._select_branch(self.branch_hotkeys[character])
+                return True
+            if character in self.worker_hotkeys:
+                self._select_worker(self.worker_hotkeys[character])
+                return True
 
     def _run_tty_text(self):
         file_descriptor = self.input_stream.fileno()
@@ -861,7 +1028,11 @@ class WatchSession:
             while True:
                 try:
                     report = self._collect()
-                    sections = self._terminal_sections(report)
+                    self._update_navigation_targets(report)
+                    sections = (
+                        self._terminal_sections(report)
+                        + self._navigation_section()
+                    )
                 except Exception as error:
                     sections = [("error", ["Error", f"  view: {error}"])]
                     report = None

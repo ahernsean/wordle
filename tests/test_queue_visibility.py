@@ -1,14 +1,8 @@
-import io
-import json
 import os
-import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
-from unittest import mock
 
-import erd_search
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue
 
@@ -18,37 +12,6 @@ WORDS = ["crane", "slate", "trace", "stale", "tales"]
 
 def _words(prefix, count):
     return [f"{prefix}{i:04d}"[:5] for i in range(count)]
-
-
-class TestQueueBranchRefParser(unittest.TestCase):
-    def test_accepts_partial_and_full_spines(self):
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE"),
-            [("CRANE", None)])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE -y--g"),
-            [("CRANE", "-y--g")])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE -y--g ALIBI"),
-            [("CRANE", "-y--g"), ("ALIBI", None)])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE -y--g ALIBI g-g--"),
-            [("CRANE", "-y--g"), ("ALIBI", "g-g--")])
-
-    def test_normalizes_lowercase_and_gray_chars(self):
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("crane .yxxg alibi 00000"),
-            [("CRANE", "-y--g"), ("ALIBI", "-----")])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE xxxxx ALIBI gyxgg"),
-            [("CRANE", "-----"), ("ALIBI", "gy-gg")])
-
-    def test_rejects_malformed_refs(self):
-        bad = ["CRAN", "CRANE ALIBI", "CRANE -y--g DOG", "CRANE -y--"]
-        for ref in bad:
-            with self.subTest(ref=ref):
-                with self.assertRaises(erd_search.QueueRefError):
-                    erd_search.parse_queue_branch_ref(ref)
 
 
 class QueueVisibilityTests(unittest.TestCase):
@@ -238,14 +201,6 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(
             self.q.list_queue_rows({"prefix": "SLATE"}), [])
 
-    def test_short_branch_id_resolves(self):
-        self.q.add_pending_many([(self.user_key, len(WORDS), 0, "crane", 0)])
-        row = self.q.list_queue_rows()[0]
-        bid = erd_search._branch_id(row["branch_key"])
-        matches = self.q.resolve_branch_ref(bid)
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["branch_key"], self.user_key)
-
     def test_queue_top_excludes_pending_rows(self):
         self.q.add_pending_many([(self.user_key, len(WORDS), 0, "crane", 0)])
         self.q.create_branch(
@@ -384,93 +339,6 @@ class QueueVisibilityTests(unittest.TestCase):
             }),
             "CRANE -----")
         self.assertEqual(self.q._row_spine_text({}), "")
-
-    def test_queue_table_columns_accommodate_rendered_values(self):
-        rows = [
-            {
-                "branch_key": b"first",
-                "kind": "coop",
-                "status": "open",
-                "priority": 1_000_000,
-                "n_words": 60,
-                "done_candidates": 12616,
-                "n_candidates": 12972,
-                "worker_count": 4,
-                "nodes_spent": 1732478,
-                "spine": "ALIBI -----",
-            },
-            {
-                "branch_key": b"second",
-                "kind": "user",
-                "status": "in_progress",
-                "priority": 170000,
-                "n_words": 841,
-                "done_candidates": 26,
-                "n_candidates": 12972,
-                "worker_count": 0,
-                "nodes_spent": 2748659,
-                "spine": "CRANE -----",
-            },
-        ]
-
-        output = io.StringIO()
-        with redirect_stdout(output):
-            erd_search._print_queue_table(rows)
-        lines = output.getvalue().splitlines()
-
-        self.assertEqual(
-            lines,
-            [
-                "ID   Kind Status         Pri Words        Done W   Nodes  Spine",
-                f"{erd_search._branch_id(b'first')} coop open          COOP    60 "
-                "12616/12972 4 1732478  ALIBI -----",
-                f"{erd_search._branch_id(b'second')} user in_progress 170000   841 "
-                "   26/12972 0 2748659  CRANE -----",
-            ],
-        )
-
-
-class QueueCliArgparseTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.queue_path = os.path.join(self._tmp.name, "q.sqlite3")
-        q = ERDQueue(self.queue_path)
-        try:
-            q.add_pending_many([
-                (ScoreCache.encode_subset(WORDS), len(WORDS), 0, "crane", 0),
-                (ScoreCache.encode_subset(WORDS[:3]), 3, 0, "slate", 0),
-            ])
-        finally:
-            q.close()
-
-    def _run_main(self, *argv):
-        buf = io.StringIO()
-        with mock.patch.object(sys, "argv", ["erd_search.py", *argv]):
-            with redirect_stdout(buf):
-                erd_search.main()
-        return buf.getvalue()
-
-    def test_queue_global_json_applies_to_child_command(self):
-        out = self._run_main(
-            "queue", "--queue", self.queue_path, "--json", "ls")
-        rows = json.loads(out)
-        self.assertEqual(len(rows), 2)
-
-    def test_queue_global_limit_applies_to_child_command(self):
-        out = self._run_main(
-            "queue", "--queue", self.queue_path, "--limit", "1", "ls", "--json")
-        rows = json.loads(out)
-        self.assertEqual(len(rows), 1)
-
-    def test_child_queue_option_overrides_queue_global(self):
-        other_path = os.path.join(self._tmp.name, "other.sqlite3")
-        out = self._run_main(
-            "queue", "--queue", other_path, "ls",
-            "--queue", self.queue_path, "--json")
-        rows = json.loads(out)
-        self.assertEqual(len(rows), 2)
-
 
 if __name__ == "__main__":
     unittest.main()

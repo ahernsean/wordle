@@ -65,195 +65,73 @@ SIGTERM.  Useful flags:
 
 ## Monitor the swarm
 
-### Live status display
+### Unified report view
+
+All read-only inspection uses `view`:
 
 ```bash
-python3.13 erd_search.py status             # one-shot snapshot
-python3.13 erd_search.py status --watch     # refresh every 30 s
-python3.13 erd_search.py status --watch 10  # refresh every 10 s
+python3.13 erd_search.py view
+python3.13 erd_search.py view --watch
+python3.13 erd_search.py view --watch 10
+python3.13 erd_search.py view --format json --queue
+python3.13 erd_search.py view --format jsonl --watch 10 --workers
 ```
 
-The display has three sections:
+The default report is the operational overview. Watched text is interactive in
+a TTY: branch letters and worker numbers open detail, Backspace or Escape goes
+back, Space refreshes, and `q` quits. Non-TTY text and structured output remain
+noninteractive.
 
-**Header** — queue counts (pending / done / in-progress) and cache ERD entry count.
+Semantic selectors infer words and branches from spine form:
 
-**Branches in progress** — one row per branch currently being swarmed.  Columns:
-`Source` (opener word + response pattern), `Ans` (answer-word count),
-`Cands` (done/total and percent), `Best guess` (running-best candidate),
-`ERD` (running-best score), `Wkrs` (active worker count), `ETA`.
+```bash
+python3.13 erd_search.py view CRANE
+python3.13 erd_search.py view "CRANE .y..g"
+python3.13 erd_search.py view "CRANE .y..g ALIBI"
+python3.13 erd_search.py view "CRANE .y..g ALIBI g.g.." --claims
+```
 
-**Workers** — one row per worker with its liveness heartbeat age (`hb=Ns`),
-the branch it is on, claim index held and hold time, total claims done, and the
-candidate currently under evaluation (`[WORD N/total depth D M evals K/s
-path:X>Y>Z]`).  A `!!STALE` flag appears when a heartbeat is more than 120 s
-old.  A `!!HANG` flag appears when the heartbeat is fresh but the node rate is
-zero (evaluation stuck).
+A trailing word reports its response groups. A trailing pattern reports the
+resulting branch. Pattern syntax is `g` for green, `y` for yellow, and `.` or
+`-` for gray. A displayed branch reference can also select a queued branch.
+
+Focused collections and live topology use the same report model:
+
+```bash
+python3.13 erd_search.py view --queue --active-only --sort size --limit 25
+python3.13 erd_search.py view --queue --tree "CRANE .y..g"
+python3.13 erd_search.py view --workers
+python3.13 erd_search.py view --worker 2
+python3.13 erd_search.py view --cache
+python3.13 erd_search.py view --cache CRANE
+python3.13 erd_search.py view --hotspots --by nodes
+python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
+```
+
+Use `--answers` for answer-word arrays on word or branch reports and `--claims`
+for sparse candidate detail on one branch. Collection filters include lifecycle,
+answer-count bounds, budget, priority, sort, and limit. Historical hotspots are
+explicitly bounded by epoch, time window, and sample size. `--tree` uses only
+extant queue topology; cache rows never reconstruct historical trees.
 
 ### Log files
 
 | File | Content |
 |---|---|
-| `erd_search.log` | Supervisor: spawn/recycle events, queue-empty signal |
-| `erd_worker_N.log` | Per-worker: candidate timing, finalize events, RAM warnings |
+| `erd_search.log` | Supervisor spawn, recycle, and queue-empty events |
+| `erd_worker_N.log` | Per-worker candidate timing, finalize events, and RAM warnings |
 
 ```bash
 tail -f erd_search.log
 tail -f erd_worker_0.log
 ```
 
-Workers log a summary line after each candidate claim completes:
-```
-claim N done: K nodes in T.1s (R.1/s)  ok=X pruned=Y useless=Z  best=WORD E.EEEE
-```
-
 ---
 
-## Queue operations
+## Queue mutations
 
-Start with the queue dashboard when you do not already know the branch:
-
-```bash
-python3.13 erd_search.py queue
-```
-
-Use `queue ls` to find work, `queue tree <partial-spine>` to understand promoted
-children, `queue show <branch-ref>` to inspect one branch, and
-`queue coverage <partial-spine>` when asking which response branches under a
-path are queued.
-
-Branch references are queue-first spine fragments:
-
-```bash
-CRANE
-CRANE -y--g
-CRANE -y--g ALIBI
-CRANE -y--g ALIBI g-g--
-```
-
-The final word may omit a pattern, meaning "show branches below this guess."
-Pattern syntax is `g`=green, `y`=yellow, and any other character as gray; quote
-refs containing leading dashes so the shell does not treat them as options.
-
-### Find and inspect work
-
-```bash
-python3.13 erd_search.py queue ls
-python3.13 erd_search.py queue tree "CRANE -y--g"
-python3.13 erd_search.py queue show "CRANE -y--g ALIBI"
-python3.13 erd_search.py queue top --by nodes "CRANE -y--g"
-python3.13 erd_search.py queue summary
-python3.13 erd_search.py queue coverage CRANE
-```
-
-`queue show` accepts the 4-hex branch id printed by `queue ls`, a full branch
-key prefix, a word/pattern pair, or a partial/full spine. If a reference matches
-multiple branches, it prints a disambiguation table.
-
-#### `queue`: dashboard
-
-```bash
-python3.13 erd_search.py queue
-python3.13 erd_search.py queue --limit 20
-python3.13 erd_search.py queue --json
-```
-
-The dashboard is the default read-only entry point. It shows aggregate queue
-counts, active branches, top pending branches, and stale/held work when present.
-Use it before you know which word or branch you care about.
-
-#### `queue ls`: inventory
-
-```bash
-python3.13 erd_search.py queue ls
-python3.13 erd_search.py queue ls --status pending --min-words 100
-python3.13 erd_search.py queue ls --source-word crane --limit 50
-python3.13 erd_search.py queue ls --prefix "CRANE -y--g" --json
-```
-
-Lists queue rows without requiring a word first. Rows include the stable 4-hex
-branch id, kind (`user` or `coop`), status, priority, answer count, candidate
-progress, live worker count, nodes spent, and spine/source path.
-
-Useful filters:
-
-| Filter | Meaning |
-|---|---|
-| `--status pending|in_progress|done|open` | Limit by pending-row or active-row status |
-| `--min-words N`, `--max-words N` | Limit by answer count |
-| `--budget N` | Limit by active solve budget |
-| `--priority N` | Limit by exact priority |
-| `--source-word WORD` | Limit to branches first queued from that word |
-| `--prefix SPINE` | Limit to descendants of a partial spine |
-| `--limit N` | Cap displayed rows |
-| `--json` | Emit machine-readable rows |
-
-Default sort is active work first, then priority descending, then branch size
-descending.
-
-#### `queue tree`: spine view
-
-```bash
-python3.13 erd_search.py queue tree
-python3.13 erd_search.py queue tree CRANE
-python3.13 erd_search.py queue tree "CRANE -y--g ALIBI"
-python3.13 erd_search.py queue tree --active-only --max-depth 3
-```
-
-Groups work by recorded spine so promoted cooperative children are easier to
-understand. Use this when a branch has spawned sub-work and `queue ls` is too
-flat. `--active-only`, `--max-depth`, `--limit`, and `--json` are supported.
-
-#### `queue show`: branch drill-down
-
-```bash
-python3.13 erd_search.py queue show 04d6
-python3.13 erd_search.py queue show "CRANE -----"
-python3.13 erd_search.py queue show "CRANE -y--g ALIBI"
-python3.13 erd_search.py queue show --claims 04d6
-```
-
-Shows one branch’s pending row, active row, candidate progress, workers, bundle
-stats, republish count, current best guess/ERD, budget, taint flag, nodes spent,
-and spine. `--claims` includes detailed candidate claim rows. If the reference
-is ambiguous, it prints matching rows and asks for a more specific spine/pattern
-or branch id.
-
-#### `queue summary`: aggregate view
-
-```bash
-python3.13 erd_search.py queue summary
-python3.13 erd_search.py queue summary --json
-```
-
-Reports counts by status, kind, budget, priority bucket, and answer-count
-bucket, plus largest/oldest pending and active branches. This is the quickest
-way to see queue shape without row-level detail.
-
-#### `queue top`: hotspots
-
-```bash
-python3.13 erd_search.py queue top --by nodes
-python3.13 erd_search.py queue top --by workers "CRANE -y--g"
-python3.13 erd_search.py queue top --by size --limit 25
-```
-
-Ranks active/open work. `--by` accepts `nodes`, `age`, `size`, `workers`,
-`priority`, or `slowest`. A trailing partial spine filters to descendants.
-
-#### `queue coverage`: response-pattern coverage
-
-```bash
-python3.13 erd_search.py queue coverage CRANE
-python3.13 erd_search.py queue coverage "CRANE -y--g ALIBI"
-python3.13 erd_search.py queue coverage CRANE --queued-only
-python3.13 erd_search.py queue coverage CRANE --missing-only
-```
-
-This is the old word-centric coverage question under the new queue group. It
-answers “for the next guess at this path, which response branches are pending,
-in progress, done, cooperative-active, or not queued?” Use it when checking
-whether a word/path has complete queue coverage rather than when looking for
-unknown work.
+Read-only queue reporting uses `view --queue`. The `queue` group contains only
+mutations.
 
 ### Add branches to the queue
 
@@ -341,17 +219,7 @@ stopped and you want to inspect or requeue before restarting.
 
 ## Cache operations
 
-### Check ERD coverage for a word
-
-```bash
-python3.13 erd_search.py cache-status --word salet
-python3.13 erd_search.py cache-status --word salet --missing-only
-```
-
-For each of the (up to 242) response patterns for WORD, reports whether the
-branch has a cached ERD entry, along with the best guess, score, and timestamp
-for hits.  Trivial patterns (0 or 1 answer word) are skipped — they need no
-ERD.
+Cache coverage inspection uses `erd_search.py view --cache` with an optional semantic selector.
 
 ### Export for the iPhone
 
