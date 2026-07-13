@@ -4,10 +4,14 @@
 Usage
 -----
   python3.13 import_cache.py <source_db> [--target PATH] [--dry-run]
+                             [--keep-source]
 
 Creates the target cache if it doesn't exist yet, or merges into it if it
 already does — adding rows from <source_db> not already present in
---target across all four cache tables. Three of them (answer_list,
+--target across all four cache tables. After a successful merge the source
+file (and its -wal/-shm siblings) is deleted; pass --keep-source to retain
+it. The source is a transitory export snapshot, so an import that leaves
+nothing behind is the normal end of the export/import cycle. Three of them (answer_list,
 response_decomposition, candidate_scores) are deterministic given the same
 answer-word universe — matching keys imply identical values — so INSERT OR
 IGNORE is exact.
@@ -222,14 +226,23 @@ def main():  # pragma: no cover
                         help=f'Target cache file (default: {DEFAULT_TARGET})')
     parser.add_argument('--dry-run', action='store_true',
                         help='Report counts without writing anything')
-    parser.add_argument('--delete-source', action='store_true',
-                        help='Delete source file after successful merge')
+    parser.add_argument('--keep-source', action='store_true',
+                        help='Keep the source file after a successful merge '
+                             '(the default deletes it)')
     args = parser.parse_args()
 
     if not os.path.exists(args.source):
         # ATTACH would silently create an empty database for a missing path,
         # turning a typo into a "0 rows inserted" non-merge.
         print(f'Error: source file {args.source} does not exist',
+              file=sys.stderr)
+        sys.exit(1)
+
+    if (not args.dry_run and not args.keep_source
+            and os.path.exists(args.target)
+            and os.path.samefile(args.source, args.target)):
+        print(f'Error: source {args.source!r} and target {args.target!r} '
+              'refer to the same file; refusing to delete the target',
               file=sys.stderr)
         sys.exit(1)
 
@@ -307,7 +320,7 @@ def main():  # pragma: no cover
             print('  checkpointing...', flush=True)
             conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             print(f'Total: {total_new:,} rows inserted')
-            if args.delete_source:
+            if not args.keep_source:
                 for suffix in ('', '-shm', '-wal'):
                     p = args.source + suffix
                     if os.path.exists(p):

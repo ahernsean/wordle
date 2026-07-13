@@ -10,6 +10,7 @@ continue to provide that coverage.  The tests here focus on the helper
 functions and the end-to-end copy path.
 """
 import hashlib
+import io
 import os
 import sqlite3
 import tempfile
@@ -260,6 +261,27 @@ class TestBootstrapTargetSchema(_TmpDB):
             self.assertEqual(rows, [("crane", 42.0)])
         finally:
             conn.close()
+
+
+class TestMainSourceDeletion(_TmpDB):
+    def test_refuses_to_delete_source_that_is_also_target(self):
+        cache_path = self.path("cache.sqlite3")
+        cache = ScoreCache(cache_path, WORDS)
+        cache.close()
+
+        stderr = io.StringIO()
+        with mock.patch("sys.argv", [
+                "import_cache.py", cache_path, "--target", cache_path]), \
+                mock.patch("sys.stderr", stderr), \
+                self.assertRaises(SystemExit) as raised:
+            import_cache.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        error = stderr.getvalue()
+        self.assertIn(f"source {cache_path!r}", error)
+        self.assertIn(f"target {cache_path!r}", error)
+        self.assertIn("refer to the same file", error)
+        self.assertTrue(os.path.exists(cache_path))
 
 
 class TestMergeTable(_TmpDB):
