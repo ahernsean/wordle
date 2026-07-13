@@ -73,8 +73,8 @@ The current Tailscale CLI form for the short MagicDNS URL
 
 Tailscale configuration is an operator action, not something this repository
 installs or mutates. Confirm external CLI syntax with `tailscale serve --help`
-and the [official Tailscale Serve documentation](https://tailscale.com/docs/features/tailscale-serve)
-at deployment. A direct LAN deployment must opt in with
+and the Tailscale Serve documentation at deployment. A direct LAN deployment
+must opt in with
 `--bind 0.0.0.0` and use the explicit server port; it has no authentication or
 TLS. Do not bind the Python process directly to privileged port 80.
 

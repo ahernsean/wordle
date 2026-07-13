@@ -123,7 +123,7 @@ The envelope's `report_kind` is the inferred domain kind.
 
 Add presentation-neutral resolver functions to `report_model.py`:
 
-    resolve_selector_branch(selector, all_answers, score_cache) -> ResolvedBranch
+    resolve_selector_branch(selector, all_answers) -> ResolvedBranch
     resolve_branch_reference(queue, digest_prefix) -> bytes
 
 `ResolvedBranch` contains selected answer words, encoded branch key,
@@ -131,7 +131,10 @@ normalized complete spine, and an optional trailing word.
 
 For a semantic spine, start with all answers loaded from
 `ReportSources.answer_list_path` and apply each guess/pattern response group
-in order through `ResponseCache`. An empty response group is a valid resolved
+in order through `ResponseCache(all_answers, score_cache=None)`. Use the pure
+reference path so selector resolution never reads or writes persistent cache
+state. Produce the encoded branch key with the static
+`ScoreCache.encode_subset` helper. An empty response group is a valid resolved
 branch with zero answers; report it rather than treating it as parse failure.
 
 For `@digest-prefix`:
@@ -294,14 +297,15 @@ Required coverage:
 4. Word coverage combines current queue and cache states and handles trivial
    groups.
 5. Semantic branch selection works when the branch is cache-only.
-6. Digest resolution rejects zero and multiple matches.
-7. The queue prefix helper and model resolver have distinct names and return
+6. Semantic selector resolution performs no persistent cache read or write.
+7. Digest resolution rejects zero and multiple matches.
+8. The queue prefix helper and model resolver have distinct names and return
    contracts.
-8. Branch detail classifies bulk elimination without inventing a worker.
-9. Claims and answer words are absent unless explicitly requested.
-10. Cache state obeys existing budget and `max_remaining_depth` reuse rules.
-11. Watched word and branch reports preserve stable identities.
-12. All legacy status and read-only queue tests remain green.
+9. Branch detail classifies bulk elimination without inventing a worker.
+10. Claims and answer words are absent unless explicitly requested.
+11. Cache state obeys existing budget and `max_remaining_depth` reuse rules.
+12. Watched word and branch reports preserve stable identities.
+13. All legacy status and read-only queue tests remain green.
 
 ## Acceptance checklist
 
