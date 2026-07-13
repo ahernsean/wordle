@@ -786,6 +786,26 @@ class ScoreCache:
         """, (self.answer_list_id,)).fetchone()
         return row["m"] if row else None
 
+    def erd_report_summary(self, policy: str, recent_since: int) -> dict:
+        """Return bounded aggregate ERD counts for the current answer list."""
+        exact = self._conn.execute("""
+            SELECT COUNT(*) AS exact_branch_count,
+                   COUNT(CASE WHEN updated_at >= ? THEN 1 END)
+                       AS recent_exact_branch_count
+            FROM branch_best_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+        """, (recent_since, policy, self.answer_list_id)).fetchone()
+        loss = self._conn.execute("""
+            SELECT COUNT(*) AS loss_branch_count
+            FROM branch_loss_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+        """, (policy, self.answer_list_id)).fetchone()
+        return {
+            "exact_branch_count": exact["exact_branch_count"],
+            "recent_exact_branch_count": exact["recent_exact_branch_count"],
+            "loss_branch_count": loss["loss_branch_count"],
+        }
+
     def stats(self):
         """Return (branch_best_rows, candidate_score_rows, decomposition_rows, last_updated_ts)."""
         sp = self._conn.execute("""

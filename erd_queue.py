@@ -1422,6 +1422,41 @@ class ERDQueue:
             "WHERE branch_key = ?", (branch_key,)).fetchone()
         return 0 if row is None else row[0]
 
+    def candidate_progress_by_branch_keys(self, branch_keys: list[bytes]) -> dict:
+        """Return evaluated and bulk-completed candidate counts by branch."""
+        if not branch_keys:
+            return {}
+        progress = {
+            bytes(branch_key): {
+                "completed_candidate_count": 0,
+                "bulk_completed_candidate_count": 0,
+            }
+            for branch_key in branch_keys
+        }
+        placeholders = ",".join("?" for _ in branch_keys)
+        completed_rows = self._conn.execute(
+            f"""SELECT branch_key, COUNT(*) AS completed_candidate_count
+                FROM candidate_claims
+                WHERE done = 1 AND branch_key IN ({placeholders})
+                GROUP BY branch_key""",
+            branch_keys,
+        ).fetchall()
+        for row in completed_rows:
+            progress[bytes(row["branch_key"])]["completed_candidate_count"] = (
+                row["completed_candidate_count"]
+            )
+        bulk_rows = self._conn.execute(
+            f"""SELECT branch_key, bulk_done_candidates
+                FROM active_branches
+                WHERE branch_key IN ({placeholders})""",
+            branch_keys,
+        ).fetchall()
+        for row in bulk_rows:
+            progress[bytes(row["branch_key"])][
+                "bulk_completed_candidate_count"
+            ] = row["bulk_done_candidates"]
+        return progress
+
     def try_finalize_branch(self, branch_key) -> bool:
         """Atomically transition a branch open -> finalized, exactly once.
 

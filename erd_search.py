@@ -63,21 +63,24 @@ import time
 from datetime import datetime
 
 from cache_sqlite import ScoreCache
+from report_model import (
+    WORKER_LIVENESS_SECONDS,
+    parse_rich_spine as _parse_spine,
+)
+from runtime_paths import (
+    DEFAULT_ANSWER_LIST_PATH,
+    DEFAULT_CACHE_PATH,
+    DEFAULT_GUESS_LIST_PATH,
+    DEFAULT_QUEUE_PATH,
+)
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
 from erd_queue import ERDQueue, encode_subset, guess_depth_from_spine
 import erd_swarm
 
-ANSWER_FILE = 'NYT_wordlist.txt'
-WORDS_FILE = 'wordle.txt'
-DEFAULT_CACHE = 'wordle_cache.sqlite3'
-DEFAULT_QUEUE = 'erd_queue.sqlite3'
-
-# Seconds of missed heartbeats after which a worker is considered dead: its
-# candidate claims are reclaimed by the queue and its heartbeat row stops
-# counting as live.  Workers heartbeat every ~2s, so this only ever fires on a
-# crashed process.  Liveness alone — not a separate display window — governs
-# both reclaim and what the status screen treats as a live worker.
-WORKER_LIVENESS_SECONDS = 30
+ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
+WORDS_FILE = DEFAULT_GUESS_LIST_PATH
+DEFAULT_CACHE = DEFAULT_CACHE_PATH
+DEFAULT_QUEUE = DEFAULT_QUEUE_PATH
 
 logger = logging.getLogger('wordle')
 
@@ -1286,37 +1289,6 @@ def _spine_sizes(path):
         else:
             parts.append(tok)
     return '→'.join(parts)
-
-
-def _parse_spine(path):
-    """Parse a rich spine string into a list of (depth, guess, pattern, size) tuples.
-
-    New-format tokens: 'guess_depth:GUESS:pattern/size' or 'guess_depth:size'.
-    Old-format tokens: 'GUESS:pattern/size' or a bare size string.
-
-    Old-format tokens always begin with a letter or sentinel character, never a
-    digit, so the leading digit is an unambiguous marker for the new format.
-    depth is an integer for new-format tokens, None for old-format.
-    """
-    if not path:
-        return []
-    result = []
-    for tok in path.split('→'):
-        depth = None
-        if tok and tok[0].isdigit():
-            colon_pos = tok.index(':')
-            depth = int(tok[:colon_pos])
-            tok = tok[colon_pos + 1:]
-        if '/' in tok:
-            gp, size_str = tok.rsplit('/', 1)
-            if ':' in gp:
-                guess, pattern = gp.split(':', 1)
-            else:
-                guess, pattern = None, gp
-            result.append((depth, guess, pattern, size_str))
-        elif tok:
-            result.append((depth, None, None, tok))
-    return result
 
 
 def _worker_guess_depth_label(parent_guess_depth, current_max_guess_depth,
