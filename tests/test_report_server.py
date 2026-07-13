@@ -187,7 +187,7 @@ class ReportServerTest(unittest.TestCase):
             missing = request(base_url, "/report_client.html")
         self.assertEqual(status, 200)
         self.assertEqual(headers.get_content_type(), "text/html")
-        self.assertIn(b"browser client arrives in phase 5", body)
+        self.assertIn(b"<title>ERD swarm reports</title>", body)
         self.assertEqual(missing[0], 404)
 
     def test_mutation_methods_are_rejected(self):
