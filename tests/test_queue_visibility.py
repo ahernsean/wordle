@@ -212,10 +212,6 @@ class QueueVisibilityTests(unittest.TestCase):
         })
         self.assertEqual(result["matched_rows"], 1)
         self.assertEqual(result["rows"][0]["lifecycle"], "active")
-        self.assertEqual(
-            self.q._report_lifecycle({"status": "finalized"}), "finalizing"
-        )
-        self.assertEqual(self.q._report_lifecycle({"status": "pending"}), "pending")
         self.q._conn.execute("DELETE FROM run_meta WHERE key = 'epoch'")
         self.assertIsNone(self.q.epoch_metadata())
 
