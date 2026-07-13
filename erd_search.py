@@ -74,7 +74,7 @@ from report_model import (
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
     DEFAULT_CACHE_PATH,
-    DEFAULT_GUESS_LIST_PATH,
+    DEFAULT_CANDIDATE_LIST_PATH,
     DEFAULT_QUEUE_PATH,
 )
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
@@ -82,7 +82,7 @@ from erd_queue import ERDQueue, encode_subset, guess_depth_from_spine
 import erd_swarm
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
-WORDS_FILE = DEFAULT_GUESS_LIST_PATH
+WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 DEFAULT_CACHE = DEFAULT_CACHE_PATH
 DEFAULT_QUEUE = DEFAULT_QUEUE_PATH
 
