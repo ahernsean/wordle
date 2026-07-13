@@ -2,7 +2,7 @@
 # export_and_send.sh — export the phone snapshot, push it over Taildrop, and
 # delete the local copy once the push succeeds.
 #
-# Usage: ./export_and_send.sh <tailnet-device>
+# Usage: ./export_and_send.sh [tailnet-device]   (default: ios-app)
 #
 # The export snapshot is transitory: its job ends when the bytes reach the
 # phone. `tailscale file cp` blocks until the peer has received the file and
@@ -13,11 +13,11 @@
 
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-    echo "Usage: $0 <tailnet-device>" >&2
+if [ $# -gt 1 ]; then
+    echo "Usage: $0 [tailnet-device]   (default: ios-app)" >&2
     exit 2
 fi
-tailnet_device="$1"
+tailnet_device="${1:-ios-app}"
 
 cd "$(dirname "$0")"
 
