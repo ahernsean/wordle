@@ -1,0 +1,298 @@
+"""Tests for terminal rendering and refresh of shared swarm reports."""
+
+from copy import deepcopy
+import io
+import json
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock, patch
+
+import erd_search
+import report_terminal
+from report_terminal import DisplayOrder, WatchSession, render_overview
+
+
+def overview_report():
+    return {
+        "schema_version": 1,
+        "report_kind": "overview",
+        "generated_at": 1000,
+        "selector": None,
+        "filters": {},
+        "sources": {
+            "queue": {
+                "path": "queue.sqlite3", "ok": True, "error": None,
+                "epoch": 4, "label": "packed", "git_sha": "abcdef12",
+            },
+            "telemetry": {
+                "path": "telemetry.sqlite3", "ok": True, "error": None,
+            },
+            "cache": {
+                "path": "cache.sqlite3", "ok": True, "error": None,
+            },
+        },
+        "data": {
+            "queue_counts": {
+                "pending_branch_count": 12,
+                "active_user_branch_count": 1,
+                "active_cooperative_branch_count": 0,
+                "finalizing_branch_count": 0,
+                "done_branch_count": 20,
+            },
+            "cache_summary": {
+                "exact_branch_count": 200,
+                "recent_exact_branch_count": 5,
+                "loss_branch_count": 3,
+            },
+            "worker_totals": {
+                "cache_hit_count": 80,
+                "cache_miss_count": 20,
+                "solved_evaluation_count": 40,
+                "erd_cutoff_evaluation_count": 50,
+                "remaining_depth_pruned_evaluation_count": 10,
+            },
+            "branches": [{
+                "branch_reference": "0123456789ab",
+                "branch_key_hex": "010203",
+                "lifecycle": "active",
+                "raw_status": "in_progress",
+                "answer_count": 33,
+                "candidate_count": 100,
+                "completed_candidate_count": 25,
+                "bulk_completed_candidate_count": 5,
+                "priority": 10,
+                "is_cooperative": False,
+                "source_word": "salet",
+                "source_pattern": "-----",
+                "best_guess": "crane",
+                "best_guess_is_answer": True,
+                "best_erd": 2.25,
+                "best_max_remaining_depth": 3,
+                "budget": 4,
+                "guess_depth": 2,
+                "spine": [
+                    {"word": "salet", "pattern": "-----", "word_is_answer": True},
+                    {"word": "crane", "pattern": "y----", "word_is_answer": True},
+                ],
+                "worker_count": 1,
+                "created_at": 900,
+                "search_node_count": 12345,
+                "ceiling": None,
+            }],
+            "workers": [{
+                "worker_id": "worker-2",
+                "worker_number": "2",
+                "pid": 42,
+                "updated_at": 995,
+                "is_live": True,
+                "branch_reference": "0123456789ab",
+                "branch_key_hex": "010203",
+                "candidate_index": 7,
+                "claim_started_at": 990,
+                "completed_claim_count": 12,
+                "current_candidate": "nurdy",
+                "current_candidate_is_answer": True,
+                "current_max_guess_depth": 5,
+                "current_node_count": 900,
+                "nodes_per_second": 45.5,
+                "descent": [],
+                "cache_hit_count": 80,
+                "cache_miss_count": 20,
+                "solved_evaluation_count": 40,
+                "erd_cutoff_evaluation_count": 50,
+                "remaining_depth_pruned_evaluation_count": 10,
+                "best_guess": "crane",
+                "best_erd": 2.25,
+                "bound_erd": 2.5,
+            }],
+        },
+    }
+
+
+def view_args(**overrides):
+    values = {
+        "watch": None,
+        "format": "text",
+        "no_color": False,
+        "queue_path": "queue.sqlite3",
+        "cache_path": "cache.sqlite3",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class FakeInput(io.StringIO):
+    def __init__(self, text="", tty=False):
+        super().__init__(text)
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
+
+    def fileno(self):
+        return 10
+
+
+class OverviewRendererTest(unittest.TestCase):
+    def test_text_contains_report_semantics_without_ansi(self):
+        output = render_overview(overview_report(), color=False, width=100)
+        self.assertIn("queue: ok", output)
+        self.assertIn("pending 12", output)
+        self.assertIn("@0123456789ab", output)
+        self.assertIn("d=2", output)
+        self.assertIn("max-d=3", output)
+        self.assertIn("W2", output)
+        self.assertNotIn("\033", output)
+
+    def test_narrow_rendering_respects_width(self):
+        output = render_overview(overview_report(), color=False, width=48)
+        self.assertTrue(all(len(line) <= 48 for line in output.splitlines()))
+
+    def test_progress_and_worker_changes_are_semantically_colored(self):
+        previous = overview_report()
+        current = deepcopy(previous)
+        current["data"]["branches"][0]["completed_candidate_count"] += 1
+        current["data"]["workers"][0]["candidate_index"] += 1
+        output = render_overview(
+            current, previous_report=previous, color=True, width=100
+        )
+        self.assertIn(report_terminal.GREEN + "  @0123456789ab", output)
+        self.assertIn(report_terminal.RED + "    W2", output)
+
+    def test_ticking_timestamps_alone_are_not_highlighted(self):
+        previous = overview_report()
+        current = deepcopy(previous)
+        current["generated_at"] += 1
+        current["data"]["workers"][0]["updated_at"] += 1
+        output = render_overview(
+            current, previous_report=previous, color=True, width=100,
+            display_order=DisplayOrder(),
+        )
+        self.assertNotIn(report_terminal.GREEN, output)
+        self.assertNotIn(report_terminal.RED, output)
+
+    def test_reordered_input_keeps_prior_identity_order(self):
+        first = overview_report()
+        second_branch = deepcopy(first["data"]["branches"][0])
+        second_branch.update({
+            "branch_reference": "bbbbbbbbbbbb",
+            "branch_key_hex": "bbbb",
+        })
+        first["data"]["branches"].append(second_branch)
+        display_order = DisplayOrder()
+        render_overview(first, width=100, display_order=display_order)
+        reordered = deepcopy(first)
+        reordered["data"]["branches"].reverse()
+        output = render_overview(
+            reordered, previous_report=first, width=100,
+            display_order=display_order,
+        )
+        self.assertLess(output.index("@0123456789ab"), output.index("@bbbbbbbbbbbb"))
+
+    def test_unavailable_queue_still_renders_cache(self):
+        report = overview_report()
+        report["sources"]["queue"].update({"ok": False, "error": "locked"})
+        output = render_overview(report, width=100)
+        self.assertIn("queue: unavailable: locked", output)
+        self.assertIn("exact 200", output)
+
+
+class ViewSessionTest(unittest.TestCase):
+    def test_json_output_round_trips_exact_report(self):
+        report = overview_report()
+        output = io.StringIO()
+        with patch("report_terminal.collect_report", return_value=report):
+            WatchSession(
+                view_args(format="json"), FakeInput(), output, io.StringIO()
+            ).run()
+        self.assertEqual(json.loads(output.getvalue()), report)
+
+    def test_jsonl_watch_emits_parseable_lines(self):
+        first = overview_report()
+        second = deepcopy(first)
+        second["generated_at"] += 1
+        output = io.StringIO()
+        with (
+            patch("report_terminal.collect_report", side_effect=[first, second]),
+            patch("report_terminal.time.sleep", side_effect=[None, KeyboardInterrupt]),
+        ):
+            WatchSession(
+                view_args(format="jsonl", watch=1.0), FakeInput(), output,
+                io.StringIO(),
+            ).run()
+        lines = output.getvalue().splitlines()
+        self.assertEqual([json.loads(line) for line in lines], [first, second])
+        self.assertNotIn("\033", output.getvalue())
+
+    def test_non_tty_watch_has_separators_and_no_control_codes(self):
+        report = overview_report()
+        output = io.StringIO()
+        with (
+            patch("report_terminal.collect_report", return_value=report),
+            patch("report_terminal.time.sleep", side_effect=KeyboardInterrupt),
+        ):
+            WatchSession(
+                view_args(watch=1.0), FakeInput(), output, io.StringIO()
+            ).run()
+        self.assertIn("--- generated_at=1000 ---", output.getvalue())
+        self.assertNotIn("\033", output.getvalue())
+
+    def test_shrinking_section_clears_old_lines(self):
+        output = io.StringIO()
+        session = WatchSession(view_args(watch=1.0), FakeInput(tty=True), output)
+        session.previous_sections = [
+            ("header", ["one", "two", "three"]),
+            ("cache", ["cache"]),
+        ]
+        session._refresh_sections([
+            ("header", ["one"]),
+            ("cache", ["cache"]),
+        ])
+        self.assertGreaterEqual(output.getvalue().count(report_terminal.CLEAR_LINE), 3)
+        self.assertIn("\033[J", output.getvalue())
+
+    def test_tty_failure_retries_and_restores_terminal(self):
+        report = overview_report()
+        output = io.StringIO()
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
+        )
+        session._collect = Mock(side_effect=[RuntimeError("temporary"), report])
+        session._wait_for_refresh = Mock(side_effect=[True, False])
+        terminal_values = [0, 0, 0, 0]
+        with (
+            patch("report_terminal.termios.tcgetattr", return_value=terminal_values),
+            patch("report_terminal.termios.tcsetattr") as set_attributes,
+        ):
+            session.run()
+        self.assertIn("view: temporary", output.getvalue())
+        self.assertIn("ERD swarm overview", output.getvalue())
+        self.assertIn("\033[?25h", output.getvalue())
+        self.assertGreaterEqual(set_attributes.call_count, 2)
+
+
+class ViewParserTest(unittest.TestCase):
+    def test_invalid_json_watch_and_short_interval_are_argparse_errors(self):
+        for arguments in (
+            ["erd_search.py", "view", "--format", "json", "--watch"],
+            ["erd_search.py", "view", "--watch", "0.1"],
+        ):
+            with self.subTest(arguments=arguments):
+                with patch("sys.argv", arguments), patch("sys.stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        erd_search.main()
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_view_cli_delegates_valid_arguments(self):
+        with (
+            patch("sys.argv", ["erd_search.py", "view", "--format", "jsonl"]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        args = run_view.call_args.args[0]
+        self.assertEqual(args.format, "jsonl")
+        self.assertIsNone(args.watch)
+
+
+if __name__ == "__main__":
+    unittest.main()

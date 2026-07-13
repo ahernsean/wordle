@@ -11,6 +11,8 @@ restart         Restart the supervisor via systemd (systemctl --user restart):
 status          Read-only progress snapshot: queue counts, cache throughput,
                 per-worker heartbeats.  --watch loops the display.
 
+view            Shared report overview in text, JSON, or watched JSON Lines.
+
 run             Start the supervisor directly (without systemd), for
                 development or one-shot use.  All output goes to erd_search.log.
 
@@ -83,6 +85,19 @@ DEFAULT_CACHE = DEFAULT_CACHE_PATH
 DEFAULT_QUEUE = DEFAULT_QUEUE_PATH
 
 logger = logging.getLogger('wordle')
+
+
+def _view_watch_interval(value):
+    interval = float(value)
+    if interval < 0.2:
+        raise argparse.ArgumentTypeError("watch interval must be at least 0.2 seconds")
+    return interval
+
+
+def cmd_view(args):
+    from report_terminal import run_view
+
+    run_view(args)
 
 
 # ---------------------------------------------------------------------------
@@ -2071,6 +2086,16 @@ def main():
                         metavar='SECONDS',
                         help='Repeat every SECONDS (default 30)')
 
+    # -- view --
+    p_view = sub.add_parser('view', help='View shared swarm reports')
+    p_view.add_argument('--watch', nargs='?', const=30.0,
+                        type=_view_watch_interval, metavar='SECONDS')
+    p_view.add_argument('--format', choices=('text', 'json', 'jsonl'),
+                        default='text')
+    p_view.add_argument('--no-color', action='store_true')
+    p_view.add_argument('--queue-path', default=DEFAULT_QUEUE, metavar='PATH')
+    p_view.add_argument('--cache-path', default=DEFAULT_CACHE, metavar='PATH')
+
     # -- cache-status --
     p_cs = sub.add_parser('cache-status',
                            help='Show ERD cache coverage for a word')
@@ -2220,6 +2245,8 @@ def main():
     p_rst.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     args = parser.parse_args()
+    if args.cmd == 'view' and args.format == 'json' and args.watch is not None:
+        parser.error('--format json cannot be used with --watch; use jsonl')
     _normalize_queue_cli_args(args)
 
     if args.cmd == 'queue':
@@ -2247,6 +2274,7 @@ def main():
         'restart': cmd_restart,
         'run': cmd_run,
         'status': cmd_status,
+        'view': cmd_view,
     }
     dispatch[args.cmd](args)
 
