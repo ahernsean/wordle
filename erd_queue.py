@@ -103,9 +103,17 @@ def guess_depth_from_spine(spine) -> int:
 # the file — never by deleting from a live queue.  Separate files also give
 # telemetry inserts their own write lock, so they never serialize against
 # claim transactions.
+#
+# journal_size_limit caps how large the -wal file is left after a checkpoint
+# completes (500MB); it bounds runaway growth on a run where checkpoint()
+# calls are merely infrequent, independent of the periodic checkpoint the
+# supervisor and workers each perform (see checkpoint()). It cannot help if
+# checkpoints are blocked outright — the limit only applies at the moment a
+# checkpoint succeeds and the WAL resets.
 _QUEUE_SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+PRAGMA journal_size_limit=524288000;
 
 CREATE TABLE IF NOT EXISTS pending_branches (
     branch_key     BLOB    NOT NULL,
@@ -317,6 +325,7 @@ CREATE TABLE IF NOT EXISTS telemetry_epoch (
 _TELEMETRY_SCHEMA_SQL = """
 PRAGMA telemetry.journal_mode=WAL;
 PRAGMA telemetry.synchronous=NORMAL;
+PRAGMA telemetry.journal_size_limit=524288000;
 
 -- One row per bundle a worker has reported on: the nodes actually spent and
 -- the wall-clock span of evaluating it (straggler/reclaim-window diagnostic
@@ -745,6 +754,21 @@ class ERDQueue:
 
     def close(self):
         self._conn.close()
+
+    def checkpoint(self):
+        """Fold the WAL into the main database file (PRAGMA wal_checkpoint(TRUNCATE)).
+
+        A TRUNCATE checkpoint only shrinks the -wal file back to zero when it
+        can take the database's exclusive lock; under sustained concurrent
+        claim/heartbeat traffic it may checkpoint what it can without
+        truncating. Called periodically rather than relying on SQLite's
+        default passive auto-checkpoint, which can be outpaced by write
+        volume and never reclaim the file (see journal_size_limit above).
+        """
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError as exc:
+            logger.warning("wal_checkpoint(TRUNCATE) failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Populate queue

@@ -489,6 +489,7 @@ class _BranchWorker:
         self.queue.clear_heartbeat(self.name)
         self.score_cache.checkpoint()
         self.score_cache.close()
+        self.queue.checkpoint()
         self.queue.close()
 
     def request_stop(self):
@@ -698,6 +699,7 @@ class _BranchWorker:
         if force or now - self._last_checkpoint > CHECKPOINT_SECONDS:
             self._flush_cost_model_buffer()
             self.score_cache.checkpoint()
+            self.queue.checkpoint()
             self._last_checkpoint = now
 
     def _check_ram(self):  # pragma: no cover

@@ -997,10 +997,15 @@ def cmd_run(args):
     logger.info('Started %d workers (supervisor pid=%d).', args.workers, os.getpid())
 
     q = ERDQueue(args.queue)
+    last_checkpoint = time.time()
     while not stop_event.is_set():
         time.sleep(5)
         if stop_event.is_set():
             break
+
+        if time.time() - last_checkpoint > erd_swarm.CHECKPOINT_SECONDS:
+            q.checkpoint()
+            last_checkpoint = time.time()
 
         for wid, (p, started_at) in list(procs.items()):
             age = time.time() - started_at
@@ -1040,6 +1045,7 @@ def cmd_run(args):
             print('\nQueue empty — all branches done.')
             stop_event.set()
 
+    q.checkpoint()
     q.close()
     logger.info('Supervisor stopping all workers...')
     for wid, (p, _) in procs.items():

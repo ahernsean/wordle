@@ -382,6 +382,23 @@ class TestMetaKV(_TmpQueue):
         self.assertEqual(self.q.get_meta("k"), "v2")
 
 
+class TestCheckpoint(_TmpQueue):
+    def _wal_size(self):
+        wal_path = os.path.join(self._tmp.name, "q.sqlite3-wal")
+        return os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+
+    def test_checkpoint_truncates_wal_after_writes(self):
+        for i in range(50):
+            self.q.add_pending_many(
+                [(f"{i:05d}".encode(), 1, 0, None, 0)])
+        self.assertGreater(self._wal_size(), 0)
+        self.q.checkpoint()
+        self.assertEqual(self._wal_size(), 0)
+
+    def test_checkpoint_does_not_raise_on_empty_queue(self):
+        self.q.checkpoint()  # no rows written yet — must be a no-op, not an error
+
+
 class TestClaimNext(_TmpQueue):
     def test_claim_next_returns_none_when_queue_empty(self):
         self.assertIsNone(self.q.claim_next("worker-0"))
