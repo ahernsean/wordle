@@ -72,6 +72,10 @@ CHECKPOINT_JITTER = 0.25
 # claim boundary (workers stay off the queue database between polls).
 PAUSE_POLL_SECONDS = 2.0
 DISK_CHECK_SECONDS = 30       # disk fullness check throttle (workers)
+# A branch still status='finalized' this long after finalized_at has a dead
+# finalizer (a live one completes the cache write + delete in milliseconds)
+# and is reopened by a waiting sibling.
+FINALIZE_TAKEOVER_SECONDS = 60
 PROGRESS_LOG_SECONDS = 120   # log a mid-candidate progress line this often
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
@@ -1179,12 +1183,16 @@ class _BranchWorker:
 
     # -- finalize -----------------------------------------------------------
 
-    def maybe_finalize(self, branch_key, words, n_candidates):
-        """If every candidate is done, finalize the branch exactly once."""
+    def maybe_finalize(self, branch_key, words, n_candidates) -> bool:
+        """If every candidate is done, finalize the branch exactly once.
+
+        Returns True when this worker completed the finalize; False when
+        candidates remain or a rival holds the finalize (see
+        _await_rival_finalize for why the rival may be dead)."""
         if self.queue.branch_done_candidates(branch_key) < n_candidates:
-            return
+            return False
         if not self.queue.try_finalize_branch(branch_key):  # pragma: no cover
-            return  # another worker won the finalize
+            return False  # another worker won the finalize
         meta = self.queue.read_branch_meta(branch_key)
         (best_guess, best_erd, max_depth, tainted, budget,
          ceiling, cut_occurred) = meta
@@ -1291,6 +1299,28 @@ class _BranchWorker:
             self.queue.mark_done(branch_key)    # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
+        return True
+
+    def _await_rival_finalize(self, branch_key, words, n_words, n_candidates):
+        """Every candidate is done but a rival holds the finalize.
+
+        A live rival completes the cache write + delete within milliseconds.
+        One killed between winning try_finalize_branch and deleting the row
+        leaves the branch 'finalized' forever — try_finalize_branch refuses
+        non-'open' rows, so without intervention every waiting sibling spins
+        silently at full CPU.  Heartbeat first (this wait must stay visible
+        and must not get this worker's parent claims reclaimed), then reopen
+        the row once it has been 'finalized' past FINALIZE_TAKEOVER_SECONDS
+        and complete the finalize from its intact claims and meta."""
+        self._heartbeat(branch_key, n_words, None, None, None, None,
+                        force=True)
+        if self.queue.reclaim_stale_finalize(branch_key,
+                                             FINALIZE_TAKEOVER_SECONDS):
+            logger.warning('%s reopened branch (%d words): finalizer died '
+                           'mid-finalize', self.name, n_words)
+            self.maybe_finalize(branch_key, words, n_candidates)
+            return
+        time.sleep(0.05)
 
     # -- recursive cooperative solving --------------------------------------
 
@@ -1506,7 +1536,10 @@ class _BranchWorker:
                         self.maybe_finalize(branch_key, words, self.n_candidates)
                     self._maybe_checkpoint()    # drain WAL during deep solving
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
-                    self.maybe_finalize(branch_key, words, self.n_candidates)
+                    if not self.maybe_finalize(branch_key, words,
+                                               self.n_candidates):
+                        self._await_rival_finalize(branch_key, words, n_words,
+                                                   self.n_candidates)
                 else:  # pragma: no cover
                     # Every candidate is claimed but coverage isn't complete: some
                     # are held by other workers.  Heartbeat first (so THIS worker,
@@ -1659,8 +1692,11 @@ class _BranchWorker:
                 # retry, rather than abandoning the branch one candidate short of
                 # finalizing (which would strand it forever).
                 if self.queue.branch_done_candidates(branch_key) >= n_candidates:
-                    self.maybe_finalize(branch_key, words, n_candidates)
-                    break
+                    if self.maybe_finalize(branch_key, words, n_candidates):
+                        break
+                    self._await_rival_finalize(branch_key, words,
+                                               branch['n_words'], n_candidates)
+                    continue
                 self._heartbeat(branch_key, branch['n_words'], None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
@@ -1670,8 +1706,8 @@ class _BranchWorker:
             if self.evaluate_bundle(branch_key, words, branch['n_words'], bundle_id,
                                     indices, forced, budget=budget):
                 if self.queue.branch_done_candidates(branch_key) >= n_candidates:
-                    self.maybe_finalize(branch_key, words, n_candidates)
-                    break
+                    if self.maybe_finalize(branch_key, words, n_candidates):
+                        break
 
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no cover

@@ -604,6 +604,36 @@ class TestWorkerDiskAndPause(unittest.TestCase):
         self.assertEqual(w.queue.checkpoint_paused.call_count, 1)
 
 
+class TestRivalFinalizeRecovery(unittest.TestCase):
+    """A finalizer killed between try_finalize_branch and delete_branch must
+    not wedge waiting siblings: the wait heartbeats, and past
+    FINALIZE_TAKEOVER_SECONDS the row is reopened and completed."""
+
+    def test_maybe_finalize_returns_false_when_rival_holds(self):
+        w = _bare_worker()
+        w.queue.branch_done_candidates.return_value = w.n_candidates
+        w.queue.try_finalize_branch.return_value = False
+        self.assertFalse(w.maybe_finalize(b"k", BRANCH, w.n_candidates))
+
+    def test_await_rival_reopens_stale_finalize_and_completes_it(self):
+        w = _bare_worker()
+        w.queue.reclaim_stale_finalize.return_value = True
+        with mock.patch.object(w, "maybe_finalize") as finalize, \
+                mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._await_rival_finalize(b"k", BRANCH, len(BRANCH), 10)
+        finalize.assert_called_once()
+        sleep.assert_not_called()
+        # The wait stays visible: liveness was written before the takeover.
+        w.queue.heartbeat.assert_called_once()
+
+    def test_await_rival_sleeps_while_finalizer_is_fresh(self):
+        w = _bare_worker()
+        w.queue.reclaim_stale_finalize.return_value = False
+        with mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._await_rival_finalize(b"k", BRANCH, len(BRANCH), 10)
+        sleep.assert_called_once()
+
+
 class TestCooperativeSolveCachedPath(unittest.TestCase):
     """cooperative_solve returns the cached result immediately when the branch
     is already solved in ScoreCache, without claiming or evaluating any candidate."""

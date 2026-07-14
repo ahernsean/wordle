@@ -245,6 +245,30 @@ class TestStartupRecovery(_TmpQueue):
         # The in-flight (done=0) claim is freed.
         self.assertEqual(self.q.claims_for_branch(self.key), [])
 
+    def test_recover_active_branches_reopens_dead_finalize(self):
+        # A finalizer killed between try_finalize_branch and delete_branch
+        # leaves the row 'finalized' with no live owner; recovery reopens it.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        self.assertTrue(self.q.try_finalize_branch(self.key))
+        self.q.recover_active_branches()
+        row = self.q.get_branch(self.key)
+        self.assertEqual(row["status"], "open")
+        self.assertIsNone(row["finalized_at"])
+        self.assertTrue(self.q.try_finalize_branch(self.key))
+
+    def test_reclaim_stale_finalize(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        self.assertTrue(self.q.try_finalize_branch(self.key))
+        # A fresh finalize belongs to a live rival: not reclaimable.
+        self.assertFalse(self.q.reclaim_stale_finalize(self.key, 60))
+        # Past the takeover window it is reclaimable, exactly once.
+        self.q._conn.execute(
+            "UPDATE active_branches SET finalized_at = finalized_at - 120 "
+            "WHERE branch_key = ?", (self.key,))
+        self.assertTrue(self.q.reclaim_stale_finalize(self.key, 60))
+        self.assertEqual(self.q.get_branch(self.key)["status"], "open")
+        self.assertFalse(self.q.reclaim_stale_finalize(self.key, 60))
+
     def test_recover_active_branches_preserves_completed_claims(self):
         # User-queued branch: has a pending_branches row.
         d0_key = self.key

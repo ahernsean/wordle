@@ -1523,6 +1523,21 @@ class ERDQueue:
         """, (now, branch_key))
         return cur.rowcount == 1
 
+    def reclaim_stale_finalize(self, branch_key, timeout_seconds: int) -> bool:
+        """Reopen a branch whose finalizer died mid-finalize.
+
+        The worker that wins try_finalize_branch completes the cache write and
+        delete_branch within milliseconds; a row still status='finalized'
+        after timeout_seconds has no live finalizer, and without intervention
+        every waiting sibling spins on it forever.  Returns True if this call
+        reopened the row (the caller should then re-run maybe_finalize)."""
+        cutoff = int(time.time()) - timeout_seconds
+        cur = self._conn.execute("""
+            UPDATE active_branches SET status = 'open', finalized_at = NULL
+            WHERE branch_key = ? AND status = 'finalized' AND finalized_at < ?
+        """, (branch_key, cutoff))
+        return cur.rowcount == 1
+
     def delete_branch(self, branch_key):
         """Remove a finished branch and its claim/packer rows to bound the queue DB.
 
@@ -1612,6 +1627,15 @@ class ERDQueue:
 
         Returns (n_branches_resumed, n_claims_freed).
         """
+        # A row stuck in status='finalized' had its finalizer killed between
+        # winning try_finalize_branch and completing the cache write + delete.
+        # No live worker can ever finish it — try_finalize_branch refuses
+        # non-'open' rows, so every visitor spins on it forever.  Reopen it;
+        # its claims and meta are intact, so the next visitor re-runs the
+        # finalize from where the dead worker left off.
+        self._conn.execute(
+            "UPDATE active_branches SET status = 'open', finalized_at = NULL "
+            "WHERE status = 'finalized'")
         n_branches_resumed = self._conn.execute(
             "SELECT COUNT(*) FROM active_branches").fetchone()[0]
         # Cut results are a delivery channel to waiting parents, and a restart
