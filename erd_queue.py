@@ -105,9 +105,11 @@ def guess_depth_from_spine(spine) -> int:
 # claim transactions.
 #
 # journal_size_limit caps how large the -wal file is left after a checkpoint
-# (500MB); it bounds runaway growth even on a run where checkpoint() calls are
-# infrequent or repeatedly blocked, independent of the periodic checkpoint the
-# supervisor and workers each perform (see checkpoint()).
+# completes (500MB); it bounds runaway growth on a run where checkpoint()
+# calls are merely infrequent, independent of the periodic checkpoint the
+# supervisor and workers each perform (see checkpoint()). It cannot help if
+# checkpoints are blocked outright — the limit only applies at the moment a
+# checkpoint succeeds and the WAL resets.
 _QUEUE_SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -323,6 +325,7 @@ CREATE TABLE IF NOT EXISTS telemetry_epoch (
 _TELEMETRY_SCHEMA_SQL = """
 PRAGMA telemetry.journal_mode=WAL;
 PRAGMA telemetry.synchronous=NORMAL;
+PRAGMA telemetry.journal_size_limit=524288000;
 
 -- One row per bundle a worker has reported on: the nodes actually spent and
 -- the wall-clock span of evaluating it (straggler/reclaim-window diagnostic

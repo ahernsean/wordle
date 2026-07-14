@@ -511,8 +511,7 @@ class TestSpineComposition(unittest.TestCase):
 
 class TestMaybeCheckpoint(unittest.TestCase):
     """_maybe_checkpoint(force=True) always checkpoints both the score cache
-    and the queue (the WAL runaway fix requires both, not just the cache);
-    force=False respects the CHECKPOINT_SECONDS timer."""
+    and the queue; force=False respects the CHECKPOINT_SECONDS timer."""
 
     def test_force_true_always_checkpoints(self):
         import time

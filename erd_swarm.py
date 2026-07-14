@@ -489,6 +489,7 @@ class _BranchWorker:
         self.queue.clear_heartbeat(self.name)
         self.score_cache.checkpoint()
         self.score_cache.close()
+        self.queue.checkpoint()
         self.queue.close()
 
     def request_stop(self):
