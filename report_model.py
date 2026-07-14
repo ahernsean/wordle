@@ -154,21 +154,24 @@ def resolve_selector_branch(
     )
 
 
-def resolve_branch_reference(queue, digest_prefix) -> bytes:
+def resolve_branch_reference(queue, digest_prefix) -> dict:
     matches = queue.branch_rows_for_reference_prefix(digest_prefix)
     if not matches:
-        raise ValueError(f"branch reference @{digest_prefix} not found")
+        raise ValueError(
+            f"branch reference @{digest_prefix} not found; use the branch spine "
+            "for cache-only state after queue completion"
+        )
     if len(matches) > 1:
         descriptions = []
         for row in matches:
             reference = branch_reference(bytes(row["branch_key"]))
-            spine = row.get("spine") or row.get("source_word") or "unknown spine"
+            spine = queue.row_spine_text(row) or "unknown spine"
             descriptions.append(f"@{reference} {spine}")
         raise ValueError(
             f"branch reference @{digest_prefix} is ambiguous: "
             + "; ".join(descriptions)
         )
-    return bytes(matches[0]["branch_key"])
+    return matches[0]
 
 
 def branch_reference(branch_key: bytes) -> str:
@@ -485,12 +488,12 @@ def _selector_payload(selector):
     }
 
 
-def _semantic_report(report_kind, sources, selector, generated_at, data):
+def _report_envelope(report_kind, sources, generated_at, data, selector=None):
     return {
         "schema_version": SCHEMA_VERSION,
         "report_kind": report_kind,
         "generated_at": generated_at,
-        "selector": _selector_payload(selector),
+        "selector": _selector_payload(selector) if selector is not None else None,
         "filters": {},
         "sources": {
             "queue": {
@@ -514,6 +517,12 @@ def _semantic_report(report_kind, sources, selector, generated_at, data):
         },
         "data": data,
     }
+
+
+def _semantic_report(report_kind, sources, selector, generated_at, data):
+    return _report_envelope(
+        report_kind, sources, generated_at, data, selector
+    )
 
 
 def _resolved_branch_payload(resolved):
@@ -609,7 +618,9 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
 
     group_budget = GAME_GUESSES - len(resolved.steps) - 1
     cache_states = {
-        branch_key: ScoreCache._report_cache_state(branch_key, None, None, group_budget)
+        branch_key: ScoreCache.report_branch_state_without_rows(
+            branch_key, group_budget
+        )
         for branch_key in branch_keys
     }
     cache = None
@@ -725,7 +736,6 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     all_answers = load_word_list(sources.answer_list_path)
     answer_set = set(all_answers)
     queue = None
-    queue_rows = []
     pending_row = None
     active_row = None
     heartbeat_rows = []
@@ -736,15 +746,10 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     try:
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
         if request.selector.kind == "branch_reference":
-            branch_key = resolve_branch_reference(
+            referenced_row = resolve_branch_reference(
                 queue, request.selector.branch_reference
             )
-            referenced_row = next(
-                row for row in queue.branch_rows_for_reference_prefix(
-                    request.selector.branch_reference
-                )
-                if bytes(row["branch_key"]) == branch_key
-            )
+            branch_key = bytes(referenced_row["branch_key"])
             resolved = ResolvedBranch(
                 _decode_branch_key(branch_key), branch_key,
                 _steps_from_queue_row(referenced_row), None,
@@ -752,10 +757,6 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         else:
             resolved = resolve_selector_branch(request.selector, all_answers)
             branch_key = resolved.branch_key
-        queue_rows = [
-            row for row in queue.list_queue_rows()
-            if bytes(row["branch_key"]) == branch_key
-        ]
         pending_row = queue.get_pending_branch(branch_key)
         active_row = queue.get_active_branch(branch_key)
         heartbeat_rows = [
@@ -793,7 +794,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ),
     }
     queue_payload = None
-    if queue_rows or active_row is not None or pending_row is not None:
+    if active_row is not None or pending_row is not None:
         queue_payload = {
             "lifecycle": lifecycle,
             "pending_status": _row_value(pending_row, "status"),
@@ -826,7 +827,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     data = {
         "branch": branch_payload,
         "queue": queue_payload,
-        "cache": ScoreCache._report_cache_state(branch_key, None, None, budget),
+        "cache": ScoreCache.report_branch_state_without_rows(branch_key, budget),
         "workers": workers,
         "republished_candidates": [
             {"candidate_index": row["idx"], "republish_count": row["count"]}
@@ -863,34 +864,9 @@ def collect_overview_report(
     if request is not None and request.report_kind not in ("auto", "overview"):
         raise ValueError(f"unsupported report kind: {request.report_kind}")
     generated_at = int(time.time())
-    report = {
-        "schema_version": SCHEMA_VERSION,
-        "report_kind": "overview",
-        "generated_at": generated_at,
-        "selector": None,
-        "filters": {},
-        "sources": {
-            "queue": {
-                "path": sources.queue_path,
-                "ok": False,
-                "error": None,
-                "epoch": None,
-                "label": None,
-                "git_sha": None,
-            },
-            "telemetry": {
-                "path": (
-                    sources.telemetry_path
-                    if sources.telemetry_path is not None
-                    else derive_telemetry_path(sources.queue_path)
-                ),
-                "ok": False,
-                "error": None,
-            },
-            "cache": {"path": sources.cache_path, "ok": False, "error": None},
-        },
-        "data": _empty_data(),
-    }
+    report = _report_envelope(
+        "overview", sources, generated_at, _empty_data()
+    )
     try:
         answer_words = load_word_list(sources.answer_list_path)
         answer_set = set(answer_words)

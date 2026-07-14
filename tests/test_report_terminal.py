@@ -133,6 +133,15 @@ class FakeInput(io.StringIO):
         return 10
 
 
+class FakeOutput(io.StringIO):
+    def __init__(self, tty=False):
+        super().__init__()
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
+
+
 class OverviewRendererTest(unittest.TestCase):
     def test_text_contains_report_semantics_without_ansi(self):
         output = render_overview(overview_report(), color=False, width=100)
@@ -172,6 +181,17 @@ class OverviewRendererTest(unittest.TestCase):
         )
         self.assertNotIn(report_terminal.GREEN, output)
         self.assertNotIn(report_terminal.RED, output)
+
+    def test_stale_and_dead_workers_have_persistent_warning_colors(self):
+        stale = overview_report()
+        stale["data"]["workers"][0]["updated_at"] = 979
+        stale_output = render_overview(stale, color=True, width=100)
+        self.assertIn(report_terminal.AMBER + "    W2", stale_output)
+
+        dead = deepcopy(stale)
+        dead["data"]["workers"][0]["is_live"] = False
+        dead_output = render_overview(dead, color=True, width=100)
+        self.assertIn(report_terminal.RED + "  W2 dead", dead_output)
 
     def test_reordered_input_keeps_prior_identity_order(self):
         first = overview_report()
@@ -326,6 +346,16 @@ class ViewSessionTest(unittest.TestCase):
             ).run()
         self.assertEqual(json.loads(output.getvalue()), report)
 
+    def test_one_shot_jsonl_is_compact(self):
+        report = overview_report()
+        output = io.StringIO()
+        with patch("report_terminal.collect_report", return_value=report):
+            WatchSession(
+                view_args(format="jsonl"), FakeInput(), output, io.StringIO()
+            ).run()
+        self.assertEqual(json.loads(output.getvalue()), report)
+        self.assertNotIn('": ', output.getvalue())
+
     def test_jsonl_watch_emits_parseable_lines(self):
         first = overview_report()
         second = deepcopy(first)
@@ -356,6 +386,19 @@ class ViewSessionTest(unittest.TestCase):
         self.assertIn("--- generated_at=1000 ---", output.getvalue())
         self.assertNotIn("\033", output.getvalue())
 
+    def test_redirected_output_uses_non_tty_watch_even_with_tty_input(self):
+        report = overview_report()
+        output = FakeOutput(tty=False)
+        with (
+            patch("report_terminal.collect_report", return_value=report),
+            patch("report_terminal.time.sleep", side_effect=KeyboardInterrupt),
+        ):
+            WatchSession(
+                view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
+            ).run()
+        self.assertIn("--- generated_at=1000 ---", output.getvalue())
+        self.assertNotIn("\033", output.getvalue())
+
     def test_shrinking_section_clears_old_lines(self):
         output = io.StringIO()
         session = WatchSession(view_args(watch=1.0), FakeInput(tty=True), output)
@@ -370,9 +413,29 @@ class ViewSessionTest(unittest.TestCase):
         self.assertGreaterEqual(output.getvalue().count(report_terminal.CLEAR_LINE), 3)
         self.assertIn("\033[J", output.getvalue())
 
+    def test_growing_section_clears_shifted_separator_row(self):
+        output = io.StringIO()
+        session = WatchSession(view_args(watch=1.0), FakeInput(tty=True), output)
+        session.previous_sections = [
+            ("first", ["one"]),
+            ("second", ["two", "three"]),
+        ]
+        session._refresh_sections([
+            ("first", ["one", "new two", "new three"]),
+            ("second", ["two", "three"]),
+        ])
+        self.assertIn("\033[4;1H" + report_terminal.CLEAR_LINE, output.getvalue())
+
+    def test_stdin_eof_exits_refresh_wait(self):
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput("", tty=True), FakeOutput(tty=True)
+        )
+        with patch("report_terminal.select.select", return_value=([session.input_stream], [], [])):
+            self.assertFalse(session._wait_for_refresh())
+
     def test_tty_failure_retries_and_restores_terminal(self):
         report = overview_report()
-        output = io.StringIO()
+        output = FakeOutput(tty=True)
         session = WatchSession(
             view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
         )
@@ -423,6 +486,22 @@ class ViewParserTest(unittest.TestCase):
                 selector = run_view.call_args.args[0].selector
                 self.assertEqual(selector.kind, "word")
                 self.assertEqual(selector.trailing_word, word.lower())
+
+    def test_claims_and_answers_reach_watch_session_request(self):
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "RAISE -----",
+                "--claims", "--answers",
+            ]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        session = WatchSession(run_view.call_args.args[0])
+        with patch("report_terminal.collect_report") as collect_report:
+            session._collect()
+        request = collect_report.call_args.args[1]
+        self.assertTrue(request.include_claims)
+        self.assertTrue(request.include_answers)
 
 
 if __name__ == "__main__":

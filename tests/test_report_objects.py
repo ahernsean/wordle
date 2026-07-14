@@ -155,8 +155,9 @@ class SemanticReportTest(unittest.TestCase):
     def test_digest_resolution_rejects_zero_and_multiple_matches(self):
         no_matches = unittest.mock.Mock()
         no_matches.branch_rows_for_reference_prefix.return_value = []
-        with self.assertRaisesRegex(ValueError, "not found"):
+        with self.assertRaisesRegex(ValueError, "not found") as raised:
             resolve_branch_reference(no_matches, "1234")
+        self.assertIn("cache-only state", str(raised.exception))
 
         multiple = unittest.mock.Mock()
         multiple.branch_rows_for_reference_prefix.return_value = [
@@ -181,7 +182,9 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(bytes(matches[0]["branch_key"]), first_key)
         self.assertEqual(
-            resolve_branch_reference(queue, branch_reference(first_key)[:6]),
+            bytes(resolve_branch_reference(
+                queue, branch_reference(first_key)[:6]
+            )["branch_key"]),
             first_key,
         )
         queue.close()
@@ -295,6 +298,18 @@ class SemanticReportTest(unittest.TestCase):
         )
         self.assertEqual(
             cache.report_branch_state(loss_key, ERD_ALL, 4)["cache_state"],
+            "missing",
+        )
+        legacy_key = ScoreCache.encode_subset(ANSWERS[9:12])
+        cache._conn.execute(
+            """INSERT INTO branch_best_by_policy
+               (branch_key, policy, answer_list_id, best_guess, best_score,
+                updated_at, max_depth, solve_budget)
+               VALUES (?, ?, ?, 'heath', 2.4, ?, NULL, NULL)""",
+            (legacy_key, ERD_ALL, cache.answer_list_id, int(time.time())),
+        )
+        self.assertEqual(
+            cache.report_branch_state(legacy_key, ERD_ALL)["cache_state"],
             "missing",
         )
         cache.close()

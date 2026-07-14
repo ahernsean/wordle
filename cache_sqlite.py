@@ -807,7 +807,7 @@ class ScoreCache:
         }
 
     @staticmethod
-    def _report_cache_state(branch_key, exact_row, loss_row, budget):
+    def _report_cache_state_from_rows(branch_key, exact_row, loss_row, budget):
         answer_count = len(branch_key) // 5
         if answer_count < 2:
             return {
@@ -825,7 +825,9 @@ class ScoreCache:
             solve_budget = exact_row["solve_budget"]
             reusable = False
             if budget is None:
-                reusable = solve_budget is None
+                reusable = (
+                    solve_budget is None and max_remaining_depth is not None
+                )
             elif max_remaining_depth is not None:
                 reusable = (
                     max_remaining_depth <= budget
@@ -868,6 +870,13 @@ class ScoreCache:
             "updated_at": None,
         }
 
+    @staticmethod
+    def report_branch_state_without_rows(branch_key, budget=None):
+        """Return report state when no exact or loss cache rows are available."""
+        return ScoreCache._report_cache_state_from_rows(
+            bytes(branch_key), None, None, budget
+        )
+
     def report_branch_state(self, branch_key, policy, budget=None) -> dict:
         """Return the reusable cache state for one branch and budget."""
         return self.report_branch_states([branch_key], policy, budget)[bytes(branch_key)]
@@ -896,7 +905,7 @@ class ScoreCache:
         exact_by_key = {bytes(row["branch_key"]): row for row in exact_rows}
         loss_by_key = {bytes(row["branch_key"]): row for row in loss_rows}
         return {
-            key: self._report_cache_state(
+            key: self._report_cache_state_from_rows(
                 key, exact_by_key.get(key), loss_by_key.get(key), budget
             )
             for key in keys

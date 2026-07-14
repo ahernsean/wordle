@@ -480,7 +480,7 @@ _TELEMETRY_TABLES = (
 )
 
 
-def _derive_telemetry_path(db_path: str) -> str:
+def derive_telemetry_path(db_path: str) -> str:
     """Default telemetry file path for a queue at db_path: the sibling file
     <stem>_telemetry<ext> (erd_queue.sqlite3 -> erd_queue_telemetry.sqlite3).
     ':memory:' maps to ':memory:', which attaches as an independent private
@@ -489,13 +489,6 @@ def _derive_telemetry_path(db_path: str) -> str:
         return ":memory:"
     root, ext = os.path.splitext(db_path)
     return f"{root}_telemetry{ext}"
-
-
-def derive_telemetry_path(db_path: str) -> str:
-    """Return the telemetry database path paired with a queue database path."""
-    return _derive_telemetry_path(db_path)
-
-
 class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
@@ -506,7 +499,7 @@ class ERDQueue:
                                      isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         if telemetry_path is None:
-            telemetry_path = _derive_telemetry_path(db_path)
+            telemetry_path = derive_telemetry_path(db_path)
         self.telemetry_path = telemetry_path
         self._conn.execute("ATTACH DATABASE ? AS telemetry", (telemetry_path,))
         self._conn.executescript(_QUEUE_SCHEMA_SQL)
@@ -1696,7 +1689,9 @@ class ERDQueue:
         return lambda r: (0 if r["status"] in ("in_progress", "open") else 1,
                           -(r["priority"] or 0), -r["n_words"], r["branch_key_hex"])
 
-    def _row_spine_text(self, row):
+    @staticmethod
+    def row_spine_text(row):
+        """Return the most specific recorded spine text for a queue row."""
         if row.get("spine"):
             return row["spine"]
         if row.get("source_word") and row.get("source_pattern_text"):
