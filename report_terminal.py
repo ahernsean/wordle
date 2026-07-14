@@ -19,6 +19,7 @@ RED = "\033[31m"
 AMBER = "\033[33m"
 RESET = "\033[0m"
 CLEAR_LINE = "\033[K"
+WORKER_STALE_SECONDS = 20
 
 
 @dataclass
@@ -122,9 +123,11 @@ def _semantic_branch_class(branch, previous_branch):
     return "red" if branch != previous_branch else None
 
 
-def _semantic_worker_class(worker, previous_worker):
+def _semantic_worker_class(worker, previous_worker, generated_at):
     if not worker["is_live"]:
         return "red"
+    if generated_at - worker["updated_at"] > WORKER_STALE_SECONDS:
+        return "amber"
     if previous_worker is None:
         return "green"
     ignored = {"updated_at"}
@@ -302,7 +305,9 @@ def _render_worker_line(
         line += f"  nodes/s={_abbreviate_number(worker.get('nodes_per_second'))}"
         if worker.get("current_max_guess_depth") is not None:
             line += f"  d={worker['current_max_guess_depth']}"
-    semantic_class = _semantic_worker_class(worker, previous_worker)
+    semantic_class = _semantic_worker_class(
+        worker, previous_worker, generated_at
+    )
     return _colorize(_fit(line, width), semantic_class, color)
 
 
@@ -360,6 +365,7 @@ class WatchSession:
             self.args.format == "text"
             and self.args.watch is not None
             and self.input_stream.isatty()
+            and self.output_stream.isatty()
             and not self.args.no_color
         )
 
@@ -368,7 +374,7 @@ class WatchSession:
             self._run_once()
         elif self.args.format == "jsonl":
             self._run_jsonl_watch()
-        elif self.input_stream.isatty():
+        elif self.input_stream.isatty() and self.output_stream.isatty():
             self._run_tty_text()
         else:
             self._run_non_tty_text()
@@ -379,7 +385,11 @@ class WatchSession:
         except Exception as error:
             self.error_stream.write(f"view: {error}\n")
             raise SystemExit(1)
-        if self.args.format in ("json", "jsonl"):
+        if self.args.format == "jsonl":
+            self.output_stream.write(
+                json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+        elif self.args.format == "json":
             self.output_stream.write(json.dumps(report, sort_keys=True) + "\n")
         else:
             self.output_stream.write(render_overview(
@@ -459,6 +469,10 @@ class WatchSession:
             if old_lines == lines and index < first_shift:
                 continue
             start_line = new_starts[index]
+            if index > 0:
+                self.output_stream.write(
+                    f"\033[{start_line - 1};1H{CLEAR_LINE}"
+                )
             self.output_stream.write(f"\033[{start_line};1H")
             for line in lines:
                 self.output_stream.write(line + CLEAR_LINE + "\n")
@@ -482,7 +496,7 @@ class WatchSession:
             if not ready:
                 continue
             character = self.input_stream.read(1)
-            if character in ("q", "Q", "\x04"):
+            if character in ("", "q", "Q", "\x04"):
                 return False
             if character == " ":
                 return True
