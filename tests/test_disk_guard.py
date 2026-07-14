@@ -150,6 +150,16 @@ class TestSupervisorCheckpoint(_TmpQueue):
         self.assertIsNone(self.q.get_meta("checkpoint_pause"))
 
 
+class TestFmtSize(unittest.TestCase):
+    def test_thousands_separator_on_large_values(self):
+        self.assertEqual(erd_search._fmt_size(1234 * 2 ** 30), "1,234G")
+        self.assertEqual(erd_search._fmt_size(1000 * 2 ** 20), "1,000M")
+
+    def test_small_values_unchanged(self):
+        self.assertEqual(erd_search._fmt_size(512 * 2 ** 20), "512M")
+        self.assertEqual(erd_search._fmt_size(5 * 2 ** 30 // 2), "2.5G")
+
+
 class TestDiskStatusLine(_TmpQueue):
     def _stats(self, used_fraction, avail=100 * 10 ** 9):
         used = int(avail * used_fraction / (1 - used_fraction))
@@ -173,8 +183,9 @@ class TestDiskStatusLine(_TmpQueue):
     def test_fill_rate_and_eta(self):
         now = int(time.time())
         st = self._stats(0.5)
-        # 30 MB/s of fill over the last 60 seconds.
-        samples = [[now - 60, st["avail_bytes"] + 60 * 30_000_000],
+        # 30 MiB/s of fill over the last 60 seconds; rate is in binary units
+        # to match the fullness/WAL sizes on the same line.
+        samples = [[now - 60, st["avail_bytes"] + 60 * 30 * 2 ** 20],
                    [now, st["avail_bytes"]]]
         with mock.patch.object(erd_search, "disk_stats", return_value=st):
             line = erd_search._disk_status_line(self.path, samples)
@@ -183,12 +194,25 @@ class TestDiskStatusLine(_TmpQueue):
     def test_freeing_disk_is_labelled_freeing(self):
         now = int(time.time())
         st = self._stats(0.5)
-        samples = [[now - 60, st["avail_bytes"] - 60 * 30_000_000],
+        samples = [[now - 60, st["avail_bytes"] - 60 * 30 * 2 ** 20],
                    [now, st["avail_bytes"]]]
         with mock.patch.object(erd_search, "disk_stats", return_value=st):
             line = erd_search._disk_status_line(self.path, samples)
         self.assertIn("freeing 30.0 MB/s", line)
         self.assertNotIn("filling", line)
+
+    def test_slow_rate_reads_steady_not_zero(self):
+        # A fill below the 0.1 MiB/s display resolution must read "steady",
+        # never "filling 0.0 MB/s": the report threshold and the display
+        # resolution have to agree.
+        now = int(time.time())
+        st = self._stats(0.5)
+        samples = [[now - 100, st["avail_bytes"] + 100 * 30_000],  # ~30 kB/s
+                   [now, st["avail_bytes"]]]
+        with mock.patch.object(erd_search, "disk_stats", return_value=st):
+            line = erd_search._disk_status_line(self.path, samples)
+        self.assertIn("steady", line)
+        self.assertNotIn("0.0 MB/s", line)
 
     def test_stale_samples_show_no_rate(self):
         now = int(time.time())

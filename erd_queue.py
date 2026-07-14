@@ -821,9 +821,9 @@ class ERDQueue:
         busy, log_frames, checkpointed = row[0], row[1], row[2]
         if busy:
             logger.warning(
-                "wal_checkpoint(%s) incomplete: busy=1 log=%d checkpointed=%d "
-                "wal_bytes=%d", mode, log_frames, checkpointed,
-                self.wal_size_bytes())
+                "wal_checkpoint(%s) incomplete: busy=1 log=%s checkpointed=%s "
+                "wal_bytes=%s", mode, f"{log_frames:,}", f"{checkpointed:,}",
+                f"{self.wal_size_bytes():,}")
         return busy, log_frames, checkpointed
 
     def wal_size_bytes(self) -> int:

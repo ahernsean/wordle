@@ -985,6 +985,10 @@ QUEUE_WAL_QUIESCE_BYTES = 2 * 1024 ** 3
 # How long the supervisor retries a quiesced TRUNCATE before giving up until
 # the next checkpoint cycle.
 TRUNCATE_RETRY_SECONDS = 15
+# Fill/drain rates below this magnitude read as "steady".  The status line
+# shows the rate to 0.1 MiB/s, so a smaller threshold would print rates that
+# round to "0.0 MB/s".
+DISK_RATE_FLOOR_BYTES = 2 ** 20 // 10   # 0.1 MiB/s
 
 
 def _disk_guard(queue, queue_path) -> bool:
@@ -1630,13 +1634,14 @@ def _fmt_fill_eta(seconds):
 
 
 def _fmt_size(n_bytes):
-    """Binary-unit size string matching df -h's numbers."""
+    """Binary-unit size string matching df -h's numbers, with thousands
+    separators so large byte counts stay readable."""
     gib = n_bytes / 2 ** 30
     if gib >= 100:
-        return f'{gib:.0f}G'
+        return f'{gib:,.0f}G'
     if gib >= 1:
         return f'{gib:.1f}G'
-    return f'{n_bytes / 2 ** 20:.0f}M'
+    return f'{n_bytes / 2 ** 20:,.0f}M'
 
 
 def _disk_status_line(queue_path, samples):
@@ -1664,15 +1669,15 @@ def _disk_status_line(queue_path, samples):
         dt = fresh[-1][0] - fresh[0][0]
         filled = fresh[0][1] - fresh[-1][1]     # avail shrank = filling
         if dt > 0:
-            rate = filled / dt
-            if rate > 10_000:                   # >10 kB/s: worth reporting
+            rate = filled / dt                  # bytes/s; positive = filling
+            if rate > DISK_RATE_FLOOR_BYTES:
                 avail_at_stop = (1 - DISK_STOP_FRACTION) * capacity
                 eta = max(st['avail_bytes'] - avail_at_stop, 0) / rate
-                line += (f'  filling {rate / 1e6:.1f} MB/s: '
+                line += (f'  filling {rate / 2 ** 20:.1f} MB/s: '
                          f'{100 * DISK_STOP_FRACTION:.0f}% in '
                          f'~{_fmt_fill_eta(eta)}')
-            elif rate < -10_000:
-                line += f'  freeing {-rate / 1e6:.1f} MB/s'
+            elif rate < -DISK_RATE_FLOOR_BYTES:
+                line += f'  freeing {-rate / 2 ** 20:.1f} MB/s'
             else:
                 line += '  steady'
     return line
