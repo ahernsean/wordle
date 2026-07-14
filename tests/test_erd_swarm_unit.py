@@ -510,7 +510,8 @@ class TestSpineComposition(unittest.TestCase):
 
 
 class TestMaybeCheckpoint(unittest.TestCase):
-    """_maybe_checkpoint(force=True) always checkpoints;
+    """_maybe_checkpoint(force=True) always checkpoints both the score cache
+    and the queue (the WAL runaway fix requires both, not just the cache);
     force=False respects the CHECKPOINT_SECONDS timer."""
 
     def test_force_true_always_checkpoints(self):
@@ -519,6 +520,7 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w._last_checkpoint = time.time()   # just checkpointed — timer not yet expired
         w._maybe_checkpoint(force=True)
         w.score_cache.checkpoint.assert_called_once()
+        w.queue.checkpoint.assert_called_once()
 
     def test_no_checkpoint_before_interval_without_force(self):
         import time
@@ -526,6 +528,7 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w._last_checkpoint = time.time()   # timer still fresh
         w._maybe_checkpoint(force=False)
         w.score_cache.checkpoint.assert_not_called()
+        w.queue.checkpoint.assert_not_called()
 
 
 class TestCooperativeSolveCachedPath(unittest.TestCase):
