@@ -22,6 +22,7 @@ import math
 import os
 import random
 import signal
+import sqlite3
 import time
 
 import pattern_matrix as pattern_matrix_module
@@ -438,6 +439,7 @@ class _BranchWorker:
         self._last_ram_check = time.time()
         self._last_disk_check = time.time()
         self._last_pause_check = 0.0
+        self._pause_active = False
         self._cand_max_depth = 0     # deepest guess_depth reached this candidate
         # Live search probe (transparency): a monotonic node counter plus the
         # active descent spine, so a long candidate evaluation never looks
@@ -720,20 +722,31 @@ class _BranchWorker:
             self.queue.checkpoint("PASSIVE")
             self._last_checkpoint = now
 
-    def _respect_checkpoint_pause(self):
-        """Between claims, stay off the queue database while the supervisor's
-        checkpoint_pause flag is set (compute in progress is unaffected; the
-        flag self-expires, so a dead supervisor cannot wedge the swarm).
-
-        The flag read is itself a queue read, so it is throttled: per-claim
-        polling would add exactly the reader overlap the quiesce exists to
-        clear."""
+    def _checkpoint_pause_active(self) -> bool:
+        """Cached view of the supervisor's checkpoint_pause flag, re-read at
+        most once per PAUSE_POLL_SECONDS.  The flag check is itself a queue
+        read, so polling it unthrottled from hot paths (heartbeats, the
+        mid-evaluation bound refresh) would add exactly the reader overlap
+        the quiesce exists to clear.  The cache makes pause transitions
+        visible up to PAUSE_POLL_SECONDS late, well inside the supervisor's
+        TRUNCATE retry window."""
         now = time.time()
-        if now - self._last_pause_check < PAUSE_POLL_SECONDS:
+        if now - self._last_pause_check >= PAUSE_POLL_SECONDS:
+            self._last_pause_check = now
+            self._pause_active = self.queue.checkpoint_paused()
+        return self._pause_active
+
+    def _respect_checkpoint_pause(self):
+        """At a claim boundary, stay off the queue database while the
+        supervisor's checkpoint_pause flag is set (compute in progress is
+        unaffected; the flag self-expires, so a dead supervisor cannot wedge
+        the swarm).  Once waiting, the flag is polled directly — the sleep
+        between polls is the throttle."""
+        if not self._checkpoint_pause_active():
             return
-        self._last_pause_check = now
         while not self.cancel() and self.queue.checkpoint_paused():
             time.sleep(PAUSE_POLL_SECONDS)
+        self._pause_active = False
 
     def _check_disk(self):
         now = time.time()
@@ -746,8 +759,15 @@ class _BranchWorker:
                 '%s disk %.0f%% full (>= %.0f%% stop threshold) — latching '
                 'swarm down', self.name, 100 * used_fraction,
                 100 * DISK_STOP_FRACTION)
-            self.queue.set_disk_stop(
-                f'{self.name}: disk {100 * used_fraction:.1f}% full')
+            try:
+                self.queue.set_disk_stop(
+                    f'{self.name}: disk {100 * used_fraction:.1f}% full')
+            except sqlite3.OperationalError as exc:
+                # A 100%-full disk can fail this very write; the worker still
+                # stops, and run's startup live-fullness check keeps the swarm
+                # down even without the latch row.
+                logger.critical('%s could not write disk_stop latch: %s',
+                                self.name, exc)
             self.request_stop()
 
     def _check_ram(self):  # pragma: no cover
@@ -779,7 +799,7 @@ class _BranchWorker:
         # Defer unforced heartbeats while the supervisor is quiescing writers
         # for a TRUNCATE checkpoint; the pause window is well inside
         # HB_TIMEOUT_SECONDS, so liveness is never in question.
-        if not force and self.queue.checkpoint_paused():
+        if not force and self._checkpoint_pause_active():
             self._last_hb = now
             self._nodes_at_last_hb = self._nodes
             return
@@ -859,7 +879,12 @@ class _BranchWorker:
     def _claim_bundle(self, branch_key, n_candidates, words):
         """claim_next_bundle for `branch_key`, supplying this worker's
         (cached) packing stats.  Returns (bundle_id, indices, forced) or None
-        — see ERDQueue.claim_next_bundle."""
+        — see ERDQueue.claim_next_bundle.
+
+        Every claim path (top-level loop, helping, deep solving, focused)
+        funnels through here, so this is where a quiescing supervisor's pause
+        flag is honoured before touching the queue."""
+        self._respect_checkpoint_pause()
         order, cost_lower_bound = self._packing_stats(branch_key, words)
         return self.queue.claim_next_bundle(
             branch_key, self.name, n_candidates, order, cost_lower_bound,
@@ -899,7 +924,13 @@ class _BranchWorker:
             # it makes the candidate a cut, recorded via mark_branch_cut below.
             nonlocal shared_best, last_refresh
             now = time.time()
-            if now - last_refresh > BEST_REFRESH_SECONDS:
+            # Skipped while the supervisor quiesces for TRUNCATE: this refresh
+            # opens a read snapshot into the WAL every BEST_REFRESH_SECONDS
+            # per worker, which is the traffic that blocks truncation.  The
+            # cached bound stays valid — bounds only tighten — so the cost is
+            # slightly weaker pruning for the pause window.
+            if (now - last_refresh > BEST_REFRESH_SECONDS
+                    and not self._checkpoint_pause_active()):
                 _, new, _ = self.queue.read_branch_best(branch_key)
                 if new is not None and (shared_best is None or new < shared_best):
                     shared_best = new

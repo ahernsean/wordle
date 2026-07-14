@@ -94,7 +94,7 @@ class TestDiskStopLatch(_TmpQueue):
 
     def test_samples_ring_is_bounded(self):
         for i in range(DISK_SAMPLE_KEEP + 5):
-            self.q.record_disk_sample(1000 - i, i)
+            self.q.record_disk_sample(1000 - i)
         samples = self.q.disk_samples()
         self.assertEqual(len(samples), DISK_SAMPLE_KEEP)
         # Oldest entries fell off the front; the newest is last.
@@ -126,16 +126,24 @@ class TestSupervisorCheckpoint(_TmpQueue):
         self.q.set_meta("k", "v")
         wal_before = self.q.wal_size_bytes()
         with mock.patch.object(erd_search, "QUEUE_WAL_QUIESCE_BYTES", 0):
-            erd_search._supervisor_checkpoint(self.q)
+            erd_search._maybe_quiesce_truncate(self.q)
         # Clearing the pause flag writes a frame into the fresh WAL, so the
         # file is small but not zero after the truncate.
         self.assertLess(self.q.wal_size_bytes(), wal_before)
         self.assertIsNone(self.q.get_meta("checkpoint_pause"))
 
-    def test_below_quiesce_threshold_stays_passive(self):
+    def test_below_quiesce_threshold_never_pauses(self):
         self.q.set_meta("k", "v")
         wal_before = self.q.wal_size_bytes()
         self.assertGreater(wal_before, 0)
+        with mock.patch.object(self.q, "set_checkpoint_pause") as pause:
+            erd_search._maybe_quiesce_truncate(self.q)
+        pause.assert_not_called()
+        self.assertEqual(self.q.wal_size_bytes(), wal_before)
+
+    def test_periodic_checkpoint_is_passive_only(self):
+        self.q.set_meta("k", "v")
+        wal_before = self.q.wal_size_bytes()
         erd_search._supervisor_checkpoint(self.q)
         # PASSIVE backfills but never truncates the file.
         self.assertEqual(self.q.wal_size_bytes(), wal_before)
@@ -166,17 +174,27 @@ class TestDiskStatusLine(_TmpQueue):
         now = int(time.time())
         st = self._stats(0.5)
         # 30 MB/s of fill over the last 60 seconds.
-        samples = [[now - 60, st["avail_bytes"] + 60 * 30_000_000, 0],
-                   [now, st["avail_bytes"], 0]]
+        samples = [[now - 60, st["avail_bytes"] + 60 * 30_000_000],
+                   [now, st["avail_bytes"]]]
         with mock.patch.object(erd_search, "disk_stats", return_value=st):
             line = erd_search._disk_status_line(self.path, samples)
         self.assertIn("filling 30.0 MB/s: 90% in ~", line)
 
+    def test_freeing_disk_is_labelled_freeing(self):
+        now = int(time.time())
+        st = self._stats(0.5)
+        samples = [[now - 60, st["avail_bytes"] - 60 * 30_000_000],
+                   [now, st["avail_bytes"]]]
+        with mock.patch.object(erd_search, "disk_stats", return_value=st):
+            line = erd_search._disk_status_line(self.path, samples)
+        self.assertIn("freeing 30.0 MB/s", line)
+        self.assertNotIn("filling", line)
+
     def test_stale_samples_show_no_rate(self):
         now = int(time.time())
         st = self._stats(0.5)
-        samples = [[now - 4000, st["avail_bytes"] + 10 ** 9, 0],
-                   [now - 3600, st["avail_bytes"], 0]]
+        samples = [[now - 4000, st["avail_bytes"] + 10 ** 9],
+                   [now - 3600, st["avail_bytes"]]]
         with mock.patch.object(erd_search, "disk_stats", return_value=st):
             line = erd_search._disk_status_line(self.path, samples)
         self.assertNotIn("filling", line)

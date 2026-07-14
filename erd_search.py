@@ -1007,15 +1007,23 @@ def _disk_guard(queue, queue_path) -> bool:
 
 
 def _supervisor_checkpoint(queue):
-    """Keep the queue WAL bounded: PASSIVE backfill every cycle, and a
-    quiesced TRUNCATE whenever the file has grown past QUEUE_WAL_QUIESCE_BYTES.
+    """Periodic PASSIVE backfill: folds whatever it can into the main file
+    without taking the writer lock, keeping the backfill debt small so a
+    later quiesced TRUNCATE has little left to do."""
+    queue.checkpoint('PASSIVE')
+
+
+def _maybe_quiesce_truncate(queue):
+    """Called on every supervisor pass: when the WAL has grown past
+    QUEUE_WAL_QUIESCE_BYTES, quiesce workers and TRUNCATE.  The size test is
+    a file stat, so checking each pass caps the sawtooth at roughly the
+    threshold plus one pass of growth — not one full checkpoint cycle's.
 
     TRUNCATE needs a moment with no readers inside the WAL, which a busy swarm
     never yields naturally — so the checkpoint_pause flag asks workers to stay
     off the database (their compute continues) while TRUNCATE retries.  The
-    flag self-expires; failure here is logged and retried next cycle, never
+    flag self-expires; failure here is logged and retried next pass, never
     fatal."""
-    queue.checkpoint('PASSIVE')
     wal_bytes = queue.wal_size_bytes()
     if wal_bytes < QUEUE_WAL_QUIESCE_BYTES:
         return
@@ -1032,7 +1040,7 @@ def _supervisor_checkpoint(queue):
                 return
             if time.time() >= deadline:
                 logger.warning('Queue WAL TRUNCATE still busy after %ds '
-                               '(wal=%.2f GB); will retry next cycle.',
+                               '(wal=%.2f GB); will retry next pass.',
                                TRUNCATE_RETRY_SECONDS,
                                queue.wal_size_bytes() / 1e9)
                 return
@@ -1117,13 +1125,13 @@ def cmd_run(args):
 
             now = time.time()
             if now - last_disk_sample > DISK_SAMPLE_SECONDS:
-                q.record_disk_sample(disk_stats(args.queue)['avail_bytes'],
-                                     q.wal_size_bytes())
+                q.record_disk_sample(disk_stats(args.queue)['avail_bytes'])
                 last_disk_sample = now
 
             if now - last_checkpoint > erd_swarm.CHECKPOINT_SECONDS:
                 _supervisor_checkpoint(q)
                 last_checkpoint = time.time()
+            _maybe_quiesce_truncate(q)
 
             for wid, (p, started_at) in list(procs.items()):
                 age = time.time() - started_at
@@ -1663,6 +1671,8 @@ def _disk_status_line(queue_path, samples):
                 line += (f'  filling {rate / 1e6:.1f} MB/s: '
                          f'{100 * DISK_STOP_FRACTION:.0f}% in '
                          f'~{_fmt_fill_eta(eta)}')
+            elif rate < -10_000:
+                line += f'  freeing {-rate / 1e6:.1f} MB/s'
             else:
                 line += '  steady'
     return line

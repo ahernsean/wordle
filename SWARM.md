@@ -126,10 +126,13 @@ deliberate reclamation:
 
 - **Workers** checkpoint PASSIVE only (backfill without blocking anyone), on
   jittered ~5-minute intervals.
-- **The supervisor** runs a PASSIVE checkpoint every 5 minutes, and when the
-  WAL exceeds 2 GB it quiesces: it sets a `checkpoint_pause` flag that workers
-  honour between claims and heartbeats (evaluation compute continues), retries
-  `wal_checkpoint(TRUNCATE)` for up to 15 s, and clears the flag.  The flag
+- **The supervisor** runs a PASSIVE checkpoint every 5 minutes and stats the
+  WAL file on every 5-second pass; when it exceeds 2 GB it quiesces: it sets
+  a `checkpoint_pause` flag that workers honour at claim acquisition, at
+  heartbeats, and at the mid-evaluation shared-bound refresh (evaluation
+  compute continues), retries `wal_checkpoint(TRUNCATE)` for up to 15 s, and
+  clears the flag.  Worker writes that land mid-quiesce merely serialize
+  behind the truncate's writer lock — only readers can defeat it.  The flag
   self-expires after 60 s, so a dead supervisor cannot wedge the swarm.
   Truncation results (or failures) are logged in `erd_search.log`.
 

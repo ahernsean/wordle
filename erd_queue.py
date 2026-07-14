@@ -1921,11 +1921,11 @@ class ERDQueue:
     # Disk watermark: samples, and the stop latch
     # ------------------------------------------------------------------
 
-    def record_disk_sample(self, avail_bytes: int, wal_bytes: int):
-        """Append (timestamp, avail_bytes, wal_bytes) to a bounded ring in
-        run_meta, for the status display's disk growth rate."""
+    def record_disk_sample(self, avail_bytes: int):
+        """Append (timestamp, avail_bytes) to a bounded ring in run_meta, for
+        the status display's disk growth rate."""
         samples = self.disk_samples()
-        samples.append([int(time.time()), int(avail_bytes), int(wal_bytes)])
+        samples.append([int(time.time()), int(avail_bytes)])
         self.set_meta("disk_samples", json.dumps(samples[-DISK_SAMPLE_KEEP:]))
 
     def disk_samples(self) -> list:

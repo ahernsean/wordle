@@ -16,6 +16,7 @@ they miss:
 """
 import multiprocessing
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -57,6 +58,7 @@ def _bare_worker():
     w._checkpoint_interval = erd_swarm.CHECKPOINT_SECONDS
     w._last_disk_check = 0.0
     w._last_pause_check = 0.0
+    w._pause_active = False
     w._cand_max_depth = 0
     w._cur_depth = 0
     w._spine = {}
@@ -564,18 +566,42 @@ class TestWorkerDiskAndPause(unittest.TestCase):
             w._check_disk()
         stats.assert_not_called()
 
+    def test_check_disk_latch_write_failure_still_stops(self):
+        # A 100%-full disk can make the latch write itself fail; the worker
+        # must still stop cleanly rather than crash out of its run loop.
+        w = _bare_worker()
+        w.queue.set_disk_stop.side_effect = sqlite3.OperationalError(
+            "database or disk is full")
+        with mock.patch.object(erd_swarm, "disk_stats",
+                               return_value={"used_fraction": 0.95}):
+            w._check_disk()
+        self.assertTrue(w._stop_requested)
+
     def test_respect_checkpoint_pause_waits_until_cleared(self):
         w = _bare_worker()
-        w.queue.checkpoint_paused.side_effect = [True, True, False]
+        # One cached entry read, then direct polls: True, True, False.
+        w.queue.checkpoint_paused.side_effect = [True, True, True, False]
         with mock.patch.object(erd_swarm.time, "sleep") as sleep:
             w._respect_checkpoint_pause()
         self.assertEqual(sleep.call_count, 2)
+        # The cache is reset on exit so the next hot-path check doesn't see a
+        # stale pause for a poll interval.
+        self.assertFalse(w._pause_active)
 
     def test_respect_checkpoint_pause_returns_immediately_when_clear(self):
         w = _bare_worker()
         with mock.patch.object(erd_swarm.time, "sleep") as sleep:
             w._respect_checkpoint_pause()
         sleep.assert_not_called()
+
+    def test_pause_flag_read_is_cached(self):
+        # The flag check is itself a queue read; hot paths (heartbeat, bound
+        # refresh) must not poll it more than once per PAUSE_POLL_SECONDS.
+        w = _bare_worker()
+        w.queue.checkpoint_paused.return_value = True
+        self.assertTrue(w._checkpoint_pause_active())
+        self.assertTrue(w._checkpoint_pause_active())
+        self.assertEqual(w.queue.checkpoint_paused.call_count, 1)
 
 
 class TestCooperativeSolveCachedPath(unittest.TestCase):
