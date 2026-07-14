@@ -79,13 +79,17 @@ The display has three sections:
 count, and a disk line:
 
 ```
-Disk: 53.2G/387G (14%)  queue WAL 1.31G  filling 34.1 MB/s: 90% in ~2.1 h
+Disk: 53.2G/387G (14%)  queue WAL 1.31G  filling 34M/s: 90% in ~2.1 h
 ```
 
 Fullness is live (`df` semantics on the filesystem holding the queue).  Above
-80% the figure is drawn in red.  The fill rate and the time remaining until
-the 90% stop threshold come from samples the supervisor records every 30 s;
-with no fresh samples (swarm stopped) only fullness and WAL size appear.
+80% the figure is drawn in red.  The fill rate and WAL size share the same
+binary units (K/M/G) as fullness, so they are directly comparable.  The rate
+and the time remaining until the 90% stop threshold come from a least-squares
+fit over the samples the supervisor records every 30 s (up to ~10 min of
+history), which averages out any single noisy reading rather than taking it
+from just the oldest and newest sample; with no fresh samples (swarm stopped)
+only fullness and WAL size appear.
 
 **Branches in progress** — one row per branch currently being swarmed.  Columns:
 `Source` (opener word + response pattern), `Ans` (answer-word count),

@@ -985,10 +985,12 @@ QUEUE_WAL_QUIESCE_BYTES = 2 * 1024 ** 3
 # How long the supervisor retries a quiesced TRUNCATE before giving up until
 # the next checkpoint cycle.
 TRUNCATE_RETRY_SECONDS = 15
-# Fill/drain rates below this magnitude read as "steady".  The status line
-# shows the rate to 0.1 MiB/s, so a smaller threshold would print rates that
-# round to "0.0 MB/s".
-DISK_RATE_FLOOR_BYTES = 2 ** 20 // 10   # 0.1 MiB/s
+# Fill/drain rates below this magnitude read as "steady": smaller than this
+# and the trend is within statvfs sampling noise (page cache, unrelated
+# processes on the same filesystem).  Anything at or above it is shown via
+# _fmt_size, whose adaptive K/M/G unit keeps a reportable rate from ever
+# rounding to a bare "0".
+DISK_RATE_FLOOR_BYTES = 10_000   # 10 kB/s
 
 
 def _disk_guard(queue, queue_path) -> bool:
@@ -1635,13 +1637,54 @@ def _fmt_fill_eta(seconds):
 
 def _fmt_size(n_bytes):
     """Binary-unit size string matching df -h's numbers, with thousands
-    separators so large byte counts stay readable."""
+    separators so large byte counts stay readable.
+
+    Also used for rates (bytes/s in, ".../s" appended by the caller) so the
+    fill figure is in the same units as the WAL and fullness figures beside
+    it, not decimal MB against their binary GiB/MiB.  The adaptive unit means
+    a nonzero value never collapses to "0": it drops to the next smaller unit
+    (a fixed-M formatter would round anything under ~0.5 MiB away — exactly
+    the range slow fill rates live in).
+    """
     gib = n_bytes / 2 ** 30
     if gib >= 100:
         return f'{gib:,.0f}G'
     if gib >= 1:
         return f'{gib:.1f}G'
-    return f'{n_bytes / 2 ** 20:,.0f}M'
+    mib = n_bytes / 2 ** 20
+    if mib >= 1:
+        return f'{mib:,.0f}M'
+    return f'{n_bytes / 2 ** 10:,.0f}K'
+
+
+def _disk_fill_rate(samples, now):
+    """Bytes/second the filesystem is filling (negative = freeing), by
+    ordinary-least-squares slope of avail_bytes over fresh samples.
+
+    Reducing the ring to an oldest-vs-newest secant, as this once did, meant
+    the rate rode on whichever two samples happened to land at the ends of a
+    ~10 min window, so one noisy statvfs reading (a concurrent checkpoint
+    TRUNCATE, unrelated filesystem churn) swung the whole figure regardless
+    of how many samples sat between.  Regressing over every fresh sample uses
+    that history to average the noise out.  Returns None when there isn't
+    enough fresh history to fit a slope; a stopped swarm has no fresh samples
+    and so shows no rate rather than a stale one.
+    """
+    fresh = [s for s in samples if now - s[0] <= 900]
+    if len(fresh) < 2:
+        return None
+    t0 = fresh[0][0]
+    xs = [s[0] - t0 for s in fresh]
+    ys = [s[1] for s in fresh]
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    variance_x = sum((x - mean_x) ** 2 for x in xs)
+    if variance_x == 0:
+        return None
+    covariance_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    slope = covariance_xy / variance_x    # d(avail_bytes)/dt
+    return -slope                         # positive = filling
 
 
 def _disk_status_line(queue_path, samples):
@@ -1661,25 +1704,18 @@ def _disk_status_line(queue_path, samples):
         wal_bytes = 0
     line = f'Disk: {fullness}  queue WAL {_fmt_size(wal_bytes)}'
 
-    # Rate needs history, and only fresh history: a stopped swarm shows no
-    # rate rather than a stale one.
-    now = time.time()
-    fresh = [s for s in samples if now - s[0] <= 900]
-    if len(fresh) >= 2:
-        dt = fresh[-1][0] - fresh[0][0]
-        filled = fresh[0][1] - fresh[-1][1]     # avail shrank = filling
-        if dt > 0:
-            rate = filled / dt                  # bytes/s; positive = filling
-            if rate > DISK_RATE_FLOOR_BYTES:
-                avail_at_stop = (1 - DISK_STOP_FRACTION) * capacity
-                eta = max(st['avail_bytes'] - avail_at_stop, 0) / rate
-                line += (f'  filling {rate / 2 ** 20:.1f} MB/s: '
-                         f'{100 * DISK_STOP_FRACTION:.0f}% in '
-                         f'~{_fmt_fill_eta(eta)}')
-            elif rate < -DISK_RATE_FLOOR_BYTES:
-                line += f'  freeing {-rate / 2 ** 20:.1f} MB/s'
-            else:
-                line += '  steady'
+    rate = _disk_fill_rate(samples, time.time())
+    if rate is not None:
+        if rate > DISK_RATE_FLOOR_BYTES:
+            avail_at_stop = (1 - DISK_STOP_FRACTION) * capacity
+            eta = max(st['avail_bytes'] - avail_at_stop, 0) / rate
+            line += (f'  filling {_fmt_size(rate)}/s: '
+                     f'{100 * DISK_STOP_FRACTION:.0f}% in '
+                     f'~{_fmt_fill_eta(eta)}')
+        elif rate < -DISK_RATE_FLOOR_BYTES:
+            line += f'  freeing {_fmt_size(-rate)}/s'
+        else:
+            line += '  steady'
     return line
 
 
