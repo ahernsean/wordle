@@ -55,6 +55,7 @@ import logging
 import multiprocessing
 import os
 import select
+import sqlite3
 from collections import defaultdict
 import signal
 import sys
@@ -64,7 +65,8 @@ from datetime import datetime
 
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
-from erd_queue import ERDQueue, encode_subset, guess_depth_from_spine
+from erd_queue import (ERDQueue, encode_subset, guess_depth_from_spine,
+                       disk_stats, DISK_WARN_FRACTION, DISK_STOP_FRACTION)
 import erd_swarm
 
 ANSWER_FILE = 'NYT_wordlist.txt'
@@ -693,6 +695,27 @@ def cmd_queue_add(args):
 # queue clear
 # ---------------------------------------------------------------------------
 
+def cmd_queue_clear_disk_stop(args):
+    """Release the disk-stop latch so `run` will start again."""
+    queue = ERDQueue(args.queue)
+    try:
+        latch = queue.disk_stop()
+        if latch is None:
+            print('No disk-stop latch is set.')
+            return
+        used_fraction = disk_stats(args.queue)['used_fraction']
+        queue.clear_disk_stop()
+        print(f'Disk-stop latch cleared (was: {latch["reason"]}).  '
+              f'Disk is now {100 * used_fraction:.1f}% full.')
+        if used_fraction >= DISK_STOP_FRACTION:
+            print(f'Warning: still at or above the '
+                  f'{100 * DISK_STOP_FRACTION:.0f}% stop threshold — '
+                  f'run will refuse to start until space is freed.',
+                  file=sys.stderr)
+    finally:
+        queue.close()
+
+
 def cmd_queue_clear(args):
     """Wipe all queue state (pending branches, active branches, candidate claims,
     heartbeats, and run metadata).  The ERD cache is not touched.
@@ -953,6 +976,71 @@ def _checkpoint_cache_on_start(cache_path):
         print(f'Startup: WAL checkpoint failed: {e}', file=sys.stderr)
 
 
+# Supervisor disk-sample cadence for the status display's growth rate.
+DISK_SAMPLE_SECONDS = 30
+# Queue WAL size above which the supervisor quiesces workers to TRUNCATE.
+# Below it, PASSIVE backfill each cycle is enough; the WAL file is reused once
+# a TRUNCATE eventually wins, so a bounded WAL is not worth pausing for.
+QUEUE_WAL_QUIESCE_BYTES = 2 * 1024 ** 3
+# How long the supervisor retries a quiesced TRUNCATE before giving up until
+# the next checkpoint cycle.
+TRUNCATE_RETRY_SECONDS = 15
+
+
+def _disk_guard(queue, queue_path) -> bool:
+    """True if the disk crossed DISK_STOP_FRACTION: the swarm must stop and
+    latch down, reserving the remaining space for the rest of the OS."""
+    used_fraction = disk_stats(queue_path)['used_fraction']
+    if used_fraction < DISK_STOP_FRACTION:
+        return False
+    logger.critical('Disk %.1f%% full (>= %.0f%% stop threshold) — stopping '
+                    'swarm and latching down.  Clear with: '
+                    'erd_search.py queue clear-disk-stop',
+                    100 * used_fraction, 100 * DISK_STOP_FRACTION)
+    try:
+        queue.set_disk_stop(f'supervisor: disk {100 * used_fraction:.1f}% full')
+    except sqlite3.OperationalError as exc:
+        # The startup live-fullness check still refuses to run, so the swarm
+        # stays down even without the latch row.
+        logger.critical('Could not write disk_stop latch: %s', exc)
+    return True
+
+
+def _supervisor_checkpoint(queue):
+    """Keep the queue WAL bounded: PASSIVE backfill every cycle, and a
+    quiesced TRUNCATE whenever the file has grown past QUEUE_WAL_QUIESCE_BYTES.
+
+    TRUNCATE needs a moment with no readers inside the WAL, which a busy swarm
+    never yields naturally — so the checkpoint_pause flag asks workers to stay
+    off the database (their compute continues) while TRUNCATE retries.  The
+    flag self-expires; failure here is logged and retried next cycle, never
+    fatal."""
+    queue.checkpoint('PASSIVE')
+    wal_bytes = queue.wal_size_bytes()
+    if wal_bytes < QUEUE_WAL_QUIESCE_BYTES:
+        return
+    logger.info('Queue WAL at %.2f GB — quiescing workers for TRUNCATE.',
+                wal_bytes / 1e9)
+    queue.set_checkpoint_pause(True)
+    try:
+        deadline = time.time() + TRUNCATE_RETRY_SECONDS
+        while True:
+            result = queue.checkpoint('TRUNCATE')
+            if result is not None and result[0] == 0:
+                logger.info('Queue WAL truncated (%.2f GB reclaimed).',
+                            wal_bytes / 1e9)
+                return
+            if time.time() >= deadline:
+                logger.warning('Queue WAL TRUNCATE still busy after %ds '
+                               '(wal=%.2f GB); will retry next cycle.',
+                               TRUNCATE_RETRY_SECONDS,
+                               queue.wal_size_bytes() / 1e9)
+                return
+            time.sleep(0.5)
+    finally:
+        queue.set_checkpoint_pause(False)
+
+
 def cmd_run(args):
     _checkpoint_cache_on_start(args.cache)
     # Apply any pending ScoreCache schema migrations single-threaded now, before
@@ -961,11 +1049,29 @@ def cmd_run(args):
     ScoreCache(args.cache, load_word_list(ANSWER_FILE),
                checkpoint_on_close=False).close()
     queue = ERDQueue(args.queue)
+    latch = queue.disk_stop()
+    if latch is not None:
+        at = datetime.fromtimestamp(latch['at']).isoformat(' ') \
+            if latch.get('at') else 'unknown time'
+        print(f'Refusing to start: disk-stop latch is set ({latch["reason"]}, '
+              f'at {at}).\n'
+              f'Free disk space, then clear it with: '
+              f'erd_search.py queue clear-disk-stop', file=sys.stderr)
+        queue.close()
+        return
+    used_fraction = disk_stats(args.queue)['used_fraction']
+    if used_fraction >= DISK_STOP_FRACTION:
+        queue.set_disk_stop(f'startup: disk {100 * used_fraction:.1f}% full')
+        print(f'Refusing to start: disk {100 * used_fraction:.1f}% full '
+              f'(>= {100 * DISK_STOP_FRACTION:.0f}% stop threshold); '
+              f'latching down.', file=sys.stderr)
+        queue.close()
+        return
     stale = queue.reset_stale_in_progress()
-    nb, nc = queue.reset_active_branches()
+    nb, nc = queue.recover_active_branches()
     if stale or nb or nc:
         print(f'Recovery: {stale} pending rows reset, '
-              f'{nb} in-progress branches / {nc} candidate claims cleared.')
+              f'{nb} active branches resumed, {nc} in-flight claims freed.')
 
     counts = queue.counts_by_status()
     if not counts.get('pending') and not counts.get('in_progress'):
@@ -998,61 +1104,83 @@ def cmd_run(args):
 
     q = ERDQueue(args.queue)
     last_checkpoint = time.time()
+    last_disk_sample = 0.0
     while not stop_event.is_set():
         time.sleep(5)
         if stop_event.is_set():
             break
 
-        if time.time() - last_checkpoint > erd_swarm.CHECKPOINT_SECONDS:
-            q.checkpoint()
-            last_checkpoint = time.time()
+        try:
+            if _disk_guard(q, args.queue):
+                stop_event.set()
+                break
 
-        for wid, (p, started_at) in list(procs.items()):
-            age = time.time() - started_at
-            if not p.is_alive():
-                logger.info('Worker %d exited (age=%.0fs), respawning', wid, age)
-                _reap_worker(q, wid)
-                procs[wid] = _spawn_worker(wid, args, stop_event)
-            elif age > args.recycle_hours * 3600:
-                logger.info('Worker %d recycle-hours hit (age=%.0fs), '
-                            'terminating and respawning', wid, age)
-                p.terminate()
-                p.join(timeout=10)
-                if p.is_alive():
-                    logger.warning('Worker %d did not exit on SIGTERM; killing',
-                                   wid)
-                    p.kill()
+            now = time.time()
+            if now - last_disk_sample > DISK_SAMPLE_SECONDS:
+                q.record_disk_sample(disk_stats(args.queue)['avail_bytes'],
+                                     q.wal_size_bytes())
+                last_disk_sample = now
+
+            if now - last_checkpoint > erd_swarm.CHECKPOINT_SECONDS:
+                _supervisor_checkpoint(q)
+                last_checkpoint = time.time()
+
+            for wid, (p, started_at) in list(procs.items()):
+                age = time.time() - started_at
+                if not p.is_alive():
+                    logger.info('Worker %d exited (age=%.0fs), respawning',
+                                wid, age)
+                    _reap_worker(q, wid)
+                    procs[wid] = _spawn_worker(wid, args, stop_event)
+                elif age > args.recycle_hours * 3600:
+                    logger.info('Worker %d recycle-hours hit (age=%.0fs), '
+                                'terminating and respawning', wid, age)
+                    p.terminate()
                     p.join(timeout=10)
-                _reap_worker(q, wid)
-                procs[wid] = _spawn_worker(wid, args, stop_event)
+                    if p.is_alive():
+                        logger.warning('Worker %d did not exit on SIGTERM; '
+                                       'killing', wid)
+                        p.kill()
+                        p.join(timeout=10)
+                    _reap_worker(q, wid)
+                    procs[wid] = _spawn_worker(wid, args, stop_event)
 
-        # Backstop: free candidate claims held by any worker that died WITHOUT
-        # being reaped above (e.g. it crashed and we haven't noticed yet).  Gated
-        # on heartbeat liveness, so a slow-but-alive worker is never reclaimed.
-        freed = q.reclaim_stale_claims(args.worker_timeout_seconds)
-        if freed:
-            logger.info('Reclaimed %d stale candidate claim(s).', freed)
-        counts = q.counts_by_status()
-        in_flight = len(q.branches_in_progress())
+            # Backstop: free candidate claims held by any worker that died
+            # WITHOUT being reaped above (e.g. it crashed and we haven't
+            # noticed yet).  Gated on heartbeat liveness, so a slow-but-alive
+            # worker is never reclaimed.
+            freed = q.reclaim_stale_claims(args.worker_timeout_seconds)
+            if freed:
+                logger.info('Reclaimed %d stale candidate claim(s).', freed)
+            counts = q.counts_by_status()
+            in_flight = len(q.branches_in_progress())
 
-        # Done when the queue holds no pending or in-progress branches and no
-        # branch is still being swarmed.
-        if (counts.get('pending', 0) == 0
-                and counts.get('in_progress', 0) == 0
-                and in_flight == 0
-                and counts):
-            logger.info('Queue drained — all branches done.')
-            print('\nQueue empty — all branches done.')
+            # Done when the queue holds no pending or in-progress branches and
+            # no branch is still being swarmed.
+            if (counts.get('pending', 0) == 0
+                    and counts.get('in_progress', 0) == 0
+                    and in_flight == 0
+                    and counts):
+                logger.info('Queue drained — all branches done.')
+                print('\nQueue empty — all branches done.')
+                stop_event.set()
+        except sqlite3.OperationalError as exc:
+            # Queue database writes failing (disk full, corruption) must stop
+            # the swarm cleanly, not kill the supervisor with a traceback and
+            # leave zombie workers behind.
+            logger.critical('Queue database error in supervisor loop: %s — '
+                            'stopping swarm.', exc)
             stop_event.set()
 
-    q.checkpoint()
-    q.close()
     logger.info('Supervisor stopping all workers...')
     for wid, (p, _) in procs.items():
         if p.is_alive():
             p.terminate()
     for wid, (p, _) in procs.items():
         p.join(timeout=30)
+    # Workers are gone: the WAL truncates uncontested.
+    q.checkpoint()
+    q.close()
     logger.info('Supervisor exited.')
     print('All workers stopped.')
 
@@ -1485,6 +1613,61 @@ def _redraw_status(args, selected_worker=None, selected_branch=None):
     sys.stdout.flush()
 
 
+def _fmt_fill_eta(seconds):
+    if seconds < 3600:
+        return f'{seconds / 60:.0f} min'
+    if seconds < 172800:
+        return f'{seconds / 3600:.1f} h'
+    return f'{seconds / 86400:.1f} d'
+
+
+def _fmt_size(n_bytes):
+    """Binary-unit size string matching df -h's numbers."""
+    gib = n_bytes / 2 ** 30
+    if gib >= 100:
+        return f'{gib:.0f}G'
+    if gib >= 1:
+        return f'{gib:.1f}G'
+    return f'{n_bytes / 2 ** 20:.0f}M'
+
+
+def _disk_status_line(queue_path, samples):
+    """One-line disk report: fullness (drawn red at DISK_WARN_FRACTION), the
+    queue WAL size, and — when the supervisor's sample ring is fresh — the
+    fill rate with the time remaining until the DISK_STOP_FRACTION stop
+    threshold."""
+    st = disk_stats(queue_path)
+    capacity = st['used_bytes'] + st['avail_bytes']
+    fullness = (f"{_fmt_size(st['used_bytes'])}/{_fmt_size(capacity)} "
+                f"({100 * st['used_fraction']:.0f}%)")
+    if st['used_fraction'] >= DISK_WARN_FRACTION:
+        fullness = f'\033[31m{fullness}\033[0m'
+    try:
+        wal_bytes = os.path.getsize(f'{queue_path}-wal')
+    except OSError:
+        wal_bytes = 0
+    line = f'Disk: {fullness}  queue WAL {_fmt_size(wal_bytes)}'
+
+    # Rate needs history, and only fresh history: a stopped swarm shows no
+    # rate rather than a stale one.
+    now = time.time()
+    fresh = [s for s in samples if now - s[0] <= 900]
+    if len(fresh) >= 2:
+        dt = fresh[-1][0] - fresh[0][0]
+        filled = fresh[0][1] - fresh[-1][1]     # avail shrank = filling
+        if dt > 0:
+            rate = filled / dt
+            if rate > 10_000:                   # >10 kB/s: worth reporting
+                avail_at_stop = (1 - DISK_STOP_FRACTION) * capacity
+                eta = max(st['avail_bytes'] - avail_at_stop, 0) / rate
+                line += (f'  filling {rate / 1e6:.1f} MB/s: '
+                         f'{100 * DISK_STOP_FRACTION:.0f}% in '
+                         f'~{_fmt_fill_eta(eta)}')
+            else:
+                line += '  steady'
+    return line
+
+
 def _print_status(args, selected_worker=None, selected_branch=None,
                   interactive=False):
     now_ts = int(time.time())
@@ -1524,11 +1707,13 @@ def _print_status(args, selected_worker=None, selected_branch=None,
                         if c['done']
                     ]
                     break
+        disk_sample_ring = queue.disk_samples()
         queue.close()
         queue_ok = True
     except Exception as e:
         print(f'Queue unavailable: {e}')
         queue_ok = False
+        disk_sample_ring = []
         counts = {}
         branches = []
         detail_branches = []
@@ -1590,6 +1775,7 @@ def _print_status(args, selected_worker=None, selected_branch=None,
         cache_line += f'  hits {_fmt_pct(hit_pct)} ({_abbrev(hits)}/{_abbrev(hit_total)})'
     if cache_line:
         print(cache_line)
+    print(_disk_status_line(args.queue, disk_sample_ring))
     print()
 
     _section_break('branches', interactive)
@@ -2253,6 +2439,10 @@ def main():
                              help='Reset in_progress rows to pending')
     p_rst.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
+    p_cds = qsub.add_parser('clear-disk-stop',
+                            help='Release the disk-stop latch so run can start')
+    p_cds.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+
     args = parser.parse_args()
     _normalize_queue_cli_args(args)
 
@@ -2270,6 +2460,7 @@ def main():
             'remove': cmd_queue_remove,
             'priority': cmd_queue_priority,
             'reset-stale': cmd_reset_stale,
+            'clear-disk-stop': cmd_queue_clear_disk_stop,
         }
         qdispatch[args.queue_cmd](args)
         return

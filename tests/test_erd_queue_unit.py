@@ -6,7 +6,7 @@ claim_next_bundle, complete_candidate, update_branch_best, read_branch_best,
 mark_branch_tainted, read_branch_meta, branch_done_candidates,
 try_finalize_branch, delete_branch, and branches_in_progress.  What they do
 NOT reach are the operator/supervisor methods only called from erd_search.py:
-reset_active_branches, reset_stale_in_progress, cancel_active_branch,
+recover_active_branches, reset_stale_in_progress, cancel_active_branch,
 status_by_branch_keys, active_branches_by_keys, get_active_branch,
 claims_for_branch, heartbeats_with_branch, worker_counts_by_branch,
 set_meta/get_meta, and total_branches.  claim_next/mark_done are also tested
@@ -232,24 +232,28 @@ class TestStartupRecovery(_TmpQueue):
         self.q.add_pending_many([(self.key, len(WORDS), 0, "salet", 0)])
         self.assertEqual(self.q.reset_stale_in_progress(), 0)
 
-    def test_reset_active_branches_clears_d0_branches_and_claims(self):
+    def test_recover_active_branches_frees_in_flight_claims_only(self):
         # A user-queued branch is identified by its pending_branches row.
         self.q.add_pending_many([(self.key, len(WORDS), 0, None, None)])
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self._claim_one_idx(self.key, "worker-0")
-        n_b, n_c = self.q.reset_active_branches()
+        n_b, n_c = self.q.recover_active_branches()
         self.assertEqual(n_b, 1)
-        self.assertGreaterEqual(n_c, 1)
-        self.assertIsNone(self.q.get_branch(self.key))
+        self.assertEqual(n_c, 1)
+        # The branch row survives so the re-promoting worker adopts it.
+        self.assertIsNotNone(self.q.get_branch(self.key))
+        # The in-flight (done=0) claim is freed.
         self.assertEqual(self.q.claims_for_branch(self.key), [])
 
-    def test_reset_active_branches_preserves_cooperative_branch_progress(self):
-        # User-queued branch: has a pending_branches row, so reset wipes it.
+    def test_recover_active_branches_preserves_completed_claims(self):
+        # User-queued branch: has a pending_branches row.
         d0_key = self.key
         self.q.add_pending_many([(d0_key, len(WORDS), 0, None, None)])
         self.q.create_branch(d0_key, len(WORDS), N_CANDIDATES)
+        idx_done = self._claim_one_idx(d0_key, "worker-0")
+        self.q.complete_candidate(d0_key, idx_done)
 
-        # Cooperative branch: no pending_branches row — must survive reset.
+        # Cooperative branch: no pending_branches row.
         coop_words = WORDS[:3]
         coop_key = ScoreCache.encode_subset(coop_words)
         self.q.create_branch(coop_key, len(coop_words), N_CANDIDATES)
@@ -259,25 +263,19 @@ class TestStartupRecovery(_TmpQueue):
         idx1 = self._claim_one_idx(coop_key, "worker-0")
         self.assertIsNotNone(idx1)
 
-        n_b, n_c = self.q.reset_active_branches()
+        n_b, n_c = self.q.recover_active_branches()
+        self.assertEqual(n_b, 2)
+        self.assertEqual(n_c, 1)
 
-        # User-queued branch is gone.
-        self.assertEqual(n_b, 1)
-        self.assertIsNone(self.q.get_branch(d0_key))
-
-        # Cooperative branch row survives.
-        self.assertIsNotNone(self.q.get_branch(coop_key))
-
-        claims = self.q.claims_for_branch(coop_key)
-        # Completed claim (done=1) is preserved so its progress isn't lost.
-        done_claims = [c for c in claims if c["done"] == 1]
-        self.assertEqual(len(done_claims), 1)
-        self.assertEqual(done_claims[0]["idx"], idx0)
-
-        # Stale in-flight claim (done=0) is freed so the candidate becomes a
-        # re-claimable gap for the next worker.
-        inflight_claims = [c for c in claims if c["done"] == 0]
-        self.assertEqual(inflight_claims, [])
+        # Both branch rows survive, and each keeps its done=1 claims.
+        for key, done_idx in ((d0_key, idx_done), (coop_key, idx0)):
+            self.assertIsNotNone(self.q.get_branch(key))
+            claims = self.q.claims_for_branch(key)
+            done_claims = [c for c in claims if c["done"] == 1]
+            self.assertEqual([c["idx"] for c in done_claims], [done_idx])
+            # Stale in-flight claims (done=0) are freed so those candidates
+            # become re-claimable gaps for the next worker.
+            self.assertEqual([c for c in claims if c["done"] == 0], [])
 
         # The freed gap is not lost, but it isn't immediately reclaimable
         # either: pack_cursor is past it (2), and holes below the cursor are
@@ -597,9 +595,9 @@ class TestCutResults(_TmpQueue):
         self.q.add_cut_result(self.key, budget=5, bound=3.0)
         self.assertEqual(self.q.read_cut_result(self.key), (3.0, 5))
 
-    def test_reset_active_branches_clears_cut_results(self):
+    def test_recover_active_branches_clears_cut_results(self):
         self.q.add_cut_result(self.key, budget=4, bound=2.5)
-        self.q.reset_active_branches()
+        self.q.recover_active_branches()
         self.assertIsNone(self.q.read_cut_result(self.key))
 
 

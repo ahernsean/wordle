@@ -54,6 +54,9 @@ def _bare_worker():
     w._eval_seconds = 0.0
     w._last_claim_complete = 0.0
     w._last_checkpoint = 0.0
+    w._checkpoint_interval = erd_swarm.CHECKPOINT_SECONDS
+    w._last_disk_check = 0.0
+    w._last_pause_check = 0.0
     w._cand_max_depth = 0
     w._cur_depth = 0
     w._spine = {}
@@ -85,6 +88,7 @@ def _bare_worker():
     w.queue = mock.MagicMock()
     w.queue.read_branch_best.return_value = (None, None, None)
     w.queue.get_cost_typical.return_value = None  # cold model by default
+    w.queue.checkpoint_paused.return_value = False
     return w
 
 
@@ -519,7 +523,9 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w._last_checkpoint = time.time()   # just checkpointed — timer not yet expired
         w._maybe_checkpoint(force=True)
         w.score_cache.checkpoint.assert_called_once()
-        w.queue.checkpoint.assert_called_once()
+        # Workers may only checkpoint the queue PASSIVE: TRUNCATE takes the
+        # writer lock and stalls every other worker while it waits on readers.
+        w.queue.checkpoint.assert_called_once_with("PASSIVE")
 
     def test_no_checkpoint_before_interval_without_force(self):
         import time
@@ -528,6 +534,48 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w._maybe_checkpoint(force=False)
         w.score_cache.checkpoint.assert_not_called()
         w.queue.checkpoint.assert_not_called()
+
+
+class TestWorkerDiskAndPause(unittest.TestCase):
+    """_check_disk latches the swarm down at DISK_STOP_FRACTION;
+    _respect_checkpoint_pause keeps the worker off the queue database while
+    the supervisor's quiesce flag is set."""
+
+    def test_check_disk_latches_and_stops_at_threshold(self):
+        w = _bare_worker()
+        with mock.patch.object(erd_swarm, "disk_stats",
+                               return_value={"used_fraction": 0.95}):
+            w._check_disk()
+        w.queue.set_disk_stop.assert_called_once()
+        self.assertTrue(w._stop_requested)
+
+    def test_check_disk_quiet_below_threshold(self):
+        w = _bare_worker()
+        with mock.patch.object(erd_swarm, "disk_stats",
+                               return_value={"used_fraction": 0.5}):
+            w._check_disk()
+        w.queue.set_disk_stop.assert_not_called()
+        self.assertFalse(w._stop_requested)
+
+    def test_check_disk_is_throttled(self):
+        w = _bare_worker()
+        w._last_disk_check = time.time()
+        with mock.patch.object(erd_swarm, "disk_stats") as stats:
+            w._check_disk()
+        stats.assert_not_called()
+
+    def test_respect_checkpoint_pause_waits_until_cleared(self):
+        w = _bare_worker()
+        w.queue.checkpoint_paused.side_effect = [True, True, False]
+        with mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._respect_checkpoint_pause()
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_respect_checkpoint_pause_returns_immediately_when_clear(self):
+        w = _bare_worker()
+        with mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._respect_checkpoint_pause()
+        sleep.assert_not_called()
 
 
 class TestCooperativeSolveCachedPath(unittest.TestCase):
