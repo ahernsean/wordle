@@ -154,10 +154,15 @@ stacks into its `erd_worker_*.log`, latches the swarm down via the same
 the post-mortem has both the stacks and a healthy filesystem.
 
 To attribute *which* traffic is filling the WAL, each worker logs its per-table
-write/read rate into the shared WAL (e.g. `candidate_claims/bulk-eliminate`,
-`candidate_claims/holes-scan(read)`, `candidate_claims/claim`) to its
-`erd_worker_*.log` on each checkpoint cycle — the breakdown the WAL file itself
-does not carry.
+write/read rate into the shared WAL — inserts, updates, and deletes alike (e.g.
+`candidate_claims/bulk-eliminate`, `candidate_claims/holes-scan(read)`,
+`candidate_claims/complete`, `candidate_claims/delete-branch`,
+`candidate_republish/republish-upsert`) — to its `erd_worker_*.log`, the
+breakdown the WAL file itself does not carry.  It runs on a short dedicated
+timer (30 s) from the heartbeat path, not the 5-minute checkpoint, and flushes
+once more on shutdown: a runaway crosses the hard ceiling in ~100 s, so the
+attribution has to be emitted well before then and captured when the ceiling
+trip stops the worker.
 
 ### Disk-stop latch (90%)
 
