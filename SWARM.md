@@ -75,7 +75,21 @@ python3.13 erd_search.py status --watch 10  # refresh every 10 s
 
 The display has three sections:
 
-**Header** — queue counts (pending / done / in-progress) and cache ERD entry count.
+**Header** — queue counts (pending / done / in-progress), cache ERD entry
+count, and a disk line:
+
+```
+Disk: 53.2G/387G (14%)  queue WAL 1.31G  filling 34M/s: 90% in ~2.1 h
+```
+
+Fullness is live (`df` semantics on the filesystem holding the queue).  Above
+80% the figure is drawn in red.  The fill rate and WAL size share the same
+binary units (K/M/G) as fullness, so they are directly comparable.  The rate
+and the time remaining until the 90% stop threshold come from a least-squares
+fit over the samples the supervisor records every 30 s (up to ~10 min of
+history), which averages out any single noisy reading rather than taking it
+from just the oldest and newest sample; with no fresh samples (swarm stopped)
+only fullness and WAL size appear.
 
 **Branches in progress** — one row per branch currently being swarmed.  Columns:
 `Source` (opener word + response pattern), `Ans` (answer-word count),
@@ -105,6 +119,45 @@ Workers log a summary line after each candidate claim completes:
 ```
 claim N done: K nodes in T.1s (R.1/s)  ok=X pruned=Y useless=Z  best=WORD E.EEEE
 ```
+
+---
+
+## Disk safety and WAL maintenance
+
+The queue database's WAL grows as long as readers overlap (SQLite can only
+recycle it in a moment with no read snapshot inside it), so a busy swarm needs
+deliberate reclamation:
+
+- **Workers** checkpoint PASSIVE only (backfill without blocking anyone), on
+  jittered ~5-minute intervals.
+- **The supervisor** runs a PASSIVE checkpoint every 5 minutes and stats the
+  WAL file on every 5-second pass; when it exceeds 2 GB it quiesces: it sets
+  a `checkpoint_pause` flag that workers honour at claim acquisition, at
+  heartbeats, and at the mid-evaluation shared-bound refresh (evaluation
+  compute continues), retries `wal_checkpoint(TRUNCATE)` for up to 15 s, and
+  clears the flag.  Worker writes that land mid-quiesce merely serialize
+  behind the truncate's writer lock — only readers can defeat it.  The flag
+  self-expires after 60 s, so a dead supervisor cannot wedge the swarm.
+  Truncation results (or failures) are logged in `erd_search.log`.
+
+### Disk-stop latch (90%)
+
+If the filesystem holding the queue reaches **90% full**, the swarm stops and
+latches down: the supervisor (or any worker, as a backstop) writes a
+`disk_stop` row into `run_meta`, all processes exit cleanly, and `run` refuses
+to start while the latch is set — including via systemd restarts and reboots.
+The reserved 10% keeps the rest of the OS healthy and leaves room to diagnose.
+
+To bring the swarm back, free disk space first, then release the latch:
+
+```bash
+python3.13 erd_search.py queue clear-disk-stop
+systemctl --user start wordle-erd
+```
+
+Restarts do not discard branch progress: completed candidate claims and the
+branch's running best survive; only claims that were in flight in a killed
+process are freed for re-claim.
 
 ---
 
