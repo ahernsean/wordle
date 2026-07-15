@@ -16,6 +16,7 @@ they miss:
 """
 import multiprocessing
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -54,6 +55,10 @@ def _bare_worker():
     w._eval_seconds = 0.0
     w._last_claim_complete = 0.0
     w._last_checkpoint = 0.0
+    w._checkpoint_interval = erd_swarm.CHECKPOINT_SECONDS
+    w._last_disk_check = 0.0
+    w._last_pause_check = 0.0
+    w._pause_active = False
     w._cand_max_depth = 0
     w._cur_depth = 0
     w._spine = {}
@@ -85,6 +90,7 @@ def _bare_worker():
     w.queue = mock.MagicMock()
     w.queue.read_branch_best.return_value = (None, None, None)
     w.queue.get_cost_typical.return_value = None  # cold model by default
+    w.queue.checkpoint_paused.return_value = False
     return w
 
 
@@ -510,8 +516,8 @@ class TestSpineComposition(unittest.TestCase):
 
 
 class TestMaybeCheckpoint(unittest.TestCase):
-    """_maybe_checkpoint(force=True) always checkpoints;
-    force=False respects the CHECKPOINT_SECONDS timer."""
+    """_maybe_checkpoint(force=True) always checkpoints both the score cache
+    and the queue; force=False respects the CHECKPOINT_SECONDS timer."""
 
     def test_force_true_always_checkpoints(self):
         import time
@@ -519,6 +525,9 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w._last_checkpoint = time.time()   # just checkpointed — timer not yet expired
         w._maybe_checkpoint(force=True)
         w.score_cache.checkpoint.assert_called_once()
+        # Workers may only checkpoint the queue PASSIVE: TRUNCATE takes the
+        # writer lock and stalls every other worker while it waits on readers.
+        w.queue.checkpoint.assert_called_once_with("PASSIVE")
 
     def test_no_checkpoint_before_interval_without_force(self):
         import time
@@ -526,6 +535,103 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w._last_checkpoint = time.time()   # timer still fresh
         w._maybe_checkpoint(force=False)
         w.score_cache.checkpoint.assert_not_called()
+        w.queue.checkpoint.assert_not_called()
+
+
+class TestWorkerDiskAndPause(unittest.TestCase):
+    """_check_disk latches the swarm down at DISK_STOP_FRACTION;
+    _respect_checkpoint_pause keeps the worker off the queue database while
+    the supervisor's quiesce flag is set."""
+
+    def test_check_disk_latches_and_stops_at_threshold(self):
+        w = _bare_worker()
+        with mock.patch.object(erd_swarm, "disk_stats",
+                               return_value={"used_fraction": 0.95}):
+            w._check_disk()
+        w.queue.set_disk_stop.assert_called_once()
+        self.assertTrue(w._stop_requested)
+
+    def test_check_disk_quiet_below_threshold(self):
+        w = _bare_worker()
+        with mock.patch.object(erd_swarm, "disk_stats",
+                               return_value={"used_fraction": 0.5}):
+            w._check_disk()
+        w.queue.set_disk_stop.assert_not_called()
+        self.assertFalse(w._stop_requested)
+
+    def test_check_disk_is_throttled(self):
+        w = _bare_worker()
+        w._last_disk_check = time.time()
+        with mock.patch.object(erd_swarm, "disk_stats") as stats:
+            w._check_disk()
+        stats.assert_not_called()
+
+    def test_check_disk_latch_write_failure_still_stops(self):
+        # A 100%-full disk can make the latch write itself fail; the worker
+        # must still stop cleanly rather than crash out of its run loop.
+        w = _bare_worker()
+        w.queue.set_disk_stop.side_effect = sqlite3.OperationalError(
+            "database or disk is full")
+        with mock.patch.object(erd_swarm, "disk_stats",
+                               return_value={"used_fraction": 0.95}):
+            w._check_disk()
+        self.assertTrue(w._stop_requested)
+
+    def test_respect_checkpoint_pause_waits_until_cleared(self):
+        w = _bare_worker()
+        # One cached entry read, then direct polls: True, True, False.
+        w.queue.checkpoint_paused.side_effect = [True, True, True, False]
+        with mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._respect_checkpoint_pause()
+        self.assertEqual(sleep.call_count, 2)
+        # The cache is reset on exit so the next hot-path check doesn't see a
+        # stale pause for a poll interval.
+        self.assertFalse(w._pause_active)
+
+    def test_respect_checkpoint_pause_returns_immediately_when_clear(self):
+        w = _bare_worker()
+        with mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._respect_checkpoint_pause()
+        sleep.assert_not_called()
+
+    def test_pause_flag_read_is_cached(self):
+        # The flag check is itself a queue read; hot paths (heartbeat, bound
+        # refresh) must not poll it more than once per PAUSE_POLL_SECONDS.
+        w = _bare_worker()
+        w.queue.checkpoint_paused.return_value = True
+        self.assertTrue(w._checkpoint_pause_active())
+        self.assertTrue(w._checkpoint_pause_active())
+        self.assertEqual(w.queue.checkpoint_paused.call_count, 1)
+
+
+class TestRivalFinalizeRecovery(unittest.TestCase):
+    """A finalizer killed between try_finalize_branch and delete_branch must
+    not wedge waiting siblings: the wait heartbeats, and past
+    FINALIZE_TAKEOVER_SECONDS the row is reopened and completed."""
+
+    def test_maybe_finalize_returns_false_when_rival_holds(self):
+        w = _bare_worker()
+        w.queue.branch_done_candidates.return_value = w.n_candidates
+        w.queue.try_finalize_branch.return_value = False
+        self.assertFalse(w.maybe_finalize(b"k", BRANCH, w.n_candidates))
+
+    def test_await_rival_reopens_stale_finalize_and_completes_it(self):
+        w = _bare_worker()
+        w.queue.reclaim_stale_finalize.return_value = True
+        with mock.patch.object(w, "maybe_finalize") as finalize, \
+                mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._await_rival_finalize(b"k", BRANCH, len(BRANCH), 10)
+        finalize.assert_called_once()
+        sleep.assert_not_called()
+        # The wait stays visible: liveness was written before the takeover.
+        w.queue.heartbeat.assert_called_once()
+
+    def test_await_rival_sleeps_while_finalizer_is_fresh(self):
+        w = _bare_worker()
+        w.queue.reclaim_stale_finalize.return_value = False
+        with mock.patch.object(erd_swarm.time, "sleep") as sleep:
+            w._await_rival_finalize(b"k", BRANCH, len(BRANCH), 10)
+        sleep.assert_called_once()
 
 
 class TestCooperativeSolveCachedPath(unittest.TestCase):
