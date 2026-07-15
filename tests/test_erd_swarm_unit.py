@@ -538,6 +538,33 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w.queue.checkpoint.assert_not_called()
 
 
+class TestWALTrafficLogThrottle(unittest.TestCase):
+    """The WAL traffic log runs on its own short timer (not the 5-minute
+    checkpoint), so a fast runaway is attributed before the hard ceiling
+    latches down; force bypasses the throttle for the shutdown flush."""
+
+    def test_throttled_within_window_does_not_snapshot(self):
+        w = _bare_worker()
+        w._last_wal_traffic_log = 1000.0
+        w._log_wal_traffic(1000.0 + 5)   # dt=5s < WAL_TRAFFIC_LOG_SECONDS
+        w.queue.wal_traffic_snapshot.assert_not_called()
+        self.assertEqual(w._last_wal_traffic_log, 1000.0)
+
+    def test_fires_after_window(self):
+        w = _bare_worker()
+        w._last_wal_traffic_log = 1000.0
+        fire_at = 1000.0 + erd_swarm.WAL_TRAFFIC_LOG_SECONDS + 1
+        w._log_wal_traffic(fire_at)
+        w.queue.wal_traffic_snapshot.assert_called_once()
+        self.assertEqual(w._last_wal_traffic_log, fire_at)
+
+    def test_force_bypasses_throttle_for_shutdown_flush(self):
+        w = _bare_worker()
+        w._last_wal_traffic_log = 1000.0
+        w._log_wal_traffic(1000.0 + 1, force=True)   # dt=1s but forced
+        w.queue.wal_traffic_snapshot.assert_called_once()
+
+
 class TestWorkerDiskAndPause(unittest.TestCase):
     """_check_disk latches the swarm down at DISK_STOP_FRACTION;
     _respect_checkpoint_pause keeps the worker off the queue database while
