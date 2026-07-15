@@ -234,6 +234,15 @@ Add renderers for each collection kind and tree layout. Text and JSON consume
 the same envelopes. Phase 2 watch sessions retain sticky order by full
 identity and preserve selected context through refresh.
 
+Queue, worker, cache, and tree rows use phase 2's adaptive layout contract.
+The 50–59-column queue inventory retains full reference, phase, answer count,
+`GuessD`, and worker count. Worker rows retain full worker identity, state,
+age, current candidate, and absolute maximum guess depth. Cache coverage
+retains pattern, answer count, cache state, and full reference. Tree rendering
+switches from indentation to an explicit `GuessD` column when indentation
+would consume the narrow layout; the semantic step and reference remain
+complete. Summary dictionaries wrap across lines at entry boundaries.
+
 ## Tests
 
 Required coverage:
@@ -253,7 +262,9 @@ Required coverage:
 8. Queue rows are not duplicated across user and cooperative state.
 9. Cache distributions obey existing reuse semantics.
 10. Incompatible report/option combinations fail with specific errors.
-11. All legacy inspection tests remain green.
+11. Every collection and tree renderer has exact width/column assertions at
+    50, 55, 59, 60, 79, 80, and 120 columns with production-sized values.
+12. All legacy inspection tests remain green.
 
 ## Acceptance checklist
 
@@ -262,6 +273,7 @@ Required coverage:
 - [ ] Tree is an option over compatible reports, not a report noun.
 - [ ] Tree nodes derive only from extant queue rows and recorded spines.
 - [ ] Cache-only solutions are never reconstructed as topology.
+- [ ] Collection and tree terminal views remain operational at 50 columns.
 - [ ] Legacy inspection commands remain available.
 - [ ] Full test suite passes.
 - [ ] No file outside the phase list is modified.
