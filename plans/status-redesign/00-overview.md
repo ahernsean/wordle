@@ -72,7 +72,7 @@ cache-parent migration, or inferred historical tree in this plan.
 
 | Plan | Deliverable | Depends on |
 |---|---|---|
-| `01-report-model.md` | shared path ownership, report envelope, normalized overview entities, lifecycle semantics, and overview collector | — |
+| `01-report-model.md` | shared path ownership, report envelope, normalized overview entities, branch status/phase semantics, and overview collector | — |
 | `02-terminal-view.md` | terminal overview renderer with text, JSON, and optional watch | 01 |
 | `03a-semantic-reports.md` | selector model plus inferred word and branch reports | 02 |
 | `03b-collection-reports.md` | collection filters, queue/worker/cache reports, and live queue tree layout | 03a |

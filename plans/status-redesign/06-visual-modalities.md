@@ -83,7 +83,7 @@ layout. This item improves navigation rather than creating a second tree:
 - compact overview rail showing collapsed sibling/ancestor activity;
 - “follow worker” action that expands and scrolls to the worker's current
   branch while preserving the selected root;
-- lifecycle/progress badges on collapsed nodes;
+- branch-status/phase badges on collapsed nodes;
 - a reset-focus action returning to the selected context.
 
 On phones, the overview rail collapses to a single context button. This DOM
@@ -92,7 +92,7 @@ scale experience is the required precursor to the landscape plan.
 Acceptance:
 
 - following a moving worker changes focus by full branch identity;
-- active-only filtering never removes the selected context breadcrumb;
+- branch filtering never removes the selected context breadcrumb;
 - Back restores prior tree focus/collapse state.
 
 ## Item E — Candidate grid

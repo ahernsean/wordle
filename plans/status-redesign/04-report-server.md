@@ -103,8 +103,8 @@ Default inferred report. Query parameters:
 |---|---|
 | `selector` | full inferred spine/reference string; omitted means root |
 | `tree` | boolean |
-| `active_only` | boolean |
-| `status` | repeatable lifecycle |
+| `branch_status` | comma-separated `active`, `pending`, `done`, `unqueued`, or `all` |
+| `branch_phase` | comma-separated `queued`, `evaluating`, `finalizing`, `complete`, or `all` |
 | `minimum_answer_count` / `maximum_answer_count` | integer |
 | `budget` / `priority` | integer |
 | `sort` / `limit` | collection controls |
@@ -120,6 +120,9 @@ Default inferred report. Query parameters:
 
 These accept the same compatible selector/filter parameters. A single worker
 uses `worker=N` on the workers endpoint.
+
+The root overview defaults to `branch_status=active`. An explicit `all`
+disables that axis's filter. Other report kinds default to all statuses.
 
 Do not expose positional reserved path names for word/branch reports. They
 remain inferred through `selector` on `/api/view`, so the HTTP and CLI grammar
@@ -138,7 +141,8 @@ Use `urllib.parse.urlsplit` and `parse_qs(..., keep_blank_values=True)`.
 
 - Accept booleans only as `1`, `0`, `true`, or `false`.
 - Reject duplicate scalar parameters.
-- Permit repeated `status` only.
+- Parse each branch filter from one comma-separated scalar value; reject
+  duplicates within the value.
 - Reject unknown parameters.
 - Apply the same minimum/maximum bounds as terminal argparse.
 - Reject URL/request targets longer than 8192 bytes.
@@ -200,14 +204,14 @@ fixture prevents startup rather than failing later during a request.
 Fixtures collectively exercise:
 
 - user and cooperative active branches;
-- pending, finalizing, done, and unqueued lifecycle;
+- valid branch-status and branch-phase combinations;
 - CACHE and QUEUE as explored words;
 - exact, loss, missing, and not-applicable cache states;
 - bulk-eliminated and evaluated candidates;
 - live, idle, finalizing, stale, and dead workers;
 - exact/cut/loss finalization history;
 - cut-reuse misses;
-- active-only tree context;
+- filtered tree context;
 - coordination workload-bucket hotspots.
 
 ## Placeholder client
@@ -226,13 +230,13 @@ Required cases:
 1. Live root view over temporary fresh databases equals a direct
    `collect_report` call in contract shape.
 2. Selector inference returns word and branch reports from the same endpoint.
-3. Tree and active-only parameters reach normalized request state.
+3. Tree and comma-separated branch filters reach normalized request state.
 4. Every explicit report endpoint returns its kind.
 5. CACHE and QUEUE selector requests return word fixtures, never cache/queue
    report fixtures.
 6. Inferred tree, queue tree, and workers tree use distinct fixtures;
    cache/hotspot tree requests return 400 before fixture lookup.
-7. Repeated status is accepted; repeated scalar and unknown parameters are
+7. Comma-separated status and phase values are accepted; repeated scalar and unknown parameters are
    rejected.
 8. Invalid booleans, integers, selector, limit, sample, and overlong target
    return 400.

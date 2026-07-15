@@ -155,7 +155,12 @@ def _branch_eta(branch, generated_at):
     completed = branch["completed_candidate_count"]
     created_at = branch.get("created_at")
     candidate_count = branch["candidate_count"]
-    if not created_at or completed <= 0 or completed >= candidate_count:
+    if (
+        candidate_count is None
+        or not created_at
+        or completed <= 0
+        or completed >= candidate_count
+    ):
         return None
     elapsed = max(0, generated_at - created_at)
     return elapsed * (candidate_count - completed) / completed
@@ -276,8 +281,8 @@ def _render_sections(report, previous_report, color, width, display_order):
         "Queue",
         _fit(
             f"  pending {queue_counts['pending_branch_count']:,}  "
-            f"active {queue_counts['active_user_branch_count']:,} user + "
-            f"{queue_counts['active_cooperative_branch_count']:,} cooperative  "
+            f"evaluating {queue_counts['evaluating_user_branch_count']:,} user + "
+            f"{queue_counts['evaluating_cooperative_branch_count']:,} cooperative  "
             f"finalizing {queue_counts['finalizing_branch_count']:,}  "
             f"done {queue_counts['done_branch_count']:,}",
             width,
@@ -290,16 +295,23 @@ def _render_sections(report, previous_report, color, width, display_order):
         ),
     ]
 
-    branch_lines = ["Active branches"]
+    selected_statuses = report.get("filters", {}).get("branch_statuses") or []
+    status_label = ",".join(selected_statuses) if selected_statuses else "all"
+    branch_lines = [f"Branches (status={status_label})"]
     active_branch_keys = set()
     workers_by_branch = {}
     for worker in workers:
         workers_by_branch.setdefault(worker.get("branch_key_hex"), []).append(worker)
     for branch in branches:
         branch_key = branch["branch_key_hex"]
-        if branch["lifecycle"] == "active":
+        if branch["branch_status"] == "active":
             active_branch_keys.add(branch_key)
         completed = branch["completed_candidate_count"]
+        candidate_count = (
+            branch["candidate_count"]
+            if branch["candidate_count"] is not None
+            else "—"
+        )
         best = "—"
         if branch.get("best_guess"):
             best = branch["best_guess"].upper()
@@ -309,13 +321,13 @@ def _render_sections(report, previous_report, color, width, display_order):
             line = (
                 f"  @{branch['branch_reference']}  "
                 f"guess_depth={branch['guess_depth']}  "
-                f"{completed}/{branch['candidate_count']}"
+                f"{completed}/{candidate_count}"
             )
         else:
             line = (
                 f"  @{branch['branch_reference']}  n={branch['answer_count']} "
                 f"guess_depth={branch['guess_depth']}  "
-                f"{completed}/{branch['candidate_count']}"
+                f"{completed}/{candidate_count}"
             )
             if branch.get("best_max_remaining_depth") is not None:
                 line += (
@@ -325,7 +337,10 @@ def _render_sections(report, previous_report, color, width, display_order):
             if branch["bulk_completed_candidate_count"]:
                 line += f" bulk={branch['bulk_completed_candidate_count']}"
             if width >= 100:
-                line += f"  best={best}  workers={branch['worker_count']}"
+                line += (
+                    f"  phase={branch['branch_phase']}  best={best}  "
+                    f"workers={branch['worker_count']}"
+                )
         if width >= 80:
             line += f"  ETA={_abbreviate_duration(_branch_eta(branch, generated_at))}"
             if branch["spine"]:
@@ -339,7 +354,7 @@ def _render_sections(report, previous_report, color, width, display_order):
             color,
         ))
         for worker in workers_by_branch.get(branch_key, []):
-            if worker["is_live"] and branch["lifecycle"] == "active":
+            if worker["is_live"] and branch["branch_status"] == "active":
                 branch_lines.append(_render_worker_line(
                     worker, previous_workers.get(worker["worker_id"]), generated_at,
                     color, width, indent="    ",
@@ -456,7 +471,9 @@ def _render_word_sections(report, previous_report, color, width, display_order):
             width,
         ),
     ]
-    rows = ["Pattern  Answers  Queue       Cache           Best        Reference"]
+    rows = [
+        "Pattern  Answers  Status    Phase       Cache           Best        Reference"
+    ]
     for group in ordered_groups:
         best = "—"
         if group.get("best_guess"):
@@ -465,7 +482,8 @@ def _render_word_sections(report, previous_report, color, width, display_order):
                 best += f"/{group['best_erd']:.3f}"
         line = (
             f"{group['pattern']:<7}  {group['answer_count']:>7}  "
-            f"{group['lifecycle']:<10}  {group['cache_state']:<14}  "
+            f"{group['branch_status']:<8}  {str(group['branch_phase'] or '—'):<10}  "
+            f"{group['cache_state']:<14}  "
             f"{best:<10}  @{group['branch_reference']}"
         )
         previous_group = previous_groups.get(group["branch_key_hex"])
@@ -490,6 +508,22 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         f"d={branch['guess_depth']} budget={branch['budget']}",
         width,
     )
+    header.append(_fit(
+        f"  status={branch['branch_status']} "
+        f"phase={branch['branch_phase'] or '—'}",
+        width,
+    ))
+    selected_statuses = report.get("filters", {}).get("branch_statuses") or []
+    selected_phases = report.get("filters", {}).get("branch_phases") or []
+    if (
+        (selected_statuses and branch["branch_status"] not in selected_statuses)
+        or (selected_phases and branch["branch_phase"] not in selected_phases)
+    ):
+        header.append(_fit(
+            "  selected detail no longer matches the parent filter; "
+            "back returns to the filtered view",
+            width,
+        ))
     if branch["spine"]:
         header.append(_fit(
             "  " + " ▸ ".join(
@@ -510,7 +544,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         queue_lines = [
             "Queue",
             _fit(
-                f"  {queue['lifecycle']}  priority={queue['priority']}  "
+                f"  status={queue['branch_status']} phase={queue['branch_phase']}  "
+                f"priority={queue['priority']}  "
                 f"progress={progress}  bulk={queue['bulk_completed_candidate_count']}  "
                 f"best={queue['best_guess'] or '—'}  nodes={_abbreviate_number(queue['search_node_count'])}",
                 width,
@@ -639,7 +674,8 @@ def _render_tree_sections(report, width):
             detail = ""
             if node["branch_reference"]:
                 detail = (
-                    f"  @{node['branch_reference']} {node['lifecycle']} "
+                    f"  @{node['branch_reference']} "
+                    f"{node['branch_status']}/{node['branch_phase']} "
                     f"n={node['answer_count']} workers={node['worker_count']}"
                 )
             if node["is_context"]:
@@ -654,11 +690,13 @@ def _render_queue_collection_sections(report, width):
     summary = data.get("summary", {})
     lines = [
         f"Queue rows: {data.get('matched_rows', 0)} matched",
-        _fit(f"  lifecycle={summary.get('branch_count_by_lifecycle', {})}", width),
+        _fit(f"  status={summary.get('branch_count_by_status', {})}", width),
+        _fit(f"  phase={summary.get('branch_count_by_phase', {})}", width),
     ]
     for row in data.get("rows", []):
         lines.append(_fit(
-            f"  @{row['branch_reference']} {row['lifecycle']} "
+            f"  @{row['branch_reference']} "
+            f"{row['branch_status']}/{row['branch_phase']} "
             f"n={row['answer_count']} "
             f"guess_depth={len((row.get('spine') or '').split()) // 2} "
             f"priority={row['priority']} workers={row['worker_count']}",

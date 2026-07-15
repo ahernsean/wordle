@@ -92,7 +92,7 @@ Derive presentation values from report fields:
 - heartbeat ages from `generated_at - updated_at`;
 - node-rate and duration abbreviations.
 
-The report model remains the authority for lifecycle, answer flags,
+The report model remains the authority for branch status/phase, answer flags,
 `guess_depth`, `best_max_remaining_depth`, and identities.
 
 The text view has named sections:

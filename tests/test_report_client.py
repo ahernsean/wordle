@@ -144,20 +144,23 @@ class ReportClientBrowserTest(unittest.TestCase):
           inferredCache: buildAPIURL(parsePageState({search:'?selector=CACHE'})),
           inferredQueue: buildAPIURL(parsePageState({search:'?selector=QUEUE'})),
           explicitCache: buildAPIURL(parsePageState({search:'?kind=cache'})),
-          explicitQueue: buildAPIURL(parsePageState({search:'?kind=queue'}))
+          explicitQueue: buildAPIURL(parsePageState({search:'?kind=queue'})),
+          defaultOverview: buildAPIURL(parsePageState({search:''})),
+          allOverview: buildAPIURL(parsePageState({search:'?branch_status=all'}))
         })""")
         self.assertTrue(result["inferredCache"].startswith("/api/view?"))
         self.assertTrue(result["inferredQueue"].startswith("/api/view?"))
         self.assertEqual(result["explicitCache"], "/api/view/cache")
         self.assertEqual(result["explicitQueue"], "/api/view/queue")
+        self.assertEqual(result["defaultOverview"], "/api/view")
+        self.assertEqual(result["allOverview"], "/api/view?branch_status=all")
 
-    def test_tree_active_only_and_context_node(self):
+    def test_tree_branch_status_filter_and_context_node(self):
         self.apply_selector("RAISE .....")
         self.page.locator("#tree").check()
-        self.page.locator("#active-only").check()
         self.page.wait_for_selector("text=Live queue tree")
         self.assertIn("tree=1", self.page.url)
-        self.assertIn("active_only=1", self.page.url)
+        self.assertIn("branch_status=active", self.page.url)
         self.assertGreater(self.page.locator("text=pending").count(), 0)
 
     def test_word_group_click_builds_full_branch_spine(self):
@@ -173,12 +176,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator(".tree button").first.click()
         self.page.wait_for_selector("text=branch report")
 
-    def test_overview_renders_branch_and_worker_lifecycles(self):
+    def test_overview_renders_branch_status_phase_and_workers(self):
         text = self.page.locator("#report").inner_text()
         self.assertIn("filesystem used", text)
         self.assertIn("12.5%", text)
         self.assertIn("queue WAL", text)
         self.assertIn("active", text)
+        self.assertIn("evaluating", text)
         self.assertIn("finalizing", text)
         self.assertIn("worker-0", text)
         self.assertIn("worker-4", text)
@@ -257,7 +261,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         identities = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view/queue')).json();
           applyReport(report,null,{...__reportClient.getState(),kind:'queue'});
-          const reordered=structuredClone(report);reordered.data.rows.reverse();reordered.data.rows[2].lifecycle='finalizing';
+          const reordered=structuredClone(report);reordered.data.rows.reverse();reordered.data.rows[2].branch_phase='finalizing';
           applyReport(reordered,report,{...__reportClient.getState(),kind:'queue'});
           return [...document.querySelectorAll('[data-identity]')].map(n=>n.dataset.identity);
         }""")
@@ -289,20 +293,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_timeout(100)
         self.assertEqual(self.page.locator("#connection").inner_text(), "connected")
 
-    def test_url_state_round_trips_statuses_and_filters(self):
-        state = self.page.evaluate("""() => parsePageState({search:'?kind=queue&status=pending&status=done&limit=25&sort=nodes&poll=5000'})""")
-        self.assertEqual(state["status"], ["pending", "done"])
+    def test_url_state_round_trips_branch_filters(self):
+        state = self.page.evaluate("""() => parsePageState({search:'?kind=queue&branch_status=pending,done&branch_phase=queued,complete&limit=25&sort=nodes&poll=5000'})""")
+        self.assertEqual(state["branch_status"], ["pending", "done"])
+        self.assertEqual(state["branch_phase"], ["queued", "complete"])
         self.assertEqual(state["limit"], 25)
         self.assertEqual(state["sort"], "nodes")
         self.assertEqual(state["poll"], 5000)
 
     def test_state_normalization_removes_incompatible_controls(self):
         states = self.page.evaluate("""() => ({
-          active: parsePageState({search:'?kind=queue&active_only=1&status=pending'}),
+          overview: parsePageState({search:''}),
+          all: parsePageState({search:'?branch_status=all'}),
+          historical: parsePageState({search:'?kind=hotspots&by=coordination&branch_status=pending&branch_phase=evaluating'}),
           tree: parsePageState({search:'?selector=RAISE%20.....&tree=1&claims=1&answers=1'}),
           word: parsePageState({search:'?selector=RAISE&sort=nodes'})
         })""")
-        self.assertEqual(states["active"]["status"], [])
+        self.assertEqual(states["overview"]["branch_status"], ["active"])
+        self.assertEqual(states["all"]["branch_status"], [])
+        self.assertEqual(states["historical"]["branch_status"], [])
+        self.assertEqual(states["historical"]["branch_phase"], [])
         self.assertFalse(states["tree"]["claims"])
         self.assertFalse(states["tree"]["answers"])
         self.assertEqual(states["word"]["sort"], "")
@@ -310,14 +320,25 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_word_summary_keeps_unfiltered_totals(self):
         text = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view?selector=QUEUE')).json();
-          const active=structuredClone(report);
-          active.data.total_rows=4;active.data.matched_rows=1;
-          active.data.response_groups=active.data.response_groups.filter(row=>row.lifecycle==='active');
-          applyReport(active,null,{...__reportClient.getState(),selector:'QUEUE',active_only:true});
+          const done=structuredClone(report);
+          done.data.total_rows=4;done.data.matched_rows=3;
+          done.data.response_groups=done.data.response_groups.filter(row=>row.branch_status==='done');
+          applyReport(done,null,{...__reportClient.getState(),selector:'QUEUE',branch_status:['done']});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("Shown 1 of 1 matched · 4 total response groups", text)
+        self.assertIn("Shown 3 of 3 matched · 4 total response groups", text)
         self.assertIn("response group count", text)
+
+    def test_selected_detail_remains_visible_after_leaving_parent_filter(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          branch.data.branch.branch_status='done';branch.data.branch.branch_phase='complete';
+          branch.data.queue.branch_status='done';branch.data.queue.branch_phase='complete';
+          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....',branch_status:['active'],branch_phase:[]});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("status\ndone", text)
+        self.assertIn("no longer matches the parent filter", text)
 
     def test_cache_renderer_handles_root_word_and_branch_contracts(self):
         identities = self.page.evaluate("""async () => {

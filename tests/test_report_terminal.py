@@ -16,7 +16,7 @@ from report_terminal import DisplayOrder, WatchSession, render_overview, render_
 
 def overview_report():
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_kind": "overview",
         "generated_at": 1000,
         "selector": None,
@@ -46,8 +46,8 @@ def overview_report():
             },
             "queue_counts": {
                 "pending_branch_count": 12,
-                "active_user_branch_count": 1,
-                "active_cooperative_branch_count": 0,
+                "evaluating_user_branch_count": 1,
+                "evaluating_cooperative_branch_count": 0,
                 "finalizing_branch_count": 0,
                 "done_branch_count": 20,
             },
@@ -66,7 +66,8 @@ def overview_report():
             "branches": [{
                 "branch_reference": "0123456789ab",
                 "branch_key_hex": "010203",
-                "lifecycle": "active",
+                "branch_status": "active",
+                "branch_phase": "evaluating",
                 "raw_status": "in_progress",
                 "answer_count": 33,
                 "candidate_count": 100,
@@ -263,7 +264,8 @@ class OverviewRendererTest(unittest.TestCase):
                 {
                     "pattern": "-----", "answer_count": 8,
                     "branch_reference": "aaaaaaaaaaaa", "branch_key_hex": "aa",
-                    "lifecycle": "unqueued", "priority": None, "worker_count": 0,
+                    "branch_status": "unqueued", "branch_phase": None,
+                    "priority": None, "worker_count": 0,
                     "cache_state": "missing", "best_guess": None,
                     "best_erd": None, "max_remaining_depth": None,
                     "updated_at": None,
@@ -271,7 +273,8 @@ class OverviewRendererTest(unittest.TestCase):
                 {
                     "pattern": "y----", "answer_count": 4,
                     "branch_reference": "bbbbbbbbbbbb", "branch_key_hex": "bb",
-                    "lifecycle": "unqueued", "priority": None, "worker_count": 0,
+                    "branch_status": "unqueued", "branch_phase": None,
+                    "priority": None, "worker_count": 0,
                     "cache_state": "missing", "best_guess": None,
                     "best_erd": None, "max_remaining_depth": None,
                     "updated_at": None,
@@ -302,6 +305,8 @@ class OverviewRendererTest(unittest.TestCase):
                 "guess_depth": 1,
                 "answer_count": 8,
                 "budget": 5,
+                "branch_status": "active",
+                "branch_phase": "evaluating",
             },
             "queue": None,
             "cache": {
@@ -332,6 +337,7 @@ class OverviewRendererTest(unittest.TestCase):
             "branch": {
                 "branch_reference": "0123456789ab", "branch_key_hex": "010203",
                 "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
+                "branch_status": "active", "branch_phase": "evaluating",
             },
             "queue": None,
             "cache": {
@@ -355,6 +361,50 @@ class OverviewRendererTest(unittest.TestCase):
             changed, previous_report=report, color=True, width=100
         )
         self.assertIn(report_terminal.RED + "  idx=4 done", output)
+
+    def test_selected_branch_detail_survives_parent_status_filter(self):
+        report = overview_report()
+        report["report_kind"] = "branch"
+        report["filters"] = {
+            "branch_statuses": ["active"], "branch_phases": [],
+        }
+        report["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
+                "branch_status": "done", "branch_phase": "complete",
+            },
+            "queue": None,
+            "cache": {
+                "cache_state": "exact", "best_guess": "crane",
+                "best_erd": 2.0, "max_remaining_depth": 3,
+            },
+            "workers": [], "republished_candidates": [], "claims": None,
+            "provenance_unknown": False,
+        }
+        output = render_report(report, width=100)
+        self.assertIn("status=done phase=complete", output)
+        self.assertIn("no longer matches the parent filter", output)
+
+    def test_pending_queued_overview_renders_without_candidate_total(self):
+        report = overview_report()
+        report["filters"] = {
+            "branch_statuses": ["pending"], "branch_phases": [],
+        }
+        branch = report["data"]["branches"][0]
+        branch.update({
+            "branch_status": "pending",
+            "branch_phase": "queued",
+            "candidate_count": None,
+            "completed_candidate_count": 0,
+            "created_at": None,
+            "worker_count": 0,
+        })
+        report["data"]["workers"] = []
+        output = render_report(report, width=120)
+        self.assertIn("Branches (status=pending)", output)
+        self.assertIn("0/—", output)
+        self.assertIn("phase=queued", output)
 
     def test_hotspot_render_labels_population_window_and_truncation(self):
         report = overview_report()
@@ -409,7 +459,8 @@ class CollectionRendererTest(unittest.TestCase):
                 ),
                 "branch_key_hex": node_id if word is not None else None,
                 "branch_reference": node_id[:12] if word is not None else None,
-                "lifecycle": "active" if word is not None else None,
+                "branch_status": "active" if word is not None else None,
+                "branch_phase": "evaluating" if word is not None else None,
                 "answer_count": 2 if word is not None else None,
                 "guess_depth": guess_depth,
                 "worker_count": 0,
@@ -442,11 +493,15 @@ class CollectionRendererTest(unittest.TestCase):
 
     def test_queue_worker_and_cache_collections_are_semantically_formatted(self):
         queue_report = self._report("queue", {
-            "summary": {"branch_count_by_lifecycle": {"active": 1}},
+            "summary": {
+                "branch_count_by_status": {"active": 1},
+                "branch_count_by_phase": {"evaluating": 1},
+            },
             "matched_rows": 1,
             "rows": [{
                 "branch_reference": "0123456789ab",
-                "lifecycle": "active",
+                "branch_status": "active",
+                "branch_phase": "evaluating",
                 "answer_count": 2,
                 "spine": "RAISE ----- CRANE y----",
                 "priority": 7,
@@ -674,7 +729,8 @@ class ViewSessionTest(unittest.TestCase):
 
     def test_back_restores_complete_prior_request(self):
         filters = ReportFilters(
-            active_only=True, minimum_answer_count=10, sort="size", limit=4
+            branch_statuses=("active",), minimum_answer_count=10,
+            sort="size", limit=4,
         )
         session = WatchSession(view_args(
             watch=1.0,
@@ -698,7 +754,7 @@ class ViewSessionTest(unittest.TestCase):
         session._update_navigation_targets(report)
         letter = session.branch_letter_by_key["010203"]
         finalizing = deepcopy(report)
-        finalizing["data"]["branches"][0]["lifecycle"] = "finalizing"
+        finalizing["data"]["branches"][0]["branch_phase"] = "finalizing"
         session._update_navigation_targets(finalizing)
         self.assertEqual(session.branch_hotkeys[letter], "010203")
 
@@ -827,15 +883,17 @@ class ViewParserTest(unittest.TestCase):
                 self.assertEqual(args.report_kind, report_kind)
                 self.assertEqual(args.worker, worker_id)
 
-    def test_tree_cache_and_conflicting_lifecycle_filters_are_rejected(self):
+    def test_incompatible_report_options_and_invalid_branch_filters_are_rejected(self):
         invalid_arguments = [
             ["erd_search.py", "view", "--cache", "--tree"],
-            ["erd_search.py", "view", "--active-only", "--status", "active"],
+            ["erd_search.py", "view", "--branch-status", "active,active"],
+            ["erd_search.py", "view", "--branch-status", "all,pending"],
+            ["erd_search.py", "view", "--branch-phase", "unknown"],
             ["erd_search.py", "view", "--queue", "--claims"],
             ["erd_search.py", "view", "--tree", "--answers"],
             ["erd_search.py", "view", "--hotspots", "--tree"],
             ["erd_search.py", "view", "--hotspots", "--by", "cut-reuse",
-             "--active-only"],
+             "--branch-status", "active"],
             ["erd_search.py", "view", "--hotspots", "--by", "coordination",
              "RAISE"],
             ["erd_search.py", "view", "--by", "nodes"],
@@ -849,6 +907,46 @@ class ViewParserTest(unittest.TestCase):
                     with self.assertRaises(SystemExit) as raised:
                         erd_search.main()
                 self.assertEqual(raised.exception.code, 2)
+
+    def test_branch_filters_are_comma_separated_and_overview_defaults_active(self):
+        cases = [
+            ([], ("active",), ()),
+            (["--branch-status", "active,pending"], ("active", "pending"), ()),
+            (["--branch-status", "all"], (), ()),
+            (["--branch-phase", "evaluating,finalizing"],
+             ("active",), ("evaluating", "finalizing")),
+            (["--queue"], (), ()),
+        ]
+        for options, statuses, phases in cases:
+            with self.subTest(options=options):
+                with (
+                    patch("sys.argv", ["erd_search.py", "view", *options]),
+                    patch("report_terminal.run_view") as run_view,
+                ):
+                    erd_search.main()
+                filters = run_view.call_args.args[0].filters
+                self.assertEqual(filters.branch_statuses, statuses)
+                self.assertEqual(filters.branch_phases, phases)
+
+    def test_view_help_explains_status_phase_and_lifecycle(self):
+        output = io.StringIO()
+        with (
+            patch("sys.argv", ["erd_search.py", "view", "--help"]),
+            patch("sys.stdout", output),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            erd_search.main()
+        self.assertEqual(raised.exception.code, 0)
+        help_text = output.getvalue()
+        self.assertIn(
+            "Status describes the branch's relationship to current work",
+            help_text,
+        )
+        self.assertIn("Phase describes the durable search milestone", help_text)
+        self.assertIn("The axes are related", help_text)
+        self.assertIn("pending / queued", help_text)
+        self.assertIn("active / evaluating <-> pending / evaluating", help_text)
+        self.assertIn("done / complete", help_text)
 
     def test_hotspot_defaults_and_sample_cap_are_normalized(self):
         with (

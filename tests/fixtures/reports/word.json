@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "report_kind": "word",
   "generated_at": 1000,
   "selector": {"kind": "word", "steps": [], "trailing_word": "queue", "branch_reference": null, "input_text": "QUEUE"},
@@ -10,14 +10,14 @@
     "word": "queue",
     "word_is_answer": false,
     "context": {"branch_reference": "000000000000", "branch_key_hex": "00", "spine": [], "guess_depth": 0, "answer_count": 20},
-    "response_group_counts": {"response_group_count": 4, "trivial_response_group_count": 1, "queued_response_group_count": 2, "active_response_group_count": 1, "exact_response_group_count": 1, "loss_response_group_count": 1, "missing_response_group_count": 1},
+    "response_group_counts": {"response_group_count": 4, "trivial_response_group_count": 1, "queued_response_group_count": 3, "active_response_group_count": 0, "exact_response_group_count": 1, "loss_response_group_count": 1, "missing_response_group_count": 1},
     "total_rows": 4,
     "matched_rows": 4,
     "response_groups": [
-      {"pattern": "-----", "answer_count": 8, "branch_reference": "111111111111", "branch_key_hex": "01", "lifecycle": "active", "priority": 5, "worker_count": 1, "cache_state": "exact", "best_guess": "crane", "best_erd": 2.1, "max_remaining_depth": 3, "updated_at": 990},
-      {"pattern": "y----", "answer_count": 5, "branch_reference": "222222222222", "branch_key_hex": "02", "lifecycle": "pending", "priority": 2, "worker_count": 0, "cache_state": "loss", "best_guess": null, "best_erd": null, "max_remaining_depth": null, "updated_at": 980},
-      {"pattern": "-y---", "answer_count": 3, "branch_reference": "333333333333", "branch_key_hex": "03", "lifecycle": "unqueued", "priority": null, "worker_count": 0, "cache_state": "missing", "best_guess": null, "best_erd": null, "max_remaining_depth": null, "updated_at": null},
-      {"pattern": "ggggg", "answer_count": 1, "branch_reference": "444444444444", "branch_key_hex": "04", "lifecycle": "unqueued", "priority": null, "worker_count": 0, "cache_state": "not_applicable", "best_guess": null, "best_erd": null, "max_remaining_depth": null, "updated_at": null}
+      {"pattern": "-----", "answer_count": 8, "branch_reference": "111111111111", "branch_key_hex": "01", "branch_status": "done", "branch_phase": "complete", "priority": 5, "worker_count": 1, "cache_state": "exact", "best_guess": "crane", "best_erd": 2.1, "max_remaining_depth": 3, "updated_at": 990},
+      {"pattern": "y----", "answer_count": 5, "branch_reference": "222222222222", "branch_key_hex": "02", "branch_status": "done", "branch_phase": "complete", "priority": 2, "worker_count": 0, "cache_state": "loss", "best_guess": null, "best_erd": null, "max_remaining_depth": null, "updated_at": 980},
+      {"pattern": "-y---", "answer_count": 3, "branch_reference": "333333333333", "branch_key_hex": "03", "branch_status": "unqueued", "branch_phase": null, "priority": null, "worker_count": 0, "cache_state": "missing", "best_guess": null, "best_erd": null, "max_remaining_depth": null, "updated_at": null},
+      {"pattern": "ggggg", "answer_count": 1, "branch_reference": "444444444444", "branch_key_hex": "04", "branch_status": "done", "branch_phase": "complete", "priority": null, "worker_count": 0, "cache_state": "not_applicable", "best_guess": null, "best_erd": null, "max_remaining_depth": null, "updated_at": null}
     ]
   }
 }
