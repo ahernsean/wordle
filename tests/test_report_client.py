@@ -264,7 +264,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("#tree").check()
         self.page.wait_for_selector(".tree details")
         details = self.page.locator(".tree details").first
-        details.locator("summary").click()
+        details.locator("summary").first.click()
         self.assertFalse(details.get_attribute("open") is not None)
         self.page.evaluate("__reportClient.fetchReport()")
         self.page.wait_for_timeout(100)
@@ -355,7 +355,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const report=await (await fetch('/api/view')).json();
           report.sources.queue.error='<img id="owned" src=x onerror="window.owned=1">';
           applyReport(report,null,__reportClient.getState());
-          return {owned:window.owned||0,node:!!document.querySelector('#owned'),text:document.querySelector('#report').innerText};
+          return {owned:window.owned||0,node:!!document.querySelector('#owned'),text:document.querySelector('#report').textContent};
         }""")
         self.assertEqual(result["owned"], 0)
         self.assertFalse(result["node"])
