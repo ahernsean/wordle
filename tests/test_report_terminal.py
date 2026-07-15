@@ -161,16 +161,18 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("Disk: 50.0G/400G (12%)  queue WAL 1.0G", output)
         self.assertIn("pending 12", output)
         self.assertIn("@0123456789ab", output)
-        self.assertIn("d=2", output)
-        self.assertIn("25/100 (25.0%)", output)
+        self.assertIn("guess_depth=2", output)
+        self.assertIn("25/100", output)
         self.assertNotIn("30/100", output)
-        self.assertIn("max-d=3", output)
-        self.assertIn("W2", output)
+        self.assertIn("max_remaining_depth=3", output)
+        self.assertIn("worker=worker-2", output)
         self.assertNotIn("\033", output)
 
     def test_narrow_rendering_respects_width(self):
         output = render_overview(overview_report(), color=False, width=48)
         self.assertTrue(all(len(line) <= 48 for line in output.splitlines()))
+        self.assertIn("@0123456789ab", output)
+        self.assertIn("worker=worker-2", output)
 
     def test_progress_and_worker_changes_are_semantically_colored(self):
         previous = overview_report()
@@ -181,7 +183,7 @@ class OverviewRendererTest(unittest.TestCase):
             current, previous_report=previous, color=True, width=100
         )
         self.assertIn(report_terminal.GREEN + "  @0123456789ab", output)
-        self.assertIn(report_terminal.RED + "    W2", output)
+        self.assertIn(report_terminal.RED + "    worker=worker-2", output)
 
     def test_ticking_timestamps_alone_are_not_highlighted(self):
         previous = overview_report()
@@ -199,12 +201,16 @@ class OverviewRendererTest(unittest.TestCase):
         stale = overview_report()
         stale["data"]["workers"][0]["updated_at"] = 979
         stale_output = render_overview(stale, color=True, width=100)
-        self.assertIn(report_terminal.AMBER + "    W2", stale_output)
+        self.assertIn(
+            report_terminal.AMBER + "    worker=worker-2", stale_output
+        )
 
         dead = deepcopy(stale)
         dead["data"]["workers"][0]["is_live"] = False
         dead_output = render_overview(dead, color=True, width=100)
-        self.assertIn(report_terminal.RED + "  W2 dead", dead_output)
+        self.assertIn(
+            report_terminal.RED + "  worker=worker-2 dead", dead_output
+        )
 
     def test_reordered_input_keeps_prior_identity_order(self):
         first = overview_report()
@@ -315,7 +321,9 @@ class OverviewRendererTest(unittest.TestCase):
             second, previous_report=first, width=100,
             display_order=display_order,
         )
-        self.assertLess(output.index("W2"), output.index("W1"))
+        self.assertLess(
+            output.index("worker=worker-2"), output.index("worker=worker-1")
+        )
 
     def test_watched_branch_claims_compare_by_candidate_index(self):
         report = overview_report()
@@ -456,7 +464,9 @@ class CollectionRendererTest(unittest.TestCase):
             "matched_rows": 1,
             "rows": [worker],
         })
-        self.assertIn("W2 stale", render_report(workers_report, width=120))
+        self.assertIn(
+            "worker=worker-2 stale", render_report(workers_report, width=120)
+        )
 
         cache_report = self._report("cache", {
             "summary": {
@@ -619,6 +629,48 @@ class ViewSessionTest(unittest.TestCase):
         worker_request = session.current_request
         self.assertEqual(worker_request.report_kind, "workers")
         self.assertEqual(worker_request.worker_id, "worker-2")
+
+    def test_tty_multi_digit_worker_hotkey_pushes_report_request(self):
+        report = overview_report()
+        worker_twelve = deepcopy(report["data"]["workers"][0])
+        worker_twelve.update({
+            "worker_id": "worker-12",
+            "worker_number": "12",
+        })
+        report["data"]["workers"].append(worker_twelve)
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput("12", tty=True), io.StringIO()
+        )
+        session._update_navigation_targets(report)
+        with patch(
+            "report_terminal.select.select",
+            return_value=([session.input_stream], [], []),
+        ):
+            self.assertTrue(session._wait_for_refresh())
+        self.assertEqual(session.current_request.report_kind, "workers")
+        self.assertEqual(session.current_request.worker_id, "worker-12")
+
+    def test_navigation_targets_wrap_to_terminal_width(self):
+        report = overview_report()
+        workers = []
+        for worker_number in range(1, 16):
+            worker = deepcopy(report["data"]["workers"][0])
+            worker.update({
+                "worker_id": f"worker-{worker_number}",
+                "worker_number": str(worker_number),
+            })
+            workers.append(worker)
+        report["data"]["workers"] = workers
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), io.StringIO()
+        )
+        session._width = Mock(return_value=48)
+        session._update_navigation_targets(report)
+        _name, lines = session._navigation_section()[0]
+        self.assertTrue(all(len(line) <= 48 for line in lines))
+        rendered = "\n".join(lines)
+        self.assertIn("[12] worker-12", rendered)
+        self.assertIn("[space] refresh", rendered)
 
     def test_back_restores_complete_prior_request(self):
         filters = ReportFilters(
