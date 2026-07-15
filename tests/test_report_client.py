@@ -23,6 +23,7 @@ except ImportError:
 ROOT = os.path.dirname(os.path.dirname(__file__))
 FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
+REQUIRE_PLAYWRIGHT_BROWSER = os.environ.get("REQUIRE_PLAYWRIGHT_BROWSER") == "1"
 
 
 class _ResourceParser(HTMLParser):
@@ -85,10 +86,17 @@ def fixture_server():
         thread.join(timeout=2)
 
 
-@unittest.skipIf(sync_playwright is None, "Playwright is not installed")
+@unittest.skipIf(
+    sync_playwright is None and not REQUIRE_PLAYWRIGHT_BROWSER,
+    "Playwright is not installed",
+)
 class ReportClientBrowserTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if sync_playwright is None:
+            raise RuntimeError(
+                "Playwright is required when REQUIRE_PLAYWRIGHT_BROWSER=1"
+            )
         cls.server_context = fixture_server()
         cls.base_url = cls.server_context.__enter__()
         cls.playwright = sync_playwright().start()
@@ -97,6 +105,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         except Exception as error:
             cls.playwright.stop()
             cls.server_context.__exit__(None, None, None)
+            if REQUIRE_PLAYWRIGHT_BROWSER:
+                raise RuntimeError("Playwright Chromium failed to start") from error
             raise unittest.SkipTest(f"Chromium is unavailable: {error}")
 
     @classmethod
