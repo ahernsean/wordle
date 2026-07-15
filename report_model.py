@@ -10,7 +10,11 @@ import time
 from typing import Optional, Tuple
 
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue, derive_telemetry_path
+from erd_queue import (
+    ERDQueue,
+    WORKER_LIVENESS_SECONDS,
+    derive_telemetry_path,
+)
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
     DEFAULT_CACHE_PATH,
@@ -23,10 +27,7 @@ from wordle_ui import fmt_pattern, parse_pattern
 
 
 SCHEMA_VERSION = 1
-# Workers heartbeat about every two seconds. This threshold governs both claim
-# reclamation and report liveness, so a worker inside it is never reclaimed or
-# excluded from live-worker totals.
-WORKER_LIVENESS_SECONDS = 30
+WORKER_STALE_SECONDS = 20
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
@@ -173,21 +174,24 @@ def resolve_selector_branch(
     )
 
 
-def resolve_branch_reference(queue, digest_prefix) -> bytes:
+def resolve_branch_reference(queue, digest_prefix) -> dict:
     matches = queue.branch_rows_for_reference_prefix(digest_prefix)
     if not matches:
-        raise ValueError(f"branch reference @{digest_prefix} not found")
+        raise ValueError(
+            f"branch reference @{digest_prefix} not found; use the branch spine "
+            "for cache-only state after queue completion"
+        )
     if len(matches) > 1:
         descriptions = []
         for row in matches:
             reference = branch_reference(bytes(row["branch_key"]))
-            spine = row.get("spine") or row.get("source_word") or "unknown spine"
+            spine = queue.row_spine_text(row) or "unknown spine"
             descriptions.append(f"@{reference} {spine}")
         raise ValueError(
             f"branch reference @{digest_prefix} is ambiguous: "
             + "; ".join(descriptions)
         )
-    return bytes(matches[0]["branch_key"])
+    return matches[0]
 
 
 def branch_reference(branch_key: bytes) -> str:
@@ -517,12 +521,14 @@ def _filters_payload(filters):
     }
 
 
-def _semantic_report(report_kind, sources, selector, generated_at, data, request=None):
+def _report_envelope(
+    report_kind, sources, generated_at, data, selector=None, request=None
+):
     return {
         "schema_version": SCHEMA_VERSION,
         "report_kind": report_kind,
         "generated_at": generated_at,
-        "selector": _selector_payload(selector),
+        "selector": _selector_payload(selector) if selector is not None else None,
         "filters": _filters_payload(request.filters) if request else {},
         "tree": request.tree if request else False,
         "sources": {
@@ -547,6 +553,14 @@ def _semantic_report(report_kind, sources, selector, generated_at, data, request
         },
         "data": data,
     }
+
+
+def _semantic_report(
+    report_kind, sources, selector, generated_at, data, request=None
+):
+    return _report_envelope(
+        report_kind, sources, generated_at, data, selector, request
+    )
 
 
 def _resolved_branch_payload(resolved):
@@ -644,7 +658,9 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
 
     group_budget = GAME_GUESSES - len(resolved.steps) - 1
     cache_states = {
-        branch_key: ScoreCache._report_cache_state(branch_key, None, None, group_budget)
+        branch_key: ScoreCache.report_branch_state_without_rows(
+            branch_key, group_budget
+        )
         for branch_key in branch_keys
     }
     cache = None
@@ -797,7 +813,6 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     all_answers = load_word_list(sources.answer_list_path)
     answer_set = set(all_answers)
     queue = None
-    queue_rows = []
     pending_row = None
     active_row = None
     heartbeat_rows = []
@@ -813,15 +828,10 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     try:
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
         if request.selector.kind == "branch_reference":
-            branch_key = resolve_branch_reference(
+            referenced_row = resolve_branch_reference(
                 queue, request.selector.branch_reference
             )
-            referenced_row = next(
-                row for row in queue.branch_rows_for_reference_prefix(
-                    request.selector.branch_reference
-                )
-                if bytes(row["branch_key"]) == branch_key
-            )
+            branch_key = bytes(referenced_row["branch_key"])
             resolved = ResolvedBranch(
                 _decode_branch_key(branch_key), branch_key,
                 _steps_from_queue_row(referenced_row), None,
@@ -829,10 +839,6 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         else:
             resolved = resolve_selector_branch(request.selector, all_answers)
             branch_key = resolved.branch_key
-        queue_rows = [
-            row for row in queue.list_queue_rows()
-            if bytes(row["branch_key"]) == branch_key
-        ]
         pending_row = queue.get_pending_branch(branch_key)
         active_row = queue.get_active_branch(branch_key)
         heartbeat_rows = [
@@ -873,7 +879,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ),
     }
     queue_payload = None
-    if queue_rows or active_row is not None or pending_row is not None:
+    if active_row is not None or pending_row is not None:
         queue_payload = {
             "lifecycle": lifecycle,
             "pending_status": _row_value(pending_row, "status"),
@@ -906,7 +912,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     data = {
         "branch": branch_payload,
         "queue": queue_payload,
-        "cache": ScoreCache._report_cache_state(branch_key, None, None, budget),
+        "cache": ScoreCache.report_branch_state_without_rows(branch_key, budget),
         "workers": workers,
         "republished_candidates": [
             {"candidate_index": row["idx"], "republish_count": row["count"]}
@@ -939,26 +945,28 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     return report
 
 
-def _selector_prefix(selector, queue=None):
+def _selector_queue_scope(selector, queue=None):
     if selector.kind == "root":
-        return ""
+        return {}, ""
     if selector.kind == "branch_reference":
         if queue is None:
-            return None
-        branch_key = resolve_branch_reference(queue, selector.branch_reference)
-        row = next(
-            row for row in queue.branch_rows_for_reference_prefix(
-                selector.branch_reference
-            )
-            if bytes(row["branch_key"]) == branch_key
-        )
-        return row.get("spine") or ""
+            return {}, ""
+        row = resolve_branch_reference(queue, selector.branch_reference)
+        prefix = row.get("spine") or ""
+        scope = {"branch_key": bytes(row["branch_key"])}
+        if prefix:
+            scope["spine_prefix"] = prefix
+        return scope, prefix
     tokens = []
     for step in selector.steps:
         tokens.extend((step.word.upper(), step.pattern))
     if selector.kind == "word":
         tokens.append(selector.trailing_word.upper())
-    return " ".join(tokens)
+    prefix = " ".join(tokens)
+    scope = {"spine_prefix": prefix}
+    if selector.kind == "word" and not selector.steps:
+        scope["source_word"] = selector.trailing_word
+    return scope, prefix
 
 
 def _row_matches_selector(row, selector, prefix):
@@ -995,13 +1003,11 @@ def _collection_summary(rows):
 def _scoped_queue_rows(queue, request, apply_filters=True):
     filters = request.filters if apply_filters else ReportFilters()
     unbounded_filters = replace(filters, limit=None)
-    result = queue.report_queue_rows(unbounded_filters)
-    prefix = _selector_prefix(request.selector, queue)
-    rows = [
-        row for row in result["rows"]
-        if _row_matches_selector(row, request.selector, prefix)
-    ]
-    return rows, prefix
+    scope, prefix = _selector_queue_scope(request.selector, queue)
+    query_filters = _filters_payload(unbounded_filters)
+    query_filters.update(scope)
+    result = queue.report_queue_rows(query_filters)
+    return result["rows"], prefix
 
 
 def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict:
@@ -1172,7 +1178,27 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
     try:
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
         filtered_rows, prefix = _scoped_queue_rows(queue, request, True)
-        unfiltered_rows, _ = _scoped_queue_rows(queue, request, False)
+        unfiltered_rows = filtered_rows
+        if request.selector.kind in ("branch", "branch_reference"):
+            unfiltered_rows, _ = _scoped_queue_rows(queue, request, False)
+        if request.worker_id is not None:
+            selected_branch_keys = {
+                bytes(row["current_branch_key"]).hex()
+                for row in queue.heartbeats_with_branch()
+                if row["current_branch_key"] is not None
+                and (
+                    row["worker_id"] == request.worker_id
+                    or _worker_number(row["worker_id"]) == request.worker_id
+                )
+            }
+            filtered_rows = [
+                row for row in filtered_rows
+                if row["branch_key_hex"] in selected_branch_keys
+            ]
+            unfiltered_rows = [
+                row for row in unfiltered_rows
+                if row["branch_key_hex"] in selected_branch_keys
+            ]
         data.update(_tree_layout(
             list(filtered_rows), request, prefix, unfiltered_rows
         ))
@@ -1188,6 +1214,7 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
 def collect_workers_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
+    answer_set = set(all_answers)
     data = {"summary": {}, "matched_rows": 0, "rows": []}
     report = _semantic_report(
         "workers", sources, request.selector, generated_at, data, request
@@ -1198,7 +1225,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
         scoped_rows, _prefix = _scoped_queue_rows(queue, request)
         scoped_keys = {row["branch_key_hex"] for row in scoped_rows}
         workers = [
-            _normalize_worker(row, generated_at, set(all_answers))
+            _normalize_worker(row, generated_at, answer_set)
             for row in queue.heartbeats_with_branch()
         ]
         filters_have_branch_scope = any((
@@ -1220,12 +1247,31 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
                 if worker["worker_id"] == request.worker_id
                 or worker["worker_number"] == request.worker_id
             ]
-        workers.sort(key=_worker_sort_key)
-        by_state = {"live": 0, "dead": 0, "idle": 0}
+        lifecycle_by_key = {
+            row["branch_key_hex"]: row["lifecycle"] for row in scoped_rows
+        }
+        by_state = {
+            "live": 0,
+            "idle": 0,
+            "finalizing": 0,
+            "stale": 0,
+            "dead": 0,
+        }
         for worker in workers:
-            by_state["live" if worker["is_live"] else "dead"] += 1
-            if worker["branch_key_hex"] is None:
-                by_state["idle"] += 1
+            age = generated_at - worker["updated_at"]
+            if not worker["is_live"]:
+                state = "dead"
+            elif age > WORKER_STALE_SECONDS:
+                state = "stale"
+            elif worker["branch_key_hex"] is None:
+                state = "idle"
+            elif lifecycle_by_key.get(worker["branch_key_hex"]) == "finalizing":
+                state = "finalizing"
+            else:
+                state = "live"
+            worker["state"] = state
+            by_state[state] += 1
+        workers.sort(key=_worker_sort_key)
         data["summary"] = {
             "worker_count": len(workers),
             "worker_count_by_state": by_state,
@@ -1304,17 +1350,24 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
             if selector.kind == "branch_reference":
                 if queue is None:
                     raise ValueError("queue unavailable for branch reference")
-                branch_key = resolve_branch_reference(queue, selector.branch_reference)
-                steps = ()
+                referenced_row = resolve_branch_reference(
+                    queue, selector.branch_reference
+                )
+                branch_key = bytes(referenced_row["branch_key"])
+                steps = _steps_from_queue_row(referenced_row)
+                budget = _row_value(
+                    referenced_row, "budget", GAME_GUESSES - len(steps)
+                )
             else:
                 resolved = resolve_selector_branch(selector, all_answers)
                 branch_key = resolved.branch_key
                 steps = resolved.steps
+                budget = GAME_GUESSES - len(steps)
             data.update({
                 "branch_key_hex": branch_key.hex(),
                 "branch_reference": branch_reference(branch_key),
                 "cache": cache.report_branch_state(
-                    branch_key, ERD_ALL, GAME_GUESSES - len(steps)
+                    branch_key, ERD_ALL, budget
                 ),
             })
         report["sources"]["cache"]["ok"] = True
@@ -1368,7 +1421,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
                 "rows": rows[:limit],
             }
         else:
-            prefix = _selector_prefix(request.selector, queue)
+            _scope, prefix = _selector_queue_scope(request.selector, queue)
             result = queue.report_hotspots(
                 field, epoch, generated_at - since_seconds,
                 sample_size, limit, prefix or None,
@@ -1406,34 +1459,9 @@ def collect_overview_report(
     if request is not None and request.report_kind not in ("auto", "overview"):
         raise ValueError(f"unsupported report kind: {request.report_kind}")
     generated_at = int(time.time())
-    report = {
-        "schema_version": SCHEMA_VERSION,
-        "report_kind": "overview",
-        "generated_at": generated_at,
-        "selector": None,
-        "filters": {},
-        "sources": {
-            "queue": {
-                "path": sources.queue_path,
-                "ok": False,
-                "error": None,
-                "epoch": None,
-                "label": None,
-                "git_sha": None,
-            },
-            "telemetry": {
-                "path": (
-                    sources.telemetry_path
-                    if sources.telemetry_path is not None
-                    else derive_telemetry_path(sources.queue_path)
-                ),
-                "ok": False,
-                "error": None,
-            },
-            "cache": {"path": sources.cache_path, "ok": False, "error": None},
-        },
-        "data": _empty_data(),
-    }
+    report = _report_envelope(
+        "overview", sources, generated_at, _empty_data(), request=request
+    )
     try:
         answer_words = load_word_list(sources.answer_list_path)
         answer_set = set(answer_words)

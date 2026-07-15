@@ -133,6 +133,15 @@ class FakeInput(io.StringIO):
         return 10
 
 
+class FakeOutput(io.StringIO):
+    def __init__(self, tty=False):
+        super().__init__()
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
+
+
 class OverviewRendererTest(unittest.TestCase):
     def test_text_contains_report_semantics_without_ansi(self):
         output = render_overview(overview_report(), color=False, width=100)
@@ -172,6 +181,17 @@ class OverviewRendererTest(unittest.TestCase):
         )
         self.assertNotIn(report_terminal.GREEN, output)
         self.assertNotIn(report_terminal.RED, output)
+
+    def test_stale_and_dead_workers_have_persistent_warning_colors(self):
+        stale = overview_report()
+        stale["data"]["workers"][0]["updated_at"] = 979
+        stale_output = render_overview(stale, color=True, width=100)
+        self.assertIn(report_terminal.AMBER + "    W2", stale_output)
+
+        dead = deepcopy(stale)
+        dead["data"]["workers"][0]["is_live"] = False
+        dead_output = render_overview(dead, color=True, width=100)
+        self.assertIn(report_terminal.RED + "  W2 dead", dead_output)
 
     def test_reordered_input_keeps_prior_identity_order(self):
         first = overview_report()
@@ -342,6 +362,113 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("truncated=true", output)
 
 
+class CollectionRendererTest(unittest.TestCase):
+    def _report(self, report_kind, data, tree=False):
+        report = overview_report()
+        report.update({
+            "report_kind": report_kind,
+            "selector": {
+                "kind": "root", "steps": [], "trailing_word": None,
+                "branch_reference": None, "input_text": "",
+            },
+            "filters": {},
+            "tree": tree,
+            "data": data,
+        })
+        return report
+
+    def test_tree_renders_each_child_beneath_its_parent(self):
+        def node(node_id, parent_node_id, guess_depth, word=None, pattern=None):
+            return {
+                "node_id": node_id,
+                "parent_node_id": parent_node_id,
+                "step": (
+                    {"word": word, "pattern": pattern}
+                    if word is not None else None
+                ),
+                "branch_key_hex": node_id if word is not None else None,
+                "branch_reference": node_id[:12] if word is not None else None,
+                "lifecycle": "active" if word is not None else None,
+                "answer_count": 2 if word is not None else None,
+                "guess_depth": guess_depth,
+                "worker_count": 0,
+                "completed_candidate_count": 0,
+                "candidate_count": 4,
+                "is_context": node_id == "root",
+            }
+
+        report = self._report("queue", {
+            "tree_available": True,
+            "unavailable_reason": None,
+            "nodes": [
+                node("root", None, 0),
+                node("raise:-----", "root", 1, "raise", "-----"),
+                node("stink:g----", "root", 1, "stink", "g----"),
+                node(
+                    "raise:-----/crane:y----", "raise:-----", 2,
+                    "crane", "y----",
+                ),
+                node(
+                    "stink:g----/mount:-y---", "stink:g----", 2,
+                    "mount", "-y---",
+                ),
+            ],
+        }, tree=True)
+        output = render_report(report, width=120)
+        self.assertLess(output.index("RAISE -----"), output.index("CRANE y----"))
+        self.assertLess(output.index("CRANE y----"), output.index("STINK g----"))
+        self.assertLess(output.index("STINK g----"), output.index("MOUNT -y---"))
+
+    def test_queue_worker_and_cache_collections_are_semantically_formatted(self):
+        queue_report = self._report("queue", {
+            "summary": {"branch_count_by_lifecycle": {"active": 1}},
+            "matched_rows": 1,
+            "rows": [{
+                "branch_reference": "0123456789ab",
+                "lifecycle": "active",
+                "answer_count": 2,
+                "spine": "RAISE ----- CRANE y----",
+                "priority": 7,
+                "worker_count": 1,
+            }],
+        })
+        queue_output = render_report(queue_report, width=120)
+        self.assertIn("guess_depth=2", queue_output)
+        self.assertNotIn(" d=2", queue_output)
+
+        worker = deepcopy(overview_report()["data"]["workers"][0])
+        worker["state"] = "stale"
+        workers_report = self._report("workers", {
+            "summary": {"worker_count_by_state": {"stale": 1}},
+            "matched_rows": 1,
+            "rows": [worker],
+        })
+        self.assertIn("W2 stale", render_report(workers_report, width=120))
+
+        cache_report = self._report("cache", {
+            "summary": {
+                "exact_branch_count": 2,
+                "loss_branch_count": 1,
+                "recent_exact_branch_count": 1,
+            },
+            "distributions": {
+                "state_branch_counts": {
+                    "exact_branch_count": 2, "loss_branch_count": 1,
+                },
+                "exact_branch_count_by_max_remaining_depth": {"3": 2},
+                "exact_branch_count_by_solve_budget": {"unbounded": 2},
+                "exact_branch_count_by_taint": {
+                    "untainted": 2, "tainted": 0,
+                },
+                "loss_branch_count_by_loss_budget": {"4": 1},
+            },
+        })
+        cache_output = render_report(cache_report, width=120)
+        self.assertIn("max remaining depth: 3=2", cache_output)
+        self.assertIn("loss budget: 4=1", cache_output)
+        self.assertNotIn("{'", cache_output)
+
+
 class ViewSessionTest(unittest.TestCase):
     def test_json_output_round_trips_exact_report(self):
         report = overview_report()
@@ -351,6 +478,16 @@ class ViewSessionTest(unittest.TestCase):
                 view_args(format="json"), FakeInput(), output, io.StringIO()
             ).run()
         self.assertEqual(json.loads(output.getvalue()), report)
+
+    def test_one_shot_jsonl_is_compact(self):
+        report = overview_report()
+        output = io.StringIO()
+        with patch("report_terminal.collect_report", return_value=report):
+            WatchSession(
+                view_args(format="jsonl"), FakeInput(), output, io.StringIO()
+            ).run()
+        self.assertEqual(json.loads(output.getvalue()), report)
+        self.assertNotIn('": ', output.getvalue())
 
     def test_jsonl_watch_emits_parseable_lines(self):
         first = overview_report()
@@ -382,6 +519,19 @@ class ViewSessionTest(unittest.TestCase):
         self.assertIn("--- generated_at=1000 ---", output.getvalue())
         self.assertNotIn("\033", output.getvalue())
 
+    def test_redirected_output_uses_non_tty_watch_even_with_tty_input(self):
+        report = overview_report()
+        output = FakeOutput(tty=False)
+        with (
+            patch("report_terminal.collect_report", return_value=report),
+            patch("report_terminal.time.sleep", side_effect=KeyboardInterrupt),
+        ):
+            WatchSession(
+                view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
+            ).run()
+        self.assertIn("--- generated_at=1000 ---", output.getvalue())
+        self.assertNotIn("\033", output.getvalue())
+
     def test_shrinking_section_clears_old_lines(self):
         output = io.StringIO()
         session = WatchSession(view_args(watch=1.0), FakeInput(tty=True), output)
@@ -396,9 +546,29 @@ class ViewSessionTest(unittest.TestCase):
         self.assertGreaterEqual(output.getvalue().count(report_terminal.CLEAR_LINE), 3)
         self.assertIn("\033[J", output.getvalue())
 
+    def test_growing_section_clears_shifted_separator_row(self):
+        output = io.StringIO()
+        session = WatchSession(view_args(watch=1.0), FakeInput(tty=True), output)
+        session.previous_sections = [
+            ("first", ["one"]),
+            ("second", ["two", "three"]),
+        ]
+        session._refresh_sections([
+            ("first", ["one", "new two", "new three"]),
+            ("second", ["two", "three"]),
+        ])
+        self.assertIn("\033[4;1H" + report_terminal.CLEAR_LINE, output.getvalue())
+
+    def test_stdin_eof_exits_refresh_wait(self):
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput("", tty=True), FakeOutput(tty=True)
+        )
+        with patch("report_terminal.select.select", return_value=([session.input_stream], [], [])):
+            self.assertFalse(session._wait_for_refresh())
+
     def test_tty_failure_retries_and_restores_terminal(self):
         report = overview_report()
-        output = io.StringIO()
+        output = FakeOutput(tty=True)
         session = WatchSession(
             view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
         )
@@ -481,6 +651,8 @@ class ViewParserTest(unittest.TestCase):
              "RAISE"],
             ["erd_search.py", "view", "--by", "nodes"],
             ["erd_search.py", "view", "--epoch", "2"],
+            ["erd_search.py", "view", "RAISE -----", "--tree", "--claims"],
+            ["erd_search.py", "view", "RAISE", "--sort", "nodes"],
         ]
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
@@ -504,6 +676,22 @@ class ViewParserTest(unittest.TestCase):
         self.assertEqual(args.since_seconds, 3600)
         self.assertEqual(args.sample_size, 1_000_000)
         self.assertEqual(args.limit, 10)
+
+    def test_claims_and_answers_reach_watch_session_request(self):
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "RAISE -----",
+                "--claims", "--answers",
+            ]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        session = WatchSession(run_view.call_args.args[0])
+        with patch("report_terminal.collect_report") as collect_report:
+            session._collect()
+        request = collect_report.call_args.args[1]
+        self.assertTrue(request.include_claims)
+        self.assertTrue(request.include_answers)
 
 
 if __name__ == "__main__":
