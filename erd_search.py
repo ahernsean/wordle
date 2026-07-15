@@ -985,6 +985,16 @@ QUEUE_WAL_QUIESCE_BYTES = 2 * 1024 ** 3
 # How long the supervisor retries a quiesced TRUNCATE before giving up until
 # the next checkpoint cycle.
 TRUNCATE_RETRY_SECONDS = 15
+# Hard ceiling on the queue WAL.  In healthy operation the quiesce/TRUNCATE
+# protocol keeps the WAL near QUEUE_WAL_QUIESCE_BYTES; a WAL an order of
+# magnitude larger means TRUNCATE has been losing for many cycles and the file
+# is on course to fill the disk — the failure mode that corrupts the database.
+# At this size the supervisor stops trying to recover in place: it captures a
+# diagnostic snapshot, signals every worker to dump its stacks, latches the
+# swarm down (a manual `queue clear-disk-stop` is then required), and exits.
+# Overridable via QUEUE_WAL_HARD_CEILING_GIB.
+QUEUE_WAL_HARD_CEILING_BYTES = int(
+    float(os.environ.get('QUEUE_WAL_HARD_CEILING_GIB', '32')) * 1024 ** 3)
 # Fill/drain rates below this magnitude read as "steady": smaller than this
 # and the trend is within statvfs sampling noise (page cache, unrelated
 # processes on the same filesystem).  Anything at or above it is shown via
@@ -1053,6 +1063,63 @@ def _maybe_quiesce_truncate(queue):
             time.sleep(0.5)
     finally:
         queue.set_checkpoint_pause(False)
+
+
+def _dump_worker_stacks(procs):
+    """SIGUSR1 every live worker so it dumps all-thread stacks to its log.
+
+    Workers register faulthandler on SIGUSR1 (erd_swarm._setup_logging), whose
+    C-level handler dumps even from inside a native call (numpy, sqlite).
+    Best-effort: a dead pid is skipped, and a worker deep in C returns its dump
+    when the call unwinds."""
+    for wid, (p, _started_at) in procs.items():
+        if not p.is_alive():
+            continue
+        try:
+            os.kill(p.pid, signal.SIGUSR1)
+            logger.critical('Requested stack dump from worker-%d (pid=%d).',
+                            wid, p.pid)
+        except OSError as exc:
+            logger.warning('Could not signal worker-%d (pid=%d): %s',
+                           wid, p.pid, exc)
+
+
+def _enforce_wal_hard_ceiling(queue, procs) -> bool:
+    """Backstop for a quiesce/TRUNCATE that never wins: when the WAL breaches
+    QUEUE_WAL_HARD_CEILING_BYTES, capture why and stop before it fills the disk
+    and corrupts the database.  Returns True once it has latched the swarm
+    down; the caller then stops."""
+    wal_bytes = queue.wal_size_bytes()
+    if wal_bytes < QUEUE_WAL_HARD_CEILING_BYTES:
+        return False
+    logger.critical(
+        'Queue WAL %.2f GB breached hard ceiling %.2f GB — TRUNCATE never '
+        'reclaimed it. Latching swarm down before the disk fills. Per-table '
+        'WAL attribution and worker stacks are in the erd_worker_*.log files.',
+        wal_bytes / 1e9, QUEUE_WAL_HARD_CEILING_BYTES / 1e9)
+    now = time.time()
+    for h in queue.heartbeats_with_branch():
+        started = h['claim_started_at']
+        updated = h['updated_at']
+        logger.critical(
+            '  worker-%s pid=%s cand=%s in_candidate=%ss since_heartbeat=%ss '
+            'nodes=%s node_rate=%s/s',
+            h['worker_id'], h['pid'], h['cur_candidate'],
+            f'{now - started:.0f}' if started else '?',
+            f'{now - updated:.0f}' if updated else '?',
+            h['cur_nodes'], h['node_rate'])
+    _dump_worker_stacks(procs)
+    # Let workers flush their dumps to their logs before the supervisor tears
+    # them down at the end of the run loop.
+    time.sleep(2)
+    try:
+        queue.set_disk_stop(
+            f'supervisor: queue WAL {wal_bytes / 1e9:.1f} GB breached hard '
+            f'ceiling ({QUEUE_WAL_HARD_CEILING_BYTES / 1e9:.0f} GB)')
+    except sqlite3.OperationalError as exc:
+        logger.critical('Could not write disk_stop latch on WAL ceiling: %s',
+                        exc)
+    return True
 
 
 def cmd_run(args):
@@ -1138,6 +1205,9 @@ def cmd_run(args):
                 _supervisor_checkpoint(q)
                 last_checkpoint = time.time()
             _maybe_quiesce_truncate(q)
+            if _enforce_wal_hard_ceiling(q, procs):
+                stop_event.set()
+                break
 
             for wid, (p, started_at) in list(procs.items()):
                 age = time.time() - started_at
