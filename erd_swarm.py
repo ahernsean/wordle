@@ -20,7 +20,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import signal
+import sqlite3
 import time
 
 import pattern_matrix as pattern_matrix_module
@@ -42,7 +44,8 @@ from wordle_engine import (
     _cache_reuse,
 )
 from erd_queue import (ERDQueue, decode_subset, encode_subset,
-                       guess_depth_from_spine,
+                       guess_depth_from_spine, disk_stats,
+                       DISK_STOP_FRACTION,
                        DEFAULT_SMALL_COUNT, DEFAULT_COUNT_CAP,
                        DEFAULT_REPUBLISH_LIMIT)
 from wordle_ui import fmt_pattern
@@ -61,6 +64,18 @@ HB_SECONDS = 2.0              # liveness heartbeat cadence during a long candida
 # heartbeats, which is conservative enough for any real process death.
 HB_TIMEOUT_SECONDS = 30
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
+# Workers space their checkpoint intervals by a per-worker random factor in
+# [1-JITTER, 1+JITTER] so six processes spawned within seconds of each other
+# don't attempt checkpoints in lockstep every cycle.
+CHECKPOINT_JITTER = 0.25
+# Poll cadence while honouring the supervisor's checkpoint_pause flag at a
+# claim boundary (workers stay off the queue database between polls).
+PAUSE_POLL_SECONDS = 2.0
+DISK_CHECK_SECONDS = 30       # disk fullness check throttle (workers)
+# A branch still status='finalized' this long after finalized_at has a dead
+# finalizer (a live one completes the cache write + delete in milliseconds)
+# and is reopened by a waiting sibling.
+FINALIZE_TAKEOVER_SECONDS = 60
 PROGRESS_LOG_SECONDS = 120   # log a mid-candidate progress line this often
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
@@ -423,7 +438,12 @@ class _BranchWorker:
         self.n_useless = 0
         self._last_hb = 0.0
         self._last_checkpoint = time.time()
+        self._checkpoint_interval = CHECKPOINT_SECONDS * random.uniform(
+            1 - CHECKPOINT_JITTER, 1 + CHECKPOINT_JITTER)
         self._last_ram_check = time.time()
+        self._last_disk_check = time.time()
+        self._last_pause_check = 0.0
+        self._pause_active = False
         self._cand_max_depth = 0     # deepest guess_depth reached this candidate
         # Live search probe (transparency): a monotonic node counter plus the
         # active descent spine, so a long candidate evaluation never looks
@@ -489,7 +509,7 @@ class _BranchWorker:
         self.queue.clear_heartbeat(self.name)
         self.score_cache.checkpoint()
         self.score_cache.close()
-        self.queue.checkpoint()
+        self.queue.checkpoint("PASSIVE")
         self.queue.close()
 
     def request_stop(self):
@@ -695,12 +715,64 @@ class _BranchWorker:
             return None
 
     def _maybe_checkpoint(self, force=False):
+        # Workers checkpoint the queue PASSIVE-only: passive backfills what it
+        # can without taking the writer lock or waiting on readers, so a
+        # worker checkpoint can never stall the other workers' writes.  Only
+        # the supervisor attempts TRUNCATE, under its quiesce protocol.
         now = time.time()
-        if force or now - self._last_checkpoint > CHECKPOINT_SECONDS:
+        if force or now - self._last_checkpoint > self._checkpoint_interval:
             self._flush_cost_model_buffer()
             self.score_cache.checkpoint()
-            self.queue.checkpoint()
+            self.queue.checkpoint("PASSIVE")
             self._last_checkpoint = now
+
+    def _checkpoint_pause_active(self) -> bool:
+        """Cached view of the supervisor's checkpoint_pause flag, re-read at
+        most once per PAUSE_POLL_SECONDS.  The flag check is itself a queue
+        read, so polling it unthrottled from hot paths (heartbeats, the
+        mid-evaluation bound refresh) would add exactly the reader overlap
+        the quiesce exists to clear.  The cache makes pause transitions
+        visible up to PAUSE_POLL_SECONDS late, well inside the supervisor's
+        TRUNCATE retry window."""
+        now = time.time()
+        if now - self._last_pause_check >= PAUSE_POLL_SECONDS:
+            self._last_pause_check = now
+            self._pause_active = self.queue.checkpoint_paused()
+        return self._pause_active
+
+    def _respect_checkpoint_pause(self):
+        """At a claim boundary, stay off the queue database while the
+        supervisor's checkpoint_pause flag is set (compute in progress is
+        unaffected; the flag self-expires, so a dead supervisor cannot wedge
+        the swarm).  Once waiting, the flag is polled directly — the sleep
+        between polls is the throttle."""
+        if not self._checkpoint_pause_active():
+            return
+        while not self.cancel() and self.queue.checkpoint_paused():
+            time.sleep(PAUSE_POLL_SECONDS)
+        self._pause_active = False
+
+    def _check_disk(self):
+        now = time.time()
+        if now - self._last_disk_check < DISK_CHECK_SECONDS:
+            return
+        self._last_disk_check = now
+        used_fraction = disk_stats(self.queue.db_path)["used_fraction"]
+        if used_fraction >= DISK_STOP_FRACTION:
+            logger.critical(
+                '%s disk %.0f%% full (>= %.0f%% stop threshold) — latching '
+                'swarm down', self.name, 100 * used_fraction,
+                100 * DISK_STOP_FRACTION)
+            try:
+                self.queue.set_disk_stop(
+                    f'{self.name}: disk {100 * used_fraction:.1f}% full')
+            except sqlite3.OperationalError as exc:
+                # A 100%-full disk can fail this very write; the worker still
+                # stops, and run's startup live-fullness check keeps the swarm
+                # down even without the latch row.
+                logger.critical('%s could not write disk_stop latch: %s',
+                                self.name, exc)
+            self.request_stop()
 
     def _check_ram(self):  # pragma: no cover
         now = time.time()
@@ -727,6 +799,13 @@ class _BranchWorker:
         self._nodes += 1
         now = time.time()
         if not force and now - self._last_hb < HB_SECONDS:
+            return
+        # Defer unforced heartbeats while the supervisor is quiescing writers
+        # for a TRUNCATE checkpoint; the pause window is well inside
+        # HB_TIMEOUT_SECONDS, so liveness is never in question.
+        if not force and self._checkpoint_pause_active():
+            self._last_hb = now
+            self._nodes_at_last_hb = self._nodes
             return
         dt = now - self._last_hb
         node_rate = (self._nodes - self._nodes_at_last_hb) / dt if dt > 0 else 0.0
@@ -804,7 +883,12 @@ class _BranchWorker:
     def _claim_bundle(self, branch_key, n_candidates, words):
         """claim_next_bundle for `branch_key`, supplying this worker's
         (cached) packing stats.  Returns (bundle_id, indices, forced) or None
-        — see ERDQueue.claim_next_bundle."""
+        — see ERDQueue.claim_next_bundle.
+
+        Every claim path (top-level loop, helping, deep solving, focused)
+        funnels through here, so this is where a quiescing supervisor's pause
+        flag is honoured before touching the queue."""
+        self._respect_checkpoint_pause()
         order, cost_lower_bound = self._packing_stats(branch_key, words)
         return self.queue.claim_next_bundle(
             branch_key, self.name, n_candidates, order, cost_lower_bound,
@@ -844,7 +928,13 @@ class _BranchWorker:
             # it makes the candidate a cut, recorded via mark_branch_cut below.
             nonlocal shared_best, last_refresh
             now = time.time()
-            if now - last_refresh > BEST_REFRESH_SECONDS:
+            # Skipped while the supervisor quiesces for TRUNCATE: this refresh
+            # opens a read snapshot into the WAL every BEST_REFRESH_SECONDS
+            # per worker, which is the traffic that blocks truncation.  The
+            # cached bound stays valid — bounds only tighten — so the cost is
+            # slightly weaker pruning for the pause window.
+            if (now - last_refresh > BEST_REFRESH_SECONDS
+                    and not self._checkpoint_pause_active()):
                 _, new, _ = self.queue.read_branch_best(branch_key)
                 if new is not None and (shared_best is None or new < shared_best):
                     shared_best = new
@@ -1093,12 +1183,16 @@ class _BranchWorker:
 
     # -- finalize -----------------------------------------------------------
 
-    def maybe_finalize(self, branch_key, words, n_candidates):
-        """If every candidate is done, finalize the branch exactly once."""
+    def maybe_finalize(self, branch_key, words, n_candidates) -> bool:
+        """If every candidate is done, finalize the branch exactly once.
+
+        Returns True when this worker completed the finalize; False when
+        candidates remain or a rival holds the finalize (see
+        _await_rival_finalize for why the rival may be dead)."""
         if self.queue.branch_done_candidates(branch_key) < n_candidates:
-            return
+            return False
         if not self.queue.try_finalize_branch(branch_key):  # pragma: no cover
-            return  # another worker won the finalize
+            return False  # another worker won the finalize
         meta = self.queue.read_branch_meta(branch_key)
         (best_guess, best_erd, max_depth, tainted, budget,
          ceiling, cut_occurred) = meta
@@ -1205,6 +1299,28 @@ class _BranchWorker:
             self.queue.mark_done(branch_key)    # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
+        return True
+
+    def _await_rival_finalize(self, branch_key, words, n_words, n_candidates):
+        """Every candidate is done but a rival holds the finalize.
+
+        A live rival completes the cache write + delete within milliseconds.
+        One killed between winning try_finalize_branch and deleting the row
+        leaves the branch 'finalized' forever — try_finalize_branch refuses
+        non-'open' rows, so without intervention every waiting sibling spins
+        silently at full CPU.  Heartbeat first (this wait must stay visible
+        and must not get this worker's parent claims reclaimed), then reopen
+        the row once it has been 'finalized' past FINALIZE_TAKEOVER_SECONDS
+        and complete the finalize from its intact claims and meta."""
+        self._heartbeat(branch_key, n_words, None, None, None, None,
+                        force=True)
+        if self.queue.reclaim_stale_finalize(branch_key,
+                                             FINALIZE_TAKEOVER_SECONDS):
+            logger.warning('%s reopened branch (%d words): finalizer died '
+                           'mid-finalize', self.name, n_words)
+            self.maybe_finalize(branch_key, words, n_candidates)
+            return
+        time.sleep(0.05)
 
     # -- recursive cooperative solving --------------------------------------
 
@@ -1420,7 +1536,10 @@ class _BranchWorker:
                         self.maybe_finalize(branch_key, words, self.n_candidates)
                     self._maybe_checkpoint()    # drain WAL during deep solving
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
-                    self.maybe_finalize(branch_key, words, self.n_candidates)
+                    if not self.maybe_finalize(branch_key, words,
+                                               self.n_candidates):
+                        self._await_rival_finalize(branch_key, words, n_words,
+                                                   self.n_candidates)
                 else:  # pragma: no cover
                     # Every candidate is claimed but coverage isn't complete: some
                     # are held by other workers.  Heartbeat first (so THIS worker,
@@ -1542,6 +1661,8 @@ class _BranchWorker:
                 self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
             self._check_ram()
+            self._check_disk()
+            self._respect_checkpoint_pause()
 
     # -- focused single-branch loop ------------------------------------------
 
@@ -1571,8 +1692,11 @@ class _BranchWorker:
                 # retry, rather than abandoning the branch one candidate short of
                 # finalizing (which would strand it forever).
                 if self.queue.branch_done_candidates(branch_key) >= n_candidates:
-                    self.maybe_finalize(branch_key, words, n_candidates)
-                    break
+                    if self.maybe_finalize(branch_key, words, n_candidates):
+                        break
+                    self._await_rival_finalize(branch_key, words,
+                                               branch['n_words'], n_candidates)
+                    continue
                 self._heartbeat(branch_key, branch['n_words'], None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
@@ -1582,8 +1706,8 @@ class _BranchWorker:
             if self.evaluate_bundle(branch_key, words, branch['n_words'], bundle_id,
                                     indices, forced, budget=budget):
                 if self.queue.branch_done_candidates(branch_key) >= n_candidates:
-                    self.maybe_finalize(branch_key, words, n_candidates)
-                    break
+                    if self.maybe_finalize(branch_key, words, n_candidates):
+                        break
 
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no cover

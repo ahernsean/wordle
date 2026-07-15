@@ -15,6 +15,7 @@ version violation — check the target version by hand, or on the box itself.
 
 from __future__ import annotations
 
+import json
 import logging
 import hashlib
 import math
@@ -76,8 +77,44 @@ DEFAULT_REPUBLISH_LIMIT = 3
 # indistinguishable from a single slow claim.
 _BUNDLE_CLAIM_RETRY_MILLIS = 100
 
+# A checkpoint_pause flag older than this is ignored by workers: it means the
+# supervisor that set it died before clearing it, and honouring it forever
+# would wedge the swarm.
+CHECKPOINT_PAUSE_STALE_SECONDS = 60
+
+# Disk sample ring length for the status display's growth rate (see
+# record_disk_sample); at the supervisor's 30s cadence this covers ~10 min.
+DISK_SAMPLE_KEEP = 20
+
+# Disk fullness thresholds, as the used fraction df reports.  Above WARN the
+# status display draws the disk figure in red; at or above STOP the swarm
+# stops and latches down (see set_disk_stop), reserving the remaining space
+# for the rest of the OS and for diagnosis.
+DISK_WARN_FRACTION = 0.80
+DISK_STOP_FRACTION = 0.90
+
 # Re-export so callers don't need to import cache_sqlite directly.
 encode_subset = ScoreCache.encode_subset
+
+
+def disk_stats(path: str) -> dict:
+    """Fullness of the filesystem holding `path`, in df's terms.
+
+    Returns {'total_bytes', 'used_bytes', 'avail_bytes', 'used_fraction'}.
+    used_fraction = used / (used + available-to-unprivileged), matching df's
+    Use% — the root-reserved blocks are excluded from capacity, so 100% here
+    is where unprivileged writes start failing, not where the platters end.
+    """
+    st = os.statvfs(path)
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    avail = st.f_bavail * st.f_frsize
+    capacity = used + avail
+    return {
+        "total_bytes": st.f_blocks * st.f_frsize,
+        "used_bytes": used,
+        "avail_bytes": avail,
+        "used_fraction": (used / capacity) if capacity else 1.0,
+    }
 
 
 def decode_subset(blob: bytes) -> list[str]:
@@ -239,7 +276,7 @@ CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
 -- waiting parents through this table instead.  A cut proven at `budget` is
 -- valid at any budget <= it (fewer guesses cannot beat the bound), mirroring
 -- the score cache's loss-reuse rule.  Transient coordination data: cleared on
--- supervisor restart (reset_active_branches), never synced anywhere.
+-- supervisor restart (recover_active_branches), never synced anywhere.
 CREATE TABLE IF NOT EXISTS cut_results (
     branch_key BLOB    PRIMARY KEY,
     budget     INTEGER NOT NULL,
@@ -505,6 +542,7 @@ class ERDQueue:
 
     def __init__(self, db_path: str, timeout: float = 30.0,
                  telemetry_path: str = None):
+        self.db_path = db_path
         self._timeout = timeout
         self._conn = sqlite3.connect(db_path, timeout=timeout,
                                      isolation_level=None)
@@ -755,20 +793,44 @@ class ERDQueue:
     def close(self):
         self._conn.close()
 
-    def checkpoint(self):
-        """Fold the WAL into the main database file (PRAGMA wal_checkpoint(TRUNCATE)).
+    def checkpoint(self, mode: str = "TRUNCATE"):
+        """Fold the WAL into the main database file (PRAGMA wal_checkpoint).
 
-        A TRUNCATE checkpoint only shrinks the -wal file back to zero when it
-        can take the database's exclusive lock; under sustained concurrent
-        claim/heartbeat traffic it may checkpoint what it can without
-        truncating. Called periodically rather than relying on SQLite's
-        default passive auto-checkpoint, which can be outpaced by write
-        volume and never reclaim the file (see journal_size_limit above).
+        Returns the pragma's (busy, log_frames, checkpointed_frames) row, or
+        None if the pragma itself errored.  busy=1 means the checkpoint could
+        not complete — SQLite reports contention through this row, NOT as an
+        exception, so callers that care must inspect the result.
+
+        mode PASSIVE backfills whatever it can without taking the writer lock
+        or waiting on readers: it can never stall other connections, but never
+        truncates the file either.  mode TRUNCATE additionally takes the
+        writer lock and waits (up to the connection busy timeout) for all
+        readers to drain past the WAL before truncating it to
+        journal_size_limit; under sustained concurrent traffic it loses that
+        wait, so it should only be attempted while writers are quiesced (see
+        set_checkpoint_pause).
         """
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"unknown checkpoint mode {mode!r}")
         try:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            row = self._conn.execute(
+                f"PRAGMA wal_checkpoint({mode})").fetchone()
         except sqlite3.OperationalError as exc:
-            logger.warning("wal_checkpoint(TRUNCATE) failed: %s", exc)
+            logger.warning("wal_checkpoint(%s) failed: %s", mode, exc)
+            return None
+        busy, log_frames, checkpointed = row[0], row[1], row[2]
+        if busy:
+            logger.warning(
+                "wal_checkpoint(%s) incomplete: busy=1 log=%s checkpointed=%s "
+                "wal_bytes=%s", mode, f"{log_frames:,}", f"{checkpointed:,}",
+                f"{self.wal_size_bytes():,}")
+        return busy, log_frames, checkpointed
+
+    def wal_size_bytes(self) -> int:
+        try:
+            return os.path.getsize(f"{self.db_path}-wal")
+        except OSError:
+            return 0
 
     # ------------------------------------------------------------------
     # Populate queue
@@ -1461,6 +1523,21 @@ class ERDQueue:
         """, (now, branch_key))
         return cur.rowcount == 1
 
+    def reclaim_stale_finalize(self, branch_key, timeout_seconds: int) -> bool:
+        """Reopen a branch whose finalizer died mid-finalize.
+
+        The worker that wins try_finalize_branch completes the cache write and
+        delete_branch within milliseconds; a row still status='finalized'
+        after timeout_seconds has no live finalizer, and without intervention
+        every waiting sibling spins on it forever.  Returns True if this call
+        reopened the row (the caller should then re-run maybe_finalize)."""
+        cutoff = int(time.time()) - timeout_seconds
+        cur = self._conn.execute("""
+            UPDATE active_branches SET status = 'open', finalized_at = NULL
+            WHERE branch_key = ? AND status = 'finalized' AND finalized_at < ?
+        """, (branch_key, cutoff))
+        return cur.rowcount == 1
+
     def delete_branch(self, branch_key):
         """Remove a finished branch and its claim/packer rows to bound the queue DB.
 
@@ -1531,42 +1608,44 @@ class ERDQueue:
             ORDER BY priority DESC, n_words DESC
         """).fetchall()
 
-    def reset_active_branches(self):
-        """Drop in-progress user-queued branch state; free stale cooperative claims.
+    def recover_active_branches(self):
+        """Free stale in-flight claims after a restart; completed work survives.
 
-        A branch is user-queued iff it has a pending_branches row.  Those rows
-        reset_stale_in_progress() already flipped back to 'pending', so wiping
-        their active_branches and claim rows just discards half-done coordination
-        — they re-promote and redo cleanly.
+        Every active_branches row — user-queued and cooperative alike — is
+        preserved along with its done=1 claims, republish rows, and bundle
+        telemetry: register_branch()'s INSERT OR IGNORE means the next worker
+        to promote or join the branch adopts the surviving row and continues
+        from its pack_cursor, bulk_done_bound, and best_erd, all of which only
+        tighten monotonically and so are sound to resume from.  Only done=0
+        claims — work that was in flight in a process the restart killed —
+        are freed, making those candidates reclaimable as gaps.
 
-        Cooperative branches have NO pending_branches row — they are inserted
-        directly into active_branches by cooperative_solve.  Wiping them throws
-        away all partial-claim progress with no recovery path.  Instead, only
-        free their stale in-flight claims (done=0 rows); done=1 rows and the
-        branch row itself survive, so the next worker to join picks up exactly
-        where the killed worker left off.
+        User-queued branches (those with a pending_branches row) additionally
+        had their pending row flipped back to 'pending' by
+        reset_stale_in_progress(), so a worker re-promotes them; the
+        re-promotion joins the preserved row rather than starting over.
 
-        Returns (n_branches, n_claims) cleared for user-queued branches only.
+        Returns (n_branches_resumed, n_claims_freed).
         """
-        member = "branch_key IN (SELECT branch_key FROM pending_branches)"
-        nb = self._conn.execute(
-            f"SELECT COUNT(*) FROM active_branches WHERE {member}").fetchone()[0]
-        nc = self._conn.execute(
-            f"SELECT COUNT(*) FROM candidate_claims WHERE {member}").fetchone()[0]
-        self._conn.execute(f"DELETE FROM candidate_claims WHERE {member}")
-        self._conn.execute(f"DELETE FROM candidate_republish WHERE {member}")
-        self._conn.execute(f"DELETE FROM telemetry.bundle_stats WHERE {member}")
-        self._conn.execute(f"DELETE FROM active_branches WHERE {member}")
+        # A row stuck in status='finalized' had its finalizer killed between
+        # winning try_finalize_branch and completing the cache write + delete.
+        # No live worker can ever finish it — try_finalize_branch refuses
+        # non-'open' rows, so every visitor spins on it forever.  Reopen it;
+        # its claims and meta are intact, so the next visitor re-runs the
+        # finalize from where the dead worker left off.
+        self._conn.execute(
+            "UPDATE active_branches SET status = 'open', finalized_at = NULL "
+            "WHERE status = 'finalized'")
+        n_branches_resumed = self._conn.execute(
+            "SELECT COUNT(*) FROM active_branches").fetchone()[0]
         # Cut results are a delivery channel to waiting parents, and a restart
         # killed every waiter.  The bounds are still true, but stale rows would
         # short-circuit future ceilinged solves against ceilings nobody asked
         # for yet; drop them and let the new run derive its own.
         self._conn.execute("DELETE FROM cut_results")
-        # Free stale in-flight claims on cooperative branches so their
-        # remaining candidates are reclaimable as gaps.
-        self._conn.execute(
+        cur = self._conn.execute(
             "DELETE FROM candidate_claims WHERE done = 0")
-        return nb, nc
+        return n_branches_resumed, cur.rowcount
 
     def worker_counts_by_branch(self, timeout_seconds: int = 30) -> dict:
         """{branch_key bytes: number of recent workers on it} for status."""
@@ -1833,6 +1912,76 @@ class ERDQueue:
         ).fetchone()
         return row["value"] if row else None
 
+    def delete_meta(self, key: str):
+        self._conn.execute("DELETE FROM run_meta WHERE key = ?", (key,))
+
+    # ------------------------------------------------------------------
+    # Checkpoint quiesce flag
+    # ------------------------------------------------------------------
+
+    def set_checkpoint_pause(self, paused: bool):
+        """Ask workers to stay off the queue database momentarily.
+
+        The flag stores its own timestamp: a worker honours it only while it
+        is younger than CHECKPOINT_PAUSE_STALE_SECONDS, so a supervisor that
+        dies with the flag set cannot wedge the swarm.
+        """
+        if paused:
+            self.set_meta("checkpoint_pause", str(int(time.time())))
+        else:
+            self.delete_meta("checkpoint_pause")
+
+    def checkpoint_paused(self) -> bool:
+        value = self.get_meta("checkpoint_pause")
+        if value is None:
+            return False
+        try:
+            set_at = int(value)
+        except ValueError:
+            return False
+        return time.time() - set_at < CHECKPOINT_PAUSE_STALE_SECONDS
+
+    # ------------------------------------------------------------------
+    # Disk watermark: samples, and the stop latch
+    # ------------------------------------------------------------------
+
+    def record_disk_sample(self, avail_bytes: int):
+        """Append (timestamp, avail_bytes) to a bounded ring in run_meta, for
+        the status display's disk growth rate."""
+        samples = self.disk_samples()
+        samples.append([int(time.time()), int(avail_bytes)])
+        self.set_meta("disk_samples", json.dumps(samples[-DISK_SAMPLE_KEEP:]))
+
+    def disk_samples(self) -> list:
+        value = self.get_meta("disk_samples")
+        if not value:
+            return []
+        try:
+            samples = json.loads(value)
+        except ValueError:
+            return []
+        return samples if isinstance(samples, list) else []
+
+    def set_disk_stop(self, reason: str):
+        """Latch the swarm down.  While set, `run` refuses to start; the latch
+        survives reboots and systemd restarts, and only clear_disk_stop()
+        (the `queue clear-disk-stop` command) releases it."""
+        self.set_meta("disk_stop",
+                      json.dumps({"at": int(time.time()), "reason": reason}))
+
+    def disk_stop(self):
+        """The latch payload as a dict, or None when not latched."""
+        value = self.get_meta("disk_stop")
+        if not value:
+            return None
+        try:
+            return json.loads(value)
+        except ValueError:
+            return {"at": None, "reason": value}
+
+    def clear_disk_stop(self):
+        self.delete_meta("disk_stop")
+
     # ------------------------------------------------------------------
     # Queue management
     # ------------------------------------------------------------------
@@ -1959,7 +2108,7 @@ class ERDQueue:
         """Delete a pending (status='pending') branch from the queue.
 
         Returns True if a row was deleted.  Does not touch active_branches or
-        candidate_claims — call reset_active_branches() first if the branch is
+        candidate_claims — call cancel_active_branch() first if the branch is
         currently in progress.
         """
         self._conn.execute(
