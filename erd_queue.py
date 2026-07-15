@@ -15,6 +15,7 @@ version violation — check the target version by hand, or on the box itself.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import hashlib
@@ -573,6 +574,44 @@ class ERDQueue:
         # bundle_id a still-open branch's bundle_stats already used).
         self._pid = os.getpid()
         self._bundle_seq = 0
+        # Cumulative WAL read/write attribution for this connection, keyed by
+        # (table/operation).  The WAL file records no per-table breakdown of
+        # what filled it; these counters do, so a worker can log which traffic
+        # it is pouring into the shared WAL.  Cumulative per connection: the
+        # worker logs deltas between snapshots as a rate (wal_traffic_snapshot),
+        # which needs no cross-process coordination.
+        self._wal_traffic_rows = collections.Counter()
+        self._wal_traffic_bytes = collections.Counter()
+
+    def _tally_wal_traffic(self, category: str, rows: int, approx_bytes: int):
+        """Attribute `rows`/`approx_bytes` of WAL traffic to `category`.
+
+        approx_bytes is a key-width estimate, not an exact frame count: the
+        point is relative magnitude between categories (which table is the
+        firehose), not a byte-accurate WAL model."""
+        if rows <= 0:
+            return
+        self._wal_traffic_rows[category] += rows
+        self._wal_traffic_bytes[category] += max(0, approx_bytes)
+
+    def wal_traffic_snapshot(self):
+        """A copy of the cumulative (rows, approx_bytes) traffic counters, for
+        a caller computing a rate from the delta between two snapshots."""
+        return (collections.Counter(self._wal_traffic_rows),
+                collections.Counter(self._wal_traffic_bytes))
+
+    def wal_traffic_report(self, top: int = 6) -> str:
+        """One-line-per-category summary of cumulative WAL traffic on this
+        connection, largest byte-estimate first.  Empty string when nothing
+        has been tallied yet."""
+        if not self._wal_traffic_bytes:
+            return ''
+        lines = []
+        for category, approx_bytes in self._wal_traffic_bytes.most_common(top):
+            rows = self._wal_traffic_rows[category]
+            lines.append(f'    {category}: {rows:,} rows, '
+                         f'~{approx_bytes / 2 ** 20:,.1f} MiB')
+        return '\n'.join(lines)
 
     def _absorb_legacy_telemetry_tables(self):
         """Handle a queue file that carries telemetry tables in the queue
@@ -848,6 +887,7 @@ class ERDQueue:
         - source_word / source_pattern record the first root word whose branch
           produced this entry (kept for display in `status`).
         """
+        rows = list(rows)
         self._conn.execute("BEGIN")
         try:
             self._conn.executemany("""
@@ -860,6 +900,9 @@ class ERDQueue:
                     source_pattern = COALESCE(source_pattern, excluded.source_pattern)
             """, rows)
             self._conn.execute("COMMIT")
+            self._tally_wal_traffic(
+                'pending_branches/add', len(rows),
+                sum(2 * len(r[0]) + 40 for r in rows))
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
@@ -1163,6 +1206,9 @@ class ERDQueue:
                     VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
                 """, [(branch_key, idx, now, now)
                       for idx in eliminated_indices])
+                self._tally_wal_traffic(
+                    'candidate_claims/bulk-eliminate', len(eliminated_indices),
+                    len(eliminated_indices) * (3 * len(branch_key) + 40))
                 self._conn.execute("""
                     UPDATE active_branches
                     SET bulk_done_candidates = bulk_done_candidates + ?,
@@ -1196,6 +1242,14 @@ class ERDQueue:
                     claim_rows = {row["idx"]: row for row in self._conn.execute(
                         "SELECT idx, done FROM candidate_claims "
                         "WHERE branch_key = ?", (branch_key,))}
+                    # A full per-branch claims re-read runs on every claim once
+                    # the branch is packed: pure read volume, but it holds a WAL
+                    # snapshot for its duration, which is what a checkpoint waits
+                    # on.  Tallied so the report shows read pressure, not just
+                    # write pressure.
+                    self._tally_wal_traffic(
+                        'candidate_claims/holes-scan(read)', len(claim_rows),
+                        len(claim_rows) * len(branch_key))
                 holes = [idx for idx in candidate_order if idx not in claim_rows]
                 eliminated_holes = [
                     idx for idx in holes if cost_lower_bound[idx] >= bound]
@@ -1208,6 +1262,10 @@ class ERDQueue:
                         VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
                     """, [(branch_key, idx, now, now)
                           for idx in eliminated_holes])
+                    self._tally_wal_traffic(
+                        'candidate_claims/bulk-eliminate-hole',
+                        len(eliminated_holes),
+                        len(eliminated_holes) * (3 * len(branch_key) + 40))
                     self._conn.execute("""
                         UPDATE active_branches
                         SET bulk_done_candidates = bulk_done_candidates + ?,
@@ -1242,6 +1300,9 @@ class ERDQueue:
                     (branch_key, idx, claimed_by, claimed_at, done, bundle_id)
                 VALUES (?, ?, ?, ?, 0, ?)
             """, [(branch_key, idx, worker_id, now, bundle_id) for idx in bundle])
+            self._tally_wal_traffic(
+                'candidate_claims/claim', len(bundle),
+                len(bundle) * (3 * len(branch_key) + 40))
             actually_claimed = {r["idx"] for r in self._conn.execute(
                 "SELECT idx FROM candidate_claims "
                 "WHERE branch_key = ? AND bundle_id = ?",
@@ -2130,11 +2191,15 @@ class ERDQueue:
         authoritative done=1 record — the evaluation already happened.
         """
         now = int(time.time())
+        indices = list(indices)
         self._conn.executemany("""
             INSERT OR REPLACE INTO candidate_claims
                 (branch_key, idx, claimed_by, claimed_at, done, done_at)
             VALUES (?, ?, 'publisher', ?, 1, ?)
         """, [(branch_key, idx, now, now) for idx in indices])
+        self._tally_wal_traffic(
+            'candidate_claims/publisher-mark-done', len(indices),
+            len(indices) * (3 * len(branch_key) + 40))
 
     def add_nodes_spent(self, branch_key: bytes, delta: int):
         """Increment nodes_spent on an active branch for cost-model sampling."""
