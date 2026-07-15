@@ -208,6 +208,13 @@ python -m unittest discover -s tests -t . -p 'test_*.py'
 
 Commits with failing tests must not be pushed.
 
+**Stage files explicitly, by path.  `git add -A`, `git add .`, `git add -u`,
+and `git commit -a` are prohibited — no exceptions.**  The working tree
+routinely holds untracked files that must never be committed: SQLite
+databases and their WAL/shm files, logs, scratch output from ad-hoc runs.
+Bulk staging sweeps them into the commit silently.  Run `git status` first,
+then name every file: `git add <path> <path> ...`.
+
 ---
 
 ## Respond to what's actually being asked
