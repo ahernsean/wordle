@@ -954,7 +954,7 @@ class ERDQueue:
             # (if un-compacted) database is fine if that is unavailable.
             try:
                 self._conn.execute("VACUUM")
-            except sqlite3.OperationalError as exc:
+            except sqlite3.OperationalError as exc:  # pragma: no cover
                 logger.warning(
                     "post-normalization VACUUM skipped (%s); database is "
                     "correct but not yet compacted", exc)

@@ -70,6 +70,33 @@ CREATE TABLE pending_branches (
     completed_at   INTEGER,
     PRIMARY KEY (branch_key)
 );
+CREATE TABLE worker_heartbeat (
+    worker_id          TEXT    PRIMARY KEY,
+    pid                INTEGER NOT NULL,
+    current_branch_key BLOB,
+    n_words            INTEGER,
+    started_at         INTEGER,
+    updated_at         INTEGER NOT NULL,
+    claims_done        INTEGER NOT NULL DEFAULT 0,
+    claim_idx          INTEGER,
+    claim_started_at   INTEGER,
+    cand_rate          REAL,
+    cache_hits         INTEGER,
+    cache_misses       INTEGER,
+    n_cutoff           INTEGER,
+    n_pruned           INTEGER,
+    n_ok               INTEGER,
+    best_guess         TEXT,
+    best_erd           REAL,
+    bound_erd          REAL,
+    cur_candidate      TEXT,
+    cand_n_seen        INTEGER,
+    claim_total        INTEGER,
+    cur_max_depth      INTEGER,
+    cur_nodes          INTEGER,
+    node_rate          REAL,
+    cur_path           TEXT
+);
 """
 
 
@@ -99,6 +126,10 @@ class TestBranchIdMigration(unittest.TestCase):
         con.execute(
             "INSERT INTO pending_branches (branch_key, n_words, priority, "
             "source_word) VALUES (?, 4, 1, 'salet')", (self.key_b,))
+        con.execute(
+            "INSERT INTO worker_heartbeat "
+            "(worker_id, pid, current_branch_key, updated_at) "
+            "VALUES ('worker-0', 123, ?, 0)", (self.key_a,))
         con.commit()
         con.close()
 
