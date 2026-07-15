@@ -64,6 +64,11 @@ transitioning to finalizing remains pinned by identity until dismissed.
 Non-TTY text and JSON Lines remain noninteractive. One-shot invocations do
 not change terminal mode.
 
+The navigation footer follows the phase 2 width contract: targets wrap as
+complete tokens, no hotkey/identity token is clipped, and lower-priority help
+text is omitted before a target is truncated. A terminal resize recomputes
+all report tables and navigation wrapping on the next refresh.
+
 ## Legacy removal
 
 Remove:
@@ -99,7 +104,9 @@ Required coverage:
 5. Removed commands fail argparse while lifecycle and queue mutation commands
    still work.
 6. Every `SWARM.md` command example parses.
-7. Every semantic assertion formerly in `tests/test_status_sections.py` has an
+7. Navigation targets and all final report kinds fit widths 50, 55, 59, 60,
+   79, 80, and 120 before the legacy renderer is removed.
+8. Every semantic assertion formerly in `tests/test_status_sections.py` has an
    equivalent report-model or report-terminal test before that file is
    deleted.
 
@@ -107,6 +114,7 @@ Required coverage:
 
 - [ ] All terminal inspection uses `erd_search.py view`.
 - [ ] Navigation is report-request state keyed by full identities.
+- [ ] The final terminal surface is adaptive and complete at 50 columns.
 - [ ] Queue commands are mutation-only.
 - [ ] `status` and `cache-status` are removed.
 - [ ] `AGENTS.md`, `SWARM.md`, parser help, and tests name the same surface.
