@@ -80,7 +80,8 @@ python3.13 erd_search.py view --format jsonl --watch 10 --workers
 The default report is the operational overview. Watched text is interactive in
 a TTY: branch letters and worker numbers open detail, Backspace or Escape goes
 back, Space refreshes, and `q` quits. Non-TTY text and structured output remain
-noninteractive.
+noninteractive. The overview includes filesystem fullness, queue WAL size, and
+a fresh fill-rate estimate with time remaining to the disk-stop threshold.
 
 Semantic selectors infer words and branches from spine form:
 
@@ -125,6 +126,27 @@ extant queue topology; cache rows never reconstruct historical trees.
 tail -f erd_search.log
 tail -f erd_worker_0.log
 ```
+
+---
+
+## Disk safety and WAL maintenance
+
+Workers periodically checkpoint the queue WAL in PASSIVE mode. The supervisor
+also checks the WAL every five seconds; above 2 GB it briefly asks workers to
+stay off the queue database while it retries a TRUNCATE checkpoint. The pause
+flag expires automatically after 60 seconds if the supervisor exits.
+
+At 90% filesystem use, the supervisor records a persistent disk-stop latch and
+stops the swarm. `run` refuses to restart while the latch is set or the live
+filesystem remains at the threshold. Free disk space first, then release it:
+
+```bash
+python3.13 erd_search.py queue clear-disk-stop
+systemctl --user start wordle-erd
+```
+
+Completed candidate claims and the running best survive the restart; only
+claims held by processes that stopped are made available again.
 
 ---
 
