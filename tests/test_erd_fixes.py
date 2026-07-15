@@ -40,8 +40,10 @@ class TestReclaimLiveness(_TmpDB, unittest.TestCase):
 
     def _insert_claim(self, worker, claimed_at, done=0, idx=0):
         self.q._conn.execute(
-            "INSERT INTO candidate_claims (branch_key, idx, claimed_by, claimed_at, done) "
-            "VALUES (?, ?, ?, ?, ?)", (self.key, idx, worker, claimed_at, done))
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, claimed_at, done) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (self.q._intern_branch(self.key, create=True), idx, worker,
+             claimed_at, done))
 
     def _n_claims(self):
         return self.q._conn.execute(

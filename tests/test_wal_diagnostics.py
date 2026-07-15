@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import erd_queue
 import erd_search
 from erd_queue import ERDQueue, encode_subset
 
@@ -36,10 +37,10 @@ class TestWALTrafficAttribution(_TmpQueue):
             small_count=5, count_cap=500)
         rows, byts = self.q.wal_traffic_snapshot()
         self.assertEqual(rows["candidate_claims/bulk-eliminate"], N_CANDIDATES)
-        # The fat branch_key blob dominates the byte estimate, so it is well
-        # above a rows-only count.
-        self.assertGreater(byts["candidate_claims/bulk-eliminate"],
-                           N_CANDIDATES * len(self.key))
+        # Post branch-id normalization the estimate is a small per-row constant
+        # (no branch_key blob in the row), so it scales with row count only.
+        self.assertEqual(byts["candidate_claims/bulk-eliminate"],
+                         N_CANDIDATES * erd_queue._CLAIM_ROW_WAL_BYTES)
 
     def test_survivor_claim_is_attributed(self):
         # A loose bound eliminates nothing and hands out a survivor bundle.
@@ -88,13 +89,14 @@ class TestWALTrafficAttribution(_TmpQueue):
             rows["candidate_republish/republish-upsert"], len(indices))
 
     def test_reclaim_paths_are_attributed(self):
+        bid = self.q._intern_branch(self.key)
         self.q._conn.execute(
-            "INSERT INTO candidate_claims (branch_key, idx, claimed_by, "
-            "claimed_at, done) VALUES (?, 0, 'dead', 0, 0)", (self.key,))
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, "
+            "claimed_at, done) VALUES (?, 0, 'dead', 0, 0)", (bid,))
         self.assertEqual(self.q.reclaim_stale_claims(120), 1)
         self.q._conn.execute(
-            "INSERT INTO candidate_claims (branch_key, idx, claimed_by, "
-            "claimed_at, done) VALUES (?, 1, 'w9', 0, 0)", (self.key,))
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, "
+            "claimed_at, done) VALUES (?, 1, 'w9', 0, 0)", (bid,))
         self.assertEqual(self.q.reclaim_claims_of_worker("w9"), 1)
         rows, _ = self.q.wal_traffic_snapshot()
         self.assertEqual(rows["candidate_claims/reclaim-stale"], 1)
