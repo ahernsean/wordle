@@ -62,8 +62,12 @@ class ReportClientStaticTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_wordle_palette_and_responsive_breakpoint_are_declared(self):
-        for color in ("#121213", "#d7dadc", "#818384", "#538d4e", "#b59f3b", "#3a3a3c", "#cc4444", "#d0a215"):
+        for color in (
+            "#ffffff", "#f8f9fa", "#1a1a1b", "#787c7e", "#6aaa64",
+            "#c9b458", "#d3d6da", "#d14b4b", "#b59f3b",
+        ):
             self.assertIn(color, self.html)
+        self.assertIn("color-scheme: light", self.html)
         self.assertIn("@media (max-width:600px)", self.html)
 
 
@@ -370,10 +374,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           return result;
         }""")
         declared = self.page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--green').trim()")
-        self.assertEqual(declared, "#538d4e")
-        self.assertEqual(colors["g"], "rgb(83, 141, 78)")
-        self.assertEqual(colors["y"], "rgb(181, 159, 59)")
-        self.assertEqual(colors["gray"], "rgb(58, 58, 60)")
+        self.assertEqual(declared, "#6aaa64")
+        self.assertEqual(colors["g"], "rgb(106, 170, 100)")
+        self.assertEqual(colors["y"], "rgb(201, 180, 88)")
+        self.assertEqual(colors["gray"], "rgb(120, 124, 126)")
 
     def test_no_horizontal_scroll_at_required_widths(self):
         for width in (375, 390, 480, 800, 1200):
