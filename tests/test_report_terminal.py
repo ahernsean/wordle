@@ -148,16 +148,18 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("queue: ok", output)
         self.assertIn("pending 12", output)
         self.assertIn("@0123456789ab", output)
-        self.assertIn("d=2", output)
-        self.assertIn("25/100 (25.0%)", output)
+        self.assertIn("guess_depth=2", output)
+        self.assertIn("25/100", output)
         self.assertNotIn("30/100", output)
-        self.assertIn("max-d=3", output)
-        self.assertIn("W2", output)
+        self.assertIn("max_remaining_depth=3", output)
+        self.assertIn("worker=worker-2", output)
         self.assertNotIn("\033", output)
 
     def test_narrow_rendering_respects_width(self):
         output = render_overview(overview_report(), color=False, width=48)
         self.assertTrue(all(len(line) <= 48 for line in output.splitlines()))
+        self.assertIn("@0123456789ab", output)
+        self.assertIn("worker=worker-2", output)
 
     def test_progress_and_worker_changes_are_semantically_colored(self):
         previous = overview_report()
@@ -168,7 +170,7 @@ class OverviewRendererTest(unittest.TestCase):
             current, previous_report=previous, color=True, width=100
         )
         self.assertIn(report_terminal.GREEN + "  @0123456789ab", output)
-        self.assertIn(report_terminal.RED + "    W2", output)
+        self.assertIn(report_terminal.RED + "    worker=worker-2", output)
 
     def test_ticking_timestamps_alone_are_not_highlighted(self):
         previous = overview_report()
@@ -186,12 +188,16 @@ class OverviewRendererTest(unittest.TestCase):
         stale = overview_report()
         stale["data"]["workers"][0]["updated_at"] = 979
         stale_output = render_overview(stale, color=True, width=100)
-        self.assertIn(report_terminal.AMBER + "    W2", stale_output)
+        self.assertIn(
+            report_terminal.AMBER + "    worker=worker-2", stale_output
+        )
 
         dead = deepcopy(stale)
         dead["data"]["workers"][0]["is_live"] = False
         dead_output = render_overview(dead, color=True, width=100)
-        self.assertIn(report_terminal.RED + "  W2 dead", dead_output)
+        self.assertIn(
+            report_terminal.RED + "  worker=worker-2 dead", dead_output
+        )
 
     def test_reordered_input_keeps_prior_identity_order(self):
         first = overview_report()
@@ -302,7 +308,9 @@ class OverviewRendererTest(unittest.TestCase):
             second, previous_report=first, width=100,
             display_order=display_order,
         )
-        self.assertLess(output.index("W2"), output.index("W1"))
+        self.assertLess(
+            output.index("worker=worker-2"), output.index("worker=worker-1")
+        )
 
     def test_watched_branch_claims_compare_by_candidate_index(self):
         report = overview_report()
@@ -443,7 +451,9 @@ class CollectionRendererTest(unittest.TestCase):
             "matched_rows": 1,
             "rows": [worker],
         })
-        self.assertIn("W2 stale", render_report(workers_report, width=120))
+        self.assertIn(
+            "worker=worker-2 stale", render_report(workers_report, width=120)
+        )
 
         cache_report = self._report("cache", {
             "summary": {
