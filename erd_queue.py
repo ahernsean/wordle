@@ -83,6 +83,13 @@ _BUNDLE_CLAIM_RETRY_MILLIS = 100
 # would wedge the swarm.
 CHECKPOINT_PAUSE_STALE_SECONDS = 60
 
+# Approximate WAL cost of one candidate_claims row (table row plus the primary
+# key and bundle indexes), for the per-table traffic estimate.  Since branch-id
+# normalization each row references a small integer branch_id, not the fat
+# branch_key blob, so this is a small constant rather than a multiple of the
+# key width.
+_CLAIM_ROW_WAL_BYTES = 96
+
 # Disk sample ring length for the status display's growth rate (see
 # record_disk_sample); at the supervisor's 30s cadence this covers ~10 min.
 DISK_SAMPLE_KEEP = 20
@@ -271,6 +278,18 @@ CREATE TABLE IF NOT EXISTS active_branches (
 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
     ON active_branches(status, priority DESC, n_words DESC);
 
+-- Registry mapping each branch's key (the concatenated word list, up to a few
+-- KB) to a small integer branch_id.  The high-volume per-candidate tables
+-- (candidate_claims, candidate_republish) and the per-branch cut_results
+-- reference branch_id instead of carrying the fat blob in every row and index
+-- entry, so bulk claim sweeps and full-branch re-reads move integers, not
+-- kilobytes.  Append-only: a branch keeps its id across pending/active/deleted
+-- transitions, so claims never dangle against a reassigned id.
+CREATE TABLE IF NOT EXISTS branches (
+    branch_id  INTEGER PRIMARY KEY,
+    branch_key BLOB    NOT NULL UNIQUE
+);
+
 -- Result channel for ceilinged (alpha-beta) cooperative solves that CUT: the
 -- score cache only carries exact optima, so a cut — "every candidate priced
 -- out at >= bound; true ERD of this branch is >= bound" — is delivered to
@@ -279,7 +298,7 @@ CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
 -- the score cache's loss-reuse rule.  Transient coordination data: cleared on
 -- supervisor restart (recover_active_branches), never synced anywhere.
 CREATE TABLE IF NOT EXISTS cut_results (
-    branch_key BLOB    PRIMARY KEY,
+    branch_id  INTEGER PRIMARY KEY,
     budget     INTEGER NOT NULL,
     bound      REAL    NOT NULL,
     created_at INTEGER NOT NULL
@@ -299,14 +318,14 @@ CREATE TABLE IF NOT EXISTS cut_results (
 -- inserted outside the packer (e.g. mark_claims_done's within-candidate
 -- overrun promotion).
 CREATE TABLE IF NOT EXISTS candidate_claims (
-    branch_key BLOB    NOT NULL,
+    branch_id  INTEGER NOT NULL,
     idx        INTEGER NOT NULL,
     claimed_by TEXT,
     claimed_at INTEGER,
     done       INTEGER NOT NULL DEFAULT 0,
     done_at    INTEGER,
     bundle_id  TEXT,
-    PRIMARY KEY (branch_key, idx)
+    PRIMARY KEY (branch_id, idx)
 );
 -- idx_candidate_claims_bundle is created in _migrate(), after the bundle_id
 -- column is guaranteed to exist on an upgraded database: this CREATE TABLE
@@ -321,10 +340,10 @@ CREATE TABLE IF NOT EXISTS candidate_claims (
 -- from one republished for the first time.  Dropped with the rest of the
 -- branch's transient state by delete_branch.
 CREATE TABLE IF NOT EXISTS candidate_republish (
-    branch_key BLOB    NOT NULL,
-    idx        INTEGER NOT NULL,
-    count      INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (branch_key, idx)
+    branch_id INTEGER NOT NULL,
+    idx       INTEGER NOT NULL,
+    count     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (branch_id, idx)
 );
 
 -- Per-size-bucket online cost model (time-weighted geometric mean of
@@ -582,6 +601,10 @@ class ERDQueue:
         # which needs no cross-process coordination.
         self._wal_traffic_rows = collections.Counter()
         self._wal_traffic_bytes = collections.Counter()
+        # branch_key BLOB -> branch_id int, memoized so a hot branch costs no
+        # SQL after its first lookup.  Only positive results are cached; the
+        # registry is append-only, so a cached id never goes stale.
+        self._branch_id_cache = {}
 
     def _tally_wal_traffic(self, category: str, rows: int, approx_bytes: int):
         """Attribute `rows`/`approx_bytes` of WAL traffic to `category`.
@@ -728,14 +751,6 @@ class ERDQueue:
         self._add_columns("candidate_claims", {
             "bundle_id": "TEXT",
         })
-        # Must run after the ADD COLUMN above: on a fresh database the
-        # CREATE TABLE in _SCHEMA_SQL already has bundle_id, but on an
-        # upgraded database that CREATE TABLE is a no-op against the
-        # pre-existing table, so creating this index any earlier (e.g. in
-        # _SCHEMA_SQL itself) would fail with "no such column: bundle_id".
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
-            "ON candidate_claims(branch_key, bundle_id)")
 
         # Alpha-beta ceiling propagation: additive/nullable-default on both
         # files.  Existing active_branches rows keep NULL ceiling (exact solve,
@@ -753,6 +768,97 @@ class ERDQueue:
             "outcome": "TEXT",
             "bulk_done_candidates": "INTEGER",
         }, schema="telemetry")
+
+        # Branch-key normalization: the fat branch_key BLOB (the concatenated
+        # word list, up to a few KB) used to sit in every candidate_claims,
+        # candidate_republish, and cut_results row and be duplicated in the
+        # claims bundle index.  Move it to the branches registry (stored once)
+        # and rebuild those tables to reference the small integer branch_id.
+        # Each table is guarded independently on its own pre-normalization
+        # column, so a database mid-normalization (or a partial fixture) is
+        # completed table by table rather than assuming all three move
+        # together.  Runs with workers stopped, so no writer races the swap.
+        def _has_branch_key(table):
+            return "branch_key" in {r["name"] for r in
+                self._conn.execute(f"PRAGMA table_info({table})")}
+
+        normalized_tables = [t for t in
+                             ("candidate_claims", "candidate_republish",
+                              "cut_results") if _has_branch_key(t)]
+        for table in normalized_tables:
+            self._conn.execute(
+                f"INSERT OR IGNORE INTO branches (branch_key) "
+                f"SELECT branch_key FROM {table}")
+        if _has_branch_key("candidate_claims"):
+            self._conn.executescript("""
+                CREATE TABLE candidate_claims_new (
+                    branch_id  INTEGER NOT NULL,
+                    idx        INTEGER NOT NULL,
+                    claimed_by TEXT,
+                    claimed_at INTEGER,
+                    done       INTEGER NOT NULL DEFAULT 0,
+                    done_at    INTEGER,
+                    bundle_id  TEXT,
+                    PRIMARY KEY (branch_id, idx)
+                );
+                INSERT INTO candidate_claims_new
+                    SELECT b.branch_id, c.idx, c.claimed_by, c.claimed_at,
+                           c.done, c.done_at, c.bundle_id
+                    FROM candidate_claims c
+                    JOIN branches b ON b.branch_key = c.branch_key;
+                DROP TABLE candidate_claims;
+                ALTER TABLE candidate_claims_new RENAME TO candidate_claims;
+            """)
+        if _has_branch_key("candidate_republish"):
+            self._conn.executescript("""
+                CREATE TABLE candidate_republish_new (
+                    branch_id INTEGER NOT NULL,
+                    idx       INTEGER NOT NULL,
+                    count     INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (branch_id, idx)
+                );
+                INSERT INTO candidate_republish_new
+                    SELECT b.branch_id, c.idx, c.count
+                    FROM candidate_republish c
+                    JOIN branches b ON b.branch_key = c.branch_key;
+                DROP TABLE candidate_republish;
+                ALTER TABLE candidate_republish_new RENAME TO candidate_republish;
+            """)
+        if _has_branch_key("cut_results"):
+            self._conn.executescript("""
+                CREATE TABLE cut_results_new (
+                    branch_id  INTEGER PRIMARY KEY,
+                    budget     INTEGER NOT NULL,
+                    bound      REAL    NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO cut_results_new
+                    SELECT b.branch_id, c.budget, c.bound, c.created_at
+                    FROM cut_results c
+                    JOIN branches b ON b.branch_key = c.branch_key;
+                DROP TABLE cut_results;
+                ALTER TABLE cut_results_new RENAME TO cut_results;
+            """)
+
+        # Claims bundle index on the (post-normalization) branch_id key.  After
+        # the ADD COLUMN and rebuild above, so bundle_id and branch_id both
+        # exist whether the database is fresh, upgraded, or already migrated.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
+            "ON candidate_claims(branch_id, bundle_id)")
+
+        if normalized_tables:
+            # DROP TABLE hands the fat-blob pages to the free-list, not the OS,
+            # so the file stays bloated until compacted.  This one-time upgrade
+            # runs with workers stopped, so reclaim the space now.  Best-effort:
+            # a VACUUM needs scratch space up to the file size, and a correct
+            # (if un-compacted) database is fine if that is unavailable.
+            try:
+                self._conn.execute("VACUUM")
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "post-normalization VACUUM skipped (%s); database is "
+                    "correct but not yet compacted", exc)
 
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
@@ -874,6 +980,32 @@ class ERDQueue:
     # ------------------------------------------------------------------
     # Populate queue
     # ------------------------------------------------------------------
+
+    def _intern_branch(self, branch_key, create=False):
+        """Map a branch_key BLOB to its integer branch_id in the branches
+        registry — the surrogate key the high-volume claim/cut tables reference
+        instead of the fat blob.
+
+        create=True registers the branch if absent (write paths that must be
+        able to reference it); create=False returns None for an unregistered
+        branch (read/delete paths, where absence means the branch simply has no
+        rows to read or delete, and must NOT write a registry entry).  Positive
+        lookups are memoized per connection.
+        """
+        cached = self._branch_id_cache.get(branch_key)
+        if cached is not None:
+            return cached
+        if create:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO branches (branch_key) VALUES (?)",
+                (branch_key,))
+        row = self._conn.execute(
+            "SELECT branch_id FROM branches WHERE branch_key = ?",
+            (branch_key,)).fetchone()
+        if row is None:
+            return None
+        self._branch_id_cache[branch_key] = row[0]
+        return row[0]
 
     def add_pending_many(self, rows):
         """Insert (branch_key, n_words, priority, source_word, source_pattern) rows.
@@ -1173,6 +1305,7 @@ class ERDQueue:
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
                 return None
+            branch_id = self._intern_branch(branch_key, create=True)
             # The branch ceiling is a bound like any achieved best: candidates
             # whose lower bound reaches it are provably pruned for free, so the
             # packer classifies against the tighter of the two.
@@ -1185,8 +1318,8 @@ class ERDQueue:
             claim_rows = None
             if bound_tightened:
                 claim_rows = {row["idx"]: row for row in self._conn.execute(
-                    "SELECT idx, done FROM candidate_claims WHERE branch_key = ?",
-                    (branch_key,))}
+                    "SELECT idx, done FROM candidate_claims WHERE branch_id = ?",
+                    (branch_id,))}
                 eliminated_indices = [
                     idx for idx in candidate_order
                     if cost_lower_bound[idx] >= bound
@@ -1201,14 +1334,14 @@ class ERDQueue:
                 # eliminated for the rest of the branch's lifetime.
                 self._conn.executemany("""
                     INSERT OR REPLACE INTO candidate_claims
-                        (branch_key, idx, claimed_by, claimed_at, done, done_at,
+                        (branch_id, idx, claimed_by, claimed_at, done, done_at,
                          bundle_id)
                     VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
-                """, [(branch_key, idx, now, now)
+                """, [(branch_id, idx, now, now)
                       for idx in eliminated_indices])
                 self._tally_wal_traffic(
                     'candidate_claims/bulk-eliminate', len(eliminated_indices),
-                    len(eliminated_indices) * (3 * len(branch_key) + 40))
+                    len(eliminated_indices) * _CLAIM_ROW_WAL_BYTES)
                 self._conn.execute("""
                     UPDATE active_branches
                     SET bulk_done_candidates = bulk_done_candidates + ?,
@@ -1241,7 +1374,7 @@ class ERDQueue:
                 if claim_rows is None:
                     claim_rows = {row["idx"]: row for row in self._conn.execute(
                         "SELECT idx, done FROM candidate_claims "
-                        "WHERE branch_key = ?", (branch_key,))}
+                        "WHERE branch_id = ?", (branch_id,))}
                     # A full per-branch claims re-read runs on every claim once
                     # the branch is packed: pure read volume, but it holds a WAL
                     # snapshot for its duration, which is what a checkpoint waits
@@ -1249,7 +1382,7 @@ class ERDQueue:
                     # write pressure.
                     self._tally_wal_traffic(
                         'candidate_claims/holes-scan(read)', len(claim_rows),
-                        len(claim_rows) * len(branch_key))
+                        len(claim_rows) * _CLAIM_ROW_WAL_BYTES)
                 holes = [idx for idx in candidate_order if idx not in claim_rows]
                 eliminated_holes = [
                     idx for idx in holes if cost_lower_bound[idx] >= bound]
@@ -1257,15 +1390,15 @@ class ERDQueue:
                     now = int(time.time())
                     self._conn.executemany("""
                         INSERT INTO candidate_claims
-                            (branch_key, idx, claimed_by, claimed_at, done,
+                            (branch_id, idx, claimed_by, claimed_at, done,
                              done_at, bundle_id)
                         VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
-                    """, [(branch_key, idx, now, now)
+                    """, [(branch_id, idx, now, now)
                           for idx in eliminated_holes])
                     self._tally_wal_traffic(
                         'candidate_claims/bulk-eliminate-hole',
                         len(eliminated_holes),
-                        len(eliminated_holes) * (3 * len(branch_key) + 40))
+                        len(eliminated_holes) * _CLAIM_ROW_WAL_BYTES)
                     self._conn.execute("""
                         UPDATE active_branches
                         SET bulk_done_candidates = bulk_done_candidates + ?,
@@ -1290,23 +1423,23 @@ class ERDQueue:
             # insert done=1 rows for a fresh branch's best-first prefix
             # before the packer ever runs over it, landing on exactly the
             # positions the forward path is about to pack. A plain INSERT
-            # would collide on the (branch_key, idx) primary key; IGNORE
+            # would collide on the (branch_id, idx) primary key; IGNORE
             # skips those rows, and the SELECT below discovers which of
             # `bundle` were actually claimed by this call, via the
             # bundle_id just stamped on them (idx_candidate_claims_bundle
             # makes this an indexed lookup, not a rescan).
             self._conn.executemany("""
                 INSERT OR IGNORE INTO candidate_claims
-                    (branch_key, idx, claimed_by, claimed_at, done, bundle_id)
+                    (branch_id, idx, claimed_by, claimed_at, done, bundle_id)
                 VALUES (?, ?, ?, ?, 0, ?)
-            """, [(branch_key, idx, worker_id, now, bundle_id) for idx in bundle])
+            """, [(branch_id, idx, worker_id, now, bundle_id) for idx in bundle])
             self._tally_wal_traffic(
                 'candidate_claims/claim', len(bundle),
-                len(bundle) * (3 * len(branch_key) + 40))
+                len(bundle) * _CLAIM_ROW_WAL_BYTES)
             actually_claimed = {r["idx"] for r in self._conn.execute(
                 "SELECT idx FROM candidate_claims "
-                "WHERE branch_key = ? AND bundle_id = ?",
-                (branch_key, bundle_id))}
+                "WHERE branch_id = ? AND bundle_id = ?",
+                (branch_id, bundle_id))}
             bundle = [idx for idx in bundle if idx in actually_claimed]
             if not bundle:
                 # Every packed position already had a row (e.g. mark_claims_
@@ -1317,9 +1450,9 @@ class ERDQueue:
             placeholders = ",".join("?" * len(bundle))
             rows = self._conn.execute(
                 f"SELECT idx FROM candidate_republish "
-                f"WHERE branch_key = ? AND count >= ? "
+                f"WHERE branch_id = ? AND count >= ? "
                 f"AND idx IN ({placeholders})",
-                (branch_key, republish_limit, *bundle)).fetchall()
+                (branch_id, republish_limit, *bundle)).fetchall()
             forced = frozenset(r["idx"] for r in rows)
             self._conn.execute("COMMIT")
             return (bundle_id, bundle, forced)
@@ -1360,28 +1493,29 @@ class ERDQueue:
             return {}
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            branch_id = self._intern_branch(branch_key, create=True)
             placeholders = ",".join("?" * len(indices))
             deleted = [r["idx"] for r in self._conn.execute(
-                f"SELECT idx FROM candidate_claims WHERE branch_key = ? "
+                f"SELECT idx FROM candidate_claims WHERE branch_id = ? "
                 f"AND done = 0 AND bundle_id = ? AND idx IN ({placeholders})",
-                (branch_key, bundle_id, *indices))]
+                (branch_id, bundle_id, *indices))]
             if not deleted:
                 self._conn.execute("COMMIT")
                 return {}
             deleted_placeholders = ",".join("?" * len(deleted))
             self._conn.execute(
-                f"DELETE FROM candidate_claims WHERE branch_key = ? "
+                f"DELETE FROM candidate_claims WHERE branch_id = ? "
                 f"AND bundle_id = ? AND idx IN ({deleted_placeholders})",
-                (branch_key, bundle_id, *deleted))
+                (branch_id, bundle_id, *deleted))
             self._conn.executemany("""
-                INSERT INTO candidate_republish (branch_key, idx, count)
+                INSERT INTO candidate_republish (branch_id, idx, count)
                 VALUES (?, ?, 1)
-                ON CONFLICT(branch_key, idx) DO UPDATE SET count = count + 1
-            """, [(branch_key, idx) for idx in deleted])
+                ON CONFLICT(branch_id, idx) DO UPDATE SET count = count + 1
+            """, [(branch_id, idx) for idx in deleted])
             rows = self._conn.execute(
                 f"SELECT idx, count FROM candidate_republish "
-                f"WHERE branch_key = ? AND idx IN ({deleted_placeholders})",
-                (branch_key, *deleted)).fetchall()
+                f"WHERE branch_id = ? AND idx IN ({deleted_placeholders})",
+                (branch_id, *deleted)).fetchall()
             self._conn.execute("COMMIT")
             return {r["idx"]: r["count"] for r in rows}
         except Exception:  # pragma: no cover
@@ -1450,10 +1584,11 @@ class ERDQueue:
     def complete_candidate(self, branch_key, idx):
         """Mark a candidate claim authoritatively complete (done=1)."""
         now = int(time.time())
+        branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("""
             UPDATE candidate_claims SET done = 1, done_at = ?
-            WHERE branch_key = ? AND idx = ?
-        """, (now, branch_key, idx))
+            WHERE branch_id = ? AND idx = ?
+        """, (now, branch_id, idx))
 
     def update_branch_best(self, branch_key, best_guess, best_erd, max_depth=None):
         """Lower the branch's running best (monotone — never raises it).
@@ -1518,10 +1653,11 @@ class ERDQueue:
         supersedes (bounds from different ceilings are all true; the latest is
         the one current waiters are waiting for)."""
         now = int(time.time())
+        branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("""
-            INSERT OR REPLACE INTO cut_results (branch_key, budget, bound, created_at)
+            INSERT OR REPLACE INTO cut_results (branch_id, budget, bound, created_at)
             VALUES (?, ?, ?, ?)
-        """, (branch_key, budget, bound, now))
+        """, (branch_id, budget, bound, now))
 
     def read_cut_result(self, branch_key):
         """Return (bound, budget) of the branch's recorded cut, or None.
@@ -1529,9 +1665,12 @@ class ERDQueue:
         The caller applies the validity rules: the bound holds at any budget
         <= the recorded one (fewer guesses cannot beat it), and satisfies a
         consumer whose ceiling is <= bound."""
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return None
         row = self._conn.execute(
-            "SELECT bound, budget FROM cut_results WHERE branch_key = ?",
-            (branch_key,)).fetchone()
+            "SELECT bound, budget FROM cut_results WHERE branch_id = ?",
+            (branch_id,)).fetchone()
         if row is None:
             return None
         return (row["bound"], row["budget"])
@@ -1558,9 +1697,12 @@ class ERDQueue:
         return cur.rowcount > 0
 
     def branch_done_candidates(self, branch_key) -> int:
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return 0
         return self._conn.execute(
-            "SELECT COUNT(*) FROM candidate_claims WHERE branch_key = ? AND done = 1",
-            (branch_key,)).fetchone()[0]
+            "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ? AND done = 1",
+            (branch_id,)).fetchone()[0]
 
     def branch_bulk_done_candidates(self, branch_key) -> int:
         """Return the aggregate number completed by exact elimination."""
@@ -1606,10 +1748,16 @@ class ERDQueue:
         called; candidate_republish is cleared here alongside candidate_claims
         since neither is meaningful once the branch is gone.
         """
-        self._conn.execute(
-            "DELETE FROM candidate_claims WHERE branch_key = ?", (branch_key,))
-        self._conn.execute(
-            "DELETE FROM candidate_republish WHERE branch_key = ?", (branch_key,))
+        # The branches registry row is intentionally left in place: it is
+        # append-only, so branch_id stays stable if this branch is ever
+        # re-promoted, and the blob it holds once is negligible.
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is not None:
+            self._conn.execute(
+                "DELETE FROM candidate_claims WHERE branch_id = ?", (branch_id,))
+            self._conn.execute(
+                "DELETE FROM candidate_republish WHERE branch_id = ?",
+                (branch_id,))
         self._conn.execute(
             "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
             (branch_key,))
@@ -1946,9 +2094,11 @@ class ERDQueue:
             "SELECT * FROM telemetry.bundle_stats "
             "WHERE branch_key = ? ORDER BY bundle_id",
             (branch_key,))]
-        detail["republish"] = [dict(r) for r in self._conn.execute(
-            "SELECT * FROM candidate_republish WHERE branch_key = ? ORDER BY idx",
-            (branch_key,))]
+        republish_id = self._intern_branch(branch_key)
+        detail["republish"] = [] if republish_id is None else [
+            dict(r) for r in self._conn.execute(
+                "SELECT * FROM candidate_republish WHERE branch_id = ? "
+                "ORDER BY idx", (republish_id,))]
         detail["finalize_log"] = [dict(r) for r in self._conn.execute(
             "SELECT * FROM telemetry.branch_finalize_log "
             "WHERE branch_key = ? ORDER BY id DESC LIMIT 5",
@@ -2111,9 +2261,12 @@ class ERDQueue:
 
     def claims_for_branch(self, branch_key: bytes):
         """Return all candidate_claims rows for branch_key."""
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return []
         return self._conn.execute(
-            "SELECT * FROM candidate_claims WHERE branch_key = ? ORDER BY idx",
-            (branch_key,)
+            "SELECT * FROM candidate_claims WHERE branch_id = ? ORDER BY idx",
+            (branch_id,)
         ).fetchall()
 
     def cancel_active_branch(self, branch_key: bytes,
@@ -2133,10 +2286,14 @@ class ERDQueue:
         """
         self._conn.execute("BEGIN")
         try:
-            self._conn.execute(
-                "DELETE FROM candidate_claims WHERE branch_key = ?", (branch_key,))
-            self._conn.execute(
-                "DELETE FROM candidate_republish WHERE branch_key = ?", (branch_key,))
+            branch_id = self._intern_branch(branch_key)
+            if branch_id is not None:
+                self._conn.execute(
+                    "DELETE FROM candidate_claims WHERE branch_id = ?",
+                    (branch_id,))
+                self._conn.execute(
+                    "DELETE FROM candidate_republish WHERE branch_id = ?",
+                    (branch_id,))
             self._conn.execute(
                 "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
                 (branch_key,))
@@ -2192,14 +2349,15 @@ class ERDQueue:
         """
         now = int(time.time())
         indices = list(indices)
+        branch_id = self._intern_branch(branch_key, create=True)
         self._conn.executemany("""
             INSERT OR REPLACE INTO candidate_claims
-                (branch_key, idx, claimed_by, claimed_at, done, done_at)
+                (branch_id, idx, claimed_by, claimed_at, done, done_at)
             VALUES (?, ?, 'publisher', ?, 1, ?)
-        """, [(branch_key, idx, now, now) for idx in indices])
+        """, [(branch_id, idx, now, now) for idx in indices])
         self._tally_wal_traffic(
             'candidate_claims/publisher-mark-done', len(indices),
-            len(indices) * (3 * len(branch_key) + 40))
+            len(indices) * _CLAIM_ROW_WAL_BYTES)
 
     def add_nodes_spent(self, branch_key: bytes, delta: int):
         """Increment nodes_spent on an active branch for cost-model sampling."""

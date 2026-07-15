@@ -181,8 +181,8 @@ class TestCandidateClaiming(_TmpQueue):
         for _ in range(3):
             self._claim_one_idx(self.key, "worker-0")
         self.q._conn.execute(
-            "DELETE FROM candidate_claims WHERE branch_key = ? AND idx = 1",
-            (self.key,))
+            "DELETE FROM candidate_claims WHERE branch_id = ? AND idx = 1",
+            (self.q._intern_branch(self.key),))
         # pack_cursor is at 3 (< N_CANDIDATES): the forward path claims the
         # next fresh slot (3), not the hole at idx 1 — holes are picked up
         # only once the cursor exhausts the full best-first order
@@ -195,8 +195,8 @@ class TestCandidateClaiming(_TmpQueue):
                   for _ in range(N_CANDIDATES)]
         hole = claimed[5]
         self.q._conn.execute(
-            "DELETE FROM candidate_claims WHERE branch_key = ? AND idx = ?",
-            (self.key, hole))
+            "DELETE FROM candidate_claims WHERE branch_id = ? AND idx = ?",
+            (self.q._intern_branch(self.key), hole))
         # pack_cursor == N_CANDIDATES now, so this call falls back to
         # holes_pass and picks the freed slot back up.
         idx = self._claim_one_idx(self.key, "worker-1")
