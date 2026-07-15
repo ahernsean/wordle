@@ -118,6 +118,15 @@ class ReportServerTest(unittest.TestCase):
         self.assertTrue(report_request.filters.active_only)
         self.assertEqual(report_request.filters.limit, 4)
 
+    def test_http_and_terminal_compatibility_validation_is_shared(self):
+        invalid_requests = (
+            ("/api/view", "selector=RAISE%20.....&tree=1&claims=1"),
+            ("/api/view", "selector=RAISE&sort=nodes"),
+        )
+        for path, query in invalid_requests:
+            with self.subTest(query=query), self.assertRaises(InvalidRequest):
+                parse_report_request(path, query)
+
     def test_every_explicit_endpoint_returns_its_kind(self):
         with running_server(fixture_configuration()) as base_url:
             for kind in ("queue", "workers", "cache", "hotspots"):
@@ -192,6 +201,36 @@ class ReportServerTest(unittest.TestCase):
                 json.dump({"schema_version": 2}, fixture_file)
         with self.assertRaisesRegex(ValueError, "schema version"):
             load_fixtures(bad_directory)
+
+    def test_cache_fixture_uses_live_root_cache_shape(self):
+        fixture = load_fixtures(FIXTURE_DIRECTORY)["cache.json"]
+        live = collect_report(
+            self.sources, parse_report_request("/api/view/cache", "")
+        )
+        self.assertEqual(set(fixture["data"]), set(live["data"]))
+        self.assertEqual(
+            set(fixture["data"]["summary"]), set(live["data"]["summary"])
+        )
+        self.assertEqual(
+            set(fixture["data"]["distributions"]),
+            set(live["data"]["distributions"]),
+        )
+        self.assertIn("recent_rows", fixture["data"])
+        expected_recent_row_keys = {
+            "branch_key_hex", "branch_reference", "best_guess", "best_erd",
+            "max_remaining_depth", "solve_budget", "tainted", "updated_at",
+        }
+        self.assertEqual(
+            set(fixture["data"]["recent_rows"][0]), expected_recent_row_keys
+        )
+
+    def test_build_configuration_uses_candidate_list_path(self):
+        configuration = build_configuration("queue.sqlite3", "cache.sqlite3")
+        defaults = ReportSources.defaults()
+        self.assertEqual(
+            configuration.sources.candidate_list_path,
+            defaults.candidate_list_path,
+        )
 
     def test_static_client_and_unknown_path(self):
         with running_server(fixture_configuration()) as base_url:

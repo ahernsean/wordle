@@ -200,6 +200,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         highlighted = [identity for identity, class_name in classes if "flash-improved" in class_name]
         self.assertEqual(highlighted, ["02"])
 
+    def test_semantic_change_highlights_tree_branch_cache_and_hotspot_identities(self):
+        classes = self.page.evaluate("""async () => {
+          const state=__reportClient.getState(),result={};
+          const tree=await (await fetch('/api/view?tree=1')).json(),changedTree=structuredClone(tree);
+          changedTree.data.nodes[2].completed_candidate_count++;
+          applyReport(changedTree,tree,{...state,tree:true});
+          result.tree=document.querySelector('[data-identity="raise:-----/alibi:y----"]').className;
+
+          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          branch.data.workers=[{worker_id:'worker-12',updated_at:990,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',current_candidate:'crane',current_max_guess_depth:2,nodes_per_second:10}];
+          const changedBranch=structuredClone(branch);changedBranch.data.workers[0].current_candidate='slate';
+          applyReport(changedBranch,branch,{...state,selector:'RAISE .....'});
+          result.branch=document.querySelector('[data-identity="worker-12"]').className;
+
+          const cache=await (await fetch('/api/view/cache')).json(),changedCache=structuredClone(cache);
+          cache.data.recent_rows[0].cache_state='missing';changedCache.data.recent_rows[0].cache_state='exact';
+          applyReport(changedCache,cache,{...state,kind:'cache'});
+          result.cache=document.querySelector('[data-identity="01"]').className;
+
+          const hotspots=await (await fetch('/api/view/hotspots')).json(),changedHotspots=structuredClone(hotspots);
+          changedHotspots.data.rows[0].claim_count++;
+          applyReport(changedHotspots,hotspots,{...state,kind:'hotspots'});
+          result.hotspot=document.querySelector('[data-identity="coordination:20:4"]').className;
+          return result;
+        }""")
+        self.assertIn("flash-improved", classes["tree"])
+        self.assertIn("flash-changed", classes["branch"])
+        self.assertIn("flash-improved", classes["cache"])
+        self.assertIn("flash-changed", classes["hotspot"])
+
     def test_generated_time_tick_does_not_flash(self):
         count = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view/queue')).json();
@@ -251,6 +281,64 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(state["limit"], 25)
         self.assertEqual(state["sort"], "nodes")
         self.assertEqual(state["poll"], 5000)
+
+    def test_state_normalization_removes_incompatible_controls(self):
+        states = self.page.evaluate("""() => ({
+          active: parsePageState({search:'?kind=queue&active_only=1&status=pending'}),
+          tree: parsePageState({search:'?selector=RAISE%20.....&tree=1&claims=1&answers=1'}),
+          word: parsePageState({search:'?selector=RAISE&sort=nodes'})
+        })""")
+        self.assertEqual(states["active"]["status"], [])
+        self.assertFalse(states["tree"]["claims"])
+        self.assertFalse(states["tree"]["answers"])
+        self.assertEqual(states["word"]["sort"], "")
+
+    def test_word_summary_keeps_unfiltered_totals(self):
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?selector=QUEUE')).json();
+          const active=structuredClone(report);
+          active.data.total_rows=4;active.data.matched_rows=1;
+          active.data.response_groups=active.data.response_groups.filter(row=>row.lifecycle==='active');
+          applyReport(active,null,{...__reportClient.getState(),selector:'QUEUE',active_only:true});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("Shown 1 of 1 matched · 4 total response groups", text)
+        self.assertIn("response group count", text)
+
+    def test_cache_renderer_handles_root_word_and_branch_contracts(self):
+        identities = self.page.evaluate("""async () => {
+          const root=await (await fetch('/api/view/cache')).json();
+          applyReport(root,null,{...__reportClient.getState(),kind:'cache'});
+          const rootIdentities=[...document.querySelectorAll('[data-identity]')].map(node=>node.dataset.identity);
+          const word=structuredClone(root);word.data={summary:{response_group_count:1},rows:[{branch_key_hex:'word-key',branch_reference:'word-ref',cache_state:'missing'}]};
+          applyReport(word,null,{...__reportClient.getState(),kind:'cache',selector:'RAISE'});
+          const wordIdentities=[...document.querySelectorAll('[data-identity]')].map(node=>node.dataset.identity);
+          const branch=structuredClone(root);branch.data={branch_key_hex:'branch-key',branch_reference:'branch-ref',cache:{cache_state:'exact',best_guess:'crane',best_erd:2.1}};
+          applyReport(branch,null,{...__reportClient.getState(),kind:'cache',selector:'RAISE .....'});
+          return {rootIdentities,wordIdentities,branchIdentities:[...document.querySelectorAll('[data-identity]')].map(node=>node.dataset.identity)};
+        }""")
+        self.assertEqual(identities["rootIdentities"], ["01", "02"])
+        self.assertEqual(identities["wordIdentities"], ["word-key"])
+        self.assertEqual(identities["branchIdentities"], ["branch-key"])
+
+    def test_stale_request_cannot_replace_newer_navigation(self):
+        result = self.page.evaluate("""async () => {
+          const originalFetch=window.fetch.bind(window);
+          const overview=await (await originalFetch('/api/view')).json();
+          const branch=await (await originalFetch('/api/view?selector=RAISE%20.....')).json();
+          let releaseOverview;
+          window.fetch=(url)=>url.includes('selector=RAISE')
+            ? Promise.resolve(new Response(JSON.stringify(branch),{status:200,headers:{'Content-Type':'application/json'}}))
+            : new Promise(resolve=>{releaseOverview=()=>resolve(new Response(JSON.stringify(overview),{status:200,headers:{'Content-Type':'application/json'}}));});
+          __reportClient.setState({...__reportClient.getState(),kind:'auto',selector:''});
+          __reportClient.setState({...__reportClient.getState(),kind:'auto',selector:'RAISE .....'});
+          await new Promise(resolve=>setTimeout(resolve,20));
+          releaseOverview();await new Promise(resolve=>setTimeout(resolve,20));
+          window.fetch=originalFetch;
+          return {heading:document.querySelector('h1').textContent,selector:__reportClient.getState().selector};
+        }""")
+        self.assertEqual(result["heading"], "branch report")
+        self.assertEqual(result["selector"], "RAISE .....")
 
     def test_malicious_text_is_literal_and_inert(self):
         result = self.page.evaluate("""async () => {

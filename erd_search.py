@@ -51,9 +51,11 @@ from datetime import datetime
 from cache_sqlite import ScoreCache
 from report_model import (
     ReportFilters,
+    ReportRequest,
     WORKER_LIVENESS_SECONDS,
     parse_report_selector,
     parse_rich_spine as _parse_spine,
+    validate_report_request,
 )
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
@@ -832,10 +834,6 @@ def main():
             args.selector = parse_report_selector(args.spine)
         except ValueError as error:
             parser.error(str(error))
-        if args.tree and args.view_cache:
-            parser.error('--tree cannot be used with --cache')
-        if args.tree and args.hotspots:
-            parser.error('--tree cannot be used with --hotspots')
         if args.limit is not None and args.limit < 1:
             parser.error('--limit must be at least 1')
         if (args.minimum_answer_count is not None
@@ -859,30 +857,8 @@ def main():
         if args.sample_size is not None and args.sample_size < 1:
             parser.error('--sample-size must be at least 1')
         hotspot_field = args.by or 'nodes'
-        historical_hotspot = hotspot_field in (
-            'evaluated-candidates', 'bulk-completed-candidates',
-            'cut-reuse', 'coordination')
-        if args.hotspots and historical_hotspot and (args.active_only or args.status):
-            parser.error('historical hotspots cannot use lifecycle filters')
-        if (args.hotspots and hotspot_field == 'coordination'
-                and args.selector.kind != 'root'):
-            parser.error('coordination hotspots cannot use a spine selector')
         if args.hotspots and args.limit is None:
             args.limit = 10
-        if args.claims and (
-                args.tree or args.report_kind != 'auto'
-                or args.selector.kind not in ('branch', 'branch_reference')):
-            parser.error('--claims requires a singular branch selector')
-        if args.answers and (
-                args.tree or args.report_kind in ('queue', 'workers')
-                or (args.report_kind == 'auto' and args.selector.kind == 'root')):
-            parser.error('--answers requires a word or branch report without --tree')
-        if (args.report_kind == 'auto' and args.selector.kind == 'word'
-                and args.sort is not None
-                and args.sort not in ('default', 'size', 'workers', 'priority')):
-            parser.error(
-                '--sort for word reports must be default, size, workers, or priority'
-            )
         args.filters = ReportFilters(
             active_only=args.active_only,
             statuses=tuple(args.status),
@@ -896,6 +872,22 @@ def main():
         args.hotspot_field = hotspot_field if args.hotspots else None
         args.sample_size = min(args.sample_size or 50_000, 1_000_000)
         args.since_seconds = args.since_seconds or 3600
+        try:
+            validate_report_request(ReportRequest(
+                report_kind=args.report_kind,
+                selector=args.selector,
+                include_claims=args.claims,
+                include_answers=args.answers,
+                tree=args.tree,
+                filters=args.filters,
+                worker_id=args.worker,
+                hotspot_field=args.hotspot_field,
+                epoch=args.epoch,
+                since_seconds=args.since_seconds,
+                sample_size=args.sample_size,
+            ))
+        except ValueError as error:
+            parser.error(str(error))
     _normalize_queue_cli_args(args)
 
     if args.cmd == 'queue':
