@@ -180,7 +180,7 @@ For a trailing-word selector:
 2. Partition those answers by the trailing word.
 3. Include every nonempty response group. Groups with fewer than two answers
    have cache state `not_applicable`.
-4. Batch lookup current queue lifecycle and cache state by encoded branch key.
+4. Batch lookup current branch status, phase, and cache state by encoded branch key.
 5. Attach active worker counts and branch references.
 
 Payload:
@@ -204,7 +204,8 @@ Payload:
                 "answer_count": int,
                 "branch_reference": str,
                 "branch_key_hex": str,
-                "lifecycle": str,
+                "branch_status": str,
+                "branch_phase": str | null,
                 "priority": int | null,
                 "worker_count": int,
                 "cache_state": str,
@@ -231,7 +232,7 @@ republish state, and cache:
             optional answer_words
         },
         "queue": {
-            lifecycle, raw statuses, priority, candidate progress,
+            branch status, branch phase, raw statuses, priority, candidate progress,
             running best, ceiling, nodes, created/finalized timestamps
         } | null,
         "cache": normalized cache state,

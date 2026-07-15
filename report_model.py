@@ -29,7 +29,7 @@ from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
 from wordle_ui import fmt_pattern, parse_pattern
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 WORKER_STALE_SECONDS = 20
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
@@ -87,14 +87,37 @@ class ResolvedBranch:
 
 @dataclass(frozen=True)
 class ReportFilters:
-    active_only: bool = False
-    statuses: tuple[str, ...] = ()
+    branch_statuses: tuple[str, ...] = ()
+    branch_phases: tuple[str, ...] = ()
     minimum_answer_count: int | None = None
     maximum_answer_count: int | None = None
     budget: int | None = None
     priority: int | None = None
     sort: str | None = None
     limit: int | None = None
+
+
+BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
+BRANCH_PHASES = ("queued", "evaluating", "finalizing", "complete")
+
+
+def branch_status_and_phase(
+    pending_status, active_status, worker_count, cache_state=None,
+):
+    """Derive operational status and monotonic progress from stored state."""
+    if pending_status == "done" or cache_state in (
+        "exact", "loss", "not_applicable",
+    ):
+        return "done", "complete"
+    if active_status == "finalized":
+        phase = "finalizing"
+    elif active_status == "open" or pending_status == "in_progress":
+        phase = "evaluating"
+    elif pending_status == "pending":
+        phase = "queued"
+    else:
+        return "unqueued", None
+    return ("active" if worker_count else "pending"), phase
 
 
 @dataclass(frozen=True)
@@ -306,7 +329,9 @@ def _normalized_branch_spine(row, answer_set):
     return []
 
 
-def _normalize_branch(row, lifecycle, progress, worker_count, answer_set):
+def _normalize_branch(
+    row, branch_status, branch_phase, progress, worker_count, answer_set,
+):
     branch_key = bytes(row["branch_key"])
     spine = _normalized_branch_spine(row, answer_set)
     best_guess = _row_value(row, "best_guess")
@@ -314,7 +339,8 @@ def _normalize_branch(row, lifecycle, progress, worker_count, answer_set):
     return {
         "branch_reference": branch_reference(branch_key),
         "branch_key_hex": branch_key.hex(),
-        "lifecycle": lifecycle,
+        "branch_status": branch_status,
+        "branch_phase": branch_phase,
         "raw_status": row["status"],
         "answer_count": row["n_words"],
         "candidate_count": row["n_candidates"],
@@ -403,8 +429,8 @@ def _empty_data():
         },
         "queue_counts": {
             "pending_branch_count": 0,
-            "active_user_branch_count": 0,
-            "active_cooperative_branch_count": 0,
+            "evaluating_user_branch_count": 0,
+            "evaluating_cooperative_branch_count": 0,
             "finalizing_branch_count": 0,
             "done_branch_count": 0,
         },
@@ -431,47 +457,48 @@ def _queue_overview(sources, generated_at, answer_set, report):
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
         report["sources"]["telemetry"]["ok"] = True
         counts = queue.counts_by_status()
-        open_rows = list(queue.branches_in_progress())
         heartbeats = list(queue.heartbeats_with_branch())
-        live_heartbeats = [
-            row for row in heartbeats
-            if generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS
-        ]
-        open_by_key = {bytes(row["branch_key"]): row for row in open_rows}
-        detached_keys = {
-            bytes(row["current_branch_key"])
-            for row in live_heartbeats
-            if row["current_branch_key"] is not None
-            and bytes(row["current_branch_key"]) not in open_by_key
-        }
-        detached_rows = queue.active_branches_by_keys(list(detached_keys))
-        finalizing_rows = {
-            key: row for key, row in detached_rows.items()
-            if row["status"] == "finalized"
-        }
-        retained_keys = list(open_by_key) + list(finalizing_rows)
-        pending_rows = queue.status_by_branch_keys(retained_keys)
-        progress = queue.candidate_progress_by_branch_keys(retained_keys)
-        live_worker_counts = {}
-        for heartbeat in live_heartbeats:
-            key_value = heartbeat["current_branch_key"]
-            if key_value is not None:
-                key = bytes(key_value)
-                live_worker_counts[key] = live_worker_counts.get(key, 0) + 1
-
+        filters = report.get("filters") or {}
+        queue_result = queue.report_queue_rows(
+            filters=filters,
+            generated_at=generated_at,
+        )
         normalized_rows = []
-        for lifecycle, branch_rows in (
-            ("active", open_by_key), ("finalizing", finalizing_rows)
-        ):
-            for key, row in branch_rows.items():
-                branch_values = dict(row)
-                branch_values["is_user_queued"] = key in pending_rows
-                if lifecycle == "active" and key in pending_rows:
-                    branch_values["status"] = pending_rows[key]["status"]
-                normalized_rows.append(_normalize_branch(
-                    branch_values, lifecycle, progress[key],
-                    live_worker_counts.get(key, 0), answer_set,
-                ))
+        for row in queue_result["rows"]:
+            branch_values = {
+                "branch_key": row["branch_key"],
+                "status": row["raw_status"],
+                "n_words": row["answer_count"],
+                "n_candidates": row["candidate_count"],
+                "priority": row["priority"],
+                "source_word": row["source_word"],
+                "source_pattern": row["source_pattern"],
+                "best_guess": row["best_guess"],
+                "best_erd": row["best_erd"],
+                "best_max_depth": row["best_max_remaining_depth"],
+                "budget": row["budget"],
+                "spine": row["spine"],
+                "created_at": row["created_at"],
+                "nodes_spent": row["search_node_count"],
+                "ceiling": row["ceiling"],
+                "is_user_queued": not row["is_cooperative"],
+            }
+            progress = {
+                "completed_candidate_count": row[
+                    "completed_candidate_count"
+                ],
+                "bulk_completed_candidate_count": row[
+                    "bulk_completed_candidate_count"
+                ],
+            }
+            normalized_rows.append(_normalize_branch(
+                branch_values,
+                row["branch_status"],
+                row["branch_phase"],
+                progress,
+                row["worker_count"],
+                answer_set,
+            ))
 
         workers = [
             _normalize_worker(row, generated_at, answer_set) for row in heartbeats
@@ -499,13 +526,24 @@ def _queue_overview(sources, generated_at, answer_set, report):
 
         report["data"]["queue_counts"] = {
             "pending_branch_count": counts.get("pending", 0),
-            "active_user_branch_count": sum(
-                key in pending_rows for key in open_by_key
+            "evaluating_user_branch_count": sum(
+                not row["is_cooperative"]
+                for row in queue.report_queue_rows(
+                    {"branch_phases": ("evaluating",)},
+                    generated_at=generated_at,
+                )["rows"]
             ),
-            "active_cooperative_branch_count": sum(
-                key not in pending_rows for key in open_by_key
+            "evaluating_cooperative_branch_count": sum(
+                row["is_cooperative"]
+                for row in queue.report_queue_rows(
+                    {"branch_phases": ("evaluating",)},
+                    generated_at=generated_at,
+                )["rows"]
             ),
-            "finalizing_branch_count": len(finalizing_rows),
+            "finalizing_branch_count": queue.report_queue_rows(
+                {"branch_phases": ("finalizing",)},
+                generated_at=generated_at,
+            )["matched_rows"],
             "done_branch_count": counts.get("done", 0),
         }
         report["data"]["worker_totals"] = worker_totals
@@ -559,8 +597,8 @@ def _selector_payload(selector):
 
 def _filters_payload(filters):
     return {
-        "active_only": filters.active_only,
-        "statuses": list(filters.statuses),
+        "branch_statuses": list(filters.branch_statuses),
+        "branch_phases": list(filters.branch_phases),
         "minimum_answer_count": filters.minimum_answer_count,
         "maximum_answer_count": filters.maximum_answer_count,
         "budget": filters.budget,
@@ -623,23 +661,6 @@ def _resolved_branch_payload(resolved):
         "guess_depth": len(resolved.steps),
         "answer_count": len(resolved.answer_words),
     }
-
-
-def _queue_lifecycle(pending_row, active_row, worker_count=0):
-    if pending_row is not None:
-        raw_status = pending_row["status"]
-        if raw_status == "pending":
-            return "pending"
-        if raw_status == "in_progress":
-            return "active"
-        if raw_status == "done":
-            return "done"
-    if active_row is not None:
-        if active_row["status"] == "open":
-            return "active"
-        if active_row["status"] == "finalized" and worker_count:
-            return "finalizing"
-    return "unqueued"
 
 
 def _mark_queue_source_ok(report):
@@ -732,14 +753,19 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         answer_words = group_row.pop("answer_words")
         pending_row = pending_rows.get(branch_key)
         active_row = active_rows.get(branch_key)
-        lifecycle = _queue_lifecycle(
-            pending_row, active_row, worker_counts.get(branch_key, 0)
-        )
         cache_state = cache_states[branch_key]
+        worker_count = worker_counts.get(branch_key, 0)
+        branch_status, branch_phase = branch_status_and_phase(
+            _row_value(pending_row, "status"),
+            _row_value(active_row, "status"),
+            worker_count,
+            cache_state["cache_state"],
+        )
         group_row.update({
-            "lifecycle": lifecycle,
+            "branch_status": branch_status,
+            "branch_phase": branch_phase,
             "priority": _row_value(active_row, "priority", _row_value(pending_row, "priority")),
-            "worker_count": worker_counts.get(branch_key, 0),
+            "worker_count": worker_count,
             "cache_state": cache_state["cache_state"],
             "best_guess": cache_state["best_guess"],
             "best_erd": cache_state["best_erd"],
@@ -753,13 +779,15 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     response_groups = data["response_groups"]
     all_response_groups = list(response_groups)
     filters = request.filters
-    if filters.active_only:
+    if filters.branch_statuses:
         response_groups = [
-            row for row in response_groups if row["lifecycle"] == "active"
+            row for row in response_groups
+            if row["branch_status"] in filters.branch_statuses
         ]
-    if filters.statuses:
+    if filters.branch_phases:
         response_groups = [
-            row for row in response_groups if row["lifecycle"] in filters.statuses
+            row for row in response_groups
+            if row["branch_phase"] in filters.branch_phases
         ]
     if filters.minimum_answer_count is not None:
         response_groups = [
@@ -790,10 +818,10 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             row["answer_count"] < 2 for row in all_response_groups
         ),
         "queued_response_group_count": sum(
-            row["lifecycle"] != "unqueued" for row in all_response_groups
+            row["branch_status"] != "unqueued" for row in all_response_groups
         ),
         "active_response_group_count": sum(
-            row["lifecycle"] in ("active", "finalizing")
+            row["branch_status"] == "active"
             for row in all_response_groups
         ),
         "exact_response_group_count": sum(
@@ -923,7 +951,19 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     ]
     workers.sort(key=_worker_sort_key)
     live_worker_count = sum(worker["is_live"] for worker in workers)
-    lifecycle = _queue_lifecycle(pending_row, active_row, live_worker_count)
+    initial_cache_state = ScoreCache.report_branch_state_without_rows(
+        branch_key, budget
+    )
+    branch_status, branch_phase = branch_status_and_phase(
+        _row_value(pending_row, "status"),
+        _row_value(active_row, "status"),
+        live_worker_count,
+        initial_cache_state["cache_state"],
+    )
+    branch_payload.update({
+        "branch_status": branch_status,
+        "branch_phase": branch_phase,
+    })
     progress = {
         "completed_candidate_count": sum(bool(row["done"]) for row in claim_rows),
         "bulk_completed_candidate_count": _row_value(
@@ -933,7 +973,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     queue_payload = None
     if active_row is not None or pending_row is not None:
         queue_payload = {
-            "lifecycle": lifecycle,
+            "branch_status": branch_status,
+            "branch_phase": branch_phase,
             "pending_status": _row_value(pending_row, "status"),
             "active_status": _row_value(active_row, "status"),
             "priority": _row_value(active_row, "priority", _row_value(pending_row, "priority")),
@@ -964,7 +1005,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     data = {
         "branch": branch_payload,
         "queue": queue_payload,
-        "cache": ScoreCache.report_branch_state_without_rows(branch_key, budget),
+        "cache": initial_cache_state,
         "workers": workers,
         "republished_candidates": [
             {"candidate_index": row["idx"], "republish_count": row["count"]}
@@ -988,6 +1029,21 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             sources.cache_path, all_answers, checkpoint_on_close=False
         )
         data["cache"] = cache.report_branch_state(branch_key, ERD_ALL, budget)
+        branch_status, branch_phase = branch_status_and_phase(
+            _row_value(pending_row, "status"),
+            _row_value(active_row, "status"),
+            live_worker_count,
+            data["cache"]["cache_state"],
+        )
+        data["branch"].update({
+            "branch_status": branch_status,
+            "branch_phase": branch_phase,
+        })
+        if data["queue"] is not None:
+            data["queue"].update({
+                "branch_status": branch_status,
+                "branch_phase": branch_phase,
+            })
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
@@ -1042,13 +1098,17 @@ def _row_matches_selector(row, selector, prefix):
 
 
 def _collection_summary(rows):
-    by_lifecycle = {}
+    by_status = {}
+    by_phase = {}
     for row in rows:
-        lifecycle = row["lifecycle"]
-        by_lifecycle[lifecycle] = by_lifecycle.get(lifecycle, 0) + 1
+        status = row["branch_status"]
+        phase = row["branch_phase"]
+        by_status[status] = by_status.get(status, 0) + 1
+        by_phase[phase] = by_phase.get(phase, 0) + 1
     return {
         "branch_count": len(rows),
-        "branch_count_by_lifecycle": by_lifecycle,
+        "branch_count_by_status": by_status,
+        "branch_count_by_phase": by_phase,
     }
 
 
@@ -1124,7 +1184,8 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
             "step": None,
             "branch_key_hex": None,
             "branch_reference": None,
-            "lifecycle": None,
+            "branch_status": None,
+            "branch_phase": None,
             "answer_count": None,
             "guess_depth": 0,
             "worker_count": 0,
@@ -1149,7 +1210,8 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
                     "step": {"word": step.word, "pattern": step.pattern},
                     "branch_key_hex": None,
                     "branch_reference": None,
-                    "lifecycle": None,
+                    "branch_status": None,
+                    "branch_phase": None,
                     "answer_count": None,
                     "guess_depth": len(steps),
                     "worker_count": 0,
@@ -1171,7 +1233,8 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
                     "step": None,
                     "branch_key_hex": None,
                     "branch_reference": None,
-                    "lifecycle": None,
+                    "branch_status": None,
+                    "branch_phase": None,
                     "answer_count": None,
                     "guess_depth": guess_depth_value,
                     "worker_count": 0,
@@ -1184,7 +1247,8 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
         final_node.update({
             "branch_key_hex": row["branch_key_hex"],
             "branch_reference": branch_reference(bytes(row["branch_key"])),
-            "lifecycle": row["lifecycle"],
+            "branch_status": row["branch_status"],
+            "branch_phase": row["branch_phase"],
             "answer_count": row["answer_count"],
             "worker_count": row["worker_count"],
             "completed_candidate_count": row["completed_candidate_count"],
@@ -1281,8 +1345,8 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
             for row in queue.heartbeats_with_branch()
         ]
         filters_have_branch_scope = any((
-            request.filters.active_only,
-            request.filters.statuses,
+            request.filters.branch_statuses,
+            request.filters.branch_phases,
             request.filters.minimum_answer_count is not None,
             request.filters.maximum_answer_count is not None,
             request.filters.budget is not None,
@@ -1299,8 +1363,8 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
                 if worker["worker_id"] == request.worker_id
                 or worker["worker_number"] == request.worker_id
             ]
-        lifecycle_by_key = {
-            row["branch_key_hex"]: row["lifecycle"] for row in scoped_rows
+        phase_by_key = {
+            row["branch_key_hex"]: row["branch_phase"] for row in scoped_rows
         }
         by_state = {
             "live": 0,
@@ -1317,7 +1381,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
                 state = "stale"
             elif worker["branch_key_hex"] is None:
                 state = "idle"
-            elif lifecycle_by_key.get(worker["branch_key_hex"]) == "finalizing":
+            elif phase_by_key.get(worker["branch_key_hex"]) == "finalizing":
                 state = "finalizing"
             else:
                 state = "live"

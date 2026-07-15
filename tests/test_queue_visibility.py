@@ -200,8 +200,12 @@ class QueueVisibilityTests(unittest.TestCase):
             self.user_key, len(WORDS), 10, priority=7, budget=4,
             spine="CRANE -----",
         )
+        self.q.heartbeat(
+            "worker-1", 1, self.user_key, len(WORDS), int(time.time()), 0
+        )
         result = self.q.report_queue_rows({
-            "statuses": ("active",),
+            "branch_statuses": ("active",),
+            "branch_phases": ("evaluating",),
             "minimum_answer_count": len(WORDS),
             "maximum_answer_count": len(WORDS),
             "budget": 4,
@@ -209,7 +213,8 @@ class QueueVisibilityTests(unittest.TestCase):
             "limit": 1,
         })
         self.assertEqual(result["matched_rows"], 1)
-        self.assertEqual(result["rows"][0]["lifecycle"], "active")
+        self.assertEqual(result["rows"][0]["branch_status"], "active")
+        self.assertEqual(result["rows"][0]["branch_phase"], "evaluating")
         self.q._conn.execute("DELETE FROM run_meta WHERE key = 'epoch'")
         self.assertIsNone(self.q.epoch_metadata())
 

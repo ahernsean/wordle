@@ -50,6 +50,8 @@ from datetime import datetime
 
 from cache_sqlite import ScoreCache
 from report_model import (
+    BRANCH_PHASES,
+    BRANCH_STATUSES,
     ReportFilters,
     WORKER_LIVENESS_SECONDS,
     parse_report_selector,
@@ -83,6 +85,38 @@ def _view_watch_interval(value):
     if interval < 0.2:
         raise argparse.ArgumentTypeError("watch interval must be at least 0.2 seconds")
     return interval
+
+
+def _comma_separated_filter(value, option_name, choices):
+    values = tuple(part.strip().lower() for part in value.split(","))
+    if not values or any(not part for part in values):
+        raise argparse.ArgumentTypeError(
+            f"{option_name} requires comma-separated values"
+        )
+    if "all" in values:
+        if len(values) != 1:
+            raise argparse.ArgumentTypeError(
+                f"{option_name}=all cannot be combined with other values"
+            )
+        return ()
+    unknown = [part for part in values if part not in choices]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown {option_name} value: {unknown[0]}"
+        )
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError(
+            f"{option_name} contains a duplicate value"
+        )
+    return values
+
+
+def _branch_status_filter(value):
+    return _comma_separated_filter(value, "branch status", BRANCH_STATUSES)
+
+
+def _branch_phase_filter(value):
+    return _comma_separated_filter(value, "branch phase", BRANCH_PHASES)
 
 
 def cmd_view(args):
@@ -694,7 +728,44 @@ def main():
                             'takes, so only a crashed process triggers this.')
 
     # -- view --
-    p_view = sub.add_parser('view', help='View shared swarm reports')
+    p_view = sub.add_parser(
+        'view', help='View shared swarm reports',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Branch status and phase
+  Status describes the branch's relationship to current work:
+    active    unfinished branch with at least one current worker
+    pending   unfinished branch without a current worker
+    done      result persisted; no work remains
+    unqueued  semantic branch with no scheduled or persisted work
+
+  Phase describes the durable search milestone normally reached in order:
+    queued -> evaluating -> finalizing -> complete
+
+  The axes are related; these are the normal combinations:
+    unqueued / -           discovered, but not scheduled or cached
+    pending / queued       scheduled and waiting for a worker
+    active / evaluating    candidates are being evaluated now
+    pending / evaluating   partial evaluation is waiting for a worker
+    active / finalizing    a worker is persisting the completed evaluation
+    pending / finalizing   an interrupted finalization is waiting for a worker
+    done / complete        a reusable result has been persisted
+
+  A branch normally moves through this lifecycle:
+
+    unqueued / -
+        -> pending / queued
+        -> active / evaluating <-> pending / evaluating
+        -> active / finalizing <-> pending / finalizing
+        -> done / complete
+
+  Worker arrival and departure change status without discarding phase progress.
+  Cached or trivial branches can move directly to done / complete.  Recovery
+  may briefly return an interrupted finalization to evaluating before retrying
+  it.  Removing unfinished work returns the branch to unqueued / -.
+
+  The overview defaults to --branch-status active.  Use comma-separated values
+  such as --branch-status active,pending, or use all to disable that filter.
+""")
     p_view.add_argument('--watch', nargs='?', const=30.0,
                         type=_view_watch_interval, metavar='SECONDS')
     p_view.add_argument('--format', choices=('text', 'json', 'jsonl'),
@@ -711,11 +782,12 @@ def main():
     view_kind.add_argument('--worker', metavar='N')
     view_kind.add_argument('--cache', dest='view_cache', action='store_true')
     view_kind.add_argument('--hotspots', action='store_true')
-    lifecycle_filter = p_view.add_mutually_exclusive_group()
-    lifecycle_filter.add_argument('--active-only', action='store_true')
-    lifecycle_filter.add_argument(
-        '--status', action='append', default=[],
-        choices=('pending', 'active', 'finalizing', 'done', 'unqueued'))
+    p_view.add_argument(
+        '--branch-status', type=_branch_status_filter, metavar='STATUSES',
+        help='Comma-separated active,pending,done,unqueued, or all')
+    p_view.add_argument(
+        '--branch-phase', type=_branch_phase_filter, metavar='PHASES',
+        help='Comma-separated queued,evaluating,finalizing,complete, or all')
     p_view.add_argument('--minimum-answer-count', type=int, metavar='N')
     p_view.add_argument('--maximum-answer-count', type=int, metavar='N')
     p_view.add_argument('--budget', type=int, metavar='N')
@@ -862,8 +934,10 @@ def main():
         historical_hotspot = hotspot_field in (
             'evaluated-candidates', 'bulk-completed-candidates',
             'cut-reuse', 'coordination')
-        if args.hotspots and historical_hotspot and (args.active_only or args.status):
-            parser.error('historical hotspots cannot use lifecycle filters')
+        if (args.hotspots and historical_hotspot
+                and (args.branch_status is not None
+                     or args.branch_phase is not None)):
+            parser.error('historical hotspots cannot use branch filters')
         if (args.hotspots and hotspot_field == 'coordination'
                 and args.selector.kind != 'root'):
             parser.error('coordination hotspots cannot use a spine selector')
@@ -883,9 +957,17 @@ def main():
             parser.error(
                 '--sort for word reports must be default, size, workers, or priority'
             )
+        branch_statuses = args.branch_status
+        if branch_statuses is None:
+            branch_statuses = (
+                ("active",)
+                if (args.report_kind == "auto"
+                    and args.selector.kind == "root" and not args.tree)
+                else ()
+            )
         args.filters = ReportFilters(
-            active_only=args.active_only,
-            statuses=tuple(args.status),
+            branch_statuses=branch_statuses,
+            branch_phases=args.branch_phase or (),
             minimum_answer_count=args.minimum_answer_count,
             maximum_answer_count=args.maximum_answer_count,
             budget=args.budget,

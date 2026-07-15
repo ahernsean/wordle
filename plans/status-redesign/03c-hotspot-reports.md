@@ -68,8 +68,8 @@ selector rather than pretending attribution exists.
 
 Phase 3b filters apply to the current-queue hotspot kinds. Historical
 finalization, cut-reuse, and coordination populations do not carry a current
-branch lifecycle, so reject `--active-only` and explicit lifecycle filters for
-those kinds rather than applying present-day queue state retroactively.
+branch status or phase, so reject branch filters for those kinds rather than
+applying present-day queue state retroactively.
 
 Historical options:
 

@@ -40,7 +40,8 @@ It combines the options specified by phases 2 and 3a–3c:
 - inferred word and branch exploration plus optional claims/answers;
 - queue, workers, single-worker, cache, and hotspot report flags;
 - tree layout where compatible;
-- lifecycle, answer-count, budget, priority, sort, and limit filters;
+- branch-status, branch-phase, answer-count, budget, priority, sort, and limit
+  filters;
 - bounded hotspot epoch, window, and sample controls.
 
 The parser keeps all compatibility and conflict rules specified in those
@@ -58,8 +59,10 @@ Watched text adds:
 - `q` quits.
 
 Selections are immutable report requests pushed onto a small navigation
-stack. Do not encode navigation by calling legacy command handlers. A branch
-transitioning to finalizing remains pinned by identity until dismissed.
+stack. Do not encode navigation by calling legacy command handlers. A selected
+branch remains pinned by identity even when a refresh changes its status or
+phase so that it no longer matches the parent filter. Dismissing the detail
+returns to the refreshed filtered parent.
 
 Non-TTY text and JSON Lines remain noninteractive. One-shot invocations do
 not change terminal mode.
@@ -96,7 +99,7 @@ Required coverage:
 3. A selected branch remains pinned through finalization by full identity.
 4. Non-TTY and structured output remain noninteractive and contain no cursor
    control sequences.
-5. Removed commands fail argparse while lifecycle and queue mutation commands
+5. Removed commands fail argparse while branch filters and queue mutation commands
    still work.
 6. Every `SWARM.md` command example parses.
 7. Every semantic assertion formerly in `tests/test_status_sections.py` has an

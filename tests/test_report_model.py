@@ -12,8 +12,10 @@ from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue
 import erd_search
 from report_model import (
+    ReportFilters,
     ReportRequest,
     ReportSources,
+    WORKER_LIVENESS_SECONDS,
     branch_reference,
     collect_overview_report,
     collect_report,
@@ -209,7 +211,8 @@ class ReportModelTest(unittest.TestCase):
             report = collect_overview_report(self.sources)
         branch = report["data"]["branches"][0]
         worker = report["data"]["workers"][0]
-        self.assertEqual(branch["lifecycle"], "active")
+        self.assertEqual(branch["branch_status"], "active")
+        self.assertEqual(branch["branch_phase"], "evaluating")
         self.assertEqual(branch["raw_status"], "in_progress")
         self.assertFalse(branch["is_cooperative"])
         self.assertEqual(branch["guess_depth"], 2)
@@ -248,10 +251,10 @@ class ReportModelTest(unittest.TestCase):
         report = collect_overview_report(self.sources)
         self.assertTrue(report["data"]["branches"][0]["is_cooperative"])
         self.assertEqual(
-            report["data"]["queue_counts"]["active_cooperative_branch_count"], 1
+            report["data"]["queue_counts"]["evaluating_cooperative_branch_count"], 1
         )
 
-    def test_only_live_heartbeat_retains_finalizing_branch(self):
+    def test_finalizing_branch_remains_visible_after_worker_departure(self):
         now = int(time.time())
         live_key = b"live-finalizing"
         dead_key = b"dead-finalizing"
@@ -267,14 +270,73 @@ class ReportModelTest(unittest.TestCase):
         queue.close()
         with patch("report_model.time.time", return_value=now):
             report = collect_overview_report(self.sources)
-        self.assertEqual(len(report["data"]["branches"]), 1)
-        self.assertEqual(report["data"]["branches"][0]["lifecycle"], "finalizing")
+        self.assertEqual(len(report["data"]["branches"]), 2)
+        branches = {
+            row["branch_key_hex"]: row for row in report["data"]["branches"]
+        }
+        self.assertEqual(branches[live_key.hex()]["branch_status"], "active")
+        self.assertEqual(branches[live_key.hex()]["branch_phase"], "finalizing")
+        self.assertEqual(branches[dead_key.hex()]["branch_status"], "pending")
+        self.assertEqual(branches[dead_key.hex()]["branch_phase"], "finalizing")
         self.assertEqual(
-            report["data"]["branches"][0]["branch_key_hex"], live_key.hex()
+            set(branches), {live_key.hex(), dead_key.hex()}
         )
-        self.assertEqual(report["data"]["queue_counts"]["finalizing_branch_count"], 1)
+        self.assertEqual(report["data"]["queue_counts"]["finalizing_branch_count"], 2)
         self.assertEqual(len(report["data"]["workers"]), 2)
         self.assertEqual(sum(worker["is_live"] for worker in report["data"]["workers"]), 1)
+
+    def test_overview_status_filter_tracks_worker_arrival_and_departure(self):
+        now = int(time.time())
+        working_key = b"working-branch"
+        waiting_key = b"waiting-branch"
+        queue = self._open_queue()
+        queue.create_branch(working_key, 2, 4)
+        queue.create_branch(waiting_key, 3, 4)
+        queue.heartbeat("worker-1", 1, working_key, 2, now, 0)
+        queue.close()
+
+        active_request = ReportRequest(filters=ReportFilters(
+            branch_statuses=("active",)
+        ))
+        with patch("report_model.time.time", return_value=now):
+            active_report = collect_report(self.sources, active_request)
+        self.assertEqual(
+            [row["branch_key_hex"] for row in active_report["data"]["branches"]],
+            [working_key.hex()],
+        )
+
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE worker_heartbeat SET updated_at = ? WHERE worker_id = ?",
+            (now - WORKER_LIVENESS_SECONDS - 1, "worker-1"),
+        )
+        queue.close()
+        with patch("report_model.time.time", return_value=now):
+            active_report = collect_report(self.sources, active_request)
+            pending_report = collect_report(self.sources, ReportRequest(
+                filters=ReportFilters(branch_statuses=("pending",), limit=1)
+            ))
+        self.assertEqual(active_report["data"]["branches"], [])
+        self.assertEqual(len(pending_report["data"]["branches"]), 1)
+        self.assertEqual(
+            pending_report["data"]["branches"][0]["branch_status"], "pending"
+        )
+
+    def test_pending_overview_includes_scheduled_branch_before_evaluation(self):
+        branch_key = b"queued-branch"
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 3, 5, "raise", 0)])
+        queue.close()
+
+        report = collect_report(self.sources, ReportRequest(
+            filters=ReportFilters(branch_statuses=("pending",))
+        ))
+        self.assertEqual(len(report["data"]["branches"]), 1)
+        branch = report["data"]["branches"][0]
+        self.assertEqual(branch["branch_key_hex"], branch_key.hex())
+        self.assertEqual(branch["branch_status"], "pending")
+        self.assertEqual(branch["branch_phase"], "queued")
+        self.assertIsNone(branch["candidate_count"])
 
     def test_candidate_progress_batch_handles_all_states(self):
         first_key = b"first"
