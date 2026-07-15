@@ -15,6 +15,7 @@ import time
 from report_model import (
     ReportRequest,
     ReportSources,
+    WORKER_STALE_SECONDS,
     collect_report,
     parse_report_selector,
 )
@@ -93,6 +94,63 @@ def _abbreviate_duration(seconds):
     return f"{seconds / 86400:.1f}d"
 
 
+DISK_RATE_FLOOR_BYTES = 10_000
+
+
+def format_disk_size(byte_count):
+    """Format byte counts with adaptive binary units."""
+    gibibytes = byte_count / 2 ** 30
+    if gibibytes >= 100:
+        return f"{gibibytes:,.0f}G"
+    if gibibytes >= 1:
+        return f"{gibibytes:.1f}G"
+    mebibytes = byte_count / 2 ** 20
+    if mebibytes >= 1:
+        return f"{mebibytes:,.0f}M"
+    return f"{byte_count / 2 ** 10:,.0f}K"
+
+
+def _format_fill_eta(seconds):
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} min"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 86400:.1f} d"
+
+
+def render_disk_status(disk, *, color=False):
+    """Render filesystem fullness, queue WAL size, and a fresh fill trend."""
+    if disk.get("used_fraction") is None:
+        return "Disk: unavailable"
+    capacity = disk["total_bytes"]
+    fullness = (
+        f"{format_disk_size(disk['used_bytes'])}/{format_disk_size(capacity)} "
+        f"({100 * disk['used_fraction']:.0f}%)"
+    )
+    if color and disk["used_fraction"] >= disk["warning_fraction"]:
+        fullness = f"{RED}{fullness}{RESET}"
+    line = (
+        f"Disk: {fullness}  queue WAL "
+        f"{format_disk_size(disk.get('queue_wal_bytes') or 0)}"
+    )
+    rate = disk.get("fill_rate_bytes_per_second")
+    if rate is not None:
+        if rate > DISK_RATE_FLOOR_BYTES:
+            available_at_stop = (1 - disk["stop_fraction"]) * capacity
+            eta = max(
+                disk["available_bytes"] - available_at_stop, 0
+            ) / rate
+            line += (
+                f"  filling {format_disk_size(rate)}/s: "
+                f"{100 * disk['stop_fraction']:.0f}% in ~{_format_fill_eta(eta)}"
+            )
+        elif rate < -DISK_RATE_FLOOR_BYTES:
+            line += f"  freeing {format_disk_size(-rate)}/s"
+        else:
+            line += "  steady"
+    return line
+
+
 def _branch_eta(branch, generated_at):
     completed = branch["completed_candidate_count"]
     created_at = branch.get("created_at")
@@ -129,9 +187,11 @@ def _semantic_branch_class(branch, previous_branch):
     return "red" if branch != previous_branch else None
 
 
-def _semantic_worker_class(worker, previous_worker):
+def _semantic_worker_class(worker, previous_worker, generated_at):
     if not worker["is_live"]:
         return "red"
+    if generated_at - worker["updated_at"] > WORKER_STALE_SECONDS:
+        return "amber"
     if previous_worker is None:
         return "green"
     ignored = {"updated_at"}
@@ -188,6 +248,9 @@ def _render_sections(report, previous_report, color, width, display_order):
         if queue_source.get("git_sha"):
             epoch_detail += f" revision={queue_source['git_sha']}"
         header.append(_fit(f"  {epoch_detail}", width))
+    header.append(_fit(
+        render_disk_status(report["data"].get("disk", {}), color=color), width
+    ))
 
     cache_summary = report["data"]["cache_summary"]
     totals = report["data"]["worker_totals"]
@@ -314,7 +377,9 @@ def _render_worker_line(
         line += f"  nodes/s={_abbreviate_number(worker.get('nodes_per_second'))}"
         if worker.get("current_max_guess_depth") is not None:
             line += f"  d={worker['current_max_guess_depth']}"
-    semantic_class = _semantic_worker_class(worker, previous_worker)
+    semantic_class = _semantic_worker_class(
+        worker, previous_worker, generated_at
+    )
     return _colorize(_fit(line, width), semantic_class, color)
 
 
@@ -522,7 +587,36 @@ def _render_tree_sections(report, width):
     if not data["tree_available"]:
         lines.append(f"  unavailable: {data['unavailable_reason']}")
     else:
+        nodes_by_id = {node["node_id"]: node for node in data["nodes"]}
+        children_by_parent = {}
         for node in data["nodes"]:
+            children_by_parent.setdefault(node["parent_node_id"], []).append(node)
+        for children in children_by_parent.values():
+            children.sort(key=lambda node: (
+                (node["step"] or {}).get("word", ""),
+                (node["step"] or {}).get("pattern", ""),
+                node["branch_key_hex"] or "",
+            ))
+
+        ordered_nodes = []
+        visited_node_ids = set()
+
+        def append_node_and_descendants(node):
+            if node["node_id"] in visited_node_ids:
+                return
+            visited_node_ids.add(node["node_id"])
+            ordered_nodes.append(node)
+            for child in children_by_parent.get(node["node_id"], []):
+                append_node_and_descendants(child)
+
+        root = nodes_by_id.get("root")
+        if root is not None:
+            append_node_and_descendants(root)
+        for node in data["nodes"]:
+            if node["node_id"] not in visited_node_ids:
+                append_node_and_descendants(node)
+
+        for node in ordered_nodes:
             indent = "  " * node["guess_depth"]
             step = node["step"]
             label = "root" if node["guess_depth"] == 0 else "unknown"
@@ -551,7 +645,8 @@ def _render_queue_collection_sections(report, width):
     for row in data.get("rows", []):
         lines.append(_fit(
             f"  @{row['branch_reference']} {row['lifecycle']} "
-            f"n={row['answer_count']} d={len((row.get('spine') or '').split()) // 2} "
+            f"n={row['answer_count']} "
+            f"guess_depth={len((row.get('spine') or '').split()) // 2} "
             f"priority={row['priority']} workers={row['worker_count']}",
             width,
         ))
@@ -578,7 +673,9 @@ def _render_workers_collection_sections(report, previous_report, color, width, d
             lines.append(_render_worker_line(
                 worker, previous_by_id.get(worker_id), report["generated_at"],
                 color, width, indent="  ",
-                state=None if worker["is_live"] else "dead",
+                state=worker.get("state") or (
+                    None if worker["is_live"] else "dead"
+                ),
             ))
     return [("header", header), ("worker_rows", lines)]
 
@@ -595,7 +692,22 @@ def _render_cache_collection_sections(report, width):
             f"recent={summary['recent_exact_branch_count']}",
             width,
         ))
-        lines.append(_fit(f"  {data['distributions']}", width))
+        distributions = data["distributions"]
+        for label, key in (
+            ("state", "state_branch_counts"),
+            (
+                "max remaining depth",
+                "exact_branch_count_by_max_remaining_depth",
+            ),
+            ("solve budget", "exact_branch_count_by_solve_budget"),
+            ("taint", "exact_branch_count_by_taint"),
+            ("loss budget", "loss_branch_count_by_loss_budget"),
+        ):
+            values = distributions[key]
+            formatted_values = ", ".join(
+                f"{name}={count}" for name, count in sorted(values.items())
+            ) or "none"
+            lines.append(_fit(f"  {label}: {formatted_values}", width))
     elif "rows" in data:
         for row in data["rows"]:
             lines.append(_fit(
@@ -879,6 +991,7 @@ class WatchSession:
             self.args.format == "text"
             and self.args.watch is not None
             and self.input_stream.isatty()
+            and self.output_stream.isatty()
             and not self.args.no_color
         )
 
@@ -887,7 +1000,7 @@ class WatchSession:
             self._run_once()
         elif self.args.format == "jsonl":
             self._run_jsonl_watch()
-        elif self.input_stream.isatty():
+        elif self.input_stream.isatty() and self.output_stream.isatty():
             self._run_tty_text()
         else:
             self._run_non_tty_text()
@@ -898,7 +1011,11 @@ class WatchSession:
         except Exception as error:
             self.error_stream.write(f"view: {error}\n")
             raise SystemExit(1)
-        if self.args.format in ("json", "jsonl"):
+        if self.args.format == "jsonl":
+            self.output_stream.write(
+                json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+        elif self.args.format == "json":
             self.output_stream.write(json.dumps(report, sort_keys=True) + "\n")
         else:
             self.output_stream.write(render_report(
@@ -978,6 +1095,10 @@ class WatchSession:
             if old_lines == lines and index < first_shift:
                 continue
             start_line = new_starts[index]
+            if index > 0:
+                self.output_stream.write(
+                    f"\033[{start_line - 1};1H{CLEAR_LINE}"
+                )
             self.output_stream.write(f"\033[{start_line};1H")
             for line in lines:
                 self.output_stream.write(line + CLEAR_LINE + "\n")
@@ -1001,7 +1122,7 @@ class WatchSession:
             if not ready:
                 continue
             character = self.input_stream.read(1)
-            if character in ("q", "Q", "\x04"):
+            if character in ("", "q", "Q", "\x04"):
                 return False
             if character == " ":
                 return True

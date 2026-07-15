@@ -394,15 +394,15 @@ class QueueVisibilityTests(unittest.TestCase):
 
     def test_row_spine_text_helper(self):
         self.assertEqual(
-            self.q._row_spine_text({"spine": "CRANE -----"}),
+            self.q.row_spine_text({"spine": "CRANE -----"}),
             "CRANE -----")
         self.assertEqual(
-            self.q._row_spine_text({
+            self.q.row_spine_text({
                 "source_word": "crane",
                 "source_pattern_text": "-----",
             }),
             "CRANE -----")
-        self.assertEqual(self.q._row_spine_text({}), "")
+        self.assertEqual(self.q.row_spine_text({}), "")
 
 if __name__ == "__main__":
     unittest.main()

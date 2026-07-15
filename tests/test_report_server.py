@@ -80,11 +80,23 @@ class ReportServerTest(unittest.TestCase):
         self.live_configuration = ServerConfiguration(self.sources, CLIENT_PATH)
 
     def test_live_root_contract_matches_direct_collection_shape(self):
-        with running_server(self.live_configuration) as base_url:
+        disk = {
+            "total_bytes": 1_000,
+            "used_bytes": 250,
+            "avail_bytes": 750,
+            "used_fraction": 0.25,
+        }
+        with (
+            patch("report_model.disk_stats", return_value=disk),
+            patch("report_model.ERDQueue.wal_size_bytes", return_value=128),
+            running_server(self.live_configuration) as base_url,
+        ):
             status, _headers, body = request(base_url, "/api/view")
+            direct = collect_report(
+                self.sources, parse_report_request("/api/view", "")
+            )
         self.assertEqual(status, 200)
         served = json.loads(body)
-        direct = collect_report(self.sources, parse_report_request("/api/view", ""))
         served.pop("generated_at")
         direct.pop("generated_at")
         self.assertEqual(served, direct)

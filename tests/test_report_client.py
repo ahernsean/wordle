@@ -161,6 +161,9 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_overview_renders_branch_and_worker_lifecycles(self):
         text = self.page.locator("#report").inner_text()
+        self.assertIn("filesystem used", text)
+        self.assertIn("12.5%", text)
+        self.assertIn("queue WAL", text)
         self.assertIn("active", text)
         self.assertIn("finalizing", text)
         self.assertIn("worker-0", text)

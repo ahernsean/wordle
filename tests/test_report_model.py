@@ -87,8 +87,9 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(json.loads(json.dumps(report)), report)
         self.assertEqual(set(report), {
             "schema_version", "report_kind", "generated_at", "selector",
-            "filters", "sources", "data",
+            "filters", "tree", "sources", "data",
         })
+        self.assertFalse(report["tree"])
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertTrue(report["sources"]["telemetry"]["ok"])
         self.assertTrue(report["sources"]["cache"]["ok"])
@@ -225,6 +226,8 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(worker["current_candidate_is_answer"])
         self.assertTrue(worker["descent"][0]["word_is_answer"])
         self.assertEqual(report["data"]["worker_totals"]["cache_hit_count"], 5)
+        self.assertGreater(report["data"]["disk"]["total_bytes"], 0)
+        self.assertGreaterEqual(report["data"]["disk"]["queue_wal_bytes"], 0)
 
     def test_all_gray_legacy_spine_fallback_has_one_guess(self):
         branch_key = b"legacy-gray"

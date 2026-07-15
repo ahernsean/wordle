@@ -184,6 +184,7 @@
       return JSON.stringify(semanticProjection(row))!==JSON.stringify(semanticProjection(previous))?"flash-changed":"";
     }
     function metric(label,value){const node=element("div","metric");node.append(element("strong","",valueOrDash(value)),element("span","dim",label));return node;}
+    function formatBytes(value){if(value===null||value===undefined)return "—";for(const [size,suffix] of [[2**30,"G"],[2**20,"M"],[2**10,"K"]])if(value>=size)return (value/size).toLocaleString(undefined,{maximumFractionDigits:value/size>=100?0:1})+suffix;return value+"B";}
     function kv(values){const node=element("div","kv");for(const [key,value] of values){node.append(element("span","",key),element("span","",valueOrDash(value)));}return node;}
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
     function patternTiles(pattern){const step=element("span","step");for(const character of pattern||"?????")step.append(element("span","tile "+(character==="g"?"g":character==="y"?"y":""),character));return step;}
@@ -218,7 +219,9 @@
       if(worker.branch_reference){const button=element("button","","Open branch");button.addEventListener("click",()=>navigateBranch(worker));card.append(button);}return card;
     }
     function renderOverview(report,previous,state){
-      const fragment=document.createDocumentFragment(),counts=report.data.queue_counts||{},metrics=element("div","metrics");for(const [label,key] of [["pending","pending_branch_count"],["active user","active_user_branch_count"],["active cooperative","active_cooperative_branch_count"],["finalizing","finalizing_branch_count"],["cached exact","exact_branch_count"]])metrics.append(metric(label,key in counts?counts[key]:report.data.cache_summary?.[key]));fragment.append(metrics,element("h2","","Active branches"));
+      const fragment=document.createDocumentFragment(),counts=report.data.queue_counts||{},metrics=element("div","metrics");for(const [label,key] of [["pending","pending_branch_count"],["active user","active_user_branch_count"],["active cooperative","active_cooperative_branch_count"],["finalizing","finalizing_branch_count"],["cached exact","exact_branch_count"]])metrics.append(metric(label,key in counts?counts[key]:report.data.cache_summary?.[key]));fragment.append(metrics);
+      const disk=report.data.disk;if(disk?.used_fraction!==null&&disk?.used_fraction!==undefined){const values=[["filesystem used",(100*disk.used_fraction).toFixed(1)+"%"],["queue WAL",formatBytes(disk.queue_wal_bytes)]];const rate=disk.fill_rate_bytes_per_second;if(rate!==null&&rate!==undefined)values.push([rate>0?"filling":"freeing",formatBytes(Math.abs(rate))+"/s"]);fragment.append(section("Disk",kv(values)));}
+      fragment.append(element("h2","","Active branches"));
       const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(branches,element("h2","","Workers"));
       const branchLifecycles=new Map((report.data.branches||[]).map(branch=>[branch.branch_key_hex,branch.lifecycle]));
       const workers=element("div","grid"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at,branchLifecycles.get(row.branch_key_hex)));fragment.append(workers);return fragment;
