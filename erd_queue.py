@@ -1816,10 +1816,16 @@ class ERDQueue:
             return filters.get(name, default)
         return getattr(filters, name, default)
 
-    def report_queue_rows(self, filters=None, sort=None, limit=None) -> dict:
+    def report_queue_rows(
+        self, filters=None, sort=None, limit=None, generated_at=None,
+    ) -> dict:
         """Return normalized, filtered queue rows with pre-limit summaries."""
-        statuses = tuple(self._report_filter_value(filters, "statuses", ()))
-        active_only = self._report_filter_value(filters, "active_only", False)
+        branch_statuses = tuple(self._report_filter_value(
+            filters, "branch_statuses", ()
+        ))
+        branch_phases = tuple(self._report_filter_value(
+            filters, "branch_phases", ()
+        ))
         minimum_answer_count = self._report_filter_value(
             filters, "minimum_answer_count"
         )
@@ -1831,13 +1837,18 @@ class ERDQueue:
         spine_prefix = self._report_filter_value(filters, "spine_prefix")
         source_word = self._report_filter_value(filters, "source_word")
         branch_key = self._report_filter_value(filters, "branch_key")
-        lifecycle_expression = """CASE
-            WHEN pending_status = 'pending' THEN 'pending'
-            WHEN pending_status = 'in_progress' THEN 'active'
-            WHEN pending_status = 'done' THEN 'done'
-            WHEN active_status = 'open' THEN 'active'
+        branch_phase_expression = """CASE
+            WHEN pending_status = 'done' THEN 'complete'
             WHEN active_status = 'finalized' THEN 'finalizing'
-            ELSE 'unknown' END"""
+            WHEN active_status = 'open' OR pending_status = 'in_progress'
+                THEN 'evaluating'
+            WHEN pending_status = 'pending' THEN 'queued'
+            ELSE NULL END"""
+        branch_status_expression = """CASE
+            WHEN pending_status = 'done' THEN 'done'
+            WHEN pending_status IS NULL AND active_status IS NULL THEN 'unqueued'
+            WHEN worker_count > 0 THEN 'active'
+            ELSE 'pending' END"""
         base_query = f"""
             WITH branch_keys AS (
                 SELECT branch_key FROM pending_branches
@@ -1874,6 +1885,8 @@ class ERDQueue:
                        active.best_erd,
                        active.best_max_depth,
                        active.nodes_spent,
+                       active.bulk_done_candidates,
+                       active.ceiling,
                        active.spine,
                        active.created_at,
                        COALESCE(completed.completed_candidate_count, 0)
@@ -1886,7 +1899,9 @@ class ERDQueue:
                 LEFT JOIN workers USING (branch_key)
             ),
             normalized AS (
-                SELECT *, {lifecycle_expression} AS lifecycle,
+                SELECT *,
+                       {branch_status_expression} AS branch_status,
+                       {branch_phase_expression} AS branch_phase,
                        COALESCE(active_priority, pending_priority, 0) AS priority,
                        COALESCE(active_answer_count, pending_answer_count) AS answer_count,
                        COALESCE(active_source_word, pending_source_word) AS source_word,
@@ -1895,13 +1910,18 @@ class ERDQueue:
             )
         """
         conditions = []
-        parameters = [int(time.time()) - WORKER_LIVENESS_SECONDS]
-        if active_only:
-            conditions.append("lifecycle = 'active'")
-        if statuses:
-            placeholders = ",".join("?" for _ in statuses)
-            conditions.append(f"lifecycle IN ({placeholders})")
-            parameters.extend(statuses)
+        parameters = [
+            int(generated_at if generated_at is not None else time.time())
+            - WORKER_LIVENESS_SECONDS
+        ]
+        if branch_statuses:
+            placeholders = ",".join("?" for _ in branch_statuses)
+            conditions.append(f"branch_status IN ({placeholders})")
+            parameters.extend(branch_statuses)
+        if branch_phases:
+            placeholders = ",".join("?" for _ in branch_phases)
+            conditions.append(f"branch_phase IN ({placeholders})")
+            parameters.extend(branch_phases)
         if minimum_answer_count is not None:
             conditions.append("answer_count >= ?")
             parameters.append(minimum_answer_count)
@@ -1933,15 +1953,22 @@ class ERDQueue:
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
         summary_rows = self._conn.execute(
             base_query
-            + " SELECT lifecycle, COUNT(*) AS branch_count FROM normalized"
+            + " SELECT branch_status, branch_phase, COUNT(*) AS branch_count"
+            + " FROM normalized"
             + where_clause
-            + " GROUP BY lifecycle",
+            + " GROUP BY branch_status, branch_phase",
             parameters,
         ).fetchall()
-        by_lifecycle = {
-            row["lifecycle"]: row["branch_count"] for row in summary_rows
-        }
-        matched_rows = sum(by_lifecycle.values())
+        by_status = {}
+        by_phase = {}
+        for row in summary_rows:
+            by_status[row["branch_status"]] = (
+                by_status.get(row["branch_status"], 0) + row["branch_count"]
+            )
+            by_phase[row["branch_phase"]] = (
+                by_phase.get(row["branch_phase"], 0) + row["branch_count"]
+            )
+        matched_rows = sum(by_status.values())
         sort_name = sort or self._report_filter_value(filters, "sort") or "default"
         order_by = {
             "age": "COALESCE(created_at, claimed_at, 0), branch_key",
@@ -1951,7 +1978,7 @@ class ERDQueue:
             "nodes": "nodes_spent DESC, answer_count DESC, branch_key",
             "slowest": "nodes_spent DESC, created_at, branch_key",
             "default": (
-                "CASE lifecycle WHEN 'active' THEN 0 ELSE 1 END, "
+                "CASE branch_status WHEN 'active' THEN 0 ELSE 1 END, "
                 "priority DESC, answer_count DESC, branch_key"
             ),
         }[sort_name]
@@ -1972,7 +1999,8 @@ class ERDQueue:
             returned_rows.append({
                 "branch_key": bytes(row["branch_key"]),
                 "branch_key_hex": bytes(row["branch_key"]).hex(),
-                "lifecycle": row["lifecycle"],
+                "branch_status": row["branch_status"],
+                "branch_phase": row["branch_phase"],
                 "raw_status": row["pending_status"] or row["active_status"],
                 "is_cooperative": row["pending_status"] is None,
                 "answer_count": row["answer_count"],
@@ -1980,8 +2008,10 @@ class ERDQueue:
                 "budget": row["budget"],
                 "candidate_count": row["candidate_count"],
                 "completed_candidate_count": row["completed_candidate_count"],
+                "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
                 "worker_count": row["worker_count"],
                 "search_node_count": row["nodes_spent"] or 0,
+                "ceiling": row["ceiling"],
                 "best_guess": row["best_guess"],
                 "best_erd": row["best_erd"],
                 "best_max_remaining_depth": row["best_max_depth"],
@@ -1997,7 +2027,8 @@ class ERDQueue:
         return {
             "summary": {
                 "branch_count": matched_rows,
-                "branch_count_by_lifecycle": by_lifecycle,
+                "branch_count_by_status": by_status,
+                "branch_count_by_phase": by_phase,
             },
             "matched_rows": matched_rows,
             "rows": returned_rows,
@@ -2006,8 +2037,12 @@ class ERDQueue:
     def report_tree_rows(self, spine_prefix, filters=None, sort=None, limit=None) -> dict:
         """Return report queue rows at or below a recorded spine prefix."""
         scoped_filters = {
-            "active_only": self._report_filter_value(filters, "active_only", False),
-            "statuses": self._report_filter_value(filters, "statuses", ()) or (),
+            "branch_statuses": self._report_filter_value(
+                filters, "branch_statuses", ()
+            ) or (),
+            "branch_phases": self._report_filter_value(
+                filters, "branch_phases", ()
+            ) or (),
             "minimum_answer_count": self._report_filter_value(
                 filters, "minimum_answer_count"
             ),

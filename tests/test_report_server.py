@@ -110,13 +110,27 @@ class ReportServerTest(unittest.TestCase):
         self.assertEqual(word["report_kind"], "word")
         self.assertEqual(branch["report_kind"], "branch")
 
-    def test_tree_and_active_only_reach_normalized_request(self):
+    def test_tree_and_branch_filters_reach_normalized_request(self):
         report_request = parse_report_request(
-            "/api/view/queue", "tree=true&active_only=1&limit=4"
+            "/api/view/queue",
+            "tree=true&branch_status=active,pending&branch_phase=evaluating&limit=4",
         )
         self.assertTrue(report_request.tree)
-        self.assertTrue(report_request.filters.active_only)
+        self.assertEqual(
+            report_request.filters.branch_statuses, ("active", "pending")
+        )
+        self.assertEqual(
+            report_request.filters.branch_phases, ("evaluating",)
+        )
         self.assertEqual(report_request.filters.limit, 4)
+
+    def test_root_overview_defaults_to_active_and_all_disables_filter(self):
+        default_request = parse_report_request("/api/view", "")
+        all_request = parse_report_request("/api/view", "branch_status=all")
+        word_request = parse_report_request("/api/view", "selector=RAISE")
+        self.assertEqual(default_request.filters.branch_statuses, ("active",))
+        self.assertEqual(all_request.filters.branch_statuses, ())
+        self.assertEqual(word_request.filters.branch_statuses, ())
 
     def test_http_and_terminal_compatibility_validation_is_shared(self):
         invalid_requests = (
@@ -157,12 +171,18 @@ class ReportServerTest(unittest.TestCase):
         self.assertEqual(workers["report_kind"], "workers")
         self.assertEqual((cache_status, hotspot_status), (400, 400))
 
-    def test_repeated_status_is_accepted_but_other_duplicates_are_not(self):
+    def test_comma_separated_status_is_accepted_but_parameters_do_not_repeat(self):
         report_request = parse_report_request(
-            "/api/view/queue", "status=pending&status=done"
+            "/api/view/queue", "branch_status=pending,done"
         )
-        self.assertEqual(report_request.filters.statuses, ("pending", "done"))
-        for query in ("limit=2&limit=3", "unknown=1"):
+        self.assertEqual(
+            report_request.filters.branch_statuses, ("pending", "done")
+        )
+        for query in (
+            "branch_status=pending&branch_status=done",
+            "limit=2&limit=3",
+            "unknown=1",
+        ):
             with self.subTest(query=query), self.assertRaises(InvalidRequest):
                 parse_report_request("/api/view", query)
 
@@ -170,6 +190,8 @@ class ReportServerTest(unittest.TestCase):
         invalid_queries = (
             "tree=yes", "limit=x", "selector=BAD", "limit=0",
             "sample_size=0", "minimum_answer_count=5&maximum_answer_count=2",
+            "branch_status=active,active", "branch_status=all,pending",
+            "branch_phase=evaluating,", "branch_phase=working",
         )
         with running_server(fixture_configuration()) as base_url:
             for query in invalid_queries:
@@ -198,7 +220,7 @@ class ReportServerTest(unittest.TestCase):
         os.mkdir(bad_directory)
         for filename in FIXTURE_FILENAMES:
             with open(os.path.join(bad_directory, filename), "w") as fixture_file:
-                json.dump({"schema_version": 2}, fixture_file)
+                json.dump({"schema_version": 1}, fixture_file)
         with self.assertRaisesRegex(ValueError, "schema version"):
             load_fixtures(bad_directory)
 

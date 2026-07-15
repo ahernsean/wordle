@@ -12,11 +12,14 @@ import sys
 from urllib.parse import parse_qs, urlsplit
 
 from report_model import (
+    BRANCH_PHASES,
+    BRANCH_STATUSES,
     SCHEMA_VERSION,
     ReportFilters,
     ReportRequest,
     ReportSources,
     collect_report,
+    parse_branch_filter,
     parse_report_selector,
     validate_report_request,
 )
@@ -35,29 +38,23 @@ FIXTURE_FILENAMES = (
     "cache.json",
     "hotspots.json",
 )
-BOOLEAN_PARAMETERS = {"tree", "active_only", "claims", "answers"}
+BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
 INTEGER_PARAMETERS = {
     "minimum_answer_count", "maximum_answer_count", "budget", "priority",
     "limit", "epoch", "since_seconds", "sample_size",
 }
 SCALAR_PARAMETERS = {
-    "selector", "sort", "by", "worker", *BOOLEAN_PARAMETERS,
+    "selector", "sort", "by", "worker", "branch_status", "branch_phase",
+    *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
 }
-ALLOWED_PARAMETERS = SCALAR_PARAMETERS | {"status"}
-LIFECYCLES = {"pending", "active", "finalizing", "done", "unqueued"}
+ALLOWED_PARAMETERS = SCALAR_PARAMETERS
 SORT_FIELDS = {"default", "age", "size", "workers", "priority", "nodes", "slowest"}
 HOTSPOT_FIELDS = {
     "nodes", "age", "size", "workers", "priority", "slowest",
     "evaluated-candidates", "bulk-completed-candidates", "cut-reuse",
     "coordination",
 }
-HISTORICAL_HOTSPOT_FIELDS = {
-    "evaluated-candidates", "bulk-completed-candidates", "cut-reuse",
-    "coordination",
-}
-
-
 class InvalidRequest(ValueError):
     pass
 
@@ -123,15 +120,28 @@ def parse_report_request(path, query):
     except ValueError as error:
         raise InvalidRequest(str(error)) from error
     tree = _boolean_value(parameters, "tree")
-    active_only = _boolean_value(parameters, "active_only")
     include_claims = _boolean_value(parameters, "claims")
     include_answers = _boolean_value(parameters, "answers")
-    statuses = tuple(parameters.get("status", ()))
-    invalid_statuses = [status for status in statuses if status not in LIFECYCLES]
-    if invalid_statuses:
-        raise InvalidRequest(f"invalid lifecycle {invalid_statuses[0]!r}")
-    if active_only and statuses:
-        raise InvalidRequest("active_only cannot be combined with status")
+    branch_status_value = _single_value(parameters, "branch_status")
+    branch_phase_value = _single_value(parameters, "branch_phase")
+    try:
+        branch_statuses = (
+            parse_branch_filter(
+                branch_status_value, "branch status", BRANCH_STATUSES
+            )
+            if branch_status_value is not None
+            else (
+                ("active",)
+                if explicit_kind == "auto" and selector.kind == "root" and not tree
+                else ()
+            )
+        )
+        branch_phases = (
+            parse_branch_filter(branch_phase_value, "branch phase", BRANCH_PHASES)
+            if branch_phase_value is not None else ()
+        )
+    except ValueError as error:
+        raise InvalidRequest(str(error)) from error
 
     integer_values = {
         name: _integer_value(parameters, name) for name in INTEGER_PARAMETERS
@@ -173,11 +183,6 @@ def parse_report_request(path, query):
     hotspot_field = hotspot_field or ("nodes" if explicit_kind == "hotspots" else None)
     if tree and explicit_kind in ("cache", "hotspots"):
         raise InvalidRequest(f"tree cannot be used with {explicit_kind}")
-    if explicit_kind == "hotspots" and hotspot_field in HISTORICAL_HOTSPOT_FIELDS:
-        if active_only or statuses:
-            raise InvalidRequest("historical hotspots cannot use lifecycle filters")
-        if hotspot_field == "coordination" and selector.kind != "root":
-            raise InvalidRequest("coordination hotspots cannot use a selector")
     worker_id = _single_value(parameters, "worker")
     if worker_id is not None and explicit_kind != "workers":
         raise InvalidRequest("worker requires the workers endpoint")
@@ -196,8 +201,8 @@ def parse_report_request(path, query):
         limit = 10
 
     filters = ReportFilters(
-        active_only=active_only,
-        statuses=statuses,
+        branch_statuses=branch_statuses,
+        branch_phases=branch_phases,
         minimum_answer_count=minimum_answer_count,
         maximum_answer_count=maximum_answer_count,
         budget=integer_values["budget"],

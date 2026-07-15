@@ -1,5 +1,5 @@
 {
-  "schema_version": 1, "report_kind": "cache", "generated_at": 1000,
+  "schema_version": 2, "report_kind": "cache", "generated_at": 1000,
   "selector": {"kind": "root", "steps": [], "trailing_word": null, "branch_reference": null, "input_text": ""},
   "filters": {}, "tree": false,
   "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": false, "error": null, "epoch": null, "label": null, "git_sha": null}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": false, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},

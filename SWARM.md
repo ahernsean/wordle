@@ -99,7 +99,7 @@ resulting branch. Pattern syntax is `g` for green, `y` for yellow, and `.` or
 Focused collections and live topology use the same report model:
 
 ```bash
-python3.13 erd_search.py view --queue --active-only --sort size --limit 25
+python3.13 erd_search.py view --queue --branch-status active,pending --sort size --limit 25
 python3.13 erd_search.py view --queue --tree "CRANE .y..g"
 python3.13 erd_search.py view --workers
 python3.13 erd_search.py view --worker 2
@@ -110,10 +110,14 @@ python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
 ```
 
 Use `--answers` for answer-word arrays on word or branch reports and `--claims`
-for sparse candidate detail on one branch. Collection filters include lifecycle,
-answer-count bounds, budget, priority, sort, and limit. Historical hotspots are
-explicitly bounded by epoch, time window, and sample size. `--tree` uses only
-extant queue topology; cache rows never reconstruct historical trees.
+for sparse candidate detail on one branch. Collection filters include branch
+status, branch phase, answer-count bounds, budget, priority, sort, and limit.
+Status tracks the branch's relationship to current work: active, pending, done,
+or unqueued. Phase tracks durable search progress from queued through evaluating
+and finalizing to complete. The two axes have a constrained set of combinations; run
+`erd_search.py view --help` for their transition diagram. Historical hotspots
+are explicitly bounded by epoch, time window, and sample size. `--tree` uses
+only extant queue topology; cache rows never reconstruct historical trees.
 
 ### Log files
 
