@@ -82,6 +82,15 @@ class SemanticReportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "five-character response pattern"):
             parse_report_selector("CRANE ALIBI")
 
+    def test_semantic_queue_programming_errors_propagate(self):
+        with patch.object(
+            ERDQueue, "status_by_branch_keys", side_effect=KeyError("bug")
+        ):
+            with self.assertRaises(KeyError):
+                collect_report(self.sources, ReportRequest(
+                    selector=parse_report_selector("RAISE")
+                ))
+
     def test_queue_and_cache_are_unreserved_words(self):
         for word in ("QUEUE", "CACHE"):
             selector = parse_report_selector(word)

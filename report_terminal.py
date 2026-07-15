@@ -242,17 +242,27 @@ def _render_sections(report, previous_report, color, width, display_order):
             best = branch["best_guess"].upper()
             if branch.get("best_erd") is not None:
                 best += f"/{branch['best_erd']:.3f}"
-        line = (
-            f"  @{branch['branch_reference']}  n={branch['answer_count']} "
-            f"d={branch['guess_depth']}  {completed}/{branch['candidate_count']} "
-            f"({_percentage(completed, branch['candidate_count'])})"
-        )
-        if branch["bulk_completed_candidate_count"]:
-            line += f" bulk={branch['bulk_completed_candidate_count']}"
-        if width >= 60:
-            line += f"  best={best}  workers={branch['worker_count']}"
+        if width < 60:
+            line = (
+                f"  @{branch['branch_reference']}  "
+                f"guess_depth={branch['guess_depth']}  "
+                f"{completed}/{branch['candidate_count']}"
+            )
+        else:
+            line = (
+                f"  @{branch['branch_reference']}  n={branch['answer_count']} "
+                f"guess_depth={branch['guess_depth']}  "
+                f"{completed}/{branch['candidate_count']}"
+            )
             if branch.get("best_max_remaining_depth") is not None:
-                line += f"  max-d={branch['best_max_remaining_depth']}"
+                line += (
+                    "  max_remaining_depth="
+                    f"{branch['best_max_remaining_depth']}"
+                )
+            if branch["bulk_completed_candidate_count"]:
+                line += f" bulk={branch['bulk_completed_candidate_count']}"
+            if width >= 100:
+                line += f"  best={best}  workers={branch['worker_count']}"
         if width >= 80:
             line += f"  ETA={_abbreviate_duration(_branch_eta(branch, generated_at))}"
             if branch["spine"]:
@@ -305,15 +315,19 @@ def _render_worker_line(
     worker, previous_worker, generated_at, color, width, indent, state=None
 ):
     age = max(0, generated_at - worker["updated_at"])
-    label = f"W{worker['worker_number']}"
+    label = f"worker={worker['worker_id']}"
     if state:
         label += f" {state}"
-    candidate = (worker.get("current_candidate") or "—").upper()
-    line = f"{indent}{label}  candidate={candidate}  age={_abbreviate_duration(age)}"
+    line = f"{indent}{label}  age={_abbreviate_duration(age)}"
     if width >= 60:
+        candidate = (worker.get("current_candidate") or "—").upper()
+        line += f"  candidate={candidate}"
         line += f"  nodes/s={_abbreviate_number(worker.get('nodes_per_second'))}"
         if worker.get("current_max_guess_depth") is not None:
-            line += f"  d={worker['current_max_guess_depth']}"
+            line += (
+                "  current_max_guess_depth="
+                f"{worker['current_max_guess_depth']}"
+            )
     semantic_class = _semantic_worker_class(
         worker, previous_worker, generated_at
     )
