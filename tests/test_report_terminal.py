@@ -148,18 +148,22 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("queue: ok", output)
         self.assertIn("pending 12", output)
         self.assertIn("@0123456789ab", output)
-        self.assertIn("guess_depth=2", output)
+        self.assertIn("GuessD", output)
         self.assertIn("25/100", output)
         self.assertNotIn("30/100", output)
-        self.assertIn("max_remaining_depth=3", output)
-        self.assertIn("worker=worker-2", output)
+        self.assertIn("MaxRD", output)
+        self.assertIn("worker-2", output)
+        self.assertNotIn("guess_depth=", output)
+        self.assertNotIn("worker=", output)
         self.assertNotIn("\033", output)
 
     def test_narrow_rendering_respects_width(self):
-        output = render_overview(overview_report(), color=False, width=48)
-        self.assertTrue(all(len(line) <= 48 for line in output.splitlines()))
+        output = render_overview(overview_report(), color=False, width=50)
+        self.assertTrue(all(len(line) <= 50 for line in output.splitlines()))
         self.assertIn("@0123456789ab", output)
-        self.assertIn("worker=worker-2", output)
+        self.assertIn("worker-2", output)
+        self.assertIn("Ref", output)
+        self.assertIn("State", output)
 
     def test_progress_and_worker_changes_are_semantically_colored(self):
         previous = overview_report()
@@ -170,7 +174,7 @@ class OverviewRendererTest(unittest.TestCase):
             current, previous_report=previous, color=True, width=100
         )
         self.assertIn(report_terminal.GREEN + "  @0123456789ab", output)
-        self.assertIn(report_terminal.RED + "    worker=worker-2", output)
+        self.assertIn(report_terminal.RED + "    worker-2", output)
 
     def test_ticking_timestamps_alone_are_not_highlighted(self):
         previous = overview_report()
@@ -189,15 +193,72 @@ class OverviewRendererTest(unittest.TestCase):
         stale["data"]["workers"][0]["updated_at"] = 979
         stale_output = render_overview(stale, color=True, width=100)
         self.assertIn(
-            report_terminal.AMBER + "    worker=worker-2", stale_output
+            report_terminal.AMBER + "    worker-2", stale_output
         )
 
         dead = deepcopy(stale)
         dead["data"]["workers"][0]["is_live"] = False
         dead_output = render_overview(dead, color=True, width=100)
         self.assertIn(
-            report_terminal.RED + "  worker=worker-2 dead", dead_output
+            report_terminal.RED + "  worker-2", dead_output
         )
+
+    def test_adaptive_columns_cover_phone_and_wide_widths(self):
+        report = overview_report()
+        branch = report["data"]["branches"][0]
+        branch["candidate_count"] = 12972
+        branch["completed_candidate_count"] = 12616
+        branch["spine"] = branch["spine"] * 5
+        report["data"]["workers"][0]["worker_id"] = "worker-12"
+
+        expected_branch_headings = {
+            50: ("Ref", "GuessD", "State", "Done", "W"),
+            55: ("Ref", "GuessD", "State", "Done", "W", "Ans"),
+            59: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
+            60: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
+            79: (
+                "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
+                "Best", "MaxRD",
+            ),
+            80: (
+                "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
+                "Best", "MaxRD",
+            ),
+            120: (
+                "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
+                "Best", "MaxRD", "ETA",
+            ),
+        }
+        for width, expected_headings in expected_branch_headings.items():
+            with self.subTest(width=width):
+                output = render_overview(report, color=False, width=width)
+                self.assertTrue(
+                    all(len(line) <= width for line in output.splitlines())
+                )
+                self.assertIn("@0123456789ab", output)
+                self.assertIn("12616/12972", output)
+                self.assertIn("worker-12", output)
+                self.assertNotIn("guess_depth=", output)
+                self.assertNotIn("candidate=", output)
+                branch_header = next(
+                    line for line in output.splitlines()
+                    if "Ref" in line and "GuessD" in line
+                )
+                self.assertEqual(tuple(branch_header.split()), expected_headings)
+
+        narrow = render_overview(report, color=False, width=50)
+        narrow_branch_header = next(
+            line for line in narrow.splitlines() if "Ref" in line and "GuessD" in line
+        )
+        self.assertIn("State", narrow_branch_header)
+        self.assertIn("Done", narrow_branch_header)
+        self.assertNotIn("Spine", narrow_branch_header)
+
+        wide = render_overview(report, color=False, width=120)
+        wide_branch_header = next(
+            line for line in wide.splitlines() if "Ref" in line and "GuessD" in line
+        )
+        self.assertIn("Best", wide_branch_header)
 
     def test_reordered_input_keeps_prior_identity_order(self):
         first = overview_report()
