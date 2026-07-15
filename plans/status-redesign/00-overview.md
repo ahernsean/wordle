@@ -106,6 +106,10 @@ than copying path strings.
 - One report model owns domain semantics for every client.
 - Semantic work selection is shared across CLI, HTTP, and browser.
 - The terminal is first-class and works without a server.
+- Terminal text is width-adaptive down to ordinary 50-column phone and split-
+  pane sessions: tabular labels live in headers, lower-priority columns
+  disappear before essential values truncate, and no report requires
+  horizontal scrolling.
 - Optional refresh wraps the same one-shot report collection.
 - Full identities drive joins, navigation, and change detection.
 - Expensive detail is fetched only when requested.
