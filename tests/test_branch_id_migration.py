@@ -35,6 +35,41 @@ CREATE TABLE cut_results (
     bound      REAL    NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE active_branches (
+    branch_key     BLOB    PRIMARY KEY,
+    n_words        INTEGER NOT NULL,
+    n_candidates   INTEGER NOT NULL,
+    priority       INTEGER NOT NULL DEFAULT 0,
+    source_word    TEXT,
+    source_pattern INTEGER,
+    best_erd       REAL,
+    best_guess     TEXT,
+    status         TEXT    NOT NULL DEFAULT 'open',
+    created_at     INTEGER,
+    finalized_at   INTEGER,
+    budget         INTEGER,
+    best_max_depth INTEGER,
+    tainted        INTEGER NOT NULL DEFAULT 0,
+    nodes_spent    INTEGER NOT NULL DEFAULT 0,
+    spine          TEXT,
+    ceiling        REAL,
+    cut_occurred   INTEGER NOT NULL DEFAULT 0,
+    bulk_done_candidates INTEGER NOT NULL DEFAULT 0,
+    bulk_done_bound REAL,
+    pack_cursor    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE pending_branches (
+    branch_key     BLOB    NOT NULL,
+    n_words        INTEGER NOT NULL,
+    priority       INTEGER NOT NULL DEFAULT 0,
+    source_word    TEXT,
+    source_pattern INTEGER,
+    status         TEXT    NOT NULL DEFAULT 'pending',
+    claimed_by     TEXT,
+    claimed_at     INTEGER,
+    completed_at   INTEGER,
+    PRIMARY KEY (branch_key)
+);
 """
 
 
@@ -57,6 +92,13 @@ class TestBranchIdMigration(unittest.TestCase):
         con.execute(
             "INSERT INTO cut_results (branch_key, budget, bound, created_at) "
             "VALUES (?, 3, 2.5, 0)", (self.key_b,))
+        con.execute(
+            "INSERT INTO active_branches (branch_key, n_words, n_candidates, "
+            "best_erd, best_guess, status) VALUES (?, 3, 40, 1.5, 'crane', 'open')",
+            (self.key_a,))
+        con.execute(
+            "INSERT INTO pending_branches (branch_key, n_words, priority, "
+            "source_word) VALUES (?, 4, 1, 'salet')", (self.key_b,))
         con.commit()
         con.close()
 
@@ -88,12 +130,25 @@ class TestBranchIdMigration(unittest.TestCase):
                 "WHERE branch_id = ? AND idx = 1", (id_a,)).fetchone()[0], 3)
         self.assertEqual(q.read_cut_result(self.key_b), (2.5, 3))
 
-        # The fat blob column is gone from every normalized table.
-        for table in ("candidate_claims", "candidate_republish", "cut_results"):
+        # active_branches / pending_branches survive, keyed by branch_id, with
+        # branch_key reachable only through the registry.
+        active = q.get_active_branch(self.key_a)
+        self.assertIsNotNone(active)
+        self.assertEqual(active["best_guess"], "crane")
+        self.assertEqual(bytes(active["branch_key"]), self.key_a)
+        self.assertTrue(q.has_pending_row(self.key_b))
+
+        # The fat blob column is gone from every normalized operational table.
+        for table in ("candidate_claims", "candidate_republish", "cut_results",
+                      "active_branches", "pending_branches"):
             cols = {r[1] for r in
                     q._conn.execute(f"PRAGMA table_info({table})")}
             self.assertIn("branch_id", cols)
             self.assertNotIn("branch_key", cols)
+        hb_cols = {r[1] for r in
+                   q._conn.execute("PRAGMA table_info(worker_heartbeat)")}
+        self.assertIn("current_branch_id", hb_cols)
+        self.assertNotIn("current_branch_key", hb_cols)
 
     def test_reopen_after_migration_is_idempotent(self):
         ERDQueue(self.path).close()   # first open migrates
