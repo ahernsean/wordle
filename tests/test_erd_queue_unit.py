@@ -264,7 +264,7 @@ class TestStartupRecovery(_TmpQueue):
         # Past the takeover window it is reclaimable, exactly once.
         self.q._conn.execute(
             "UPDATE active_branches SET finalized_at = finalized_at - 120 "
-            "WHERE branch_key = ?", (self.key,))
+            "WHERE branch_id = ?", (self.q._intern_branch(self.key),))
         self.assertTrue(self.q.reclaim_stale_finalize(self.key, 60))
         self.assertEqual(self.q.get_branch(self.key)["status"], "open")
         self.assertFalse(self.q.reclaim_stale_finalize(self.key, 60))
