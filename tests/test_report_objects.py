@@ -600,6 +600,15 @@ class SemanticReportTest(unittest.TestCase):
             filters=ReportFilters(active_only=True),
         ))
         self.assertEqual(report["data"]["matched_rows"], 1)
+        self.assertGreater(report["data"]["total_rows"], 1)
+        self.assertEqual(
+            report["data"]["response_group_counts"]["response_group_count"],
+            report["data"]["total_rows"],
+        )
+        self.assertEqual(
+            report["data"]["response_group_counts"]["active_response_group_count"],
+            1,
+        )
         self.assertTrue(all(
             row["lifecycle"] == "active"
             for row in report["data"]["response_groups"]

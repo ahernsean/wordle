@@ -698,6 +698,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         data["response_groups"].append(group_row)
 
     response_groups = data["response_groups"]
+    all_response_groups = list(response_groups)
     filters = request.filters
     if filters.active_only:
         response_groups = [
@@ -731,26 +732,28 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         response_groups.sort(key=lambda row: (-(row["priority"] or 0), row["pattern"]))
     matched_response_groups = list(response_groups)
     data["response_group_counts"] = {
-        "response_group_count": len(matched_response_groups),
+        "response_group_count": len(all_response_groups),
         "trivial_response_group_count": sum(
-            row["answer_count"] < 2 for row in matched_response_groups
+            row["answer_count"] < 2 for row in all_response_groups
         ),
         "queued_response_group_count": sum(
-            row["lifecycle"] != "unqueued" for row in matched_response_groups
+            row["lifecycle"] != "unqueued" for row in all_response_groups
         ),
         "active_response_group_count": sum(
-            row["lifecycle"] in ("active", "finalizing") for row in matched_response_groups
+            row["lifecycle"] in ("active", "finalizing")
+            for row in all_response_groups
         ),
         "exact_response_group_count": sum(
-            row["cache_state"] == "exact" for row in matched_response_groups
+            row["cache_state"] == "exact" for row in all_response_groups
         ),
         "loss_response_group_count": sum(
-            row["cache_state"] == "loss" for row in matched_response_groups
+            row["cache_state"] == "loss" for row in all_response_groups
         ),
         "missing_response_group_count": sum(
-            row["cache_state"] == "missing" for row in matched_response_groups
+            row["cache_state"] == "missing" for row in all_response_groups
         ),
     }
+    data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = (
         matched_response_groups[:filters.limit]
