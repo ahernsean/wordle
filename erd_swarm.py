@@ -66,6 +66,12 @@ HB_SECONDS = 2.0              # liveness heartbeat cadence during a long candida
 # heartbeats, which is conservative enough for any real process death.
 HB_TIMEOUT_SECONDS = 30
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
+# Cadence for the per-table WAL traffic log.  Deliberately far shorter than the
+# checkpoint interval: at the runaway rates this diagnostic exists to catch, the
+# WAL crosses the hard ceiling (and latches the swarm down) in ~100 s — long
+# before a 5-minute checkpoint — so the attribution has to be emitted on its own
+# fast timer, and from the heartbeat path so it fires mid-evaluation too.
+WAL_TRAFFIC_LOG_SECONDS = 30
 # Workers space their checkpoint intervals by a per-worker random factor in
 # [1-JITTER, 1+JITTER] so six processes spawned within seconds of each other
 # don't attempt checkpoints in lockstep every cycle.
@@ -513,6 +519,10 @@ class _BranchWorker:
     # -- lifecycle ----------------------------------------------------------
 
     def close(self):
+        # Final unthrottled flush so the last interval's attribution is captured
+        # even when a hard-ceiling trip terminates the worker between periodic
+        # logs (the ceiling stops the swarm via SIGTERM -> request_stop -> this).
+        self._log_wal_traffic(time.time(), force=True)
         self.queue.clear_heartbeat(self.name)
         self.score_cache.checkpoint()
         self.score_cache.close()
@@ -808,6 +818,11 @@ class _BranchWorker:
         now = time.time()
         if not force and now - self._last_hb < HB_SECONDS:
             return
+        # Emit the WAL traffic attribution on its own fast timer, before the
+        # pause-defer below: a runaway that provokes the hard ceiling coincides
+        # with the supervisor quiescing, so gating this behind the pause would
+        # suppress exactly the diagnostic the ceiling trip needs.
+        self._log_wal_traffic(now)
         # Defer unforced heartbeats while the supervisor is quiescing writers
         # for a TRUNCATE checkpoint; the pause window is well inside
         # HB_TIMEOUT_SECONDS, so liveness is never in question.
@@ -857,14 +872,23 @@ class _BranchWorker:
                             self.name, self._eval_seconds, eval_pct,
                             coord_seconds, 100.0 - eval_pct, elapsed)
 
-    def _log_wal_traffic(self, now):  # pragma: no cover
+    def _log_wal_traffic(self, now, force=False):
         """Log this worker's per-table WAL write/read rate since the last such
         log, largest first.  Names which coordination traffic (bulk-elimination
-        sweeps, holes-scan re-reads, claims) is pouring into the shared WAL —
-        the breakdown the WAL file itself does not carry."""
+        sweeps, holes-scan re-reads, claims, updates, deletes) is pouring into
+        the shared WAL — the breakdown the WAL file itself does not carry.
+
+        Self-throttled to WAL_TRAFFIC_LOG_SECONDS and called from the heartbeat
+        (so it fires even during a single long candidate) so a fast runaway
+        still emits attribution before the hard ceiling latches the swarm down.
+        force bypasses the throttle for the final flush on shutdown, so the last
+        interval's traffic is never lost when the ceiling trip terminates the
+        worker between logs."""
+        dt = now - self._last_wal_traffic_log
+        if not force and dt < WAL_TRAFFIC_LOG_SECONDS:
+            return
         _, byts = self.queue.wal_traffic_snapshot()
         _, prev_bytes = self._last_wal_traffic
-        dt = now - self._last_wal_traffic_log
         self._last_wal_traffic = (None, byts)
         self._last_wal_traffic_log = now
         if dt <= 0:

@@ -87,7 +87,8 @@ CHECKPOINT_PAUSE_STALE_SECONDS = 60
 # key and bundle indexes), for the per-table traffic estimate.  Since branch-id
 # normalization each row references a small integer branch_id, not the fat
 # branch_key blob, so this is a small constant rather than a multiple of the
-# key width.
+# key width.  The row COUNT tallied alongside it is exact (from SQLite
+# changes() on the delete/update paths); only this width is an estimate.
 _CLAIM_ROW_WAL_BYTES = 96
 
 # Disk sample ring length for the status display's growth rate (see
@@ -1630,6 +1631,12 @@ class ERDQueue:
                 VALUES (?, ?, 1)
                 ON CONFLICT(branch_id, idx) DO UPDATE SET count = count + 1
             """, [(branch_id, idx) for idx in deleted])
+            self._tally_wal_traffic(
+                'candidate_claims/republish-delete', len(deleted),
+                len(deleted) * _CLAIM_ROW_WAL_BYTES)
+            self._tally_wal_traffic(
+                'candidate_republish/republish-upsert', len(deleted),
+                len(deleted) * _CLAIM_ROW_WAL_BYTES)
             rows = self._conn.execute(
                 f"SELECT idx, count FROM candidate_republish "
                 f"WHERE branch_id = ? AND idx IN ({deleted_placeholders})",
@@ -1711,6 +1718,9 @@ class ERDQueue:
             UPDATE candidate_claims SET done = 1, done_at = ?
             WHERE branch_id = ? AND idx = ?
         """, (now, branch_id, idx))
+        n = self._conn.execute("SELECT changes()").fetchone()[0]
+        self._tally_wal_traffic(
+            'candidate_claims/complete', n, n * _CLAIM_ROW_WAL_BYTES)
 
     def update_branch_best(self, branch_key, best_guess, best_erd, max_depth=None):
         """Lower the branch's running best (monotone — never raises it).
@@ -1901,9 +1911,17 @@ class ERDQueue:
         if branch_id is not None:
             self._conn.execute(
                 "DELETE FROM candidate_claims WHERE branch_id = ?", (branch_id,))
+            n_claims = self._conn.execute("SELECT changes()").fetchone()[0]
             self._conn.execute(
                 "DELETE FROM candidate_republish WHERE branch_id = ?",
                 (branch_id,))
+            n_republish = self._conn.execute("SELECT changes()").fetchone()[0]
+            self._tally_wal_traffic(
+                'candidate_claims/delete-branch', n_claims,
+                n_claims * _CLAIM_ROW_WAL_BYTES)
+            self._tally_wal_traffic(
+                'candidate_republish/delete-branch', n_republish,
+                n_republish * _CLAIM_ROW_WAL_BYTES)
         self._conn.execute(
             "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
             (branch_key,))
@@ -1942,7 +1960,10 @@ class ERDQueue:
                   WHERE updated_at >= ?
               )
         """, (age_floor, hb_cutoff))
-        return self._conn.execute("SELECT changes()").fetchone()[0]
+        n = self._conn.execute("SELECT changes()").fetchone()[0]
+        self._tally_wal_traffic(
+            'candidate_claims/reclaim-stale', n, n * _CLAIM_ROW_WAL_BYTES)
+        return n
 
     def reclaim_claims_of_worker(self, worker_id: str) -> int:
         """Free all in-flight (done=0) candidate claims held by a specific worker.
@@ -1955,7 +1976,10 @@ class ERDQueue:
         self._conn.execute(
             "DELETE FROM candidate_claims WHERE done = 0 AND claimed_by = ?",
             (worker_id,))
-        return self._conn.execute("SELECT changes()").fetchone()[0]
+        n = self._conn.execute("SELECT changes()").fetchone()[0]
+        self._tally_wal_traffic(
+            'candidate_claims/reclaim-worker', n, n * _CLAIM_ROW_WAL_BYTES)
+        return n
 
     def branches_in_progress(self):
         """Open branches, highest priority first — for swarm scheduling."""
@@ -2549,6 +2573,9 @@ class ERDQueue:
         self._conn.execute(
             "UPDATE active_branches SET nodes_spent = nodes_spent + ? "
             "WHERE branch_id = ?", (delta, branch_id))
+        n = self._conn.execute("SELECT changes()").fetchone()[0]
+        self._tally_wal_traffic(
+            'active_branches/nodes-spent', n, n * _CLAIM_ROW_WAL_BYTES)
 
     # ------------------------------------------------------------------
     # Cost model (online time-weighted geometric mean per size bucket)

@@ -61,6 +61,52 @@ class TestWALTrafficAttribution(_TmpQueue):
         rows, _ = self.q.wal_traffic_snapshot()
         self.assertEqual(rows["pending_branches/add"], 1)
 
+    # -- the update/delete write paths, so the report is not insert-only -------
+
+    def _claim_a_bundle(self):
+        return self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, [2.9] * N_CANDIDATES,
+            small_count=5, count_cap=500)
+
+    def test_complete_candidate_update_is_attributed(self):
+        _, indices, _ = self._claim_a_bundle()
+        self.q.complete_candidate(self.key, indices[0])
+        rows, _ = self.q.wal_traffic_snapshot()
+        self.assertEqual(rows["candidate_claims/complete"], 1)
+
+    def test_delete_branch_deletes_are_attributed(self):
+        self._claim_a_bundle()
+        self.q.delete_branch(self.key)
+        rows, _ = self.q.wal_traffic_snapshot()
+        self.assertGreater(rows["candidate_claims/delete-branch"], 0)
+
+    def test_republish_delete_and_upsert_are_attributed(self):
+        bundle_id, indices, _ = self._claim_a_bundle()
+        self.q.republish_remainder(self.key, bundle_id, indices)
+        rows, _ = self.q.wal_traffic_snapshot()
+        self.assertEqual(rows["candidate_claims/republish-delete"], len(indices))
+        self.assertEqual(
+            rows["candidate_republish/republish-upsert"], len(indices))
+
+    def test_reclaim_paths_are_attributed(self):
+        bid = self.q._intern_branch(self.key)
+        self.q._conn.execute(
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, "
+            "claimed_at, done) VALUES (?, 0, 'dead', 0, 0)", (bid,))
+        self.assertEqual(self.q.reclaim_stale_claims(120), 1)
+        self.q._conn.execute(
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, "
+            "claimed_at, done) VALUES (?, 1, 'w9', 0, 0)", (bid,))
+        self.assertEqual(self.q.reclaim_claims_of_worker("w9"), 1)
+        rows, _ = self.q.wal_traffic_snapshot()
+        self.assertEqual(rows["candidate_claims/reclaim-stale"], 1)
+        self.assertEqual(rows["candidate_claims/reclaim-worker"], 1)
+
+    def test_add_nodes_spent_update_is_attributed(self):
+        self.q.add_nodes_spent(self.key, 500)
+        rows, _ = self.q.wal_traffic_snapshot()
+        self.assertEqual(rows["active_branches/nodes-spent"], 1)
+
     def test_snapshot_is_a_copy_so_deltas_are_stable(self):
         before, _ = self.q.wal_traffic_snapshot()
         self.q.mark_claims_done(self.key, [0, 1, 2])
