@@ -305,17 +305,27 @@ def _render_sections(report, previous_report, color, width, display_order):
             best = branch["best_guess"].upper()
             if branch.get("best_erd") is not None:
                 best += f"/{branch['best_erd']:.3f}"
-        line = (
-            f"  @{branch['branch_reference']}  n={branch['answer_count']} "
-            f"d={branch['guess_depth']}  {completed}/{branch['candidate_count']} "
-            f"({_percentage(completed, branch['candidate_count'])})"
-        )
-        if branch["bulk_completed_candidate_count"]:
-            line += f" bulk={branch['bulk_completed_candidate_count']}"
-        if width >= 60:
-            line += f"  best={best}  workers={branch['worker_count']}"
+        if width < 60:
+            line = (
+                f"  @{branch['branch_reference']}  "
+                f"guess_depth={branch['guess_depth']}  "
+                f"{completed}/{branch['candidate_count']}"
+            )
+        else:
+            line = (
+                f"  @{branch['branch_reference']}  n={branch['answer_count']} "
+                f"guess_depth={branch['guess_depth']}  "
+                f"{completed}/{branch['candidate_count']}"
+            )
             if branch.get("best_max_remaining_depth") is not None:
-                line += f"  max-d={branch['best_max_remaining_depth']}"
+                line += (
+                    "  max_remaining_depth="
+                    f"{branch['best_max_remaining_depth']}"
+                )
+            if branch["bulk_completed_candidate_count"]:
+                line += f" bulk={branch['bulk_completed_candidate_count']}"
+            if width >= 100:
+                line += f"  best={best}  workers={branch['worker_count']}"
         if width >= 80:
             line += f"  ETA={_abbreviate_duration(_branch_eta(branch, generated_at))}"
             if branch["spine"]:
@@ -368,15 +378,19 @@ def _render_worker_line(
     worker, previous_worker, generated_at, color, width, indent, state=None
 ):
     age = max(0, generated_at - worker["updated_at"])
-    label = f"W{worker['worker_number']}"
+    label = f"worker={worker['worker_id']}"
     if state:
         label += f" {state}"
-    candidate = (worker.get("current_candidate") or "—").upper()
-    line = f"{indent}{label}  candidate={candidate}  age={_abbreviate_duration(age)}"
+    line = f"{indent}{label}  age={_abbreviate_duration(age)}"
     if width >= 60:
+        candidate = (worker.get("current_candidate") or "—").upper()
+        line += f"  candidate={candidate}"
         line += f"  nodes/s={_abbreviate_number(worker.get('nodes_per_second'))}"
         if worker.get("current_max_guess_depth") is not None:
-            line += f"  d={worker['current_max_guess_depth']}"
+            line += (
+                "  current_max_guess_depth="
+                f"{worker['current_max_guess_depth']}"
+            )
     semantic_class = _semantic_worker_class(
         worker, previous_worker, generated_at
     )
@@ -804,6 +818,7 @@ class WatchSession:
         self.previous_sections = []
         self.terminal_settings = None
         self.cursor_hidden = False
+        self.pending_input_character = None
 
     def _sources(self):
         defaults = ReportSources.defaults()
@@ -894,7 +909,7 @@ class WatchSession:
         self.worker_hotkeys = {}
         for worker in self._identity_rows(report, "worker_id"):
             worker_number = str(worker.get("worker_number") or "")
-            if len(worker_number) == 1 and worker_number.isdigit():
+            if worker_number.isdigit():
                 self.worker_hotkeys[worker_number] = worker["worker_id"]
 
     def _branch_selector(self, row):
@@ -934,12 +949,40 @@ class WatchSession:
         targets = []
         for letter, branch_key in self.branch_hotkeys.items():
             targets.append(f"[{letter}] branch {branch_key[:12]}")
-        for digit, worker_id in self.worker_hotkeys.items():
-            targets.append(f"[{digit}] {worker_id}")
-        controls = "[space] refresh  [q] quit"
+        for worker_number, worker_id in self.worker_hotkeys.items():
+            targets.append(f"[{worker_number}] {worker_id}")
         if len(self.navigation_stack) > 1:
-            controls = "[backspace/esc] back  " + controls
-        return [("navigation", ["Navigation", "  " + "  ".join(targets + [controls])])]
+            targets.append("[backspace/esc] back")
+        targets.extend(("[space] refresh", "[q] quit"))
+        width = self._width()
+        lines = ["Navigation"]
+        current_line = "  "
+        for target in targets:
+            separator = "" if current_line == "  " else "  "
+            if len(current_line) + len(separator) + len(target) > width:
+                lines.append(current_line)
+                current_line = "  " + target
+            else:
+                current_line += separator + target
+        if current_line != "  ":
+            lines.append(current_line)
+        return [("navigation", lines)]
+
+    def _read_worker_number(self, first_digit):
+        worker_number = first_digit
+        while any(
+            candidate.startswith(worker_number) and candidate != worker_number
+            for candidate in self.worker_hotkeys
+        ):
+            ready, _, _ = select.select([self.input_stream], [], [], 0.2)
+            if not ready:
+                break
+            character = self.input_stream.read(1)
+            if not character.isdigit():
+                self.pending_input_character = character
+                break
+            worker_number += character
+        return worker_number
 
     def _reset_navigation_display(self):
         self.previous_report = None
@@ -1116,12 +1159,16 @@ class WatchSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return True
-            ready, _, _ = select.select(
-                [self.input_stream], [], [], min(remaining, 0.2)
-            )
-            if not ready:
-                continue
-            character = self.input_stream.read(1)
+            if self.pending_input_character is not None:
+                character = self.pending_input_character
+                self.pending_input_character = None
+            else:
+                ready, _, _ = select.select(
+                    [self.input_stream], [], [], min(remaining, 0.2)
+                )
+                if not ready:
+                    continue
+                character = self.input_stream.read(1)
             if character in ("", "q", "Q", "\x04"):
                 return False
             if character == " ":
@@ -1132,8 +1179,11 @@ class WatchSession:
             if character in self.branch_hotkeys:
                 self._select_branch(self.branch_hotkeys[character])
                 return True
-            if character in self.worker_hotkeys:
-                self._select_worker(self.worker_hotkeys[character])
+            if character.isdigit():
+                worker_number = self._read_worker_number(character)
+                if worker_number not in self.worker_hotkeys:
+                    continue
+                self._select_worker(self.worker_hotkeys[worker_number])
                 return True
 
     def _run_tty_text(self):

@@ -721,11 +721,20 @@ class ERDQueue:
             ("branch_finalize_log", {"branch_key", "recorded_at"},
              "idx_branch_finalize_log_branch_recorded_at",
              "branch_key, recorded_at"),
+            ("branch_finalize_log", {"epoch", "recorded_at", "id"},
+             "idx_branch_finalize_log_epoch_recorded_id",
+             "epoch, recorded_at DESC, id DESC"),
             ("cut_reuse_misses", {"branch_key", "recorded_at"},
              "idx_cut_reuse_misses_branch_recorded_at",
              "branch_key, recorded_at"),
+            ("cut_reuse_misses", {"epoch", "recorded_at", "id"},
+             "idx_cut_reuse_misses_epoch_recorded_id",
+             "epoch, recorded_at DESC, id DESC"),
             ("claim_telemetry", {"epoch", "id"},
              "idx_claim_telemetry_epoch_id", "epoch, id"),
+            ("claim_telemetry", {"epoch", "recorded_at", "id"},
+             "idx_claim_telemetry_epoch_recorded_id",
+             "epoch, recorded_at DESC, id DESC"),
         )
         for table, required_columns, index_name, indexed_columns in report_indexes:
             columns = {row["name"] for row in self._conn.execute(
@@ -2193,7 +2202,7 @@ class ERDQueue:
         outcome = row["outcome"]
         if outcome in ("exact", "cut", "loss"):
             return outcome
-        return "cut" if row["ceiling"] is not None else "exact"
+        return "cut" if row["ceiling"] is not None else "unknown"
 
     def report_branch_telemetry(self, branch_key, limit) -> dict:
         """Return bounded current and historical telemetry for one branch."""
@@ -2255,18 +2264,22 @@ class ERDQueue:
         }
 
     def _bounded_sample_metadata(self, table, epoch, since, sample_size,
-                                 spine_prefix=None):
+                                 spine_prefix=None, branch_key=None):
         spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""
+        branch_condition = " AND branch_key = ?" if branch_key is not None else ""
         parameters = [epoch, since]
         if spine_prefix:
             parameters.extend((spine_prefix, spine_prefix + " %"))
+        if branch_key is not None:
+            parameters.append(branch_key)
         parameters.append(sample_size + 1)
         row = self._conn.execute(
             f"""SELECT COUNT(*) AS sampled_row_count FROM (
                     SELECT id FROM telemetry.{table}
                     WHERE epoch = ? AND recorded_at >= ?
                     {spine_condition}
-                    ORDER BY id DESC LIMIT ?
+                    {branch_condition}
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
                 )""",
             parameters,
         ).fetchone()
@@ -2274,7 +2287,7 @@ class ERDQueue:
         return min(sampled_with_probe, sample_size), sampled_with_probe > sample_size
 
     def report_hotspots(self, field, epoch, since, sample_size, limit,
-                        spine_prefix=None) -> dict:
+                        spine_prefix=None, branch_key=None) -> dict:
         """Return an explicitly bounded current or historical hotspot ranking."""
         current_fields = {"nodes", "age", "size", "workers", "priority", "slowest"}
         if field in current_fields:
@@ -2294,6 +2307,10 @@ class ERDQueue:
             }
         if field == "coordination" and spine_prefix:
             raise ValueError("coordination hotspots cannot be attributed to a spine")
+        if field == "cut-reuse" and spine_prefix and branch_key is None:
+            raise ValueError(
+                "cut-reuse hotspots require a singular branch selector"
+            )
         table = {
             "evaluated-candidates": "branch_finalize_log",
             "bulk-completed-candidates": "branch_finalize_log",
@@ -2303,8 +2320,10 @@ class ERDQueue:
         if table is None:
             raise ValueError(f"unsupported hotspot field: {field}")
         sample_spine_prefix = spine_prefix if table == "branch_finalize_log" else None
+        sample_branch_key = branch_key if table == "cut_reuse_misses" else None
         sampled_row_count, sample_truncated = self._bounded_sample_metadata(
-            table, epoch, since, sample_size, sample_spine_prefix
+            table, epoch, since, sample_size, sample_spine_prefix,
+            sample_branch_key,
         )
         if field in ("evaluated-candidates", "bulk-completed-candidates"):
             metric = "n_claims" if field == "evaluated-candidates" else "bulk_done_candidates"
@@ -2317,7 +2336,7 @@ class ERDQueue:
                 WITH sample AS (
                     SELECT * FROM telemetry.branch_finalize_log
                     WHERE epoch = ? AND recorded_at >= ? {spine_condition}
-                    ORDER BY id DESC LIMIT ?
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
                 )
                 SELECT * FROM sample
                 ORDER BY COALESCE({metric}, 0) DESC, id DESC LIMIT ?
@@ -2337,18 +2356,24 @@ class ERDQueue:
             } for row in rows]
             population = "recent_branch_finalizations"
         elif field == "cut-reuse":
-            rows = self._conn.execute("""
+            branch_condition = " AND branch_key = ?" if branch_key is not None else ""
+            parameters = [epoch, since]
+            if branch_key is not None:
+                parameters.append(branch_key)
+            parameters.extend((sample_size, limit))
+            rows = self._conn.execute(f"""
                 WITH sample AS (
                     SELECT * FROM telemetry.cut_reuse_misses
                     WHERE epoch = ? AND recorded_at >= ?
-                    ORDER BY id DESC LIMIT ?
+                    {branch_condition}
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
                 )
                 SELECT branch_key, COUNT(*) AS miss_count,
                        MAX(recorded_at) AS recorded_at,
                        MAX(n_words) AS answer_count
                 FROM sample GROUP BY branch_key
                 ORDER BY miss_count DESC, branch_key LIMIT ?
-            """, (epoch, since, sample_size, limit)).fetchall()
+            """, parameters).fetchall()
             normalized_rows = [{
                 "row_id": (
                     f"cut-reuse:{bytes(row['branch_key']).hex()}"
@@ -2368,7 +2393,7 @@ class ERDQueue:
                 WITH sample AS (
                     SELECT * FROM telemetry.claim_telemetry
                     WHERE epoch = ? AND recorded_at >= ?
-                    ORDER BY id DESC LIMIT ?
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
                 )
                 SELECT n_words, worker_count, COUNT(*) AS claim_count,
                        SUM(coordination_millis) AS coordination_millis,

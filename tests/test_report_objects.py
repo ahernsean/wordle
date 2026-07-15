@@ -82,6 +82,15 @@ class SemanticReportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "five-character response pattern"):
             parse_report_selector("CRANE ALIBI")
 
+    def test_semantic_queue_programming_errors_propagate(self):
+        with patch.object(
+            ERDQueue, "status_by_branch_keys", side_effect=KeyError("bug")
+        ):
+            with self.assertRaises(KeyError):
+                collect_report(self.sources, ReportRequest(
+                    selector=parse_report_selector("RAISE")
+                ))
+
     def test_queue_and_cache_are_unreserved_words(self):
         for word in ("QUEUE", "CACHE"):
             selector = parse_report_selector(word)
@@ -607,6 +616,15 @@ class SemanticReportTest(unittest.TestCase):
             filters=ReportFilters(active_only=True),
         ))
         self.assertEqual(report["data"]["matched_rows"], 1)
+        self.assertGreater(report["data"]["total_rows"], 1)
+        self.assertEqual(
+            report["data"]["response_group_counts"]["response_group_count"],
+            report["data"]["total_rows"],
+        )
+        self.assertEqual(
+            report["data"]["response_group_counts"]["active_response_group_count"],
+            1,
+        )
         self.assertTrue(all(
             row["lifecycle"] == "active"
             for row in report["data"]["response_groups"]
@@ -638,6 +656,27 @@ class SemanticReportTest(unittest.TestCase):
         self.assertTrue(data["sample_truncated"])
         self.assertEqual(len(data["rows"]), 1)
         self.assertEqual(data["rows"][0]["evaluated_candidate_count"], 9)
+
+    def test_cut_reuse_hotspot_honors_singular_branch_selector(self):
+        selector = parse_report_selector("RAISE -----")
+        selected_key = resolve_selector_branch(selector, ANSWERS).branch_key
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.add_cut_reuse_miss(selected_key, 3, 4, None, 2.5, 3)
+        queue.add_cut_reuse_miss(b"other", 2, 4, None, 2.0, 3)
+        queue.close()
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="hotspots",
+            selector=selector,
+            hotspot_field="cut-reuse",
+        ))
+        self.assertEqual(len(report["data"]["rows"]), 1)
+        self.assertEqual(report["data"]["rows"][0]["branch_key_hex"], selected_key.hex())
+        with self.assertRaisesRegex(ValueError, "singular branch selector"):
+            collect_report(self.sources, ReportRequest(
+                report_kind="hotspots",
+                selector=parse_report_selector("RAISE"),
+                hotspot_field="cut-reuse",
+            ))
 
 
 if __name__ == "__main__":

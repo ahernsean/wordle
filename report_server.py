@@ -18,6 +18,7 @@ from report_model import (
     ReportSources,
     collect_report,
     parse_report_selector,
+    validate_report_request,
 )
 from runtime_paths import DEFAULT_CACHE_PATH, DEFAULT_QUEUE_PATH
 
@@ -204,7 +205,7 @@ def parse_report_request(path, query):
         sort=sort,
         limit=limit,
     )
-    return ReportRequest(
+    request = ReportRequest(
         report_kind=explicit_kind,
         selector=selector,
         include_claims=include_claims,
@@ -217,6 +218,11 @@ def parse_report_request(path, query):
         since_seconds=since_seconds or 3600,
         sample_size=min(sample_size or 50_000, 1_000_000),
     )
+    try:
+        validate_report_request(request)
+    except ValueError as error:
+        raise InvalidRequest(str(error)) from error
+    return request
 
 
 def fixture_name_for_request(path, request):
@@ -336,7 +342,7 @@ def build_configuration(queue_path, cache_path, fixture_directory=None):
         queue_path=queue_path,
         cache_path=cache_path,
         answer_list_path=defaults.answer_list_path,
-        guess_list_path=defaults.guess_list_path,
+        candidate_list_path=defaults.candidate_list_path,
         telemetry_path=(
             defaults.telemetry_path if queue_path == defaults.queue_path else None
         ),

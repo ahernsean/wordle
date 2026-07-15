@@ -112,6 +112,53 @@ class ReportRequest:
     sample_size: int | None = None
 
 
+def validate_report_request(request: ReportRequest) -> None:
+    """Reject report options that have no meaning for the selected report."""
+    report_kind = request.report_kind
+    selector_kind = request.selector.kind
+    if request.tree and report_kind in ("cache", "hotspots"):
+        raise ValueError(f"--tree cannot be used with --{report_kind}")
+    if request.include_claims and (
+        request.tree
+        or report_kind != "auto"
+        or selector_kind not in ("branch", "branch_reference")
+    ):
+        raise ValueError("--claims requires a singular branch selector")
+    if request.include_answers and (
+        request.tree
+        or report_kind in ("queue", "workers")
+        or (report_kind == "auto" and selector_kind == "root")
+    ):
+        raise ValueError(
+            "--answers requires a word or branch report without --tree"
+        )
+    if (
+        report_kind == "auto"
+        and selector_kind == "word"
+        and request.filters.sort is not None
+        and request.filters.sort not in ("default", "size", "workers", "priority")
+    ):
+        raise ValueError(
+            "--sort for word reports must be default, size, workers, or priority"
+        )
+    historical_hotspot = request.hotspot_field in (
+        "evaluated-candidates", "bulk-completed-candidates",
+        "cut-reuse", "coordination",
+    )
+    if report_kind == "hotspots" and historical_hotspot and (
+        request.filters.active_only or request.filters.statuses
+    ):
+        raise ValueError("historical hotspots cannot use lifecycle filters")
+    if (
+        report_kind == "hotspots"
+        and request.hotspot_field == "coordination"
+        and selector_kind != "root"
+    ):
+        raise ValueError("coordination hotspots cannot use a selector")
+    if request.worker_id is not None and report_kind != "workers":
+        raise ValueError("worker requires a workers report")
+
+
 @dataclass(frozen=True)
 class ReportSources:
     queue_path: str
@@ -699,7 +746,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         active_rows = queue.active_branches_by_keys(branch_keys)
         worker_counts = queue.worker_counts_by_branch(WORKER_LIVENESS_SECONDS)
         _mark_queue_source_ok(report)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
         if queue is not None:
@@ -721,7 +768,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             branch_keys, ERD_ALL, group_budget
         )
         report["sources"]["cache"]["ok"] = True
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     finally:
         if cache is not None:
@@ -751,6 +798,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         data["response_groups"].append(group_row)
 
     response_groups = data["response_groups"]
+    all_response_groups = list(response_groups)
     filters = request.filters
     if filters.active_only:
         response_groups = [
@@ -784,26 +832,28 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         response_groups.sort(key=lambda row: (-(row["priority"] or 0), row["pattern"]))
     matched_response_groups = list(response_groups)
     data["response_group_counts"] = {
-        "response_group_count": len(matched_response_groups),
+        "response_group_count": len(all_response_groups),
         "trivial_response_group_count": sum(
-            row["answer_count"] < 2 for row in matched_response_groups
+            row["answer_count"] < 2 for row in all_response_groups
         ),
         "queued_response_group_count": sum(
-            row["lifecycle"] != "unqueued" for row in matched_response_groups
+            row["lifecycle"] != "unqueued" for row in all_response_groups
         ),
         "active_response_group_count": sum(
-            row["lifecycle"] in ("active", "finalizing") for row in matched_response_groups
+            row["lifecycle"] in ("active", "finalizing")
+            for row in all_response_groups
         ),
         "exact_response_group_count": sum(
-            row["cache_state"] == "exact" for row in matched_response_groups
+            row["cache_state"] == "exact" for row in all_response_groups
         ),
         "loss_response_group_count": sum(
-            row["cache_state"] == "loss" for row in matched_response_groups
+            row["cache_state"] == "loss" for row in all_response_groups
         ),
         "missing_response_group_count": sum(
-            row["cache_state"] == "missing" for row in matched_response_groups
+            row["cache_state"] == "missing" for row in all_response_groups
         ),
     }
+    data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = (
         matched_response_groups[:filters.limit]
@@ -900,7 +950,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         branch_telemetry = queue.report_branch_telemetry(
             branch_key, request.filters.limit or 5
         )
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         queue_error = error
         if request.selector.kind == "branch_reference":
             raise
@@ -986,7 +1036,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         )
         data["cache"] = cache.report_branch_state(branch_key, ERD_ALL, budget)
         report["sources"]["cache"]["ok"] = True
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     finally:
         if cache is not None:
@@ -1076,7 +1126,7 @@ def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict
         for row in data["rows"]:
             row["branch_reference"] = branch_reference(bytes(row.pop("branch_key")))
         _mark_queue_source_ok(report)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
         if queue is not None:
@@ -1252,7 +1302,7 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
             list(filtered_rows), request, prefix, unfiltered_rows
         ))
         _mark_queue_source_ok(report)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
         if queue is not None:
@@ -1329,7 +1379,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
         limit = request.filters.limit
         data["rows"] = workers[:limit] if limit is not None else workers
         _mark_queue_source_ok(report)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
         if queue is not None:
@@ -1348,7 +1398,7 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
     try:
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
         _mark_queue_source_ok(report)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     cache = None
     try:
@@ -1420,7 +1470,7 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
                 ),
             })
         report["sources"]["cache"]["ok"] = True
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     finally:
         if cache is not None:
@@ -1470,10 +1520,16 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
                 "rows": rows[:limit],
             }
         else:
-            _scope, prefix = _selector_queue_scope(request.selector, queue)
+            scope, prefix = _selector_queue_scope(request.selector, queue)
+            branch_key = scope.get("branch_key")
+            if field == "cut-reuse" and request.selector.kind == "branch":
+                all_answers = load_word_list(sources.answer_list_path)
+                branch_key = resolve_selector_branch(
+                    request.selector, all_answers
+                ).branch_key
             result = queue.report_hotspots(
                 field, epoch, generated_at - since_seconds,
-                sample_size, limit, prefix or None,
+                sample_size, limit, prefix or None, branch_key,
             )
         normalized_rows = []
         for row in result["rows"]:
@@ -1493,7 +1549,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
             "rows": normalized_rows,
         })
         _mark_queue_source_ok(report)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
         if queue is not None:
