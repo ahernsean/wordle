@@ -610,7 +610,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         active_rows = queue.active_branches_by_keys(branch_keys)
         worker_counts = queue.worker_counts_by_branch(WORKER_LIVENESS_SECONDS)
         _mark_queue_source_ok(report)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
         if queue is not None:
@@ -632,7 +632,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             branch_keys, ERD_ALL, group_budget
         )
         report["sources"]["cache"]["ok"] = True
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     finally:
         if cache is not None:
@@ -766,7 +766,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ]
         claim_rows = list(queue.claims_for_branch(branch_key))
         republish_rows = queue.candidate_republish_for_branch(branch_key)
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         queue_error = error
         if request.selector.kind == "branch_reference":
             raise
@@ -849,7 +849,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         )
         data["cache"] = cache.report_branch_state(branch_key, ERD_ALL, budget)
         report["sources"]["cache"]["ok"] = True
-    except Exception as error:
+    except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     finally:
         if cache is not None:
