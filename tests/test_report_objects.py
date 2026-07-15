@@ -156,8 +156,9 @@ class SemanticReportTest(unittest.TestCase):
     def test_digest_resolution_rejects_zero_and_multiple_matches(self):
         no_matches = unittest.mock.Mock()
         no_matches.branch_rows_for_reference_prefix.return_value = []
-        with self.assertRaisesRegex(ValueError, "not found"):
+        with self.assertRaisesRegex(ValueError, "not found") as raised:
             resolve_branch_reference(no_matches, "1234")
+        self.assertIn("cache-only state", str(raised.exception))
 
         multiple = unittest.mock.Mock()
         multiple.branch_rows_for_reference_prefix.return_value = [
@@ -182,7 +183,9 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(bytes(matches[0]["branch_key"]), first_key)
         self.assertEqual(
-            resolve_branch_reference(queue, branch_reference(first_key)[:6]),
+            bytes(resolve_branch_reference(
+                queue, branch_reference(first_key)[:6]
+            )["branch_key"]),
             first_key,
         )
         queue.close()
@@ -298,6 +301,18 @@ class SemanticReportTest(unittest.TestCase):
             cache.report_branch_state(loss_key, ERD_ALL, 4)["cache_state"],
             "missing",
         )
+        legacy_key = ScoreCache.encode_subset(ANSWERS[9:12])
+        cache._conn.execute(
+            """INSERT INTO branch_best_by_policy
+               (branch_key, policy, answer_list_id, best_guess, best_score,
+                updated_at, max_depth, solve_budget)
+               VALUES (?, ?, ?, 'heath', 2.4, ?, NULL, NULL)""",
+            (legacy_key, ERD_ALL, cache.answer_list_id, int(time.time())),
+        )
+        self.assertEqual(
+            cache.report_branch_state(legacy_key, ERD_ALL)["cache_state"],
+            "missing",
+        )
         cache.close()
 
     def test_queue_filters_precede_limit_and_do_not_duplicate_user_work(self):
@@ -339,6 +354,11 @@ class SemanticReportTest(unittest.TestCase):
         )
         self.assertEqual(scoped["matched_rows"], 1)
         self.assertEqual(scoped["rows"][0]["spine"], "RAISE -----")
+        statements = []
+        queue._conn.set_trace_callback(statements.append)
+        queue.report_tree_rows("RAISE -----")
+        queue._conn.set_trace_callback(None)
+        self.assertTrue(any("spine LIKE" in statement for statement in statements))
         queue.close()
 
     def test_active_only_excludes_finalizing_lifecycle(self):
@@ -484,6 +504,78 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(workers_report["data"]["rows"][0]["worker_number"], "2")
         self.assertEqual(cache_report["report_kind"], "cache")
         self.assertEqual(cache_report["data"]["summary"]["exact_branch_count"], 1)
+
+    def test_worker_states_are_mutually_exclusive_and_worker_tree_is_scoped(self):
+        now = int(time.time())
+        active_key = b"cigarrebut"
+        other_key = b"awakeblush"
+        finalizing_key = b"focalserve"
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(active_key, 2, 4, budget=5, spine="RAISE -----")
+        queue.create_branch(other_key, 2, 4, budget=5, spine="STINK g----")
+        queue.create_branch(
+            finalizing_key, 2, 4, budget=5, spine="CRANE y----"
+        )
+        queue.try_finalize_branch(finalizing_key)
+        for worker_id, branch_key in (
+            ("worker-1", active_key),
+            ("worker-2", None),
+            ("worker-3", finalizing_key),
+            ("worker-4", active_key),
+            ("worker-5", other_key),
+        ):
+            queue.heartbeat(worker_id, int(worker_id.split("-")[1]), branch_key, 2, now, 0)
+        queue._conn.execute(
+            "UPDATE worker_heartbeat SET updated_at = ? WHERE worker_id = 'worker-4'",
+            (now - 25,),
+        )
+        queue._conn.execute(
+            "UPDATE worker_heartbeat SET updated_at = ? WHERE worker_id = 'worker-5'",
+            (now - 40,),
+        )
+        queue.close()
+
+        workers_report = collect_report(
+            self.sources, ReportRequest(report_kind="workers")
+        )
+        state_counts = workers_report["data"]["summary"]["worker_count_by_state"]
+        self.assertEqual(
+            state_counts,
+            {"live": 1, "idle": 1, "finalizing": 1, "stale": 1, "dead": 1},
+        )
+        self.assertEqual(sum(state_counts.values()), 5)
+
+        tree_report = collect_report(self.sources, ReportRequest(
+            report_kind="workers", tree=True, worker_id="1"
+        ))
+        branch_keys = {
+            node["branch_key_hex"] for node in tree_report["data"]["nodes"]
+            if node["branch_key_hex"] is not None
+        }
+        self.assertEqual(branch_keys, {active_key.hex()})
+
+    def test_branch_reference_cache_report_uses_recorded_budget(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS[:3])
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(
+            branch_key, 3, 4, budget=4,
+            spine="RAISE ----- CRANE y----",
+        )
+        queue.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(
+            branch_key, ERD_ALL, "cigar", 2.0,
+            max_depth=5, solve_budget=None,
+        )
+        cache.close()
+
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="cache",
+            selector=parse_report_selector(
+                "@" + branch_reference(branch_key)[:6]
+            ),
+        ))
+        self.assertEqual(report["data"]["cache"]["cache_state"], "missing")
 
     def test_active_only_has_same_meaning_for_word_groups(self):
         pattern_code, answer_words, branch_key = self._largest_group()

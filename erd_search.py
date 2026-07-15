@@ -2290,13 +2290,19 @@ def main():
             'cache' if args.view_cache else 'auto'
         )
         if args.claims and (
-                args.report_kind != 'auto'
+                args.tree or args.report_kind != 'auto'
                 or args.selector.kind not in ('branch', 'branch_reference')):
             parser.error('--claims requires a singular branch selector')
         if args.answers and (
                 args.tree or args.report_kind in ('queue', 'workers')
                 or (args.report_kind == 'auto' and args.selector.kind == 'root')):
             parser.error('--answers requires a word or branch report without --tree')
+        if (args.report_kind == 'auto' and args.selector.kind == 'word'
+                and args.sort is not None
+                and args.sort not in ('default', 'size', 'workers', 'priority')):
+            parser.error(
+                '--sort for word reports must be default, size, workers, or priority'
+            )
         args.filters = ReportFilters(
             active_only=args.active_only,
             statuses=tuple(args.status),

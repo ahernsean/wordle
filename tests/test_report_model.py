@@ -87,8 +87,9 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(json.loads(json.dumps(report)), report)
         self.assertEqual(set(report), {
             "schema_version", "report_kind", "generated_at", "selector",
-            "filters", "sources", "data",
+            "filters", "tree", "sources", "data",
         })
+        self.assertFalse(report["tree"])
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertTrue(report["sources"]["telemetry"]["ok"])
         self.assertTrue(report["sources"]["cache"]["ok"])

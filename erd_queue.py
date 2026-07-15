@@ -27,6 +27,11 @@ from wordle_ui import fmt_pattern
 
 logger = logging.getLogger(__name__)
 
+# Workers heartbeat about every two seconds. This threshold governs both claim
+# reclamation and report liveness, so a worker inside it is never reclaimed or
+# excluded from live-worker totals.
+WORKER_LIVENESS_SECONDS = 30
+
 # Time-weighted geometric mean EMA: half-life for the cost model.
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
@@ -480,7 +485,7 @@ _TELEMETRY_TABLES = (
 )
 
 
-def _derive_telemetry_path(db_path: str) -> str:
+def derive_telemetry_path(db_path: str) -> str:
     """Default telemetry file path for a queue at db_path: the sibling file
     <stem>_telemetry<ext> (erd_queue.sqlite3 -> erd_queue_telemetry.sqlite3).
     ':memory:' maps to ':memory:', which attaches as an independent private
@@ -489,13 +494,6 @@ def _derive_telemetry_path(db_path: str) -> str:
         return ":memory:"
     root, ext = os.path.splitext(db_path)
     return f"{root}_telemetry{ext}"
-
-
-def derive_telemetry_path(db_path: str) -> str:
-    """Return the telemetry database path paired with a queue database path."""
-    return _derive_telemetry_path(db_path)
-
-
 class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
@@ -506,7 +504,7 @@ class ERDQueue:
                                      isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         if telemetry_path is None:
-            telemetry_path = _derive_telemetry_path(db_path)
+            telemetry_path = derive_telemetry_path(db_path)
         self.telemetry_path = telemetry_path
         self._conn.execute("ATTACH DATABASE ? AS telemetry", (telemetry_path,))
         self._conn.executescript(_QUEUE_SCHEMA_SQL)
@@ -1584,7 +1582,9 @@ class ERDQueue:
             "DELETE FROM candidate_claims WHERE done = 0")
         return nb, nc
 
-    def worker_counts_by_branch(self, timeout_seconds: int = 30) -> dict:
+    def worker_counts_by_branch(
+        self, timeout_seconds: int = WORKER_LIVENESS_SECONDS
+    ) -> dict:
         """{branch_key bytes: number of recent workers on it} for status."""
         cutoff = int(time.time()) - timeout_seconds
         rows = self._conn.execute("""
@@ -1699,6 +1699,9 @@ class ERDQueue:
         )
         budget = self._report_filter_value(filters, "budget")
         priority = self._report_filter_value(filters, "priority")
+        spine_prefix = self._report_filter_value(filters, "spine_prefix")
+        source_word = self._report_filter_value(filters, "source_word")
+        branch_key = self._report_filter_value(filters, "branch_key")
         lifecycle_expression = """CASE
             WHEN pending_status = 'pending' THEN 'pending'
             WHEN pending_status = 'in_progress' THEN 'active'
@@ -1763,7 +1766,7 @@ class ERDQueue:
             )
         """
         conditions = []
-        parameters = [int(time.time()) - 30]
+        parameters = [int(time.time()) - WORKER_LIVENESS_SECONDS]
         if active_only:
             conditions.append("lifecycle = 'active'")
         if statuses:
@@ -1782,6 +1785,22 @@ class ERDQueue:
         if priority is not None:
             conditions.append("priority = ?")
             parameters.append(priority)
+        scope_conditions = []
+        scope_parameters = []
+        if spine_prefix:
+            scope_conditions.append("(spine = ? OR spine LIKE ?)")
+            scope_parameters.extend((spine_prefix, spine_prefix + " %"))
+        if source_word:
+            scope_conditions.append(
+                "(spine IS NULL AND LOWER(source_word) = ?)"
+            )
+            scope_parameters.append(source_word.lower())
+        if branch_key is not None:
+            scope_conditions.append("branch_key = ?")
+            scope_parameters.append(bytes(branch_key))
+        if scope_conditions:
+            conditions.append("(" + " OR ".join(scope_conditions) + ")")
+            parameters.extend(scope_parameters)
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
         summary_rows = self._conn.execute(
             base_query
@@ -1857,7 +1876,7 @@ class ERDQueue:
 
     def report_tree_rows(self, spine_prefix, filters=None, sort=None, limit=None) -> dict:
         """Return report queue rows at or below a recorded spine prefix."""
-        unbounded_filters = {
+        scoped_filters = {
             "active_only": self._report_filter_value(filters, "active_only", False),
             "statuses": self._report_filter_value(filters, "statuses", ()) or (),
             "minimum_answer_count": self._report_filter_value(
@@ -1869,33 +1888,10 @@ class ERDQueue:
             "budget": self._report_filter_value(filters, "budget"),
             "priority": self._report_filter_value(filters, "priority"),
             "sort": self._report_filter_value(filters, "sort"),
+            "limit": self._report_filter_value(filters, "limit"),
+            "spine_prefix": (spine_prefix or "").strip(),
         }
-        result = self.report_queue_rows(unbounded_filters, sort, None)
-        prefix = (spine_prefix or "").strip()
-        rows = result["rows"]
-        if prefix:
-            rows = [
-                row for row in rows
-                if (row["spine"] or "") == prefix
-                or (row["spine"] or "").startswith(prefix + " ")
-            ]
-        matched_rows = len(rows)
-        by_lifecycle = {}
-        for row in rows:
-            lifecycle = row["lifecycle"]
-            by_lifecycle[lifecycle] = by_lifecycle.get(lifecycle, 0) + 1
-        effective_limit = limit if limit is not None else self._report_filter_value(
-            filters, "limit"
-        )
-        rows = rows[:effective_limit] if effective_limit else rows
-        return {
-            "summary": {
-                "branch_count": matched_rows,
-                "branch_count_by_lifecycle": by_lifecycle,
-            },
-            "matched_rows": matched_rows,
-            "rows": rows,
-        }
+        return self.report_queue_rows(scoped_filters, sort, limit)
 
     def _queue_sort_key(self, sort):
         if sort == "nodes":
@@ -1914,7 +1910,9 @@ class ERDQueue:
         return lambda r: (0 if r["status"] in ("in_progress", "open") else 1,
                           -(r["priority"] or 0), -r["n_words"], r["branch_key_hex"])
 
-    def _row_spine_text(self, row):
+    @staticmethod
+    def row_spine_text(row):
+        """Return the most specific recorded spine text for a queue row."""
         if row.get("spine"):
             return row["spine"]
         if row.get("source_word") and row.get("source_pattern_text"):
