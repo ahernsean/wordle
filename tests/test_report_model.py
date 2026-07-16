@@ -186,15 +186,15 @@ class ReportModelTest(unittest.TestCase):
         )
         queue._conn.execute(
             "INSERT INTO candidate_claims "
-            "(branch_key, idx, claimed_by, claimed_at, done, done_at) "
+            "(branch_id, idx, claimed_by, claimed_at, done, done_at) "
             "VALUES (?, 0, 'worker-2', ?, 1, ?)",
-            (branch_key, now, now),
+            (queue._intern_branch(branch_key), now, now),
         )
         queue._conn.execute(
             "UPDATE active_branches SET bulk_done_candidates = 2, "
             "best_guess = 'CRANE', best_erd = 2.25, best_max_depth = 3, "
-            "nodes_spent = 1234 WHERE branch_key = ?",
-            (branch_key,),
+            "nodes_spent = 1234 WHERE branch_id = ?",
+            (queue._intern_branch(branch_key),),
         )
         queue.heartbeat(
             "worker-2", pid=42, current_branch_key=branch_key, n_words=3,
@@ -346,12 +346,12 @@ class ReportModelTest(unittest.TestCase):
         queue.create_branch(first_key, 2, 4)
         queue.create_branch(second_key, 2, 4)
         queue._conn.execute(
-            "INSERT INTO candidate_claims (branch_key, idx, done) VALUES (?, 0, 1)",
-            (first_key,),
+            "INSERT INTO candidate_claims (branch_id, idx, done) VALUES (?, 0, 1)",
+            (queue._intern_branch(first_key),),
         )
         queue._conn.execute(
             "UPDATE active_branches SET bulk_done_candidates = 3 "
-            "WHERE branch_key = ?", (second_key,),
+            "WHERE branch_id = ?", (queue._intern_branch(second_key),),
         )
         progress = queue.candidate_progress_by_branch_keys(
             [first_key, second_key, missing_key]

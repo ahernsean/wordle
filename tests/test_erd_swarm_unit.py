@@ -55,6 +55,8 @@ def _bare_worker():
     w._eval_seconds = 0.0
     w._last_claim_complete = 0.0
     w._last_checkpoint = 0.0
+    w._last_wal_traffic = ({}, {})
+    w._last_wal_traffic_log = 0.0
     w._checkpoint_interval = erd_swarm.CHECKPOINT_SECONDS
     w._last_disk_check = 0.0
     w._last_pause_check = 0.0
@@ -91,6 +93,7 @@ def _bare_worker():
     w.queue.read_branch_best.return_value = (None, None, None)
     w.queue.get_cost_typical.return_value = None  # cold model by default
     w.queue.checkpoint_paused.return_value = False
+    w.queue.wal_traffic_snapshot.return_value = ({}, {})
     return w
 
 
@@ -536,6 +539,33 @@ class TestMaybeCheckpoint(unittest.TestCase):
         w._maybe_checkpoint(force=False)
         w.score_cache.checkpoint.assert_not_called()
         w.queue.checkpoint.assert_not_called()
+
+
+class TestWALTrafficLogThrottle(unittest.TestCase):
+    """The WAL traffic log runs on its own short timer (not the 5-minute
+    checkpoint), so a fast runaway is attributed before the hard ceiling
+    latches down; force bypasses the throttle for the shutdown flush."""
+
+    def test_throttled_within_window_does_not_snapshot(self):
+        w = _bare_worker()
+        w._last_wal_traffic_log = 1000.0
+        w._log_wal_traffic(1000.0 + 5)   # dt=5s < WAL_TRAFFIC_LOG_SECONDS
+        w.queue.wal_traffic_snapshot.assert_not_called()
+        self.assertEqual(w._last_wal_traffic_log, 1000.0)
+
+    def test_fires_after_window(self):
+        w = _bare_worker()
+        w._last_wal_traffic_log = 1000.0
+        fire_at = 1000.0 + erd_swarm.WAL_TRAFFIC_LOG_SECONDS + 1
+        w._log_wal_traffic(fire_at)
+        w.queue.wal_traffic_snapshot.assert_called_once()
+        self.assertEqual(w._last_wal_traffic_log, fire_at)
+
+    def test_force_bypasses_throttle_for_shutdown_flush(self):
+        w = _bare_worker()
+        w._last_wal_traffic_log = 1000.0
+        w._log_wal_traffic(1000.0 + 1, force=True)   # dt=1s but forced
+        w.queue.wal_traffic_snapshot.assert_called_once()
 
 
 class TestWorkerDiskAndPause(unittest.TestCase):

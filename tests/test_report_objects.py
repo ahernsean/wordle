@@ -239,23 +239,24 @@ class SemanticReportTest(unittest.TestCase):
             branch_key, len(answer_words), 10, source_word="raise",
             source_pattern=pattern_code, budget=5, spine=f"RAISE {pattern}",
         )
+        branch_id = queue._intern_branch(branch_key)
         queue._conn.executemany(
             "INSERT INTO candidate_claims "
-            "(branch_key, idx, claimed_by, claimed_at, done, done_at, bundle_id) "
+            "(branch_id, idx, claimed_by, claimed_at, done, done_at, bundle_id) "
             "VALUES (?, ?, ?, ?, 1, ?, ?)",
             [
-                (branch_key, 1, "bulk-elimination", now, now, None),
-                (branch_key, 2, "worker-3", now, now, "bundle-1"),
-                (branch_key, 3, "legacy-holder", now, now, None),
+                (branch_id, 1, "bulk-elimination", now, now, None),
+                (branch_id, 2, "worker-3", now, now, "bundle-1"),
+                (branch_id, 3, "legacy-holder", now, now, None),
             ],
         )
         queue._conn.execute(
             "UPDATE active_branches SET bulk_done_candidates = 1 "
-            "WHERE branch_key = ?", (branch_key,),
+            "WHERE branch_id = ?", (branch_id,),
         )
         queue._conn.execute(
-            "INSERT INTO candidate_republish (branch_key, idx, count) "
-            "VALUES (?, 2, 4)", (branch_key,),
+            "INSERT INTO candidate_republish (branch_id, idx, count) "
+            "VALUES (?, 2, 4)", (branch_id,),
         )
         queue.add_branch_finalize_log(
             branch_key, f"RAISE {pattern}", len(answer_words), 5,

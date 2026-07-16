@@ -140,6 +140,12 @@ also checks the WAL every five seconds; above 2 GB it briefly asks workers to
 stay off the queue database while it retries a TRUNCATE checkpoint. The pause
 flag expires automatically after 60 seconds if the supervisor exits.
 
+If the WAL nevertheless reaches the 32 GB hard ceiling (override with
+`QUEUE_WAL_HARD_CEILING_GIB`), the supervisor captures each worker's current
+candidate, signals live workers to dump all-thread stacks into their logs,
+sets the disk-stop latch, and exits before the WAL can fill the filesystem.
+Workers log per-table WAL traffic attribution every 30 seconds and once more
+on shutdown so the runaway writer is visible in the post-mortem.
 At 90% filesystem use, the supervisor records a persistent disk-stop latch and
 stops the swarm. `run` refuses to restart while the latch is set or the live
 filesystem remains at the threshold. Free disk space first, then release it:
