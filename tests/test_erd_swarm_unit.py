@@ -1399,6 +1399,44 @@ class TestPublishStormGuards(unittest.TestCase):
         w.queue.create_branch.assert_not_called()
 
 
+class TestPromotedSpineDepthCap(unittest.TestCase):
+    """_promoted_spine caps composition at the promoted branch's guess depth:
+    the live descent map keeps edges from deeper frames the engine has already
+    unwound out of, and composing them into a shallower promotion builds a
+    spine whose guess_depth contradicts the branch's budget — which
+    create_branch's budget + guess_depth = root_budget invariant rejects."""
+
+    def _descended_worker(self):
+        w = _bare_worker()
+        w._claimed_branch_spine = 'ALIBI ----- ELOPE y-y--'
+        w._spine = {3: (7, 'rends', '-y-y-'), 4: (3, 'motza', '-g---')}
+        return w
+
+    def test_stale_deeper_entries_are_excluded(self):
+        w = self._descended_worker()
+        self.assertEqual(w._promoted_spine(3),
+                         'ALIBI ----- ELOPE y-y-- RENDS -y-y-')
+
+    def test_uncapped_keeps_full_descent(self):
+        w = self._descended_worker()
+        self.assertEqual(
+            w._promoted_spine(),
+            'ALIBI ----- ELOPE y-y-- RENDS -y-y- MOTZA -g---')
+
+    def test_publisher_spine_matches_budget_invariant(self):
+        w = self._descended_worker()
+        w.queue.get_cost_typical.return_value = 10
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 3, False))
+        pub = erd_swarm._MidLoopPublisher(w)
+        token = pub.enter(BRANCH[:5], budget=3)
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        pub.check(token, CANDIDATES, 0, None, None, 3)
+        spine = w.queue.create_branch.call_args.kwargs['spine']
+        self.assertEqual(spine, 'ALIBI ----- ELOPE y-y-- RENDS -y-y-')
+        self.assertEqual(guess_depth_from_spine(spine) + 3, w.root_budget)
+
+
 class TestWorkerWALCeiling(unittest.TestCase):
     """Worker-side backstop for the queue WAL hard ceiling: trips, latches,
     requests a stop, and is throttled between probes."""

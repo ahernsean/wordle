@@ -330,7 +330,9 @@ class _MidLoopPublisher:
             priority=PROMOTED_PRIORITY,
             source_word=self._worker._top_source_word,
             source_pattern=self._worker._top_source_pattern,
-            budget=budget, spine=self._worker._promoted_spine(),
+            budget=budget,
+            spine=self._worker._promoted_spine(
+                self._worker.root_budget - budget),
             root_budget=self._worker.root_budget,
             ceiling=branch_ceiling)
 
@@ -692,11 +694,19 @@ class _BranchWorker:
             return stored
         return self._spine_budget(branch['spine'] if 'spine' in keys else None)
 
-    def _promoted_spine(self):
+    def _promoted_spine(self, max_guess_depth=None):
         """Absolute root -> promoted-branch spine: the claimed branch's base plus
         the live descent guesses (guess_depth-ordered "GUESS pattern" tokens).
         Returns None when the base is unknown, leaving the branch row to fall back
         to the source word.  Sentinel/size-only spine entries (no guess) are skipped.
+
+        max_guess_depth caps the composed spine at the promoted branch's own
+        guess depth (root_budget - its budget).  The live descent map keeps
+        entries from deeper frames the engine has already unwound out of — a
+        candidate loop that recursed to depth d and returned still shows the
+        depth-d edge — so without the cap a promotion at a shallower frame
+        composes a spine longer than its budget allows, which create_branch's
+        budget + guess_depth = root_budget invariant rejects.
         """
         base = getattr(self, '_claimed_branch_spine', None)
         if not base:
@@ -712,6 +722,8 @@ class _BranchWorker:
         for guess_depth in sorted(getattr(self, '_spine', {})):
             if guess_depth <= base_guess_depth:
                 continue
+            if max_guess_depth is not None and guess_depth > max_guess_depth:
+                break
             _size, guess, pattern = self._spine[guess_depth]
             if not (guess and guess != '•' and pattern):
                 continue
@@ -1587,7 +1599,7 @@ class _BranchWorker:
         """
         # Absolute spine of the branch being promoted, composed from the descent
         # that reached it before this frame's own work overwrites self._spine.
-        child_spine = self._promoted_spine()
+        child_spine = self._promoted_spine(self.root_budget - budget)
         saved_spine = self._claimed_branch_spine
         try:
             branch_key = encode_subset(words)
