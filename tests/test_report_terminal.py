@@ -370,7 +370,7 @@ class OverviewRendererTest(unittest.TestCase):
             display_order=display_order,
         )
         self.assertLess(
-            output.index("worker=worker-2"), output.index("worker=worker-1")
+            output.index("worker-2"), output.index("worker-1")
         )
 
     def test_watched_branch_claims_compare_by_candidate_index(self):

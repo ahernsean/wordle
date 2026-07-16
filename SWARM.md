@@ -140,6 +140,30 @@ deliberate reclamation:
   self-expires after 60 s, so a dead supervisor cannot wedge the swarm.
   Truncation results (or failures) are logged in `erd_search.log`.
 
+### WAL hard ceiling (32 GB)
+
+The quiesce above keeps the WAL near 2 GB in healthy operation.  If TRUNCATE
+keeps losing (a reader never drains, or bulk coordination writes outrun
+reclamation), the WAL can instead grow without bound and fill the disk — the
+failure mode that corrupts the queue database.  As a backstop, when the WAL
+crosses **32 GB** (override with `QUEUE_WAL_HARD_CEILING_GIB`) the supervisor
+stops trying to recover in place: it logs each worker's current candidate and
+time-in-candidate, signals every worker with `SIGUSR1` to dump its all-thread
+stacks into its `erd_worker_*.log`, latches the swarm down via the same
+`disk_stop` row as below, and exits.  This trips long before the disk fills, so
+the post-mortem has both the stacks and a healthy filesystem.
+
+To attribute *which* traffic is filling the WAL, each worker logs its per-table
+write/read rate into the shared WAL — inserts, updates, and deletes alike (e.g.
+`candidate_claims/bulk-eliminate`, `candidate_claims/holes-scan(read)`,
+`candidate_claims/complete`, `candidate_claims/delete-branch`,
+`candidate_republish/republish-upsert`) — to its `erd_worker_*.log`, the
+breakdown the WAL file itself does not carry.  It runs on a short dedicated
+timer (30 s) from the heartbeat path, not the 5-minute checkpoint, and flushes
+once more on shutdown: a runaway crosses the hard ceiling in ~100 s, so the
+attribution has to be emitted well before then and captured when the ceiling
+trip stops the worker.
+
 ### Disk-stop latch (90%)
 
 If the filesystem holding the queue reaches **90% full**, the swarm stops and
@@ -147,6 +171,7 @@ latches down: the supervisor (or any worker, as a backstop) writes a
 `disk_stop` row into `run_meta`, all processes exit cleanly, and `run` refuses
 to start while the latch is set — including via systemd restarts and reboots.
 The reserved 10% keeps the rest of the OS healthy and leaves room to diagnose.
+A WAL-hard-ceiling trip uses this same latch and is cleared the same way.
 
 To bring the swarm back, free disk space first, then release the latch:
 
