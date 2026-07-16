@@ -37,10 +37,29 @@ class TestWALTrafficAttribution(_TmpQueue):
             small_count=5, count_cap=500)
         rows, byts = self.q.wal_traffic_snapshot()
         self.assertEqual(rows["candidate_claims/bulk-eliminate"], N_CANDIDATES)
-        # Post branch-id normalization the estimate is a small per-row constant
-        # (no branch_key blob in the row), so it scales with row count only.
-        self.assertEqual(byts["candidate_claims/bulk-eliminate"],
-                         N_CANDIDATES * erd_queue._CLAIM_ROW_WAL_BYTES)
+        # The byte estimate is floored at a per-commit page cost: WAL frames
+        # are whole 4 KiB pages, so a commit can never cost less than a couple
+        # of pages regardless of row width.
+        self.assertGreaterEqual(byts["candidate_claims/bulk-eliminate"],
+                                N_CANDIDATES * erd_queue._CLAIM_ROW_WAL_BYTES)
+        self.assertGreaterEqual(byts["candidate_claims/bulk-eliminate"],
+                                2 * erd_queue._WAL_PAGE_BYTES)
+
+    def test_write_tally_is_floored_at_page_grain(self):
+        # A one-row write commit reads as pages, not as its ~100-byte row
+        # width; without the floor, a storm of tiny transactions would
+        # under-report the real WAL fill rate by orders of magnitude.
+        self.q._tally_wal_traffic("candidate_claims/claim", 1, 96)
+        _, byts = self.q.wal_traffic_snapshot()
+        self.assertGreaterEqual(byts["candidate_claims/claim"],
+                                2 * erd_queue._WAL_PAGE_BYTES)
+
+    def test_read_tally_keeps_raw_estimate(self):
+        # Read categories append nothing to the WAL and are exempt from the
+        # per-commit floor.
+        self.q._tally_wal_traffic("candidate_claims/holes-scan(read)", 10, 500)
+        _, byts = self.q.wal_traffic_snapshot()
+        self.assertEqual(byts["candidate_claims/holes-scan(read)"], 500)
 
     def test_survivor_claim_is_attributed(self):
         # A loose bound eliminates nothing and hands out a survivor bundle.
