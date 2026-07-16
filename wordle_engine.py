@@ -1428,6 +1428,12 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     token = mid_loop_publisher.enter(branch_words, budget) if mid_loop_publisher is not None else None
 
     for i, candidate in enumerate(candidate_list):
+        # Checked every iteration, not only inside evaluate_candidate: a
+        # candidate answered entirely from cache returns before any deeper
+        # cancel check runs, so a loop of cache hits would otherwise never
+        # observe a stop request.
+        if cancel_check is not None and cancel_check():
+            return CANCEL_RECVD
         if (candidate_cost_lower_bounds is not None
                 and candidate_cost_lower_bounds[i] >= best_erd):
             # ERD-lower-bound pruned: the same admissible bound

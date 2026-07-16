@@ -66,7 +66,8 @@ from datetime import datetime
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
 from erd_queue import (ERDQueue, encode_subset, guess_depth_from_spine,
-                       disk_stats, DISK_WARN_FRACTION, DISK_STOP_FRACTION)
+                       disk_stats, DISK_WARN_FRACTION, DISK_STOP_FRACTION,
+                       QUEUE_WAL_HARD_CEILING_BYTES)
 import erd_swarm
 
 ANSWER_FILE = 'NYT_wordlist.txt'
@@ -985,16 +986,15 @@ QUEUE_WAL_QUIESCE_BYTES = 2 * 1024 ** 3
 # How long the supervisor retries a quiesced TRUNCATE before giving up until
 # the next checkpoint cycle.
 TRUNCATE_RETRY_SECONDS = 15
-# Hard ceiling on the queue WAL.  In healthy operation the quiesce/TRUNCATE
-# protocol keeps the WAL near QUEUE_WAL_QUIESCE_BYTES; a WAL an order of
-# magnitude larger means TRUNCATE has been losing for many cycles and the file
-# is on course to fill the disk — the failure mode that corrupts the database.
-# At this size the supervisor stops trying to recover in place: it captures a
-# diagnostic snapshot, signals every worker to dump its stacks, latches the
-# swarm down (a manual `queue clear-disk-stop` is then required), and exits.
-# Overridable via QUEUE_WAL_HARD_CEILING_GIB.
-QUEUE_WAL_HARD_CEILING_BYTES = int(
-    float(os.environ.get('QUEUE_WAL_HARD_CEILING_GIB', '32')) * 1024 ** 3)
+# Hard ceiling on the queue WAL (QUEUE_WAL_HARD_CEILING_BYTES, shared with
+# the workers' backstop via erd_queue).  In healthy operation the
+# quiesce/TRUNCATE protocol keeps the WAL near QUEUE_WAL_QUIESCE_BYTES; a WAL
+# an order of magnitude larger means TRUNCATE has been losing for many cycles
+# and the file is on course to fill the disk — the failure mode that corrupts
+# the database.  At this size the supervisor stops trying to recover in place:
+# it captures a diagnostic snapshot, signals every worker to dump its stacks,
+# latches the swarm down (a manual `queue clear-disk-stop` is then required),
+# and exits.
 # Fill/drain rates below this magnitude read as "steady": smaller than this
 # and the trend is within statvfs sampling noise (page cache, unrelated
 # processes on the same filesystem).  Anything at or above it is shown via
@@ -1262,6 +1262,13 @@ def cmd_run(args):
             p.terminate()
     for wid, (p, _) in procs.items():
         p.join(timeout=30)
+        if p.is_alive():
+            # A worker that ignores SIGTERM must not outlive the supervisor:
+            # every WAL/disk safeguard below assumes no writers remain, and an
+            # orphaned writer can fill the disk unsupervised.
+            logger.warning('Worker %d did not exit on SIGTERM; killing.', wid)
+            p.kill()
+            p.join(timeout=10)
     # Workers are gone: the WAL truncates uncontested.
     q.checkpoint()
     q.close()

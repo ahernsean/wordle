@@ -61,6 +61,8 @@ def _bare_worker():
     w._last_disk_check = 0.0
     w._last_pause_check = 0.0
     w._pause_active = False
+    w._last_wal_ceiling_check = 0.0
+    w._wal_ceiling_hit = False
     w._cand_max_depth = 0
     w._cur_depth = 0
     w._spine = {}
@@ -94,6 +96,7 @@ def _bare_worker():
     w.queue.get_cost_typical.return_value = None  # cold model by default
     w.queue.checkpoint_paused.return_value = False
     w.queue.wal_traffic_snapshot.return_value = ({}, {})
+    w.queue.wal_size_bytes.return_value = 0
     return w
 
 
@@ -1217,15 +1220,16 @@ class TestMidLoopPublisher(unittest.TestCase):
         words = BRANCH[:2]  # exactly MIN_PUBLISH_BRANCH_WORDS
         token = pub.enter(words, budget=0)
         self.assertIsNotNone(token)
-        nodes_at_entry, predicted, entry_time, bw, depth = token
+        nodes_at_entry, predicted, entry_time, bw, depth = token[:5]
         self.assertEqual(bw, words)
         self.assertEqual(predicted, 1000)
+        self.assertTrue(token[5])  # armed
 
     def test_enter_cold_model_still_returns_token(self):
         pub, _ = self._pub(predicted=None)  # cold model
         token = pub.enter(BRANCH[:6], budget=1)
         self.assertIsNotNone(token)
-        _, predicted, _, _, _ = token
+        _, predicted, _, _, _ = token[:5]
         self.assertIsNone(predicted)  # token carries None when model is cold
 
     def test_check_returns_none_for_none_token(self):
@@ -1243,9 +1247,10 @@ class TestMidLoopPublisher(unittest.TestCase):
         # Cold model, but the frame has run past COLD_BACKSTOP_SECONDS: the
         # backstop hands off the remainder even with no cost-model prediction.
         pub, w = self._pub(predicted=None)
-        nodes_at_entry, _, _, words, entry_budget = pub.enter(BRANCH[:6], budget=0)
+        nodes_at_entry, _, _, words, entry_budget = \
+            pub.enter(BRANCH[:6], budget=0)[:5]
         old_entry = time.time() - (erd_swarm.COLD_BACKSTOP_SECONDS + 1)
-        token = (nodes_at_entry, None, old_entry, words, entry_budget)
+        token = [nodes_at_entry, None, old_entry, words, entry_budget, True]
         w._nodes = nodes_at_entry + 50   # some work done, no prediction to compare
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
@@ -1263,7 +1268,9 @@ class TestMidLoopPublisher(unittest.TestCase):
         # wall-clock backstop is recorded for tuning.
         pub, w = self._pub(predicted=10)
         token = pub.enter(BRANCH[:6], budget=0)
-        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        # Past the proportionate trigger (OVERRUN_K * predicted) AND the
+        # absolute break-even gate (_publish_threshold, bootstrap when cold).
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         pub.check(token, CANDIDATES, 0, None, None, 5)
@@ -1280,7 +1287,9 @@ class TestMidLoopPublisher(unittest.TestCase):
         words = BRANCH[:6]
         token = pub.enter(words, budget=0)
         # Simulate spending > OVERRUN_K * predicted nodes
-        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        # Past the proportionate trigger (OVERRUN_K * predicted) AND the
+        # absolute break-even gate (_publish_threshold, bootstrap when cold).
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         # last_index=0 of a 10-candidate list → 9 remaining (>= MIN_HANDOFF).
         result = pub.check(token, CANDIDATES, 0, None, None, 5)
@@ -1290,7 +1299,9 @@ class TestMidLoopPublisher(unittest.TestCase):
     def test_check_returns_none_when_remaining_count_below_threshold(self):
         pub, w = self._pub(predicted=10)
         token = pub.enter(BRANCH[:6], budget=0)
-        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        # Past the proportionate trigger (OVERRUN_K * predicted) AND the
+        # absolute break-even gate (_publish_threshold, bootstrap when cold).
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         # last_index=7 of a 10-candidate list → only 2 remaining (< MIN_HANDOFF=4)
         self.assertIsNone(pub.check(token, CANDIDATES, 7, None, None, 5))
 
@@ -1298,7 +1309,9 @@ class TestMidLoopPublisher(unittest.TestCase):
         pub, w = self._pub(predicted=10)
         words = BRANCH[:6]
         token = pub.enter(words, budget=0)
-        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        # Past the proportionate trigger (OVERRUN_K * predicted) AND the
+        # absolute break-even gate (_publish_threshold, bootstrap when cold).
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         # last_index=1 → the evaluated prefix is CANDIDATES[:2].
         pub.check(token, CANDIDATES, 1, None, None, 5)
@@ -1327,6 +1340,87 @@ class TestMidLoopPublisher(unittest.TestCase):
         pub, w = self._pub()
         pub.record_inline(None)
         self.assertEqual(w._cost_model_buffer, {})
+
+
+class TestPublishStormGuards(unittest.TestCase):
+    """The latches that prevent a publish-per-iteration write storm: the
+    absolute break-even gate, the disarm-on-decline token flag, and the
+    stop/WAL-ceiling refusal.  Without them, a collapsed cost model (typical
+    ~= cache-hit node counts) makes the proportionate trigger fire on every
+    iteration of every frame, and an unjoinable raced row turns that into
+    mark_claims_done per candidate — the WAL flood that filled the disk."""
+
+    def _pub(self, predicted=None):
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = predicted
+        return erd_swarm._MidLoopPublisher(w), w
+
+    def test_overrun_below_break_even_does_not_publish(self):
+        pub, w = self._pub(predicted=5)
+        token = pub.enter(BRANCH[:5], budget=0)
+        w._nodes = erd_swarm.OVERRUN_K * 5 + 1   # proportionate trigger true
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        w.queue.create_branch.assert_not_called()
+        w.queue.mark_claims_done.assert_not_called()
+        self.assertTrue(token[5])   # not disarmed: may fire later in the frame
+
+    def test_unjoinable_budget_disarms_and_writes_nothing(self):
+        pub, w = self._pub(predicted=10)
+        token = pub.enter(BRANCH[:5], budget=0)
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        w.queue.create_branch.return_value = False   # raced: row exists
+        w.queue.get_branch.return_value = {'budget': 4, 'ceiling': None}
+        w.cooperative_solve = mock.MagicMock()
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertFalse(token[5])
+        w.queue.mark_claims_done.assert_not_called()
+        w.queue.add_cost_sample.assert_not_called()
+        w.cooperative_solve.assert_not_called()
+        # Disarmed: later iterations return immediately, touching nothing.
+        w.queue.get_branch.reset_mock()
+        self.assertIsNone(pub.check(token, CANDIDATES, 1, None, None, 5))
+        w.queue.get_branch.assert_not_called()
+
+    def test_cooperative_decline_disarms(self):
+        pub, w = self._pub(predicted=10)
+        token = pub.enter(BRANCH[:5], budget=0)
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        w.cooperative_solve = mock.MagicMock(return_value=None)
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertFalse(token[5])
+
+    def test_stop_requested_disarms_without_writing(self):
+        pub, w = self._pub(predicted=10)
+        token = pub.enter(BRANCH[:5], budget=0)
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        w._stop_requested = True
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertFalse(token[5])
+        w.queue.create_branch.assert_not_called()
+
+
+class TestWorkerWALCeiling(unittest.TestCase):
+    """Worker-side backstop for the queue WAL hard ceiling: trips, latches,
+    requests a stop, and is throttled between probes."""
+
+    def test_trips_latches_and_requests_stop(self):
+        w = _bare_worker()
+        w.queue.wal_size_bytes.return_value = \
+            erd_swarm.QUEUE_WAL_HARD_CEILING_BYTES
+        self.assertTrue(w._wal_ceiling_tripped())
+        self.assertTrue(w._stop_requested)
+        # Latched: no further size probes once tripped.
+        w.queue.wal_size_bytes.reset_mock()
+        self.assertTrue(w._wal_ceiling_tripped())
+        w.queue.wal_size_bytes.assert_not_called()
+
+    def test_below_ceiling_probes_are_throttled(self):
+        w = _bare_worker()
+        self.assertFalse(w._wal_ceiling_tripped())
+        self.assertFalse(w._stop_requested)
+        # Within WAL_CEILING_CHECK_SECONDS the size is not re-probed.
+        self.assertFalse(w._wal_ceiling_tripped())
+        self.assertEqual(w.queue.wal_size_bytes.call_count, 1)
 
 
 class TestSubbranchSolverCostModel(unittest.TestCase):
@@ -1542,7 +1636,8 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         pub = erd_swarm._MidLoopPublisher(w)
         words = BRANCH[:6]
         token = pub.enter(words, budget=0)
-        w._nodes = erd_swarm.OVERRUN_K * predicted + 1
+        # Past the proportionate trigger AND the absolute break-even gate.
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         result = pub.check(token, CANDIDATES, 0, best_guess, 1.5, 5)
@@ -1566,7 +1661,9 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         pub = erd_swarm._MidLoopPublisher(w)
         words = BRANCH[:6]
         token = pub.enter(words, budget=0)
-        w._nodes = erd_swarm.OVERRUN_K * 10 + 1
+        # Past the proportionate trigger (OVERRUN_K * predicted) AND the
+        # absolute break-even gate (_publish_threshold, bootstrap when cold).
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         unknown_words = ["zzzzz"] * 10
@@ -1824,7 +1921,8 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
             return_value=(SOLVED, 2.0, 3, False))
         pub = erd_swarm._MidLoopPublisher(w)
         token = pub.enter(BRANCH[:6], budget=5)
-        w._nodes = erd_swarm.OVERRUN_K * predicted + 1
+        # Past the proportionate trigger AND the absolute break-even gate.
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         return pub, w, token
 
     def test_ceilinged_frame_publishes_ceilinged_branch(self):
@@ -1880,12 +1978,20 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         w.queue.mark_claims_done.assert_not_called()
         w.queue.update_branch_best.assert_not_called()
 
-    def test_race_to_tighter_ceiling_keeps_prefix_marks(self):
+    def test_race_to_tighter_ceiling_declines_and_disarms(self):
+        # A raced row with a strictly tighter ceiling proves too little to
+        # join, so the frame solves inline — writing nothing.  The prefix
+        # marks would be sound for that row in isolation, but pouring them
+        # into a branch this frame will not join repeats on every later
+        # iteration (the overrun stays true), which is the write storm the
+        # armed flag exists to prevent.
         pub, w, token = self._overrunning()
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": 2.0, "budget": 5}
-        pub.check(token, CANDIDATES, 1, None, 2.5, 5)
-        w.queue.mark_claims_done.assert_called_once()
+        self.assertIsNone(pub.check(token, CANDIDATES, 1, None, 2.5, 5))
+        self.assertFalse(token[5])
+        w.queue.mark_claims_done.assert_not_called()
+        w.cooperative_solve.assert_not_called()
 
 
 class TestCeilingFinalizeIntegration(unittest.TestCase):

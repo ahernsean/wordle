@@ -153,6 +153,13 @@ stacks into its `erd_worker_*.log`, latches the swarm down via the same
 `disk_stop` row as below, and exits.  This trips long before the disk fills, so
 the post-mortem has both the stacks and a healthy filesystem.
 
+Each worker enforces the same ceiling on its own (checked from the heartbeat
+path and the mid-loop publisher, at most one file-size probe per 5 s): a worker
+that outlives the supervisor, or spins in a coordination path that never
+reaches a bundle boundary, stops itself instead of writing unsupervised.  The
+supervisor's shutdown also escalates to SIGKILL for any worker still alive 30 s
+after SIGTERM, so no writer can survive a supervisor exit.
+
 To attribute *which* traffic is filling the WAL, each worker logs its per-table
 write/read rate into the shared WAL — inserts, updates, and deletes alike (e.g.
 `candidate_claims/bulk-eliminate`, `candidate_claims/holes-scan(read)`,
