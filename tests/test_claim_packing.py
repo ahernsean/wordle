@@ -440,24 +440,25 @@ class TestRepublishRemainder(_TmpQueue):
         stolen_idx = indices[0]
         # Simulate reclaim_stale_claims freeing it, then another worker's
         # packer legitimately re-claiming it under a fresh bundle_id.
+        bid = self.q._intern_branch(self.key)
         self.q._conn.execute(
-            "DELETE FROM candidate_claims WHERE branch_key = ? AND idx = ?",
-            (self.key, stolen_idx))
+            "DELETE FROM candidate_claims WHERE branch_id = ? AND idx = ?",
+            (bid, stolen_idx))
         self.q._conn.execute("""
             INSERT INTO candidate_claims
-                (branch_key, idx, claimed_by, claimed_at, done, bundle_id)
+                (branch_id, idx, claimed_by, claimed_at, done, bundle_id)
             VALUES (?, ?, 'other-worker', 0, 0, 'other-bundle')
-        """, (self.key, stolen_idx))
+        """, (bid, stolen_idx))
 
         counts = self.q.republish_remainder(self.key, bundle_id, indices)
         self.assertNotIn(stolen_idx, counts)   # not bumped: not deleted by this call
         row = self.q._conn.execute(
-            "SELECT bundle_id FROM candidate_claims WHERE branch_key = ? AND idx = ?",
-            (self.key, stolen_idx)).fetchone()
+            "SELECT bundle_id FROM candidate_claims WHERE branch_id = ? AND idx = ?",
+            (bid, stolen_idx)).fetchone()
         self.assertEqual(row["bundle_id"], "other-bundle")   # untouched
         republish_row = self.q._conn.execute(
-            "SELECT count FROM candidate_republish WHERE branch_key = ? AND idx = ?",
-            (self.key, stolen_idx)).fetchone()
+            "SELECT count FROM candidate_republish WHERE branch_id = ? AND idx = ?",
+            (bid, stolen_idx)).fetchone()
         self.assertIsNone(republish_row)   # no spurious count bump
 
     def test_republish_returns_empty_when_nothing_still_claimed_under_bundle_id(self):
@@ -467,10 +468,11 @@ class TestRepublishRemainder(_TmpQueue):
         # Every one of this bundle's rows already moved to a different
         # bundle_id (e.g. reclaimed and re-claimed elsewhere) before this
         # worker's own republish call runs.
+        bid = self.q._intern_branch(self.key)
         self.q._conn.executemany(
             "UPDATE candidate_claims SET bundle_id = 'elsewhere' "
-            "WHERE branch_key = ? AND idx = ?",
-            [(self.key, idx) for idx in indices])
+            "WHERE branch_id = ? AND idx = ?",
+            [(bid, idx) for idx in indices])
         counts = self.q.republish_remainder(self.key, bundle_id, indices)
         self.assertEqual(counts, {})
 
@@ -757,8 +759,8 @@ class TestMidSweepReclaimEquivalence(unittest.TestCase):
         # time actually elapsed during the test (mirrors test_erd_fixes.py's
         # TestReclaimLiveness pattern).
         self.q._conn.execute(
-            "UPDATE candidate_claims SET claimed_at = 0 WHERE branch_key = ?",
-            (self.key,))
+            "UPDATE candidate_claims SET claimed_at = 0 WHERE branch_id = ?",
+            (self.q._intern_branch(self.key),))
         freed = self.q.reclaim_stale_claims(heartbeat_timeout_seconds=120)
         self.assertEqual(freed, len(indices))
 

@@ -370,7 +370,7 @@ class OverviewRendererTest(unittest.TestCase):
             display_order=display_order,
         )
         self.assertLess(
-            output.index("worker=worker-2"), output.index("worker=worker-1")
+            output.index("worker-2"), output.index("worker-1")
         )
 
     def test_watched_branch_claims_compare_by_candidate_index(self):
@@ -486,9 +486,10 @@ class CollectionRendererTest(unittest.TestCase):
             "matched_rows": 1,
             "rows": [worker],
         })
-        self.assertIn(
-            "worker=worker-2 stale", render_report(workers_report, width=120)
-        )
+        workers_output = render_report(workers_report, width=120)
+        self.assertIn("Worker", workers_output)
+        self.assertIn("worker-2", workers_output)
+        self.assertIn("stale", workers_output)
 
         cache_report = self._report("cache", {
             "summary": {
