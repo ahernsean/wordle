@@ -454,8 +454,8 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q.mark_claims_done(small_key, [0, 1])
         self.q.record_bundle_stats(small_key, "bundle-1", 100, 50)
         self.q._conn.execute(
-            "INSERT INTO candidate_republish (branch_key, idx, count) "
-            "VALUES (?, 2, 1)", (small_key,))
+            "INSERT INTO candidate_republish (branch_id, idx, count) "
+            "VALUES (?, 2, 1)", (self.q._intern_branch(small_key, create=True),))
         self.q.add_branch_finalize_log(
             small_key, "CRANE -y--g ALIBI g-g--", 3, 2,
             10, 20, 123, 2)
