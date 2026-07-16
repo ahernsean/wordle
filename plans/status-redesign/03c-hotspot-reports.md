@@ -110,6 +110,13 @@ Add the hotspot renderer and bounded telemetry sections to branch detail.
 Always label population, epoch/window, sample size, and truncation. A cut is
 transient coordination history, never an exact cache state.
 
+Hotspot identities and metrics render as an adaptive table. Identity and the
+primary ranked metric are essential; secondary metrics disappear by declared
+priority as width tightens. Population/window/sample metadata wraps at field
+boundaries. Branch telemetry uses the same phase 2 helper and remains legible
+at 50 columns without clipping outcome, epoch, or evaluated-versus-bulk
+completion counts.
+
 ## Tests
 
 Required coverage:
@@ -123,7 +130,9 @@ Required coverage:
 6. Defaults and upper bounds for time window, sample, and limit are enforced.
 7. Hotspot queries use the new indexes and do not scan unbounded history.
 8. `--tree --hotspots` is rejected.
-9. Existing queue migration and visibility tests remain green.
+9. Hotspot and branch-telemetry text has exact 50–120-column coverage,
+   including rows whose secondary metrics must be hidden.
+10. Existing queue migration and visibility tests remain green.
 
 ## Acceptance checklist
 
@@ -131,6 +140,7 @@ Required coverage:
 - [ ] Telemetry changes are index-only Linux queue migrations.
 - [ ] Exact, cut, and loss remain distinct.
 - [ ] Coordination data is never falsely attributed to a branch.
+- [ ] Hotspot and telemetry terminal tables remain operational at 50 columns.
 - [ ] Legacy inspection commands remain available.
 - [ ] Full test suite passes.
 - [ ] No file outside the phase list is modified.

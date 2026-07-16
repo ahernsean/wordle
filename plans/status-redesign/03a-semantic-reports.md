@@ -283,6 +283,13 @@ phase 2 watch behavior continues to collect the current request on every
 refresh. Semantic change comparison uses branch keys, worker IDs, and
 candidate indices; it does not diff rendered characters.
 
+Every response-group, queue-state, worker, claim, finalization, and cut-reuse
+row uses phase 2's adaptive column helper. At 50–59 columns, response groups
+retain pattern, answer count, phase, cache state, and full branch reference;
+branch detail retains semantic identity plus the smallest table that still
+explains queue/cache state. Optional answer lists wrap or truncate as elastic
+text instead of forcing the semantic columns wider.
+
 This phase adds no drill-down hotkeys. Users select a different report by
 starting another command until phase 3d adds an in-session navigation stack.
 
@@ -306,7 +313,10 @@ Required coverage:
 10. Claims and answer words are absent unless explicitly requested.
 11. Cache state obeys existing budget and `max_remaining_depth` reuse rules.
 12. Watched word and branch reports preserve stable identities.
-13. All legacy status and read-only queue tests remain green.
+13. Word and branch text at widths 50, 55, 59, 60, 79, 80, and 120 obeys the
+    shared column-removal order and preserves patterns, references, worker
+    IDs, and candidate indices.
+14. All legacy status and read-only queue tests remain green.
 
 ## Acceptance checklist
 
@@ -314,6 +324,7 @@ Required coverage:
 - [ ] Word reports join current queue and cache coverage.
 - [ ] Branch detail works for queued, active, done, and cache-only branches.
 - [ ] Claim provenance distinguishes evaluated and bulk-eliminated work.
+- [ ] Word and branch terminal tables remain operational at 50 columns.
 - [ ] Queue prefix lookup and single-reference resolution are unambiguous APIs.
 - [ ] Legacy inspection commands remain available.
 - [ ] Full test suite passes.
