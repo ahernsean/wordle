@@ -89,13 +89,14 @@ class TestWALTrafficAttribution(_TmpQueue):
             rows["candidate_republish/republish-upsert"], len(indices))
 
     def test_reclaim_paths_are_attributed(self):
+        bid = self.q._intern_branch(self.key)
         self.q._conn.execute(
-            "INSERT INTO candidate_claims (branch_key, idx, claimed_by, "
-            "claimed_at, done) VALUES (?, 0, 'dead', 0, 0)", (self.key,))
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, "
+            "claimed_at, done) VALUES (?, 0, 'dead', 0, 0)", (bid,))
         self.assertEqual(self.q.reclaim_stale_claims(120), 1)
         self.q._conn.execute(
-            "INSERT INTO candidate_claims (branch_key, idx, claimed_by, "
-            "claimed_at, done) VALUES (?, 1, 'w9', 0, 0)", (self.key,))
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, "
+            "claimed_at, done) VALUES (?, 1, 'w9', 0, 0)", (bid,))
         self.assertEqual(self.q.reclaim_claims_of_worker("w9"), 1)
         rows, _ = self.q.wal_traffic_snapshot()
         self.assertEqual(rows["candidate_claims/reclaim-stale"], 1)

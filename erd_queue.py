@@ -29,6 +29,11 @@ from wordle_ui import fmt_pattern
 
 logger = logging.getLogger(__name__)
 
+# Workers heartbeat about every two seconds. This threshold governs both claim
+# reclamation and report liveness, so a worker inside it is never reclaimed or
+# excluded from live-worker totals.
+WORKER_LIVENESS_SECONDS = 30
+
 # Time-weighted geometric mean EMA: half-life for the cost model.
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
@@ -546,7 +551,7 @@ _TELEMETRY_TABLES = (
 )
 
 
-def _derive_telemetry_path(db_path: str) -> str:
+def derive_telemetry_path(db_path: str) -> str:
     """Default telemetry file path for a queue at db_path: the sibling file
     <stem>_telemetry<ext> (erd_queue.sqlite3 -> erd_queue_telemetry.sqlite3).
     ':memory:' maps to ':memory:', which attaches as an independent private
@@ -568,7 +573,7 @@ class ERDQueue:
                                      isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         if telemetry_path is None:
-            telemetry_path = _derive_telemetry_path(db_path)
+            telemetry_path = derive_telemetry_path(db_path)
         self.telemetry_path = telemetry_path
         self._conn.execute("ATTACH DATABASE ? AS telemetry", (telemetry_path,))
         self._conn.executescript(_QUEUE_SCHEMA_SQL)
@@ -768,6 +773,33 @@ class ERDQueue:
             "outcome": "TEXT",
             "bulk_done_candidates": "INTEGER",
         }, schema="telemetry")
+
+        report_indexes = (
+            ("branch_finalize_log", {"branch_key", "recorded_at"},
+             "idx_branch_finalize_log_branch_recorded_at",
+             "branch_key, recorded_at"),
+            ("branch_finalize_log", {"epoch", "recorded_at", "id"},
+             "idx_branch_finalize_log_epoch_recorded_id",
+             "epoch, recorded_at DESC, id DESC"),
+            ("cut_reuse_misses", {"branch_key", "recorded_at"},
+             "idx_cut_reuse_misses_branch_recorded_at",
+             "branch_key, recorded_at"),
+            ("cut_reuse_misses", {"epoch", "recorded_at", "id"},
+             "idx_cut_reuse_misses_epoch_recorded_id",
+             "epoch, recorded_at DESC, id DESC"),
+            ("claim_telemetry", {"epoch", "id"},
+             "idx_claim_telemetry_epoch_id", "epoch, id"),
+            ("claim_telemetry", {"epoch", "recorded_at", "id"},
+             "idx_claim_telemetry_epoch_recorded_id",
+             "epoch, recorded_at DESC, id DESC"),
+        )
+        for table, required_columns, index_name, indexed_columns in report_indexes:
+            columns = {row["name"] for row in self._conn.execute(
+                f"PRAGMA telemetry.table_info({table})")}
+            if required_columns <= columns:
+                self._conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS telemetry.{index_name} "
+                    f"ON {table}({indexed_columns})")
 
         # Branch-key normalization: the fat branch_key BLOB (the concatenated
         # word list, up to a few KB) used to sit in every candidate_claims,
@@ -1861,6 +1893,43 @@ class ERDQueue:
             "WHERE branch_id = ?", (branch_id,)).fetchone()
         return 0 if row is None else row[0]
 
+    def candidate_progress_by_branch_keys(self, branch_keys: list[bytes]) -> dict:
+        """Return evaluated and bulk-completed candidate counts by branch."""
+        if not branch_keys:
+            return {}
+        progress = {
+            bytes(branch_key): {
+                "completed_candidate_count": 0,
+                "bulk_completed_candidate_count": 0,
+            }
+            for branch_key in branch_keys
+        }
+        placeholders = ",".join("?" for _ in branch_keys)
+        completed_rows = self._conn.execute(
+            f"""SELECT b.branch_key, COUNT(*) AS completed_candidate_count
+                FROM candidate_claims c
+                JOIN branches b ON b.branch_id = c.branch_id
+                WHERE c.done = 1 AND b.branch_key IN ({placeholders})
+                GROUP BY c.branch_id""",
+            branch_keys,
+        ).fetchall()
+        for row in completed_rows:
+            progress[bytes(row["branch_key"])]["completed_candidate_count"] = (
+                row["completed_candidate_count"]
+            )
+        bulk_rows = self._conn.execute(
+            f"""SELECT b.branch_key, a.bulk_done_candidates
+                FROM active_branches a
+                JOIN branches b ON b.branch_id = a.branch_id
+                WHERE b.branch_key IN ({placeholders})""",
+            branch_keys,
+        ).fetchall()
+        for row in bulk_rows:
+            progress[bytes(row["branch_key"])][
+                "bulk_completed_candidate_count"
+            ] = row["bulk_done_candidates"]
+        return progress
+
     def try_finalize_branch(self, branch_key) -> bool:
         """Atomically transition a branch open -> finalized, exactly once.
 
@@ -2029,7 +2098,9 @@ class ERDQueue:
             "DELETE FROM candidate_claims WHERE done = 0")
         return n_branches_resumed, cur.rowcount
 
-    def worker_counts_by_branch(self, timeout_seconds: int = 30) -> dict:
+    def worker_counts_by_branch(
+        self, timeout_seconds: int = WORKER_LIVENESS_SECONDS
+    ) -> dict:
         """{branch_key bytes: number of recent workers on it} for status."""
         cutoff = int(time.time()) - timeout_seconds
         rows = self._conn.execute("""
@@ -2129,6 +2200,256 @@ class ERDQueue:
             rows = rows[:limit]
         return rows
 
+    @staticmethod
+    def _report_filter_value(filters, name, default=None):
+        if filters is None:
+            return default
+        if isinstance(filters, dict):
+            return filters.get(name, default)
+        return getattr(filters, name, default)
+
+    def report_queue_rows(
+        self, filters=None, sort=None, limit=None, generated_at=None,
+    ) -> dict:
+        """Return normalized, filtered queue rows with pre-limit summaries."""
+        branch_statuses = tuple(self._report_filter_value(
+            filters, "branch_statuses", ()
+        ))
+        branch_phases = tuple(self._report_filter_value(
+            filters, "branch_phases", ()
+        ))
+        minimum_answer_count = self._report_filter_value(
+            filters, "minimum_answer_count"
+        )
+        maximum_answer_count = self._report_filter_value(
+            filters, "maximum_answer_count"
+        )
+        budget = self._report_filter_value(filters, "budget")
+        priority = self._report_filter_value(filters, "priority")
+        spine_prefix = self._report_filter_value(filters, "spine_prefix")
+        source_word = self._report_filter_value(filters, "source_word")
+        branch_key = self._report_filter_value(filters, "branch_key")
+        branch_phase_expression = """CASE
+            WHEN pending_status = 'done' THEN 'complete'
+            WHEN active_status = 'finalized' THEN 'finalizing'
+            WHEN active_status = 'open' OR pending_status = 'in_progress'
+                THEN 'evaluating'
+            WHEN pending_status = 'pending' THEN 'queued'
+            ELSE NULL END"""
+        branch_status_expression = """CASE
+            WHEN pending_status = 'done' THEN 'done'
+            WHEN pending_status IS NULL AND active_status IS NULL THEN 'unqueued'
+            WHEN worker_count > 0 THEN 'active'
+            ELSE 'pending' END"""
+        base_query = f"""
+            WITH branch_ids AS (
+                SELECT branch_id FROM pending_branches
+                UNION
+                SELECT branch_id FROM active_branches
+            ),
+            completed AS (
+                SELECT branch_id, COUNT(*) AS completed_candidate_count
+                FROM candidate_claims WHERE done = 1 GROUP BY branch_id
+            ),
+            workers AS (
+                SELECT current_branch_id AS branch_id, COUNT(*) AS worker_count
+                FROM worker_heartbeat
+                WHERE current_branch_id IS NOT NULL AND updated_at >= ?
+                GROUP BY current_branch_id
+            ),
+            source_rows AS (
+                SELECT registry.branch_key,
+                       pending.status AS pending_status,
+                       active.status AS active_status,
+                       pending.priority AS pending_priority,
+                       active.priority AS active_priority,
+                       pending.n_words AS pending_answer_count,
+                       active.n_words AS active_answer_count,
+                       pending.source_word AS pending_source_word,
+                       active.source_word AS active_source_word,
+                       pending.source_pattern AS pending_source_pattern,
+                       active.source_pattern AS active_source_pattern,
+                       pending.claimed_at,
+                       pending.completed_at,
+                       active.n_candidates AS candidate_count,
+                       active.budget,
+                       active.best_guess,
+                       active.best_erd,
+                       active.best_max_depth,
+                       active.nodes_spent,
+                       active.bulk_done_candidates,
+                       active.ceiling,
+                       active.spine,
+                       active.created_at,
+                       COALESCE(completed.completed_candidate_count, 0)
+                           AS completed_candidate_count,
+                       COALESCE(workers.worker_count, 0) AS worker_count
+                FROM branch_ids AS keys
+                JOIN branches AS registry USING (branch_id)
+                LEFT JOIN pending_branches AS pending USING (branch_id)
+                LEFT JOIN active_branches AS active USING (branch_id)
+                LEFT JOIN completed USING (branch_id)
+                LEFT JOIN workers USING (branch_id)
+            ),
+            normalized AS (
+                SELECT *,
+                       {branch_status_expression} AS branch_status,
+                       {branch_phase_expression} AS branch_phase,
+                       COALESCE(active_priority, pending_priority, 0) AS priority,
+                       COALESCE(active_answer_count, pending_answer_count) AS answer_count,
+                       COALESCE(active_source_word, pending_source_word) AS source_word,
+                       COALESCE(active_source_pattern, pending_source_pattern) AS source_pattern
+                FROM source_rows
+            )
+        """
+        conditions = []
+        parameters = [
+            int(generated_at if generated_at is not None else time.time())
+            - WORKER_LIVENESS_SECONDS
+        ]
+        if branch_statuses:
+            placeholders = ",".join("?" for _ in branch_statuses)
+            conditions.append(f"branch_status IN ({placeholders})")
+            parameters.extend(branch_statuses)
+        if branch_phases:
+            placeholders = ",".join("?" for _ in branch_phases)
+            conditions.append(f"branch_phase IN ({placeholders})")
+            parameters.extend(branch_phases)
+        if minimum_answer_count is not None:
+            conditions.append("answer_count >= ?")
+            parameters.append(minimum_answer_count)
+        if maximum_answer_count is not None:
+            conditions.append("answer_count <= ?")
+            parameters.append(maximum_answer_count)
+        if budget is not None:
+            conditions.append("budget = ?")
+            parameters.append(budget)
+        if priority is not None:
+            conditions.append("priority = ?")
+            parameters.append(priority)
+        scope_conditions = []
+        scope_parameters = []
+        if spine_prefix:
+            scope_conditions.append("(spine = ? OR spine LIKE ?)")
+            scope_parameters.extend((spine_prefix, spine_prefix + " %"))
+        if source_word:
+            scope_conditions.append(
+                "(spine IS NULL AND LOWER(source_word) = ?)"
+            )
+            scope_parameters.append(source_word.lower())
+        if branch_key is not None:
+            scope_conditions.append("branch_key = ?")
+            scope_parameters.append(bytes(branch_key))
+        if scope_conditions:
+            conditions.append("(" + " OR ".join(scope_conditions) + ")")
+            parameters.extend(scope_parameters)
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        summary_rows = self._conn.execute(
+            base_query
+            + " SELECT branch_status, branch_phase, COUNT(*) AS branch_count"
+            + " FROM normalized"
+            + where_clause
+            + " GROUP BY branch_status, branch_phase",
+            parameters,
+        ).fetchall()
+        by_status = {}
+        by_phase = {}
+        for row in summary_rows:
+            by_status[row["branch_status"]] = (
+                by_status.get(row["branch_status"], 0) + row["branch_count"]
+            )
+            by_phase[row["branch_phase"]] = (
+                by_phase.get(row["branch_phase"], 0) + row["branch_count"]
+            )
+        matched_rows = sum(by_status.values())
+        sort_name = sort or self._report_filter_value(filters, "sort") or "default"
+        order_by = {
+            "age": "COALESCE(created_at, claimed_at, 0), branch_key",
+            "size": "answer_count DESC, branch_key",
+            "workers": "worker_count DESC, answer_count DESC, branch_key",
+            "priority": "priority DESC, answer_count DESC, branch_key",
+            "nodes": "nodes_spent DESC, answer_count DESC, branch_key",
+            "slowest": "nodes_spent DESC, created_at, branch_key",
+            "default": (
+                "CASE branch_status WHEN 'active' THEN 0 ELSE 1 END, "
+                "priority DESC, answer_count DESC, branch_key"
+            ),
+        }[sort_name]
+        effective_limit = (
+            limit if limit is not None
+            else self._report_filter_value(filters, "limit")
+        )
+        row_query = base_query + " SELECT * FROM normalized" + where_clause
+        row_query += " ORDER BY " + order_by
+        row_parameters = list(parameters)
+        if effective_limit is not None:
+            row_query += " LIMIT ?"
+            row_parameters.append(effective_limit)
+        source_rows = self._conn.execute(row_query, row_parameters).fetchall()
+        returned_rows = []
+        for row in source_rows:
+            source_pattern = row["source_pattern"]
+            returned_rows.append({
+                "branch_key": bytes(row["branch_key"]),
+                "branch_key_hex": bytes(row["branch_key"]).hex(),
+                "branch_status": row["branch_status"],
+                "branch_phase": row["branch_phase"],
+                "raw_status": row["pending_status"] or row["active_status"],
+                "is_cooperative": row["pending_status"] is None,
+                "answer_count": row["answer_count"],
+                "priority": row["priority"],
+                "budget": row["budget"],
+                "candidate_count": row["candidate_count"],
+                "completed_candidate_count": row["completed_candidate_count"],
+                "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
+                "worker_count": row["worker_count"],
+                "search_node_count": row["nodes_spent"] or 0,
+                "ceiling": row["ceiling"],
+                "best_guess": row["best_guess"],
+                "best_erd": row["best_erd"],
+                "best_max_remaining_depth": row["best_max_depth"],
+                "source_word": row["source_word"],
+                "source_pattern": (
+                    fmt_pattern(source_pattern) if source_pattern is not None else None
+                ),
+                "spine": row["spine"],
+                "created_at": row["created_at"],
+                "updated_at": row["completed_at"] or row["claimed_at"] or row["created_at"],
+                "is_context": False,
+            })
+        return {
+            "summary": {
+                "branch_count": matched_rows,
+                "branch_count_by_status": by_status,
+                "branch_count_by_phase": by_phase,
+            },
+            "matched_rows": matched_rows,
+            "rows": returned_rows,
+        }
+
+    def report_tree_rows(self, spine_prefix, filters=None, sort=None, limit=None) -> dict:
+        """Return report queue rows at or below a recorded spine prefix."""
+        scoped_filters = {
+            "branch_statuses": self._report_filter_value(
+                filters, "branch_statuses", ()
+            ) or (),
+            "branch_phases": self._report_filter_value(
+                filters, "branch_phases", ()
+            ) or (),
+            "minimum_answer_count": self._report_filter_value(
+                filters, "minimum_answer_count"
+            ),
+            "maximum_answer_count": self._report_filter_value(
+                filters, "maximum_answer_count"
+            ),
+            "budget": self._report_filter_value(filters, "budget"),
+            "priority": self._report_filter_value(filters, "priority"),
+            "sort": self._report_filter_value(filters, "sort"),
+            "limit": self._report_filter_value(filters, "limit"),
+            "spine_prefix": (spine_prefix or "").strip(),
+        }
+        return self.report_queue_rows(scoped_filters, sort, limit)
+
     def _queue_sort_key(self, sort):
         if sort == "nodes":
             return lambda r: (-(r["nodes_spent"] or 0), -r["n_words"], r["branch_key_hex"])
@@ -2146,7 +2467,9 @@ class ERDQueue:
         return lambda r: (0 if r["status"] in ("in_progress", "open") else 1,
                           -(r["priority"] or 0), -r["n_words"], r["branch_key_hex"])
 
-    def _row_spine_text(self, row):
+    @staticmethod
+    def row_spine_text(row):
+        """Return the most specific recorded spine text for a queue row."""
         if row.get("spine"):
             return row["spine"]
         if row.get("source_word") and row.get("source_pattern_text"):
@@ -2258,6 +2581,27 @@ class ERDQueue:
             return matches
         return [r for r in rows if self._row_matches_spine_prefix(r, ref)]
 
+    def branch_rows_for_reference_prefix(self, digest_prefix) -> list[dict]:
+        """Return queue rows whose stable SHA-1 reference starts with a prefix."""
+        normalized_prefix = digest_prefix.lower()
+        return [
+            row for row in self.list_queue_rows()
+            if hashlib.sha1(bytes(row["branch_key"])).hexdigest().startswith(
+                normalized_prefix
+            )
+        ]
+
+    def candidate_republish_for_branch(self, branch_key) -> list[dict]:
+        """Return sparse candidate republish counts for one branch."""
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return []
+        return [dict(row) for row in self._conn.execute(
+            "SELECT idx, count FROM candidate_republish "
+            "WHERE branch_id = ? ORDER BY idx",
+            (branch_id,),
+        )]
+
     def branch_detail(self, branch_key, include_claims=False):
         p = self.get_pending_branch(branch_key)
         a = self.get_active_branch(branch_key)
@@ -2288,6 +2632,231 @@ class ERDQueue:
                 "ORDER BY worker_id", (workers_id,))]
         return detail
 
+
+    @staticmethod
+    def _report_finalization_outcome(row):
+        outcome = row["outcome"]
+        if outcome in ("exact", "cut", "loss"):
+            return outcome
+        return "cut" if row["ceiling"] is not None else "unknown"
+
+    def report_branch_telemetry(self, branch_key, limit) -> dict:
+        """Return bounded current and historical telemetry for one branch."""
+        bundle_row = self._conn.execute("""
+            SELECT COUNT(*) AS bundle_count,
+                   SUM(nodes) AS node_count,
+                   SUM(wall_millis) AS wall_millis,
+                   SUM(censored) AS censored_unit_count,
+                   MAX(nodes) AS maximum_bundle_node_count
+            FROM telemetry.bundle_stats WHERE branch_key = ?
+        """, (branch_key,)).fetchone()
+        bundle_summary = None
+        if bundle_row["bundle_count"]:
+            bundle_summary = dict(bundle_row)
+        finalization_rows = self._conn.execute("""
+            SELECT * FROM telemetry.branch_finalize_log
+            WHERE branch_key = ?
+            ORDER BY recorded_at DESC, id DESC LIMIT ?
+        """, (branch_key, limit)).fetchall()
+        finalizations = []
+        for row in finalization_rows:
+            finalizations.append({
+                "finalization_id": row["id"],
+                "outcome": self._report_finalization_outcome(row),
+                "ceiling": row["ceiling"],
+                "budget": row["budget"],
+                "answer_count": row["n_words"],
+                "search_node_count": row["nodes_spent"],
+                "created_at": row["created_at"],
+                "finalized_at": row["finalized_at"],
+                "wall_millis": row["total_bundle_wall_millis"],
+                "bundle_count": row["n_bundles"],
+                "maximum_bundle_node_count": row["max_bundle_nodes"],
+                "censored_unit_count": row["censored_units"],
+                "epoch": row["epoch"],
+                "evaluated_candidate_count": row["n_claims"],
+                "bulk_completed_candidate_count": row["bulk_done_candidates"],
+                "recorded_at": row["recorded_at"],
+            })
+        cut_rows = self._conn.execute("""
+            SELECT * FROM telemetry.cut_reuse_misses
+            WHERE branch_key = ?
+            ORDER BY recorded_at DESC, id DESC LIMIT ?
+        """, (branch_key, limit)).fetchall()
+        cut_reuse_misses = [{
+            "cut_reuse_miss_id": row["id"],
+            "answer_count": row["n_words"],
+            "budget": row["budget"],
+            "wanted_ceiling": row["wanted_ceiling"],
+            "available_bound": row["available_bound"],
+            "available_budget": row["available_budget"],
+            "epoch": row["epoch"],
+            "recorded_at": row["recorded_at"],
+        } for row in cut_rows]
+        return {
+            "bundle_summary": bundle_summary,
+            "recent_finalizations": finalizations,
+            "cut_reuse_misses": cut_reuse_misses,
+        }
+
+    def _bounded_sample_metadata(self, table, epoch, since, sample_size,
+                                 spine_prefix=None, branch_key=None):
+        spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""
+        branch_condition = " AND branch_key = ?" if branch_key is not None else ""
+        parameters = [epoch, since]
+        if spine_prefix:
+            parameters.extend((spine_prefix, spine_prefix + " %"))
+        if branch_key is not None:
+            parameters.append(branch_key)
+        parameters.append(sample_size + 1)
+        row = self._conn.execute(
+            f"""SELECT COUNT(*) AS sampled_row_count FROM (
+                    SELECT id FROM telemetry.{table}
+                    WHERE epoch = ? AND recorded_at >= ?
+                    {spine_condition}
+                    {branch_condition}
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
+                )""",
+            parameters,
+        ).fetchone()
+        sampled_with_probe = row["sampled_row_count"]
+        return min(sampled_with_probe, sample_size), sampled_with_probe > sample_size
+
+    def report_hotspots(self, field, epoch, since, sample_size, limit,
+                        spine_prefix=None, branch_key=None) -> dict:
+        """Return an explicitly bounded current or historical hotspot ranking."""
+        current_fields = {"nodes", "age", "size", "workers", "priority", "slowest"}
+        if field in current_fields:
+            filters = {"sort": field, "limit": limit}
+            result = (
+                self.report_tree_rows(spine_prefix, filters, field, limit)
+                if spine_prefix else self.report_queue_rows(filters, field, limit)
+            )
+            return {
+                "population": "current_queue_branches",
+                "epoch": epoch,
+                "since": since,
+                "sample_size": None,
+                "sampled_row_count": result["matched_rows"],
+                "sample_truncated": result["matched_rows"] > len(result["rows"]),
+                "rows": result["rows"],
+            }
+        if field == "coordination" and spine_prefix:
+            raise ValueError("coordination hotspots cannot be attributed to a spine")
+        if field == "cut-reuse" and spine_prefix and branch_key is None:
+            raise ValueError(
+                "cut-reuse hotspots require a singular branch selector"
+            )
+        table = {
+            "evaluated-candidates": "branch_finalize_log",
+            "bulk-completed-candidates": "branch_finalize_log",
+            "cut-reuse": "cut_reuse_misses",
+            "coordination": "claim_telemetry",
+        }.get(field)
+        if table is None:
+            raise ValueError(f"unsupported hotspot field: {field}")
+        sample_spine_prefix = spine_prefix if table == "branch_finalize_log" else None
+        sample_branch_key = branch_key if table == "cut_reuse_misses" else None
+        sampled_row_count, sample_truncated = self._bounded_sample_metadata(
+            table, epoch, since, sample_size, sample_spine_prefix,
+            sample_branch_key,
+        )
+        if field in ("evaluated-candidates", "bulk-completed-candidates"):
+            metric = "n_claims" if field == "evaluated-candidates" else "bulk_done_candidates"
+            spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""
+            parameters = [epoch, since]
+            if spine_prefix:
+                parameters.extend((spine_prefix, spine_prefix + " %"))
+            parameters.extend((sample_size, limit))
+            rows = self._conn.execute(f"""
+                WITH sample AS (
+                    SELECT * FROM telemetry.branch_finalize_log
+                    WHERE epoch = ? AND recorded_at >= ? {spine_condition}
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
+                )
+                SELECT * FROM sample
+                ORDER BY COALESCE({metric}, 0) DESC, id DESC LIMIT ?
+            """, parameters).fetchall()
+            normalized_rows = [{
+                "row_id": f"finalization:{row['id']}",
+                "branch_key": bytes(row["branch_key"]) if row["branch_key"] else None,
+                "spine": row["spine"],
+                "answer_count": row["n_words"],
+                "budget": row["budget"],
+                "epoch": row["epoch"],
+                "outcome": self._report_finalization_outcome(row),
+                "evaluated_candidate_count": row["n_claims"] or 0,
+                "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
+                "search_node_count": row["nodes_spent"] or 0,
+                "recorded_at": row["recorded_at"],
+            } for row in rows]
+            population = "recent_branch_finalizations"
+        elif field == "cut-reuse":
+            branch_condition = " AND branch_key = ?" if branch_key is not None else ""
+            parameters = [epoch, since]
+            if branch_key is not None:
+                parameters.append(branch_key)
+            parameters.extend((sample_size, limit))
+            rows = self._conn.execute(f"""
+                WITH sample AS (
+                    SELECT * FROM telemetry.cut_reuse_misses
+                    WHERE epoch = ? AND recorded_at >= ?
+                    {branch_condition}
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
+                )
+                SELECT branch_key, COUNT(*) AS miss_count,
+                       MAX(recorded_at) AS recorded_at,
+                       MAX(n_words) AS answer_count
+                FROM sample GROUP BY branch_key
+                ORDER BY miss_count DESC, branch_key LIMIT ?
+            """, parameters).fetchall()
+            normalized_rows = [{
+                "row_id": (
+                    f"cut-reuse:{bytes(row['branch_key']).hex()}"
+                    if row["branch_key"] is not None else "cut-reuse:unknown"
+                ),
+                "branch_key": (
+                    bytes(row["branch_key"])
+                    if row["branch_key"] is not None else None
+                ),
+                "answer_count": row["answer_count"],
+                "cut_reuse_miss_count": row["miss_count"],
+                "recorded_at": row["recorded_at"],
+            } for row in rows]
+            population = "recent_cut_reuse_misses"
+        else:
+            rows = self._conn.execute("""
+                WITH sample AS (
+                    SELECT * FROM telemetry.claim_telemetry
+                    WHERE epoch = ? AND recorded_at >= ?
+                    ORDER BY recorded_at DESC, id DESC LIMIT ?
+                )
+                SELECT n_words, worker_count, COUNT(*) AS claim_count,
+                       SUM(coordination_millis) AS coordination_millis,
+                       SUM(COALESCE(claim_retries, 0)) AS claim_retry_count,
+                       SUM(COALESCE(busy_wait_millis, 0)) AS busy_wait_millis
+                FROM sample GROUP BY n_words, worker_count
+                ORDER BY coordination_millis DESC, n_words, worker_count LIMIT ?
+            """, (epoch, since, sample_size, limit)).fetchall()
+            normalized_rows = [{
+                "row_id": f"coordination:{row['n_words']}:{row['worker_count']}",
+                "answer_count": row["n_words"],
+                "worker_count": row["worker_count"],
+                "claim_count": row["claim_count"],
+                "coordination_millis": row["coordination_millis"],
+                "claim_retry_count": row["claim_retry_count"],
+                "busy_wait_millis": row["busy_wait_millis"],
+            } for row in rows]
+            population = "recent_claim_coordination_buckets"
+        return {
+            "population": population,
+            "epoch": epoch,
+            "since": since,
+            "sample_size": sample_size,
+            "sampled_row_count": sampled_row_count,
+            "sample_truncated": sample_truncated,
+            "rows": normalized_rows,
+        }
     # ------------------------------------------------------------------
     # run_meta key-value store
     # ------------------------------------------------------------------
@@ -2302,6 +2871,22 @@ class ERDQueue:
             "SELECT value FROM run_meta WHERE key = ?", (key,)
         ).fetchone()
         return row["value"] if row else None
+
+    def epoch_metadata(self):
+        """Return the active telemetry epoch and its descriptive metadata."""
+        epoch_text = self.get_meta("epoch")
+        if epoch_text is None:
+            return None
+        epoch = int(epoch_text)
+        row = self._conn.execute(
+            "SELECT label, git_sha FROM main.telemetry_epoch WHERE epoch = ?",
+            (epoch,),
+        ).fetchone()
+        return {
+            "epoch": epoch,
+            "label": row["label"] if row else None,
+            "git_sha": row["git_sha"] if row else None,
+        }
 
     def delete_meta(self, key: str):
         self._conn.execute("DELETE FROM run_meta WHERE key = ?", (key,))

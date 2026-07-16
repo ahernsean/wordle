@@ -55,6 +55,8 @@ def _bare_worker():
     w._eval_seconds = 0.0
     w._last_claim_complete = 0.0
     w._last_checkpoint = 0.0
+    w._last_wal_traffic = ({}, {})
+    w._last_wal_traffic_log = 0.0
     w._checkpoint_interval = erd_swarm.CHECKPOINT_SECONDS
     w._last_disk_check = 0.0
     w._last_pause_check = 0.0
@@ -91,6 +93,7 @@ def _bare_worker():
     w.queue.read_branch_best.return_value = (None, None, None)
     w.queue.get_cost_typical.return_value = None  # cold model by default
     w.queue.checkpoint_paused.return_value = False
+    w.queue.wal_traffic_snapshot.return_value = ({}, {})
     return w
 
 
