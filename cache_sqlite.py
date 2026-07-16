@@ -786,6 +786,198 @@ class ScoreCache:
         """, (self.answer_list_id,)).fetchone()
         return row["m"] if row else None
 
+    def erd_report_summary(self, policy: str, recent_since: int) -> dict:
+        """Return bounded aggregate ERD counts for the current answer list."""
+        exact = self._conn.execute("""
+            SELECT COUNT(*) AS exact_branch_count,
+                   COUNT(CASE WHEN updated_at >= ? THEN 1 END)
+                       AS recent_exact_branch_count
+            FROM branch_best_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+        """, (recent_since, policy, self.answer_list_id)).fetchone()
+        loss = self._conn.execute("""
+            SELECT COUNT(*) AS loss_branch_count
+            FROM branch_loss_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+        """, (policy, self.answer_list_id)).fetchone()
+        return {
+            "exact_branch_count": exact["exact_branch_count"],
+            "recent_exact_branch_count": exact["recent_exact_branch_count"],
+            "loss_branch_count": loss["loss_branch_count"],
+        }
+
+    @staticmethod
+    def _report_cache_state_from_rows(branch_key, exact_row, loss_row, budget):
+        answer_count = len(branch_key) // 5
+        if answer_count < 2:
+            return {
+                "cache_state": "not_applicable",
+                "best_guess": None,
+                "best_erd": None,
+                "max_remaining_depth": None,
+                "solve_budget": None,
+                "tainted": False,
+                "loss_budget": None,
+                "updated_at": None,
+            }
+        if exact_row is not None:
+            max_remaining_depth = exact_row["max_depth"]
+            solve_budget = exact_row["solve_budget"]
+            reusable = False
+            if budget is None:
+                reusable = (
+                    solve_budget is None and max_remaining_depth is not None
+                )
+            elif max_remaining_depth is not None:
+                reusable = (
+                    max_remaining_depth <= budget
+                    if solve_budget is None else solve_budget == budget
+                )
+            if reusable:
+                return {
+                    "cache_state": "exact",
+                    "best_guess": exact_row["best_guess"],
+                    "best_erd": exact_row["best_score"],
+                    "max_remaining_depth": max_remaining_depth,
+                    "solve_budget": solve_budget,
+                    "tainted": solve_budget is not None,
+                    "loss_budget": None,
+                    "updated_at": exact_row["updated_at"],
+                }
+        if (
+            loss_row is not None
+            and budget is not None
+            and budget <= loss_row["loss_budget"]
+        ):
+            return {
+                "cache_state": "loss",
+                "best_guess": None,
+                "best_erd": None,
+                "max_remaining_depth": None,
+                "solve_budget": None,
+                "tainted": False,
+                "loss_budget": loss_row["loss_budget"],
+                "updated_at": loss_row["updated_at"],
+            }
+        return {
+            "cache_state": "missing",
+            "best_guess": None,
+            "best_erd": None,
+            "max_remaining_depth": None,
+            "solve_budget": None,
+            "tainted": False,
+            "loss_budget": None,
+            "updated_at": None,
+        }
+
+    @staticmethod
+    def report_branch_state_without_rows(branch_key, budget=None):
+        """Return report state when no exact or loss cache rows are available."""
+        return ScoreCache._report_cache_state_from_rows(
+            bytes(branch_key), None, None, budget
+        )
+
+    def report_branch_state(self, branch_key, policy, budget=None) -> dict:
+        """Return the reusable cache state for one branch and budget."""
+        return self.report_branch_states([branch_key], policy, budget)[bytes(branch_key)]
+
+    def report_branch_states(self, branch_keys, policy, budget=None) -> dict:
+        """Return reusable cache states for a bounded set of branch keys."""
+        if not branch_keys:
+            return {}
+        keys = [bytes(branch_key) for branch_key in branch_keys]
+        placeholders = ",".join("?" for _ in keys)
+        exact_rows = self._conn.execute(
+            f"""SELECT branch_key, best_guess, best_score, updated_at,
+                       max_depth, solve_budget
+                FROM branch_best_by_policy
+                WHERE policy = ? AND answer_list_id = ?
+                  AND branch_key IN ({placeholders})""",
+            [policy, self.answer_list_id, *keys],
+        ).fetchall()
+        loss_rows = self._conn.execute(
+            f"""SELECT branch_key, loss_budget, updated_at
+                FROM branch_loss_by_policy
+                WHERE policy = ? AND answer_list_id = ?
+                  AND branch_key IN ({placeholders})""",
+            [policy, self.answer_list_id, *keys],
+        ).fetchall()
+        exact_by_key = {bytes(row["branch_key"]): row for row in exact_rows}
+        loss_by_key = {bytes(row["branch_key"]): row for row in loss_rows}
+        return {
+            key: self._report_cache_state_from_rows(
+                key, exact_by_key.get(key), loss_by_key.get(key), budget
+            )
+            for key in keys
+        }
+
+    def report_recent_rows(self, policy, since, limit) -> list[dict]:
+        """Return bounded recently updated exact branch rows."""
+        rows = self._conn.execute("""
+            SELECT branch_key, best_guess, best_score, updated_at,
+                   max_depth, solve_budget
+            FROM branch_best_by_policy
+            WHERE policy = ? AND answer_list_id = ? AND updated_at >= ?
+            ORDER BY updated_at DESC, branch_key
+            LIMIT ?
+        """, (policy, self.answer_list_id, since, limit)).fetchall()
+        return [
+            {
+                "branch_key": bytes(row["branch_key"]),
+                "best_guess": row["best_guess"],
+                "best_erd": row["best_score"],
+                "updated_at": row["updated_at"],
+                "max_remaining_depth": row["max_depth"],
+                "solve_budget": row["solve_budget"],
+                "tainted": row["solve_budget"] is not None,
+            }
+            for row in rows
+        ]
+
+    def report_cache_distributions(self, policy) -> dict:
+        """Return exact/loss counts grouped by their cache reuse axes."""
+        exact_rows = self._conn.execute("""
+            SELECT max_depth, solve_budget, COUNT(*) AS branch_count
+            FROM branch_best_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+            GROUP BY max_depth, solve_budget
+        """, (policy, self.answer_list_id)).fetchall()
+        loss_rows = self._conn.execute("""
+            SELECT loss_budget, COUNT(*) AS branch_count
+            FROM branch_loss_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+            GROUP BY loss_budget
+        """, (policy, self.answer_list_id)).fetchall()
+        by_max_remaining_depth = {}
+        by_solve_budget = {}
+        by_taint = {"untainted": 0, "tainted": 0}
+        for row in exact_rows:
+            max_key = "unknown" if row["max_depth"] is None else str(row["max_depth"])
+            budget_key = (
+                "unbounded" if row["solve_budget"] is None
+                else str(row["solve_budget"])
+            )
+            count = row["branch_count"]
+            by_max_remaining_depth[max_key] = (
+                by_max_remaining_depth.get(max_key, 0) + count
+            )
+            by_solve_budget[budget_key] = by_solve_budget.get(budget_key, 0) + count
+            taint_key = "tainted" if row["solve_budget"] is not None else "untainted"
+            by_taint[taint_key] += count
+        by_loss_budget = {
+            str(row["loss_budget"]): row["branch_count"] for row in loss_rows
+        }
+        return {
+            "state_branch_counts": {
+                "exact_branch_count": sum(row["branch_count"] for row in exact_rows),
+                "loss_branch_count": sum(row["branch_count"] for row in loss_rows),
+            },
+            "exact_branch_count_by_max_remaining_depth": by_max_remaining_depth,
+            "exact_branch_count_by_solve_budget": by_solve_budget,
+            "exact_branch_count_by_taint": by_taint,
+            "loss_branch_count_by_loss_budget": by_loss_budget,
+        }
+
     def stats(self):
         """Return (branch_best_rows, candidate_score_rows, decomposition_rows, last_updated_ts)."""
         sp = self._conn.execute("""

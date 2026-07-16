@@ -56,10 +56,9 @@ Top-level controls:
 2. One selector input labeled “Spine or @branch reference.”
 3. Apply and Back buttons.
 4. Tree toggle.
-5. Active-only toggle.
-6. Expandable filters for lifecycle, answer count, budget, priority, sort,
+5. Expandable filters for branch status, branch phase, answer count, budget, priority, sort,
    limit, hotspot field/epoch/window.
-7. Connection chip and generated timestamp.
+6. Connection chip and generated timestamp.
 
 The selector input always uses inference:
 
@@ -80,12 +79,14 @@ Encode navigation in `location.search`:
     ?selector=CRANE+-y--g
     &kind=auto
     &tree=1
-    &active_only=1
+    &branch_status=active,pending
+    &branch_phase=evaluating
     &sort=nodes
     &limit=25
     &poll=2000
 
-Omit default values. Use repeated `status` parameters. On Apply/filter
+Omit default values. Use one comma-separated parameter per branch-filter axis;
+`all` explicitly disables the root overview's default active filter. On Apply/filter
 changes, call `history.pushState`; Back uses browser history. `popstate`
 reconstructs controls and fetches immediately.
 
@@ -141,7 +142,7 @@ Every report renders:
 - queue, telemetry, and cache source paths;
 - telemetry epoch/label/revision;
 - partial source errors;
-- active filters;
+- active branch-status and branch-phase filters;
 - connection state.
 
 Paths collapse behind a details disclosure on phone widths.
@@ -154,21 +155,22 @@ Render:
 - context spine as Wordle pattern tiles;
 - response-group summary counts;
 - sortable response-group table/cards containing pattern, answer count,
-  lifecycle, cache state, best guess/ERD, `max_remaining_depth`, workers, and
+  branch status, branch phase, cache state, best guess/ERD,
+  `max_remaining_depth`, workers, and
   branch reference.
 
 Click/tap a response group appends its pattern to the selector and navigates
 to branch detail. No separate “open branch” mode chooser appears.
 
-Active-only hides nonactive response rows but leaves the unfiltered summary
-visible and labels the shown/matched counts.
+Branch filters hide unmatched response rows but leave the unfiltered summary
+visible and label the shown/matched counts.
 
 ## Branch detail
 
 Sections:
 
 1. Semantic spine and identity.
-2. Queue state: lifecycle, priority, budget, candidate progress, bulk-done
+2. Queue state: branch status, branch phase, priority, budget, candidate progress, bulk-done
    count, running best, ceiling, nodes, workers.
 3. Cache state: exact/loss/missing, best guess/ERD,
    `max_remaining_depth`, reusable-budget information.
@@ -184,6 +186,9 @@ refetches with `claims=1` and keeps that flag only while the disclosure is
 open. Do not request either payload for collapsed detail.
 
 Bulk-eliminated candidates display as proofs, not worker activity.
+A selected branch remains visible if a refresh moves it outside its parent
+filter. The detail calls that out; Back returns to the refreshed filtered
+parent, where the branch is absent.
 
 ## Tree layout
 
@@ -193,9 +198,9 @@ navigation tab. Its nodes derive only from extant queue rows and their
 recorded spines; cache results may annotate queued nodes but never create
 nodes.
 
-- Each node shows guess/pattern tiles, `guess_depth`, lifecycle, answer count,
+- Each node shows guess/pattern tiles, `guess_depth`, branch status and phase, answer count,
   progress, branch reference, and worker chips where available.
-- Context nodes remain visible when active-only filters descendants.
+- Context nodes remain visible when branch filters exclude descendants.
 - Unknown legacy spine segments render as `?` at their known
   `guess_depth`.
 - Clicking a branch node removes tree mode and navigates to its semantic
@@ -210,7 +215,7 @@ nodes.
 
 ### Overview
 
-Responsive header metrics, active branch cards, nested worker rows, and
+Responsive header metrics, filtered branch cards, nested worker rows, and
 idle/finalizing/dead worker lane. Preserve the useful information from the
 terminal overview without matching its exact line layout.
 
@@ -221,7 +226,7 @@ Tree toggle reuses the common tree renderer.
 
 ### Workers
 
-One stable card/chip per worker with lifecycle, heartbeat age, branch,
+One stable card/chip per worker with state, heartbeat age, branch,
 candidate, absolute `guess_depth`, node rate, cache/prune counters, and
 descent. Clicking its branch navigates to branch detail.
 
@@ -308,10 +313,10 @@ Required cases:
    type chooser.
 2. CACHE and QUEUE positional selectors request inferred word reports;
    navigation buttons request explicit cache/queue endpoints.
-3. Tree and active-only toggles alter URL/API state and keep the context node.
+3. Tree and comma-separated branch filters alter URL/API state and keep the context node.
 4. Clicking a word response group navigates to its full branch spine.
 5. Clicking a tree/branch reference navigates to detail.
-6. Overview renders user/cooperative branches and every worker lifecycle.
+6. Overview defaults to active branches and renders every worker state.
 7. Candidate disclosure performs a claims request only while expanded and
    labels bulk elimination without a worker chip.
 8. Exact/cut/loss and cut-reuse sections render distinctly.
@@ -320,12 +325,15 @@ Required cases:
 11. Sticky order survives input reordering and branch finalization.
 12. Expansion/collapse state survives polls and browser Back.
 13. Disconnect preserves prior data and recovers.
-14. URL state round-trips repeated statuses and compatible filters.
-15. Malicious fixture text renders literally and cannot create an element or
+14. URL state round-trips comma-separated status/phase values, including
+    explicit `all`, and compatible filters.
+15. Selected detail survives leaving its parent filter; Back returns to the
+    refreshed filtered collection.
+16. Malicious fixture text renders literally and cannot create an element or
     execute script.
-16. Tile colors match the Wordle palette.
-17. No horizontal body scroll at all required widths.
-18. Screenshot artifacts at 390 and 1200 px for overview, word, branch, and
+17. Tile colors match the Wordle palette.
+18. No horizontal body scroll at all required widths.
+19. Screenshot artifacts at 390 and 1200 px for overview, word, branch, and
     tree views are written to a temporary directory for reviewer inspection.
 
 ## Manual checklist
@@ -342,7 +350,7 @@ Required cases:
 
 - [ ] One self-contained browser client supports every report kind.
 - [ ] Word versus branch is inferred only from selector form.
-- [ ] Tree and active-only are ordinary shared controls.
+- [ ] Tree and branch status/phase are ordinary shared controls.
 - [ ] URL state is deep-linkable and browser-history aware.
 - [ ] Semantic identity/change behavior matches the terminal contract.
 - [ ] Bulk elimination is never presented as a worker.

@@ -11,7 +11,7 @@ questions are decided with the user.
 A pinch-zoomable map of the swarm's extant work:
 
 - zoomed out: the shape and concentration of queued work;
-- closer: recorded spines resolve into branches and lifecycle;
+- closer: recorded spines resolve into branches, status, and phase;
 - closer again: workers, progress, finalization, and live descent become
   visible;
 - finest useful level: a selected branch's current candidate sweep.
@@ -111,7 +111,7 @@ phase 6 context navigator:
 
 For each zoom level, define what a cluster summarizes and name its population
 and time window. Possible live measures include queued branch count,
-answer-count mass, nodes/wall, candidate progress, lifecycle, and worker
+answer-count mass, nodes/wall, candidate progress, branch status/phase, and worker
 activity. Avoid force-directed layout unless stable coordinates can be
 proven.
 

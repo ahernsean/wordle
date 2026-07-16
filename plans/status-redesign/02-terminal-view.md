@@ -92,7 +92,7 @@ Derive presentation values from report fields:
 - heartbeat ages from `generated_at - updated_at`;
 - node-rate and duration abbreviations.
 
-The report model remains the authority for lifecycle, answer flags,
+The report model remains the authority for branch status/phase, answer flags,
 `guess_depth`, `best_max_remaining_depth`, and identities.
 
 The text view has named sections:
@@ -105,10 +105,48 @@ The text view has named sections:
    ETA, and compact spine.
 5. Workers nested under branches, followed by idle/finalizing/dead workers.
 
-At width below 60 columns, remove lower-priority columns rather than
-truncating semantic identifiers or forcing horizontal scrolling. At width 80
-or greater, include source paths and expanded metrics. Exact breakpoints and
-spacing belong to renderer tests, not the model.
+### Adaptive width contract
+
+Terminal text is designed for 50–60-column sessions first, not obtained by
+rendering a wide row and clipping its tail. Every repeated row set is a table
+with one header. Field names such as `Phase`, `Age`, and `Current` appear once
+in that header; rows contain only values and never repeat `phase=`, `age=`,
+`candidate=`, or similar labels.
+
+`report_terminal.py` owns one reusable column-layout helper. Each column
+declares:
+
+- a short, unambiguous heading;
+- left or right alignment;
+- whether it is essential;
+- its removal priority when space tightens;
+- a minimum and optional maximum display width;
+- whether its values may be head- or tail-truncated.
+
+The helper measures headings and already-formatted values, including
+production-sized counts, then applies this order:
+
+1. include every column that fits at its measured width;
+2. remove nonessential columns in their declared order until the table fits;
+3. shrink only columns explicitly marked elastic;
+4. below the minimum tabular width, use stacked heading/value rows.
+
+Branch references, worker IDs, warnings, response patterns, and numeric
+progress remain complete. Spines, source paths, answer-word lists, and other
+free text are elastic; spines retain their most recent end when truncated.
+Summary prose wraps at field boundaries rather than disappearing behind a
+line-wide ellipsis.
+
+The overview's 50–59-column branch table keeps `Ref`, `GuessD`, `Phase`,
+`Done`, and `W`; wider layouts add answer count, bulk completion, best result,
+`MaxRD`, ETA, and spine in priority order. Worker tables keep identity, state,
+age, current candidate, and absolute maximum guess depth before optional rate
+and counter columns. At width 80 or greater, source paths and expanded metrics
+may appear, but the same measured layout still decides what actually fits.
+
+These rules apply to every terminal renderer added in phases 3a–3c and to the
+navigation footer in phase 3d. The report model never receives terminal width
+or presentation-priority state.
 
 ## Semantic change highlighting
 
@@ -176,19 +214,24 @@ Required cases:
 
 1. One-shot text contains source health, queue counts, branch reference,
    worker, `guess_depth`, and no ANSI when color is false.
-2. Narrow rendering has no line longer than the requested width.
-3. JSON output round-trips to the exact report dictionary.
-4. JSONL watch emits independently parseable lines.
-5. `json + watch` and sub-0.2-second intervals are rejected.
-6. Non-TTY watched text contains separators and no escape character.
-7. A branch progress improvement is green; an unrelated worker field change
+2. Overview rendering at widths 50, 55, 59, 60, 79, 80, and 120 has no line
+   longer than requested and exposes exactly the expected priority columns.
+3. Production-shaped values such as `12,616/12,972`, multi-digit workers, and
+   long spines cannot shift a value under the wrong heading.
+4. Narrow branch and worker rows use headers and contain no repeated field
+   labels; semantic identities and warnings remain complete.
+5. JSON output round-trips to the exact report dictionary.
+6. JSONL watch emits independently parseable lines.
+7. `json + watch` and sub-0.2-second intervals are rejected.
+8. Non-TTY watched text contains separators and no escape character.
+9. A branch progress improvement is green; an unrelated worker field change
    is red; ticking timestamps alone produce no highlight.
-8. Reordered input identities keep prior display order.
-9. A shrinking section clears its old terminal lines.
-10. Simulated collector failure followed by success retries and restores
+10. Reordered input identities keep prior display order.
+11. A shrinking section clears its old terminal lines.
+12. Simulated collector failure followed by success retries and restores
     cursor/terminal state.
-11. One source unavailable still renders the other source.
-12. Legacy `status` tests remain green unmodified.
+13. One source unavailable still renders the other source.
+14. Legacy `status` tests remain green unmodified.
 
 ## Acceptance checklist
 
@@ -196,6 +239,8 @@ Required cases:
 - [ ] One-shot text, JSON, and watched JSONL describe the same envelope.
 - [ ] Watch state lives in an object, not function attributes.
 - [ ] Change detection is semantic and identity-based.
+- [ ] Every overview table follows the adaptive width contract at 50–120
+      columns without losing identities or misaligning values.
 - [ ] Non-TTY output contains no cursor-control sequences.
 - [ ] Existing `status` remains available during this transition.
 - [ ] Full test suite passes.

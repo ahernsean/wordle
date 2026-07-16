@@ -6,7 +6,8 @@ Read phases 00–03a and `AGENTS.md` first. Requires phase 3a merged.
 
 Add bounded collection exploration over the semantic report model:
 
-- shared lifecycle, answer-count, budget, priority, sort, and limit filters;
+- shared branch-status, branch-phase, answer-count, budget, priority, sort,
+  and limit filters;
 - queue, worker, and cache reports;
 - live queue topology as an optional layout over compatible selections;
 - SQL-backed filtering and summaries before pagination.
@@ -29,8 +30,8 @@ Legacy inspection commands remain available until phase 3d.
 Add the frozen dataclass:
 
     ReportFilters(
-        active_only: bool = False,
-        statuses: tuple[str, ...] = (),
+        branch_statuses: tuple[str, ...] = (),
+        branch_phases: tuple[str, ...] = (),
         minimum_answer_count: int | None = None,
         maximum_answer_count: int | None = None,
         budget: int | None = None,
@@ -57,8 +58,8 @@ Extend `view` with:
     --worker N
     --cache
 
-    --active-only
-    --status STATUS          repeatable
+    --branch-status STATUSES
+    --branch-phase PHASES
     --minimum-answer-count N
     --maximum-answer-count N
     --budget N
@@ -71,9 +72,10 @@ Keep all phase 2 and 3a options. `--queue`, `--workers`, `--worker`, and
 filters it to that worker. A positional selector may scope any compatible
 kind. Reject meaningless combinations with a specific argparse error.
 
-`--active-only` and explicit `--status` are mutually exclusive.
-`--active-only` normalizes to lifecycle `active` and remains true in the
-echoed filter object.
+Status and phase values are comma-separated. `all` alone disables that axis's
+filter. Reject unknown values, duplicates, empty items, and `all` combined with
+another value. The root overview defaults to `--branch-status active`; other
+report kinds default to all branch statuses.
 
 ## Dispatch and scoping
 
@@ -105,7 +107,8 @@ never uses cache rows to create descendants.
 
 ## Filter behavior
 
-Normalize raw queue status through phase 1's lifecycle vocabulary before
+Normalize raw queue state through phase 1's branch-status and branch-phase
+vocabulary before
 filtering. Push filters into SQL wherever practical; do not load the complete
 queue merely because legacy helpers do.
 
@@ -119,9 +122,11 @@ When selected context is represented by queue-derived topology, retain it
 even when it does not match the row filter and mark `is_context=true`.
 Selector context remains in root metadata when no queue node is available.
 
-`--active-only` applies to queue rows, word response branches, tree
-descendants, and worker-associated branches. It does not alter singular
-branch detail, global cache totals, or the selected context root.
+Branch filters apply to queue rows, word response branches, tree descendants,
+and worker-associated branches. They do not remove singular branch detail,
+global cache totals, or the selected context root. A selected detail remains
+visible after refresh when it stops matching; returning to its parent reveals
+the refreshed filtered collection.
 
 ## Queue query helpers
 
@@ -174,7 +179,8 @@ Return a flat, identity-addressable node array:
                 "step": {"word": str, "pattern": str} | null,
                 "branch_key_hex": str | null,
                 "branch_reference": str | null,
-                "lifecycle": str | null,
+                "branch_status": str | null,
+                "branch_phase": str | null,
                 "answer_count": int | null,
                 "guess_depth": int,
                 "worker_count": int,
@@ -234,26 +240,38 @@ Add renderers for each collection kind and tree layout. Text and JSON consume
 the same envelopes. Phase 2 watch sessions retain sticky order by full
 identity and preserve selected context through refresh.
 
+Queue, worker, cache, and tree rows use phase 2's adaptive layout contract.
+The 50–59-column queue inventory retains full reference, phase, answer count,
+`GuessD`, and worker count. Worker rows retain full worker identity, state,
+age, current candidate, and absolute maximum guess depth. Cache coverage
+retains pattern, answer count, cache state, and full reference. Tree rendering
+switches from indentation to an explicit `GuessD` column when indentation
+would consume the narrow layout; the semantic step and reference remain
+complete. Summary dictionaries wrap across lines at entry boundaries.
+
 ## Tests
 
 Required coverage:
 
 1. `view --queue`, `--workers`, `--worker`, and `--cache` dispatch correctly;
    positional `QUEUE` and `CACHE` remain word selectors.
-2. `--active-only` exactly matches normalized active lifecycle and excludes
-   finalizing.
+2. Status and phase filters accept comma-separated values and enforce the
+   constrained status/phase combinations.
 3. Filtering occurs before limit and summaries count the unpaginated
    population.
 4. Word, branch, and root trees derive only from extant queue rows and their
    spines, have stable parents, and expose absolute `guess_depth`.
-5. Tree context survives filtering while unmatched descendants do not.
+5. Tree context and selected detail survive filtering while unmatched
+   descendants do not.
 6. Cache-only branch detail remains available but its tree is unavailable;
    word trees do not synthesize unqueued response groups.
 7. Missing legacy spine segments never fabricate guesses.
 8. Queue rows are not duplicated across user and cooperative state.
 9. Cache distributions obey existing reuse semantics.
 10. Incompatible report/option combinations fail with specific errors.
-11. All legacy inspection tests remain green.
+11. Every collection and tree renderer has exact width/column assertions at
+    50, 55, 59, 60, 79, 80, and 120 columns with production-sized values.
+12. All legacy inspection tests remain green.
 
 ## Acceptance checklist
 
@@ -262,6 +280,7 @@ Required coverage:
 - [ ] Tree is an option over compatible reports, not a report noun.
 - [ ] Tree nodes derive only from extant queue rows and recorded spines.
 - [ ] Cache-only solutions are never reconstructed as topology.
+- [ ] Collection and tree terminal views remain operational at 50 columns.
 - [ ] Legacy inspection commands remain available.
 - [ ] Full test suite passes.
 - [ ] No file outside the phase list is modified.

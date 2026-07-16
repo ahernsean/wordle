@@ -13,7 +13,7 @@ Create the presentation-neutral foundation used by every later client:
 - one versioned report envelope;
 - one minimal overview request;
 - normalized branch and worker entities;
-- normalized lifecycle and identity semantics;
+- normalized branch-status, branch-phase, and identity semantics;
 - a lightweight operational overview collector.
 
 The model prints nothing and contains no terminal, HTTP, or HTML logic.
@@ -41,7 +41,7 @@ The model prints nothing and contains no terminal, HTTP, or HTML logic.
 
 `report_model.py` exports:
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
     WORKER_LIVENESS_SECONDS = 30
 
     branch_reference(branch_key: bytes) -> str
@@ -115,7 +115,7 @@ aliased into the legacy renderer. `report_model.py` must not import
 
 The model normalizes business meaning that every client must agree on:
 
-- branch lifecycle;
+- branch status and phase;
 - `guess_depth`;
 - `best_max_remaining_depth` from the legacy
   `active_branches.best_max_depth` column;
@@ -134,26 +134,36 @@ The model does not calculate:
 - human abbreviations;
 - layout or ordering that exists only for display stability.
 
-`is_live` is a normalized lifecycle fact and may be included, calculated from
+`is_live` is a normalized worker fact and may be included, calculated from
 `generated_at - updated_at <= WORKER_LIVENESS_SECONDS`. Keep `updated_at` so
 renderers can calculate the displayed age.
 
-### Lifecycle vocabulary
+### Branch status, phase, and lifecycle
 
 SQLite uses different status values for user-queued and cooperative work.
-Normalize them before producing branch objects:
+Normalize them onto two related axes before producing branch objects.
+`branch_status` describes the branch's relationship to current work:
+`active`, `pending`, `done`, or `unqueued`. `branch_phase` describes durable
+search progress: `queued`, `evaluating`, `finalizing`, or `complete`.
 
-| Report lifecycle | Source state |
-|---|---|
-| `pending` | `pending_branches.status = 'pending'` |
-| `active` | user `in_progress` or cooperative `active_branches.status = 'open'` |
-| `finalizing` | finalized branch still referenced by a live heartbeat |
-| `done` | `pending_branches.status = 'done'` |
+The valid normal combinations are:
 
-Phase 3 adds `unqueued` for a derived word response branch absent from queue
-state. Cache state is independent of lifecycle and uses `exact`, `loss`,
-`missing`, or `not_applicable`. A cut is transient telemetry/coordination
-state, not an exact cache state.
+| Branch status | Branch phase | Meaning |
+|---|---|---|
+| `unqueued` | null | semantic branch without scheduled or persisted work |
+| `pending` | `queued` | scheduled and waiting for a worker |
+| `active` | `evaluating` | candidates are being evaluated now |
+| `pending` | `evaluating` | partial evaluation is waiting for a worker |
+| `active` | `finalizing` | a worker is persisting the completed evaluation |
+| `pending` | `finalizing` | interrupted finalization is waiting for a worker |
+| `done` | `complete` | a reusable result has been persisted |
+
+Worker arrival and departure changes status between `active` and `pending`
+without discarding phase progress. Cached and trivial branches may resolve
+directly to `done` / `complete`. Recovery may briefly return an interrupted
+finalization to `evaluating` before retrying it. Cache state remains a separate
+source fact and uses `exact`, `loss`, `missing`, or `not_applicable`. A cut is
+transient telemetry/coordination state, not an exact cache state.
 
 ## Bounded queue helper
 
@@ -257,8 +267,8 @@ Return every top-level key even under partial failure:
         "data": {
             "queue_counts": {
                 "pending_branch_count": int,
-                "active_user_branch_count": int,
-                "active_cooperative_branch_count": int,
+                "evaluating_user_branch_count": int,
+                "evaluating_cooperative_branch_count": int,
                 "finalizing_branch_count": int,
                 "done_branch_count": int,
             },
@@ -296,7 +306,8 @@ Every overview branch has:
 |---|---|
 | `branch_reference` | str, 12 hex without `@` |
 | `branch_key_hex` | str |
-| `lifecycle` | `active` or `finalizing` |
+| `branch_status` | `active`, `pending`, or `done` |
+| `branch_phase` | `queued`, `evaluating`, `finalizing`, or `complete` |
 | `raw_status` | source status string |
 | `answer_count` | int |
 | `candidate_count` | int |
@@ -373,10 +384,10 @@ still a renderer concern.
    named `claim_idx`.
 10. All-gray pattern code 0 produces `guess_depth == 1` in the legacy-spine
    fallback.
-11. A cooperative branch normalizes to `active` and contributes to
-   `active_cooperative_branch_count`.
-12. A finalized branch referenced by a live heartbeat normalizes to
-    `finalizing`; one referenced only by a dead heartbeat is not retained.
+11. A cooperative branch with a current worker normalizes to `active` and contributes to
+    `evaluating_cooperative_branch_count`.
+12. Finalizing branches remain visible as `active` or `pending` according to
+    current worker presence.
 13. Candidate progress batch lookup handles empty, missing, evaluated, and
     bulk-eliminated candidates.
 14. No overview branch object contains `best_max_depth` and no worker object

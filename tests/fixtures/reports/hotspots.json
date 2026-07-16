@@ -1,0 +1,7 @@
+{
+  "schema_version": 2, "report_kind": "hotspots", "generated_at": 1000,
+  "selector": {"kind": "root", "steps": [], "trailing_word": null, "branch_reference": null, "input_text": ""},
+  "filters": {"limit": 10}, "tree": false,
+  "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": false, "error": null}},
+  "data": {"field": "coordination", "population": "recent_claim_coordination_buckets", "epoch": 4, "since_seconds": 3600, "window_started_at": 0, "sample_size": 50000, "sampled_row_count": 400, "sample_truncated": false, "rows": [{"row_id": "coordination:20:4", "answer_count": 20, "worker_count": 4, "claim_count": 120, "coordination_millis": 900, "claim_retry_count": 4, "busy_wait_millis": 120}, {"row_id": "coordination:50:6", "answer_count": 50, "worker_count": 6, "claim_count": 80, "coordination_millis": 700, "claim_retry_count": 3, "busy_wait_millis": 90}]}
+}

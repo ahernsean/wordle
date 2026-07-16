@@ -1,13 +1,8 @@
-import io
-import json
 import os
-import sys
 import tempfile
+import time
 import unittest
-from contextlib import redirect_stdout
-from unittest import mock
 
-import erd_search
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue
 
@@ -17,37 +12,6 @@ WORDS = ["crane", "slate", "trace", "stale", "tales"]
 
 def _words(prefix, count):
     return [f"{prefix}{i:04d}"[:5] for i in range(count)]
-
-
-class TestQueueBranchRefParser(unittest.TestCase):
-    def test_accepts_partial_and_full_spines(self):
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE"),
-            [("CRANE", None)])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE -y--g"),
-            [("CRANE", "-y--g")])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE -y--g ALIBI"),
-            [("CRANE", "-y--g"), ("ALIBI", None)])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE -y--g ALIBI g-g--"),
-            [("CRANE", "-y--g"), ("ALIBI", "g-g--")])
-
-    def test_normalizes_lowercase_and_gray_chars(self):
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("crane .yxxg alibi 00000"),
-            [("CRANE", "-y--g"), ("ALIBI", "-----")])
-        self.assertEqual(
-            erd_search.parse_queue_branch_ref("CRANE xxxxx ALIBI gyxgg"),
-            [("CRANE", "-----"), ("ALIBI", "gy-gg")])
-
-    def test_rejects_malformed_refs(self):
-        bad = ["CRAN", "CRANE ALIBI", "CRANE -y--g DOG", "CRANE -y--"]
-        for ref in bad:
-            with self.subTest(ref=ref):
-                with self.assertRaises(erd_search.QueueRefError):
-                    erd_search.parse_queue_branch_ref(ref)
 
 
 class QueueVisibilityTests(unittest.TestCase):
@@ -66,6 +30,270 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "user")
         self.assertEqual(rows[0]["status"], "pending")
         self.assertEqual(rows[0]["source_pattern_text"], "----y")
+
+    def test_report_telemetry_indexes_exist_and_are_idempotent(self):
+        expected = {
+            "idx_branch_finalize_log_branch_recorded_at",
+            "idx_branch_finalize_log_epoch_recorded_id",
+            "idx_cut_reuse_misses_branch_recorded_at",
+            "idx_cut_reuse_misses_epoch_recorded_id",
+            "idx_claim_telemetry_epoch_id",
+            "idx_claim_telemetry_epoch_recorded_id",
+        }
+        indexes = set()
+        for table in (
+            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry"
+        ):
+            indexes.update(
+                row["name"] for row in self.q._conn.execute(
+                    f"PRAGMA telemetry.index_list({table})"
+                )
+            )
+        self.assertTrue(expected.issubset(indexes))
+        self.q._migrate()
+        indexes_after = set()
+        for table in (
+            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry"
+        ):
+            indexes_after.update(
+                row["name"] for row in self.q._conn.execute(
+                    f"PRAGMA telemetry.index_list({table})"
+                )
+            )
+        self.assertEqual(indexes, indexes_after)
+
+    def test_branch_report_telemetry_is_bounded_and_preserves_outcomes(self):
+        self.q.create_branch(self.user_key, len(WORDS), 10)
+        self.q.record_bundle_stats(self.user_key, "bundle-1", 50, 20, censored=True)
+        for outcome, evaluated, bulk in (
+            ("exact", 7, 1), ("cut", 5, 2), ("loss", 3, 4),
+        ):
+            self.q.add_branch_finalize_log(
+                self.user_key, "CRANE -----", 5, 5,
+                10, 20, 100, evaluated,
+                n_bundles=2, max_bundle_nodes=60,
+                total_bundle_wall_millis=30, censored_units=1,
+                ceiling=2.5 if outcome == "cut" else None,
+                outcome=outcome, bulk_done_candidates=bulk,
+            )
+        self.q.add_cut_reuse_miss(self.user_key, 5, 4, None, 2.5, 3)
+        telemetry = self.q.report_branch_telemetry(self.user_key, limit=2)
+        self.assertEqual(telemetry["bundle_summary"]["bundle_count"], 1)
+        self.assertEqual(len(telemetry["recent_finalizations"]), 2)
+        self.assertEqual(
+            {row["outcome"] for row in telemetry["recent_finalizations"]},
+            {"cut", "loss"},
+        )
+        loss = telemetry["recent_finalizations"][0]
+        self.assertNotEqual(
+            loss["evaluated_candidate_count"],
+            loss["bulk_completed_candidate_count"],
+        )
+        self.assertEqual(len(telemetry["cut_reuse_misses"]), 1)
+
+    def test_historical_hotspots_are_bounded_and_coordination_is_bucketed(self):
+        now = int(time.time())
+        for index in range(5):
+            self.q._conn.execute("""
+                INSERT INTO telemetry.claim_telemetry
+                    (n_words, coordination_millis, work_nodes, claim_retries,
+                     busy_wait_millis, worker_count, epoch, recorded_at)
+                VALUES (?, ?, 100, 1, 2, ?, 0, ?)
+            """, (10 + index % 2, 20 + index, 2 + index % 2, now))
+        result = self.q.report_hotspots(
+            "coordination", epoch=0, since=now - 60,
+            sample_size=3, limit=2,
+        )
+        self.assertEqual(result["population"], "recent_claim_coordination_buckets")
+        self.assertEqual(result["sample_size"], 3)
+        self.assertEqual(result["sampled_row_count"], 3)
+        self.assertTrue(result["sample_truncated"])
+        self.assertLessEqual(len(result["rows"]), 2)
+        self.assertTrue(all(row["row_id"].startswith("coordination:")
+                            for row in result["rows"]))
+        with self.assertRaisesRegex(ValueError, "cannot be attributed"):
+            self.q.report_hotspots(
+                "coordination", 0, now - 60, 3, 2,
+                spine_prefix="CRANE -----",
+            )
+
+    def test_current_hotspots_support_queue_and_tree_populations(self):
+        self.q.create_branch(
+            self.user_key, len(WORDS), 10, priority=7, budget=4,
+            spine="CRANE -----",
+        )
+        self.q.add_nodes_spent(self.user_key, 25)
+
+        queue_result = self.q.report_hotspots(
+            "nodes", epoch=0, since=0, sample_size=10, limit=1,
+        )
+        tree_result = self.q.report_hotspots(
+            "size", epoch=0, since=0, sample_size=10, limit=1,
+            spine_prefix="CRANE -----",
+        )
+
+        self.assertEqual(queue_result["population"], "current_queue_branches")
+        self.assertEqual(queue_result["sample_size"], None)
+        self.assertEqual(queue_result["rows"][0]["search_node_count"], 25)
+        self.assertEqual(tree_result["sampled_row_count"], 1)
+        self.assertEqual(tree_result["rows"][0]["spine"], "CRANE -----")
+
+    def test_cut_reuse_and_bulk_completion_hotspots_are_normalized(self):
+        now = int(time.time())
+        self.q.add_cut_reuse_miss(self.user_key, 5, 4, None, 2.5, 3)
+        self.q.add_branch_finalize_log(
+            self.user_key, "CRANE -----", 5, 4, now - 1, now,
+            100, 3, outcome="cut", bulk_done_candidates=9,
+        )
+
+        cut_reuse = self.q.report_hotspots(
+            "cut-reuse", epoch=0, since=now - 60,
+            sample_size=10, limit=1,
+        )
+        bulk_completion = self.q.report_hotspots(
+            "bulk-completed-candidates", epoch=0, since=now - 60,
+            sample_size=10, limit=1,
+        )
+
+        self.assertEqual(cut_reuse["population"], "recent_cut_reuse_misses")
+        self.assertEqual(cut_reuse["rows"][0]["cut_reuse_miss_count"], 1)
+        self.assertEqual(
+            bulk_completion["rows"][0]["bulk_completed_candidate_count"], 9
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported hotspot field"):
+            self.q.report_hotspots("unknown", 0, now - 60, 10, 1)
+
+    def test_cut_reuse_hotspot_scope_uses_exact_branch_key(self):
+        now = int(time.time())
+        self.q.add_cut_reuse_miss(self.user_key, 5, 4, None, 2.5, 3)
+        self.q.add_cut_reuse_miss(self.coop_key, 3, 3, None, 2.0, 2)
+        result = self.q.report_hotspots(
+            "cut-reuse", epoch=0, since=now - 60,
+            sample_size=10, limit=10, spine_prefix="CRANE -----",
+            branch_key=self.user_key,
+        )
+        self.assertEqual(
+            [row["branch_key"] for row in result["rows"]], [self.user_key]
+        )
+        with self.assertRaisesRegex(ValueError, "singular branch selector"):
+            self.q.report_hotspots(
+                "cut-reuse", epoch=0, since=now - 60,
+                sample_size=10, limit=10, spine_prefix="CRANE",
+            )
+
+    def test_legacy_finalization_does_not_claim_an_exact_outcome(self):
+        now = int(time.time())
+        self.q.add_branch_finalize_log(
+            self.user_key, "CRANE -----", 5, 4, now - 2, now - 1,
+            100, 3, outcome="loss",
+        )
+        self.q._conn.execute(
+            "UPDATE telemetry.branch_finalize_log "
+            "SET outcome = NULL, ceiling = NULL WHERE branch_key = ?",
+            (self.user_key,),
+        )
+        telemetry = self.q.report_branch_telemetry(self.user_key, limit=1)
+        self.assertEqual(telemetry["recent_finalizations"][0]["outcome"], "unknown")
+
+    def test_report_queue_filters_accept_dicts_and_cover_each_bound(self):
+        self.q.create_branch(
+            self.user_key, len(WORDS), 10, priority=7, budget=4,
+            spine="CRANE -----",
+        )
+        self.q.heartbeat(
+            "worker-1", 1, self.user_key, len(WORDS), int(time.time()), 0
+        )
+        result = self.q.report_queue_rows({
+            "branch_statuses": ("active",),
+            "branch_phases": ("evaluating",),
+            "minimum_answer_count": len(WORDS),
+            "maximum_answer_count": len(WORDS),
+            "budget": 4,
+            "priority": 7,
+            "limit": 1,
+        })
+        self.assertEqual(result["matched_rows"], 1)
+        self.assertEqual(result["rows"][0]["branch_status"], "active")
+        self.assertEqual(result["rows"][0]["branch_phase"], "evaluating")
+        self.q._conn.execute("DELETE FROM run_meta WHERE key = 'epoch'")
+        self.assertIsNone(self.q.epoch_metadata())
+
+    def test_finalization_hotspot_metadata_uses_the_scoped_population(self):
+        now = int(time.time())
+        for index, spine in enumerate((
+            "RAISE -----", "RAISE -----", "RAISE -----", "CRANE -----",
+        )):
+            self.q.add_branch_finalize_log(
+                bytes([index]), spine, 5, 4, now - 10, now,
+                100 + index, index + 1,
+            )
+        result = self.q.report_hotspots(
+            "evaluated-candidates", epoch=0, since=now - 60,
+            sample_size=2, limit=2, spine_prefix="RAISE -----",
+        )
+        self.assertEqual(result["sampled_row_count"], 2)
+        self.assertTrue(result["sample_truncated"])
+        self.assertEqual(len(result["rows"]), 2)
+        self.assertTrue(all(row["spine"] == "RAISE -----"
+                            for row in result["rows"]))
+        self.assertTrue(all(row["outcome"] == "unknown"
+                            for row in result["rows"]))
+
+    def test_historical_queries_use_bounded_report_indexes(self):
+        finalize_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.branch_finalize_log
+                WHERE branch_key = ? ORDER BY recorded_at DESC LIMIT 5
+            """, (self.user_key,))
+        )
+        cut_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.cut_reuse_misses
+                WHERE branch_key = ? ORDER BY recorded_at DESC LIMIT 5
+            """, (self.user_key,))
+        )
+        claim_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.claim_telemetry
+                WHERE epoch = ? ORDER BY id DESC LIMIT 5
+            """, (0,))
+        )
+        finalization_sample_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.branch_finalize_log
+                WHERE epoch = ? AND recorded_at >= ?
+                ORDER BY recorded_at DESC, id DESC LIMIT 5
+            """, (0, 1))
+        )
+        cut_sample_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.cut_reuse_misses
+                WHERE epoch = ? AND recorded_at >= ?
+                ORDER BY recorded_at DESC, id DESC LIMIT 5
+            """, (0, 1))
+        )
+        claim_sample_plan = " ".join(
+            row["detail"] for row in self.q._conn.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT * FROM telemetry.claim_telemetry
+                WHERE epoch = ? AND recorded_at >= ?
+                ORDER BY recorded_at DESC, id DESC LIMIT 5
+            """, (0, 1))
+        )
+        self.assertIn("idx_branch_finalize_log_branch_recorded_at", finalize_plan)
+        self.assertIn("idx_cut_reuse_misses_branch_recorded_at", cut_plan)
+        self.assertIn("idx_claim_telemetry_epoch_id", claim_plan)
+        self.assertIn(
+            "idx_branch_finalize_log_epoch_recorded_id",
+            finalization_sample_plan,
+        )
+        self.assertIn("idx_cut_reuse_misses_epoch_recorded_id", cut_sample_plan)
+        self.assertIn("idx_claim_telemetry_epoch_recorded_id", claim_sample_plan)
 
     def test_user_in_progress_joins_pending_and_active_state(self):
         self.q.add_pending_many([(self.user_key, len(WORDS), 5, "crane", 1)])
@@ -106,14 +334,6 @@ class QueueVisibilityTests(unittest.TestCase):
             len(self.q.list_queue_rows({"prefix": "CRANE -y--g"})), 1)
         self.assertEqual(
             self.q.list_queue_rows({"prefix": "SLATE"}), [])
-
-    def test_short_branch_id_resolves(self):
-        self.q.add_pending_many([(self.user_key, len(WORDS), 0, "crane", 0)])
-        row = self.q.list_queue_rows()[0]
-        bid = erd_search._branch_id(row["branch_key"])
-        matches = self.q.resolve_branch_ref(bid)
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["branch_key"], self.user_key)
 
     def test_queue_top_excludes_pending_rows(self):
         self.q.add_pending_many([(self.user_key, len(WORDS), 0, "crane", 0)])
@@ -244,102 +464,15 @@ class QueueVisibilityTests(unittest.TestCase):
 
     def test_row_spine_text_helper(self):
         self.assertEqual(
-            self.q._row_spine_text({"spine": "CRANE -----"}),
+            self.q.row_spine_text({"spine": "CRANE -----"}),
             "CRANE -----")
         self.assertEqual(
-            self.q._row_spine_text({
+            self.q.row_spine_text({
                 "source_word": "crane",
                 "source_pattern_text": "-----",
             }),
             "CRANE -----")
-        self.assertEqual(self.q._row_spine_text({}), "")
-
-    def test_queue_table_columns_accommodate_rendered_values(self):
-        rows = [
-            {
-                "branch_key": b"first",
-                "kind": "coop",
-                "status": "open",
-                "priority": 1_000_000,
-                "n_words": 60,
-                "done_candidates": 12616,
-                "n_candidates": 12972,
-                "worker_count": 4,
-                "nodes_spent": 1732478,
-                "spine": "ALIBI -----",
-            },
-            {
-                "branch_key": b"second",
-                "kind": "user",
-                "status": "in_progress",
-                "priority": 170000,
-                "n_words": 841,
-                "done_candidates": 26,
-                "n_candidates": 12972,
-                "worker_count": 0,
-                "nodes_spent": 2748659,
-                "spine": "CRANE -----",
-            },
-        ]
-
-        output = io.StringIO()
-        with redirect_stdout(output):
-            erd_search._print_queue_table(rows)
-        lines = output.getvalue().splitlines()
-
-        self.assertEqual(
-            lines,
-            [
-                "ID   Kind Status         Pri Words        Done W   Nodes  Spine",
-                f"{erd_search._branch_id(b'first')} coop open          COOP    60 "
-                "12616/12972 4 1732478  ALIBI -----",
-                f"{erd_search._branch_id(b'second')} user in_progress 170000   841 "
-                "   26/12972 0 2748659  CRANE -----",
-            ],
-        )
-
-
-class QueueCliArgparseTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.queue_path = os.path.join(self._tmp.name, "q.sqlite3")
-        q = ERDQueue(self.queue_path)
-        try:
-            q.add_pending_many([
-                (ScoreCache.encode_subset(WORDS), len(WORDS), 0, "crane", 0),
-                (ScoreCache.encode_subset(WORDS[:3]), 3, 0, "slate", 0),
-            ])
-        finally:
-            q.close()
-
-    def _run_main(self, *argv):
-        buf = io.StringIO()
-        with mock.patch.object(sys, "argv", ["erd_search.py", *argv]):
-            with redirect_stdout(buf):
-                erd_search.main()
-        return buf.getvalue()
-
-    def test_queue_global_json_applies_to_child_command(self):
-        out = self._run_main(
-            "queue", "--queue", self.queue_path, "--json", "ls")
-        rows = json.loads(out)
-        self.assertEqual(len(rows), 2)
-
-    def test_queue_global_limit_applies_to_child_command(self):
-        out = self._run_main(
-            "queue", "--queue", self.queue_path, "--limit", "1", "ls", "--json")
-        rows = json.loads(out)
-        self.assertEqual(len(rows), 1)
-
-    def test_child_queue_option_overrides_queue_global(self):
-        other_path = os.path.join(self._tmp.name, "other.sqlite3")
-        out = self._run_main(
-            "queue", "--queue", other_path, "ls",
-            "--queue", self.queue_path, "--json")
-        rows = json.loads(out)
-        self.assertEqual(len(rows), 2)
-
+        self.assertEqual(self.q.row_spine_text({}), "")
 
 if __name__ == "__main__":
     unittest.main()

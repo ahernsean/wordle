@@ -3,8 +3,8 @@
 Covers the pieces that keep the queue WAL bounded and the disk from filling:
 ERDQueue.checkpoint's result row (SQLite reports checkpoint contention in the
 row, not as an exception), the checkpoint_pause quiesce flag, the disk-stop
-latch, the supervisor's _disk_guard / _supervisor_checkpoint, and the status
-display's disk line.
+latch, the supervisor's _disk_guard / _supervisor_checkpoint, and the report
+view's disk line.
 """
 import os
 import sqlite3
@@ -16,6 +16,8 @@ from unittest import mock
 import erd_search
 from erd_queue import (ERDQueue, disk_stats, DISK_SAMPLE_KEEP,
                        DISK_WARN_FRACTION, DISK_STOP_FRACTION)
+from report_model import disk_fill_rate
+from report_terminal import format_disk_size, render_disk_status
 
 
 class _TmpQueue(unittest.TestCase):
@@ -152,17 +154,17 @@ class TestSupervisorCheckpoint(_TmpQueue):
 
 class TestFmtSize(unittest.TestCase):
     def test_thousands_separator_on_large_values(self):
-        self.assertEqual(erd_search._fmt_size(1234 * 2 ** 30), "1,234G")
-        self.assertEqual(erd_search._fmt_size(1000 * 2 ** 20), "1,000M")
+        self.assertEqual(format_disk_size(1234 * 2 ** 30), "1,234G")
+        self.assertEqual(format_disk_size(1000 * 2 ** 20), "1,000M")
 
     def test_small_values_unchanged(self):
-        self.assertEqual(erd_search._fmt_size(512 * 2 ** 20), "512M")
-        self.assertEqual(erd_search._fmt_size(5 * 2 ** 30 // 2), "2.5G")
+        self.assertEqual(format_disk_size(512 * 2 ** 20), "512M")
+        self.assertEqual(format_disk_size(5 * 2 ** 30 // 2), "2.5G")
 
     def test_sub_megabyte_drops_to_kilobytes(self):
         # Below 1 MiB the value must not round to "0M"; it drops to K.
-        self.assertEqual(erd_search._fmt_size(30 * 2 ** 10), "30K")
-        self.assertEqual(erd_search._fmt_size(700 * 2 ** 10), "700K")
+        self.assertEqual(format_disk_size(30 * 2 ** 10), "30K")
+        self.assertEqual(format_disk_size(700 * 2 ** 10), "700K")
 
 
 class TestDiskStatusLine(_TmpQueue):
@@ -171,29 +173,37 @@ class TestDiskStatusLine(_TmpQueue):
         return {"total_bytes": used + avail, "used_bytes": used,
                 "avail_bytes": avail, "used_fraction": used_fraction}
 
+    def _render(self, used_fraction, samples, *, color=False):
+        stats = self._stats(used_fraction)
+        return render_disk_status({
+            "total_bytes": stats["total_bytes"],
+            "used_bytes": stats["used_bytes"],
+            "available_bytes": stats["avail_bytes"],
+            "used_fraction": stats["used_fraction"],
+            "queue_wal_bytes": 0,
+            "fill_rate_bytes_per_second": disk_fill_rate(samples, time.time()),
+            "warning_fraction": DISK_WARN_FRACTION,
+            "stop_fraction": DISK_STOP_FRACTION,
+        }, color=color)
+
     def test_plain_below_warn(self):
-        with mock.patch.object(erd_search, "disk_stats",
-                               return_value=self._stats(0.5)):
-            line = erd_search._disk_status_line(self.path, [])
+        line = self._render(0.5, [])
         self.assertIn("Disk:", line)
         self.assertIn("(50%)", line)
         self.assertNotIn("\033[31m", line)
 
     def test_red_at_warn_threshold(self):
-        with mock.patch.object(erd_search, "disk_stats",
-                               return_value=self._stats(DISK_WARN_FRACTION)):
-            line = erd_search._disk_status_line(self.path, [])
+        line = self._render(DISK_WARN_FRACTION, [], color=True)
         self.assertIn("\033[31m", line)
 
     def test_fill_rate_and_eta(self):
         now = int(time.time())
         st = self._stats(0.5)
         # 30 MiB/s of fill over the last 60 seconds; the rate shares the
-        # fullness/WAL binary units (_fmt_size), so it reads "30M/s".
+        # fullness/WAL binary units, so it reads "30M/s".
         samples = [[now - 60, st["avail_bytes"] + 60 * 30 * 2 ** 20],
                    [now, st["avail_bytes"]]]
-        with mock.patch.object(erd_search, "disk_stats", return_value=st):
-            line = erd_search._disk_status_line(self.path, samples)
+        line = self._render(0.5, samples)
         self.assertIn("filling 30M/s: 90% in ~", line)
 
     def test_rate_shares_units_with_sizes(self):
@@ -202,8 +212,7 @@ class TestDiskStatusLine(_TmpQueue):
         st = self._stats(0.5)
         samples = [[now - 60, st["avail_bytes"] + 60 * 30 * 2 ** 20],
                    [now, st["avail_bytes"]]]
-        with mock.patch.object(erd_search, "disk_stats", return_value=st):
-            line = erd_search._disk_status_line(self.path, samples)
+        line = self._render(0.5, samples)
         self.assertNotIn("MB/s", line)
         self.assertIn("M/s", line)
 
@@ -212,8 +221,7 @@ class TestDiskStatusLine(_TmpQueue):
         st = self._stats(0.5)
         samples = [[now - 60, st["avail_bytes"] - 60 * 30 * 2 ** 20],
                    [now, st["avail_bytes"]]]
-        with mock.patch.object(erd_search, "disk_stats", return_value=st):
-            line = erd_search._disk_status_line(self.path, samples)
+        line = self._render(0.5, samples)
         self.assertIn("freeing 30M/s", line)
         self.assertNotIn("filling", line)
 
@@ -225,8 +233,7 @@ class TestDiskStatusLine(_TmpQueue):
         st = self._stats(0.5)
         samples = [[now - 100, st["avail_bytes"] + 100 * 30_000],  # ~30 kB/s
                    [now, st["avail_bytes"]]]
-        with mock.patch.object(erd_search, "disk_stats", return_value=st):
-            line = erd_search._disk_status_line(self.path, samples)
+        line = self._render(0.5, samples)
         self.assertIn("filling 29K/s", line)
         self.assertNotIn("0.0", line)
 
@@ -237,16 +244,13 @@ class TestDiskStatusLine(_TmpQueue):
         st = self._stats(0.5)
         samples = [[now - 100, st["avail_bytes"] + 100 * 5_000],   # ~5 kB/s
                    [now, st["avail_bytes"]]]
-        with mock.patch.object(erd_search, "disk_stats", return_value=st):
-            line = erd_search._disk_status_line(self.path, samples)
+        line = self._render(0.5, samples)
         self.assertIn("steady", line)
         self.assertNotIn("filling", line)
 
     def test_regression_ignores_one_noisy_endpoint(self):
-        # A steady ~10 MB/s fill with one wildly noisy final reading (a burst
-        # of freed space).  The old oldest-vs-newest secant anchored on that
-        # endpoint and would have reported "freeing"; the regression over the
-        # whole window still reports the true filling trend.
+        # A steady ~10 MB/s fill with one wildly noisy final reading still
+        # reports the trend fitted across the full window.
         now = int(time.time())
         st = self._stats(0.5)
         n_steps, step_seconds, step_bytes = 12, 30, 10 * 2 ** 20
@@ -256,8 +260,7 @@ class TestDiskStatusLine(_TmpQueue):
                     start_avail - k * step_bytes]
                    for k in range(n_steps + 1)]
         samples[-1][1] += 50 * 2 ** 20   # noisy last reading: a freeing burst
-        with mock.patch.object(erd_search, "disk_stats", return_value=st):
-            line = erd_search._disk_status_line(self.path, samples)
+        line = self._render(0.5, samples)
         self.assertIn("filling", line)
 
     def test_stale_samples_show_no_rate(self):
@@ -265,38 +268,35 @@ class TestDiskStatusLine(_TmpQueue):
         st = self._stats(0.5)
         samples = [[now - 4000, st["avail_bytes"] + 10 ** 9],
                    [now - 3600, st["avail_bytes"]]]
-        with mock.patch.object(erd_search, "disk_stats", return_value=st):
-            line = erd_search._disk_status_line(self.path, samples)
+        line = self._render(0.5, samples)
         self.assertNotIn("filling", line)
 
 
 class TestDiskFillRate(unittest.TestCase):
-    """_disk_fill_rate fits a slope across every fresh sample rather than the
-    oldest and newest alone, so a single noisy reading can't swing the rate
-    the way a two-point secant would."""
+    """The fill rate fits a slope across every fresh sample."""
 
     def test_two_points_matches_secant(self):
         now = time.time()
         samples = [[now - 60, 1_000_000], [now, 400_000]]
         # avail fell 600,000 over 60 s -> filling 10,000 B/s.
-        self.assertAlmostEqual(erd_search._disk_fill_rate(samples, now), 10_000)
+        self.assertAlmostEqual(disk_fill_rate(samples, now), 10_000)
 
     def test_perfectly_linear_series_recovers_exact_slope(self):
         now = time.time()
         # Chronological, oldest first: avail falls 150,000 every 30 s = 5 kB/s.
         samples = [[now - (10 - k) * 30, 2_000_000 - k * 150_000]
                    for k in range(11)]
-        self.assertAlmostEqual(erd_search._disk_fill_rate(samples, now),
+        self.assertAlmostEqual(disk_fill_rate(samples, now),
                                5_000.0, delta=1.0)
 
     def test_single_fresh_sample_has_no_rate(self):
         now = time.time()
-        self.assertIsNone(erd_search._disk_fill_rate([[now, 1_000_000]], now))
+        self.assertIsNone(disk_fill_rate([[now, 1_000_000]], now))
 
     def test_stale_samples_are_excluded(self):
         now = time.time()
         samples = [[now - 4000, 2_000_000], [now - 3600, 1_000_000]]
-        self.assertIsNone(erd_search._disk_fill_rate(samples, now))
+        self.assertIsNone(disk_fill_rate(samples, now))
 
 
 if __name__ == "__main__":
