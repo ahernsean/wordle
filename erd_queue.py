@@ -96,6 +96,19 @@ CHECKPOINT_PAUSE_STALE_SECONDS = 60
 # changes() on the delete/update paths); only this width is an estimate.
 _CLAIM_ROW_WAL_BYTES = 96
 
+# WAL frames are whole database pages; the traffic estimate's per-commit floor
+# is expressed in these.
+_WAL_PAGE_BYTES = 4096
+
+# Queue WAL size at which the swarm must stop rather than keep writing: the
+# quiesce/TRUNCATE machinery has failed to reclaim the WAL and the disk is at
+# risk.  Enforced twice — by the supervisor (which latches the swarm down and
+# collects diagnostics) and by each worker as a backstop (a worker that
+# outlives the supervisor, or spins without reaching a bundle boundary, must
+# still stop writing on its own).  Overridable via QUEUE_WAL_HARD_CEILING_GIB.
+QUEUE_WAL_HARD_CEILING_BYTES = int(
+    float(os.environ.get('QUEUE_WAL_HARD_CEILING_GIB', '32')) * 1024 ** 3)
+
 # Disk sample ring length for the status display's growth rate (see
 # record_disk_sample); at the supervisor's 30s cadence this covers ~10 min.
 DISK_SAMPLE_KEEP = 20
@@ -616,9 +629,21 @@ class ERDQueue:
 
         approx_bytes is a key-width estimate, not an exact frame count: the
         point is relative magnitude between categories (which table is the
-        firehose), not a byte-accurate WAL model."""
+        firehose), not a byte-accurate WAL model.
+
+        Write categories are floored at a per-commit page estimate: each tally
+        call is roughly one autocommit transaction, and a transaction appends
+        whole 4 KiB pages to the WAL — a one-row write costs a few pages (leaf,
+        index, overhead), never its row width.  Without the floor, a storm of
+        tiny transactions reads as ~100 bytes each and the attribution
+        under-reports the real WAL fill rate by orders of magnitude.  Read
+        categories (suffixed '(read)') append nothing to the WAL and are
+        exempt."""
         if rows <= 0:
             return
+        if not category.endswith('(read)'):
+            approx_bytes = max(approx_bytes,
+                               _WAL_PAGE_BYTES * (2 + rows // 8))
         self._wal_traffic_rows[category] += rows
         self._wal_traffic_bytes[category] += max(0, approx_bytes)
 
@@ -1278,6 +1303,11 @@ class ERDQueue:
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
               best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
               cur_max_depth, cur_nodes, node_rate, cur_path))
+        # Attributed so a heartbeat write storm is visible in the WAL report: an
+        # unthrottled per-candidate heartbeat is a full-page WAL frame each and
+        # otherwise hides here, uncategorised.
+        self._tally_wal_traffic('worker_heartbeat/heartbeat', 1,
+                                _CLAIM_ROW_WAL_BYTES)
 
     def clear_heartbeat(self, worker_id: str):
         self._conn.execute(

@@ -48,6 +48,7 @@ from wordle_engine import (
 from erd_queue import (ERDQueue, decode_subset, encode_subset,
                        guess_depth_from_spine, disk_stats,
                        DISK_STOP_FRACTION,
+                       QUEUE_WAL_HARD_CEILING_BYTES,
                        DEFAULT_SMALL_COUNT, DEFAULT_COUNT_CAP,
                        DEFAULT_REPUBLISH_LIMIT)
 from wordle_ui import fmt_pattern
@@ -80,6 +81,9 @@ CHECKPOINT_JITTER = 0.25
 # claim boundary (workers stay off the queue database between polls).
 PAUSE_POLL_SECONDS = 2.0
 DISK_CHECK_SECONDS = 30       # disk fullness check throttle (workers)
+# Worker-side WAL hard-ceiling check throttle.  The check is one getsize()
+# call; the throttle keeps it out of per-node and per-iteration hot paths.
+WAL_CEILING_CHECK_SECONDS = 5.0
 # A branch still status='finalized' this long after finalized_at has a dead
 # finalizer (a live one completes the cache write + delete in milliseconds)
 # and is reopened by a waiting sibling.
@@ -225,17 +229,26 @@ class _MidLoopPublisher:
         """Called just before the candidate loop of each _solve_subset frame.
 
         Returns an opaque token
-        (nodes_at_entry, predicted, entry_time, branch_words, budget) for any
-        non-trivial frame (>= MIN_PUBLISH_BRANCH_WORDS answer words).  predicted
-        may be None (cold model) — the node-proportionate check then can't arm,
-        but the wall-clock backstop in check() still fires off entry_time, and
-        record_inline() still warms the model on frame completion.
+        [nodes_at_entry, predicted, entry_time, branch_words, budget, armed]
+        for any non-trivial frame (>= MIN_PUBLISH_BRANCH_WORDS answer words).
+        predicted may be None (cold model) — the node-proportionate check then
+        can't arm, but the wall-clock backstop in check() still fires off
+        entry_time, and record_inline() still warms the model on frame
+        completion.
+
+        The token is mutable: check() clears the trailing `armed` flag when a
+        publication is declined (unjoinable existing row, cooperative decline,
+        WAL ceiling), committing the frame to finish inline.  Without the
+        latch, the overrun condition — still true on every subsequent
+        iteration — would re-run the whole publish sequence per candidate,
+        an O(n²) write storm against a branch that can never be joined.
         """
         n = len(branch_words)
         if n < MIN_PUBLISH_BRANCH_WORDS:
             return None
         predicted = self._worker._typical(n, budget)
-        return (self._worker._nodes, predicted, time.time(), branch_words, budget)
+        return [self._worker._nodes, predicted, time.time(), branch_words,
+                budget, True]
 
     def check(self, token, candidate_list, last_index,
               best_guess, best_erd, budget):
@@ -248,46 +261,53 @@ class _MidLoopPublisher:
 
         Fires on either of two triggers:
         - node-proportionate: the frame has spent > OVERRUN_K * predicted nodes
-          since enter() (warm model only — disabled when predicted is None);
+          since enter() (warm model only — disabled when predicted is None),
+          AND at least _publish_threshold() nodes in absolute terms (the
+          break-even gate below);
         - wall-clock backstop: the frame has run longer than COLD_BACKSTOP_SECONDS
           since enter() (always armed, the only guard while the model is cold).
 
         When either fires and enough candidates remain to be worth handing off,
         emits the promotion sentinel, publishes the remainder as a cooperative
         branch, and returns the cooperative result so the engine can short-
-        circuit.  Returns None to continue inline.
+        circuit.  Returns None to continue inline — either transiently (the
+        trigger may fire again later in the frame) or permanently, by clearing
+        the token's armed flag, when the publication was declined and every
+        retry would be declined the same way.
         """
-        if token is None:
+        if token is None or not token[5]:
             return None
-        nodes_at_entry, predicted, entry_time, branch_words, entry_budget = token
+        nodes_at_entry, predicted, entry_time, branch_words, entry_budget = \
+            token[:5]
         delta = self._worker._nodes - nodes_at_entry
         node_overrun = predicted is not None and delta > OVERRUN_K * predicted
         elapsed = time.time() - entry_time
         time_overrun = elapsed > COLD_BACKSTOP_SECONDS
         if not (node_overrun or time_overrun):
             return None
+        # Break-even gate: a handoff pays roughly _publish_threshold()
+        # node-equivalents of coordination, so the frame must have proven at
+        # least that much work in absolute terms before publishing is worth
+        # it.  The proportionate trigger alone cannot be trusted for this:
+        # once the score cache is warm, most frames complete in a handful of
+        # nodes, the model's geometric mean sits near that cache-hit mode, and
+        # OVERRUN_K * typical can be single-digit nodes — which would hand off
+        # frames whose entire remainder costs less than the coordination to
+        # share them.  The wall-clock backstop is exempt: minutes of wall time
+        # prove the frame expensive regardless of its node count.
+        if not time_overrun and delta < self._worker._publish_threshold():
+            return None
         remaining_count = len(candidate_list) - (last_index + 1)
         if remaining_count < MIN_HANDOFF_CANDIDATES:
             return None
+        # A worker that must stop writing publishes nothing: publication is
+        # pure queue-write traffic.
+        if self._worker.cancel() or self._worker._wal_ceiling_tripped():
+            token[5] = False
+            return None
 
         n = len(branch_words)
-        # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
-        # tuned offline; the node-proportionate path is the model working as
-        # intended and isn't what we're tuning.
-        if time_overrun:
-            self._worker.queue.add_backstop_telemetry(
-                n, entry_budget, int(elapsed * 1000), delta, predicted, remaining_count)
-        # This frame is handed off before finishing, so its true cost exceeds the
-        # `delta` nodes measured so far: record a right-censored sample (a lower
-        # bound).  The online cost model only folds COMPLETED frames, so a partial
-        # never pollutes it; this keeps a capped monster honestly visible to an
-        # offline survival fit instead of vanishing.
-        self._worker.queue.add_cost_sample(
-            ERD_ALL, n, delta, 'censored', budget=entry_budget, censored=1)
         branch_key = encode_subset(branch_words)
-
-        # Spine sentinel: mark this frame as handed off in the heartbeat display.
-        self._worker._note_depth(entry_budget, -n, None, None)
 
         # A frame with no achieved best whose bound is finite is still riding
         # its entry alpha-beta ceiling (best_erd is only ever lowered from the
@@ -310,20 +330,58 @@ class _MidLoopPublisher:
             priority=PROMOTED_PRIORITY,
             source_word=self._worker._top_source_word,
             source_pattern=self._worker._top_source_pattern,
-            budget=budget, spine=self._worker._promoted_spine(),
+            budget=budget,
+            spine=self._worker._promoted_spine(
+                self._worker.root_budget - budget),
             root_budget=self._worker.root_budget,
             ceiling=branch_ceiling)
+
+        if created:
+            row_budget, row_ceiling = budget, branch_ceiling
+        else:
+            row = self._worker.queue.get_branch(branch_key)
+            row_budget = row['budget'] if row is not None else None
+            row_ceiling = row['ceiling'] if row is not None else None
+
+        # Joinability, decided BEFORE any write against the row and mirroring
+        # cooperative_solve's own decline rules: the budget must match exactly,
+        # and the row's ceiling must be NULL (exact) or >= ours.  A row that
+        # fails either test can never serve this frame; publishing to it would
+        # pour prefix marks into a branch this frame will not join — and since
+        # the overrun condition stays true on every later iteration, it would
+        # do so per candidate, forever.  Disarm the token and finish inline.
+        ours = best_erd if frame_ceilinged else None
+        joinable = row_budget == budget and (
+            row_ceiling is None or (ours is not None and row_ceiling >= ours))
+        if not joinable:
+            token[5] = False
+            return None
+
+        # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
+        # tuned offline; the node-proportionate path is the model working as
+        # intended and isn't what we're tuning.
+        if time_overrun:
+            self._worker.queue.add_backstop_telemetry(
+                n, entry_budget, int(elapsed * 1000), delta, predicted, remaining_count)
+        # This frame is handed off before finishing, so its true cost exceeds the
+        # `delta` nodes measured so far: record a right-censored sample (a lower
+        # bound).  The online cost model only folds COMPLETED frames, so a partial
+        # never pollutes it; this keeps a capped monster honestly visible to an
+        # offline survival fit instead of vanishing.
+        self._worker.queue.add_cost_sample(
+            ERD_ALL, n, delta, 'censored', budget=entry_budget, censored=1)
+
+        # Spine sentinel: mark this frame as handed off in the heartbeat display.
+        self._worker._note_depth(entry_budget, -n, None, None)
 
         # Mark the already-evaluated candidates done by their all_words index so
         # cooperative workers claim only the unevaluated remainder.  The prefix
         # slice is built here — only when an overrun actually fires — not on
         # every loop iteration.
         #
-        # Everything the prefix proved, it proved at THIS frame's budget: a
-        # raced row at another budget can take neither the done-marks nor the
-        # best seed (feasibility and cost are budget-specific).  With the
-        # budget matched, soundness of the marks depends on what the prefix
-        # was priced against:
+        # Everything the prefix proved, it proved at THIS frame's budget (the
+        # row's budget matches — joinability above).  Soundness of the marks
+        # then depends on what the prefix was priced against:
         # - an achieved best (best_guess set): sound — the seed below caps the
         #   branch's final value at that best, and every marked candidate is
         #   proven >= it;
@@ -333,15 +391,7 @@ class _MidLoopPublisher:
         #   ours (its outcomes then never contradict a >= ours price-out).  A
         #   racing creator may have won with a looser or absent ceiling — skip
         #   the marks then and let the branch redo the prefix.
-        if created:
-            row_budget, row_ceiling = budget, branch_ceiling
-        else:
-            row = self._worker.queue.get_branch(branch_key)
-            row_budget = row['budget'] if row is not None else None
-            row_ceiling = row['ceiling'] if row is not None else None
-        if row_budget != budget:
-            sound_to_mark = False
-        elif frame_ceilinged:
+        if frame_ceilinged:
             sound_to_mark = row_ceiling is not None and row_ceiling <= best_erd
         else:
             sound_to_mark = True
@@ -354,14 +404,19 @@ class _MidLoopPublisher:
 
         # Seed the cooperative branch's bound only when we have an achieved cost
         # (a None best_guess means no feasible candidate yet — the entry
-        # ceiling, if any, rides on the branch's ceiling column instead), and
-        # only at the matching budget: the seed is a budget-specific value.
-        if best_guess is not None and row_budget == budget:
+        # ceiling, if any, rides on the branch's ceiling column instead).
+        if best_guess is not None:
             self._worker.queue.update_branch_best(branch_key, best_guess, best_erd)
 
-        return self._worker.cooperative_solve(
+        result = self._worker.cooperative_solve(
             branch_words, budget,
             ceiling=best_erd if frame_ceilinged else float('inf'))
+        if result is None:
+            # cooperative_solve re-checked joinability and declined: a racing
+            # writer changed the row between our read and its own.  The frame
+            # solves inline from here on.
+            token[5] = False
+        return result
 
     def record_inline(self, token):
         """Called on the SOLVED return of each completed _solve_subset frame.
@@ -374,7 +429,8 @@ class _MidLoopPublisher:
         """
         if token is None:
             return
-        nodes_at_entry, _predicted, _entry_time, branch_words, entry_budget = token
+        nodes_at_entry, _predicted, _entry_time, branch_words, entry_budget = \
+            token[:5]
         n = len(branch_words)
         nodes = self._worker._nodes - nodes_at_entry
         if nodes <= 0:
@@ -452,6 +508,8 @@ class _BranchWorker:
         self._last_disk_check = time.time()
         self._last_pause_check = 0.0
         self._pause_active = False
+        self._last_wal_ceiling_check = 0.0
+        self._wal_ceiling_hit = False
         self._cand_max_depth = 0     # deepest guess_depth reached this candidate
         # Live search probe (transparency): a monotonic node counter plus the
         # active descent spine, so a long candidate evaluation never looks
@@ -636,11 +694,19 @@ class _BranchWorker:
             return stored
         return self._spine_budget(branch['spine'] if 'spine' in keys else None)
 
-    def _promoted_spine(self):
+    def _promoted_spine(self, max_guess_depth=None):
         """Absolute root -> promoted-branch spine: the claimed branch's base plus
         the live descent guesses (guess_depth-ordered "GUESS pattern" tokens).
         Returns None when the base is unknown, leaving the branch row to fall back
         to the source word.  Sentinel/size-only spine entries (no guess) are skipped.
+
+        max_guess_depth caps the composed spine at the promoted branch's own
+        guess depth (root_budget - its budget).  The live descent map keeps
+        entries from deeper frames the engine has already unwound out of — a
+        candidate loop that recursed to depth d and returned still shows the
+        depth-d edge — so without the cap a promotion at a shallower frame
+        composes a spine longer than its budget allows, which create_branch's
+        budget + guess_depth = root_budget invariant rejects.
         """
         base = getattr(self, '_claimed_branch_spine', None)
         if not base:
@@ -656,6 +722,8 @@ class _BranchWorker:
         for guess_depth in sorted(getattr(self, '_spine', {})):
             if guess_depth <= base_guess_depth:
                 continue
+            if max_guess_depth is not None and guess_depth > max_guess_depth:
+                break
             _size, guess, pattern = self._spine[guess_depth]
             if not (guess and guess != '•' and pattern):
                 continue
@@ -744,6 +812,32 @@ class _BranchWorker:
             self._last_checkpoint = now
             self._log_wal_traffic(now)
 
+    def _wal_ceiling_tripped(self) -> bool:
+        """Worker-side backstop for the queue WAL hard ceiling.
+
+        The supervisor enforces the same ceiling, but a worker that outlives
+        the supervisor — or spins in a coordination path that never reaches a
+        bundle boundary — must stop writing on its own before the WAL fills
+        the disk.  Latches once tripped and requests a stop; throttled to one
+        file-size probe per WAL_CEILING_CHECK_SECONDS so it is safe to call
+        from hot paths."""
+        if self._wal_ceiling_hit:
+            return True
+        now = time.time()
+        if now - self._last_wal_ceiling_check < WAL_CEILING_CHECK_SECONDS:
+            return False
+        self._last_wal_ceiling_check = now
+        wal_bytes = self.queue.wal_size_bytes()
+        if wal_bytes >= QUEUE_WAL_HARD_CEILING_BYTES:
+            self._wal_ceiling_hit = True
+            logger.critical(
+                '%s queue WAL %.2f GB breached hard ceiling %.2f GB — '
+                'stopping this worker', self.name, wal_bytes / 1e9,
+                QUEUE_WAL_HARD_CEILING_BYTES / 1e9)
+            self.request_stop()
+            return True
+        return False
+
     def _checkpoint_pause_active(self) -> bool:
         """Cached view of the supervisor's checkpoint_pause flag, re-read at
         most once per PAUSE_POLL_SECONDS.  The flag check is itself a queue
@@ -818,6 +912,11 @@ class _BranchWorker:
         now = time.time()
         if not force and now - self._last_hb < HB_SECONDS:
             return
+        # Per-heartbeat-window WAL backstop: an evaluation deep in the engine
+        # passes through here even when it never reaches a bundle boundary,
+        # so a runaway writer stops itself instead of relying on the
+        # supervisor being alive to stop it.
+        self._wal_ceiling_tripped()
         # Emit the WAL traffic attribution on its own fast timer, before the
         # pause-defer below: a runaway that provokes the hard ceiling coincides
         # with the supervisor quiescing, so gating this behind the pause would
@@ -999,8 +1098,13 @@ class _BranchWorker:
             v = _bound_provider()
             return None if v == float('inf') else v
 
+        # Throttled, not forced: forcing a heartbeat here writes the DB once per
+        # candidate, which floods the WAL (and blocks the checkpoint TRUNCATE by
+        # writing through the supervisor's quiesce) when candidates are tiny and
+        # evaluate in microseconds.  Liveness and the cur_candidate display come
+        # from the throttled per-node heartbeat inside evaluate_candidate.
         self._heartbeat(branch_key, n_words, idx, claim_started,
-                        local_candidate, local_best, force=True,
+                        local_candidate, local_best,
                         bound_erd=_eff_bound(), cur_candidate=candidate)
 
         if self.cancel():
@@ -1122,9 +1226,10 @@ class _BranchWorker:
             self.queue.add_claim_telemetry(
                 n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
         self.claims_done += 1
+        # Throttled, not forced: see the per-candidate heartbeat above — a forced
+        # write here is per-candidate and floods the WAL on fast candidates.
         self._heartbeat(branch_key, n_words, idx, claim_started,
-                        local_candidate, local_best, bound_erd=_eff_bound(),
-                        force=True)
+                        local_candidate, local_best, bound_erd=_eff_bound())
         return True
 
     # -- evaluate a packer-issued bundle of candidate claims -----------------
@@ -1494,7 +1599,7 @@ class _BranchWorker:
         """
         # Absolute spine of the branch being promoted, composed from the descent
         # that reached it before this frame's own work overwrites self._spine.
-        child_spine = self._promoted_spine()
+        child_spine = self._promoted_spine(self.root_budget - budget)
         saved_spine = self._claimed_branch_spine
         try:
             branch_key = encode_subset(words)

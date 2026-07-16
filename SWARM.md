@@ -144,8 +144,11 @@ If the WAL nevertheless reaches the 32 GB hard ceiling (override with
 `QUEUE_WAL_HARD_CEILING_GIB`), the supervisor captures each worker's current
 candidate, signals live workers to dump all-thread stacks into their logs,
 sets the disk-stop latch, and exits before the WAL can fill the filesystem.
-Workers log per-table WAL traffic attribution every 30 seconds and once more
-on shutdown so the runaway writer is visible in the post-mortem.
+Each worker also enforces the same ceiling on its own, so a worker that
+outlives the supervisor stops itself instead of writing unsupervised, and
+supervisor shutdown escalates to SIGKILL for any worker still alive 30 seconds
+after SIGTERM. Workers log per-table WAL traffic attribution every 30 seconds
+and once more on shutdown so the runaway writer is visible in the post-mortem.
 At 90% filesystem use, the supervisor records a persistent disk-stop latch and
 stops the swarm. `run` refuses to restart while the latch is set or the live
 filesystem remains at the threshold. Free disk space first, then release it:
