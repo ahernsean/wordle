@@ -18,29 +18,44 @@ queue command.
 
 ## Service: start, stop, status
 
-The supervisor runs as a systemd user service named `wordle-erd`.
+The supervisor runs as a systemd user service named `wordle-erd`.  The report
+web server (`report_server.py`) runs as a separate systemd user service named
+`wordle-report-server`.
 
-### Install the service (one-time)
+### Install the services (one-time)
 
 ```bash
 ln -s ~/work/wordle/wordle-erd.service ~/.config/systemd/user/
+ln -s ~/work/wordle/wordle-report-server.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable wordle-erd   # start automatically on login
+systemctl --user enable wordle-erd             # start automatically on login
+systemctl --user enable wordle-report-server   # start automatically on login
 ```
 
 ### Start and stop
 
 ```bash
-python3.13 erd_search.py start    # systemctl --user start wordle-erd
-python3.13 erd_search.py stop     # systemctl --user stop wordle-erd
-python3.13 erd_search.py restart  # systemctl --user restart wordle-erd
+python3.13 erd_search.py start    # systemctl --user start wordle-erd wordle-report-server
+python3.13 erd_search.py stop     # systemctl --user stop wordle-erd wordle-report-server
+python3.13 erd_search.py restart  # systemctl --user restart wordle-erd wordle-report-server
 
-systemctl --user status wordle-erd   # raw systemd status
+systemctl --user status wordle-erd            # raw systemd status
+systemctl --user status wordle-report-server  # raw systemd status
 ```
 
-`restart` is a stop followed by a start in one step.  Like `start`, it prints
-the post-action service status (with `--no-pager`, so it does not drop into a
-pager).
+`start`, `stop`, and `restart` all act on both services, whichever of them
+isn't already in the target state.  Pass `--workers-only` to any of the three
+to act on the supervisor alone and leave the report web server untouched:
+
+```bash
+python3.13 erd_search.py start --workers-only
+python3.13 erd_search.py stop --workers-only
+python3.13 erd_search.py restart --workers-only
+```
+
+`restart` is a stop followed by a start in one step, per service.  Like
+`start`, it prints the post-action service status (with `--no-pager`, so it
+does not drop into a pager).
 
 Stopping sends SIGTERM to the supervisor, which sets the stop event.  Workers
 finish their current candidate evaluation (a few seconds at most) and exit
