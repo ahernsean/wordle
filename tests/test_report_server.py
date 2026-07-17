@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from threading import Thread
+import io
 import json
 import os
 import tempfile
@@ -18,6 +19,7 @@ from report_server import (
     ServerConfiguration,
     build_configuration,
     load_fixtures,
+    main,
     make_handler,
     parse_report_request,
 )
@@ -318,6 +320,24 @@ class ReportServerTest(unittest.TestCase):
                 status, _headers, body = request(base_url, "/api/view")
         self.assertEqual(status, 500)
         self.assertNotIn("secret", body.decode())
+
+
+class ReportServerMainTest(unittest.TestCase):
+    def test_port_collision_exits_cleanly_instead_of_crashing(self):
+        with running_server(fixture_configuration()) as base_url:
+            port = base_url.rsplit(":", 1)[1]
+            argv = [
+                "report_server.py",
+                "--port", port,
+                "--queue-path", "unused-queue",
+                "--cache-path", "unused-cache",
+            ]
+            with patch("sys.argv", argv), \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    main()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn("already in use", stderr.getvalue())
 
 
 if __name__ == "__main__":

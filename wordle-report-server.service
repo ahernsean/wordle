@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/home/ahern/work/wordle
-ExecStart=/usr/bin/python3.13 /home/ahern/work/wordle/report_server.py
+ExecStart=/usr/bin/python3.13 /home/ahern/work/wordle/report_server.py --bind 0.0.0.0
 Restart=on-failure
 RestartSec=10
 
