@@ -265,6 +265,12 @@ def make_handler(configuration):
         def log_message(self, _format, *_args):
             return
 
+        def handle_error(self, request, client_address):
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+                return
+            super().handle_error(request, client_address)
+
         def _write(self, status, content_type, body, extra_headers=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
