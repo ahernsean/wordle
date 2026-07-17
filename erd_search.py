@@ -3,8 +3,12 @@
 
 Subcommands
 -----------
-start           Start the supervisor via systemd (systemctl --user start).
-stop            Stop the supervisor via systemd (systemctl --user stop).
+start           Start the supervisor and the report web server via systemd
+                (systemctl --user start), unless each is already running.
+                --workers-only starts the supervisor alone.
+stop            Stop the supervisor and the report web server via systemd
+                (systemctl --user stop).  --workers-only stops the supervisor
+                alone, leaving the report web server running.
 restart         Restart the supervisor via systemd (systemctl --user restart):
                 a stop followed by a start in one step.
 
@@ -361,47 +365,76 @@ def cmd_queue_priority(args):
 # ---------------------------------------------------------------------------
 
 _SYSTEMD_SERVICE = 'wordle-erd'
+_REPORT_SERVER_SYSTEMD_SERVICE = 'wordle-report-server'
 
 
-def _run_systemctl(action: str, *extra: str) -> int:
+def _run_systemctl(service: str, action: str, *extra: str) -> int:
     """Run `systemctl --user <action> <service> [extra...]` and return the
     exit code."""
     import subprocess
     result = subprocess.run(
-        ['systemctl', '--user', action, _SYSTEMD_SERVICE, *extra],
+        ['systemctl', '--user', action, service, *extra],
         capture_output=False)
     return result.returncode
 
 
-def cmd_start(_args):
-    """Start the supervisor via systemd."""
-    rc = _run_systemctl('start')
-    if rc == 0:
-        _run_systemctl('status', '--no-pager')
-    else:
+def cmd_start(args):
+    """Start the supervisor via systemd, and the report web server too
+    unless --workers-only is given.  Starting a service that is already
+    running is a no-op."""
+    rc = _run_systemctl(_SYSTEMD_SERVICE, 'start')
+    if rc != 0:
         print(f'systemctl start failed (exit {rc}).  '
               f'Is the service installed?  '
               f'Check: systemctl --user status {_SYSTEMD_SERVICE}',
               file=sys.stderr)
         sys.exit(rc)
 
+    server_rc = 0
+    if not args.workers_only:
+        server_rc = _run_systemctl(_REPORT_SERVER_SYSTEMD_SERVICE, 'start')
+        if server_rc != 0:
+            print(f'systemctl start failed (exit {server_rc}).  '
+                  f'Is the service installed?  '
+                  f'Check: systemctl --user status '
+                  f'{_REPORT_SERVER_SYSTEMD_SERVICE}',
+                  file=sys.stderr)
 
-def cmd_stop(_args):
-    """Stop the supervisor via systemd."""
-    rc = _run_systemctl('stop')
-    if rc == 0:
-        print(f'Supervisor stopped.')
+    _run_systemctl(_SYSTEMD_SERVICE, 'status', '--no-pager')
+    if not args.workers_only:
+        _run_systemctl(_REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager')
+    if server_rc != 0:
+        sys.exit(server_rc)
+
+
+def cmd_stop(args):
+    """Stop the supervisor via systemd, and the report web server too unless
+    --workers-only is given."""
+    rc = _run_systemctl(_SYSTEMD_SERVICE, 'stop')
+    if rc != 0:
+        print(f'systemctl stop failed (exit {rc}).', file=sys.stderr)
+
+    server_rc = 0
+    if not args.workers_only:
+        server_rc = _run_systemctl(_REPORT_SERVER_SYSTEMD_SERVICE, 'stop')
+        if server_rc != 0:
+            print(f'systemctl stop failed for report server (exit '
+                  f'{server_rc}).', file=sys.stderr)
+
+    if rc == 0 and server_rc == 0:
+        if args.workers_only:
+            print('Supervisor stopped.')
+        else:
+            print('Supervisor and report server stopped.')
     else:
-        print(f'systemctl stop failed (exit {rc}).',
-              file=sys.stderr)
-        sys.exit(rc)
+        sys.exit(rc or server_rc)
 
 
 def cmd_restart(_args):
     """Restart the supervisor via systemd (stop + start in one step)."""
-    rc = _run_systemctl('restart')
+    rc = _run_systemctl(_SYSTEMD_SERVICE, 'restart')
     if rc == 0:
-        _run_systemctl('status', '--no-pager')
+        _run_systemctl(_SYSTEMD_SERVICE, 'status', '--no-pager')
     else:
         print(f'systemctl restart failed (exit {rc}).  '
               f'Is the service installed?  '
@@ -942,14 +975,22 @@ def main():
     p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     # -- start --
-    sub.add_parser('start',
-                   help='Start the supervisor via systemd '
-                        '(systemctl --user start wordle-erd)')
+    p_start = sub.add_parser(
+        'start',
+        help='Start the supervisor and the report web server via systemd '
+             '(systemctl --user start wordle-erd wordle-report-server)')
+    p_start.add_argument('--workers-only', action='store_true',
+                          help='Start the supervisor only; leave the report '
+                               'web server alone')
 
     # -- stop --
-    sub.add_parser('stop',
-                   help='Stop the supervisor via systemd '
-                        '(systemctl --user stop wordle-erd)')
+    p_stop = sub.add_parser(
+        'stop',
+        help='Stop the supervisor and the report web server via systemd '
+             '(systemctl --user stop wordle-erd wordle-report-server)')
+    p_stop.add_argument('--workers-only', action='store_true',
+                         help='Stop the supervisor only; leave the report '
+                              'web server running')
 
     # -- restart --
     sub.add_parser('restart',

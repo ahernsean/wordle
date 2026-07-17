@@ -1,0 +1,16 @@
+[Unit]
+Description=Wordle ERD swarm report web server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ahern/work/wordle
+ExecStart=/usr/bin/python3.13 /home/ahern/work/wordle/report_server.py
+Restart=on-failure
+RestartSec=10
+
+# Be a good citizen on an otherwise-idle box.
+Nice=10
+
+[Install]
+WantedBy=default.target
