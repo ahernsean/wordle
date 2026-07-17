@@ -177,6 +177,7 @@ attic
 audio
 audit
 auger
+aught
 augur
 aunty
 aural
@@ -1167,6 +1168,7 @@ geeky
 geese
 genie
 genre
+genus
 geode
 germy
 getup
@@ -1519,6 +1521,7 @@ koala
 kooky
 koran
 krill
+krone
 kudos
 kudzu
 kugel
@@ -2083,6 +2086,7 @@ pound
 pouty
 power
 prank
+prate
 prawn
 preen
 press
@@ -2116,6 +2120,7 @@ proxy
 prude
 prune
 psalm
+pshaw
 psych
 pubic
 pudge
@@ -2194,6 +2199,7 @@ rater
 ratio
 ratty
 raved
+ravel
 raven
 raver
 rayon
@@ -2442,6 +2448,7 @@ shire
 shirk
 shirt
 shiva
+shlep
 shoal
 shock
 shoed
@@ -2642,6 +2649,7 @@ squid
 stack
 staff
 stage
+stagy
 staid
 stain
 stair
@@ -2797,6 +2805,7 @@ taxed
 teach
 teary
 tease
+techy
 teddy
 teeny
 teeth
