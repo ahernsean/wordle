@@ -4,17 +4,20 @@
 
 The 2026-07-15 Wordle answer was PSHAW — present in the all-words candidate
 dictionary (`wordle.txt`) but absent from the answer list
-(`NYT_wordlist.txt`). The corrected list is on branch
-`sda/new-NYT-answers-list`: **9 additions, 0 deletions** (3,199 → 3,208):
+(`NYT_wordlist.txt`). The corrected list is captured in this repository as
+`NYT_wordlist_2026-07-17.txt`: **9 additions, 0 deletions** (3,199 → 3,208):
 
     aught  genus  krone  prate  pshaw  ravel  shlep  stagy  techy
 
 All nine were already in `wordle.txt`, so the all-words candidate dictionary
-is unchanged; only the answer list grows.
+is unchanged; only the answer list grows. (The list originated on branch
+`sda/new-NYT-answers-list`, which is disposable now that the file is
+captured here.)
 
 This plan covers: (1) which cache entries provably survive, (2) the
-migration that retains them, (3) the recompute of the invalidated region,
-and (4) reverification before the migrated cache is trusted or synced.
+transition operating mode — both lists live side by side until the
+migration and recomputation are verified, (3) the migration and recompute
+themselves, and (4) cutover and retirement of the old list.
 
 ## Part 1 — What survives, and proofs
 
@@ -103,24 +106,72 @@ single narrowing cone. Total genuinely-new work: the root census (every
 top-level candidate against the 3,208-word set), the 9 cones, and the
 discarded `erd_answers_unfiltered` namespace. A full restart is not
 required — the overwhelming bulk of cached work is provably-exact reuse.
+Solving a grown branch reads retained exact rows for every response group
+the new words do not occupy, so a cache-missed key near the root is in
+practice a solve against a warm cache, not a cold recomputation.
 
-## Part 2 — Procedure
+## Part 2 — Transition operating mode: both lists side by side
+
+The `answer_list_id` in every primary key — the reason retention needs a
+re-tag at all — is also what makes coexistence safe: the old and new worlds
+are disjoint namespaces in the same database. Nothing in the old namespace
+is modified by the migration or the recompute, so the old world keeps
+working, byte-identical, until cutover.
+
+During the transition:
+
+- **Old list stays the default.** `NYT_wordlist.txt` remains untouched;
+  interactive play, the phone, and any old-world tooling continue against
+  the old `answer_list_id` exactly as before.
+- **New list lives at `NYT_wordlist_2026-07-17.txt`.** The migration script
+  and the recompute swarm run against it explicitly. The answer-list path
+  is currently a hardcoded constant in `wordle.py`, `erd_swarm.py`,
+  `verify_erd_cache.py`, and `runtime_paths.py`/`erd_search.py`, so Phase 0
+  adds a selection mechanism (recommendation below).
+- **Epoch testing is suspended.** Swarm telemetry comparisons filter on
+  `telemetry_epoch` ("a contiguous run under one claiming regime"); the
+  transition workload (root census + new-word cones against a warm cache)
+  is not representative of steady-state claiming and would contaminate any
+  cross-epoch comparison. Suspend claim-regime testing before the freeze,
+  bump a fresh epoch when the transition swarm starts (so transition
+  samples are cleanly separable, never mixed into a testing epoch), and
+  resume testing only after cutover, in another fresh epoch.
+- **Rollback is trivial until retirement.** Reverting means pointing back
+  at the old list; the old namespace was never modified.
+- **Storage cost.** The re-tag copies rows, so retained tables roughly
+  double until retirement deletes the old namespace. Check disk headroom
+  before Phase 2 (on both Linux and the phone if the DB syncs before
+  retirement).
+
+## Part 3 — Procedure
 
 The re-tag and recompute steps are one-time operations: scripts run from
-the scratchpad, never committed (only the plan is).
+the scratchpad, never committed. The answer-list selection mechanism is the
+exception — it is a permanent source change (list corrections will happen
+again) and goes through a PR.
 
-### Phase 0 — Land the corrected list
+### Phase 0 — Capture the list and add a selection mechanism
 
-1. Merge `sda/new-NYT-answers-list` (via PR, per repo rules).
-2. Sanity-check in CI/local: 3,208 lines, 9 additions vs. old list, no
-   deletions, all additions present in `wordle.txt`.
+1. New list captured as `NYT_wordlist_2026-07-17.txt` (done — verified 9
+   additions, 0 deletions vs. `NYT_wordlist.txt`, all 9 present in
+   `wordle.txt`). The `sda/new-NYT-answers-list` branch is no longer
+   needed; deleting it is the user's call.
+2. Add an answer-list override so tools can be pointed at either list.
+   Recommended: an environment variable (e.g. `WORDLE_ANSWER_LIST`) read in
+   `runtime_paths.py`, with the four hardcoding modules taking their
+   default from there; default remains `NYT_wordlist.txt` so behavior is
+   unchanged when unset. Alternative (no code change): run the transition
+   swarm from a second checkout whose `NYT_wordlist.txt` is the new list,
+   sharing the cache via explicit `--cache`; rejected as the default
+   because it is easy to get wrong silently and leaves nothing reusable
+   for the next list correction.
 
 ### Phase 1 — Freeze and back up
 
-1. Stop all swarm workers; confirm no live claims
+1. Suspend epoch testing; note the current epoch number.
+2. Stop all swarm workers; confirm no live claims
    (`erd_search.py view` worker/queue reports).
-2. Back up `wordle_cache.sqlite3` (and its WAL/shm via a checkpoint first)
-   and `erd_queue.sqlite3`.
+3. Checkpoint and back up `wordle_cache.sqlite3` and `erd_queue.sqlite3`.
 
 ### Phase 2 — Re-tag migration (retention)
 
@@ -132,27 +183,30 @@ the scratchpad, never committed (only the plan is).
      the new id for `erd_words_unfiltered` and `erd_answers_compliant` only.
    - `candidate_scores`: copy all old-id rows to the new id.
 3. Copy nothing for `erd_answers_unfiltered`.
-4. Leave old-id rows in place until Phase 4 passes; delete only for space.
+4. Old-id rows are left fully intact — they are the live old world until
+   cutover and the rollback path until retirement.
 
 ### Phase 3 — Recompute (update the cache)
 
 1. Clear the queue (`erd_search.py queue clear`) — its seeds and priorities
-   were derived from the old root tree.
-2. Re-seed from the new 3,208-word root and restart the swarm. Workers
-   recompute the root census and descend the 9 new-word cones; unchanged
-   sub-branches hit retained rows.
-3. `erd_answers_unfiltered` repopulates lazily on use (or enqueue
+   were derived from the old root tree. (The queue is Linux-only swarm
+   state, not part of the old world's serving path.)
+2. Bump a fresh `telemetry_epoch` for the transition run.
+3. Re-seed from the new 3,208-word root and start the swarm against the
+   new list. Workers recompute the root census and descend the 9 new-word
+   cones; unchanged sub-branches hit retained rows.
+4. `erd_answers_unfiltered` repopulates lazily on use (or enqueue
    explicitly if that namespace is wanted precomputed).
-4. `response_decomposition` blobs rebuild on demand for the new id.
+5. `response_decomposition` blobs rebuild on demand for the new id.
 
 ### Phase 4 — Reverification
 
-Run in this order; each step gates the next.
+Run in this order against the new list/namespace; each step gates the next.
 
 1. **Structural reconciliation.** Row counts per (policy, answer_list_id):
    new-id counts equal old-id counts for the two retained policies plus
    whatever Phase 3 has added; zero `erd_answers_unfiltered` rows under the
-   new id unless Phase 3.3 ran.
+   new id unless Phase 3.4 ran.
 2. **Sampled exactness check.** Random sample of re-tagged rows per
    retained policy, stratified by branch size; recompute each from scratch
    under the new list with a fresh in-memory cache; require exact equality
@@ -168,18 +222,37 @@ Run in this order; each step gates the next.
 4. **Loss sweep.** `verify_erd_losses.py` over retained loss entries.
 5. **Test suite.** `python -m unittest discover -s tests -t . -p 'test_*.py'`.
 
-### Phase 5 — Phone sync
+### Phase 5 — Cutover
 
-The re-tag is data-only — no schema change, no `schema_migrations` entry,
-no phone code deploy required. Sync the migrated database to the phone only
-after Phase 4 passes. (The phone must already run code that reads
-`NYT_wordlist.txt` from the synced state, or receive the new list with the
-same sync.)
+Only after Phase 4 passes in full.
+
+1. Promote the new list to the default: `NYT_wordlist_2026-07-17.txt`
+   becomes `NYT_wordlist.txt` (the old file is renamed aside, e.g.
+   `NYT_wordlist_pre-2026-07.txt`, kept until retirement as the rollback
+   target). Source change via PR.
+2. Sync the migrated database to the phone. The re-tag itself is data-only
+   (no schema change, no `schema_migrations` entry), but the phone must
+   receive the new list with the same sync so its `answer_list_id` matches.
+3. Soak: normal interactive and swarm use against the new world, with the
+   old namespace still present as rollback.
+
+### Phase 6 — Retirement
+
+Only after the soak period gives confidence that the new world is safe.
+
+1. Delete old-`answer_list_id` rows from `branch_best_by_policy`,
+   `branch_loss_by_policy`, `candidate_scores`, and
+   `response_decomposition`; vacuum/checkpoint; re-sync the phone.
+2. Remove the retired list file from the repository (PR).
+3. Resume epoch testing in a fresh `telemetry_epoch` — steady-state
+   claiming against the new world, uncontaminated by transition samples.
 
 ## Open items
 
-- Timing of the `sda/new-NYT-answers-list` merge (Phase 0).
-- Whether `erd_answers_unfiltered` is worth precomputing (Phase 3.3) or can
+- Approve the answer-list override mechanism (Phase 0.2 recommendation:
+  environment variable in `runtime_paths.py`) before any code is written.
+- Whether `erd_answers_unfiltered` is worth precomputing (Phase 3.4) or can
   stay lazy.
 - Whether to run Phase 4.3 as a full sweep immediately or start with the
   sampled check and schedule the sweep alongside normal swarm operation.
+- Length of the Phase 5 soak before retirement.
