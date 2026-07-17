@@ -37,24 +37,25 @@ systemctl --user enable wordle-report-server   # start automatically on login
 ```bash
 python3.13 erd_search.py start    # systemctl --user start wordle-erd wordle-report-server
 python3.13 erd_search.py stop     # systemctl --user stop wordle-erd wordle-report-server
-python3.13 erd_search.py restart  # systemctl --user restart wordle-erd
+python3.13 erd_search.py restart  # systemctl --user restart wordle-erd wordle-report-server
 
 systemctl --user status wordle-erd            # raw systemd status
 systemctl --user status wordle-report-server  # raw systemd status
 ```
 
-`start` and `stop` act on both services, starting or stopping whichever of
-them isn't already in the target state.  Pass `--workers-only` to act on the
-supervisor alone and leave the report web server untouched:
+`start`, `stop`, and `restart` all act on both services, whichever of them
+isn't already in the target state.  Pass `--workers-only` to any of the three
+to act on the supervisor alone and leave the report web server untouched:
 
 ```bash
 python3.13 erd_search.py start --workers-only
 python3.13 erd_search.py stop --workers-only
+python3.13 erd_search.py restart --workers-only
 ```
 
-`restart` only affects the supervisor: a stop followed by a start in one
-step.  Like `start`, it prints the post-action service status (with
-`--no-pager`, so it does not drop into a pager).
+`restart` is a stop followed by a start in one step, per service.  Like
+`start`, it prints the post-action service status (with `--no-pager`, so it
+does not drop into a pager).
 
 Stopping sends SIGTERM to the supervisor, which sets the stop event.  Workers
 finish their current candidate evaluation (a few seconds at most) and exit
