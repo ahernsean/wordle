@@ -1,40 +1,51 @@
-# Answer-list correction: cache retention, recompute, and reverification plan
+# Vocabulary correction: cache retention, recertification, and reverification plan
 
 ## Context
 
-The 2026-07-15 Wordle answer was PSHAW — present in the all-words candidate
-dictionary (`wordle.txt`) but absent from the answer list
-(`NYT_wordlist.txt`). The corrected list is captured in this repository as
-`NYT_wordlist_2026-07-17.txt`: **9 additions, 0 deletions** (3,199 → 3,208):
+Two staleness discoveries, in escalating order:
 
-    aught  genus  krone  prate  pshaw  ravel  shlep  stagy  techy
+1. **Answer list.** The 2026-07-15 Wordle answer was PSHAW — absent from
+   `NYT_wordlist.txt`. The corrected list is captured as
+   `NYT_wordlist_2026-07-17.txt`: **9 additions, 0 deletions**
+   (3,200 → 3,209 words):
 
-All nine were already in `wordle.txt`, so the all-words candidate dictionary
-is unchanged; only the answer list grows.
+       aught  genus  krone  prate  pshaw  ravel  shlep  stagy  techy
+
+2. **Candidate universe.** Wordle Tools reports the NYT full dictionary at
+   **14,855 words**; our `wordle.txt` has 12,972 — a stale snapshot from the
+   pre-NYT era. Direct local evidence of the staleness: 14 answer words
+   (`amaro crema flowy glamp glowy hacky janky koran popup queso quran
+   runup untag venti`) appear in the answer list but not in `wordle.txt`,
+   which is impossible in real Wordle (every answer is an accepted guess).
+   The exact delta — additions *and* possible removals, since NYT removed
+   some original words — is unknown until the 14,855-word list is sourced.
+
+The candidate-universe change dominates the planning: `ERD_ALL`'s guess
+vocabulary is `wordle.txt`, so the namespace that the answer-list-only
+analysis retained as exact is precisely the one a candidate-universe change
+demotes. Both corrections must land as **one combined uplift**, candidate
+universe first in the analysis: recertifying `ERD_ALL` against a vocabulary
+known to be wrong, then invalidating it again, would do the work twice.
 
 Operating decisions already made:
 
-- **No side-by-side operation.** The phone stays on the old list — no pull
-  from origin — until the uplift is entirely done. The Linux side flips
-  wholesale to the corrected list when execution starts.
-- **The epoch swarm is already stopped** for the duration of the uplift;
-  no telemetry-epoch fencing is needed. Epoch testing resumes after
-  retirement.
+- The phone stays on the old lists — no pull from origin — until the uplift
+  is entirely done. The Linux side flips wholesale when execution starts.
+- The epoch swarm is already stopped for the duration; epoch testing
+  resumes after retirement.
 
-## Part 1 — What survives, and proofs
+## Part 1 — Foundations (unchanged by the second discovery)
 
 ### Content-addressed keys freeze each row's answer set
 
 `ScoreCache.encode_subset` keys every row by the sorted concatenation of the
-branch's actual words. Growing the global answer list changes *which keys
-arise* in the game tree — never the meaning of an existing key. A branch
-that now contains a new word is a different `branch_key`: a cache miss,
-computed fresh. `_solve_subset` partitions `branch_words` itself to form
-sub-branches and never consults the global list to enumerate answers, so
-the subproblem a row describes is exactly its key. The only input that can
-vary for a fixed key is the guess vocabulary its policy draws from.
+branch's actual words. Growing the answer list changes *which keys arise*
+in the game tree — never the meaning of an existing key. `_solve_subset`
+partitions `branch_words` itself to form sub-branches and never consults
+the global list to enumerate answers. The only input that can vary for a
+fixed key is the guess vocabulary its policy draws from.
 
-### Theorem: guess-universe growth can only lower ERD (branch fixed)
+### Theorem: guess-vocabulary growth can only lower ERD (branch fixed)
 
 Fix a branch word set B and guess vocabulary V. A strategy for (B, V) is a
 decision tree with every node labeled by a guess g ∈ V; an answer a ∈ B
@@ -55,41 +66,17 @@ problems: `calculate_response(g, a)` depends only on the pair (g, a), and
 the tree's labels and the answer set B are unchanged, so every a ∈ B traces
 the same path. Hence the strategy set for (B, V′) contains that for (B, V)
 with costs preserved, and a minimum over a superset is at most the minimum
-over the subset. Apply with the mean (ERD), the max
-(max_remaining_depth), and existence within a budget (feasibility). ∎
+over the subset. Apply with the mean (ERD), the max (max_remaining_depth),
+and existence within a budget (feasibility). ∎
 
-**Loss corollary.** A loss proof over V ("no strategy over V solves B
-within b") says nothing about V′ ⊋ V: the superset may contain a winning
-tree. Losses in a grown-vocabulary namespace are therefore invalidated —
-in the favorable direction (previously-lost branches may now be winnable).
-The reverse direction is valid: a loss over V′ implies a loss over every
-V ⊆ V′, since any winning tree over V would be a winning tree over V′.
-
-### Disposition by policy namespace
-
-| Policy | Guess vocabulary | Effect of the 9 additions | Disposition |
-|---|---|---|---|
-| `erd_words_unfiltered` (`ERD_ALL`) | all-words list — unchanged (all 9 already in it) | V′ = V: rows and loss proofs remain **exact** | retain |
-| `erd_answers_compliant` (`ERD_ANSWERS`) | the branch words themselves (`guesses=None` ⇒ `candidate_list = branch_words`, recursively) | pure function of `branch_key`; the global list never enters: **exact** | retain |
-| `erd_answers_unfiltered` (`ERD_ANSWERS_UNFILTERED`) | full answer list — grew by 9 | ERDs become **upper bounds** (theorem); `best_guess` possibly suboptimal; loss proofs **invalid** (corollary) | rebuild (see Part 3 — old rows are reusable as bounds, not as exact entries) |
-| `erd_words_compliant` (`ERD_CONSTRAINED`) | path-dependent | never persisted | n/a |
-
-Note the retained set needs no content filtering: validity above is
-content-independent (it depends only on the policy's vocabulary), and old
-rows cannot contain the new words anyway.
-
-Other tables:
-
-- **`candidate_scores`** — a score is a function of (branch word set,
-  candidate, method) only; retain all rows. Scores of the 9 words as
-  candidates, and of any candidate against grown branches, are new keys
-  computed on demand.
-- **`branch_loss_by_policy`** — same disposition as its policy: retain
-  `ERD_ALL` and `ERD_ANSWERS` losses; `erd_answers_unfiltered` losses are
-  invalid but can be re-seeded (Part 3).
-- **`response_decomposition`** — one byte per answer in canonical
-  answer-list order, keyed by (guess, answer_list_id); old rows are
-  unusable under the new list and rebuild automatically on demand.
+**Corollaries.**
+- *Growth:* old exact values become upper bounds; old loss proofs become
+  invalid (a new guess word may rescue the branch). A loss over the larger
+  vocabulary implies a loss over any sub-vocabulary.
+- *Removal:* the inequalities reverse — old exact values become lower
+  bounds, and a stored best_guess may no longer be a legal word.
+- *Mixed additions and removals:* no per-row direction is provable; old
+  values are heuristics only.
 
 ### ERD is not monotone in the answer set (why the root must recompute)
 
@@ -97,240 +84,267 @@ ERD is a mean, not a sum. Adding a word that resolves in 2 guesses to a
 branch of n words with ERD e yields (n·e + 2)/(n + 1) < e whenever e > 2;
 adding a hard word raises the mean. Monotone nondecreasing under set
 growth: max_remaining_depth, the cost sum, and the mean restricted to the
-original words. Per-candidate root ERDs can therefore move both ways and
-the best first guess can change — root results recompute regardless (the
-full-set `branch_key` changes anyway, so this happens naturally).
+original words. Per-candidate root ERDs can move both ways and the best
+first guess can change — root results recompute regardless (the full-set
+`branch_key` changes anyway).
 
-### The recompute region is a union of 9 thin cones, not the tree
+### The answer-side recompute region is a union of 9 thin cones
 
-For any first guess, the 9 new words land in at most 9 of its nonempty
-response groups; every other group is a byte-identical key with a retained
-exact row. Within an affected group, the next guess isolates each new word
-into one sub-group again, so the changed region under each new word is a
-single narrowing cone. Total genuinely-new work: the root census (every
-top-level candidate against the 3,208-word set), the 9 cones, and the
-`erd_answers_unfiltered` rebuild. A full restart is not required — the
-overwhelming bulk of cached work is provably-exact reuse.
+For any first guess, the 9 new answer words land in at most 9 of its
+nonempty response groups; every other group is a byte-identical key.
+Within an affected group, the next guess isolates each new word into one
+sub-group again, so the changed region under each new word is a single
+narrowing cone. (This bounds which *keys* are new; whether the retained
+keys' *values* still serve depends on the vocabulary analysis below.)
 
-## Part 2 — How retained work accelerates the recompute
+## Part 2 — Disposition by namespace under the combined change
 
-Four mechanisms, in order of leverage. Throughout, G′ = G ∪ {w} denotes a
-grown branch and G its retained base (strip the new words from G′);
-everything generalizes to k added words.
+| Policy | Guess vocabulary | Effect of combined change | Disposition |
+|---|---|---|---|
+| `erd_answers_compliant` (`ERD_ANSWERS`) | the branch words themselves (`guesses=None` ⇒ `candidate_list = branch_words`, recursively) | pure function of `branch_key`; neither list enters: **exact** | retain — the only fully exact ERD namespace |
+| `erd_words_unfiltered` (`ERD_ALL`) | `wordle.txt` — grew ~1.9k net, removals possible | growth-only: rows demote to **upper bounds** (legal best_guess, valid incumbent); with removals: rows whose strategy touches a removed word are unreliable and best_guess may be illegal; losses **invalid** either way | retain rows as **recertification seeds**, not servable truths; drop losses |
+| `erd_answers_unfiltered` (`ERD_ANSWERS_UNFILTERED`) | answer list — grew by 9 | rows demote to upper bounds; losses invalid | rebuild via sandwich seeding (Part 4) after the `ERD_ALL` sweep |
+| `erd_words_compliant` (`ERD_CONSTRAINED`) | path-dependent | never persisted | n/a |
 
-### Mechanism 1 — Recurrence-level reuse (automatic, already implemented)
+Other tables:
 
-To evaluate a candidate c on G′, `_solve_subset` needs the ERD of each
-response group of G′ under c. The new word w lands in exactly one group;
-every other group is the identical word set as the corresponding group of
-G, and its retained exact row is read instead of recursed into. So the
-per-candidate cost of the "full" solve of G′ is cached lookups plus one
-recursive solve of the w-containing group — the same problem one level
-down, on a shrinking set, memoized across candidates once computed. A
-cache-missed key near the root is in practice a solve against a warm
-cache. No new code; this is how retention pays off.
+- **`candidate_scores`** — a score is a function of (branch word set,
+  candidate, method) only; retain all rows. Rows for removed candidates
+  become dead weight (harmless); scores for added candidates and grown
+  branches are new keys computed on demand.
+- **`branch_loss_by_policy`** — retain `erd_answers_compliant` losses
+  (exact); drop `ERD_ALL` and `erd_answers_unfiltered` losses (invalid
+  under vocabulary growth). Losses rebuild organically as the swarm
+  re-proves deep branches.
+- **`response_decomposition`** — keyed (guess, answer_list_id); rebuilds
+  for the new id. Blobs for retained guesses can be spliced (old blob + 9
+  bytes); added guesses need fresh blobs; removed guesses' blobs are dead
+  weight.
 
-### Mechanism 2 — O(1) transfer bounds from G's row (not yet implemented)
+## Part 3 — The `ERD_ALL` recertification sweep (the centerpiece)
 
-From G's cached (E = best_score, md = max_depth, loss rows), without
-search:
+`verify_erd_cache.py` already implements the needed shape: leaves-first
+re-verification of every `ERD_ALL` row against the true optimum, reading
+sub-branch costs from the cache and correcting rows in place, waves
+parallelized within a branch size. Recertification after a vocabulary
+change is the same computation with a different candidate delta:
 
-- **Loss transfer.** A proven loss for G within budget b is a proven loss
-  for G′ within b: any tree solving G′ restricts to one solving G ⊆ G′.
-- **max_remaining_depth sandwich.** md(G) ≤ md(G′) ≤ md(G) + k. Lower
-  bound by restriction. Upper bound by construction: run each new word
-  through G's optimal-worst-case tree; where its response leaves the tree,
-  extend with one node guessing it; if it rides to a leaf word a, guess a
-  then the new word — cost ≤ md(G) + 1 per new word, G words unchanged.
-  The construction is legal in both retained policies. Feasibility is
-  decided with zero search whenever the query budget falls outside the
-  sandwich's knife edge.
-- **ERD envelope.** (n·E + k)/(n + k) ≤ ERD(G′) ≤ (n·E + Σ costs of new
-  words in the extension tree)/(n + k) ≤ (n·E + k·(md(G) + 1))/(n + k).
-  The lower bound is an admissible floor a parent can use to prune a
-  candidate whose sub-branch is G′ without descending into the cone. (Note
-  ERD(G′) ≥ E is NOT valid — see the non-monotonicity section.)
+- Process branches leaves-first so corrected child values are in place
+  before any parent is re-evaluated.
+- Per row: if the stored best_guess was removed from the vocabulary,
+  re-solve the branch (warm — Mechanism 1 below). Otherwise re-validate
+  the stored value against updated children and evaluate the **added**
+  candidates; in the growth-only case the stored value is a valid
+  incumbent (upper bound), so most rows close after the added-candidate
+  scan.
+- Per-branch incremental cost ≈ |added candidates| evaluations plus drift
+  re-checks — order 15% of a full sweep per branch (1.9k of 14.9k
+  candidates), against the measured ~900 full sweeps/day pre-kernel
+  baseline (`full_tree_plan.md`) with the kernel's 10–50× on top. Real
+  numbers come from timing a sample wave on rocky before committing.
 
-### Mechanism 3 — Warm-starting the candidate scan on G′
+Whether this lands as an extension of `verify_erd_cache.py` (committed —
+vocabulary changes will happen again) or a scratchpad variant is decided on
+rocky; the leaves-first wave structure and cache-read model carry over
+either way.
 
-G's cached best_guess, evaluated first on G′, yields a strong incumbent
-that prunes most of the remaining candidate scan. G's candidate_scores
-ranking is a near-perfect evaluation order for G′: exact scores shift only
-through w's group membership (e.g. max_group_size(c, G′) =
-max(max_group_size(c, G), |w's group under c| + 1)), an O(1) update per
-candidate given w's pattern byte.
+## Part 4 — Rebuilding `erd_answers_unfiltered`
 
-### Mechanism 4 — Pattern-matrix splice (minor)
+### The vocabulary-inclusion sandwich — gated, and only post-sweep
 
-`response_decomposition` blobs for the new list can be spliced from the old
-blobs plus 9 new bytes per guess instead of recomputed at 3,208 × ~13k.
-The vectorized rebuild is fast anyway; an economy, not a necessity.
+With the corrected lists, verify (do not assume): every answer word ∈ new
+`wordle.txt`. Then for any branch B, B ⊆ answers′ ⊆ all-words′, and the
+theorem gives:
 
-### The honest limit
+    ERD_ALL′(B)  ≤  ERD_ANSWERS_UNFILTERED′(B)  ≤  ERD_ANSWERS(B)
 
-None of this certifies *optimality* for G′ by itself: ERD(G′) is a min over
-all candidates and a new word can change which candidate wins. The scan
-always runs to completion; the mechanisms make the scan and each
-evaluation cheap, not skippable.
+**The left value must be the post-sweep (recertified) `ERD_ALL` value.**
+The sandwich was unsound against the old cache for two reasons: the old
+`ERD_ALL` values were computed over a vocabulary that did not contain the
+answer list (14 missing words — the inclusion simply failed), and the
+vocabulary has now changed besides. Both are repaired only after Phase 0
+fixes the lists and Phase 3 recertifies.
 
-### Recommendation
+Where the outer values are equal, seed the row by **copying the entire
+`erd_answers_compliant` row** (best_guess, best_score, max_depth): its
+strategy's guesses all lie within the branch ⊆ answers′, so it is a legal
+`erd_answers_unfiltered` strategy attaining the pinned score — giving the
+seed a usable best_guess and max_depth (a NULL-max_depth row is never
+reused at budgeted queries). Guard the pinch on `solve_budget IS NULL` on
+both sides: tainted rows hold budget-specific values and pin nothing.
 
-Rely on Mechanism 1 alone for the first swarm pass — it is free and it is
-the bulk of the win. Implement Mechanisms 2–3 as a small "grown-branch
-bootstrap" (on a cache miss for key B, strip the new words to get B₀ and
-read its retained row) only if the root census or the fat upper-cone nodes
-measure slow. Measure first, implement second.
-
-## Part 3 — Rebuilding `erd_answers_unfiltered`, and how long it takes
-
-### The vocabulary-inclusion sandwich
-
-For any branch B, the three policies' vocabularies nest:
-B ⊆ answers list ⊆ all-words list. By the Part 1 theorem applied twice:
-
-    ERD_ALL(B)  ≤  ERD_ANSWERS_UNFILTERED(B)  ≤  ERD_ANSWERS(B)
-
-The two outer quantities are retained **exact** rows. Wherever they are
-equal — plausibly the common case, since most cached branches are small and
-their optima coincide across vocabularies — the middle value is pinned with
-**zero search**: write it directly. Where they differ, the solve starts
-with the retained `ERD_ANSWERS` value (or the old unfiltered row, which the
-theorem makes a valid and tighter upper bound) as incumbent and the
-retained `ERD_ALL` value as admissible floor: a branch-and-bound run that
-begins nearly closed.
-
-Losses re-seed the same way: a retained `ERD_ALL` loss at budget b is a
-valid `erd_answers_unfiltered` loss at b (loss over the largest vocabulary
-implies loss over every sub-vocabulary).
+Do **not** seed losses from old `ERD_ALL` losses (invalid under growth).
+Once the sweep re-proves an `ERD_ALL` loss under the new vocabulary, it
+transfers validly (loss over the superset vocabulary implies loss over
+answers′ ⊆ all-words′).
 
 ### Cost model
 
-Per-branch sweep cost scales with candidate count: an
-`erd_answers_unfiltered` sweep is 3,208 candidates vs. 12,972 for
-`ERD_ALL` — roughly 4× cheaper. The measured `ERD_ALL` baseline
-(full_tree_plan.md, derived from the Jun 23–29 epoch-0 run) is ~900 branch
-sweeps/day pre-kernel, so the pre-kernel unfiltered rate is ~3,600
-sweeps/day; the NumPy kernel's 10–50× lifts that to ~36k–180k/day. Only
-branches the sandwich does not pinch need sweeps at all.
+An unfiltered sweep is 3,209 candidates vs. 14,855 — ~4.6× cheaper per
+branch than a new-universe `ERD_ALL` sweep. Only un-pinched rows need
+sweeps:
 
-    rebuild time ≈ (unfiltered rows where ERD_ALL(B) ≠ ERD_ANSWERS(B))
+    rebuild time ≈ (rows where ERD_ALL′(B) ≠ ERD_ANSWERS(B), untainted)
                    / (unfiltered sweeps per day on current engine)
 
-Both numerator and denominator are measurable before committing:
+Numerator: one SQL join after the Phase 3 sweep. Denominator: time a
+sample. If the un-pinched population is large, seed the pinched rows
+(zero search) and leave the rest lazy.
 
-- Numerator: join the old unfiltered namespace against the two retained
-  namespaces on branch_key and count the un-pinched rows (single SQL query
-  against the backup).
-- Denominator: time a sample of un-pinched branches with the current
-  kernel engine.
+## Part 5 — How retained work accelerates everything
 
-### Eager vs. lazy decision rule
+G′ = G ∪ {added words} denotes a grown branch, G its retained base.
 
-Run the numerator query first. If the un-pinched population is small
-(likely), eager rebuild is cheap — hours, not days — and worth doing during
-the uplift while the swarm is already dedicated. If it is unexpectedly
-large, seed the pinched rows and losses eagerly (zero search) and leave the
-rest lazy; interactive use then pays a bounded warm-start solve per miss
-instead of a cold one.
+### Mechanism 1 — Recurrence-level reuse (automatic)
 
-## Part 4 — Procedure
+To evaluate a candidate c on G′, `_solve_subset` needs each response
+group's ERD; the added words land in few groups, and every unchanged group
+is the identical word set with a cached row read instead of recursed into.
+Per-candidate cost = cached lookups + recursive solves of the few changed
+groups, memoized across candidates. A cache-missed key near the root is a
+solve against a warm cache. This also powers the sweep's re-solves.
 
-The re-tag, seeding, and recompute steps are one-time operations: scripts
-run from the scratchpad, never committed.
+### Mechanism 2 — O(1) transfer bounds (scoped; not yet implemented)
 
-### Phase 0 — Flip the Linux side to the corrected list
+Valid **only for fixed-vocabulary policies** (`erd_words_unfiltered`,
+`erd_answers_unfiltered`): in `erd_answers_compliant` the vocabulary *is*
+the branch, so growing the branch also grows the vocabulary — the
+restriction argument fails, and the lower-bound claims are genuinely false
+there (G can be a compliant loss at budget b while G′ is compliant-solvable
+at b). A policy-blind implementation would write false losses.
 
-1. New list captured as `NYT_wordlist_2026-07-17.txt` (done — verified 9
-   additions, 0 deletions vs. `NYT_wordlist.txt`, all 9 present in
-   `wordle.txt`). The `sda/new-NYT-answers-list` branch is disposable.
-2. Replace the content of `NYT_wordlist.txt` with the corrected list and
-   delete the date-stamped capture (git history preserves both lists).
-   Source change via PR. The phone does not pull origin until Phase 5, so
-   this flip is Linux-only. Rollback until retirement: revert the commit —
-   the old cache namespace is never modified.
+For fixed vocabulary, from G's cached row (E = best_score, md = max_depth,
+losses), with k added words:
+
+- **Loss transfer.** A proven loss for G within b is a proven loss for G′
+  within b (restriction). Valid only when the loss itself is valid under
+  the current vocabulary — post-sweep losses, not pre-uplift ones.
+- **Feasibility (one-sided).** The cached md is the worst case *of the
+  ERD-optimal strategy*, an upper bound on the true worst-case optimum. So
+  budget ≥ md(G) + k ⇒ G′ feasible (extend the cached strategy: run each
+  added word through the tree; where its response leaves the tree, extend
+  with one guessing node; collisions chain, so the j-th word colliding on
+  one path costs up to md + j, but md + k bounds the worst case overall).
+  The infeasible side (budget < md ⇒ loss) is **unsound** — a strategy
+  with a worse mean can have a smaller max; only a true loss row proves
+  infeasibility.
+- **ERD envelope.** (n·E + k)/(n + k) ≤ ERD(G′) ≤
+  (n·E + k·md(G) + k(k+1)/2)/(n + k). The lower bound is an admissible
+  parent-pruning floor; the upper bound's collision term is the honest
+  worst case of the extension construction. (ERD(G′) ≥ E is NOT valid —
+  see non-monotonicity.)
+
+### Mechanism 3 — Warm-starting the candidate scan
+
+G's cached best_guess evaluated first gives a strong incumbent; G's
+candidate_scores ranking is a near-perfect evaluation order (exact scores
+shift only through the added words' group membership — an O(1) update per
+candidate given their pattern bytes).
+
+### Mechanism 4 — Pattern-matrix splice (minor)
+
+Retained guesses' `response_decomposition` blobs splice (old blob + 9 new
+bytes); only the ~1.9k added guesses need fresh blobs. An economy, not a
+necessity.
+
+### The honest limit
+
+Nothing above certifies optimality by itself: ERD is a min over all
+candidates and an added word can change the winner. Scans always run to
+completion; the mechanisms make each scan cheap, not skippable.
+
+## Part 6 — Procedure
+
+One-time operations run from the scratchpad and are never committed;
+the list flips and any `verify_erd_cache.py` extension go through PRs.
+
+### Phase 0 — Source and land the corrected vocabularies
+
+1. Source the current 14,855-word NYT full dictionary (the NYT game's JS
+   bundle is ground truth; `Get_NYT_Wordlist.py`'s scrape pattern extends).
+2. Compute the `wordle.txt` delta **in both directions**; record additions
+   and removals. The removal set decides the sweep's shape (Part 3).
+3. Gates before anything else runs: new answer list ⊆ new candidate list
+   (the 14 words included); both files sorted, unique, 5-letter lowercase.
+4. Land both corrected lists in one PR (`wordle.txt` and
+   `NYT_wordlist.txt`; delete the date-stamped capture — git history
+   preserves everything). The phone does not pull until Phase 6.
 
 ### Phase 1 — Freeze and back up
 
-1. Swarm workers are already stopped (epoch testing suspended for the
-   uplift); confirm no live claims (`erd_search.py view` worker/queue
-   reports).
+1. Swarm already stopped; confirm no live claims (`erd_search.py view`).
 2. Checkpoint and back up `wordle_cache.sqlite3` and `erd_queue.sqlite3`.
-3. Check disk headroom on the Linux box: the re-tag copies rows, so
-   retained tables roughly double until retirement.
+3. Check disk headroom: retained tables roughly double until retirement.
 
-### Phase 2 — Re-tag migration (retention)
+### Phase 2 — Re-tag migration
 
-1. Open the cache once with the new list so `ScoreCache._ensure_answer_list`
-   registers the new `answer_list_id` (canonical form is the newline-joined
-   list in file order — do not derive the hash by hand).
-2. With both ids in hand, `INSERT OR IGNORE` (new-id rows, if any, win):
-   - `branch_best_by_policy`, `branch_loss_by_policy`: copy old-id rows to
-     the new id for `erd_words_unfiltered` and `erd_answers_compliant` only.
-   - `candidate_scores`: copy all old-id rows to the new id.
-3. Seed `erd_answers_unfiltered` under the new id per Part 3: sandwich-
-   pinched rows written exact; `ERD_ALL` losses copied in as valid losses;
-   nothing else.
-4. Old-id rows are left fully intact — rollback path until retirement.
+1. Open the cache once with the new answer list so
+   `ScoreCache._ensure_answer_list` registers the new `answer_list_id`.
+2. `INSERT OR IGNORE` old-id → new-id:
+   - `branch_best_by_policy`: `erd_answers_compliant` rows (exact) and
+     `erd_words_unfiltered` rows (recertification seeds).
+   - `branch_loss_by_policy`: `erd_answers_compliant` only.
+   - `candidate_scores`: all rows.
+3. Copy nothing for `erd_answers_unfiltered`; copy no `ERD_ALL` losses.
+4. Old-id rows stay intact — rollback path until retirement.
 
-### Phase 3 — Recompute
+### Phase 3 — `ERD_ALL` recertification sweep
 
-1. Run the Part 3 numerator query; decide eager vs. lazy for the
-   un-pinched `erd_answers_unfiltered` remainder.
-2. Clear the queue (`erd_search.py queue clear`) — its seeds and priorities
-   were derived from the old root tree.
-3. Re-seed from the new 3,208-word root and start the swarm. Workers
-   recompute the root census and descend the 9 new-word cones; unchanged
-   sub-branches hit retained rows (Part 2, Mechanism 1).
-4. If eager: enqueue the un-pinched unfiltered branches after the cones
-   finish (they are lower priority than the serving namespace).
-5. If cone or census throughput measures slow, implement the grown-branch
-   bootstrap (Part 2, Mechanisms 2–3) before brute-forcing.
+1. Time a sample wave; extrapolate; decide committed-extension vs.
+   scratchpad variant of `verify_erd_cache.py`.
+2. Run the sweep leaves-first to completion. No `ERD_ALL` row is served
+   to a user before its wave completes (phone is frozen; Linux use during
+   the sweep is at-your-own-risk and confined to swept sizes).
 
-### Phase 4 — Reverification
+### Phase 4 — Recompute and seed
 
-Run in this order against the new namespace; each step gates the next.
+1. Clear and re-seed the queue from the new 3,209-word root; the swarm
+   computes the root census and the 9 answer-cones (all against the new
+   candidate universe, warm via Mechanism 1).
+2. Sandwich-seed `erd_answers_unfiltered` per Part 4 (post-sweep values,
+   untainted guard, full compliant-row copy, no loss seeding).
+3. Run the un-pinched count; decide eager rebuild vs. lazy.
 
-1. **Structural reconciliation.** Row counts per (policy, answer_list_id):
-   new-id counts equal old-id counts for the two retained policies plus
-   whatever Phase 3 added; unfiltered counts match the seeding + rebuild
-   decision.
-2. **Sampled exactness check.** Random sample of re-tagged rows per
-   retained policy, stratified by branch size; recompute each from scratch
-   under the new list with a fresh in-memory cache; require exact equality
-   of best_score and max_remaining_depth (DB column `max_depth`), and that
-   the stored best_guess achieves the stored score. The retained set is
-   closed under sub-branching (sub-branches of a retained branch are
-   subsets of it), so samples resolve without touching new-word cones.
-   Include a sample of sandwich-pinched unfiltered rows.
-3. **Full ERD_ALL sweep.** `verify_erd_cache.py` re-verifies every
-   `erd_words_unfiltered` entry leaves-first against the true optimum
-   (swarm must be stopped, per its header). This is the strong "reverify
-   ERDs" guarantee: any row the migration should not have kept would be
-   caught and corrected here.
-4. **Loss sweep.** `verify_erd_losses.py` over retained loss entries.
+### Phase 5 — Reverification
+
+1. **Structural reconciliation.** Row counts per (policy, answer_list_id)
+   match the copy/seed/rebuild ledger.
+2. **Sampled exactness check** (`erd_answers_compliant` and seeded
+   unfiltered rows): fresh from-scratch solve per sampled branch; require
+   `best_score` equality against the fresh solve; then verify the stored
+   pair directly — evaluate the stored best_guess on the branch and
+   require it to attain the stored best_score and stored max_depth.
+   (Fresh-solve max_depth equality is tie-dependent — an equally-optimal
+   different guess may carry a different worst case — so the stored pair,
+   which is what the row asserts, is what gets checked.)
+3. **Sweep audit.** Re-run the Phase 3 sweep's verifier mode over a random
+   sample of swept `ERD_ALL` rows with fresh solves (same stored-pair
+   discipline).
+4. **Loss sweep.** `verify_erd_losses.py` over retained compliant losses.
 5. **Test suite.** `python -m unittest discover -s tests -t . -p 'test_*.py'`.
 
-### Phase 5 — Phone catch-up
+### Phase 6 — Phone catch-up
 
-Only after Phase 4 passes in full: the phone pulls origin (picking up the
-list flip) and receives the migrated database in the same sync, so its code
-and `answer_list_id` move together. The re-tag itself is data-only — no
-schema change, no `schema_migrations` entry, no phone code deploy beyond
-the list file.
+Only after Phase 5 passes in full: the phone pulls origin (both list
+flips) and receives the migrated database in the same sync, so code and
+`answer_list_id` move together. Data-only migration otherwise — no schema
+change, no `schema_migrations` entry.
 
-### Phase 6 — Retirement
+### Phase 7 — Retirement
 
-After enough post-cutover use to trust the new world:
+After enough post-cutover use to trust the new world — the soak should
+include simulated games against each of the 9 new answer words and a few
+of the 14 rescued guess words:
 
-1. Delete old-`answer_list_id` rows from `branch_best_by_policy`,
-   `branch_loss_by_policy`, `candidate_scores`, and
-   `response_decomposition`; vacuum/checkpoint; re-sync the phone.
-2. Resume epoch testing (fresh `telemetry_epoch`, steady-state claiming
-   against the new world).
+1. Delete old-`answer_list_id` rows from all four tables;
+   vacuum/checkpoint; re-sync the phone.
+2. Resume epoch testing (fresh `telemetry_epoch`).
 
 ## Open items
 
-- Green-light to execute Phase 0.2 (the list flip PR) and the migration.
-- Eager vs. lazy for the un-pinched `erd_answers_unfiltered` remainder —
-  decided by the Phase 3.1 measurement, not in advance.
-- How much post-cutover use constitutes enough soak for retirement.
+- Source the 14,855-word list (in progress — user).
+- The `wordle.txt` removal set (unknown until sourced) — decides whether
+  `ERD_ALL` seeds are valid incumbents or heuristics only.
+- Committed extension vs. scratchpad variant for the sweep.
+- Eager vs. lazy for the un-pinched `erd_answers_unfiltered` remainder.
+- Soak length before retirement.
