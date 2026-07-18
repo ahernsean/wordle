@@ -22,7 +22,7 @@ Two staleness discoveries, in escalating order:
    client-side in the NYT Wordle web app's own webpack bundle — needed for
    instant offline guess validation. (The answer list is not shipped there;
    revealing it would spoil the game, which is why it stays sourced from
-   Wordle Tools' third-party reconstruction instead.) `Get_NYT_Words.py`
+   Wordle Tools' third-party reconstruction instead.) `Get_NYT_Candidates.py`
    extracts it by shape — a run of ≥5,000 quoted 5-letter words inside a
    downloaded chunk — rather than a hardcoded chunk filename, since NYT's
    chunk hashes and numbering change on every deploy. The delta against
@@ -273,9 +273,12 @@ the list flips and any `verify_erd_cache.py` extension go through PRs.
 ### Phase 0 — Source, rename, and land the corrected vocabularies
 
 1. Source the current 14,855-word NYT full dictionary — **done**.
-   `Get_NYT_Words.py` (new script, mirrors `Get_NYT_Wordlist.py`'s style)
-   scrapes the NYT Wordle web client's bundled dictionary directly; verified
-   independently against a manual extraction, byte-for-byte identical.
+   `Get_NYT_Candidates.py` (new script, mirrors `Get_NYT_Answers.py`'s
+   style — both already carry their permanent names, renamed ahead of the
+   file rename below since neither script's identity depends on which
+   filename it currently writes to) scrapes the NYT Wordle web client's
+   bundled dictionary directly; verified independently against a manual
+   extraction, byte-for-byte identical.
 2. Delta against `wordle.txt` computed in both directions — **done**:
    1,883 additions, 0 removals. No mixed-case handling needed anywhere in
    this plan; the growth-only rows throughout apply as written.
@@ -292,10 +295,12 @@ the list flips and any `verify_erd_cache.py` extension go through PRs.
    update: `runtime_paths.py` (`DEFAULT_ANSWER_LIST_PATH`,
    `DEFAULT_CANDIDATE_LIST_PATH`), `wordle.py` (`ANSWER_FILE`,
    `WORDS_FILE`), `erd_swarm.py`, `erd_search.py`, `verify_erd_cache.py`,
-   `Get_NYT_Wordlist.py` and `Get_NYT_Words.py` (their write targets), any
-   test fixtures/paths referencing the old names, and prose references in
-   `SWARM.md`/`AGENTS.md`. No `schema_migrations` entry — this is a file
-   rename, not a cache schema change.
+   and the write-target constants inside `Get_NYT_Answers.py` and
+   `Get_NYT_Candidates.py` (already correctly named — only the string
+   literal they write to changes here), any test fixtures/paths
+   referencing the old names, and prose references in `SWARM.md`/
+   `AGENTS.md`. No `schema_migrations` entry — this is a file rename, not
+   a cache schema change.
 5. Land the rename plus the corrected content as one PR. No temporary
    dated-capture file is kept once landed — git history holds the old
    content, and the old-`answer_list_id` cache rows (Phase 2 onward) hold
@@ -398,12 +403,15 @@ of the 14 rescued guess words:
 
 ## Resolved
 
-- **14,855-word candidate list**: sourced via `Get_NYT_Words.py`, scraping
-  the NYT Wordle web client's bundled dictionary directly.
+- **14,855-word candidate list**: sourced via `Get_NYT_Candidates.py`,
+  scraping the NYT Wordle web client's bundled dictionary directly.
 - **`wordle.txt` removal set**: 0 removals (1,883 additions only) — the
   growth-only case applies throughout; no mixed-case handling is needed.
 - **File naming**: `wordle.txt`/`NYT_wordlist.txt` → `all_candidates.txt`/
-  `all_answers.txt`, folded into Phase 0.
+  `all_answers.txt`, folded into Phase 0. Both scraper scripts already
+  carry their permanent names (`Get_NYT_Wordlist.py` → `Get_NYT_Answers.py`,
+  `Get_NYT_Words.py` → `Get_NYT_Candidates.py`) — only their write-target
+  string literals still need updating at Phase 0.
 - **Phone sync mechanism**: git pull (Working Copy) for code and lists;
   the existing manual export/import dance for the cache, independently —
   see Phase 6.

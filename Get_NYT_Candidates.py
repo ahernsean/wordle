@@ -21,8 +21,8 @@ def _fetch(url: str) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
-def get_NYT_guess_words() -> list[str]:
-    """Scrape the NYT Wordle web client's bundled guess dictionary.
+def get_NYT_candidate_words() -> list[str]:
+    """Scrape the NYT Wordle web client's bundled candidate dictionary.
 
     The dictionary is shipped to the client (unlike the answer list, which
     would spoil the game) as a JSON array literal inside one of the game's
@@ -44,7 +44,7 @@ def get_NYT_guess_words() -> list[str]:
 
 
 if __name__ == "__main__":
-    words = get_NYT_guess_words()
+    words = get_NYT_candidate_words()
     print(f"Found {len(words)} words")
     with open("wordle.txt", "w") as f:
         f.write("\n".join(words))
