@@ -17,8 +17,20 @@ Two staleness discoveries, in escalating order:
    (`amaro crema flowy glamp glowy hacky janky koran popup queso quran
    runup untag venti`) appear in the answer list but not in `wordle.txt`,
    which is impossible in real Wordle (every answer is an accepted guess).
-   The exact delta — additions *and* possible removals, since NYT removed
-   some original words — is unknown until the 14,855-word list is sourced.
+
+   **Sourced and confirmed.** The current 14,855-word dictionary is shipped
+   client-side in the NYT Wordle web app's own webpack bundle — needed for
+   instant offline guess validation. (The answer list is not shipped there;
+   revealing it would spoil the game, which is why it stays sourced from
+   Wordle Tools' third-party reconstruction instead.) `Get_NYT_Words.py`
+   extracts it by shape — a run of ≥5,000 quoted 5-letter words inside a
+   downloaded chunk — rather than a hardcoded chunk filename, since NYT's
+   chunk hashes and numbering change on every deploy. The delta against
+   `wordle.txt` is **1,883 additions, 0 removals**; the corrected answer
+   list is confirmed a subset of the corrected candidate list, including
+   all 14 previously-missing words and all 9 PSHAW-era additions. Zero
+   removals resolves Part 2's table to the growth-only row throughout:
+   `ERD_ALL` rows are valid upper bounds/incumbents, not mere heuristics.
 
 The candidate-universe change dominates the planning: `ERD_ALL`'s guess
 vocabulary is `wordle.txt`, so the namespace that the answer-list-only
@@ -102,7 +114,7 @@ keys' *values* still serve depends on the vocabulary analysis below.)
 | Policy | Guess vocabulary | Effect of combined change | Disposition |
 |---|---|---|---|
 | `erd_answers_compliant` (`ERD_ANSWERS`) | the branch words themselves (`guesses=None` ⇒ `candidate_list = branch_words`, recursively) | pure function of `branch_key`; neither list enters: **exact** | retain — the only fully exact ERD namespace |
-| `erd_words_unfiltered` (`ERD_ALL`) | `wordle.txt` — grew ~1.9k net, removals possible | growth-only: rows demote to **upper bounds** (legal best_guess, valid incumbent); with removals: rows whose strategy touches a removed word are unreliable and best_guess may be illegal; losses **invalid** either way | retain rows as **recertification seeds**, not servable truths; drop losses |
+| `erd_words_unfiltered` (`ERD_ALL`) | `all_candidates.txt` (formerly `wordle.txt`) — grew by 1,883, 0 removals (confirmed) | growth-only case applies: rows demote to **upper bounds** (legal best_guess, valid incumbent); losses **invalid** regardless | retain rows as **recertification seeds**, not servable truths; drop losses |
 | `erd_answers_unfiltered` (`ERD_ANSWERS_UNFILTERED`) | answer list — grew by 9 | rows demote to upper bounds; losses invalid | rebuild via sandwich seeding (Part 4) after the `ERD_ALL` sweep |
 | `erd_words_compliant` (`ERD_CONSTRAINED`) | path-dependent | never persisted | n/a |
 
@@ -153,8 +165,8 @@ either way.
 ### The vocabulary-inclusion sandwich — gated, and only post-sweep
 
 With the corrected lists, verify (do not assume): every answer word ∈ new
-`wordle.txt`. Then for any branch B, B ⊆ answers′ ⊆ all-words′, and the
-theorem gives:
+`all_candidates.txt`. Then for any branch B, B ⊆ answers′ ⊆ all-words′, and
+the theorem gives:
 
     ERD_ALL′(B)  ≤  ERD_ANSWERS_UNFILTERED′(B)  ≤  ERD_ANSWERS(B)
 
@@ -258,17 +270,37 @@ completion; the mechanisms make each scan cheap, not skippable.
 One-time operations run from the scratchpad and are never committed;
 the list flips and any `verify_erd_cache.py` extension go through PRs.
 
-### Phase 0 — Source and land the corrected vocabularies
+### Phase 0 — Source, rename, and land the corrected vocabularies
 
-1. Source the current 14,855-word NYT full dictionary (the NYT game's JS
-   bundle is ground truth; `Get_NYT_Wordlist.py`'s scrape pattern extends).
-2. Compute the `wordle.txt` delta **in both directions**; record additions
-   and removals. The removal set decides the sweep's shape (Part 3).
-3. Gates before anything else runs: new answer list ⊆ new candidate list
-   (the 14 words included); both files sorted, unique, 5-letter lowercase.
-4. Land both corrected lists in one PR (`wordle.txt` and
-   `NYT_wordlist.txt`; delete the date-stamped capture — git history
-   preserves everything). The phone does not pull until Phase 6.
+1. Source the current 14,855-word NYT full dictionary — **done**.
+   `Get_NYT_Words.py` (new script, mirrors `Get_NYT_Wordlist.py`'s style)
+   scrapes the NYT Wordle web client's bundled dictionary directly; verified
+   independently against a manual extraction, byte-for-byte identical.
+2. Delta against `wordle.txt` computed in both directions — **done**:
+   1,883 additions, 0 removals. No mixed-case handling needed anywhere in
+   this plan; the growth-only rows throughout apply as written.
+3. Gates confirmed: new answer list ⊆ new candidate list (the 14 words
+   included, plus all 9 PSHAW-era words); both source lists sorted, unique,
+   5-letter lowercase.
+4. **Rename** `wordle.txt` → `all_candidates.txt` and `NYT_wordlist.txt` →
+   `all_answers.txt`, landing the corrected content under the new names in
+   the same PR (no separate rename pass). `all_candidates.txt` names the
+   file for what it is — the universe the anchored **candidate** vocabulary
+   term (AGENTS.md) is drawn from — and pairs cleanly with
+   `all_answers.txt`, whereas `wordle.txt` was opaque and `NYT_wordlist.txt`
+   was easily confused with the file it's now renamed away from. Files to
+   update: `runtime_paths.py` (`DEFAULT_ANSWER_LIST_PATH`,
+   `DEFAULT_CANDIDATE_LIST_PATH`), `wordle.py` (`ANSWER_FILE`,
+   `WORDS_FILE`), `erd_swarm.py`, `erd_search.py`, `verify_erd_cache.py`,
+   `Get_NYT_Wordlist.py` and `Get_NYT_Words.py` (their write targets), any
+   test fixtures/paths referencing the old names, and prose references in
+   `SWARM.md`/`AGENTS.md`. No `schema_migrations` entry — this is a file
+   rename, not a cache schema change.
+5. Land the rename plus the corrected content as one PR. No temporary
+   dated-capture file is kept once landed — git history holds the old
+   content, and the old-`answer_list_id` cache rows (Phase 2 onward) hold
+   the old world's computed results; neither needs a parallel on-disk file
+   to survive through the soak. The phone does not pull until Phase 6.
 
 ### Phase 1 — Freeze and back up
 
@@ -325,10 +357,27 @@ the list flips and any `verify_erd_cache.py` extension go through PRs.
 
 ### Phase 6 — Phone catch-up
 
-Only after Phase 5 passes in full: the phone pulls origin (both list
-flips) and receives the migrated database in the same sync, so code and
-`answer_list_id` move together. Data-only migration otherwise — no schema
-change, no `schema_migrations` entry.
+Only after Phase 5 passes in full. Code/list sync and cache sync are two
+separate, decoupled mechanisms on this project, not one combined step:
+
+1. **Code and lists.** The phone (Working Copy) pulls `main` — a plain git
+   pull, picking up the Phase 0 rename/content PR and everything since.
+2. **Cache.** The already-established export/import dance brings the
+   phone's database in line with rocky's post-migration, post-sweep
+   `wordle_cache.sqlite3` (`wordle_cache.sqlite3` itself is not tracked in
+   git, so step 1 alone never touches it).
+
+Order between the two doesn't threaten correctness either way:
+`_ensure_answer_list` always computes `answer_list_id` fresh from whichever
+list files are currently loaded, and every read filters on that id, so an
+old-code/new-cache or new-code/old-cache mismatch just produces cache
+misses (the engine falls through to computing on the fly) rather than a
+wrong answer. Do step 1 before step 2 anyway, for a mundane reason: no
+sense importing a multi-gigabyte database before the code that can make use
+of its new-id rows is even in place.
+
+No schema change and no `schema_migrations` entry either way — this is a
+data and file-content migration, not a structural one.
 
 ### Phase 7 — Retirement
 
@@ -342,9 +391,19 @@ of the 14 rescued guess words:
 
 ## Open items
 
-- Source the 14,855-word list (in progress — user).
-- The `wordle.txt` removal set (unknown until sourced) — decides whether
-  `ERD_ALL` seeds are valid incumbents or heuristics only.
-- Committed extension vs. scratchpad variant for the sweep.
+- Committed extension vs. scratchpad variant for the `ERD_ALL`
+  recertification sweep.
 - Eager vs. lazy for the un-pinched `erd_answers_unfiltered` remainder.
 - Soak length before retirement.
+
+## Resolved
+
+- **14,855-word candidate list**: sourced via `Get_NYT_Words.py`, scraping
+  the NYT Wordle web client's bundled dictionary directly.
+- **`wordle.txt` removal set**: 0 removals (1,883 additions only) — the
+  growth-only case applies throughout; no mixed-case handling is needed.
+- **File naming**: `wordle.txt`/`NYT_wordlist.txt` → `all_candidates.txt`/
+  `all_answers.txt`, folded into Phase 0.
+- **Phone sync mechanism**: git pull (Working Copy) for code and lists;
+  the existing manual export/import dance for the cache, independently —
+  see Phase 6.
