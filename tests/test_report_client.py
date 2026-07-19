@@ -157,7 +157,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_branch_status_filter_and_context_node(self):
         self.apply_selector("RAISE .....")
-        self.page.locator("#tree").check()
+        self.page.locator("#tree-button").click()
         self.page.wait_for_selector("text=Live queue tree")
         self.assertIn("tree=1", self.page.url)
         self.assertIn("branch_status=active", self.page.url)
@@ -171,7 +171,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
-        self.page.locator("#tree").check()
+        self.page.locator("#tree-button").click()
         self.page.wait_for_selector(".tree button")
         self.page.locator(".tree button").first.click()
         self.page.wait_for_selector("text=branch report")
@@ -184,8 +184,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("active", text)
         self.assertIn("evaluating", text)
         self.assertIn("finalizing", text)
-        self.assertIn("worker-0", text)
-        self.assertIn("worker-4", text)
+        self.assertIn("w0", text)
+        self.assertIn("w4", text)
+        self.assertNotIn("worker-0", text)
         self.assertGreater(self.page.locator(".card.dead").count(), 0)
 
     def test_candidate_disclosure_requests_claims_and_labels_proof(self):
@@ -231,6 +232,12 @@ class ReportClientBrowserTest(unittest.TestCase):
           const changedBranch=structuredClone(branch);changedBranch.data.workers[0].current_candidate='slate';
           applyReport(changedBranch,branch,{...state,selector:'RAISE .....'});
           result.branch=document.querySelector('[data-identity="worker-12"]').className;
+          const deadBranch=structuredClone(branch);deadBranch.data.workers[0].is_live=false;
+          applyReport(deadBranch,branch,{...state,selector:'RAISE .....'});
+          result.deadWorker=document.querySelector('[data-identity="worker-12"]').className;
+          const heartbeatOnly=structuredClone(branch);heartbeatOnly.data.workers[0].updated_at=995;heartbeatOnly.data.workers[0].nodes_per_second=99;
+          applyReport(heartbeatOnly,branch,{...state,selector:'RAISE .....'});
+          result.heartbeatWorker=document.querySelector('[data-identity="worker-12"]').className;
 
           const cache=await (await fetch('/api/view/cache')).json(),changedCache=structuredClone(cache);
           cache.data.recent_rows[0].cache_state='missing';changedCache.data.recent_rows[0].cache_state='exact';
@@ -244,7 +251,9 @@ class ReportClientBrowserTest(unittest.TestCase):
           return result;
         }""")
         self.assertIn("flash-improved", classes["tree"])
-        self.assertIn("flash-changed", classes["branch"])
+        self.assertIn("flash-improved", classes["branch"])
+        self.assertIn("flash-changed", classes["deadWorker"])
+        self.assertNotIn("flash", classes["heartbeatWorker"])
         self.assertIn("flash-improved", classes["cache"])
         self.assertIn("flash-changed", classes["hotspot"])
 
@@ -269,7 +278,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_collapse_and_browser_back_survive_poll(self):
         self.page.locator("[data-kind=queue]").click()
-        self.page.locator("#tree").check()
+        self.page.locator("#tree-button").click()
         self.page.wait_for_selector(".tree details")
         details = self.page.locator(".tree details").first
         details.locator("summary").first.click()
@@ -286,12 +295,15 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.evaluate("__reportClient.fetchReport()")
         self.page.evaluate("__reportClient.fetchReport()")
         self.page.wait_for_timeout(100)
-        self.assertIn("disconnected", self.page.locator("#connection").inner_text())
+        chip = self.page.locator("#connection")
+        self.assertIn("disconnected", chip.get_attribute("class") or "")
+        self.assertIn("offline", chip.inner_text())
         self.assertEqual(self.page.locator("#report").inner_text(), original)
         self.page.unroute("**/api/view**")
         self.page.evaluate("__reportClient.fetchReport()")
         self.page.wait_for_timeout(100)
-        self.assertEqual(self.page.locator("#connection").inner_text(), "connected")
+        self.assertNotIn("disconnected", chip.get_attribute("class") or "")
+        self.assertEqual(chip.inner_text(), "●")
 
     def test_url_state_round_trips_branch_filters(self):
         state = self.page.evaluate("""() => parsePageState({search:'?kind=queue&branch_status=pending,done&branch_phase=queued,complete&limit=25&sort=nodes&poll=5000'})""")
@@ -327,7 +339,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("Shown 3 of 3 matched · 4 total response groups", text)
-        self.assertIn("response group count", text)
+        self.assertIn("response groups", text)
 
     def test_selected_detail_remains_visible_after_leaving_parent_filter(self):
         text = self.page.evaluate("""async () => {
@@ -338,7 +350,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("status\ndone", text)
-        self.assertIn("no longer matches the parent filter", text)
+        self.assertNotIn("no longer matches the parent filter", text)
 
     def test_cache_renderer_handles_root_word_and_branch_contracts(self):
         identities = self.page.evaluate("""async () => {
@@ -406,6 +418,66 @@ class ReportClientBrowserTest(unittest.TestCase):
                 self.page.set_viewport_size({"width": width, "height": 800})
                 overflow = self.page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth")
                 self.assertFalse(overflow)
+
+    def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
+        result = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          branch.data.completed_candidate_indexes=[...Array(50).keys()];
+          branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
+          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          const cells=[...document.querySelectorAll('.sweep-cell')];
+          return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),workerCells:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber)};
+        }""")
+        self.assertGreater(result["cellCount"], 20)
+        self.assertEqual(result["firstFill"], "100%")
+        self.assertEqual(result["lastFill"], "0%")
+        self.assertEqual(result["workerCells"], ["3"])
+
+    def test_integers_use_comma_separators(self):
+        self.apply_selector("RAISE .....")
+        self.page.wait_for_selector("text=branch report")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("12,000", text)
+        self.assertNotIn("12000", text)
+
+    def test_candidates_are_uppercase_with_answer_asterisk(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',current_candidate:'crane',current_candidate_is_answer:true,current_max_guess_depth:2,nodes_per_second:10}];
+          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("CRANE*", text)
+        self.assertNotIn("crane", text)
+
+    def test_hotspot_population_is_humanized_and_hex_is_hidden(self):
+        self.page.locator("[data-kind=hotspots]").click()
+        self.page.wait_for_selector("text=hotspots report")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("recent claim coordination buckets", text)
+        self.assertNotIn("recent_claim_coordination_buckets", text)
+        self.page.locator("[data-kind=cache]").click()
+        self.page.wait_for_selector("text=cache report")
+        cache_text = self.page.locator("#report").inner_text()
+        self.assertNotIn("branch key hex", cache_text)
+        self.assertNotIn("branch_key_hex", cache_text)
+
+    def test_tree_toggle_is_hidden_for_treeless_kinds(self):
+        tree_button = self.page.locator("#tree-button")
+        self.assertTrue(tree_button.is_visible())
+        self.page.locator("[data-kind=cache]").click()
+        self.page.wait_for_selector("text=cache report")
+        self.assertFalse(tree_button.is_visible())
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector("text=queue report")
+        self.assertTrue(tree_button.is_visible())
+        tree_button.click()
+        self.page.wait_for_selector("text=Live queue tree")
+        self.assertEqual(tree_button.get_attribute("aria-pressed"), "true")
+        tree_button.click()
+        self.page.wait_for_timeout(150)
+        self.assertEqual(tree_button.get_attribute("aria-pressed"), "false")
+        self.assertNotIn("tree=1", self.page.url)
 
     def test_review_screenshots_are_written(self):
         with tempfile.TemporaryDirectory() as directory:

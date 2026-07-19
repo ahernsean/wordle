@@ -33,6 +33,7 @@ BRANCH_HOTKEYS = "abcdefghijklmnoprstuvwxyz"
 class DisplayOrder:
     branch_keys: list[str] = field(default_factory=list)
     worker_ids: list[str] = field(default_factory=list)
+    hotkey_letters: dict[str, str] = field(default_factory=dict)
 
     @staticmethod
     def _update_identities(existing, incoming, pinned):
@@ -82,6 +83,87 @@ def _percentage(numerator, denominator):
     if not denominator:
         return "—"
     return f"{100.0 * numerator / denominator:.1f}%"
+
+
+def _display_reference(branch_reference):
+    """Four-character display prefix of a branch reference.
+
+    Collisions among the few dozen simultaneously live branches are
+    vanishingly unlikely over a 16-bit space, and any prefix remains a valid
+    @reference selector.
+    """
+    return branch_reference[:4]
+
+
+def _hotkey_label(display_order, branch_key_hex):
+    letter = display_order.hotkey_letters.get(branch_key_hex)
+    return f"[{letter}]" if letter else ""
+
+
+def candidate_sweep_bar(candidate_count, completed_candidate_indexes,
+                        worker_positions, width=40):
+    """Render compressed candidate completion and worker positions.
+
+    Each cell covers a range of candidate indices.  Unicode block heights show
+    how much of the cell is done; worker labels overlay that conceptual
+    completion map at their current claim positions.
+    """
+    if candidate_count <= 0 or width <= 0:
+        return ""
+    done_counts = [0] * width
+    seen_indexes = set()
+    for index in completed_candidate_indexes or ():
+        if index is None or index < 0 or index in seen_indexes:
+            continue
+        seen_indexes.add(index)
+        position = min(width - 1, int(width * index / candidate_count))
+        done_counts[position] += 1
+    ramp = " ▁▂▃▄▅▆▇█"
+    marks = [" "] * width
+    for position, done_count in enumerate(done_counts):
+        if done_count == 0:
+            continue
+        start = (position * candidate_count + width - 1) // width
+        end = ((position + 1) * candidate_count + width - 1) // width
+        cell_size = end - start
+        level = min(
+            len(ramp) - 1,
+            (done_count * (len(ramp) - 1) + cell_size - 1) // cell_size,
+        )
+        marks[position] = ramp[level]
+    for index, label in worker_positions or ():
+        if index is None or index < 0:
+            continue
+        position = min(width - 1, int(width * index / candidate_count))
+        # Preserve multiple adjacent worker digits where possible, while still
+        # allowing a worker to replace a progress marker in its approximate
+        # bucket.
+        while position < width and marks[position].isdigit():
+            position += 1
+        if position >= width:
+            position = width - 1
+        marks[position] = str(label)[-1]
+    return "".join(marks)
+
+
+def _highlight_changes(new_line, old_line):
+    """Return new_line with runs of changed characters highlighted in red."""
+    if new_line == old_line:
+        return new_line
+    result = []
+    in_change = False
+    for index, character in enumerate(new_line):
+        changed = index >= len(old_line) or character != old_line[index]
+        if changed and not in_change:
+            result.append(RED)
+            in_change = True
+        elif not changed and in_change:
+            result.append(RESET)
+            in_change = False
+        result.append(character)
+    if in_change:
+        result.append(RESET)
+    return "".join(result)
 
 
 def _abbreviate_number(value):
@@ -196,12 +278,12 @@ def _column_value(column, row):
     return "—" if value is None or value == "" else str(value)
 
 
-def _table_layout(columns, rows, available_width):
+def _table_layout(columns, rows, available_width, *, include_heading_widths=True):
     visible_columns = list(columns)
 
     def measured_width(column):
         width = max(
-            len(column.heading),
+            len(column.heading) if include_heading_widths else 0,
             column.minimum_width,
             *(_column_value(column, row).__len__() for row in rows),
         )
@@ -275,17 +357,32 @@ def _render_stacked_rows(columns, rows, width, indent, row_classes, color):
 
 
 def _render_table(
-    columns, rows, width, *, indent="", row_classes=None,
-    measurement_rows=None, include_header=True, color=False,
+    columns, rows, width, *, indent="", row_classes=None, previous_rows=None,
+    measurement_rows=None, include_header=True, measure_headings=None,
+    color=False,
 ):
     measurement_rows = rows if measurement_rows is None else measurement_rows
     available_width = max(0, width - len(indent))
-    layout = _table_layout(columns, measurement_rows, available_width)
+    layout = _table_layout(
+        columns, measurement_rows, available_width,
+        include_heading_widths=(
+            include_header if measure_headings is None else measure_headings
+        ),
+    )
     if layout is None:
         return _render_stacked_rows(
             columns, rows, width, indent, row_classes, color
         )
     visible_columns, column_widths = layout
+
+    def formatted_line(row):
+        return indent + "  ".join(
+            _format_table_cell(
+                _column_value(column, row), column, column_widths[column]
+            )
+            for column in visible_columns
+        ).rstrip()
+
     lines = []
     if include_header:
         lines.append(indent + "  ".join(
@@ -293,14 +390,15 @@ def _render_table(
             for column in visible_columns
         ).rstrip())
     for index, row in enumerate(rows):
-        line = indent + "  ".join(
-            _format_table_cell(
-                _column_value(column, row), column, column_widths[column]
-            )
-            for column in visible_columns
-        ).rstrip()
+        line = formatted_line(row)
         semantic_class = row_classes[index] if row_classes else None
-        lines.append(_colorize(line, semantic_class, color))
+        previous_row = previous_rows[index] if previous_rows else None
+        if semantic_class == "changed":
+            if color and previous_row is not None:
+                line = _highlight_changes(line, formatted_line(previous_row))
+        else:
+            line = _colorize(line, semantic_class, color)
+        lines.append(line)
     return lines
 
 
@@ -338,7 +436,7 @@ def _semantic_branch_class(branch, previous_branch):
         )
     ):
         return "green"
-    return "red" if branch != previous_branch else None
+    return "changed" if branch != previous_branch else None
 
 
 def _semantic_worker_class(worker, previous_worker, generated_at):
@@ -353,26 +451,47 @@ def _semantic_worker_class(worker, previous_worker, generated_at):
     previous_values = {
         key: value for key, value in previous_worker.items() if key not in ignored
     }
-    return "red" if current_values != previous_values else None
+    return "changed" if current_values != previous_values else None
 
 
 def _colorize(line, semantic_class, color):
-    if not color or semantic_class is None:
+    if not color:
         return line
-    prefix = {"green": GREEN, "red": RED, "amber": AMBER}[semantic_class]
+    prefix = {"green": GREEN, "red": RED, "amber": AMBER}.get(semantic_class)
+    if prefix is None:
+        return line
     return f"{prefix}{line}{RESET}"
 
 
-def _source_line(name, source, width):
-    if source["ok"]:
-        health = "ok"
-    elif source["error"] is None:
-        health = "not used"
-    else:
-        health = f"unavailable: {source['error']}"
-    if width >= 80:
-        return _fit(f"  {name}: {health}  path={source['path']}", width)
-    return _fit(f"  {name}: {health}", width)
+def _source_problem_lines(report, width):
+    lines = []
+    for name in ("queue", "telemetry", "cache"):
+        source = report["sources"][name]
+        if not source["ok"] and source["error"] is not None:
+            lines.append(_fit(
+                f"  {name} unavailable: {source['error']}  path={source['path']}",
+                width,
+            ))
+    return lines
+
+
+def _inline_section(label, fields, width):
+    """One wrapped section line: 'Label: field  field  …' with continuations
+    indented two spaces."""
+    lines = []
+    current = label
+    at_line_start = True
+    for field_text in fields:
+        separator = " " if at_line_start else "  "
+        candidate = current + separator + field_text
+        if len(candidate) > width and not at_line_start:
+            lines.append(current)
+            current = "  " + field_text
+        else:
+            current = candidate
+        at_line_start = False
+    lines.append(current)
+    return [_fit(line, width) for line in lines]
 
 
 def _render_sections(report, previous_report, color, width, display_order):
@@ -391,17 +510,25 @@ def _render_sections(report, previous_report, color, width, display_order):
 
     generated_at = report["generated_at"]
     generated_text = datetime.fromtimestamp(generated_at).strftime("%Y-%m-%d %H:%M:%S")
+    previous_generated_at = (
+        previous_report["generated_at"] if previous_report else generated_at
+    )
     queue_source = report["sources"]["queue"]
-    header = [_fit(f"ERD swarm overview  {generated_text}  ({generated_at})", width)]
-    for source_name in ("queue", "telemetry", "cache"):
-        header.append(_source_line(source_name, report["sources"][source_name], width))
+    header = [_fit(f"ERD swarm overview  {generated_text}", width)]
+    source_fields = []
+    problem_lines = _source_problem_lines(report, width)
+    if not problem_lines:
+        source_fields.append("sources ok")
     if queue_source.get("epoch") is not None:
         epoch_detail = f"epoch={queue_source['epoch']}"
         if queue_source.get("label"):
             epoch_detail += f" {queue_source['label']}"
         if queue_source.get("git_sha"):
             epoch_detail += f" revision={queue_source['git_sha']}"
-        header.append(_fit(f"  {epoch_detail}", width))
+        source_fields.append(epoch_detail)
+    header.extend(problem_lines)
+    if source_fields:
+        header.extend(_wrap_fields(source_fields, width))
     header.append(_fit(
         render_disk_status(report["data"].get("disk", {}), color=color), width
     ))
@@ -409,26 +536,23 @@ def _render_sections(report, previous_report, color, width, display_order):
     cache_summary = report["data"]["cache_summary"]
     totals = report["data"]["worker_totals"]
     cache_attempts = totals["cache_hit_count"] + totals["cache_miss_count"]
-    cache = ["Cache"] + _wrap_fields([
-        f"exact {cache_summary['exact_branch_count']:,}",
-        f"loss {cache_summary['loss_branch_count']:,}",
-        f"recent {cache_summary['recent_exact_branch_count']:,}",
-        f"live hit {_percentage(totals['cache_hit_count'], cache_attempts)}",
-    ], width)
-
-    queue_counts = report["data"]["queue_counts"]
     evaluation_count = (
         totals["solved_evaluation_count"]
         + totals["erd_cutoff_evaluation_count"]
         + totals["remaining_depth_pruned_evaluation_count"]
     )
-    queue = ["Queue"] + _wrap_fields([
+    queue_counts = report["data"]["queue_counts"]
+    summary = _inline_section("Cache:", [
+        f"exact {cache_summary['exact_branch_count']:,}",
+        f"loss {cache_summary['loss_branch_count']:,}",
+        f"recent {cache_summary['recent_exact_branch_count']:,}",
+        f"live hit {_percentage(totals['cache_hit_count'], cache_attempts)}",
+    ], width) + _inline_section("Queue:", [
         f"pending {queue_counts['pending_branch_count']:,}",
-        f"evaluating user {queue_counts['evaluating_user_branch_count']:,}",
-        f"evaluating coop {queue_counts['evaluating_cooperative_branch_count']:,}",
+        f"user {queue_counts['evaluating_user_branch_count']:,}",
+        f"coop {queue_counts['evaluating_cooperative_branch_count']:,}",
         f"finalizing {queue_counts['finalizing_branch_count']:,}",
         f"done {queue_counts['done_branch_count']:,}",
-    ], width) + _wrap_fields([
         f"ERD cutoff {_percentage(totals['erd_cutoff_evaluation_count'], evaluation_count)}",
         "remaining-depth pruned "
         f"{_percentage(totals['remaining_depth_pruned_evaluation_count'], evaluation_count)}",
@@ -442,9 +566,94 @@ def _render_sections(report, previous_report, color, width, display_order):
     for worker in workers:
         workers_by_branch.setdefault(worker.get("branch_key_hex"), []).append(worker)
     branch_rows = []
+    previous_branch_rows = []
     branch_classes = []
-    branch_columns = [
-        TerminalColumn("Ref", lambda row: "@" + row["branch_reference"], required=True),
+    branch_columns = _branch_columns(display_order)
+    for branch in branches:
+        branch_key = branch["branch_key_hex"]
+        if branch["branch_status"] == "active":
+            active_branch_keys.add(branch_key)
+        branch_rows.append(
+            _branch_display_row(branch, generated_at, display_order)
+        )
+        previous_branch = previous_branches.get(branch_key)
+        previous_branch_rows.append(
+            _branch_display_row(
+                previous_branch, previous_generated_at, display_order
+            )
+            if previous_branch is not None else None
+        )
+        branch_classes.append(_semantic_branch_class(branch, previous_branch))
+
+    header_rendered = False
+    for index, branch in enumerate(branches):
+        branch_lines.extend(_render_table(
+            branch_columns, [branch_rows[index]], width, indent="  ",
+            row_classes=[branch_classes[index]],
+            previous_rows=[previous_branch_rows[index]],
+            measurement_rows=branch_rows,
+            include_header=not header_rendered, measure_headings=True,
+            color=color,
+        ))
+        header_rendered = True
+        branch_key = branch["branch_key_hex"]
+        if branch["branch_status"] != "active":
+            continue
+        live_branch_workers = [
+            item for item in workers_by_branch.get(branch_key, [])
+            if item["is_live"]
+        ]
+        if live_branch_workers:
+            branch_lines.extend(_worker_lines(
+                live_branch_workers, previous_workers, generated_at,
+                previous_generated_at, width, indent="    ", color=color,
+                state=lambda worker: "active",
+            ))
+    if len(branch_lines) == 1:
+        branch_lines.append("  none")
+
+    remaining_worker_lines = ["Other workers"]
+    remaining_workers = [
+        worker for worker in workers
+        if not (worker["is_live"] and worker.get("branch_key_hex") in active_branch_keys)
+    ]
+
+    def remaining_state(worker):
+        if not worker["is_live"]:
+            return "dead"
+        if worker.get("branch_key_hex") is None:
+            return "idle"
+        return "finalizing"
+
+    if remaining_workers:
+        remaining_worker_lines.extend(_worker_lines(
+            remaining_workers, previous_workers, generated_at,
+            previous_generated_at, width, indent="  ", color=color,
+            state=remaining_state,
+        ))
+    else:
+        remaining_worker_lines.append("  none")
+
+    return [
+        ("header", header),
+        ("summary", summary),
+        ("branches", branch_lines),
+        ("workers", remaining_worker_lines),
+    ]
+
+
+def _branch_columns(display_order):
+    columns = []
+    if display_order.hotkey_letters:
+        columns.append(
+            TerminalColumn("Key", "display_hotkey", required=True)
+        )
+    columns.extend([
+        TerminalColumn(
+            "Ref",
+            lambda row: "@" + _display_reference(row["branch_reference"]),
+            required=True,
+        ),
         TerminalColumn("GuessD", "guess_depth", required=True, alignment="right"),
         TerminalColumn("State", "display_state", required=True),
         TerminalColumn(
@@ -471,141 +680,122 @@ def _render_sections(report, previous_report, color, width, display_order):
             "Spine", "display_spine", remove_priority=60,
             minimum_width=12, maximum_width=40, truncation="tail",
         ),
+    ])
+    return columns
+
+
+def _display_best(row):
+    if not row.get("best_guess"):
+        return "—"
+    best = row["best_guess"].upper()
+    if row.get("best_guess_is_answer"):
+        best += "*"
+    if row.get("best_erd") is not None:
+        best += f"/{row['best_erd']:.3f}"
+    return best
+
+
+def _branch_display_row(branch, generated_at, display_order):
+    branch_row = dict(branch)
+    branch_row["display_hotkey"] = _hotkey_label(
+        display_order, branch["branch_key_hex"]
+    )
+    branch_row["display_state"] = {
+        "finalizing": "final",
+    }.get(branch["branch_status"], branch["branch_status"])
+    branch_row["display_best"] = _display_best(branch)
+    branch_row["display_eta"] = _abbreviate_duration(
+        _branch_eta(branch, generated_at)
+    )
+    branch_row["display_spine"] = " ▸ ".join(
+        f"{step['word'].upper()} {step['pattern']}" for step in branch["spine"]
+    ) or "—"
+    return branch_row
+
+
+def _worker_lines(
+    workers, previous_workers, generated_at, previous_generated_at, width,
+    *, indent, color, state,
+):
+    rows = [
+        _worker_display_row(worker, generated_at, state(worker))
+        for worker in workers
     ]
-    for branch in branches:
-        branch_key = branch["branch_key_hex"]
-        if branch["branch_status"] == "active":
-            active_branch_keys.add(branch_key)
-        best = "—"
-        if branch.get("best_guess"):
-            best = branch["best_guess"].upper()
-            if branch.get("best_erd") is not None:
-                best += f"/{branch['best_erd']:.3f}"
-        branch_row = dict(branch)
-        branch_row["display_state"] = {
-            "finalizing": "final",
-        }.get(branch["branch_status"], branch["branch_status"])
-        branch_row["display_best"] = best
-        branch_row["display_eta"] = _abbreviate_duration(
-            _branch_eta(branch, generated_at)
-        )
-        branch_row["display_spine"] = " ▸ ".join(
-            f"{step['word'].upper()} {step['pattern']}" for step in branch["spine"]
-        ) or "—"
-        branch_rows.append(branch_row)
-        branch_classes.append(
-            _semantic_branch_class(branch, previous_branches.get(branch_key))
-        )
-
-    header_rendered = False
-    for index, branch in enumerate(branches):
-        branch_lines.extend(_render_table(
-            branch_columns, [branch_rows[index]], width, indent="  ",
-            row_classes=[branch_classes[index]], measurement_rows=branch_rows,
-            include_header=not header_rendered, color=color,
-        ))
-        header_rendered = True
-        branch_key = branch["branch_key_hex"]
-        for worker in workers_by_branch.get(branch_key, []):
-            if worker["is_live"] and branch["branch_status"] == "active":
-                branch_workers = [
-                    _worker_display_row(item, generated_at, "active")
-                    for item in workers_by_branch.get(branch_key, [])
-                    if item["is_live"] and branch["branch_status"] == "active"
-                ]
-                branch_worker_classes = [
-                    _semantic_worker_class(
-                        item, previous_workers.get(item["worker_id"]), generated_at
-                    )
-                    for item in workers_by_branch.get(branch_key, [])
-                    if item["is_live"] and branch["branch_status"] == "active"
-                ]
-                branch_lines.extend(_render_worker_table(
-                    branch_workers, branch_worker_classes, width,
-                    indent="    ", color=color,
-                ))
-                break
-    if len(branch_lines) == 1:
-        branch_lines.append("  none")
-
-    remaining_worker_lines = ["Other workers"]
-    remaining_workers = []
-    remaining_worker_classes = []
+    previous_rows = []
+    row_classes = []
     for worker in workers:
-        branch_key = worker.get("branch_key_hex")
-        if worker["is_live"] and branch_key in active_branch_keys:
-            continue
-        if not worker["is_live"]:
-            state = "dead"
-        elif branch_key is None:
-            state = "idle"
-        else:
-            state = "finalizing"
-        remaining_workers.append(_worker_display_row(worker, generated_at, state))
-        remaining_worker_classes.append(_semantic_worker_class(
-            worker, previous_workers.get(worker["worker_id"]), generated_at
+        previous_worker = previous_workers.get(worker["worker_id"])
+        previous_rows.append(
+            _worker_display_row(
+                previous_worker, previous_generated_at, state(worker)
+            )
+            if previous_worker is not None else None
+        )
+        row_classes.append(_semantic_worker_class(
+            worker, previous_worker, generated_at
         ))
-    if remaining_workers:
-        remaining_worker_lines.extend(_render_worker_table(
-            remaining_workers, remaining_worker_classes, width,
-            indent="  ", color=color,
-        ))
-    else:
-        remaining_worker_lines.append("  none")
-
-    return [
-        ("header", header),
-        ("cache", cache),
-        ("queue", queue),
-        ("branches", branch_lines),
-        ("workers", remaining_worker_lines),
-    ]
+    return _render_worker_table(
+        rows, row_classes, width, indent=indent, color=color,
+        previous_rows=previous_rows,
+    )
 
 
 def _worker_display_row(worker, generated_at, state):
     age = max(0, generated_at - worker["updated_at"])
     row = dict(worker)
+    worker_number = str(
+        worker.get("worker_number")
+        or worker["worker_id"].rsplit("-", 1)[-1]
+    )
+    row["display_worker"] = (
+        f"w{worker_number}" if worker_number.isdigit() else worker["worker_id"]
+    )
     row["display_state"] = {
         "finalizing": "final",
     }.get(state or "active", state or "active")
     row["display_age"] = _abbreviate_duration(age)
-    row["display_candidate"] = (worker.get("current_candidate") or "—").upper()
-    row["display_rate"] = _abbreviate_number(worker.get("nodes_per_second"))
+    candidate = worker.get("current_candidate")
+    display_candidate = "—"
+    if candidate:
+        display_candidate = candidate.upper()
+        if worker.get("current_candidate_is_answer"):
+            display_candidate += "*"
+    row["display_candidate"] = display_candidate
+    guess_depth = worker.get("current_max_guess_depth")
+    row["display_guess_depth"] = (
+        f"d{guess_depth}" if guess_depth is not None else "—"
+    )
+    rate = worker.get("nodes_per_second")
+    row["display_rate"] = (
+        f"{_abbreviate_number(rate)}/s" if rate is not None else "—"
+    )
     return row
 
 
 def _worker_columns():
+    # Rendered headerless: dN, …/s, and …s suffixes label the cells in place.
     return [
-        TerminalColumn("Worker", "worker_id", required=True),
+        TerminalColumn("Worker", "display_worker", required=True),
         TerminalColumn("State", "display_state", required=True),
-        TerminalColumn("Age", "display_age", required=True, alignment="right"),
-        TerminalColumn("Current", "display_candidate", required=True),
+        TerminalColumn("Candidate", "display_candidate", required=True),
         TerminalColumn(
-            "MaxGD", "current_max_guess_depth", required=True, alignment="right"
+            "MaxGD", "display_guess_depth", required=True, alignment="right"
         ),
         TerminalColumn(
             "Rate", "display_rate", remove_priority=10, alignment="right"
         ),
+        TerminalColumn("Age", "display_age", required=True, alignment="right"),
     ]
 
 
-def _render_worker_table(rows, row_classes, width, *, indent, color):
+def _render_worker_table(
+    rows, row_classes, width, *, indent, color, previous_rows=None,
+):
     return _render_table(
         _worker_columns(), rows, width, indent=indent,
-        row_classes=row_classes, color=color,
+        row_classes=row_classes, previous_rows=previous_rows,
+        include_header=False, color=color,
     )
-
-
-def _render_worker_line(
-    worker, previous_worker, generated_at, color, width, indent, state=None
-):
-    rows = [_worker_display_row(worker, generated_at, state or "active")]
-    row_classes = [
-        _semantic_worker_class(worker, previous_worker, generated_at)
-    ]
-    return _render_worker_table(
-        rows, row_classes, width, indent=indent, color=color
-    )[-1]
 
 
 def render_overview(
@@ -625,9 +815,11 @@ def render_overview(
 
 
 def _semantic_header(report, title, width):
-    header = [_fit(f"{title}  generated_at={report['generated_at']}", width)]
-    for source_name in ("queue", "telemetry", "cache"):
-        header.append(_source_line(source_name, report["sources"][source_name], width))
+    generated_text = datetime.fromtimestamp(
+        report["generated_at"]
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    header = [_fit(f"{title}  {generated_text}", width)]
+    header.extend(_source_problem_lines(report, width))
     return header
 
 
@@ -649,7 +841,8 @@ def _render_word_sections(report, previous_report, color, width, display_order):
     context = data["context"]
     header = _semantic_header(
         report,
-        f"Word {data['word'].upper()}  context=@{context['branch_reference']} "
+        f"Word {data['word'].upper()}{'*' if data.get('word_is_answer') else ''}  "
+        f"context=@{_display_reference(context['branch_reference'])} "
         f"n={context['answer_count']} d={context['guess_depth']}",
         width,
     )
@@ -667,25 +860,30 @@ def _render_word_sections(report, previous_report, color, width, display_order):
             width,
         ),
     ]
-    rows = ["Pattern  Answers  Status    Phase       Cache           Best        Reference"]
-    for group in ordered_groups:
-        best = "—"
-        if group.get("best_guess"):
-            best = group["best_guess"].upper()
-            if group.get("best_erd") is not None:
-                best += f"/{group['best_erd']:.3f}"
-        line = (
+    hotkey_width = 5 if display_order.hotkey_letters else 0
+
+    def group_line(group):
+        hotkey = _hotkey_label(display_order, group["branch_key_hex"])
+        return (
+            f"{hotkey:<{hotkey_width}}"
             f"{group['pattern']:<7}  {group['answer_count']:>7}  "
             f"{group['branch_status']:<8}  {str(group['branch_phase'] or '—'):<10}  "
             f"{group['cache_state']:<14}  "
-            f"{best:<10}  @{group['branch_reference']}"
+            f"{_display_best(group):<10}  @{_display_reference(group['branch_reference'])}"
         )
+
+    rows = [
+        " " * hotkey_width
+        + "Pattern  Answers  Status    Phase       Cache           Best        Ref"
+    ]
+    for group in ordered_groups:
+        line = _fit(group_line(group), width)
         previous_group = previous_groups.get(group["branch_key_hex"])
-        semantic_class = (
-            "green" if previous_group is None
-            else ("red" if group != previous_group else None)
-        )
-        rows.append(_colorize(_fit(line, width), semantic_class, color))
+        if previous_group is None:
+            line = _colorize(line, "green", color)
+        elif group != previous_group and color:
+            line = _highlight_changes(line, _fit(group_line(previous_group), width))
+        rows.append(line)
         if group.get("answer_words"):
             rows.append(_fit("  " + " ".join(group["answer_words"]), width))
     if len(rows) == 1:
@@ -698,7 +896,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     branch = data["branch"]
     header = _semantic_header(
         report,
-        f"Branch @{branch['branch_reference']}  n={branch['answer_count']} "
+        f"Branch @{_display_reference(branch['branch_reference'])}  "
+        f"n={branch['answer_count']} "
         f"d={branch['guess_depth']} budget={branch['budget']}",
         width,
     )
@@ -707,17 +906,6 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         f"phase={branch['branch_phase'] or '—'}",
         width,
     ))
-    selected_statuses = report.get("filters", {}).get("branch_statuses") or []
-    selected_phases = report.get("filters", {}).get("branch_phases") or []
-    if (
-        (selected_statuses and branch["branch_status"] not in selected_statuses)
-        or (selected_phases and branch["branch_phase"] not in selected_phases)
-    ):
-        header.append(_fit(
-            "  selected detail no longer matches the parent filter; "
-            "back returns to the filtered view",
-            width,
-        ))
     if branch["spine"]:
         header.append(_fit(
             "  " + " ▸ ".join(
@@ -745,6 +933,21 @@ def _render_branch_sections(report, previous_report, color, width, display_order
                 width,
             ),
         ]
+        candidate_count = queue["candidate_count"]
+        if candidate_count:
+            worker_positions = [
+                (worker.get("candidate_index"), worker["worker_number"])
+                for worker in data["workers"]
+                if worker["is_live"] and worker.get("candidate_index") is not None
+            ]
+            sweep = candidate_sweep_bar(
+                candidate_count,
+                data.get("completed_candidate_indexes") or (),
+                worker_positions,
+                width=max(10, min(40, width - 4)),
+            )
+            if sweep.strip():
+                queue_lines.append(_fit(f"  [{sweep}]", width))
     cache = data["cache"]
     cache_line = f"  {cache['cache_state']}"
     if cache.get("best_guess"):
@@ -763,15 +966,19 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         for worker in (previous_report or {}).get("data", {}).get("workers", [])
     }
     worker_lines = ["Workers"]
-    for worker_id in display_order.worker_ids:
-        worker = workers_by_id.get(worker_id)
-        if worker is not None:
-            worker_lines.append(_render_worker_line(
-                worker, previous_workers.get(worker_id), report["generated_at"],
-                color, width, indent="  ",
-                state=None if worker["is_live"] else "dead",
-            ))
-    if len(worker_lines) == 1:
+    ordered_workers = [
+        workers_by_id[worker_id]
+        for worker_id in display_order.worker_ids
+        if worker_id in workers_by_id
+    ]
+    if ordered_workers:
+        worker_lines.extend(_worker_lines(
+            ordered_workers, previous_workers, report["generated_at"],
+            (previous_report or report)["generated_at"], width,
+            indent="  ", color=color,
+            state=lambda worker: "active" if worker["is_live"] else "dead",
+        ))
+    else:
         worker_lines.append("  none")
 
     detail_lines = ["Candidate state"]
@@ -783,19 +990,30 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             claim["candidate_index"]: claim
             for claim in (previous_report or {}).get("data", {}).get("claims", []) or []
         }
-        for claim in sorted(data["claims"], key=lambda row: row["candidate_index"]):
-            previous_claim = previous_claims.get(claim["candidate_index"])
-            semantic_class = (
-                "green" if previous_claim is None
-                else ("red" if claim != previous_claim else None)
+
+        def claim_line(claim):
+            worker_id = claim["worker_id"]
+            worker_number = (worker_id or "").rsplit("-", 1)[-1]
+            worker_text = (
+                f"w{worker_number}" if worker_number.isdigit()
+                else (worker_id or "—")
             )
-            detail_lines.append(_colorize(_fit(
+            return _fit(
                 f"  idx={claim['candidate_index']} {claim['state']} "
                 f"kind={claim['completion_kind'] or 'unknown'} "
-                f"worker={claim['worker_id'] or '—'} "
+                f"worker={worker_text} "
                 f"republished={claim['republish_count']}",
                 width,
-            ), semantic_class, color))
+            )
+
+        for claim in sorted(data["claims"], key=lambda row: row["candidate_index"]):
+            previous_claim = previous_claims.get(claim["candidate_index"])
+            line = claim_line(claim)
+            if previous_claim is None:
+                line = _colorize(line, "green", color)
+            elif claim != previous_claim and color:
+                line = _highlight_changes(line, claim_line(previous_claim))
+            detail_lines.append(line)
     telemetry_lines = ["Telemetry"]
     bundle_summary = data.get("bundle_summary")
     if bundle_summary:
@@ -823,7 +1041,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     ]
 
 
-def _render_tree_sections(report, width):
+def _render_tree_sections(report, width, display_order):
     data = report["data"]
     header = _semantic_header(report, "Live queue tree", width)
     lines = ["Topology: queue"]
@@ -868,17 +1086,19 @@ def _render_tree_sections(report, width):
             detail = ""
             if node["branch_reference"]:
                 detail = (
-                    f"  @{node['branch_reference']} "
+                    f"  @{_display_reference(node['branch_reference'])} "
                     f"{node['branch_status']}/{node['branch_phase']} "
                     f"n={node['answer_count']} workers={node['worker_count']}"
                 )
             if node["is_context"]:
                 detail += "  [context]"
-            lines.append(_fit(f"{indent}{label}{detail}", width))
+            hotkey = _hotkey_label(display_order, node.get("branch_key_hex"))
+            hotkey_prefix = f"{hotkey} " if hotkey else ""
+            lines.append(_fit(f"{indent}{hotkey_prefix}{label}{detail}", width))
     return [("header", header), ("tree", lines)]
 
 
-def _render_queue_collection_sections(report, width):
+def _render_queue_collection_sections(report, width, display_order):
     data = report["data"]
     header = _semantic_header(report, "Queue report", width)
     summary = data.get("summary", {})
@@ -888,8 +1108,10 @@ def _render_queue_collection_sections(report, width):
         _fit(f"  phase={summary.get('branch_count_by_phase', {})}", width),
     ]
     for row in data.get("rows", []):
+        hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
+        hotkey_prefix = f"{hotkey} " if hotkey else ""
         lines.append(_fit(
-            f"  @{row['branch_reference']} "
+            f"  {hotkey_prefix}@{_display_reference(row['branch_reference'])} "
             f"{row['branch_status']}/{row['branch_phase']} "
             f"n={row['answer_count']} "
             f"guess_depth={len((row.get('spine') or '').split()) // 2} "
@@ -913,20 +1135,24 @@ def _render_workers_collection_sections(report, previous_report, color, width, d
         for worker in (previous_report or {}).get("data", {}).get("rows", [])
     }
     lines = [f"Workers: {data.get('matched_rows', 0)} matched"]
-    for worker_id in display_order.worker_ids:
-        worker = by_id.get(worker_id)
-        if worker is not None:
-            lines.append(_render_worker_line(
-                worker, previous_by_id.get(worker_id), report["generated_at"],
-                color, width, indent="  ",
-                state=worker.get("state") or (
-                    None if worker["is_live"] else "dead"
-                ),
-            ))
+    ordered_workers = [
+        by_id[worker_id]
+        for worker_id in display_order.worker_ids
+        if worker_id in by_id
+    ]
+    if ordered_workers:
+        lines.extend(_worker_lines(
+            ordered_workers, previous_by_id, report["generated_at"],
+            (previous_report or report)["generated_at"], width,
+            indent="  ", color=color,
+            state=lambda worker: worker.get("state") or (
+                "active" if worker["is_live"] else "dead"
+            ),
+        ))
     return [("header", header), ("worker_rows", lines)]
 
 
-def _render_cache_collection_sections(report, width):
+def _render_cache_collection_sections(report, width, display_order):
     data = report["data"]
     header = _semantic_header(report, "Cache report", width)
     lines = ["Cache"]
@@ -956,20 +1182,23 @@ def _render_cache_collection_sections(report, width):
             lines.append(_fit(f"  {label}: {formatted_values}", width))
     elif "rows" in data:
         for row in data["rows"]:
+            hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
+            hotkey_prefix = f"{hotkey} " if hotkey else ""
             lines.append(_fit(
-                f"  {row['pattern']} n={row['answer_count']} "
-                f"{row['cache_state']} @{row['branch_reference']}",
+                f"  {hotkey_prefix}{row['pattern']} n={row['answer_count']} "
+                f"{row['cache_state']} @{_display_reference(row['branch_reference'])}",
                 width,
             ))
     elif "cache" in data:
         lines.append(_fit(
-            f"  @{data['branch_reference']} {data['cache']['cache_state']}",
+            f"  @{_display_reference(data['branch_reference'])} "
+            f"{data['cache']['cache_state']}",
             width,
         ))
     return [("header", header), ("cache_rows", lines)]
 
 
-def _render_hotspot_sections(report, width):
+def _render_hotspot_sections(report, width, display_order):
     data = report["data"]
     header = _semantic_header(report, f"Hotspots by {data['field']}", width)
     lines = [
@@ -982,22 +1211,25 @@ def _render_hotspot_sections(report, width):
         ),
     ]
     for row in data["rows"]:
-        identity = row.get("row_id") or (
-            "@" + row["branch_reference"] if row.get("branch_reference") else "bucket"
-        )
+        if row.get("branch_reference"):
+            identity = "@" + _display_reference(row["branch_reference"])
+        else:
+            identity = row.get("row_id") or "bucket"
+        hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
+        hotkey_prefix = f"{hotkey} " if hotkey else ""
         metrics = ", ".join(
             f"{key}={value}" for key, value in row.items()
             if key not in (
                 "row_id", "branch_key_hex", "branch_reference", "spine"
             )
         )
-        lines.append(_fit(f"  {identity}  {metrics}", width))
+        lines.append(_fit(f"  {hotkey_prefix}{identity}  {metrics}", width))
     return [("header", header), ("hotspots", lines)]
 
 
 def _report_sections(report, previous_report, color, width, display_order):
     if report.get("tree"):
-        return _render_tree_sections(report, width)
+        return _render_tree_sections(report, width, display_order)
     if report["report_kind"] == "overview":
         return _render_sections(
             report, previous_report, color, width, display_order
@@ -1011,15 +1243,15 @@ def _report_sections(report, previous_report, color, width, display_order):
             report, previous_report, color, width, display_order
         )
     if report["report_kind"] == "queue":
-        return _render_queue_collection_sections(report, width)
+        return _render_queue_collection_sections(report, width, display_order)
     if report["report_kind"] == "workers":
         return _render_workers_collection_sections(
             report, previous_report, color, width, display_order
         )
     if report["report_kind"] == "cache":
-        return _render_cache_collection_sections(report, width)
+        return _render_cache_collection_sections(report, width, display_order)
     if report["report_kind"] == "hotspots":
-        return _render_hotspot_sections(report, width)
+        return _render_hotspot_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 
@@ -1137,6 +1369,7 @@ class WatchSession:
             letter: branch_key
             for branch_key, letter in retained_letters.items()
         }
+        self.display_order.hotkey_letters = dict(retained_letters)
 
         self.worker_hotkeys = {}
         for worker in self._identity_rows(report, "worker_id"):
@@ -1178,27 +1411,17 @@ class WatchSession:
         return parse_report_selector("@" + branch_digest)
 
     def _navigation_section(self):
-        targets = []
-        for letter, branch_key in self.branch_hotkeys.items():
-            targets.append(f"[{letter}] branch {branch_key[:12]}")
-        for worker_number, worker_id in self.worker_hotkeys.items():
-            targets.append(f"[{worker_number}] {worker_id}")
+        # Branch hotkey letters appear inline as [x] on their own rows; worker
+        # rows are selected by their wN digits.
+        fields = []
+        if self.branch_hotkeys:
+            fields.append("[a-z] branch")
+        if self.worker_hotkeys:
+            fields.append("[0-9] worker")
         if len(self.navigation_stack) > 1:
-            targets.append("[backspace/esc] back")
-        targets.extend(("[space] refresh", "[q] quit"))
-        width = self._width()
-        lines = ["Navigation"]
-        current_line = "  "
-        for target in targets:
-            separator = "" if current_line == "  " else "  "
-            if len(current_line) + len(separator) + len(target) > width:
-                lines.append(current_line)
-                current_line = "  " + target
-            else:
-                current_line += separator + target
-        if current_line != "  ":
-            lines.append(current_line)
-        return [("navigation", lines)]
+            fields.append("[esc] back")
+        fields.extend(("[space] refresh", "[q] quit"))
+        return [("navigation", _inline_section("keys:", fields, self._width()))]
 
     def _read_worker_number(self, first_digit):
         worker_number = first_digit
@@ -1220,7 +1443,16 @@ class WatchSession:
         self.previous_report = None
         self.previous_sections = []
         self.display_order = DisplayOrder()
-        self.output_stream.write("\033[2J\033[H")
+        self._write_loading_notice()
+
+    def _write_loading_notice(self):
+        sources = self._sources()
+        self.output_stream.write(
+            "\033[2J\033[H"
+            f"Collecting report…{CLEAR_LINE}\n"
+            f"  queue: {sources.queue_path}{CLEAR_LINE}\n"
+            f"  cache: {sources.cache_path}{CLEAR_LINE}\n"
+        )
         self.output_stream.flush()
 
     def _select_branch(self, branch_key_hex):
@@ -1343,8 +1575,17 @@ class WatchSession:
         )
 
     def _write_initial_sections(self, sections):
-        text = "\n\n".join("\n".join(lines) for _name, lines in sections)
-        self.output_stream.write(text + CLEAR_LINE)
+        # The loading notice is on screen; repaint from the top without a
+        # separate clear so the first report draws over it without a flash.
+        lines = []
+        for index, (_name, section_lines) in enumerate(sections):
+            if index:
+                lines.append("")
+            lines.extend(section_lines)
+        self.output_stream.write("\033[H")
+        self.output_stream.write(
+            (CLEAR_LINE + "\n").join(lines) + CLEAR_LINE + "\033[J"
+        )
         self.output_stream.flush()
 
     @staticmethod
@@ -1425,9 +1666,9 @@ class WatchSession:
         new_settings[3] &= ~(termios.ICANON | termios.ECHO)
         try:
             termios.tcsetattr(file_descriptor, termios.TCSADRAIN, new_settings)
-            self.output_stream.write("\033[?25l\033[2J\033[H")
-            self.output_stream.flush()
+            self.output_stream.write("\033[?25l")
             self.cursor_hidden = True
+            self._write_loading_notice()
             while True:
                 try:
                     report = self._collect()

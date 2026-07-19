@@ -836,6 +836,10 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             "worker_count": worker_count,
             "cache_state": cache_state["cache_state"],
             "best_guess": cache_state["best_guess"],
+            "best_guess_is_answer": bool(
+                cache_state["best_guess"]
+                and cache_state["best_guess"].lower() in answer_set
+            ),
             "best_erd": cache_state["best_erd"],
             "max_remaining_depth": cache_state["max_remaining_depth"],
             "updated_at": cache_state["updated_at"],
@@ -1050,6 +1054,10 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             "completed_candidate_count": progress["completed_candidate_count"],
             "bulk_completed_candidate_count": progress["bulk_completed_candidate_count"],
             "best_guess": _row_value(active_row, "best_guess"),
+            "best_guess_is_answer": bool(
+                _row_value(active_row, "best_guess")
+                and str(_row_value(active_row, "best_guess")).lower() in answer_set
+            ),
             "best_erd": _row_value(active_row, "best_erd"),
             "best_max_remaining_depth": _row_value(active_row, "best_max_depth"),
             "ceiling": _row_value(active_row, "ceiling"),
@@ -1079,6 +1087,9 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             {"candidate_index": row["idx"], "republish_count": row["count"]}
             for row in republish_rows
         ],
+        "completed_candidate_indexes": sorted(
+            row["idx"] for row in claim_rows if row["done"]
+        ),
         "claims": normalized_claims if request.include_claims else None,
         "provenance_unknown": provenance_unknown,
         **branch_telemetry,
