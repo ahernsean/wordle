@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -376,7 +377,20 @@ def main():
     configuration = build_configuration(
         args.queue_path, args.cache_path, args.fixture_directory
     )
-    server = ThreadingHTTPServer((args.bind, args.port), make_handler(configuration))
+    try:
+        server = ThreadingHTTPServer(
+            (args.bind, args.port), make_handler(configuration)
+        )
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            print(
+                f"Cannot start: {args.bind}:{args.port} is already in use by "
+                f"another process. Only one report server may run at a time; "
+                f"find and stop it before retrying.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
     print(f"Serving ERD reports on http://{args.bind}:{args.port}/")
     try:
         server.serve_forever()
