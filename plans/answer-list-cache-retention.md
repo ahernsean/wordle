@@ -68,9 +68,8 @@ cost(a) over a ∈ B. (This models the code: `guesses` is threaded unchanged
 into every recursive `_solve_subset` call, so unfiltered policies draw from
 the same fixed V at every node.)
 
-**Claim.** V ⊆ V′ implies ERD(B, V′) ≤ ERD(B, V),
-max_remaining_depth(B, V′) ≤ max_remaining_depth(B, V), and any budget
-feasible for (B, V) is feasible for (B, V′).
+**Claim.** V ⊆ V′ implies ERD(B, V′) ≤ ERD(B, V), and any budget feasible
+for (B, V) is feasible for (B, V′).
 
 **Proof.** Any strategy T for (B, V) has every node label in V ⊆ V′, so T
 is verbatim a strategy for (B, V′). Its cost profile is identical in both
@@ -78,8 +77,25 @@ problems: `calculate_response(g, a)` depends only on the pair (g, a), and
 the tree's labels and the answer set B are unchanged, so every a ∈ B traces
 the same path. Hence the strategy set for (B, V′) contains that for (B, V)
 with costs preserved, and a minimum over a superset is at most the minimum
-over the subset. Apply with the mean (ERD), the max (max_remaining_depth),
-and existence within a budget (feasibility). ∎
+over the subset. Apply with the mean (ERD) and existence within a budget
+(feasibility). ∎
+
+**What this does not give: `max_depth` monotonicity.** The *abstract*
+quantity "min over all strategies of the worst-case cost" is monotone
+nonincreasing under the same restriction argument (T's worst case is
+preserved verbatim in V′, so the minimum over a superset is
+again at most the minimum over the subset). But that abstract quantity is
+not what the cache stores. `_solve_subset` only updates
+`best_max_remaining_depth` when a candidate strictly beats the running
+`best_erd` (`wordle_engine.py`: `if cost < best_erd: ... best_max_remaining_depth
+= max_remaining_depth`) — the stored `max_depth` is the worst case *of
+whichever tree won the ERD race*, not a separately minimized worst case.
+Growing V can hand the race to a new, lower-ERD tree with a *larger* worst
+case than the old winner's, so the stored `max_depth` is not provably
+monotone under vocabulary growth in either direction. (Mechanism 2 already
+treats cached `max_depth` this way — an upper bound on the true worst-case
+optimum, not an exact or monotone value; this note aligns the Theorem with
+that rather than contradicting it.)
 
 **Corollaries.**
 - *Growth:* old exact values become upper bounds; old loss proofs become
@@ -95,10 +111,17 @@ and existence within a budget (feasibility). ∎
 ERD is a mean, not a sum. Adding a word that resolves in 2 guesses to a
 branch of n words with ERD e yields (n·e + 2)/(n + 1) < e whenever e > 2;
 adding a hard word raises the mean. Monotone nondecreasing under set
-growth: max_remaining_depth, the cost sum, and the mean restricted to the
-original words. Per-candidate root ERDs can move both ways and the best
-first guess can change — root results recompute regardless (the full-set
-`branch_key` changes anyway).
+growth: the cost sum, and the mean restricted to the original words (both
+provable by the same restriction argument as the Theorem above: any tree
+solving the grown branch restricts to a valid, if suboptimal, tree for the
+original words). `max_remaining_depth` is deliberately absent from that
+list: it has the identical flaw as the Theorem's retracted claim, just
+along the answer-set axis instead of the vocabulary axis — the stored
+value tracks whichever tree wins the *ERD* race for the grown branch, an
+independently-computed tree with no proven relationship to the original
+branch's stored worst case. Per-candidate root ERDs can move both ways and
+the best first guess can change — root results recompute regardless (the
+full-set `branch_key` changes anyway).
 
 ### The answer-side recompute region is a union of 9 thin cones
 
@@ -129,36 +152,59 @@ Other tables:
   under vocabulary growth). Losses rebuild organically as the swarm
   re-proves deep branches.
 - **`response_decomposition`** — keyed (guess, answer_list_id); rebuilds
-  for the new id. Blobs for retained guesses can be spliced (old blob + 9
-  bytes); added guesses need fresh blobs; removed guesses' blobs are dead
-  weight.
+  for the new id. Blobs are positional (byte *i* = answer *i* in sorted
+  order), and the 9 new answer words are interleaved rather than appended,
+  so a splice is not the cheap shortcut it sounds like — see Mechanism 4.
+  Rebuild.
 
 ## Part 3 — The `ERD_ALL` recertification sweep (the centerpiece)
 
-`verify_erd_cache.py` already implements the needed shape: leaves-first
-re-verification of every `ERD_ALL` row against the true optimum, reading
-sub-branch costs from the cache and correcting rows in place, waves
-parallelized within a branch size. Recertification after a vocabulary
-change is the same computation with a different candidate delta:
+`verify_erd_cache.py` already implements exactly what's needed here — no
+new engineering. It re-verifies every `erd_words_unfiltered` row leaves-first
+against the true optimum, checking whether *any* candidate in the complete
+`all_words` vocabulary beats the stored `best_score` (reading sub-branch
+costs from the cache rather than recursing), correcting rows in place. It
+opens the cache by loading `ANSWER_FILE`/`WORDS_FILE`
+(`cache_sqlite.py`'s `answer_list_id` scoping then confines every query to
+that namespace), so once Phase 0's rename lands and those two constants
+point at the corrected files, running the tool unmodified *is* the
+recertification sweep.
+
+**The scan must cover every candidate, not just the added ones.** An
+earlier draft of this section proposed scanning only the ~1,883 added
+candidates per row, at an estimated ~15% of a full sweep's cost. That
+undercounts: an *old* (non-added) candidate's cost depends recursively on
+its response-groups' cached ERDs, so when the leaves-first sweep lowers a
+child's value, a previously-losing old candidate can newly win even though
+no added word is involved — checking only new candidates would miss that
+case and could leave a suboptimal row stored as final. `verify_erd_cache.py`
+already scans the complete candidate list per row for exactly this reason;
+the "added-candidates-only" shortcut doesn't hold up, and this section no
+longer claims it (also resolves the contradiction Part 5 already avoided
+by saying scans always run to completion).
 
 - Process branches leaves-first so corrected child values are in place
-  before any parent is re-evaluated.
-- Per row: if the stored best_guess was removed from the vocabulary,
-  re-solve the branch (warm — Mechanism 1 below). Otherwise re-validate
-  the stored value against updated children and evaluate the **added**
-  candidates; in the growth-only case the stored value is a valid
-  incumbent (upper bound), so most rows close after the added-candidate
-  scan.
-- Per-branch incremental cost ≈ |added candidates| evaluations plus drift
-  re-checks — order 15% of a full sweep per branch (1.9k of 14.9k
-  candidates), against the measured ~900 full sweeps/day pre-kernel
-  baseline (`full_tree_plan.md`) with the kernel's 10–50× on top. Real
-  numbers come from timing a sample wave on rocky before committing.
+  before any parent is re-evaluated — this is what makes a full-scan sweep
+  correct, not merely thorough: a parent's re-scan reads already-corrected,
+  not stale, child costs.
+- Per row: scan every word in the new candidate vocabulary (14,855, not
+  12,972); correct the row if any candidate beats the stored value.
 
-Whether this lands as an extension of `verify_erd_cache.py` (committed —
-vocabulary changes will happen again) or a scratchpad variant is decided on
-rocky; the leaves-first wave structure and cache-read model carry over
-either way.
+### Cost: grounded in a prior real run of this exact tool
+
+This is not a projection from first principles — `verify_erd_cache.py` has
+already run a full sweep of the whole `ERD_ALL` cache once, for an
+unrelated reason (the reclaim-while-alive bug fix, completed 2026-07-12):
+**3,485,333 rows, full candidate scan, 13h48m wall time, post-kernel** (the
+kernel deployed 2026-07-05, so this figure already reflects it — no further
+speedup to project on top). Same tool, same machine, same leaves-first
+full-scan shape as this sweep, so it's the best available estimate.
+Scaling for today's larger inputs — roughly 3.6M rows now vs. 3,485,333
+then, 14,855 candidates vs. 12,972 — gives a rough **15–17 hour**
+extrapolation: call it an overnight run, not a multi-day one. That's an
+extrapolation from one data point, not a measurement; time an actual
+sample wave on rocky first, using the tool's own `--start-size` resumption
+support to bound the risk of committing to a bad estimate.
 
 ## Part 4 — Rebuilding `erd_answers_unfiltered`
 
@@ -253,11 +299,20 @@ candidate_scores ranking is a near-perfect evaluation order (exact scores
 shift only through the added words' group membership — an O(1) update per
 candidate given their pattern bytes).
 
-### Mechanism 4 — Pattern-matrix splice (minor)
+### Mechanism 4 — Pattern-matrix rebuild (minor; not a splice)
 
-Retained guesses' `response_decomposition` blobs splice (old blob + 9 new
-bytes); only the ~1.9k added guesses need fresh blobs. An economy, not a
-necessity.
+`response_decomposition` blobs are strictly positional — byte *i* is
+answer *i* in canonical (sorted) answer-list order (`wordle_engine.py`:
+`_encode_response(calculate_response(guess, answer)) for answer in
+self.answer_words`). The corrected answer list is sorted with its 9 new
+words interleaved, not appended — `aught` lands at index 179 of 3,209, for
+instance — so "old blob + 9 bytes appended" would misalign every byte from
+the first insertion point onward for every guess. There's no cheap splice
+here: either insert each new byte at its correct index for every retained
+blob, or just rebuild. Rebuilding is already fast (the vectorized kernel
+path this project deployed 2026-07-05), so that's the recommendation; if a
+splice is ever implemented instead, verify it byte-for-byte against a
+fresh rebuild before trusting it.
 
 ### The honest limit
 
@@ -267,8 +322,8 @@ completion; the mechanisms make each scan cheap, not skippable.
 
 ## Part 6 — Procedure
 
-One-time operations run from the scratchpad and are never committed;
-the list flips and any `verify_erd_cache.py` extension go through PRs.
+One-time operations run from the scratchpad and are never committed; the
+list-and-rename flip (Phase 0) is the one exception and goes through a PR.
 
 ### Phase 0 — Source, rename, and land the corrected vocabularies
 
@@ -291,16 +346,42 @@ the list flips and any `verify_erd_cache.py` extension go through PRs.
    file for what it is — the universe the anchored **candidate** vocabulary
    term (AGENTS.md) is drawn from — and pairs cleanly with
    `all_answers.txt`, whereas `wordle.txt` was opaque and `NYT_wordlist.txt`
-   was easily confused with the file it's now renamed away from. Files to
-   update: `runtime_paths.py` (`DEFAULT_ANSWER_LIST_PATH`,
-   `DEFAULT_CANDIDATE_LIST_PATH`), `wordle.py` (`ANSWER_FILE`,
-   `WORDS_FILE`), `erd_swarm.py`, `erd_search.py`, `verify_erd_cache.py`,
-   and the write-target constants inside `Get_NYT_Answers.py` and
-   `Get_NYT_Candidates.py` (already correctly named — only the string
-   literal they write to changes here), any test fixtures/paths
-   referencing the old names, and prose references in `SWARM.md`/
-   `AGENTS.md`. No `schema_migrations` entry — this is a file rename, not
-   a cache schema change.
+   was easily confused with the file it's now renamed away from.
+
+   Exhaustive inventory (verified by grepping the repository for both old
+   filenames, not reconstructed from memory — an earlier draft of this
+   list was incomplete):
+
+   - **Routes through `runtime_paths.py` already — edit only the one file.**
+     `erd_search.py` imports `DEFAULT_ANSWER_LIST_PATH`/
+     `DEFAULT_CANDIDATE_LIST_PATH` rather than hardcoding either name, so
+     updating `runtime_paths.py` alone is sufficient for it.
+   - **Hardcode their own `ANSWER_FILE`/`WORDS_FILE` (or equivalent)
+     literals — each needs a direct edit:** `wordle.py`, `erd_swarm.py`,
+     `verify_erd_cache.py`, `verify_erd_losses.py` (hardcodes both names;
+     Phase 5 runs it, so a missed edit surfaces there, not earlier),
+     `import_cache.py` (hardcodes `NYT_wordlist.txt`; feeds the Phase 6
+     cache-import workflow), `diag_ab_equiv.py`, `diag_ab_wall.py`,
+     `diag_kernel_bench.py`, `diag_ordering.py`, `diag_order_tune.py`,
+     `diag_toplevel_census.py`, and `Get_NYT_Candidates.py`'s new
+     answer-list plausibility check (reads `NYT_wordlist.txt` directly,
+     alongside its existing hardcoded write target — see Part 6's scraper
+     fix). None of these currently import from `runtime_paths.py`;
+     centralizing them through it instead of editing each literal is a
+     legitimate alternative Phase 0 can choose at execution time, but
+     that's a separate, larger decision this plan doesn't make now.
+   - **Test files with hardcoded literals:**
+     `tests/test_diag_toplevel_census.py`, `tests/test_erd_scaling.py`,
+     `tests/test_kernel_equivalence.py`, `tests/test_pattern_matrix.py`,
+     `tests/test_swarm_vs_engine_overhead.py`.
+   - **Prose only — won't break, but will go stale:** `design.md`,
+     `full_tree_plan.md`, `SWARM.md`, and a comment in
+     `tests/test_queue_add.py`.
+
+   No `schema_migrations` entry — this is a file rename, not a cache
+   schema change. Run the full test suite after the rename lands, before
+   any later phase begins; a missed hardcoded reference fails loudly there
+   (`FileNotFoundError`) rather than silently.
 5. Land the rename plus the corrected content as one PR. No temporary
    dated-capture file is kept once landed — git history holds the old
    content, and the old-`answer_list_id` cache rows (Phase 2 onward) hold
@@ -327,11 +408,13 @@ the list flips and any `verify_erd_cache.py` extension go through PRs.
 
 ### Phase 3 — `ERD_ALL` recertification sweep
 
-1. Time a sample wave; extrapolate; decide committed-extension vs.
-   scratchpad variant of `verify_erd_cache.py`.
-2. Run the sweep leaves-first to completion. No `ERD_ALL` row is served
-   to a user before its wave completes (phone is frozen; Linux use during
-   the sweep is at-your-own-risk and confined to swept sizes).
+1. Time a sample wave (`--start-size` bounds it to a small branch range)
+   to confirm the ~15–17 hour extrapolation before committing to the full
+   run (Part 3).
+2. Run `python3.13 verify_erd_cache.py` unmodified, leaves-first, to
+   completion. No `ERD_ALL` row is served to a user before its wave
+   completes (phone is frozen; Linux use during the sweep is at-your-own-
+   risk and confined to swept sizes).
 
 ### Phase 4 — Recompute and seed
 
@@ -396,10 +479,11 @@ of the 14 rescued guess words:
 
 ## Open items
 
-- Committed extension vs. scratchpad variant for the `ERD_ALL`
-  recertification sweep.
 - Eager vs. lazy for the un-pinched `erd_answers_unfiltered` remainder.
 - Soak length before retirement.
+- Whether to centralize the hardcoded `ANSWER_FILE`/`WORDS_FILE`-style
+  consumers listed in Phase 0 through `runtime_paths.py` now, or just edit
+  each literal — noted there as a real but separate decision.
 
 ## Resolved
 
@@ -408,10 +492,24 @@ of the 14 rescued guess words:
 - **`wordle.txt` removal set**: 0 removals (1,883 additions only) — the
   growth-only case applies throughout; no mixed-case handling is needed.
 - **File naming**: `wordle.txt`/`NYT_wordlist.txt` → `all_candidates.txt`/
-  `all_answers.txt`, folded into Phase 0. Both scraper scripts already
-  carry their permanent names (`Get_NYT_Wordlist.py` → `Get_NYT_Answers.py`,
+  `all_answers.txt`, folded into Phase 0, with an exhaustive (grep-verified)
+  inventory of every consumer. Both scraper scripts already carry their
+  permanent names (`Get_NYT_Wordlist.py` → `Get_NYT_Answers.py`,
   `Get_NYT_Words.py` → `Get_NYT_Candidates.py`) — only their write-target
-  string literals still need updating at Phase 0.
+  string literals (and `Get_NYT_Candidates.py`'s new answer-list check)
+  still need updating at Phase 0.
 - **Phone sync mechanism**: git pull (Working Copy) for code and lists;
   the existing manual export/import dance for the cache, independently —
   see Phase 6.
+- **Recertification sweep implementation**: no new engineering —
+  `verify_erd_cache.py` already scans the full candidate list per row;
+  running it unmodified after Phase 0's rename *is* Phase 3. Cost grounded
+  in a real prior full sweep of this cache (13h48m, 2026-07-12): expect
+  roughly 15–17 hours, confirm with a timed sample wave before committing
+  to the full run.
+- **Max_remaining_depth is not provably monotone** under either vocabulary
+  growth (Part 1) or answer-set growth (Part 1, "ERD is not monotone") —
+  the cache only stores the worst case of whichever tree wins the *ERD*
+  race, not a separately minimized worst case. Two theorem statements
+  corrected; ERD monotonicity and budget-feasibility monotonicity are
+  unaffected and still hold.
