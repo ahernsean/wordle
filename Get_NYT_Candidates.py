@@ -35,22 +35,31 @@ def get_NYT_candidate_words() -> list[str]:
     index_html = _fetch(WORDLE_PAGE_URL)
     chunk_urls = sorted({html.unescape(u) for u in CHUNK_URL_PATTERN.findall(index_html)})
 
-    words: list[str] = []
+    arrays: list[list[str]] = []
     for url in chunk_urls:
         chunk = _fetch(url)
         for match in WORD_ARRAY_PATTERN.finditer(chunk):
-            candidate = json.loads(match.group(0))
-            if len(candidate) > len(words):
-                words = candidate
+            decoded = json.loads(match.group(0))
+            if decoded not in arrays:
+                arrays.append(decoded)
 
-    if not words:
+    if not arrays:
         raise RuntimeError(
             f"No candidate dictionary (a run of >= {MINIMUM_DICTIONARY_SIZE} "
             f"quoted 5-letter words) found in any chunk referenced from "
             f"{WORDLE_PAGE_URL}. The page's chunk structure may have changed."
         )
 
-    return sorted(set(words))
+    arrays.sort(key=len, reverse=True)
+    if len(arrays) > 1 and len(arrays[1]) == len(arrays[0]):
+        raise RuntimeError(
+            f"Ambiguous extraction: {len(arrays)} distinct qualifying arrays "
+            f"found and the two largest have the same length "
+            f"({len(arrays[0])} words) with different content — refusing to "
+            "guess which is the candidate dictionary."
+        )
+
+    return sorted(set(arrays[0]))
 
 
 def _validate_against_answer_list(candidate_words: list[str]) -> None:
@@ -59,12 +68,12 @@ def _validate_against_answer_list(candidate_words: list[str]) -> None:
     A partial or corrupted extraction is far more likely to silently drop
     words than to invent new well-formed ones, so a missing answer word is
     the cheapest available signal that the scrape should not be trusted.
+    An absent answer-list file is itself suspicious (wrong working
+    directory, or a rename this literal missed), so it raises rather than
+    silently skipping the gate.
     """
-    try:
-        with open("NYT_wordlist.txt") as f:
-            answer_words = f.read().split()
-    except FileNotFoundError:
-        return
+    with open("NYT_wordlist.txt") as f:
+        answer_words = f.read().split()
     missing = sorted(set(answer_words) - set(candidate_words))
     if missing:
         raise RuntimeError(
