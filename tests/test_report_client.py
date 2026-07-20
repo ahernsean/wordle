@@ -426,12 +426,12 @@ class ReportClientBrowserTest(unittest.TestCase):
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
           applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
           const cells=[...document.querySelectorAll('.sweep-cell')];
-          return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),fills:cells.map(cell=>Number.parseInt(cell.style.getPropertyValue('--fill'),10)),workerCells:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber)};
+          return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),fills:cells.map(cell=>Number.parseInt(cell.style.getPropertyValue('--fill'),10)),markers:[...document.querySelectorAll('.sweep-marker')].map(marker=>marker.dataset.workerNumber)};
         }""")
         self.assertEqual(result["cellCount"], 50)
         self.assertEqual(result["firstFill"], "100%")
         self.assertEqual(result["lastFill"], "0%")
-        self.assertEqual(result["workerCells"], ["3"])
+        self.assertEqual(result["markers"], ["3"])
         self.assertFalse(any(85 < fill < 100 for fill in result["fills"]))
 
     def test_overview_branch_cards_render_sweep_with_worker_markers(self):
@@ -439,12 +439,36 @@ class ReportClientBrowserTest(unittest.TestCase):
           const cards=[...document.querySelectorAll('#report .grid article.card.clickable')];
           const first=cards.find(card=>card.dataset.identity==='01');
           const cells=[...first.querySelectorAll('.sweep-cell')];
-          return {sweepCount:document.querySelectorAll('#report .sweep').length,cellCount:cells.length,workerNumbers:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber),fullCells:cells.filter(cell=>cell.style.getPropertyValue('--fill')==='100%').length};
+          return {sweepCount:document.querySelectorAll('#report .sweep').length,cellCount:cells.length,workerNumbers:[...first.querySelectorAll('.sweep-marker')].map(marker=>marker.dataset.workerNumber),fullCells:cells.filter(cell=>cell.style.getPropertyValue('--fill')==='100%').length};
         }""")
         self.assertEqual(result["sweepCount"], 3)
         self.assertEqual(result["cellCount"], 50)
         self.assertEqual(result["workerNumbers"], ["0"])
         self.assertGreater(result["fullCells"], 0)
+
+    def test_worker_marker_slides_between_cells_on_progress(self):
+        result = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          const makeWorker=index=>({worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:index,current_candidate:'crane',current_candidate_is_answer:true});
+          branch.data.workers=[makeWorker(10)];
+          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          const moved=structuredClone(branch);moved.data.workers=[makeWorker(80)];
+          applyReport(moved,branch,{...__reportClient.getState(),selector:'RAISE .....'});
+          const marker=document.querySelector('.sweep-marker');
+          const during=Number.parseFloat(getComputedStyle(marker).left);
+          await new Promise(resolve=>setTimeout(resolve,700));
+          const settled=Number.parseFloat(getComputedStyle(marker).left);
+
+          const rebranched=structuredClone(branch);rebranched.data.workers=[{...makeWorker(80),branch_key_hex:'02',branch_reference:'222222222222'}];
+          applyReport(rebranched,branch,{...__reportClient.getState(),selector:'RAISE .....'});
+          const jumped=document.querySelector('.sweep-marker');
+          const immediate=Number.parseFloat(getComputedStyle(jumped).left);
+          const fadingIn=getComputedStyle(jumped).opacity;
+          return {during,settled,immediate,fadingIn};
+        }""")
+        self.assertLess(result["during"], result["settled"] - 10)
+        self.assertAlmostEqual(result["immediate"], result["settled"], delta=2)
+        self.assertLess(float(result["fadingIn"]), 1)
 
     def test_rows_without_claim_indexes_fall_back_to_progress_bar(self):
         self.page.locator("[data-kind=queue]").click()

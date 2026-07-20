@@ -56,14 +56,14 @@
     .progress-line { display:flex; gap:.4rem; align-items:center; margin:.25rem 0; }
     .progress { flex:1 1 auto; height:.3rem; border-radius:999px; background:var(--border); overflow:hidden; }
     .progress > span { display:block; height:100%; background:var(--green); }
-    .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; }
+    .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
     .progress-line .sweep { flex:1 1 auto; height:.9rem; margin:0; }
-    .sweep-cell { flex:1 1 0; min-width:2px; position:relative; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
+    .sweep-cell { flex:1 1 0; min-width:2px; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
     /* The digit is an SVG background image, not laid-out text: SVG
        rasterization places the glyph geometrically, so the digit stays
        centered at any sub-pixel cell position where HTML text layout would
        snap the baseline to a whole pixel and drift up to a pixel off center. */
-    .sweep-cell.worker { background:var(--yellow); background-position:center; background-repeat:no-repeat; }
+    .sweep-marker { position:absolute; top:0; height:100%; border-radius:1px; background:var(--yellow); background-position:center; background-repeat:no-repeat; transition:left .4s ease, opacity .4s ease; }
     .kv { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .kv .pair { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .kv .pair-label { color:var(--dim); }
@@ -241,13 +241,13 @@
       if(row.best_erd!==null&&row.best_erd!==undefined)text+="/"+Number(row.best_erd).toFixed(3);
       return text;
     }
-    function cardForBranch(row,previous,branchWorkers=[]){
+    function cardForBranch(row,previous,branchWorkers=[],previousWorkersById=null){
       const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previous));card.dataset.identity=row.branch_key_hex;
       const title=element("div","card-title");
       title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)),element("span","chip",formatInteger(row.answer_count)+" answers"));
       card.append(title);
       if(row.spine)card.append(Array.isArray(row.spine)?renderSpine(row.spine):element("div","dim",row.spine));
-      if(row.candidate_count){const line=element("div","progress-line");const fill=Array.isArray(row.completed_candidate_indexes)?sweepStrip(row.candidate_count,row.completed_candidate_indexes,branchWorkers):progress(row.completed_candidate_count,row.candidate_count);line.append(fill,element("span","dim",formatInteger(row.completed_candidate_count)+"/"+formatInteger(row.candidate_count)));card.append(line);}
+      if(row.candidate_count){const line=element("div","progress-line");const fill=Array.isArray(row.completed_candidate_indexes)?sweepStrip(row.candidate_count,row.completed_candidate_indexes,branchWorkers,previousWorkersById):progress(row.completed_candidate_count,row.candidate_count);line.append(fill,element("span","dim",formatInteger(row.completed_candidate_count)+"/"+formatInteger(row.candidate_count)));card.append(line);}
       const parts=[];
       const best=bestText(row);if(best)parts.push(best);
       if(row.worker_count)parts.push(formatInteger(row.worker_count)+(row.worker_count===1?" worker":" workers"));
@@ -278,7 +278,7 @@
       if(worker.branch_reference){card.classList.add("clickable");card.addEventListener("click",()=>navigateBranch(worker));}
       return card;
     }
-    function sweepStrip(candidateCount,completedCandidateIndexes,workers){
+    function sweepStrip(candidateCount,completedCandidateIndexes,workers,previousWorkersById){
       const cellCount=Math.max(1,Math.min(50,candidateCount));
       const strip=element("div","sweep"),done=new Set(completedCandidateIndexes||[]);
       for(let cell=0;cell<cellCount;cell++){
@@ -292,14 +292,40 @@
         cellNode.style.setProperty("--fill",fill+"%");
         strip.append(cellNode);
       }
+      const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));
+      const cellLeft=cell=>`calc((100% - ${cellCount-1}px) * ${cell} / ${cellCount} + ${cell}px)`;
+      const animate=comparisonAvailable&&!matchMedia("(prefers-reduced-motion: reduce)").matches;
       for(const worker of workers||[]){
         if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
-        const cell=Math.min(cellCount-1,Math.floor(cellCount*worker.candidate_index/candidateCount));
-        const cellNode=strip.children[cell],workerNumber=workerName(worker).replace(/^w/,"");
-        cellNode.classList.add("worker");cellNode.dataset.workerNumber=workerNumber;
-        cellNode.style.backgroundImage=workerMarkerImage(workerNumber);
+        const cell=cellFor(worker.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
+        const marker=element("span","sweep-marker");
+        marker.dataset.workerNumber=workerNumber;
+        marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
+        marker.style.backgroundImage=workerMarkerImage(workerNumber);
+        const previous=previousWorkersById?.get(String(worker.worker_id));
+        const previousIndex=previous&&previous.branch_key_hex===worker.branch_key_hex?previous.candidate_index:null;
+        if(animate&&previousIndex!==null&&previousIndex!==undefined){
+          // FLIP: start at the previous poll's cell; applyReport slides the
+          // marker to its current cell once the strip is in the document.
+          const previousCell=cellFor(previousIndex);
+          marker.style.left=cellLeft(previousCell);
+          if(previousCell!==cell)marker.dataset.moveTo=cellLeft(cell);
+        }else{
+          marker.style.left=cellLeft(cell);
+          if(animate){marker.style.opacity="0";marker.dataset.fadeIn="1";}
+        }
+        strip.append(marker);
       }
       return strip;
+    }
+    function animateSweepMarkers(root){
+      const pending=root.querySelectorAll("[data-move-to],[data-fade-in]");
+      if(!pending.length)return;
+      root.getBoundingClientRect();
+      for(const marker of pending){
+        if(marker.dataset.moveTo){marker.style.left=marker.dataset.moveTo;delete marker.dataset.moveTo;}
+        if(marker.dataset.fadeIn){marker.style.opacity="1";delete marker.dataset.fadeIn;}
+      }
     }
     function renderOverview(report,previous,state){
       const fragment=document.createDocumentFragment(),counts=report.data.queue_counts||{},metrics=element("div","metrics");for(const [labelText,key] of [["queued pending","pending_branch_count"],["evaluating user","evaluating_user_branch_count"],["evaluating coop","evaluating_cooperative_branch_count"],["finalizing","finalizing_branch_count"],["cached exact","exact_branch_count"]])metrics.append(metric(labelText,key in counts?counts[key]:report.data.cache_summary?.[key]));
@@ -307,7 +333,8 @@
       fragment.append(metrics);
       fragment.append(element("h2","","Branches · status "+(state.branch_status.length?state.branch_status.join(", "):"all")));
       const liveWorkersByBranch=new Map();for(const worker of report.data.workers||[]){if(!worker.is_live||worker.branch_key_hex===null||worker.branch_key_hex===undefined)continue;const key=String(worker.branch_key_hex);if(!liveWorkersByBranch.has(key))liveWorkersByBranch.set(key,[]);liveWorkersByBranch.get(key).push(worker);}
-      const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex)),liveWorkersByBranch.get(String(row.branch_key_hex))||[]));fragment.append(branches,element("h2","","Workers"));
+      const previousWorkersById=previousBy(previous,"workers","worker_id");
+      const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex)),liveWorkersByBranch.get(String(row.branch_key_hex))||[],previousWorkersById));fragment.append(branches,element("h2","","Workers"));
       const branchPhases=new Map((report.data.branches||[]).map(branch=>[branch.branch_key_hex,branch.branch_phase]));
       const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at,branchPhases.get(row.branch_key_hex)));fragment.append(workers);return fragment;
     }
@@ -322,7 +349,7 @@
     function renderBranch(report,previous,state){
       const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};if(branch.spine?.length)fragment.append(section("Identity",renderSpine(branch.spine)));
       fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):null],["ERD",data.queue.best_erd],["ceiling",data.queue.ceiling],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
-      if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers)));}
+      if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
       fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[label(key),key==="best_guess"&&value?String(value).toUpperCase():value]))));
       if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
       if(data.recent_finalizations?.length){const finalizations=element("div","grid");for(const row of data.recent_finalizations){const card=element("article","card outcome-"+row.outcome);card.append(element("h3","",row.outcome),kv([["ceiling",row.ceiling],["evaluated",row.evaluated_candidate_count],["bulk proofs",row.bulk_completed_candidate_count],["bundles",row.bundle_count],["nodes",row.search_node_count],["wall ms",row.wall_millis],["epoch",row.epoch]]));finalizations.append(card);}fragment.append(section("Recent finalizations",finalizations));}
@@ -351,7 +378,7 @@
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
       const root=byId("report"),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
       if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport));else throw new Error("Unknown report kind");
-      root.replaceChildren(content);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      root.replaceChildren(content);animateSweepMarkers(root);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" fill="#1a1a1b">'+workerNumber+'</text></svg>';
