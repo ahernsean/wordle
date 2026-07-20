@@ -947,6 +947,50 @@ def _decode_branch_key(branch_key):
     )
 
 
+def _summarize_claims(normalized_claims):
+    """Aggregate per-candidate claims into a bounded provenance summary.
+
+    A branch can hold tens of thousands of claims, so the human reports show
+    this summary rather than a row per candidate.  Counts and per-worker
+    contributions are the useful signal; the raw list stays available only to
+    programmatic consumers via include_claims.
+    """
+    done_count = evaluated_count = bulk_count = provenance_unknown_count = 0
+    in_flight_count = 0
+    done_by_worker = {}
+    for claim in normalized_claims:
+        if claim["state"] != "done":
+            in_flight_count += 1
+            continue
+        done_count += 1
+        kind = claim["completion_kind"]
+        if kind == "evaluated":
+            evaluated_count += 1
+        elif kind == "bulk_eliminated":
+            bulk_count += 1
+        else:
+            provenance_unknown_count += 1
+        worker_id = claim["worker_id"]
+        if worker_id:
+            done_by_worker[worker_id] = done_by_worker.get(worker_id, 0) + 1
+    worker_contributions = sorted(
+        (
+            {"worker_id": worker_id, "done_count": count}
+            for worker_id, count in done_by_worker.items()
+        ),
+        key=lambda item: (-item["done_count"], item["worker_id"]),
+    )
+    return {
+        "total_claim_count": len(normalized_claims),
+        "done_count": done_count,
+        "in_flight_count": in_flight_count,
+        "evaluated_count": evaluated_count,
+        "bulk_eliminated_count": bulk_count,
+        "provenance_unknown_count": provenance_unknown_count,
+        "worker_contributions": worker_contributions,
+    }
+
+
 def _normalize_claim(row, republish_count):
     claimed_by = _row_value(row, "claimed_by")
     done = bool(row["done"])
@@ -1101,6 +1145,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             row["idx"] for row in claim_rows if row["done"]
         ),
         "claims": normalized_claims if request.include_claims else None,
+        "claim_summary": _summarize_claims(normalized_claims),
         "provenance_unknown": provenance_unknown,
         **branch_telemetry,
     }

@@ -17,6 +17,7 @@
       {"candidate_index": 3, "state": "done", "completion_kind": "evaluated", "worker_id": "worker-0", "bundle_id": "bundle-1", "claimed_at": 930, "done_at": 940, "republish_count": 0},
       {"candidate_index": 4, "state": "done", "completion_kind": "bulk_eliminated", "worker_id": null, "bundle_id": null, "claimed_at": 940, "done_at": 940, "republish_count": 0}
     ],
+    "claim_summary": {"total_claim_count": 12972, "done_count": 12819, "in_flight_count": 5, "evaluated_count": 11200, "bulk_eliminated_count": 1619, "provenance_unknown_count": 0, "worker_contributions": [{"worker_id": "worker-0", "done_count": 6484}, {"worker_id": "worker-2", "done_count": 6335}]},
     "provenance_unknown": false,
     "bundle_summary": {"bundle_count": 3, "node_count": 9000, "wall_millis": 800, "censored_unit_count": 1, "maximum_bundle_node_count": 5000},
     "recent_finalizations": [

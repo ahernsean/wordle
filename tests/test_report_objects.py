@@ -278,6 +278,23 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(claims[2]["republish_count"], 4)
         self.assertIsNone(claims[3]["completion_kind"])
         self.assertTrue(report["data"]["provenance_unknown"])
+        # The bounded summary is present regardless of include_claims and
+        # aggregates the same three claims: one evaluated, one bulk, one
+        # unattributed, with the evaluated one credited to its worker.
+        summary = report["data"]["claim_summary"]
+        self.assertEqual(summary["done_count"], 3)
+        self.assertEqual(summary["evaluated_count"], 1)
+        self.assertEqual(summary["bulk_eliminated_count"], 1)
+        self.assertEqual(summary["provenance_unknown_count"], 1)
+        self.assertEqual(summary["in_flight_count"], 0)
+        self.assertEqual(
+            summary["worker_contributions"],
+            [{"worker_id": "worker-3", "done_count": 1}],
+        )
+        summary_without_detail = collect_report(
+            self.sources, ReportRequest(selector=selector)
+        )["data"]["claim_summary"]
+        self.assertEqual(summary_without_detail["done_count"], 3)
         self.assertNotIn("answer_words", report["data"]["branch"])
         self.assertEqual(
             report["data"]["queue"]["bulk_completed_candidate_count"], 1

@@ -144,6 +144,13 @@ def _hotkey_label(display_order, branch_key_hex):
     return f"[{letter}]" if letter else ""
 
 
+def _worker_number_label(worker_id):
+    if not worker_id:
+        return "—"
+    number = worker_id.rsplit("-", 1)[-1]
+    return f"w{number}" if number.isdigit() else worker_id
+
+
 def candidate_sweep_bar(candidate_count, completed_candidate_indexes,
                         worker_positions, width=40):
     """Render compressed candidate completion and worker positions.
@@ -1022,35 +1029,29 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     detail_lines.append(
         f"  republished candidates: {len(data['republished_candidates'])}"
     )
-    if data["claims"] is not None:
-        previous_claims = {
-            claim["candidate_index"]: claim
-            for claim in (previous_report or {}).get("data", {}).get("claims", []) or []
-        }
-
-        def claim_line(claim):
-            worker_id = claim["worker_id"]
-            worker_number = (worker_id or "").rsplit("-", 1)[-1]
-            worker_text = (
-                f"w{worker_number}" if worker_number.isdigit()
-                else (worker_id or "—")
+    claim_summary = data.get("claim_summary") or {}
+    if claim_summary.get("total_claim_count"):
+        completion_fields = [
+            f"{claim_summary['done_count']:,} done",
+            f"{claim_summary['evaluated_count']:,} evaluated",
+            f"{claim_summary['bulk_eliminated_count']:,} bulk proofs",
+        ]
+        if claim_summary.get("provenance_unknown_count"):
+            completion_fields.append(
+                f"{claim_summary['provenance_unknown_count']:,} unattributed"
             )
-            return _fit(
-                f"  idx={claim['candidate_index']} {claim['state']} "
-                f"kind={claim['completion_kind'] or 'unknown'} "
-                f"worker={worker_text} "
-                f"republished={claim['republish_count']}",
-                width,
+        if claim_summary.get("in_flight_count"):
+            completion_fields.append(
+                f"{claim_summary['in_flight_count']:,} in flight"
             )
-
-        for claim in sorted(data["claims"], key=lambda row: row["candidate_index"]):
-            previous_claim = previous_claims.get(claim["candidate_index"])
-            line = claim_line(claim)
-            if previous_claim is None:
-                line = _colorize(line, "green", color)
-            elif claim != previous_claim and color:
-                line = _highlight_changes(line, claim_line(previous_claim))
-            detail_lines.append(line)
+        detail_lines.extend(_inline_section("  completion:", completion_fields, width))
+        contributions = claim_summary.get("worker_contributions") or []
+        if contributions:
+            worker_fields = [
+                f"{_worker_number_label(row['worker_id'])} {row['done_count']:,}"
+                for row in contributions
+            ]
+            detail_lines.extend(_inline_section("  by worker:", worker_fields, width))
     telemetry_lines = ["Telemetry"]
     bundle_summary = data.get("bundle_summary")
     if bundle_summary:

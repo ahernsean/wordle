@@ -189,16 +189,23 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("worker-0", text)
         self.assertGreater(self.page.locator(".card.dead").count(), 0)
 
-    def test_candidate_disclosure_requests_claims_and_labels_proof(self):
+    def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
         self.apply_selector("RAISE .....")
         self.page.wait_for_selector("text=Candidate detail")
-        self.page.locator("details:has-text('Candidate detail') summary").click()
-        self.page.wait_for_timeout(150)
-        self.assertTrue(any("claims=1" in url for url in requested))
-        self.assertIn("Proof (bulk eliminated)", self.page.locator("#report").inner_text())
-        self.assertNotIn("Worker bulk-elimination", self.page.locator("#report").inner_text())
+        text = self.page.locator("section:has-text('Candidate detail')").inner_text()
+        # A summary of provenance and per-worker contribution, never a row per
+        # candidate — the branch holds far more claims than a browser can render.
+        self.assertIn("12,819 done", text)
+        self.assertIn("11,200 evaluated", text)
+        self.assertIn("1,619 bulk proofs", text)
+        self.assertIn("5 in flight", text)
+        self.assertIn("w0 6,484", text)
+        # Nothing fetches the raw per-candidate list, and no per-candidate rows
+        # are rendered.
+        self.assertFalse(any("claims=1" in url for url in requested))
+        self.assertLess(self.page.locator("section:has-text('Candidate detail') .card").count(), 1)
 
     def test_finalization_outcomes_and_cut_reuse_are_distinct(self):
         self.apply_selector("RAISE .....")

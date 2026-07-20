@@ -447,7 +447,7 @@ class OverviewRendererTest(unittest.TestCase):
         )
         self.assertLess(output.index("w2"), output.index("w1"))
 
-    def test_watched_branch_claims_compare_by_candidate_index(self):
+    def test_candidate_state_renders_bounded_claim_summary(self):
         report = overview_report()
         report["report_kind"] = "branch"
         report["data"] = {
@@ -463,22 +463,24 @@ class OverviewRendererTest(unittest.TestCase):
             },
             "workers": [],
             "republished_candidates": [],
-            "claims": [{
-                "candidate_index": 4, "state": "in_flight",
-                "completion_kind": None, "worker_id": "worker-2",
-                "bundle_id": None, "claimed_at": 900, "done_at": None,
-                "republish_count": 0,
-            }],
+            "claims": None,
+            "claim_summary": {
+                "total_claim_count": 12972, "done_count": 12819,
+                "in_flight_count": 5, "evaluated_count": 11200,
+                "bulk_eliminated_count": 1619, "provenance_unknown_count": 0,
+                "worker_contributions": [
+                    {"worker_id": "worker-0", "done_count": 6484},
+                    {"worker_id": "worker-2", "done_count": 6335},
+                ],
+            },
             "provenance_unknown": False,
         }
-        changed = deepcopy(report)
-        changed["data"]["claims"][0]["state"] = "done"
-        changed["data"]["claims"][0]["completion_kind"] = "evaluated"
-        output = render_report(
-            changed, previous_report=report, color=True, width=100
-        )
-        self.assertIn("  idx=4 " + report_terminal.RED, output)
-        self.assertNotIn(report_terminal.RED + "  idx=4", output)
+        output = render_report(report, width=100)
+        self.assertIn("12,819 done", output)
+        self.assertIn("1,619 bulk proofs", output)
+        self.assertIn("5 in flight", output)
+        self.assertIn("by worker: w0 6,484", output)
+        self.assertNotIn("idx=", output)
 
     def test_selected_branch_detail_survives_parent_status_filter(self):
         report = overview_report()
