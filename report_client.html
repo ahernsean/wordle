@@ -59,7 +59,10 @@
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; }
     .progress-line .sweep { flex:1 1 auto; height:.9rem; margin:0; }
     .sweep-cell { flex:1 1 0; min-width:2px; position:relative; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
-    .sweep-cell.worker::after { content:attr(data-worker-number); position:absolute; inset:0; display:grid; place-items:center; font-size:.65rem; font-weight:bold; color:var(--text); background:var(--yellow); border-radius:1px; }
+    /* line-height 1 keeps the line box inside the cell; the small top padding
+       offsets the digit's empty descender space so the glyph ink is optically
+       centered. */
+    .sweep-cell.worker::after { content:attr(data-worker-number); position:absolute; inset:0; display:grid; place-items:center; font-size:.65rem; line-height:1; padding-top:.15em; font-weight:bold; color:var(--text); background:var(--yellow); border-radius:1px; }
     .kv { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .kv .pair { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .kv .pair-label { color:var(--dim); }
