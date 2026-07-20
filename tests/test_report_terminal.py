@@ -214,7 +214,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("Ref", output)
         self.assertIn("State", output)
 
-    def test_progress_and_worker_changes_are_semantically_colored(self):
+    def test_progress_is_highlighted_by_cell_rules(self):
         previous = overview_report()
         current = deepcopy(previous)
         current["data"]["branches"][0]["completed_candidate_count"] += 1
@@ -222,9 +222,28 @@ class OverviewRendererTest(unittest.TestCase):
         output = render_overview(
             current, previous_report=previous, color=True, width=100
         )
-        self.assertIn(report_terminal.GREEN + "  @0123", output)
-        self.assertIn(report_terminal.RED + "SLATE", output)
-        self.assertNotIn(report_terminal.RED + "    w2", output)
+        self.assertIn(report_terminal.GREEN + "26/100", output)
+        self.assertIn(report_terminal.GREEN + "SLATE", output)
+        self.assertNotIn(report_terminal.RED, output)
+
+    def test_improved_best_erd_highlights_best_cell(self):
+        previous = overview_report()
+        current = deepcopy(previous)
+        current["data"]["branches"][0]["best_erd"] = 2.125
+        output = render_overview(
+            current, previous_report=previous, color=True, width=100
+        )
+        self.assertIn(report_terminal.GREEN + "CRANE*/2.125", output)
+        self.assertNotIn(report_terminal.GREEN + "26/100", output)
+
+    def test_stalled_worker_rate_is_highlighted_red(self):
+        previous = overview_report()
+        current = deepcopy(previous)
+        current["data"]["workers"][0]["nodes_per_second"] = 0
+        output = render_overview(
+            current, previous_report=previous, color=True, width=100
+        )
+        self.assertIn(report_terminal.RED + "0/s", output)
 
     def test_ticking_timestamps_alone_are_not_highlighted(self):
         previous = overview_report()

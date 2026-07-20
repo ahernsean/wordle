@@ -15,9 +15,8 @@
     input[type="checkbox"] { min-height:auto; accent-color:var(--green); }
     header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
     .nav, .selector, .filter-grid, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
-    .selector { margin-top:.35rem; }
-    .selector label { flex:0 0 auto; color:var(--dim); }
-    #selector-input { flex:1 1 14rem; min-width:8rem; }
+    .selector { margin-top:.35rem; flex-wrap:nowrap; }
+    #selector-input { flex:1 1 8rem; min-width:6rem; }
     details.filters { margin-top:.3rem; color:var(--dim); }
     .filter-grid { padding:.5rem 0; align-items:end; }
     .field { display:grid; gap:.15rem; color:var(--dim); min-width:7rem; flex:1 1 8rem; }
@@ -25,16 +24,18 @@
     #connection { margin-left:auto; color:var(--green); padding:.1rem .3rem; white-space:nowrap; }
     #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
     main { width:min(1200px,100%); margin:auto; padding:.5rem clamp(.5rem,1.5vw,1rem) 2rem; }
-    .report-meta { display:flex; flex-wrap:wrap; gap:.6rem; align-items:baseline; margin:.2rem 0 .5rem; }
+    .report-meta { display:flex; flex-wrap:wrap; gap:.2rem .6rem; align-items:baseline; margin:.2rem 0 .35rem; }
+    details.source-paths { display:inline-block; }
+    details.source-paths[open] { display:block; flex-basis:100%; }
     h1,h2,h3 { margin:.4rem 0 .25rem; }
     h1 { font-size:1rem; display:inline; }
     h2 { font-size:.95rem; }
     h3 { font-size:.9rem; margin:0; }
     .dim, .source, .empty { color:var(--dim); }
     .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:#fff1f1; }
-    .metrics { margin:.4rem 0; }
-    .metric { min-width:5.5rem; flex:1 1 auto; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.3rem .5rem; }
-    .metric strong { display:block; font-size:1rem; overflow-wrap:anywhere; }
+    .metrics { margin:.3rem 0; gap:.15rem 1rem; }
+    .metric { display:inline-flex; gap:.35rem; align-items:baseline; min-width:0; flex:0 1 auto; }
+    .metric strong { overflow-wrap:anywhere; }
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,15rem),1fr)); gap:.4rem; }
     .grid.workers { grid-template-columns:repeat(auto-fill,minmax(min(100%,11rem),1fr)); }
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
@@ -57,8 +58,9 @@
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; }
     .sweep-cell { flex:1 1 0; min-width:2px; position:relative; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
     .sweep-cell.worker::after { content:attr(data-worker-number); position:absolute; inset:0; display:grid; place-items:center; font-size:.65rem; font-weight:bold; color:var(--text); background:var(--yellow); border-radius:1px; }
-    .kv { display:grid; grid-template-columns:auto 1fr; gap:.1rem .55rem; }
-    .kv > :nth-child(odd) { color:var(--dim); }
+    .kv { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
+    .kv .pair { display:inline-block; min-width:0; overflow-wrap:anywhere; }
+    .kv .pair-label { color:var(--dim); }
     .tree ul { list-style:none; margin:.2rem 0 .2rem .5rem; padding-left:.6rem; border-left:1px solid var(--border); }
     .tree summary { cursor:pointer; min-height:28px; padding:.15rem 0; }
     .clickable { cursor:pointer; }
@@ -70,7 +72,6 @@
     @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
     @media (max-width:600px) {
       header { position:static; }
-      .nav button { flex:1 1 auto; }
     }
   </style>
 </head>
@@ -81,8 +82,7 @@
       <span id="connection">●</span>
     </div>
     <div class="selector">
-      <label for="selector-input">Spine or @branch</label>
-      <input id="selector-input" autocomplete="off" spellcheck="false">
+      <input id="selector-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
       <button id="apply">Apply</button><button id="back">Back</button>
     </div>
     <details class="filters"><summary>Filters</summary>
@@ -216,20 +216,18 @@
     }
     function metric(labelText,value){const node=element("div","metric");node.append(element("strong","",valueOrDash(value)),element("span","dim",labelText));return node;}
     function formatBytes(value){if(value===null||value===undefined)return "—";for(const [size,suffix] of [[2**30,"G"],[2**20,"M"],[2**10,"K"]])if(value>=size)return (value/size).toLocaleString(undefined,{maximumFractionDigits:value/size>=100?0:1})+suffix;return value+"B";}
-    function kv(values){const node=element("div","kv");for(const [key,value] of values){node.append(element("span","",key),element("span","",valueOrDash(value)));}return node;}
+    function kv(values){const node=element("div","kv");for(const [key,value] of values){if(value===null||value===undefined||value==="")continue;const pair=element("span","pair");pair.append(element("span","pair-label",key)," ",element("span","",valueOrDash(value)));node.append(pair);}return node;}
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
     function patternTiles(pattern){const step=element("span","step");for(const character of pattern||"?????")step.append(element("span","tile "+(character==="g"?"g":character==="y"?"y":""),character));return step;}
     function renderSpine(spine){const node=element("div","tiles");for(const step of spine||[]){node.append(element("span","",String(step.word||"?").toUpperCase()),patternTiles(step.pattern));}return node;}
     function branchClass(row){return row.is_live===false?"dead":row.branch_phase==="finalizing"?"finalizing":row.branch_status||"";}
     function reportHeader(report,state){
-      const fragment=document.createDocumentFragment();
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"),element("span","dim",state.selector||"root"),element("span","dim",new Date(report.generated_at*1000).toLocaleTimeString()));
-      fragment.append(meta);
       const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.append(summary);
       for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}
       if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));
-      details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));fragment.append(details);return fragment;
+      details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);return meta;
     }
     function bestText(row){
       if(!row.best_guess)return null;
@@ -296,8 +294,9 @@
       return strip;
     }
     function renderOverview(report,previous,state){
-      const fragment=document.createDocumentFragment(),counts=report.data.queue_counts||{},metrics=element("div","metrics");for(const [labelText,key] of [["queued pending","pending_branch_count"],["evaluating user","evaluating_user_branch_count"],["evaluating coop","evaluating_cooperative_branch_count"],["finalizing","finalizing_branch_count"],["cached exact","exact_branch_count"]])metrics.append(metric(labelText,key in counts?counts[key]:report.data.cache_summary?.[key]));fragment.append(metrics);
-      const disk=report.data.disk;if(disk?.used_fraction!==null&&disk?.used_fraction!==undefined){const values=[["filesystem used",(100*disk.used_fraction).toFixed(1)+"%"],["queue WAL",formatBytes(disk.queue_wal_bytes)]];const rate=disk.fill_rate_bytes_per_second;if(rate!==null&&rate!==undefined)values.push([rate>0?"filling":"freeing",formatBytes(Math.abs(rate))+"/s"]);fragment.append(section("Disk",kv(values)));}
+      const fragment=document.createDocumentFragment(),counts=report.data.queue_counts||{},metrics=element("div","metrics");for(const [labelText,key] of [["queued pending","pending_branch_count"],["evaluating user","evaluating_user_branch_count"],["evaluating coop","evaluating_cooperative_branch_count"],["finalizing","finalizing_branch_count"],["cached exact","exact_branch_count"]])metrics.append(metric(labelText,key in counts?counts[key]:report.data.cache_summary?.[key]));
+      const disk=report.data.disk;if(disk?.used_fraction!==null&&disk?.used_fraction!==undefined){metrics.append(metric("filesystem used",(100*disk.used_fraction).toFixed(1)+"%"),metric("queue WAL",formatBytes(disk.queue_wal_bytes)));const rate=disk.fill_rate_bytes_per_second;if(rate!==null&&rate!==undefined)metrics.append(metric(rate>0?"filling":"freeing",formatBytes(Math.abs(rate))+"/s"));}
+      fragment.append(metrics);
       fragment.append(element("h2","","Branches · status "+(state.branch_status.length?state.branch_status.join(", "):"all")));
       const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(branches,element("h2","","Workers"));
       const branchPhases=new Map((report.data.branches||[]).map(branch=>[branch.branch_key_hex,branch.branch_phase]));
@@ -312,14 +311,17 @@
     }
     function section(title,content,className=""){const node=element("section","section "+className);node.append(element("h2","",title));if(content)node.append(content);return node;}
     function renderBranch(report,previous,state){
-      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};fragment.append(section("Identity",renderSpine(branch.spine)));
+      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};if(branch.spine?.length)fragment.append(section("Identity",renderSpine(branch.spine)));
       fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):null],["ERD",data.queue.best_erd],["ceiling",data.queue.ceiling],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers)));}
       fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[label(key),key==="best_guess"&&value?String(value).toUpperCase():value]))));
-      const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers||[])workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));
-      const finalizations=element("div","grid");for(const row of data.recent_finalizations||[]){const card=element("article","card outcome-"+row.outcome);card.append(element("h3","",row.outcome),kv([["ceiling",row.ceiling],["evaluated",row.evaluated_candidate_count],["bulk proofs",row.bulk_completed_candidate_count],["bundles",row.bundle_count],["nodes",row.search_node_count],["wall ms",row.wall_millis],["epoch",row.epoch]]));finalizations.append(card);}fragment.append(section("Recent finalizations",finalizations));
-      const misses=element("div","grid");for(const row of data.cut_reuse_misses||[])misses.append(element("article","card outcome-cut","cut reuse · available "+row.available_bound+" · budget "+row.available_budget));fragment.append(section("Cut-reuse misses",misses));
-      fragment.append(section("Bundle and republish",kv([["bundle summary",data.bundle_summary?JSON.stringify(data.bundle_summary):null],["republished candidates",(data.republished_candidates||[]).map(row=>row.candidate_index+"×"+row.republish_count).join(", ")]])));
+      if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
+      if(data.recent_finalizations?.length){const finalizations=element("div","grid");for(const row of data.recent_finalizations){const card=element("article","card outcome-"+row.outcome);card.append(element("h3","",row.outcome),kv([["ceiling",row.ceiling],["evaluated",row.evaluated_candidate_count],["bulk proofs",row.bulk_completed_candidate_count],["bundles",row.bundle_count],["nodes",row.search_node_count],["wall ms",row.wall_millis],["epoch",row.epoch]]));finalizations.append(card);}fragment.append(section("Recent finalizations",finalizations));}
+      if(data.cut_reuse_misses?.length){const misses=element("div","grid");for(const row of data.cut_reuse_misses)misses.append(element("article","card outcome-cut","cut reuse · available "+row.available_bound+" · budget "+row.available_budget));fragment.append(section("Cut-reuse misses",misses));}
+      const bundleLabels={bundle_count:"bundles",node_count:"nodes",wall_millis:"wall ms",censored_unit_count:"censored units",maximum_bundle_node_count:"max bundle nodes"};
+      const bundlePairs=Object.entries(data.bundle_summary||{}).map(([key,value])=>[bundleLabels[key]||label(key),value]);
+      const republished=(data.republished_candidates||[]).map(row=>row.candidate_index+"×"+row.republish_count).join(", ");
+      if(bundlePairs.length||republished)fragment.append(section("Bundle and republish",kv([...bundlePairs,["republished candidates",republished]])));
       const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
       const claims=element("details","section");claims.open=state.claims;claims.append(element("summary","","Candidate detail"));if(data.claims)for(const claim of data.claims){const claimLabel=claim.completion_kind==="bulk_eliminated"?"Proof (bulk eliminated)":claim.worker_id?"Worker "+workerName({worker_id:claim.worker_id}):valueOrDash(claim.state);claims.append(element("div","card",claim.candidate_index+" · "+claimLabel));}claims.addEventListener("toggle",()=>{if(claims.open!==currentState.claims)setState({...currentState,claims:claims.open},false);});fragment.append(claims);return fragment;
     }

@@ -77,6 +77,50 @@ class TerminalColumn:
     minimum_width: int = 1
     maximum_width: int | None = None
     truncation: str | None = None
+    # Semantic cell highlighting: called with (row, previous_row) — the
+    # previous row is None on a first sighting — and returns a semantic class
+    # or None.  Rules read row fields, so thresholds and comparisons stay
+    # per-quantity instead of falling back to character diffs.
+    highlight_rule: object = None
+
+
+def _count_increase_rule(field):
+    def rule(row, previous_row):
+        if previous_row is None:
+            return None
+        current = row.get(field) or 0
+        previous = previous_row.get(field) or 0
+        return "green" if current > previous else None
+    return rule
+
+
+def _best_erd_improvement_rule(row, previous_row):
+    if previous_row is None or row.get("best_erd") is None:
+        return None
+    previous_erd = previous_row.get("best_erd")
+    if previous_erd is None or row["best_erd"] < previous_erd:
+        return "green"
+    return None
+
+
+def _candidate_advance_rule(row, previous_row):
+    if previous_row is None:
+        return None
+    if row.get("current_candidate") != previous_row.get("current_candidate"):
+        return "green"
+    return None
+
+
+def _rate_stall_rule(row, _previous_row):
+    # A live worker holding search nodes with a zero evaluation rate is
+    # stalled, not merely idle.
+    if (
+        row.get("is_live")
+        and (row.get("current_node_count") or 0) > 0
+        and not (row.get("nodes_per_second") or 0)
+    ):
+        return "red"
+    return None
 
 
 def _percentage(numerator, denominator):
@@ -383,14 +427,6 @@ def _render_table(
         )
     visible_columns, column_widths = layout
 
-    def formatted_line(row):
-        return indent + "  ".join(
-            _format_table_cell(
-                _column_value(column, row), column, column_widths[column]
-            )
-            for column in visible_columns
-        ).rstrip()
-
     lines = []
     if include_header:
         lines.append(indent + "  ".join(
@@ -398,15 +434,20 @@ def _render_table(
             for column in visible_columns
         ).rstrip())
     for index, row in enumerate(rows):
-        line = formatted_line(row)
         semantic_class = row_classes[index] if row_classes else None
         previous_row = previous_rows[index] if previous_rows else None
-        if semantic_class == "changed":
-            if color and previous_row is not None:
-                line = _highlight_changes(line, formatted_line(previous_row))
-        else:
-            line = _colorize(line, semantic_class, color)
-        lines.append(line)
+        cells = []
+        for column in visible_columns:
+            cell = _format_table_cell(
+                _column_value(column, row), column, column_widths[column]
+            )
+            if color and semantic_class is None and column.highlight_rule:
+                cell = _colorize(
+                    cell, column.highlight_rule(row, previous_row), color
+                )
+            cells.append(cell)
+        line = (indent + "  ".join(cells)).rstrip()
+        lines.append(_colorize(line, semantic_class, color))
     return lines
 
 
@@ -430,21 +471,7 @@ def _wrap_fields(fields, width, indent="  "):
 
 
 def _semantic_branch_class(branch, previous_branch):
-    if previous_branch is None:
-        return "green"
-    if (
-        branch["completed_candidate_count"]
-        > previous_branch["completed_candidate_count"]
-        or (
-            branch.get("best_erd") is not None
-            and (
-                previous_branch.get("best_erd") is None
-                or branch["best_erd"] < previous_branch["best_erd"]
-            )
-        )
-    ):
-        return "green"
-    return "changed" if branch != previous_branch else None
+    return "green" if previous_branch is None else None
 
 
 def _semantic_worker_class(worker, previous_worker, generated_at):
@@ -452,14 +479,7 @@ def _semantic_worker_class(worker, previous_worker, generated_at):
         return "red"
     if generated_at - worker["updated_at"] > WORKER_STALE_SECONDS:
         return "amber"
-    if previous_worker is None:
-        return "green"
-    ignored = {"updated_at"}
-    current_values = {key: value for key, value in worker.items() if key not in ignored}
-    previous_values = {
-        key: value for key, value in previous_worker.items() if key not in ignored
-    }
-    return "changed" if current_values != previous_values else None
+    return "green" if previous_worker is None else None
 
 
 def _colorize(line, semantic_class, color):
@@ -669,6 +689,7 @@ def _branch_columns(display_order):
                 f"{row['completed_candidate_count']}/"
                 f"{row['candidate_count'] if row['candidate_count'] is not None else '—'}"
             ), required=True, alignment="right",
+            highlight_rule=_count_increase_rule("completed_candidate_count"),
         ),
         TerminalColumn("W", "worker_count", required=True, alignment="right"),
         TerminalColumn(
@@ -677,8 +698,12 @@ def _branch_columns(display_order):
         TerminalColumn(
             "Bulk", "bulk_completed_candidate_count", remove_priority=20,
             alignment="right",
+            highlight_rule=_count_increase_rule("bulk_completed_candidate_count"),
         ),
-        TerminalColumn("Best", "display_best", remove_priority=30),
+        TerminalColumn(
+            "Best", "display_best", remove_priority=30,
+            highlight_rule=_best_erd_improvement_rule,
+        ),
         TerminalColumn(
             "MaxRD", "best_max_remaining_depth", remove_priority=40,
             alignment="right",
@@ -785,12 +810,16 @@ def _worker_columns():
     return [
         TerminalColumn("Worker", "display_worker", required=True),
         TerminalColumn("State", "display_state", required=True),
-        TerminalColumn("Candidate", "display_candidate", required=True),
+        TerminalColumn(
+            "Candidate", "display_candidate", required=True,
+            highlight_rule=_candidate_advance_rule,
+        ),
         TerminalColumn(
             "MaxGD", "display_guess_depth", required=True, alignment="right"
         ),
         TerminalColumn(
-            "Rate", "display_rate", remove_priority=10, alignment="right"
+            "Rate", "display_rate", remove_priority=10, alignment="right",
+            highlight_rule=_rate_stall_rule,
         ),
         TerminalColumn("Age", "display_age", required=True, alignment="right"),
     ]
@@ -1025,7 +1054,22 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     telemetry_lines = ["Telemetry"]
     bundle_summary = data.get("bundle_summary")
     if bundle_summary:
-        telemetry_lines.append(_fit(f"  active bundles: {bundle_summary}", width))
+        bundle_labels = {
+            "bundle_count": "bundles",
+            "node_count": "nodes",
+            "wall_millis": "wall ms",
+            "censored_unit_count": "censored units",
+            "maximum_bundle_node_count": "max bundle nodes",
+        }
+        bundle_fields = [
+            bundle_labels.get(key, key.replace("_", " "))
+            + " "
+            + (f"{value:,}" if isinstance(value, int) else str(value))
+            for key, value in bundle_summary.items()
+        ]
+        telemetry_lines.extend(
+            _inline_section("  active bundles:", bundle_fields, width)
+        )
     for finalization in data.get("recent_finalizations", []):
         telemetry_lines.append(_fit(
             f"  {finalization['outcome']} epoch={finalization['epoch']} "

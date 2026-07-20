@@ -349,7 +349,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....',branch_status:['active'],branch_phase:[]});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("status\ndone", text)
+        self.assertIn("status done", text)
         self.assertNotIn("no longer matches the parent filter", text)
 
     def test_cache_renderer_handles_root_word_and_branch_contracts(self):
