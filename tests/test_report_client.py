@@ -310,24 +310,32 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("disconnected", chip.get_attribute("class") or "")
         self.assertEqual(chip.inner_text(), "●")
 
-    def test_finalized_branch_404_keeps_report_and_stays_connected(self):
-        self.apply_selector("RAISE .....")
+    def test_branch_view_pins_selector_to_its_spine(self):
+        # Navigating by a queue reference resolves once; the client then pins
+        # the view to the branch's spine so later polls never depend on the
+        # reference (which 404s after finalization).
+        self.page.goto(self.base_url + "?selector=@0123456789ab")
         self.page.wait_for_selector("text=branch report")
-        original = self.page.locator("#report").inner_text()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().selector === 'raise -----'"
+        )
+        self.assertIn("selector=raise", self.page.url)
+        self.assertNotIn("0123456789ab", self.page.url)
+        self.assertEqual(self.page.locator("#selector-input").input_value(), "raise -----")
+
+    def test_unresolvable_reference_reports_error_not_a_fake_report(self):
         self.page.route(
             "**/api/view**",
             lambda route: route.fulfill(
                 status=404, content_type="application/json",
-                body='{"error":{"kind":"not_found","message":"branch reference @01 not found"}}',
+                body='{"error":{"kind":"not_found","message":"branch reference @dead not found"}}',
             ),
         )
-        self.page.evaluate("__reportClient.fetchReport()")
-        self.page.evaluate("__reportClient.fetchReport()")
-        self.page.wait_for_timeout(120)
-        chip = self.page.locator("#connection")
-        self.assertNotIn("disconnected", chip.get_attribute("class") or "")
-        self.assertEqual(chip.inner_text(), "●")
-        self.assertEqual(self.page.locator("#report").inner_text(), original)
+        self.page.evaluate(
+            "__reportClient.setState({...__reportClient.getState(),kind:'auto',selector:'@dead'})"
+        )
+        self.page.wait_for_selector("#report .error")
+        self.assertIn("not found", self.page.locator("#report .error").inner_text())
         self.page.unroute("**/api/view**")
 
     def test_overview_cards_animate_moves_and_departures(self):
