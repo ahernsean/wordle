@@ -77,6 +77,7 @@
     .clickable { cursor:pointer; }
     .clickable:hover { border-color:var(--green); }
     .badge { background:var(--red); color:white; border-radius:4px; padding:.1rem .35rem; }
+    .leave-layer { position:fixed; inset:0; pointer-events:none; z-index:50; }
     .flash-added { animation:added 1.5s; } .flash-improved { animation:improved 1.5s; } .flash-changed { animation:changed 1.5s; }
     @keyframes added { from { box-shadow:0 0 0 3px var(--green); } }
     @keyframes improved { from { border-color:var(--green); background:#e8f4e7; } }
@@ -366,8 +367,9 @@
       if(data.cut_reuse_misses?.length){const misses=element("div","grid");for(const row of data.cut_reuse_misses)misses.append(element("article","card outcome-cut","cut reuse · available "+row.available_bound+" · budget "+row.available_budget));fragment.append(section("Cut-reuse misses",misses));}
       const bundleLabels={bundle_count:"bundles",node_count:"nodes",wall_millis:"wall ms",censored_unit_count:"censored units",maximum_bundle_node_count:"max bundle nodes"};
       const bundlePairs=Object.entries(data.bundle_summary||{}).map(([key,value])=>[bundleLabels[key]||label(key),value]);
-      const republished=(data.republished_candidates||[]).map(row=>row.candidate_index+"×"+row.republish_count).join(", ");
-      if(bundlePairs.length||republished)fragment.append(section("Bundle and republish",kv([...bundlePairs,["republished candidates",republished]])));
+      const republishedList=data.republished_candidates||[];
+      const republishedSummary=republishedList.length?numText(republishedList.length)+(republishedList.length===1?" candidate":" candidates")+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)":null;
+      if(bundlePairs.length||republishedSummary)fragment.append(section("Bundle and republish",kv([...bundlePairs,["candidates re-queued",republishedSummary]])));
       const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
       const claims=element("details","section");claims.open=state.claims;claims.append(element("summary","","Candidate detail"));if(data.claims)for(const claim of data.claims){const claimLabel=claim.completion_kind==="bulk_eliminated"?"Proof (bulk eliminated)":claim.worker_id?"Worker "+workerName({worker_id:claim.worker_id}):valueOrDash(claim.state);claims.append(element("div","card",claim.candidate_index+" · "+claimLabel));}claims.addEventListener("toggle",()=>{if(claims.open!==currentState.claims)setState({...currentState,claims:claims.open},false);});fragment.append(claims);return fragment;
     }
@@ -384,11 +386,45 @@
     function displayEntries(row){return Object.entries(row).filter(([key])=>!["row_id","branch_key_hex","branch_reference","spine"].includes(key)).map(([key,value])=>[label(key),key==="best_guess"&&value?String(value).toUpperCase():value]);}
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),kv(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),kv(displayEntries(row)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
     function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=element("div","grid"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,kv(displayEntries(row)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
+    function captureGridCards(root){
+      const map=new Map();
+      for(const node of root.querySelectorAll(".grid > [data-identity]"))map.set(node.dataset.identity,{rect:node.getBoundingClientRect(),node});
+      return map;
+    }
+    function animateGridTransitions(root,before,sameView){
+      if(!sameView||!before.size||matchMedia("(prefers-reduced-motion: reduce)").matches)return;
+      const present=new Set();
+      for(const node of root.querySelectorAll(".grid > [data-identity]")){
+        present.add(node.dataset.identity);
+        const prior=before.get(node.dataset.identity);
+        if(prior){
+          // FLIP: a card that survived the refresh glides from where it was to
+          // where it landed, so watching one branch never means chasing it.
+          const after=node.getBoundingClientRect(),dx=prior.rect.left-after.left,dy=prior.rect.top-after.top;
+          if(dx||dy)node.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:"none"}],{duration:350,easing:"ease"});
+        }else{
+          node.animate([{opacity:0,transform:"scale(.96)"},{opacity:1,transform:"none"}],{duration:300,easing:"ease"});
+        }
+      }
+      const leaving=[...before].filter(([identity])=>!present.has(identity));
+      if(!leaving.length)return;
+      const layer=element("div","leave-layer");document.body.append(layer);
+      for(const [,{rect,node}] of leaving){
+        const clone=node.cloneNode(true);
+        Object.assign(clone.style,{position:"fixed",margin:"0",left:rect.left+"px",top:rect.top+"px",width:rect.width+"px",height:rect.height+"px"});
+        layer.append(clone);
+        clone.animate([{opacity:1,transform:"none"},{opacity:0,transform:"scale(.96)"}],{duration:300,easing:"ease"});
+      }
+      setTimeout(()=>layer.remove(),350);
+    }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
-      const root=byId("report"),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
+      const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
       if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport));else throw new Error("Unknown report kind");
-      root.replaceChildren(content);animateSweepMarkers(root);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      // Only glide cards on a refresh of the same view; switching report kinds
+      // (or the first paint over a stale screen) snaps rather than stampedes.
+      const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;
+      root.replaceChildren(content);animateSweepMarkers(root);animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" fill="#1a1a1b">'+workerNumber+'</text></svg>';
@@ -406,7 +442,13 @@
       try{
         const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});
         if(generation!==requestGeneration)return;
-        if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
+        if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}
+          // A 404 means the selected thing is gone (e.g. a branch that finalized
+          // and left the queue), not that the server is unreachable.  Stay
+          // connected and keep the last good report on screen rather than
+          // flipping to "offline"; only show the note when there is nothing to keep.
+          if(response.status===404){connection(true,"connected");if(!lastReport||context!==lastContext)byId("report").replaceChildren(element("p","empty",message));lastSuccess=Date.now();failureCount=0;return;}
+          throw new Error(message);}
         const report=await response.json();if(generation!==requestGeneration)return;
         const previous=context===lastContext?lastReport:null;applyReport(report,previous,state);lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
       }

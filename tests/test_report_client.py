@@ -310,6 +310,51 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("disconnected", chip.get_attribute("class") or "")
         self.assertEqual(chip.inner_text(), "●")
 
+    def test_finalized_branch_404_keeps_report_and_stays_connected(self):
+        self.apply_selector("RAISE .....")
+        self.page.wait_for_selector("text=branch report")
+        original = self.page.locator("#report").inner_text()
+        self.page.route(
+            "**/api/view**",
+            lambda route: route.fulfill(
+                status=404, content_type="application/json",
+                body='{"error":{"kind":"not_found","message":"branch reference @01 not found"}}',
+            ),
+        )
+        self.page.evaluate("__reportClient.fetchReport()")
+        self.page.evaluate("__reportClient.fetchReport()")
+        self.page.wait_for_timeout(120)
+        chip = self.page.locator("#connection")
+        self.assertNotIn("disconnected", chip.get_attribute("class") or "")
+        self.assertEqual(chip.inner_text(), "●")
+        self.assertEqual(self.page.locator("#report").inner_text(), original)
+        self.page.unroute("**/api/view**")
+
+    def test_overview_cards_animate_moves_and_departures(self):
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view')).json();
+          applyReport(report,null,__reportClient.getState());
+          const before=[...document.querySelectorAll('.grid > [data-identity]')].map(node=>node.dataset.identity);
+          const reordered=structuredClone(report);
+          reordered.data.branches.reverse();
+          reordered.data.branches.shift();
+          applyReport(reordered,report,__reportClient.getState());
+          const moved=[...document.querySelectorAll('.grid > [data-identity]')].filter(node=>node.getAnimations().length).length;
+          const leaveClones=document.querySelectorAll('.leave-layer > *').length;
+          return {before,moved,leaveClones};
+        }""")
+        self.assertGreater(len(result["before"]), 1)
+        self.assertGreater(result["moved"], 0)
+        self.assertEqual(result["leaveClones"], 1)
+
+    def test_republished_candidates_render_as_summary_not_raw_list(self):
+        self.apply_selector("RAISE .....")
+        self.page.wait_for_selector("text=Bundle and republish")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("re-queued", text)
+        self.assertIn("candidates re-queued", text)
+        self.assertNotIn("7×2", text)
+
     def test_url_state_round_trips_branch_filters(self):
         state = self.page.evaluate("""() => parsePageState({search:'?kind=queue&branch_status=pending,done&branch_phase=queued,complete&limit=25&sort=nodes&poll=5000'})""")
         self.assertEqual(state["branch_status"], ["pending", "done"])
