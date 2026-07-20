@@ -434,6 +434,42 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["workerCells"], ["3"])
         self.assertFalse(any(85 < fill < 100 for fill in result["fills"]))
 
+    def test_overview_branch_cards_render_sweep_with_worker_markers(self):
+        result = self.page.evaluate("""() => {
+          const cards=[...document.querySelectorAll('#report .grid article.card.clickable')];
+          const first=cards.find(card=>card.dataset.identity==='01');
+          const cells=[...first.querySelectorAll('.sweep-cell')];
+          return {sweepCount:document.querySelectorAll('#report .sweep').length,cellCount:cells.length,workerNumbers:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber),fullCells:cells.filter(cell=>cell.style.getPropertyValue('--fill')==='100%').length};
+        }""")
+        self.assertEqual(result["sweepCount"], 3)
+        self.assertGreater(result["cellCount"], 20)
+        self.assertEqual(result["workerNumbers"], ["0"])
+        self.assertGreater(result["fullCells"], 0)
+
+    def test_rows_without_claim_indexes_fall_back_to_progress_bar(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector("text=queue report")
+        self.assertEqual(self.page.locator("#report .sweep").count(), 0)
+        self.assertGreater(self.page.locator("#report .progress").count(), 0)
+
+    def test_spine_words_never_separate_from_their_patterns(self):
+        result = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          const groups=[...document.querySelectorAll('.tiles .step-group')];
+          const spineGroups=groups.map(group=>({text:group.textContent,hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
+          const tree=await (await fetch('/api/view?tree=1')).json();
+          applyReport(tree,null,{...__reportClient.getState(),selector:'',tree:true});
+          const treeGroups=[...document.querySelectorAll('summary .step-group')].map(group=>({hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
+          return {spineGroups,treeGroupCount:treeGroups.length,treeAllNoWrap:treeGroups.every(group=>group.noWrap)};
+        }""")
+        self.assertTrue(result["spineGroups"])
+        for group in result["spineGroups"]:
+            self.assertTrue(group["hasTiles"])
+            self.assertTrue(group["noWrap"])
+        self.assertGreater(result["treeGroupCount"], 0)
+        self.assertTrue(result["treeAllNoWrap"])
+
     def test_integers_use_comma_separators(self):
         self.apply_selector("RAISE .....")
         self.page.wait_for_selector("text=branch report")

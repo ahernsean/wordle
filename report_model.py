@@ -559,14 +559,24 @@ def _queue_overview(sources, generated_at, answer_set, report):
                     "bulk_completed_candidate_count"
                 ],
             }
-            normalized_rows.append(_normalize_branch(
+            normalized = _normalize_branch(
                 branch_values,
                 row["branch_status"],
                 row["branch_phase"],
                 progress,
                 row["worker_count"],
                 answer_set,
-            ))
+            )
+            # Active branches carry their done claim indexes so overview
+            # displays can draw the candidate sweep; the set is bounded by the
+            # worker count.  Other statuses have no live claim rows.
+            if normalized["branch_status"] == "active":
+                normalized["completed_candidate_indexes"] = sorted(
+                    claim["idx"]
+                    for claim in queue.claims_for_branch(bytes(row["branch_key"]))
+                    if claim["done"]
+                )
+            normalized_rows.append(normalized)
 
         workers = [
             _normalize_worker(row, generated_at, answer_set) for row in heartbeats
