@@ -545,6 +545,18 @@ class CandidateSweepBarTest(unittest.TestCase):
         self.assertNotEqual(bar[0], " ")
         self.assertNotEqual(bar[0], "█")
 
+    def test_first_completion_lifts_cell_off_baseline(self):
+        bar = report_terminal.candidate_sweep_bar(80, [0], (), width=8)
+        self.assertEqual(bar[0], "▁")
+
+    def test_full_block_requires_entirely_completed_cell(self):
+        nearly_full = report_terminal.candidate_sweep_bar(
+            80, range(0, 9), (), width=8
+        )
+        self.assertEqual(nearly_full[0], "▇")
+        full = report_terminal.candidate_sweep_bar(80, range(0, 10), (), width=8)
+        self.assertEqual(full[0], "█")
+
     def test_worker_positions_overlay_digits(self):
         bar = report_terminal.candidate_sweep_bar(
             100, range(0, 50), [(75, "2")], width=10

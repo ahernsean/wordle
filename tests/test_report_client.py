@@ -426,12 +426,13 @@ class ReportClientBrowserTest(unittest.TestCase):
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
           applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
           const cells=[...document.querySelectorAll('.sweep-cell')];
-          return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),workerCells:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber)};
+          return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),fills:cells.map(cell=>Number.parseInt(cell.style.getPropertyValue('--fill'),10)),workerCells:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber)};
         }""")
         self.assertGreater(result["cellCount"], 20)
         self.assertEqual(result["firstFill"], "100%")
         self.assertEqual(result["lastFill"], "0%")
         self.assertEqual(result["workerCells"], ["3"])
+        self.assertFalse(any(85 < fill < 100 for fill in result["fills"]))
 
     def test_integers_use_comma_separators(self):
         self.apply_selector("RAISE .....")

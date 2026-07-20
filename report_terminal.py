@@ -126,10 +126,18 @@ def candidate_sweep_bar(candidate_count, completed_candidate_indexes,
         start = (position * candidate_count + width - 1) // width
         end = ((position + 1) * candidate_count + width - 1) // width
         cell_size = end - start
-        level = min(
-            len(ramp) - 1,
-            (done_count * (len(ramp) - 1) + cell_size - 1) // cell_size,
-        )
+        # The full block is reserved for a cell whose every candidate is done
+        # — no worker will ever claim inside it again.  Partial completion
+        # maps onto the intermediate blocks only, and any progress at all
+        # lifts the cell off the baseline.
+        if done_count >= cell_size:
+            level = len(ramp) - 1
+        else:
+            intermediate_levels = len(ramp) - 2
+            level = min(
+                intermediate_levels,
+                (done_count * intermediate_levels + cell_size - 1) // cell_size,
+            )
         marks[position] = ramp[level]
     for index, label in worker_positions or ():
         if index is None or index < 0:
