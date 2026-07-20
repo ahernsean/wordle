@@ -129,6 +129,19 @@ def _percentage(numerator, denominator):
     return f"{100.0 * numerator / denominator:.1f}%"
 
 
+# ERD and its bounds are means/ceilings; three decimals is the precision worth
+# showing, never a raw float like 2.793103449275866.
+BOUND_FIELDS = frozenset(
+    {"best_erd", "erd", "ceiling", "bound_erd", "available_bound", "wanted_ceiling"}
+)
+
+
+def _format_metric_value(key, value):
+    if key in BOUND_FIELDS and isinstance(value, float):
+        return f"{value:.3f}"
+    return value
+
+
 def _display_reference(branch_reference):
     """Four-character display prefix of a branch reference.
 
@@ -1082,7 +1095,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     for miss in data.get("cut_reuse_misses", []):
         telemetry_lines.append(_fit(
             f"  cut reuse miss epoch={miss['epoch']} budget={miss['budget']} "
-            f"available={miss['available_bound']}",
+            f"available={_format_metric_value('available_bound', miss['available_bound'])}",
             width,
         ))
     if len(telemetry_lines) == 1:
@@ -1271,7 +1284,7 @@ def _render_hotspot_sections(report, width, display_order):
         hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
         hotkey_prefix = f"{hotkey} " if hotkey else ""
         metrics = ", ".join(
-            f"{key}={value}" for key, value in row.items()
+            f"{key}={_format_metric_value(key, value)}" for key, value in row.items()
             if key not in (
                 "row_id", "branch_key_hex", "branch_reference", "spine"
             )

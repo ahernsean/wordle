@@ -526,6 +526,23 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("Branches (status=pending)", output)
         self.assertIn("0/—", output)
 
+    def test_hotspot_render_rounds_erd_and_ceiling_bounds(self):
+        report = overview_report()
+        report.update({"report_kind": "hotspots", "tree": False})
+        report["data"] = {
+            "field": "nodes", "population": "current_queue_branches",
+            "epoch": 4, "since_seconds": 3600, "sample_size": 50000,
+            "sampled_row_count": 1, "sample_truncated": False,
+            "rows": [{
+                "branch_reference": "abcd1234ef00", "answer_count": 33,
+                "best_erd": 2.793103449275866, "ceiling": 2.0000000009999996,
+            }],
+        }
+        output = render_report(report, width=120)
+        self.assertIn("best_erd=2.793", output)
+        self.assertIn("ceiling=2.000", output)
+        self.assertNotIn("2.793103449275866", output)
+
     def test_hotspot_render_labels_population_window_and_truncation(self):
         report = overview_report()
         report.update({"report_kind": "hotspots", "tree": False})

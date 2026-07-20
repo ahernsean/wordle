@@ -231,6 +231,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("budget", text)
         self.assertNotIn("2.2000", text)
 
+    def test_erd_and_bounds_round_in_cache_and_hotspot_views(self):
+        result = self.page.evaluate("""async () => {
+          const out={};
+          const cache=await (await fetch('/api/view/cache')).json();
+          cache.data.recent_rows[0].best_erd=2.793103449275866;cache.data.recent_rows[0].ceiling=2.0000000009999996;
+          applyReport(cache,null,{...__reportClient.getState(),kind:'cache'});
+          out.cache=document.querySelector('#report').innerText;
+          const hot=await (await fetch('/api/view/hotspots')).json();
+          hot.data.rows=[{row_id:'r1',branch_reference:'abcd1234ef00',best_erd:2.517241380310347,answer_count:33}];
+          applyReport(hot,null,{...__reportClient.getState(),kind:'hotspots'});
+          out.hotspot=document.querySelector('#report').innerText;
+          return out;
+        }""")
+        self.assertIn("2.793", result["cache"])
+        self.assertNotIn("2.793103449275866", result["cache"])
+        self.assertIn("2.000", result["cache"])
+        self.assertIn("2.517", result["hotspot"])
+        self.assertNotIn("2.517241380310347", result["hotspot"])
+
     def test_finalization_outcomes_and_cut_reuse_are_distinct(self):
         self.apply_selector("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")
