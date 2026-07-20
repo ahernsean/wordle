@@ -206,37 +206,97 @@ acceptance. Leaves-first order then maintains the invariant that every
 consulted child is exact, so every completed row is exact and Part 4's
 pinch may use any post-sweep value.
 
-**Fallback if the sample wave prices inline solving out:** keep the sweep
-read-only, but track per row whether any candidate was skipped for a
-missing sub-branch or any evaluation consulted a tainted or uncertified
-child. Rows with zero such events are **certified** exact; certification
-propagates leaves-first through a run-local sidecar keyed by `branch_key`
-(not a cache schema change). Uncertified rows remain demoted upper bounds,
-and Part 4's pinch is restricted to certified rows — the original cost
-envelope preserved at the price of a smaller seeding set.
+**Missing sub-branches are the common case, not an edge case — and that's
+fine.** Direct measurement (below) confirms why: a new candidate's response
+partition of an existing branch is a *combination* of old answer words that
+essentially never coincides with a partition any old candidate produced, so
+most candidates against most branches hit an uncached sub-branch. In
+practice this means most rows cost close to a full fresh solve rather than
+a cheap audit-and-skip — measured and priced below, and still a tractable
+overnight-class run, not a blocker. The read-only-certified fallback
+described in an earlier draft (defer uncertified rows, keep the sweep pure
+read-only) is no longer the live design: at the measured cost there is no
+need to trade correctness coverage for speed. Retained only as a
+contingency if a production wave runs materially slower than sampled.
 
-Either way, the scan covers every candidate, not just the added ones: an
-*old* candidate's cost depends recursively on its response-groups' cached
-ERDs, so when the leaves-first sweep lowers a child, a previously-losing
-old candidate can newly win even though no added word is involved. An
+The scan covers every candidate, not just the added ones: an *old*
+candidate's cost depends recursively on its response-groups' cached ERDs,
+so when the leaves-first sweep lowers a child, a previously-losing old
+candidate can newly win even though no added word is involved. An
 "added-candidates-only" shortcut misses that case (an earlier draft
 claimed it at ~15% of full cost; withdrawn).
 
-### Cost: the prior run bounds only the read-only scan
+**Why this must stay a standalone forced-recompute pass, never the normal
+swarm.** `branch_best_by_policy` keys rows on `(branch_key, policy,
+answer_list_id)` only — there is no guess-vocabulary component in the
+schema (confirmed by inspection of `cache_sqlite.py`'s table definitions).
+`_cache_reuse` (`wordle_engine.py`) has no notion of "verified under the
+current vocabulary" either — it accepts any present, untainted-or-
+appropriately-tainted row at face value. So a Phase-2-copied-forward row is
+indistinguishable, to any ordinary read, from one the sweep has already
+recertified: a normal swarm worker claiming that branch would serve the
+stale value as if exact. Only an explicit delete-then-resolve pass (what
+`verify_erd_cache.py` and this section's extension both do) forces
+recomputation. This is also why Phase 4's normal-swarm root-census-and-
+cones work is safe *after* Part 3 finishes but the swarm must stay off
+this table before then — not just an operational rule (Phase 3 step 3
+already says so) but a correctness requirement.
 
-`verify_erd_cache.py` has already run a full sweep of the whole `ERD_ALL`
-cache once, for an unrelated reason (the reclaim-while-alive bug fix,
-completed 2026-07-12): **3,485,333 rows, full candidate scan, 13h48m wall
-time, post-kernel** (the kernel deployed 2026-07-05, so this figure
-already reflects it — no further speedup to project on top). Scaling for
-today's larger inputs — roughly 3.6M rows vs. 3,485,333, 14,855 candidates
-vs. 12,972 — extrapolates to roughly **15–17 hours**. Two caveats: that's
-one data point, and the precedent was measured *with* the skip behaviour
-under an unchanged vocabulary, so it bounds the read-only scan only — the
-inline solves are new, unmeasured work on top. Time a sample wave on rocky
-first (the tool's `--start-size` resumption support bounds the
-commitment), and let it decide between the inline-solve design and the
-read-only-certified fallback.
+**Monitoring differs between the two halves of the uplift.** The sweep
+(this Part) runs as a standalone script — its own worker pool, its own
+`--log` file, its own stdout progress lines — and does **not** register
+with `erd_search.py view --workers`, since it never touches
+`erd_queue.sqlite3`. Watch its log/stdout directly. Phase 4's root-census-
+and-cones work, by contrast, *is* routed through the normal swarm and is
+fully visible through the usual `erd_search.py view` reports.
+
+### Cost: measured directly (2026-07-19/20, idle machine, two sampling passes)
+
+`verify_erd_cache.py` ran a full sweep of the whole `ERD_ALL` cache once
+before, for an unrelated reason (the reclaim-while-alive bug fix, completed
+2026-07-12): 3,485,333 rows, full candidate scan, 13h48m wall time. That
+number bounds only the tool's original *read-only, unchanged-vocabulary*
+behavior and does not price this sweep's inline solves — superseded by
+direct measurement below.
+
+**Method.** Against a read-only production cache and a scratch database
+(no production writes), for branches sampled from every `ERD_ALL` size
+bucket: solve fresh under the new 14,855-word vocabulary (populating
+children), then delete just the top row and re-solve with children warm —
+isolating the steady-state per-row cost a leaves-first sweep would see.
+Two passes: an initial 208-branch stratified sample across sizes 4–200,
+then a 251-branch targeted resample of the 16–30-word bucket (the
+production histogram's largest concentration — 1.15M of 3.6M rows) with
+exact per-size row-count weighting, since that bucket's cost turned out to
+be the dominant source of uncertainty.
+
+**Result: 3.0–8.7 days on 6 workers; 5.4 days is the central estimate**
+(780 serial hours, trimmed-mean method). The spread comes from a genuine
+heavy tail — most branches solve in under a second, but near-exact-tie
+branches (alpha-beta gets no early cutoff) can take tens to low hundreds of
+seconds, and 4.2% of the 16–30-word bucket didn't finish within a 90s
+per-branch cap in the second pass. Plan for the low end of a week; budget
+for the full week as a ceiling.
+
+**Correctness, corroborated empirically.** Across both passes, 432 branches
+completed a fresh solve; 28 (6.5%) produced a strictly better ERD than the
+old stored value (a real, solver-verified improvement — new candidates
+winning branches they couldn't reach before), and **zero** produced a worse
+one. Zero anomalies is exactly what the Part 1 growth-only theorem
+predicts and would have been the signature of real cache corruption had
+any existed. It didn't.
+
+**The old cache's cost-side value is the row-key list and leaves-first
+scheduling, not the stored scores.** A direct test — price the old
+`best_guess` first and feed its cost to the solver as an alpha-beta
+ceiling, instead of leaving the ceiling at ∞ — showed no net benefit (71
+faster / 110 flat-or-slower across 181 branches, sums within 0.2% of each
+other). The engine's own candidate ordering (`wordle_engine.py`: sorts by
+Σk², response-group-size proxy, for any branch ≥8 words) already finds a
+near-optimal incumbent on its own, and evaluating the old guess separately
+just to seed a ceiling mostly duplicates work the ordinary scan would do
+anyway. See the corresponding note on Mechanism 2 in Part 5 — this doesn't
+touch the mechanism's *correctness*, only its practical payoff here.
 
 ## Part 4 — Rebuilding `erd_answers_unfiltered`
 
@@ -301,7 +361,24 @@ solve against a warm cache. This is also what keeps the sweep's inline
 solves of missing sub-branches cheap (Part 3) — the sweep's read-only scan
 itself never recurses.
 
-### Mechanism 2 — O(1) transfer bounds (scoped; not yet implemented)
+### Mechanism 2 — O(1) transfer bounds (scoped; measured not worth building)
+
+**Empirical note (2026-07-19/20).** This mechanism transfers bounds along
+the *answer-set-growth* axis (G → G′, new answer words landing in an
+existing branch); the direct measurement in Part 3 tested the adjacent
+*vocabulary-growth* axis instead (same branch, old best_guess used as a
+solve ceiling under the grown candidate list) and found no net benefit —
+the engine's built-in Σk² candidate ordering already reaches a near-optimal
+incumbent without external help. That root cause (the ordering heuristic,
+not anything specific to which axis grew) has no reason to stop applying
+here, so the same lack of payoff is the expected outcome for Mechanism 2's
+ceiling-style reuse too — but this is an inference from an adjacent result,
+not a direct measurement of G→G′ specifically. The math below remains
+correct regardless (an admissible bound can only prune, never mislead); the
+open question is only whether implementing it is worth the code, and
+current evidence says no. Retain the proofs — they're cheap insurance if a
+future engine change (e.g. a weaker default ordering) makes them pay off —
+but do not build the ceiling-injection machinery without re-measuring.
 
 Valid **only for fixed-vocabulary policies** (`erd_words_unfiltered`,
 `erd_answers_unfiltered`): in `erd_answers_compliant` the vocabulary *is*
@@ -457,12 +534,17 @@ list-and-rename flip (Phase 0) is the one exception and goes through a PR.
 1. Write the sweep extension (inline solves of missing sub-branches,
    tainted-child re-solves; Part 3) as a committed change to
    `verify_erd_cache.py`, through a PR.
-2. Time a sample wave (`--start-size` bounds it to a small branch range);
-   decide inline-solve vs. the read-only-certified fallback on the
-   measured cost (Part 3).
-3. Run the extended sweep leaves-first to completion. No `ERD_ALL` row is
-   served to a user before its wave completes (phone is frozen; Linux use
-   during the sweep is at-your-own-risk and confined to swept sizes).
+2. Confirm the swarm is idle (`erd_search.py view --workers --format json`
+   — check, don't assume) before starting; keep it stopped for the whole
+   phase. Required, not just operational hygiene: Part 3 explains why a
+   live worker could silently serve a not-yet-recertified row as exact.
+3. Run the extended sweep leaves-first to completion (~3–8.7 days on 6
+   workers, ~5.4 days central estimate — measured directly, Part 3; no
+   further sample-wave timing needed). Monitor via the sweep's own
+   `--log` file and stdout, not `erd_search.py view` (Part 3 — it doesn't
+   run through the queue). No `ERD_ALL` row is served to a user before its
+   wave completes (phone is frozen; Linux use during the sweep is
+   at-your-own-risk and confined to swept sizes).
 
 ### Phase 4 — Recompute and seed
 
@@ -534,6 +616,15 @@ of the 14 rescued guess words:
   consumers listed in Phase 0 through `runtime_paths.py` now, or just edit
   each literal — noted there as a real but separate decision.
 
+Resolved since the last revision (previously open): sweep cost (measured,
+Part 3), inline-solve vs. read-only-certified fallback (inline-solve
+chosen — affordable at the measured cost), whether Mechanism 2's
+ceiling-injection machinery is worth building (measured negligible payoff;
+proofs retained, implementation deferred), and whether Part 3 can run
+through the normal swarm/queue (no — schema has no guess-vocabulary
+scoping, so a live worker can't distinguish a certified row from a
+copied-forward one; see Part 3).
+
 ## Resolved
 
 - **14,855-word candidate list**: sourced via `Get_NYT_Candidates.py`,
@@ -555,10 +646,26 @@ of the 14 rescued guess words:
   with uncached sub-branches and reads tainted children as if exact, so it
   audits rather than recertifies. Decided design: inline-solve missing
   sub-branches at unconstrained budget (committed extension, written at
-  Phase 3 time), with a read-only certified-subset fallback if the timed
-  sample wave prices inline solving out. The prior full sweep (13h48m,
-  2026-07-12) bounds the read-only scan at roughly 15–17 hours scaled; the
-  inline solves are unmeasured on top — the sample wave decides.
+  Phase 3 time). Measured cost (2026-07-19/20, idle machine, 432 sampled
+  branches across two passes): **3.0–8.7 days on 6 workers, ~5.4 days
+  central estimate** — affordable outright, so the read-only-certified
+  fallback is no longer the live design (contingency only). Must run
+  standalone, never through the normal swarm/queue: `branch_best_by_policy`
+  has no guess-vocabulary scoping, so `_cache_reuse` cannot tell a
+  recertified row from a copied-forward one — only explicit
+  delete-then-resolve forces recomputation (Part 3).
+- **Old cache reused as ceiling ("hint") for the sweep — measured, not
+  worth it**: pricing the old `best_guess` and passing its cost as an
+  alpha-beta ceiling gave no net speedup (181 branches: 71 faster, 110
+  flat-or-slower, totals within 0.2%) — the engine's built-in Σk²
+  candidate ordering already reaches a near-optimal incumbent unaided. The
+  old cache's real value is its row-key list and leaves-first schedule
+  (guaranteeing warm children), not its stored scores.
+- **Empirical corroboration of the growth-only theorem**: 432 branches
+  fresh-solved under the new vocabulary, 28 (6.5%) strictly improved, zero
+  regressed — no branch's new optimum was ever worse than its old stored
+  value, exactly as Part 1 predicts and the signature real corruption would
+  have broken.
 - **Max_remaining_depth is not provably monotone** under either vocabulary
   growth (Part 1) or answer-set growth (Part 1, "ERD is not monotone") —
   the cache only stores the worst case of whichever tree wins the *ERD*
