@@ -428,7 +428,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const cells=[...document.querySelectorAll('.sweep-cell')];
           return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),fills:cells.map(cell=>Number.parseInt(cell.style.getPropertyValue('--fill'),10)),workerCells:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber)};
         }""")
-        self.assertGreater(result["cellCount"], 20)
+        self.assertEqual(result["cellCount"], 50)
         self.assertEqual(result["firstFill"], "100%")
         self.assertEqual(result["lastFill"], "0%")
         self.assertEqual(result["workerCells"], ["3"])
@@ -442,7 +442,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           return {sweepCount:document.querySelectorAll('#report .sweep').length,cellCount:cells.length,workerNumbers:cells.filter(cell=>cell.classList.contains('worker')).map(cell=>cell.dataset.workerNumber),fullCells:cells.filter(cell=>cell.style.getPropertyValue('--fill')==='100%').length};
         }""")
         self.assertEqual(result["sweepCount"], 3)
-        self.assertGreater(result["cellCount"], 20)
+        self.assertEqual(result["cellCount"], 50)
         self.assertEqual(result["workerNumbers"], ["0"])
         self.assertGreater(result["fullCells"], 0)
 

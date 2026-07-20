@@ -275,7 +275,7 @@
       return card;
     }
     function sweepStrip(candidateCount,completedCandidateIndexes,workers){
-      const cellCount=Math.max(1,Math.min(60,candidateCount));
+      const cellCount=Math.max(1,Math.min(50,candidateCount));
       const strip=element("div","sweep"),done=new Set(completedCandidateIndexes||[]);
       for(let cell=0;cell<cellCount;cell++){
         const start=Math.floor(cell*candidateCount/cellCount),end=Math.max(start+1,Math.floor((cell+1)*candidateCount/cellCount));
