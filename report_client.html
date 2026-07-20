@@ -59,10 +59,11 @@
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; }
     .progress-line .sweep { flex:1 1 auto; height:.9rem; margin:0; }
     .sweep-cell { flex:1 1 0; min-width:2px; position:relative; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
-    /* line-height 1 keeps the line box inside the cell; the small top padding
-       offsets the digit's empty descender space so the glyph ink is optically
-       centered. */
-    .sweep-cell.worker::after { content:attr(data-worker-number); position:absolute; inset:0; display:grid; place-items:center; font-size:.65rem; line-height:1; padding-top:.15em; font-weight:bold; color:var(--text); background:var(--yellow); border-radius:1px; }
+    /* The digit is an SVG background image, not laid-out text: SVG
+       rasterization places the glyph geometrically, so the digit stays
+       centered at any sub-pixel cell position where HTML text layout would
+       snap the baseline to a whole pixel and drift up to a pixel off center. */
+    .sweep-cell.worker { background:var(--yellow); background-position:center; background-repeat:no-repeat; }
     .kv { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .kv .pair { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .kv .pair-label { color:var(--dim); }
@@ -294,7 +295,9 @@
       for(const worker of workers||[]){
         if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
         const cell=Math.min(cellCount-1,Math.floor(cellCount*worker.candidate_index/candidateCount));
-        const cellNode=strip.children[cell];cellNode.classList.add("worker");cellNode.dataset.workerNumber=workerName(worker).replace(/^w/,"");
+        const cellNode=strip.children[cell],workerNumber=workerName(worker).replace(/^w/,"");
+        cellNode.classList.add("worker");cellNode.dataset.workerNumber=workerNumber;
+        cellNode.style.backgroundImage=workerMarkerImage(workerNumber);
       }
       return strip;
     }
@@ -349,6 +352,10 @@
       const root=byId("report"),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
       if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport));else throw new Error("Unknown report kind");
       root.replaceChildren(content);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+    }
+    function workerMarkerImage(workerNumber){
+      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" fill="#1a1a1b">'+workerNumber+'</text></svg>';
+      return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;chip.title=ok?"connected":message;}
     async function fetchReport(){
