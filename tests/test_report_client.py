@@ -207,6 +207,30 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertFalse(any("claims=1" in url for url in requested))
         self.assertLess(self.page.locator("section:has-text('Candidate detail') .card").count(), 1)
 
+    def test_branch_surfaces_missing_best_and_rounds_bounds(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          branch.data.queue.best_guess=null;branch.data.queue.best_erd=null;
+          branch.data.queue.ceiling=2.793103449275866;
+          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("none yet", text)
+        self.assertIn("2.793", text)
+        self.assertNotIn("2.793103449275866", text)
+
+    def test_finalizations_are_glossed_and_timestamped(self):
+        self.apply_selector("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        text = self.page.locator("section:has-text('Recent finalizations')").inner_text()
+        self.assertIn("Cut — best line exceeds the budget", text)
+        self.assertIn("Exact — solved within budget", text)
+        self.assertIn("Loss — unsolvable in the game", text)
+        self.assertIn("newest first", text)
+        self.assertIn("ago", text)
+        self.assertIn("budget", text)
+        self.assertNotIn("2.2000", text)
+
     def test_finalization_outcomes_and_cut_reuse_are_distinct(self):
         self.apply_selector("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")

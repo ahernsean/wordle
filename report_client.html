@@ -143,6 +143,8 @@
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
     const valueOrDash=value=>{if(value===null||value===undefined||value==="")return "—";if(typeof value==="number"&&Number.isInteger(value))return formatInteger(value);return String(value);};
     const numText=formatInteger;
+    const fixed=(value,digits=3)=>value===null||value===undefined?null:Number(value).toFixed(digits);
+    const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
     const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts)if(part)node.append(element("span","",part));return node;};
     const label=key=>String(key).replaceAll("_"," ");
     const shortReference=reference=>String(reference).slice(0,4);
@@ -370,12 +372,30 @@
     function section(title,content,className=""){const node=element("section","section "+className);node.append(element("h2","",title));if(content)node.append(content);return node;}
     function renderBranch(report,previous,state){
       const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};if(branch.spine?.length)fragment.append(section("Identity",renderSpine(branch.spine)));
-      fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):null],["ERD",data.queue.best_erd],["ceiling",data.queue.ceiling],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
+      fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
-      fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[label(key),key==="best_guess"&&value?String(value).toUpperCase():value]))));
+      fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[label(key),key==="best_guess"&&value?String(value).toUpperCase():(key==="best_erd"||key==="ceiling")&&value!==null&&value!==undefined?fixed(value):value]))));
       if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
-      if(data.recent_finalizations?.length){const finalizations=element("div","grid");for(const row of data.recent_finalizations){const card=element("article","card outcome-"+row.outcome);card.append(element("h3","",row.outcome),kv([["ceiling",row.ceiling],["evaluated",row.evaluated_candidate_count],["bulk proofs",row.bulk_completed_candidate_count],["bundles",row.bundle_count],["nodes",row.search_node_count],["wall ms",row.wall_millis],["epoch",row.epoch]]));finalizations.append(card);}fragment.append(section("Recent finalizations",finalizations));}
-      if(data.cut_reuse_misses?.length){const misses=element("div","grid");for(const row of data.cut_reuse_misses)misses.append(element("article","card outcome-cut","cut reuse · available "+row.available_bound+" · budget "+row.available_budget));fragment.append(section("Cut-reuse misses",misses));}
+      if(data.recent_finalizations?.length){
+        const outcomeGloss={exact:"Exact — solved within budget",cut:"Cut — best line exceeds the budget",loss:"Loss — unsolvable in the game",unknown:"Finalized"};
+        const finalizations=element("div","grid");
+        for(const row of data.recent_finalizations){
+          const card=element("article","card outcome-"+row.outcome);
+          card.append(element("h3","",outcomeGloss[row.outcome]||row.outcome));
+          card.append(statLine(["budget "+valueOrDash(row.budget),"epoch "+valueOrDash(row.epoch),relativeAge(row.recorded_at,report.generated_at)]));
+          const facts=[];
+          if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ceiling "+fixed(row.ceiling));
+          facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.bulk_completed_candidate_count)+" bulk proofs",numText(row.search_node_count)+" nodes");
+          if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
+          if(row.wall_millis)facts.push(numText(row.wall_millis)+" ms");
+          card.append(statLine(facts));
+          finalizations.append(card);
+        }
+        const wrap=element("section","section");
+        wrap.append(element("h2","","Recent finalizations"),element("p","dim","Attempts to resolve the whole branch within its depth budget, newest first."),finalizations);
+        fragment.append(wrap);
+      }
+      if(data.cut_reuse_misses?.length){const misses=element("div","grid");for(const row of data.cut_reuse_misses)misses.append(element("article","card outcome-cut","cut reuse · available "+fixed(row.available_bound)+" · budget "+valueOrDash(row.available_budget)));fragment.append(section("Cut-reuse misses",misses));}
       const bundleLabels={bundle_count:"bundles",node_count:"nodes",wall_millis:"wall ms",censored_unit_count:"censored units",maximum_bundle_node_count:"max bundle nodes"};
       const bundlePairs=Object.entries(data.bundle_summary||{}).map(([key,value])=>[bundleLabels[key]||label(key),value]);
       const republishedList=data.republished_candidates||[];
