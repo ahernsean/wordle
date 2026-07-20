@@ -535,6 +535,17 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertAlmostEqual(result["immediate"], result["settled"], delta=2)
         self.assertLess(float(result["fadingIn"]), 1)
 
+    def test_worker_markers_carry_a_pointer_triangle(self):
+        result = self.page.evaluate("""() => {
+          const marker=document.querySelector('.sweep-marker');
+          const after=getComputedStyle(marker,'::after');
+          return {content:after.content,bottomColor:after.borderBottomColor,bottomWidth:parseFloat(after.borderBottomWidth),leftColor:after.borderLeftColor,textColor:getComputedStyle(document.documentElement).getPropertyValue('--text').trim(),markerCount:document.querySelectorAll('.sweep-marker').length};
+        }""")
+        self.assertNotEqual(result["content"], "none")
+        self.assertGreater(result["bottomWidth"], 0)
+        self.assertEqual(result["bottomColor"], "rgb(26, 26, 27)")
+        self.assertIn("rgba(0, 0, 0, 0)", result["leftColor"])
+
     def test_rows_without_claim_indexes_fall_back_to_progress_bar(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.wait_for_selector("text=queue report")

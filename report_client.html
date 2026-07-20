@@ -64,7 +64,7 @@
     .stat-line > span { white-space:nowrap; }
     .stat-line > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
-    .progress-line .sweep { height:1rem; margin:0; }
+    .progress-line .sweep { height:1rem; margin:0 0 .3rem; }
     .sweep-cell { flex:1 1 0; min-width:2px; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
     /* The digit is an SVG background image, not laid-out text: SVG
        rasterization places the glyph geometrically, so the digit stays
@@ -75,6 +75,10 @@
        halo (drawn in the SVG) so it reads over both green and gray while the
        cell's own fill stays visible straight through it. */
     .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; z-index:1; background-position:center; background-repeat:no-repeat; transition:left .4s ease, opacity .4s ease; }
+    /* A small solid pointer in the strip of white space under the ramp, apex
+       almost touching the worker's cell.  It is part of the marker, so it
+       rides the same slide and fade as the digit. */
+    .sweep-marker::after { content:""; position:absolute; top:calc(100% + 1px); left:50%; transform:translateX(-50%); width:0; height:0; border-left:.2rem solid transparent; border-right:.2rem solid transparent; border-bottom:.26rem solid var(--text); }
     .kv { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .kv .pair { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .kv .pair-label { color:var(--dim); }
