@@ -238,6 +238,9 @@ class ReportClientBrowserTest(unittest.TestCase):
           const heartbeatOnly=structuredClone(branch);heartbeatOnly.data.workers[0].updated_at=995;heartbeatOnly.data.workers[0].nodes_per_second=99;
           applyReport(heartbeatOnly,branch,{...state,selector:'RAISE .....'});
           result.heartbeatWorker=document.querySelector('[data-identity="worker-12"]').className;
+          const switchedBranch=structuredClone(branch);switchedBranch.data.workers[0].branch_key_hex='02';switchedBranch.data.workers[0].branch_reference='222222222222';
+          applyReport(switchedBranch,branch,{...state,selector:'RAISE .....'});
+          result.switchedWorker=document.querySelector('[data-identity="worker-12"]').className;
 
           const cache=await (await fetch('/api/view/cache')).json(),changedCache=structuredClone(cache);
           cache.data.recent_rows[0].cache_state='missing';changedCache.data.recent_rows[0].cache_state='exact';
@@ -254,6 +257,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("flash-improved", classes["branch"])
         self.assertIn("flash-changed", classes["deadWorker"])
         self.assertNotIn("flash", classes["heartbeatWorker"])
+        self.assertIn("flash-improved", classes["switchedWorker"])
+        self.assertNotIn("flash-changed", classes["switchedWorker"])
         self.assertIn("flash-improved", classes["cache"])
         self.assertIn("flash-changed", classes["hotspot"])
 
