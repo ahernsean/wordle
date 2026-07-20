@@ -56,9 +56,13 @@
     .progress-line { margin:.25rem 0; }
     .progress { height:.3rem; border-radius:999px; background:var(--border); overflow:hidden; }
     .progress > span { display:block; height:100%; background:var(--green); }
-    /* Numbers must never break mid-digit; the card's overflow-wrap:anywhere
-       (needed for long hex/spine text) otherwise splits "12,972" across lines. */
-    .stat-line { overflow-wrap:normal; margin-top:.1rem; }
+    /* Facts pack onto a wrapping row separated by a drawn middot rather than
+       literal " · " text, at a smaller size than the panel's identity line.
+       Each fact is its own nowrap span, so a number never breaks mid-digit and
+       "best CRANE*" never splits from its value. */
+    .stat-line { display:flex; flex-wrap:wrap; font-size:.8rem; margin-top:.15rem; }
+    .stat-line > span { white-space:nowrap; }
+    .stat-line > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
     .progress-line .sweep { height:1rem; margin:0; }
     .sweep-cell { flex:1 1 0; min-width:2px; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
@@ -67,8 +71,10 @@
        centered at any sub-pixel cell position where HTML text layout would
        snap the baseline to a whole pixel and drift up to a pixel off center.
        min-width keeps a marker at least a digit wide when cells are only a few
-       pixels, and the panel-colored ring separates overlapping markers. */
-    .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; box-shadow:0 0 0 1px var(--panel); z-index:1; border-radius:1px; background:var(--yellow); background-position:center; background-repeat:no-repeat; transition:left .4s ease, opacity .4s ease; }
+       pixels.  The marker has no fill of its own — the digit carries a light
+       halo (drawn in the SVG) so it reads over both green and gray while the
+       cell's own fill stays visible straight through it. */
+    .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; z-index:1; background-position:center; background-repeat:no-repeat; transition:left .4s ease, opacity .4s ease; }
     .kv { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .kv .pair { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .kv .pair-label { color:var(--dim); }
@@ -133,7 +139,7 @@
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
     const valueOrDash=value=>{if(value===null||value===undefined||value==="")return "—";if(typeof value==="number"&&Number.isInteger(value))return formatInteger(value);return String(value);};
     const numText=formatInteger;
-    const statLine=parts=>element("div","dim stat-line",parts.join(" · "));
+    const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts)if(part)node.append(element("span","",part));return node;};
     const label=key=>String(key).replaceAll("_"," ");
     const shortReference=reference=>String(reference).slice(0,4);
     const workerName=worker=>{const number=String(worker.worker_number??String(worker.worker_id).split("-").pop());return /^[0-9]+$/.test(number)?"w"+number:String(worker.worker_id);};
@@ -258,8 +264,9 @@
       title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));
       card.append(title);
       if(row.spine)card.append(Array.isArray(row.spine)?renderSpine(row.spine):element("div","dim",row.spine));
-      if(row.candidate_count){const line=element("div","progress-line");const fill=Array.isArray(row.completed_candidate_indexes)?sweepStrip(row.candidate_count,row.completed_candidate_indexes,branchWorkers,previousWorkersById):progress(row.completed_candidate_count,row.candidate_count);line.append(fill);card.append(line,statLine([numText(row.completed_candidate_count)+" / "+numText(row.candidate_count)+" candidates"]));}
-      const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers")];
+      const parts=[];
+      if(row.candidate_count){const line=element("div","progress-line");const fill=Array.isArray(row.completed_candidate_indexes)?sweepStrip(row.candidate_count,row.completed_candidate_indexes,branchWorkers,previousWorkersById):progress(row.completed_candidate_count,row.candidate_count);line.append(fill);card.append(line);parts.push(numText(row.completed_candidate_count)+"/"+numText(row.candidate_count)+" cands");}
+      parts.push(numText(row.answer_count)+(row.answer_count===1?" answer":" answers"));
       const best=bestText(row);if(best)parts.push(best);
       if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));
       if(row.search_node_count)parts.push(numText(row.search_node_count)+" nodes");
@@ -285,7 +292,7 @@
       if(worker.nodes_per_second!==null&&worker.nodes_per_second!==undefined)parts.push(formatInteger(Math.round(worker.nodes_per_second))+" nodes/s");
       parts.push(age+"s");
       if(worker.branch_reference)parts.push("@"+shortReference(worker.branch_reference));
-      card.append(element("div","dim",parts.join(" · ")));
+      card.append(statLine(parts));
       if(worker.branch_reference){card.classList.add("clickable");card.addEventListener("click",()=>navigateBranch(worker));}
       return card;
     }
@@ -427,7 +434,7 @@
       root.replaceChildren(content);animateSweepMarkers(root);animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
-      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" fill="#1a1a1b">'+workerNumber+'</text></svg>';
+      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
       return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;chip.title=ok?"connected":message;}

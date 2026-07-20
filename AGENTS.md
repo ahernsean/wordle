@@ -154,6 +154,30 @@ comments with references to information in your context.
 
 ---
 
+## Errors are for the exceptional, not the routine
+
+Do not model an expected, recurring state as an error. A raised exception, an
+error return, or an HTTP error status (4xx/5xx) is a claim that something went
+wrong — reserve it for cases that genuinely did. When a normal lifecycle
+transition starts surfacing as an error, the fix is to make the normal path
+return a normal result, not to teach the caller to treat the error as success.
+Swallowing an exception or an error status to keep going on a routine path is a
+red flag: it means the wrong thing is raising.
+
+The clearest example in this codebase's history: a finalized branch could no
+longer be resolved by its queue *reference* (a one-way hash the queue must
+invert), so the report server answered `404` — and a first attempt "fixed" the
+resulting client breakage by catching the `404` and rendering it as though it
+were a normal report. That conflates a transport failure with an application
+state. The real fix pinned the branch view to its *spine*, which resolves from
+the answer list with no queue dependency, so finalization returns an ordinary
+`200` and `404` again means only what it should: a reference that never
+resolved.
+
+Prefer designs where the common case cannot raise.
+
+---
+
 ## Dangerous operations — always ask first
 
 Never perform any of the following without explicit instruction from the user:
