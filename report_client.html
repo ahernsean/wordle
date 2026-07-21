@@ -7,85 +7,105 @@
   <style>
     :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --red:#d14b4b; --amber:#b59f3b; }
     * { box-sizing:border-box; }
-    html, body { margin:0; min-width:0; background:var(--bg); color:var(--text); font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    html, body { margin:0; min-width:0; background:var(--bg); color:var(--text); font:13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
     body { overflow-x:hidden; }
-    button, input, select { min-height:34px; border:1px solid var(--border); border-radius:5px; background:#ffffff; color:var(--text); font:inherit; padding:.4rem .65rem; }
+    button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:#ffffff; color:var(--text); font:inherit; padding:.25rem .5rem; }
     button { cursor:pointer; }
-    button:hover, button[aria-current="page"] { border-color:var(--green); background:#edf5ec; }
+    button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:#edf5ec; }
     input[type="checkbox"] { min-height:auto; accent-color:var(--green); }
-    header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.7rem clamp(.65rem,2vw,1.5rem); }
-    .nav, .selector, .toggles, .filter-grid, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; }
-    .selector { margin-top:.6rem; }
-    .selector label { flex:0 0 auto; }
-    #selector-input { flex:1 1 22rem; min-width:10rem; }
-    .toggles { margin-top:.55rem; color:var(--dim); }
-    details.filters { margin-top:.5rem; }
-    .filter-grid { padding:.7rem 0; align-items:end; }
-    .field { display:grid; gap:.2rem; color:var(--dim); min-width:8rem; flex:1 1 9rem; }
-    .statuses { display:flex; flex-wrap:wrap; gap:.6rem; padding:.3rem 0; }
-    #connection { margin-left:auto; border-radius:999px; padding:.25rem .6rem; background:var(--green); color:white; }
-    #connection.disconnected { background:var(--red); }
-    main { width:min(1200px,100%); margin:auto; padding:1rem clamp(.65rem,2vw,1.5rem) 4rem; }
-    .report-header { display:grid; grid-template-columns:1fr auto; gap:.8rem; margin-bottom:1rem; }
-    h1,h2,h3 { margin:.15rem 0 .55rem; }
-    h1 { font-size:1.35rem; }
-    h2 { font-size:1.08rem; }
+    header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
+    .nav, .selector, .filter-grid, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
+    .selector { margin-top:.35rem; flex-wrap:nowrap; }
+    #selector-input { flex:1 1 8rem; min-width:6rem; }
+    details.filters { margin-top:.3rem; color:var(--dim); }
+    .filter-grid { padding:.5rem 0; align-items:end; }
+    .field { display:grid; gap:.15rem; color:var(--dim); min-width:7rem; flex:1 1 8rem; }
+    .statuses { display:flex; flex-wrap:wrap; gap:.5rem; padding:.2rem 0; }
+    #connection { margin-left:auto; color:var(--green); padding:.1rem .3rem; white-space:nowrap; }
+    #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
+    main { width:min(1200px,100%); margin:auto; padding:.5rem clamp(.5rem,1.5vw,1rem) 2rem; }
+    .report-meta { display:flex; flex-wrap:wrap; gap:.2rem .6rem; align-items:baseline; margin:.2rem 0 .35rem; }
+    details.source-paths { display:inline-block; }
+    details.source-paths[open] { display:block; flex-basis:100%; }
+    h1,h2,h3 { margin:.4rem 0 .25rem; }
+    h1 { font-size:1rem; display:inline; }
+    h2 { font-size:.95rem; }
+    h3 { font-size:.9rem; margin:0; }
     .dim, .source, .empty { color:var(--dim); }
-    .error { border-left:4px solid var(--red); padding:.5rem .7rem; background:#fff1f1; }
-    .metrics { margin:.7rem 0; }
-    .metric { min-width:9rem; flex:1 1 9rem; background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:.7rem; }
-    .metric strong { display:block; font-size:1.2rem; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,270px),1fr)); gap:.65rem; }
-    .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:.75rem; overflow-wrap:anywhere; }
-    .section { margin:.7rem 0; }
+    .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:#fff1f1; }
+    .metrics { margin:.3rem 0; gap:.15rem 1rem; }
+    .metric { display:inline-flex; gap:.35rem; align-items:baseline; min-width:0; flex:0 1 auto; }
+    .metric strong { overflow-wrap:anywhere; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,15rem),1fr)); gap:.4rem; }
+    .grid.workers { grid-template-columns:repeat(auto-fill,minmax(min(100%,11rem),1fr)); }
+    .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
+    .section { margin:.45rem 0; }
     .card.active { border-color:var(--green); }
     .card.finalizing, .stale { border-color:var(--amber); }
     .dead { border-color:var(--red); }
-    .chip { display:inline-block; border:1px solid var(--border); border-radius:999px; padding:.12rem .45rem; color:var(--dim); }
+    .card-title { display:flex; flex-wrap:wrap; gap:.35rem; align-items:baseline; }
+    .chip { display:inline-block; border:1px solid var(--border); border-radius:999px; padding:.05rem .4rem; color:var(--dim); font-size:.85em; }
     .chip.exact, .outcome-exact { border-color:var(--green); color:#3e7c3a; }
     .chip.cut, .outcome-cut { border-color:var(--amber); color:#7d6812; }
     .chip.loss, .outcome-loss { border-color:var(--red); color:#a32c2c; }
-    .tiles { display:flex; flex-wrap:wrap; gap:.2rem; align-items:center; margin:.3rem 0; }
-    .step { display:inline-flex; gap:.12rem; white-space:nowrap; margin-right:.45rem; }
-    .tile { display:inline-grid; place-items:center; width:1.5rem; height:1.5rem; font-weight:bold; color:white; background:var(--gray); }
+    .tiles { display:flex; flex-wrap:wrap; gap:.15rem .5rem; align-items:center; margin:.2rem 0; }
+    .step-group { display:inline-flex; gap:.3rem; align-items:center; white-space:nowrap; }
+    .step { display:inline-flex; gap:.1rem; white-space:nowrap; }
+    .tile { display:inline-grid; place-items:center; width:1.15rem; height:1.15rem; font-size:.75rem; font-weight:bold; color:white; background:var(--gray); }
     .tile.g { background:var(--green); } .tile.y { background:var(--yellow); }
-    .progress { height:.35rem; border-radius:999px; background:var(--border); overflow:hidden; margin:.4rem 0; }
+    .progress-line { margin:.25rem 0; }
+    .progress { height:.3rem; border-radius:999px; background:var(--border); overflow:hidden; }
     .progress > span { display:block; height:100%; background:var(--green); }
-    .kv { display:grid; grid-template-columns:minmax(8rem,auto) 1fr; gap:.2rem .7rem; }
-    .kv > :nth-child(odd) { color:var(--dim); }
-    .tree ul { list-style:none; margin:.25rem 0 .25rem .7rem; padding-left:.8rem; border-left:1px solid var(--border); }
-    .tree summary { cursor:pointer; min-height:32px; padding:.25rem 0; }
+    /* Facts pack onto a wrapping row separated by a drawn middot rather than
+       literal " · " text, at a smaller size than the panel's identity line.
+       Each fact is its own nowrap span, so a number never breaks mid-digit and
+       "best CRANE*" never splits from its value. */
+    .stat-line { display:flex; flex-wrap:wrap; font-size:.8rem; margin-top:.15rem; }
+    .stat-line > span { white-space:nowrap; }
+    .stat-line > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
+    .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
+    .progress-line .sweep { height:1rem; margin:0 0 .3rem; }
+    .sweep-cell { flex:1 1 0; min-width:2px; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
+    /* The digit is an SVG background image, not laid-out text: SVG
+       rasterization places the glyph geometrically, so the digit stays
+       centered at any sub-pixel cell position where HTML text layout would
+       snap the baseline to a whole pixel and drift up to a pixel off center.
+       min-width keeps a marker at least a digit wide when cells are only a few
+       pixels.  The marker has no fill of its own — the digit carries a light
+       halo (drawn in the SVG) so it reads over both green and gray while the
+       cell's own fill stays visible straight through it. */
+    .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; z-index:1; background-position:center; background-repeat:no-repeat; transition:left .4s ease, opacity .4s ease; }
+    /* A small solid pointer in the strip of white space under the ramp, apex
+       almost touching the worker's cell.  It is part of the marker, so it
+       rides the same slide and fade as the digit. */
+    .sweep-marker::after { content:""; position:absolute; top:calc(100% + 1px); left:50%; transform:translateX(-50%); width:0; height:0; border-left:.2rem solid transparent; border-right:.2rem solid transparent; border-bottom:.26rem solid var(--text); }
+    .kv { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
+    .kv .pair { display:inline-block; min-width:0; overflow-wrap:anywhere; }
+    .kv .pair-label { color:var(--dim); }
+    .tree ul { list-style:none; margin:.2rem 0 .2rem .5rem; padding-left:.6rem; border-left:1px solid var(--border); }
+    .tree summary { cursor:pointer; min-height:28px; padding:.15rem 0; }
     .clickable { cursor:pointer; }
     .clickable:hover { border-color:var(--green); }
     .badge { background:var(--red); color:white; border-radius:4px; padding:.1rem .35rem; }
+    .leave-layer { position:fixed; inset:0; pointer-events:none; z-index:50; }
     .flash-added { animation:added 1.5s; } .flash-improved { animation:improved 1.5s; } .flash-changed { animation:changed 1.5s; }
     @keyframes added { from { box-shadow:0 0 0 3px var(--green); } }
     @keyframes improved { from { border-color:var(--green); background:#e8f4e7; } }
     @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
     @media (max-width:600px) {
       header { position:static; }
-      .nav button { flex:1 1 auto; }
-      .report-header { grid-template-columns:1fr; }
-      .grid { grid-template-columns:1fr; }
-      .kv { grid-template-columns:1fr; }
-      .kv > :nth-child(odd) { margin-top:.35rem; }
     }
   </style>
 </head>
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button>
-      <span id="connection">connecting</span>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button id="tree-button" aria-pressed="false">Tree</button>
+      <span id="connection">●</span>
     </div>
     <div class="selector">
-      <label for="selector-input">Spine or @branch reference</label>
-      <input id="selector-input" autocomplete="off" spellcheck="false">
+      <input id="selector-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
       <button id="apply">Apply</button><button id="back">Back</button>
-    </div>
-    <div class="toggles">
-      <label><input id="tree" type="checkbox"> Tree</label>
-      <span id="generated"></span>
     </div>
     <details class="filters"><summary>Filters</summary>
       <div class="field">Branch status <span class="statuses" id="branch-statuses"></span></div>
@@ -110,15 +130,28 @@
   <script>
   (() => {
     "use strict";
-    const SCHEMA_VERSION=2, DEFAULT_POLL=2000;
+    const SCHEMA_VERSION=2, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
     const explicitKinds=new Set(["queue","workers","cache","hotspots"]);
+    const treelessKinds=new Set(["cache","hotspots"]);
+    const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), stickyOrders=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
-    const valueOrDash=value=>value===null||value===undefined||value===""?"—":String(value);
+    const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
+    const valueOrDash=value=>{if(value===null||value===undefined||value==="")return "—";if(typeof value==="number"&&Number.isInteger(value))return formatInteger(value);return String(value);};
+    const numText=formatInteger;
+    const boundFields=new Set(["best_erd","erd","ceiling","bound_erd","available_bound","wanted_ceiling"]);
+    const fixed=(value,digits=3)=>value===null||value===undefined?null:Number(value).toFixed(digits);
+    const displayValue=(key,value)=>key==="best_guess"&&value?String(value).toUpperCase():boundFields.has(key)&&typeof value==="number"?fixed(value):value;
+    const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
+    const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts)if(part)node.append(element("span","",part));return node;};
+    const label=key=>String(key).replaceAll("_"," ");
+    const shortReference=reference=>String(reference).slice(0,4);
+    const workerName=worker=>{const number=String(worker.worker_number??String(worker.worker_id).split("-").pop());return /^[0-9]+$/.test(number)?"w"+number:String(worker.worker_id);};
+    const candidateText=(word,isAnswer)=>word?String(word).toUpperCase()+(isAnswer?"*":""):"—";
     const bool=value=>value==="1"||value==="true";
     const intOrNull=value=>{if(value===null||value===""||value===undefined)return null;const parsed=Number.parseInt(value,10);return Number.isFinite(parsed)?parsed:null;};
     const branchValues=(value,allowed)=>value===undefined?undefined:[...(value||[])].filter(item=>allowed.includes(item));
@@ -127,7 +160,7 @@
       const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",selector:(state.selector||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims};
       if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.selector===""&&!normalized.tree?["active"]:[];
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
-      if(normalized.kind==="cache"||normalized.kind==="hotspots")normalized.tree=false;
+      if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
@@ -162,22 +195,26 @@
       return endpoint+(query.size?"?"+query.toString():"");
     }
     function contextKey(state){return buildAPIURL(state);}
+    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}}
     function setState(next,push=true){
-      if(activeRequestController)activeRequestController.abort();
+      abortActiveRequest();
       currentState=normalizeState(next); const query=stateQuery(currentState,true).toString();
       const url=location.pathname+(query?"?"+query:"");
       if(push)history.pushState(null,"",url);else history.replaceState(null,"",url);
       syncControls(); fetchReport(); schedulePoll();
     }
     function syncControls(){
-      byId("selector-input").value=currentState.selector;byId("tree").checked=currentState.tree;byId("poll").value=currentState.poll;
+      byId("selector-input").value=currentState.selector;byId("poll").value=currentState.poll;
+      const treeButton=byId("tree-button");
+      treeButton.hidden=treelessKinds.has(currentState.kind);
+      treeButton.setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
       byId("sort").value=currentState.sort;byId("by").value=currentState.by;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",button.dataset.kind===currentState.kind?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
     }
-    function readControls(){return {...currentState,selector:byId("selector-input").value,tree:byId("tree").checked,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value};}
+    function readControls(){return {...currentState,selector:byId("selector-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -198,27 +235,50 @@
       if(row.cache_state==="exact"&&previous.cache_state!=="exact")return "flash-improved";
       return JSON.stringify(semanticProjection(row))!==JSON.stringify(semanticProjection(previous))?"flash-changed":"";
     }
-    function metric(label,value){const node=element("div","metric");node.append(element("strong","",valueOrDash(value)),element("span","dim",label));return node;}
+    function workerProjection(worker){return {worker_id:worker.worker_id,is_live:worker.is_live,branch_key_hex:worker.branch_key_hex??null,current_candidate:worker.current_candidate??null,candidate_index:worker.candidate_index??null};}
+    function workerChangeClass(worker,previous){
+      if(!previous)return comparisonAvailable?"flash-added":"";
+      // Red is reserved for a worker that just went not-live — the only worker
+      // transition worth alarm.  A branch reassignment or candidate advance is
+      // routine forward motion and flashes green.
+      if(previous.is_live&&!worker.is_live)return "flash-changed";
+      const current=workerProjection(worker),before=workerProjection(previous);
+      return JSON.stringify(current)!==JSON.stringify(before)?"flash-improved":"";
+    }
+    function metric(labelText,value){const node=element("div","metric");node.append(element("strong","",valueOrDash(value)),element("span","dim",labelText));return node;}
     function formatBytes(value){if(value===null||value===undefined)return "—";for(const [size,suffix] of [[2**30,"G"],[2**20,"M"],[2**10,"K"]])if(value>=size)return (value/size).toLocaleString(undefined,{maximumFractionDigits:value/size>=100?0:1})+suffix;return value+"B";}
-    function kv(values){const node=element("div","kv");for(const [key,value] of values){node.append(element("span","",key),element("span","",valueOrDash(value)));}return node;}
+    function kv(values){const node=element("div","kv");for(const [key,value] of values){if(value===null||value===undefined||value==="")continue;const pair=element("span","pair");pair.append(element("span","pair-label",key)," ",element("span","",valueOrDash(value)));node.append(pair);}return node;}
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
     function patternTiles(pattern){const step=element("span","step");for(const character of pattern||"?????")step.append(element("span","tile "+(character==="g"?"g":character==="y"?"y":""),character));return step;}
-    function renderSpine(spine){const node=element("div","tiles");for(const step of spine||[]){node.append(element("span","",String(step.word||"?").toUpperCase()),patternTiles(step.pattern));}return node;}
+    function renderSpine(spine){const node=element("div","tiles");for(const step of spine||[]){const group=element("span","step-group");group.append(element("span","",String(step.word||"?").toUpperCase()),patternTiles(step.pattern));node.append(group);}return node;}
     function branchClass(row){return row.is_live===false?"dead":row.branch_phase==="finalizing"?"finalizing":row.branch_status||"";}
     function reportHeader(report,state){
-      const header=element("section","report-header"),left=element("div"),right=element("div","dim");
-      left.append(element("h1","",report.report_kind+" report"),element("div","",state.selector||"root"));right.textContent=new Date(report.generated_at*1000).toLocaleString();header.append(left,right);
-      const details=element("details","source-paths"),summary=element("summary","","Sources and filters");details.append(summary);
+      const meta=element("section","report-meta");
+      meta.append(element("h1","",report.report_kind+" report"),element("span","dim",state.selector||"root"),element("span","dim",new Date(report.generated_at*1000).toLocaleTimeString()));
+      const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.append(summary);
       for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}
       if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));
-      details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));header.append(details);return header;
+      details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);return meta;
     }
-    function cardForBranch(row,previous){
+    function bestText(row){
+      if(!row.best_guess)return null;
+      let text="best "+candidateText(row.best_guess,row.best_guess_is_answer);
+      if(row.best_erd!==null&&row.best_erd!==undefined)text+="/"+Number(row.best_erd).toFixed(3);
+      return text;
+    }
+    function cardForBranch(row,previous,branchWorkers=[],previousWorkersById=null){
       const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previous));card.dataset.identity=row.branch_key_hex;
-      card.append(element("h3","","@"+valueOrDash(row.branch_reference)),element("div","chips"));card.querySelector(".chips").append(element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)),element("span","chip",valueOrDash(row.answer_count)+" answers"));
+      const title=element("div","card-title");
+      title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));
+      card.append(title);
       if(row.spine)card.append(Array.isArray(row.spine)?renderSpine(row.spine):element("div","dim",row.spine));
-      if(row.candidate_count){card.append(progress(row.completed_candidate_count,row.candidate_count),element("div","dim",row.completed_candidate_count+" / "+row.candidate_count+" candidates"));}
-      card.append(kv([["best",row.best_guess],["ERD",row.best_erd],["workers",row.worker_count],["nodes",row.search_node_count]]));
+      const parts=[];
+      if(row.candidate_count){const line=element("div","progress-line");const fill=Array.isArray(row.completed_candidate_indexes)?sweepStrip(row.candidate_count,row.completed_candidate_indexes,branchWorkers,previousWorkersById):progress(row.completed_candidate_count,row.candidate_count);line.append(fill);card.append(line);parts.push(numText(row.completed_candidate_count)+"/"+numText(row.candidate_count)+" cands");}
+      parts.push(numText(row.answer_count)+(row.answer_count===1?" answer":" answers"));
+      const best=bestText(row);if(best)parts.push(best);
+      if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));
+      if(row.search_node_count)parts.push(numText(row.search_node_count)+" nodes");
+      card.append(statLine(parts));
       card.addEventListener("click",()=>navigateBranch(row));return card;
     }
     function navigateBranch(row){
@@ -228,70 +288,249 @@
       selector=selector||"@"+row.branch_reference;setState({...currentState,kind:"auto",selector,tree:false,claims:false,answers:false});
     }
     function workerCard(worker,previous,generatedAt,branchPhase=null){
-      const age=Math.max(0,generatedAt-worker.updated_at),classes="card "+(!worker.is_live?"dead":branchPhase==="finalizing"?"finalizing":age>20?"stale":"")+" "+changeClass(worker,previous),card=element("article",classes);card.dataset.identity=worker.worker_id;
-      const workerState=!worker.is_live?"dead":branchPhase==="finalizing"?"finalizing":worker.branch_key_hex?age>20?"stale":"working":"idle";
-      card.append(element("h3","",worker.worker_id),kv([["state",workerState],["heartbeat",age+"s"],["branch",worker.branch_reference?"@"+worker.branch_reference:null],["candidate",worker.current_candidate],["guess depth",worker.current_max_guess_depth],["nodes/s",worker.nodes_per_second]]));
-      if(worker.branch_reference){const button=element("button","","Open branch");button.addEventListener("click",()=>navigateBranch(worker));card.append(button);}return card;
+      const age=Math.max(0,generatedAt-worker.updated_at);
+      const stateClass=!worker.is_live?"dead":branchPhase==="finalizing"?"finalizing":age>20?"stale":"";
+      const workerState=!worker.is_live?"dead":branchPhase==="finalizing"?"finalizing":worker.branch_key_hex?(age>20?"stale":"working"):"idle";
+      const card=element("article",("card worker "+stateClass+" "+workerChangeClass(worker,previous)).trim());card.dataset.identity=worker.worker_id;
+      const title=element("div","card-title");
+      title.append(element("strong","",workerName(worker)),element("span","chip",workerState),element("span","",candidateText(worker.current_candidate,worker.current_candidate_is_answer)));
+      card.append(title);
+      const parts=[];
+      if(worker.current_max_guess_depth!==null&&worker.current_max_guess_depth!==undefined)parts.push("d"+worker.current_max_guess_depth);
+      if(worker.nodes_per_second!==null&&worker.nodes_per_second!==undefined)parts.push(formatInteger(Math.round(worker.nodes_per_second))+" nodes/s");
+      parts.push(age+"s");
+      if(worker.branch_reference)parts.push("@"+shortReference(worker.branch_reference));
+      card.append(statLine(parts));
+      if(worker.branch_reference){card.classList.add("clickable");card.addEventListener("click",()=>navigateBranch(worker));}
+      return card;
+    }
+    function sweepStrip(candidateCount,completedCandidateIndexes,workers,previousWorkersById){
+      const cellCount=Math.max(1,Math.min(50,candidateCount));
+      const strip=element("div","sweep"),done=new Set(completedCandidateIndexes||[]);
+      for(let cell=0;cell<cellCount;cell++){
+        const start=Math.floor(cell*candidateCount/cellCount),end=Math.max(start+1,Math.floor((cell+1)*candidateCount/cellCount));
+        let doneCount=0;for(let index=start;index<end;index++)if(done.has(index))doneCount++;
+        const cellNode=element("span","sweep-cell");
+        // A 100% fill is reserved for a cell whose every candidate is done;
+        // partial completion is capped below full (and lifted off zero) so a
+        // nearly-done cell never reads as finished.
+        const fill=doneCount>=end-start?100:doneCount>0?Math.max(15,Math.min(85,Math.round(100*doneCount/(end-start)))):0;
+        cellNode.style.setProperty("--fill",fill+"%");
+        strip.append(cellNode);
+      }
+      const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));
+      const cellLeft=cell=>`calc((100% - ${cellCount-1}px) * ${cell} / ${cellCount} + ${cell}px)`;
+      const animate=comparisonAvailable&&!matchMedia("(prefers-reduced-motion: reduce)").matches;
+      for(const worker of workers||[]){
+        if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
+        const cell=cellFor(worker.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
+        const marker=element("span","sweep-marker");
+        marker.dataset.workerNumber=workerNumber;
+        marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
+        marker.style.backgroundImage=workerMarkerImage(workerNumber);
+        const previous=previousWorkersById?.get(String(worker.worker_id));
+        const previousIndex=previous&&previous.branch_key_hex===worker.branch_key_hex?previous.candidate_index:null;
+        if(animate&&previousIndex!==null&&previousIndex!==undefined){
+          // FLIP: start at the previous poll's cell; applyReport slides the
+          // marker to its current cell once the strip is in the document.
+          const previousCell=cellFor(previousIndex);
+          marker.style.left=cellLeft(previousCell);
+          if(previousCell!==cell)marker.dataset.moveTo=cellLeft(cell);
+        }else{
+          marker.style.left=cellLeft(cell);
+          if(animate){marker.style.opacity="0";marker.dataset.fadeIn="1";}
+        }
+        strip.append(marker);
+      }
+      return strip;
+    }
+    function animateSweepMarkers(root){
+      const pending=root.querySelectorAll("[data-move-to],[data-fade-in]");
+      if(!pending.length)return;
+      root.getBoundingClientRect();
+      for(const marker of pending){
+        if(marker.dataset.moveTo){marker.style.left=marker.dataset.moveTo;delete marker.dataset.moveTo;}
+        if(marker.dataset.fadeIn){marker.style.opacity="1";delete marker.dataset.fadeIn;}
+      }
     }
     function renderOverview(report,previous,state){
-      const fragment=document.createDocumentFragment(),counts=report.data.queue_counts||{},metrics=element("div","metrics");for(const [label,key] of [["queued pending","pending_branch_count"],["evaluating user","evaluating_user_branch_count"],["evaluating cooperative","evaluating_cooperative_branch_count"],["finalizing","finalizing_branch_count"],["cached exact","exact_branch_count"]])metrics.append(metric(label,key in counts?counts[key]:report.data.cache_summary?.[key]));fragment.append(metrics);
-      const disk=report.data.disk;if(disk?.used_fraction!==null&&disk?.used_fraction!==undefined){const values=[["filesystem used",(100*disk.used_fraction).toFixed(1)+"%"],["queue WAL",formatBytes(disk.queue_wal_bytes)]];const rate=disk.fill_rate_bytes_per_second;if(rate!==null&&rate!==undefined)values.push([rate>0?"filling":"freeing",formatBytes(Math.abs(rate))+"/s"]);fragment.append(section("Disk",kv(values)));}
+      const fragment=document.createDocumentFragment(),counts=report.data.queue_counts||{},metrics=element("div","metrics");for(const [labelText,key] of [["queued pending","pending_branch_count"],["evaluating user","evaluating_user_branch_count"],["evaluating coop","evaluating_cooperative_branch_count"],["finalizing","finalizing_branch_count"],["cached exact","exact_branch_count"]])metrics.append(metric(labelText,key in counts?counts[key]:report.data.cache_summary?.[key]));
+      const disk=report.data.disk;if(disk?.used_fraction!==null&&disk?.used_fraction!==undefined){metrics.append(metric("filesystem used",(100*disk.used_fraction).toFixed(1)+"%"),metric("queue WAL",formatBytes(disk.queue_wal_bytes)));const rate=disk.fill_rate_bytes_per_second;if(rate!==null&&rate!==undefined)metrics.append(metric(rate>0?"filling":"freeing",formatBytes(Math.abs(rate))+"/s"));}
+      fragment.append(metrics);
       fragment.append(element("h2","","Branches · status "+(state.branch_status.length?state.branch_status.join(", "):"all")));
-      const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(branches,element("h2","","Workers"));
+      const liveWorkersByBranch=new Map();for(const worker of report.data.workers||[]){if(!worker.is_live||worker.branch_key_hex===null||worker.branch_key_hex===undefined)continue;const key=String(worker.branch_key_hex);if(!liveWorkersByBranch.has(key))liveWorkersByBranch.set(key,[]);liveWorkersByBranch.get(key).push(worker);}
+      const previousWorkersById=previousBy(previous,"workers","worker_id");
+      const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex)),liveWorkersByBranch.get(String(row.branch_key_hex))||[],previousWorkersById));fragment.append(branches,element("h2","","Workers"));
       const branchPhases=new Map((report.data.branches||[]).map(branch=>[branch.branch_key_hex,branch.branch_phase]));
-      const workers=element("div","grid"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at,branchPhases.get(row.branch_key_hex)));fragment.append(workers);return fragment;
+      const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at,branchPhases.get(row.branch_key_hex)));fragment.append(workers);return fragment;
     }
     function renderWord(report,previous,state){
-      const fragment=document.createDocumentFragment(),data=report.data;fragment.append(element("h2","",String(data.word).toUpperCase()+(data.word_is_answer?" ★":"")),renderSpine(data.context?.spine));
-      const summary=element("div","metrics");for(const [label,value] of Object.entries(data.response_group_counts||{}))summary.append(metric(label.replaceAll("_"," "),value));fragment.append(summary);
+      const fragment=document.createDocumentFragment(),data=report.data;fragment.append(element("h2","",candidateText(data.word,data.word_is_answer)),renderSpine(data.context?.spine));
+      const groupCountLabels={response_group_count:"response groups",trivial_response_group_count:"trivial",queued_response_group_count:"queued",active_response_group_count:"active",exact_response_group_count:"exact",loss_response_group_count:"loss",missing_response_group_count:"missing"};
+      const summary=element("div","metrics");for(const [key,value] of Object.entries(data.response_group_counts||{}))summary.append(metric(groupCountLabels[key]||label(key),value));fragment.append(summary);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??data.response_group_counts?.response_group_count??matchedRows;fragment.append(element("p","dim","Shown "+shownRows.length+" of "+matchedRows+" matched · "+totalRows+" total response groups"));
-      const grid=element("div","grid"),previousRows=previousBy(previous,"response_groups","branch_key_hex");for(const row of ordered(shownRows,"branch_key_hex","response-groups",state)){const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;card.append(patternTiles(row.pattern),kv([["answers",row.answer_count],["status",row.branch_status],["phase",row.branch_phase],["cache",row.cache_state],["best",row.best_guess],["ERD",row.best_erd],["max remaining depth",row.max_remaining_depth],["workers",row.worker_count],["branch","@"+row.branch_reference]]));card.addEventListener("click",()=>setState({...state,kind:"auto",selector:(state.selector+" "+row.pattern).trim(),tree:false}));grid.append(card);}fragment.append(grid);return fragment;
+      const grid=element("div","grid"),previousRows=previousBy(previous,"response_groups","branch_key_hex");for(const row of ordered(shownRows,"branch_key_hex","response-groups",state)){const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;const title=element("div","card-title");title.append(patternTiles(row.pattern),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));card.append(title);const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+valueOrDash(row.cache_state)];const best=bestText(row);if(best)parts.push(best);if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)parts.push("max remaining depth "+row.max_remaining_depth);if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));parts.push("@"+shortReference(valueOrDash(row.branch_reference)));card.append(statLine(parts));card.addEventListener("click",()=>setState({...state,kind:"auto",selector:(state.selector+" "+row.pattern).trim(),tree:false}));grid.append(card);}fragment.append(grid);return fragment;
     }
     function section(title,content,className=""){const node=element("section","section "+className);node.append(element("h2","",title));if(content)node.append(content);return node;}
     function renderBranch(report,previous,state){
-      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};fragment.append(section("Identity",renderSpine(branch.spine)));fragment.append(section("Queue",data.queue?kv([["branch","@"+branch.branch_reference],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",data.queue.completed_candidate_count+" / "+data.queue.candidate_count],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess],["ERD",data.queue.best_erd],["ceiling",data.queue.ceiling],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
-      const outsideStatus=state.branch_status.length&&!state.branch_status.includes(branch.branch_status),outsidePhase=state.branch_phase.length&&!state.branch_phase.includes(branch.branch_phase);if(outsideStatus||outsidePhase)fragment.append(element("p","error","This selected branch no longer matches the parent filter. Back returns to the filtered view."));
-      fragment.append(section("Cache",kv(Object.entries(data.cache||{}))));
-      const workers=element("div","grid"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers||[])workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));
-      const finalizations=element("div","grid");for(const row of data.recent_finalizations||[]){const card=element("article","card outcome-"+row.outcome);card.append(element("h3","",row.outcome),kv([["ceiling",row.ceiling],["evaluated",row.evaluated_candidate_count],["bulk proofs",row.bulk_completed_candidate_count],["bundles",row.bundle_count],["nodes",row.search_node_count],["wall ms",row.wall_millis],["epoch",row.epoch]]));finalizations.append(card);}fragment.append(section("Recent finalizations",finalizations));
-      const misses=element("div","grid");for(const row of data.cut_reuse_misses||[])misses.append(element("article","card outcome-cut","cut reuse · available "+row.available_bound+" · budget "+row.available_budget));fragment.append(section("Cut-reuse misses",misses));
-      fragment.append(section("Bundle and republish",kv([["bundle summary",data.bundle_summary?JSON.stringify(data.bundle_summary):null],["republished candidates",(data.republished_candidates||[]).map(row=>row.candidate_index+"×"+row.republish_count).join(", ")]])));
+      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};if(branch.spine?.length)fragment.append(section("Identity",renderSpine(branch.spine)));
+      fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
+      if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
+      fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[label(key),displayValue(key,value)]))));
+      if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
+      if(data.recent_finalizations?.length){
+        const outcomeGloss={exact:"Exact — solved within budget",cut:"Cut — best line exceeds the budget",loss:"Loss — unsolvable in the game",unknown:"Finalized"};
+        const finalizations=element("div","grid");
+        for(const row of data.recent_finalizations){
+          const card=element("article","card outcome-"+row.outcome);
+          card.append(element("h3","",outcomeGloss[row.outcome]||row.outcome));
+          card.append(statLine(["budget "+valueOrDash(row.budget),"epoch "+valueOrDash(row.epoch),relativeAge(row.recorded_at,report.generated_at)]));
+          const facts=[];
+          if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ceiling "+fixed(row.ceiling));
+          facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.bulk_completed_candidate_count)+" bulk proofs",numText(row.search_node_count)+" nodes");
+          if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
+          if(row.wall_millis)facts.push(numText(row.wall_millis)+" ms");
+          card.append(statLine(facts));
+          finalizations.append(card);
+        }
+        const wrap=element("section","section");
+        wrap.append(element("h2","","Recent finalizations"),element("p","dim","Attempts to resolve the whole branch within its depth budget, newest first."),finalizations);
+        fragment.append(wrap);
+      }
+      if(data.cut_reuse_misses?.length){const misses=element("div","grid");for(const row of data.cut_reuse_misses)misses.append(element("article","card outcome-cut","cut reuse · available "+fixed(row.available_bound)+" · budget "+valueOrDash(row.available_budget)));fragment.append(section("Cut-reuse misses",misses));}
+      const bundleLabels={bundle_count:"bundles",node_count:"nodes",wall_millis:"wall ms",censored_unit_count:"censored units",maximum_bundle_node_count:"max bundle nodes"};
+      const bundlePairs=Object.entries(data.bundle_summary||{}).map(([key,value])=>[bundleLabels[key]||label(key),value]);
+      const republishedList=data.republished_candidates||[];
+      const republishedSummary=republishedList.length?numText(republishedList.length)+(republishedList.length===1?" candidate":" candidates")+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)":null;
+      if(bundlePairs.length||republishedSummary)fragment.append(section("Bundle and republish",kv([...bundlePairs,["candidates re-queued",republishedSummary]])));
       const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
-      const claims=element("details","section");claims.open=state.claims;claims.append(element("summary","","Candidate detail"));if(data.claims)for(const claim of data.claims){const label=claim.completion_kind==="bulk_eliminated"?"Proof (bulk eliminated)":claim.worker_id?"Worker "+claim.worker_id:valueOrDash(claim.state);claims.append(element("div","card",claim.candidate_index+" · "+label));}claims.addEventListener("toggle",()=>{if(claims.open!==currentState.claims)setState({...currentState,claims:claims.open},false);});fragment.append(claims);return fragment;
+      const claimSummary=data.claim_summary;
+      if(claimSummary&&claimSummary.total_claim_count){
+        const completion=[numText(claimSummary.done_count)+" done",numText(claimSummary.evaluated_count)+" evaluated",numText(claimSummary.bulk_eliminated_count)+" bulk proofs"];
+        if(claimSummary.provenance_unknown_count)completion.push(numText(claimSummary.provenance_unknown_count)+" unattributed");
+        if(claimSummary.in_flight_count)completion.push(numText(claimSummary.in_flight_count)+" in flight");
+        const detail=element("section","section");detail.append(element("h2","","Candidate detail"),statLine(completion));
+        if(claimSummary.worker_contributions&&claimSummary.worker_contributions.length)detail.append(statLine(claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+" "+numText(row.done_count))));
+        fragment.append(detail);
+      }
+      return fragment;
     }
     function renderTree(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;if(!data.tree_available){fragment.append(section("Tree",element("p","empty",data.unavailable_reason||"No extant queue topology")));return fragment;}
       const children=new Map();for(const node of data.nodes||[]){const parent=node.parent_node_id||"__root__";if(!children.has(parent))children.set(parent,[]);children.get(parent).push(node);}
       const previousNodes=previousBy(previous,"nodes","node_id");
-      const build=(node)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const details=element("details");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);if(matchMedia("(max-width:479px)").matches&&node.guess_depth>1&&!node.is_context)collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const summary=element("summary","clickable"),label=node.step?String(node.step.word).toUpperCase()+" ":node.node_id==="root"?"root ":"? ";summary.append(element("span","",label));if(node.step)summary.append(patternTiles(node.step.pattern));summary.append(element("span","dim"," guess_depth="+node.guess_depth+" · "+valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase)+" · "+valueOrDash(node.answer_count)+" answers · "+valueOrDash(node.worker_count)+" workers · "+valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count)+" · "+(node.branch_reference?"@"+node.branch_reference:"structure")));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});summary.append(openButton);}details.addEventListener("toggle",()=>details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id));details.append(summary);const list=element("ul");for(const child of children.get(node.node_id)||[])list.append(build(child));if(list.children.length)details.append(list);item.append(details);return item;};
+      const build=(node)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const details=element("details");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);if(matchMedia("(max-width:479px)").matches&&node.guess_depth>1&&!node.is_context)collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const summary=element("summary","clickable"),labelText=node.step?String(node.step.word).toUpperCase():node.node_id==="root"?"root":"?",headGroup=element("span","step-group");headGroup.append(element("span","",labelText));if(node.step)headGroup.append(patternTiles(node.step.pattern));summary.append(headGroup);summary.append(element("span","dim"," d"+node.guess_depth+" · "+valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase)+" · "+valueOrDash(node.answer_count)+" answers · "+valueOrDash(node.worker_count)+" workers · "+valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count)+" · "+(node.branch_reference?"@"+shortReference(node.branch_reference):"structure")));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});summary.append(openButton);}details.addEventListener("toggle",()=>details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id));details.append(summary);const list=element("ul");for(const child of children.get(node.node_id)||[])list.append(build(child));if(list.children.length)details.append(list);item.append(details);return item;};
       const tree=element("div","tree"),list=element("ul");for(const root of children.get("__root__")||[])list.append(build(root));tree.append(list);fragment.append(section("Live queue tree",tree));return fragment;
     }
     function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=element("div","grid"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
-    function renderWorkers(report,previous,state){const grid=element("div","grid"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(report.data.rows||[],"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;}
+    function renderWorkers(report,previous,state){const grid=element("div","grid workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(report.data.rows||[],"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;}
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}
-    function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(key.replaceAll("_"," "),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(name.replaceAll("_"," "),kv(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+valueOrDash(row.branch_reference),kv(Object.entries(row)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
-    function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [label,value] of [["population",data.population],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(label,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=element("div","grid"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),card=section(identity,kv(Object.entries(row)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
+    function displayEntries(row){return Object.entries(row).filter(([key])=>!["row_id","branch_key_hex","branch_reference","spine"].includes(key)).map(([key,value])=>[label(key),displayValue(key,value)]);}
+    function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),kv(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),kv(displayEntries(row)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
+    function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=element("div","grid"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,kv(displayEntries(row)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
+    function captureGridCards(root){
+      const map=new Map();
+      for(const node of root.querySelectorAll(".grid > [data-identity]"))map.set(node.dataset.identity,{rect:node.getBoundingClientRect(),node});
+      return map;
+    }
+    function animateGridTransitions(root,before,sameView){
+      if(!sameView||!before.size||matchMedia("(prefers-reduced-motion: reduce)").matches)return;
+      const present=new Set();
+      for(const node of root.querySelectorAll(".grid > [data-identity]")){
+        present.add(node.dataset.identity);
+        const prior=before.get(node.dataset.identity);
+        if(prior){
+          // FLIP: a card that survived the refresh glides from where it was to
+          // where it landed, so watching one branch never means chasing it.
+          const after=node.getBoundingClientRect(),dx=prior.rect.left-after.left,dy=prior.rect.top-after.top;
+          if(dx||dy)node.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:"none"}],{duration:350,easing:"ease"});
+        }else{
+          node.animate([{opacity:0,transform:"scale(.96)"},{opacity:1,transform:"none"}],{duration:300,easing:"ease"});
+        }
+      }
+      const leaving=[...before].filter(([identity])=>!present.has(identity));
+      if(!leaving.length)return;
+      const layer=element("div","leave-layer");document.body.append(layer);
+      for(const [,{rect,node}] of leaving){
+        const clone=node.cloneNode(true);
+        Object.assign(clone.style,{position:"fixed",margin:"0",left:rect.left+"px",top:rect.top+"px",width:rect.width+"px",height:rect.height+"px"});
+        layer.append(clone);
+        clone.animate([{opacity:1,transform:"none"},{opacity:0,transform:"scale(.96)"}],{duration:300,easing:"ease"});
+      }
+      setTimeout(()=>layer.remove(),350);
+    }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
-      const root=byId("report"),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
+      const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
       if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport));else throw new Error("Unknown report kind");
-      root.replaceChildren(content);byId("generated").textContent="generated "+new Date(report.generated_at*1000).toLocaleTimeString();setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      // Only glide cards on a refresh of the same view; switching report kinds
+      // (or the first paint over a stale screen) snaps rather than stampedes.
+      const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;
+      root.replaceChildren(content);animateSweepMarkers(root);animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
-    function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"connected":message;}
+    function workerMarkerImage(workerNumber){
+      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
+      return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
+    }
+    function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;chip.title=ok?"connected":message;}
     async function fetchReport(){
-      if(document.hidden)return;const state=normalizeState(currentState),context=contextKey(state),generation=++requestGeneration,controller=new AbortController();if(activeRequestController)activeRequestController.abort();activeRequestController=controller;
-      try{const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});if(generation!==requestGeneration)return;if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}const report=await response.json();if(generation!==requestGeneration)return;const previous=context===lastContext?lastReport:null;applyReport(report,previous,state);lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");}
-      catch(error){if(error.name==="AbortError"||generation!==requestGeneration)return;failureCount++;if(failureCount>=2){const age=lastSuccess?Math.floor((Date.now()-lastSuccess)/1000)+"s":"never";connection(false,"disconnected · "+age);if(!lastReport)byId("report").replaceChildren(element("p","error",error.message));}}
+      if(document.hidden)return;
+      if(activeRequestController){
+        if(Date.now()-activeRequestStartedAt<STUCK_REQUEST_MILLIS)return;
+        abortActiveRequest();
+      }
+      const state=normalizeState(currentState),context=contextKey(state),generation=++requestGeneration,controller=new AbortController();
+      activeRequestController=controller;activeRequestStartedAt=Date.now();
+      try{
+        const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});
+        if(generation!==requestGeneration)return;
+        if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
+        const report=await response.json();if(generation!==requestGeneration)return;
+        const previous=context===lastContext?lastReport:null;applyReport(report,previous,state);lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
+        pinBranchToSpine(report,state);
+      }
+      catch(error){
+        if(error.name==="AbortError"||generation!==requestGeneration)return;
+        failureCount++;
+        const navigated=context!==lastContext;
+        if(navigated||failureCount>=2){
+          const age=lastSuccess?Math.floor((Date.now()-lastSuccess)/1000)+"s":"never";
+          connection(false,navigated?"error":"offline "+age);
+          if(navigated||!lastReport)byId("report").replaceChildren(element("p","error",error.message));
+        }
+      }
+      finally{if(activeRequestController===controller)activeRequestController=null;}
+    }
+    function pinBranchToSpine(report,state){
+      // A branch reference is a one-way hash the queue must invert, so it stops
+      // resolving (404) once the branch finalizes out of the queue.  A branch's
+      // spine resolves from the answer list alone — queue-independent — so once
+      // a branch view has loaded, pin the selector to its spine.  Polling then
+      // keeps returning cache-only state on a normal 200 through finalization,
+      // and a 404 stays meaningful: a reference that never resolved.
+      if(report.report_kind!=="branch"||report.tree)return;
+      // Only a queue reference needs replacing; a spine the user typed is
+      // already stable, so leave its wording untouched.
+      if(!/^@/.test((state.selector||"").trim()))return;
+      const spine=report.data&&report.data.branch&&report.data.branch.spine;
+      if(!Array.isArray(spine)||!spine.length)return;
+      const canonical=spine.flatMap(step=>[step.word,step.pattern]).join(" ");
+      if(!canonical||canonical===state.selector)return;
+      currentState=normalizeState({...currentState,selector:canonical});
+      const query=stateQuery(currentState,true).toString();
+      history.replaceState(null,"",location.pathname+(query?"?"+query:""));
+      lastContext=contextKey(currentState);
+      byId("selector-input").value=currentState.selector;
     }
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
-      const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const label=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";label.append(input," "+name);container.append(label);}};
+      const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
       addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-phases",branchPhaseNames,"branchPhase");
       currentState=parsePageState(location);syncControls();
       byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("selector-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
-      byId("tree").addEventListener("change",()=>setState(readControls()));byId("apply-filters").addEventListener("click",()=>setState(readControls()));
+      byId("tree-button").addEventListener("click",()=>setState({...readControls(),tree:!currentState.tree}));byId("apply-filters").addEventListener("click",()=>setState(readControls()));
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,selector:overview?"":currentState.selector,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false});}));
-      addEventListener("popstate",()=>{currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
+      addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.applyReport=applyReport;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);

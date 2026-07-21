@@ -559,14 +559,24 @@ def _queue_overview(sources, generated_at, answer_set, report):
                     "bulk_completed_candidate_count"
                 ],
             }
-            normalized_rows.append(_normalize_branch(
+            normalized = _normalize_branch(
                 branch_values,
                 row["branch_status"],
                 row["branch_phase"],
                 progress,
                 row["worker_count"],
                 answer_set,
-            ))
+            )
+            # Active branches carry their done claim indexes so overview
+            # displays can draw the candidate sweep; the set is bounded by the
+            # worker count.  Other statuses have no live claim rows.
+            if normalized["branch_status"] == "active":
+                normalized["completed_candidate_indexes"] = sorted(
+                    claim["idx"]
+                    for claim in queue.claims_for_branch(bytes(row["branch_key"]))
+                    if claim["done"]
+                )
+            normalized_rows.append(normalized)
 
         workers = [
             _normalize_worker(row, generated_at, answer_set) for row in heartbeats
@@ -836,6 +846,10 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             "worker_count": worker_count,
             "cache_state": cache_state["cache_state"],
             "best_guess": cache_state["best_guess"],
+            "best_guess_is_answer": bool(
+                cache_state["best_guess"]
+                and cache_state["best_guess"].lower() in answer_set
+            ),
             "best_erd": cache_state["best_erd"],
             "max_remaining_depth": cache_state["max_remaining_depth"],
             "updated_at": cache_state["updated_at"],
@@ -931,6 +945,50 @@ def _decode_branch_key(branch_key):
         branch_key[index:index + 5].decode()
         for index in range(0, len(branch_key), 5)
     )
+
+
+def _summarize_claims(normalized_claims):
+    """Aggregate per-candidate claims into a bounded provenance summary.
+
+    A branch can hold tens of thousands of claims, so the human reports show
+    this summary rather than a row per candidate.  Counts and per-worker
+    contributions are the useful signal; the raw list stays available only to
+    programmatic consumers via include_claims.
+    """
+    done_count = evaluated_count = bulk_count = provenance_unknown_count = 0
+    in_flight_count = 0
+    done_by_worker = {}
+    for claim in normalized_claims:
+        if claim["state"] != "done":
+            in_flight_count += 1
+            continue
+        done_count += 1
+        kind = claim["completion_kind"]
+        if kind == "evaluated":
+            evaluated_count += 1
+        elif kind == "bulk_eliminated":
+            bulk_count += 1
+        else:
+            provenance_unknown_count += 1
+        worker_id = claim["worker_id"]
+        if worker_id:
+            done_by_worker[worker_id] = done_by_worker.get(worker_id, 0) + 1
+    worker_contributions = sorted(
+        (
+            {"worker_id": worker_id, "done_count": count}
+            for worker_id, count in done_by_worker.items()
+        ),
+        key=lambda item: (-item["done_count"], item["worker_id"]),
+    )
+    return {
+        "total_claim_count": len(normalized_claims),
+        "done_count": done_count,
+        "in_flight_count": in_flight_count,
+        "evaluated_count": evaluated_count,
+        "bulk_eliminated_count": bulk_count,
+        "provenance_unknown_count": provenance_unknown_count,
+        "worker_contributions": worker_contributions,
+    }
 
 
 def _normalize_claim(row, republish_count):
@@ -1050,6 +1108,10 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             "completed_candidate_count": progress["completed_candidate_count"],
             "bulk_completed_candidate_count": progress["bulk_completed_candidate_count"],
             "best_guess": _row_value(active_row, "best_guess"),
+            "best_guess_is_answer": bool(
+                _row_value(active_row, "best_guess")
+                and str(_row_value(active_row, "best_guess")).lower() in answer_set
+            ),
             "best_erd": _row_value(active_row, "best_erd"),
             "best_max_remaining_depth": _row_value(active_row, "best_max_depth"),
             "ceiling": _row_value(active_row, "ceiling"),
@@ -1079,7 +1141,11 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             {"candidate_index": row["idx"], "republish_count": row["count"]}
             for row in republish_rows
         ],
+        "completed_candidate_indexes": sorted(
+            row["idx"] for row in claim_rows if row["done"]
+        ),
         "claims": normalized_claims if request.include_claims else None,
+        "claim_summary": _summarize_claims(normalized_claims),
         "provenance_unknown": provenance_unknown,
         **branch_telemetry,
     }

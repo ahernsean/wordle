@@ -158,37 +158,92 @@ class FakeOutput(io.StringIO):
 class OverviewRendererTest(unittest.TestCase):
     def test_text_contains_report_semantics_without_ansi(self):
         output = render_overview(overview_report(), color=False, width=100)
-        self.assertIn("queue: ok", output)
+        self.assertIn("sources ok", output)
+        self.assertIn("epoch=4 packed revision=abcdef12", output)
         self.assertIn("Disk: 50.0G/400G (12%)  queue WAL 1.0G", output)
-        self.assertIn("pending 12", output)
-        self.assertIn("@0123456789ab", output)
+        self.assertIn("Cache: exact 200", output)
+        self.assertIn("Queue: pending 12", output)
+        self.assertIn("@0123", output)
+        self.assertNotIn("@0123456789ab", output)
         self.assertIn("GuessD", output)
         self.assertIn("25/100", output)
         self.assertNotIn("30/100", output)
         self.assertIn("MaxRD", output)
-        self.assertIn("worker-2", output)
+        self.assertIn("w2", output)
+        self.assertNotIn("worker-2", output)
+        self.assertIn("NURDY*", output)
+        self.assertIn("CRANE*/2.250", output)
         self.assertNotIn("guess_depth=", output)
         self.assertNotIn("worker=", output)
         self.assertNotIn("\033", output)
 
+    def test_header_compacts_healthy_sources_to_one_line(self):
+        output = render_overview(overview_report(), color=False, width=100)
+        lines = output.splitlines()
+        blank_index = lines.index("")
+        header_lines = lines[:blank_index]
+        self.assertEqual(len(header_lines), 3)
+        self.assertNotIn("queue: ok", output)
+        self.assertNotIn("telemetry", output)
+
+    def test_worker_rows_have_no_repeated_headers(self):
+        report = overview_report()
+        second_branch = deepcopy(report["data"]["branches"][0])
+        second_branch.update({
+            "branch_reference": "bbbbbbbbbbbb", "branch_key_hex": "bbbb",
+        })
+        second_worker = deepcopy(report["data"]["workers"][0])
+        second_worker.update({
+            "worker_id": "worker-3", "worker_number": "3",
+            "branch_reference": "bbbbbbbbbbbb", "branch_key_hex": "bbbb",
+        })
+        report["data"]["branches"].append(second_branch)
+        report["data"]["workers"].append(second_worker)
+        output = render_overview(report, color=False, width=100)
+        self.assertEqual(output.count("GuessD"), 1)
+        self.assertNotIn("Worker", output)
+        self.assertNotIn("Current", output)
+        self.assertIn("w2", output)
+        self.assertIn("w3", output)
+
     def test_narrow_rendering_respects_width(self):
         output = render_overview(overview_report(), color=False, width=50)
         self.assertTrue(all(len(line) <= 50 for line in output.splitlines()))
-        self.assertIn("@0123456789ab", output)
-        self.assertIn("worker-2", output)
+        self.assertIn("@0123", output)
+        self.assertIn("w2", output)
         self.assertIn("Ref", output)
         self.assertIn("State", output)
 
-    def test_progress_and_worker_changes_are_semantically_colored(self):
+    def test_progress_is_highlighted_by_cell_rules(self):
         previous = overview_report()
         current = deepcopy(previous)
         current["data"]["branches"][0]["completed_candidate_count"] += 1
-        current["data"]["workers"][0]["candidate_index"] += 1
+        current["data"]["workers"][0]["current_candidate"] = "slate"
         output = render_overview(
             current, previous_report=previous, color=True, width=100
         )
-        self.assertIn(report_terminal.GREEN + "  @0123456789ab", output)
-        self.assertIn(report_terminal.RED + "    worker-2", output)
+        self.assertIn(report_terminal.GREEN + "26/100", output)
+        self.assertIn(report_terminal.GREEN + "SLATE", output)
+        self.assertNotIn(report_terminal.RED, output)
+
+    def test_improved_best_erd_highlights_best_cell(self):
+        previous = overview_report()
+        current = deepcopy(previous)
+        current["data"]["branches"][0]["best_erd"] = 2.125
+        output = render_overview(
+            current, previous_report=previous, color=True, width=100
+        )
+        self.assertIn(report_terminal.GREEN + "CRANE*/2.125", output)
+        self.assertNotIn(report_terminal.GREEN + "26/100", output)
+
+    def test_stalled_worker_rate_is_highlighted_red(self):
+        previous = overview_report()
+        current = deepcopy(previous)
+        current["data"]["workers"][0]["nodes_per_second"] = 0
+        output = render_overview(
+            current, previous_report=previous, color=True, width=100
+        )
+        self.assertIn(report_terminal.RED + "0/s", output)
 
     def test_ticking_timestamps_alone_are_not_highlighted(self):
         previous = overview_report()
@@ -207,14 +262,14 @@ class OverviewRendererTest(unittest.TestCase):
         stale["data"]["workers"][0]["updated_at"] = 979
         stale_output = render_overview(stale, color=True, width=100)
         self.assertIn(
-            report_terminal.AMBER + "    worker-2", stale_output
+            report_terminal.AMBER + "    w2", stale_output
         )
 
         dead = deepcopy(stale)
         dead["data"]["workers"][0]["is_live"] = False
         dead_output = render_overview(dead, color=True, width=100)
         self.assertIn(
-            report_terminal.RED + "  worker-2", dead_output
+            report_terminal.RED + "  w2", dead_output
         )
 
     def test_adaptive_columns_cover_phone_and_wide_widths(self):
@@ -223,24 +278,26 @@ class OverviewRendererTest(unittest.TestCase):
         branch["candidate_count"] = 12972
         branch["completed_candidate_count"] = 12616
         branch["spine"] = branch["spine"] * 5
-        report["data"]["workers"][0]["worker_id"] = "worker-12"
+        report["data"]["workers"][0].update({
+            "worker_id": "worker-12", "worker_number": "12",
+        })
 
         expected_branch_headings = {
-            50: ("Ref", "GuessD", "State", "Done", "W"),
-            55: ("Ref", "GuessD", "State", "Done", "W", "Ans"),
+            50: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
+            55: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
             59: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
             60: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
             79: (
                 "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
-                "Best", "MaxRD",
+                "Best", "MaxRD", "ETA",
             ),
             80: (
                 "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
-                "Best", "MaxRD",
+                "Best", "MaxRD", "ETA",
             ),
             120: (
                 "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
-                "Best", "MaxRD", "ETA",
+                "Best", "MaxRD", "ETA", "Spine",
             ),
         }
         for width, expected_headings in expected_branch_headings.items():
@@ -249,9 +306,9 @@ class OverviewRendererTest(unittest.TestCase):
                 self.assertTrue(
                     all(len(line) <= width for line in output.splitlines())
                 )
-                self.assertIn("@0123456789ab", output)
+                self.assertIn("@0123", output)
                 self.assertIn("12616/12972", output)
-                self.assertIn("worker-12", output)
+                self.assertIn("w12", output)
                 self.assertNotIn("guess_depth=", output)
                 self.assertNotIn("candidate=", output)
                 branch_header = next(
@@ -290,13 +347,14 @@ class OverviewRendererTest(unittest.TestCase):
             reordered, previous_report=first, width=100,
             display_order=display_order,
         )
-        self.assertLess(output.index("@0123456789ab"), output.index("@bbbbbbbbbbbb"))
+        self.assertLess(output.index("@0123"), output.index("@bbbb"))
 
     def test_unavailable_queue_still_renders_cache(self):
         report = overview_report()
         report["sources"]["queue"].update({"ok": False, "error": "locked"})
         output = render_overview(report, width=100)
-        self.assertIn("queue: unavailable: locked", output)
+        self.assertIn("queue unavailable: locked", output)
+        self.assertNotIn("sources ok", output)
         self.assertIn("exact 200", output)
 
     def test_watched_word_groups_preserve_full_identity_order(self):
@@ -350,7 +408,7 @@ class OverviewRendererTest(unittest.TestCase):
             second, previous_report=first, width=100,
             display_order=display_order,
         )
-        self.assertLess(output.index("@aaaaaaaaaaaa"), output.index("@bbbbbbbbbbbb"))
+        self.assertLess(output.index("@aaaa"), output.index("@bbbb"))
 
     def test_watched_branch_workers_preserve_worker_identity_order(self):
         first = overview_report()
@@ -387,11 +445,9 @@ class OverviewRendererTest(unittest.TestCase):
             second, previous_report=first, width=100,
             display_order=display_order,
         )
-        self.assertLess(
-            output.index("worker-2"), output.index("worker-1")
-        )
+        self.assertLess(output.index("w2"), output.index("w1"))
 
-    def test_watched_branch_claims_compare_by_candidate_index(self):
+    def test_candidate_state_renders_bounded_claim_summary(self):
         report = overview_report()
         report["report_kind"] = "branch"
         report["data"] = {
@@ -407,21 +463,24 @@ class OverviewRendererTest(unittest.TestCase):
             },
             "workers": [],
             "republished_candidates": [],
-            "claims": [{
-                "candidate_index": 4, "state": "in_flight",
-                "completion_kind": None, "worker_id": "worker-2",
-                "bundle_id": None, "claimed_at": 900, "done_at": None,
-                "republish_count": 0,
-            }],
+            "claims": None,
+            "claim_summary": {
+                "total_claim_count": 12972, "done_count": 12819,
+                "in_flight_count": 5, "evaluated_count": 11200,
+                "bulk_eliminated_count": 1619, "provenance_unknown_count": 0,
+                "worker_contributions": [
+                    {"worker_id": "worker-0", "done_count": 6484},
+                    {"worker_id": "worker-2", "done_count": 6335},
+                ],
+            },
             "provenance_unknown": False,
         }
-        changed = deepcopy(report)
-        changed["data"]["claims"][0]["state"] = "done"
-        changed["data"]["claims"][0]["completion_kind"] = "evaluated"
-        output = render_report(
-            changed, previous_report=report, color=True, width=100
-        )
-        self.assertIn(report_terminal.RED + "  idx=4 done", output)
+        output = render_report(report, width=100)
+        self.assertIn("12,819 done", output)
+        self.assertIn("1,619 bulk proofs", output)
+        self.assertIn("5 in flight", output)
+        self.assertIn("by worker: w0 6,484", output)
+        self.assertNotIn("idx=", output)
 
     def test_selected_branch_detail_survives_parent_status_filter(self):
         report = overview_report()
@@ -444,8 +503,9 @@ class OverviewRendererTest(unittest.TestCase):
             "provenance_unknown": False,
         }
         output = render_report(report, width=100)
+        self.assertIn("Branch @0123", output)
         self.assertIn("status=done phase=complete", output)
-        self.assertIn("no longer matches the parent filter", output)
+        self.assertNotIn("no longer matches the parent filter", output)
 
     def test_pending_queued_overview_renders_without_candidate_total(self):
         report = overview_report()
@@ -465,6 +525,23 @@ class OverviewRendererTest(unittest.TestCase):
         output = render_report(report, width=120)
         self.assertIn("Branches (status=pending)", output)
         self.assertIn("0/—", output)
+
+    def test_hotspot_render_rounds_erd_and_ceiling_bounds(self):
+        report = overview_report()
+        report.update({"report_kind": "hotspots", "tree": False})
+        report["data"] = {
+            "field": "nodes", "population": "current_queue_branches",
+            "epoch": 4, "since_seconds": 3600, "sample_size": 50000,
+            "sampled_row_count": 1, "sample_truncated": False,
+            "rows": [{
+                "branch_reference": "abcd1234ef00", "answer_count": 33,
+                "best_erd": 2.793103449275866, "ceiling": 2.0000000009999996,
+            }],
+        }
+        output = render_report(report, width=120)
+        self.assertIn("best_erd=2.793", output)
+        self.assertIn("ceiling=2.000", output)
+        self.assertNotIn("2.793103449275866", output)
 
     def test_hotspot_render_labels_population_window_and_truncation(self):
         report = overview_report()
@@ -491,6 +568,112 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("since-seconds=3600", output)
         self.assertIn("sample-size=50000", output)
         self.assertIn("truncated=true", output)
+
+
+class CandidateSweepBarTest(unittest.TestCase):
+    def test_block_heights_scale_with_cell_completion(self):
+        bar = report_terminal.candidate_sweep_bar(80, range(0, 40), (), width=8)
+        self.assertEqual(len(bar), 8)
+        self.assertEqual(bar[:4], "████")
+        self.assertEqual(bar[4:], "    ")
+
+    def test_partial_cells_use_intermediate_blocks(self):
+        bar = report_terminal.candidate_sweep_bar(80, range(0, 5), (), width=8)
+        self.assertEqual(len(bar), 8)
+        self.assertNotEqual(bar[0], " ")
+        self.assertNotEqual(bar[0], "█")
+
+    def test_first_completion_lifts_cell_off_baseline(self):
+        bar = report_terminal.candidate_sweep_bar(80, [0], (), width=8)
+        self.assertEqual(bar[0], "▁")
+
+    def test_full_block_requires_entirely_completed_cell(self):
+        nearly_full = report_terminal.candidate_sweep_bar(
+            80, range(0, 9), (), width=8
+        )
+        self.assertEqual(nearly_full[0], "▇")
+        full = report_terminal.candidate_sweep_bar(80, range(0, 10), (), width=8)
+        self.assertEqual(full[0], "█")
+
+    def test_worker_positions_overlay_digits(self):
+        bar = report_terminal.candidate_sweep_bar(
+            100, range(0, 50), [(75, "2")], width=10
+        )
+        self.assertEqual(len(bar), 10)
+        self.assertIn("2", bar)
+        self.assertEqual(bar.index("2"), 7)
+
+    def test_adjacent_worker_digits_are_preserved(self):
+        bar = report_terminal.candidate_sweep_bar(
+            100, (), [(70, "1"), (70, "2")], width=10
+        )
+        self.assertIn("1", bar)
+        self.assertIn("2", bar)
+
+    def test_empty_branch_renders_empty_bar(self):
+        self.assertEqual(report_terminal.candidate_sweep_bar(0, (), ()), "")
+
+    def test_branch_report_renders_sweep_with_worker_position(self):
+        report = {
+            "schema_version": 2,
+            "report_kind": "branch",
+            "generated_at": 1000,
+            "selector": None,
+            "filters": {},
+            "sources": {
+                "queue": {"path": "q", "ok": True, "error": None},
+                "telemetry": {"path": "t", "ok": True, "error": None},
+                "cache": {"path": "c", "ok": True, "error": None},
+            },
+            "data": {
+                "branch": {
+                    "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                    "spine": [], "guess_depth": 0, "answer_count": 8, "budget": 6,
+                    "branch_status": "active", "branch_phase": "evaluating",
+                },
+                "queue": {
+                    "branch_status": "active", "branch_phase": "evaluating",
+                    "priority": 1, "candidate_count": 80,
+                    "completed_candidate_count": 40,
+                    "bulk_completed_candidate_count": 0,
+                    "best_guess": "crane", "best_guess_is_answer": True,
+                    "best_erd": 2.0, "best_max_remaining_depth": 3,
+                    "ceiling": None, "search_node_count": 100,
+                    "created_at": 900, "finalized_at": None,
+                },
+                "cache": {
+                    "cache_state": "missing", "best_guess": None,
+                    "best_erd": None, "max_remaining_depth": None,
+                },
+                "workers": [{
+                    "worker_id": "worker-2", "worker_number": "2",
+                    "updated_at": 999, "is_live": True,
+                    "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                    "candidate_index": 60, "current_candidate": "slate",
+                    "current_candidate_is_answer": True,
+                    "current_max_guess_depth": 2, "nodes_per_second": 10.0,
+                }],
+                "republished_candidates": [],
+                "completed_candidate_indexes": list(range(0, 40)),
+                "claims": None,
+                "provenance_unknown": False,
+            },
+        }
+        output = render_report(report, width=80)
+        sweep_line = next(
+            line for line in output.splitlines()
+            if line.strip().startswith("[") and "█" in line
+        )
+        self.assertIn("2", sweep_line)
+        self.assertLessEqual(len(sweep_line), 80)
+
+        unswept = deepcopy(report)
+        unswept["data"]["completed_candidate_indexes"] = []
+        unswept["data"]["workers"] = []
+        unswept_output = render_report(unswept, width=80)
+        self.assertFalse(any(
+            line.strip().startswith("[") for line in unswept_output.splitlines()
+        ))
 
 
 class CollectionRendererTest(unittest.TestCase):
@@ -579,7 +762,7 @@ class CollectionRendererTest(unittest.TestCase):
             "matched_rows": 1,
             "rows": [worker],
         })
-        self.assertIn("worker-2  stale", render_report(workers_report, width=120))
+        self.assertIn("w2  stale", render_report(workers_report, width=120))
 
         cache_report = self._report("cache", {
             "summary": {
@@ -702,6 +885,37 @@ class ViewSessionTest(unittest.TestCase):
         with patch("report_terminal.select.select", return_value=([session.input_stream], [], [])):
             self.assertFalse(session._wait_for_refresh())
 
+    def test_tty_watch_shows_loading_notice_before_first_report(self):
+        report = overview_report()
+        output = FakeOutput(tty=True)
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
+        )
+
+        def collect_after_notice():
+            self.assertIn("Collecting report…", output.getvalue())
+            self.assertIn("queue: queue.sqlite3", output.getvalue())
+            self.assertIn("cache: cache.sqlite3", output.getvalue())
+            return report
+
+        session._collect = Mock(side_effect=collect_after_notice)
+        session._wait_for_refresh = Mock(return_value=False)
+        with (
+            patch("report_terminal.termios.tcgetattr", return_value=[0, 0, 0, 0]),
+            patch("report_terminal.termios.tcsetattr"),
+        ):
+            session.run()
+        self.assertIn("ERD swarm overview", output.getvalue())
+
+    def test_navigation_reset_shows_loading_notice(self):
+        output = FakeOutput(tty=True)
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
+        )
+        session._update_navigation_targets(overview_report())
+        session._select_branch("010203")
+        self.assertIn("Collecting report…", output.getvalue())
+
     def test_tty_failure_retries_and_restores_terminal(self):
         report = overview_report()
         output = FakeOutput(tty=True)
@@ -763,7 +977,7 @@ class ViewSessionTest(unittest.TestCase):
         self.assertEqual(session.current_request.report_kind, "workers")
         self.assertEqual(session.current_request.worker_id, "worker-12")
 
-    def test_navigation_targets_wrap_to_terminal_width(self):
+    def test_navigation_legend_is_compact_and_fits_width(self):
         report = overview_report()
         workers = []
         for worker_number in range(1, 16):
@@ -781,9 +995,25 @@ class ViewSessionTest(unittest.TestCase):
         session._update_navigation_targets(report)
         _name, lines = session._navigation_section()[0]
         self.assertTrue(all(len(line) <= 48 for line in lines))
+        self.assertLessEqual(len(lines), 2)
         rendered = "\n".join(lines)
-        self.assertIn("[12] worker-12", rendered)
+        self.assertIn("[a-z] branch", rendered)
+        self.assertIn("[0-9] worker", rendered)
         self.assertIn("[space] refresh", rendered)
+        self.assertNotIn("worker-12", rendered)
+
+    def test_branch_hotkey_letters_render_inline(self):
+        report = overview_report()
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), io.StringIO()
+        )
+        session._update_navigation_targets(report)
+        letter = session.branch_letter_by_key["010203"]
+        output = render_overview(
+            report, width=100, display_order=session.display_order
+        )
+        self.assertIn("Key", output)
+        self.assertIn(f"[{letter}]  @0123", output)
 
     def test_back_restores_complete_prior_request(self):
         filters = ReportFilters(

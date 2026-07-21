@@ -8,14 +8,16 @@
   "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
   "data": {
     "branch": {"branch_reference": "111111111111", "branch_key_hex": "01", "spine": [{"word": "raise", "pattern": "-----", "word_is_answer": false}], "guess_depth": 1, "budget": 5, "answer_count": 8, "branch_status": "done", "branch_phase": "complete"},
-    "queue": {"branch_status": "done", "branch_phase": "complete", "pending_status": "in_progress", "active_status": "open", "priority": 5, "candidate_count": 100, "completed_candidate_count": 25, "bulk_completed_candidate_count": 4, "best_guess": "crane", "best_erd": 2.1, "best_max_remaining_depth": 3, "ceiling": 2.4, "search_node_count": 12000, "created_at": 900, "finalized_at": null},
+    "queue": {"branch_status": "done", "branch_phase": "complete", "pending_status": "in_progress", "active_status": "open", "priority": 5, "candidate_count": 100, "completed_candidate_count": 25, "bulk_completed_candidate_count": 4, "best_guess": "crane", "best_guess_is_answer": true, "best_erd": 2.1, "best_max_remaining_depth": 3, "ceiling": 2.4, "search_node_count": 12000, "created_at": 900, "finalized_at": null},
     "cache": {"cache_state": "exact", "best_guess": "crane", "best_erd": 2.1, "max_remaining_depth": 3, "solve_budget": 5, "tainted": false, "updated_at": 990},
     "workers": [],
     "republished_candidates": [{"candidate_index": 7, "republish_count": 2}],
+    "completed_candidate_indexes": [3, 4],
     "claims": [
       {"candidate_index": 3, "state": "done", "completion_kind": "evaluated", "worker_id": "worker-0", "bundle_id": "bundle-1", "claimed_at": 930, "done_at": 940, "republish_count": 0},
       {"candidate_index": 4, "state": "done", "completion_kind": "bulk_eliminated", "worker_id": null, "bundle_id": null, "claimed_at": 940, "done_at": 940, "republish_count": 0}
     ],
+    "claim_summary": {"total_claim_count": 12972, "done_count": 12819, "in_flight_count": 5, "evaluated_count": 11200, "bulk_eliminated_count": 1619, "provenance_unknown_count": 0, "worker_contributions": [{"worker_id": "worker-0", "done_count": 6484}, {"worker_id": "worker-2", "done_count": 6335}]},
     "provenance_unknown": false,
     "bundle_summary": {"bundle_count": 3, "node_count": 9000, "wall_millis": 800, "censored_unit_count": 1, "maximum_bundle_node_count": 5000},
     "recent_finalizations": [
