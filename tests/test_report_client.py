@@ -139,6 +139,23 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(self.page.locator("[data-kind]").count(), 5)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
+    def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
+        overview_button = self.page.locator("[data-overview]")
+        self.assertEqual(overview_button.get_attribute("aria-current"), "page")
+        self.apply_selector("RAISE .....")
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(overview_button.get_attribute("aria-current"), "false")
+        self.apply_selector("")
+        self.page.wait_for_selector("text=overview report")
+        self.assertEqual(overview_button.get_attribute("aria-current"), "page")
+
+    def test_answer_word_count_is_shown_before_expansion(self):
+        self.apply_selector("RAISE .....")
+        self.page.wait_for_selector("text=branch report")
+        summary = self.page.locator("summary:has-text('Answer words')")
+        self.assertEqual(summary.inner_text(), "Answer words (8)")
+        self.assertIsNone(summary.locator("xpath=..").get_attribute("open"))
+
     def test_positional_cache_queue_and_explicit_navigation_urls(self):
         result = self.page.evaluate("""() => ({
           inferredCache: buildAPIURL(parsePageState({search:'?selector=CACHE'})),
