@@ -455,7 +455,7 @@ def _normalize_worker(row, generated_at, answer_set):
         # True while the worker's branch still has an active row; False once it
         # has been finalized and removed, which lags the heartbeat by up to one
         # interval and leaves the worker naming a branch no report will list.
-        "on_live_branch": bool(_row_value(row, "on_live_branch", 1)),
+        "on_active_branch": bool(_row_value(row, "on_active_branch", 1)),
         "candidate_index": _row_value(row, "claim_idx"),
         "claim_started_at": _row_value(row, "claim_started_at"),
         "completed_claim_count": _row_value(row, "claims_done", 0),
@@ -1520,7 +1520,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
                 state = "stale"
             elif worker["branch_key_hex"] is None:
                 state = "idle"
-            elif not worker["on_live_branch"]:
+            elif not worker["on_active_branch"]:
                 state = "transitioning"
             elif phase_by_key.get(worker["branch_key_hex"]) == "finalizing":
                 state = "finalizing"

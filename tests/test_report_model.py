@@ -306,8 +306,8 @@ class ReportModelTest(unittest.TestCase):
         workers = {
             worker["worker_id"]: worker for worker in report["data"]["workers"]
         }
-        self.assertTrue(workers["worker-1"]["on_live_branch"])
-        self.assertFalse(workers["worker-2"]["on_live_branch"])
+        self.assertTrue(workers["worker-1"]["on_active_branch"])
+        self.assertFalse(workers["worker-2"]["on_active_branch"])
 
     def test_idle_worker_is_not_on_a_live_branch(self):
         now = int(time.time())
@@ -318,7 +318,7 @@ class ReportModelTest(unittest.TestCase):
             report = collect_overview_report(self.sources)
         worker = report["data"]["workers"][0]
         self.assertIsNone(worker["branch_key_hex"])
-        self.assertFalse(worker["on_live_branch"])
+        self.assertFalse(worker["on_active_branch"])
 
     def test_overview_status_filter_tracks_worker_arrival_and_departure(self):
         now = int(time.time())

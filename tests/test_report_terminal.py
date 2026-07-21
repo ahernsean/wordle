@@ -212,13 +212,29 @@ class OverviewRendererTest(unittest.TestCase):
         stray.update({
             "worker_id": "worker-7", "worker_number": "7",
             "branch_reference": "cccccccccccc", "branch_key_hex": "cccc",
-            "on_live_branch": False,
+            "on_active_branch": False,
         })
         report["data"]["workers"].append(stray)
         output = render_overview(report, color=False, width=100)
         self.assertIn("Other workers", output)
         self.assertIn("w7", output)
-        self.assertIn("moving", output)
+        self.assertIn("trans", output)
+
+    def test_worker_on_unshown_active_branch_is_working_not_transitioning(self):
+        report = overview_report()
+        elsewhere = deepcopy(report["data"]["workers"][0])
+        elsewhere.update({
+            "worker_id": "worker-8", "worker_number": "8",
+            "branch_reference": "dddddddddddd", "branch_key_hex": "dddd",
+            "on_active_branch": True,
+        })
+        report["data"]["workers"].append(elsewhere)
+        output = render_overview(report, color=False, width=100)
+        worker_line = next(
+            line for line in output.splitlines() if "w8" in line
+        )
+        self.assertIn("active", worker_line)
+        self.assertNotIn("trans", worker_line)
 
     def test_narrow_rendering_respects_width(self):
         output = render_overview(overview_report(), color=False, width=50)

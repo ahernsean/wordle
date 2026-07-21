@@ -235,7 +235,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const state=__reportClient.getState();
           const overview=await (await fetch('/api/view')).json();
           const stray={...overview.data.workers[0],worker_id:'worker-9',worker_number:'9',
-            branch_key_hex:'ff',branch_reference:'ffffffffffff',on_live_branch:false};
+            branch_key_hex:'ff',branch_reference:'ffffffffffff',on_active_branch:false};
           const next=structuredClone(overview);next.data.workers=[...overview.data.workers,stray];
           applyReport(next,overview,state);
           const card=document.querySelector('[data-identity="worker-9"]');
@@ -251,7 +251,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const workers=await (await fetch('/api/view/workers')).json();
           const stray={...workers.data.rows[0],worker_id:'worker-9',worker_number:'9',
             branch_key_hex:'ff',branch_reference:'ffffffffffff',is_live:true,
-            on_live_branch:false,state:'transitioning'};
+            on_active_branch:false,state:'transitioning'};
           const next=structuredClone(workers);next.data.rows=[...workers.data.rows,stray];
           applyReport(next,workers,state);
           const card=document.querySelector('[data-identity="worker-9"]');

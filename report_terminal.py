@@ -609,6 +609,11 @@ def _render_sections(report, previous_report, color, width, display_order):
     selected_statuses = report.get("filters", {}).get("branch_statuses") or []
     status_label = ",".join(selected_statuses) if selected_statuses else "all"
     branch_lines = [f"Branches (status={status_label})"]
+    # Which active branches are shown here decides the layout: a worker on one
+    # is drawn under its branch, everyone else falls to "Other workers".  This
+    # is a display concern (it tracks the filtered branch set), separate from
+    # on_active_branch, which the worker state below reads to tell a genuinely
+    # between-branches worker from one merely on an unshown branch.
     active_branch_keys = set()
     workers_by_branch = {}
     for worker in workers:
@@ -671,10 +676,13 @@ def _render_sections(report, previous_report, color, width, display_order):
             return "dead"
         if worker.get("branch_key_hex") is None:
             return "idle"
-        # Live, but its branch is not among the shown active branches: the
-        # branch it last reported has been finalized and removed, and the
-        # worker is between branches until its next heartbeat.
-        return "transitioning"
+        if not worker.get("on_active_branch", True):
+            # Its branch no longer has an active row: finalized and removed,
+            # and the worker is between branches until its next heartbeat.
+            return "transitioning"
+        # Live on an active branch that this view does not list (e.g. a branch
+        # filter hides it); still working, just not drawn under a branch.
+        return "active"
 
     if remaining_workers:
         remaining_worker_lines.extend(_worker_lines(
@@ -808,7 +816,7 @@ def _worker_display_row(worker, generated_at, state):
     )
     row["display_state"] = {
         "finalizing": "final",
-        "transitioning": "moving",
+        "transitioning": "trans",
     }.get(state or "active", state or "active")
     row["display_age"] = _abbreviate_duration(age)
     candidate = worker.get("current_candidate")
@@ -1039,7 +1047,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             indent="  ", color=color,
             state=lambda worker: (
                 "dead" if not worker["is_live"]
-                else "transitioning" if not worker.get("on_live_branch", True)
+                else "transitioning" if not worker.get("on_active_branch", True)
                 else "active"
             ),
         ))

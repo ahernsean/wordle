@@ -293,7 +293,7 @@
       // Live worker still naming a branch whose active row is gone: its branch
       // was finalized and removed, and it is between branches until its next
       // heartbeat.
-      const transitioning=worker.is_live&&!!worker.branch_key_hex&&worker.on_live_branch===false;
+      const transitioning=worker.is_live&&!!worker.branch_key_hex&&worker.on_active_branch===false;
       const stateClass=!worker.is_live?"dead":transitioning?"transitioning":branchPhase==="finalizing"?"finalizing":age>20?"stale":"";
       const workerState=!worker.is_live?"dead":!worker.branch_key_hex?"idle":transitioning?"transitioning":branchPhase==="finalizing"?"finalizing":(age>20?"stale":"working");
       const card=element("article",("card worker "+stateClass+" "+workerChangeClass(worker,previous)).trim());card.dataset.identity=worker.worker_id;
