@@ -285,6 +285,57 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(len(report["data"]["workers"]), 2)
         self.assertEqual(sum(worker["is_live"] for worker in report["data"]["workers"]), 1)
 
+    def test_worker_on_removed_branch_is_not_on_a_live_branch(self):
+        now = int(time.time())
+        live_key = b"live-branch-xx"
+        removed_key = b"gone-branch-xx"
+        queue = self._open_queue()
+        queue.create_branch(live_key, 2, 4)
+        queue.heartbeat("worker-1", 1, live_key, 2, now, 0)
+        # worker-2 still names a branch that has no pending or active row, as
+        # happens for one heartbeat interval after a branch is finalized and
+        # removed while the worker moves on to its next claim.
+        queue.heartbeat("worker-2", 2, removed_key, 2, now, 0)
+        queue.close()
+        with patch("report_model.time.time", return_value=now):
+            report = collect_overview_report(self.sources)
+        branch_keys = {
+            row["branch_key_hex"] for row in report["data"]["branches"]
+        }
+        self.assertEqual(branch_keys, {live_key.hex()})
+        workers = {
+            worker["worker_id"]: worker for worker in report["data"]["workers"]
+        }
+        self.assertTrue(workers["worker-1"]["on_active_branch"])
+        self.assertFalse(workers["worker-2"]["on_active_branch"])
+
+    def test_idle_worker_is_not_on_a_live_branch(self):
+        now = int(time.time())
+        queue = self._open_queue()
+        queue.heartbeat("worker-1", 1, None, 0, now, 0)
+        queue.close()
+        with patch("report_model.time.time", return_value=now):
+            report = collect_overview_report(self.sources)
+        worker = report["data"]["workers"][0]
+        self.assertIsNone(worker["branch_key_hex"])
+        self.assertFalse(worker["on_active_branch"])
+
+    def test_branch_worker_without_candidate_is_coordinating(self):
+        now = int(time.time())
+        key = b"coord-branch-x"
+        queue = self._open_queue()
+        queue.create_branch(key, 2, 4)
+        queue.heartbeat("worker-1", 1, key, 2, now, 0, cur_candidate="crane")
+        queue.heartbeat("worker-2", 2, key, 2, now, 0)
+        queue.close()
+        with patch("report_model.time.time", return_value=now):
+            report = collect_overview_report(self.sources)
+        workers = {
+            worker["worker_id"]: worker for worker in report["data"]["workers"]
+        }
+        self.assertEqual(workers["worker-1"]["state"], "working")
+        self.assertEqual(workers["worker-2"]["state"], "coordinating")
+
     def test_overview_status_filter_tracks_worker_arrival_and_departure(self):
         now = int(time.time())
         working_key = b"working-branch"

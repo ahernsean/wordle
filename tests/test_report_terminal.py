@@ -206,6 +206,34 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("w2", output)
         self.assertIn("w3", output)
 
+    def test_renders_the_model_worker_state_in_other_workers(self):
+        # The terminal renders whatever state the model set; it no longer
+        # re-derives it, so a transitioning worker shows as "trans".
+        report = overview_report()
+        stray = deepcopy(report["data"]["workers"][0])
+        stray.update({
+            "worker_id": "worker-7", "worker_number": "7",
+            "branch_reference": "cccccccccccc", "branch_key_hex": "cccc",
+            "state": "transitioning",
+        })
+        report["data"]["workers"].append(stray)
+        output = render_overview(report, color=False, width=100)
+        self.assertIn("Other workers", output)
+        worker_line = next(
+            line for line in output.splitlines() if "w7" in line
+        )
+        self.assertIn("trans", worker_line)
+
+    def test_working_worker_under_its_branch_shows_model_state(self):
+        report = overview_report()
+        report["data"]["workers"][0]["state"] = "working"
+        output = render_overview(report, color=False, width=100)
+        worker_line = next(
+            line for line in output.splitlines() if "w2" in line
+        )
+        self.assertIn("working", worker_line)
+        self.assertNotIn("trans", worker_line)
+
     def test_narrow_rendering_respects_width(self):
         output = render_overview(overview_report(), color=False, width=50)
         self.assertTrue(all(len(line) <= 50 for line in output.splitlines()))

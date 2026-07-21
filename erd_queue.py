@@ -1327,14 +1327,18 @@ class ERDQueue:
 
         source_word/pattern/priority come from active_branches (the branch the
         worker is on), so the health display can label a worker by the branch
-        it's helping rather than by an opaque key.
+        it's helping rather than by an opaque key.  on_active_branch is 1 when
+        that branch still has an active row and 0 once it has been finalized
+        and removed, so a display can tell a working worker apart from one
+        between branches.
         """
         return self._conn.execute("""
             SELECT h.*,
                    bk.branch_key AS current_branch_key,
                    b.priority,
                    b.source_word,
-                   b.source_pattern
+                   b.source_pattern,
+                   b.branch_id IS NOT NULL AS on_active_branch
             FROM worker_heartbeat h
             LEFT JOIN active_branches b
                    ON h.current_branch_id = b.branch_id

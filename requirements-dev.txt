@@ -1,0 +1,10 @@
+# Development and test dependencies.  Install with:
+#   pip install -r requirements-dev.txt
+#
+# Playwright drives the browser contract tests in tests/test_report_client.py.
+# Install the Python package only; do NOT run "playwright install" in the
+# managed environment — a Chromium build is already present under
+# PLAYWRIGHT_BROWSERS_PATH, and the browser tests launch it by path when the
+# package's bundled revision is absent (see ReportClientBrowserTest).
+-r requirements.txt
+playwright

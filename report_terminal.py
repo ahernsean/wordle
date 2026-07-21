@@ -502,6 +502,12 @@ def _semantic_worker_class(worker, previous_worker, generated_at):
     return "green" if previous_worker is None else None
 
 
+def _worker_state(worker):
+    """The model-computed worker state (report_model.worker_state), with a
+    fallback for any report that predates or omits it."""
+    return worker.get("state") or "working"
+
+
 def _colorize(line, semantic_class, color):
     if not color:
         return line
@@ -609,6 +615,10 @@ def _render_sections(report, previous_report, color, width, display_order):
     selected_statuses = report.get("filters", {}).get("branch_statuses") or []
     status_label = ",".join(selected_statuses) if selected_statuses else "all"
     branch_lines = [f"Branches (status={status_label})"]
+    # Which active branches are shown here decides the layout: a worker on one
+    # is drawn under its branch, everyone else falls to "Other workers".  This
+    # is a display concern (it tracks the filtered branch set), independent of
+    # each worker's state, which the model computes and both clients render.
     active_branch_keys = set()
     workers_by_branch = {}
     for worker in workers:
@@ -655,7 +665,7 @@ def _render_sections(report, previous_report, color, width, display_order):
             branch_lines.extend(_worker_lines(
                 live_branch_workers, previous_workers, generated_at,
                 previous_generated_at, width, indent="    ", color=color,
-                state=lambda worker: "active",
+                state=_worker_state,
             ))
     if len(branch_lines) == 1:
         branch_lines.append("  none")
@@ -666,18 +676,11 @@ def _render_sections(report, previous_report, color, width, display_order):
         if not (worker["is_live"] and worker.get("branch_key_hex") in active_branch_keys)
     ]
 
-    def remaining_state(worker):
-        if not worker["is_live"]:
-            return "dead"
-        if worker.get("branch_key_hex") is None:
-            return "idle"
-        return "finalizing"
-
     if remaining_workers:
         remaining_worker_lines.extend(_worker_lines(
             remaining_workers, previous_workers, generated_at,
             previous_generated_at, width, indent="  ", color=color,
-            state=remaining_state,
+            state=_worker_state,
         ))
     else:
         remaining_worker_lines.append("  none")
@@ -805,6 +808,8 @@ def _worker_display_row(worker, generated_at, state):
     )
     row["display_state"] = {
         "finalizing": "final",
+        "transitioning": "trans",
+        "coordinating": "coord",
     }.get(state or "active", state or "active")
     row["display_age"] = _abbreviate_duration(age)
     candidate = worker.get("current_candidate")
@@ -1033,7 +1038,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             ordered_workers, previous_workers, report["generated_at"],
             (previous_report or report)["generated_at"], width,
             indent="  ", color=color,
-            state=lambda worker: "active" if worker["is_live"] else "dead",
+            state=_worker_state,
         ))
     else:
         worker_lines.append("  none")
@@ -1211,9 +1216,7 @@ def _render_workers_collection_sections(report, previous_report, color, width, d
             ordered_workers, previous_by_id, report["generated_at"],
             (previous_report or report)["generated_at"], width,
             indent="  ", color=color,
-            state=lambda worker: worker.get("state") or (
-                "active" if worker["is_live"] else "dead"
-            ),
+            state=_worker_state,
         ))
     return [("header", header), ("worker_rows", lines)]
 
