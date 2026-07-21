@@ -206,6 +206,20 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("w2", output)
         self.assertIn("w3", output)
 
+    def test_worker_on_removed_branch_renders_as_transitioning(self):
+        report = overview_report()
+        stray = deepcopy(report["data"]["workers"][0])
+        stray.update({
+            "worker_id": "worker-7", "worker_number": "7",
+            "branch_reference": "cccccccccccc", "branch_key_hex": "cccc",
+            "on_live_branch": False,
+        })
+        report["data"]["workers"].append(stray)
+        output = render_overview(report, color=False, width=100)
+        self.assertIn("Other workers", output)
+        self.assertIn("w7", output)
+        self.assertIn("moving", output)
+
     def test_narrow_rendering_respects_width(self):
         output = render_overview(overview_report(), color=False, width=50)
         self.assertTrue(all(len(line) <= 50 for line in output.splitlines()))

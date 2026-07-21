@@ -189,6 +189,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("worker-0", text)
         self.assertGreater(self.page.locator(".card.dead").count(), 0)
 
+    def test_worker_on_removed_branch_renders_as_transitioning(self):
+        result = self.page.evaluate("""async () => {
+          const state=__reportClient.getState();
+          const overview=await (await fetch('/api/view')).json();
+          const stray={...overview.data.workers[0],worker_id:'worker-9',worker_number:'9',
+            branch_key_hex:'ff',branch_reference:'ffffffffffff',on_live_branch:false};
+          const next=structuredClone(overview);next.data.workers=[...overview.data.workers,stray];
+          applyReport(next,overview,state);
+          const card=document.querySelector('[data-identity="worker-9"]');
+          return {className:card.className,text:card.innerText};
+        }""")
+        self.assertIn("transitioning", result["className"])
+        self.assertIn("transitioning", result["text"])
+        self.assertNotIn("working", result["text"])
+
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))

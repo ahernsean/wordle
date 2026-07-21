@@ -671,7 +671,10 @@ def _render_sections(report, previous_report, color, width, display_order):
             return "dead"
         if worker.get("branch_key_hex") is None:
             return "idle"
-        return "finalizing"
+        # Live, but its branch is not among the shown active branches: the
+        # branch it last reported has been finalized and removed, and the
+        # worker is between branches until its next heartbeat.
+        return "transitioning"
 
     if remaining_workers:
         remaining_worker_lines.extend(_worker_lines(
@@ -805,6 +808,7 @@ def _worker_display_row(worker, generated_at, state):
     )
     row["display_state"] = {
         "finalizing": "final",
+        "transitioning": "moving",
     }.get(state or "active", state or "active")
     row["display_age"] = _abbreviate_duration(age)
     candidate = worker.get("current_candidate")

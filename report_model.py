@@ -582,6 +582,22 @@ def _queue_overview(sources, generated_at, answer_set, report):
             _normalize_worker(row, generated_at, answer_set) for row in heartbeats
         ]
         workers.sort(key=_worker_sort_key)
+        # A worker's heartbeat can still name a branch that has since been
+        # finalized and removed from the queue, until its next heartbeat.  Such
+        # a branch has no active row, so the branch panel omits it; on_live_branch
+        # marks whether the worker's branch is still one of those shown active
+        # branches, so a display can show the worker transitioning between
+        # branches rather than implying work on a branch that is not listed.
+        active_branch_keys = {
+            branch["branch_key_hex"]
+            for branch in normalized_rows
+            if branch["branch_status"] == "active"
+        }
+        for worker in workers:
+            worker["on_live_branch"] = (
+                worker["branch_key_hex"] is not None
+                and worker["branch_key_hex"] in active_branch_keys
+            )
         worker_total_keys = tuple(report["data"]["worker_totals"])
         worker_totals = {
             key: sum(worker[key] for worker in workers if worker["is_live"])
