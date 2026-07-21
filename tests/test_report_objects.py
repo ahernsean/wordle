@@ -633,7 +633,7 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(
             state_counts,
             {
-                "live": 1, "idle": 1, "transitioning": 1,
+                "working": 1, "idle": 1, "transitioning": 1,
                 "finalizing": 1, "stale": 1, "dead": 1,
             },
         )

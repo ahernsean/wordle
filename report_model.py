@@ -480,6 +480,30 @@ def _normalize_worker(row, generated_at, answer_set):
     }
 
 
+def worker_state(worker, generated_at, branch_phase):
+    """The one worker-state classification, shared by every report and both
+    clients.
+
+    Computed in the model and stored on each worker so the browser card and
+    the terminal render the same label from the same precedence rather than
+    each re-deriving it.  branch_phase is the phase of the worker's current
+    branch, or None when it has none listed.  A worker silent past
+    WORKER_STALE_SECONDS reads as stale regardless of its branch: the order
+    below is the single source of truth for how these conditions rank.
+    """
+    if not worker["is_live"]:
+        return "dead"
+    if generated_at - worker["updated_at"] > WORKER_STALE_SECONDS:
+        return "stale"
+    if worker["branch_key_hex"] is None:
+        return "idle"
+    if not worker["on_active_branch"]:
+        return "transitioning"
+    if branch_phase == "finalizing":
+        return "finalizing"
+    return "working"
+
+
 def _worker_sort_key(worker):
     worker_number = worker["worker_number"]
     if worker_number.isdigit():
@@ -586,6 +610,14 @@ def _queue_overview(sources, generated_at, answer_set, report):
             _normalize_worker(row, generated_at, answer_set) for row in heartbeats
         ]
         workers.sort(key=_worker_sort_key)
+        phase_by_key = {
+            branch["branch_key_hex"]: branch["branch_phase"]
+            for branch in normalized_rows
+        }
+        for worker in workers:
+            worker["state"] = worker_state(
+                worker, generated_at, phase_by_key.get(worker["branch_key_hex"])
+            )
         worker_total_keys = tuple(report["data"]["worker_totals"])
         worker_totals = {
             key: sum(worker[key] for worker in workers if worker["is_live"])
@@ -1094,6 +1126,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         "branch_status": branch_status,
         "branch_phase": branch_phase,
     })
+    for worker in workers:
+        worker["state"] = worker_state(worker, generated_at, branch_phase)
     progress = {
         "completed_candidate_count": sum(bool(row["done"]) for row in claim_rows),
         "bulk_completed_candidate_count": _row_value(
@@ -1505,7 +1539,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
             row["branch_key_hex"]: row["branch_phase"] for row in scoped_rows
         }
         by_state = {
-            "live": 0,
+            "working": 0,
             "idle": 0,
             "transitioning": 0,
             "finalizing": 0,
@@ -1513,19 +1547,9 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
             "dead": 0,
         }
         for worker in workers:
-            age = generated_at - worker["updated_at"]
-            if not worker["is_live"]:
-                state = "dead"
-            elif age > WORKER_STALE_SECONDS:
-                state = "stale"
-            elif worker["branch_key_hex"] is None:
-                state = "idle"
-            elif not worker["on_active_branch"]:
-                state = "transitioning"
-            elif phase_by_key.get(worker["branch_key_hex"]) == "finalizing":
-                state = "finalizing"
-            else:
-                state = "live"
+            state = worker_state(
+                worker, generated_at, phase_by_key.get(worker["branch_key_hex"])
+            )
             worker["state"] = state
             by_state[state] += 1
         workers.sort(key=_worker_sort_key)

@@ -235,7 +235,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const state=__reportClient.getState();
           const overview=await (await fetch('/api/view')).json();
           const stray={...overview.data.workers[0],worker_id:'worker-9',worker_number:'9',
-            branch_key_hex:'ff',branch_reference:'ffffffffffff',on_active_branch:false};
+            branch_key_hex:'ff',branch_reference:'ffffffffffff',state:'transitioning'};
           const next=structuredClone(overview);next.data.workers=[...overview.data.workers,stray];
           applyReport(next,overview,state);
           const card=document.querySelector('[data-identity="worker-9"]');
