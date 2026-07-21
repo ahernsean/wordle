@@ -64,6 +64,7 @@ def _bare_worker():
     w._last_wal_ceiling_check = 0.0
     w._wal_ceiling_hit = False
     w._cand_max_depth = 0
+    w._cur_candidate = None
     w._cur_depth = 0
     w._spine = {}
     w._hb_max_spine = {}
@@ -126,6 +127,23 @@ class TestHeartbeatThrottling(unittest.TestCase):
         branch_key = ScoreCache.encode_subset(BRANCH)
         w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
         self.assertEqual(w._hb_max_spine, {})
+
+    def test_heartbeat_reports_worker_cur_candidate(self):
+        """The DB write carries the worker's in-flight candidate — a heartbeat
+        reports current state, so a coordination heartbeat (cur_candidate
+        cleared) records None even while the worker still holds its branch."""
+        w = _bare_worker()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w._cur_candidate = "crane"
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
+        self.assertEqual(
+            w.queue.heartbeat.call_args.kwargs["cur_candidate"], "crane")
+
+        w._cur_candidate = None
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
+        self.assertIsNone(
+            w.queue.heartbeat.call_args.kwargs["cur_candidate"])
 
 
 class TestPromotedSpine(unittest.TestCase):

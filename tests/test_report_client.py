@@ -245,6 +245,27 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("transitioning", result["text"])
         self.assertNotIn("working", result["text"])
 
+    def test_worker_on_active_branch_without_candidate_renders_as_coordinating(self):
+        result = self.page.evaluate("""async () => {
+          const state=__reportClient.getState();
+          const overview=await (await fetch('/api/view')).json();
+          const base=overview.data.workers[0];
+          const working={...base,worker_id:'worker-8',worker_number:'8',
+            current_candidate:'crane',current_candidate_is_answer:false};
+          const coordinating={...base,worker_id:'worker-9',worker_number:'9',
+            current_candidate:null,current_candidate_is_answer:false};
+          const next=structuredClone(overview);
+          next.data.workers=[working,coordinating];
+          applyReport(next,overview,state);
+          const read=id=>document.querySelector(`[data-identity="${id}"]`).innerText;
+          return {working:read('worker-8'),coordinating:read('worker-9')};
+        }""")
+        self.assertIn("working", result["working"])
+        self.assertIn("CRANE", result["working"])
+        self.assertIn("coordinating", result["coordinating"])
+        self.assertNotIn("working", result["coordinating"])
+        self.assertIn("—", result["coordinating"])
+
     def test_workers_tab_renders_removed_branch_worker_as_transitioning(self):
         result = self.page.evaluate("""async () => {
           const state={...__reportClient.getState(),kind:'workers'};
