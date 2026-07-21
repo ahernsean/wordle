@@ -211,7 +211,8 @@
       treeButton.setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
       byId("sort").value=currentState.sort;byId("by").value=currentState.by;
-      document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",button.dataset.kind===currentState.kind?"page":"false"));
+      const isOverview=currentState.kind==="auto"&&currentState.selector===""&&!currentState.tree;
+      document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
     }
@@ -406,7 +407,7 @@
       const republishedList=data.republished_candidates||[];
       const republishedSummary=republishedList.length?numText(republishedList.length)+(republishedList.length===1?" candidate":" candidates")+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)":null;
       if(bundlePairs.length||republishedSummary)fragment.append(section("Bundle and republish",kv([...bundlePairs,["candidates re-queued",republishedSummary]])));
-      const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
+      const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words ("+numText(branch.answer_count)+")"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
       const claimSummary=data.claim_summary;
       if(claimSummary&&claimSummary.total_claim_count){
         const completion=[numText(claimSummary.done_count)+" done",numText(claimSummary.evaluated_count)+" evaluated",numText(claimSummary.bulk_eliminated_count)+" bulk proofs"];
