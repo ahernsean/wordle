@@ -809,6 +809,7 @@ def _worker_display_row(worker, generated_at, state):
     row["display_state"] = {
         "finalizing": "final",
         "transitioning": "trans",
+        "coordinating": "coord",
     }.get(state or "active", state or "active")
     row["display_age"] = _abbreviate_duration(age)
     candidate = worker.get("current_candidate")

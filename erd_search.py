@@ -5,14 +5,15 @@ Subcommands
 -----------
 start           Start the supervisor and the report web server via systemd
                 (systemctl --user start), unless each is already running.
-                --workers-only starts the supervisor alone.
+                --swarm-only starts the supervisor alone; --web-only starts
+                the report web server alone.
 stop            Stop the supervisor and the report web server via systemd
-                (systemctl --user stop).  --workers-only stops the supervisor
-                alone, leaving the report web server running.
+                (systemctl --user stop).  --swarm-only stops the supervisor
+                alone; --web-only stops the report web server alone.
 restart         Restart the supervisor and the report web server via systemd
                 (systemctl --user restart): a stop followed by a start in one
-                step, per service.  --workers-only restarts the supervisor
-                alone.
+                step, per service.  --swarm-only restarts the supervisor
+                alone; --web-only restarts the report web server alone.
 
 view            Shared swarm reports in text, JSON, or watched JSON Lines.
 
@@ -380,9 +381,30 @@ def _run_systemctl(service: str, action: str, *extra: str) -> int:
     return result.returncode
 
 
+def _service_scope_noun(args) -> str:
+    """The subject describing which services a scoped command acted on."""
+    if args.swarm_only:
+        return 'Supervisor'
+    if args.web_only:
+        return 'Report server'
+    return 'Supervisor and report server'
+
+
+def _add_service_scope_flags(parser, verb: str) -> None:
+    """Add the mutually exclusive --swarm-only / --web-only scope flags shared
+    by start, stop, and restart.  Neither flag means act on both services."""
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        '--swarm-only', action='store_true',
+        help=f'{verb} the supervisor only; leave the report web server alone')
+    scope.add_argument(
+        '--web-only', action='store_true',
+        help=f'{verb} the report web server only; leave the supervisor alone')
+
+
 def _start_or_restart_services(args, action: str) -> None:
     """Shared body for `start` and `restart`: run `systemctl <action>` on the
-    supervisor, then, unless --workers-only, on the report server too.
+    supervisor (unless --web-only) and the report server (unless --swarm-only).
 
     A supervisor failure aborts before touching the report server: a broken
     supervisor is the primary problem, and the report server has nothing new
@@ -390,16 +412,17 @@ def _start_or_restart_services(args, action: str) -> None:
     server is attempted independently and its failure is reported without
     undoing the supervisor action -- these are two separately-managed
     services, not a transaction."""
-    rc = _run_systemctl(_SYSTEMD_SERVICE, action)
-    if rc != 0:
-        print(f'systemctl {action} failed (exit {rc}).  '
-              f'Is the service installed?  '
-              f'Check: systemctl --user status {_SYSTEMD_SERVICE}',
-              file=sys.stderr)
-        sys.exit(rc)
+    if not args.web_only:
+        rc = _run_systemctl(_SYSTEMD_SERVICE, action)
+        if rc != 0:
+            print(f'systemctl {action} failed (exit {rc}).  '
+                  f'Is the service installed?  '
+                  f'Check: systemctl --user status {_SYSTEMD_SERVICE}',
+                  file=sys.stderr)
+            sys.exit(rc)
 
     server_rc = 0
-    if not args.workers_only:
+    if not args.swarm_only:
         server_rc = _run_systemctl(_REPORT_SERVER_SYSTEMD_SERVICE, action)
         if server_rc != 0:
             print(f'systemctl {action} failed (exit {server_rc}).  '
@@ -408,50 +431,50 @@ def _start_or_restart_services(args, action: str) -> None:
                   f'{_REPORT_SERVER_SYSTEMD_SERVICE}',
                   file=sys.stderr)
 
-    _run_systemctl(_SYSTEMD_SERVICE, 'status', '--no-pager')
-    if not args.workers_only:
+    if not args.web_only:
+        _run_systemctl(_SYSTEMD_SERVICE, 'status', '--no-pager')
+    if not args.swarm_only:
         _run_systemctl(_REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager')
     if server_rc != 0:
         sys.exit(server_rc)
 
 
 def cmd_start(args):
-    """Start the supervisor via systemd, and the report web server too
-    unless --workers-only is given.  Starting a service that is already
-    running is a no-op."""
+    """Start the supervisor and the report web server via systemd, scoped by
+    --swarm-only / --web-only.  Starting a service that is already running is a
+    no-op."""
     _start_or_restart_services(args, 'start')
 
 
 def cmd_stop(args):
-    """Stop the supervisor via systemd, and the report web server too unless
-    --workers-only is given.
+    """Stop the supervisor and the report web server via systemd, scoped by
+    --swarm-only / --web-only.
 
     Both stops are attempted even if the first fails: stopping is best-effort
     cleanup, not a pipeline, so a failure on one service must never skip the
     other."""
-    rc = _run_systemctl(_SYSTEMD_SERVICE, 'stop')
-    if rc != 0:
-        print(f'systemctl stop failed (exit {rc}).', file=sys.stderr)
+    rc = 0
+    if not args.web_only:
+        rc = _run_systemctl(_SYSTEMD_SERVICE, 'stop')
+        if rc != 0:
+            print(f'systemctl stop failed (exit {rc}).', file=sys.stderr)
 
     server_rc = 0
-    if not args.workers_only:
+    if not args.swarm_only:
         server_rc = _run_systemctl(_REPORT_SERVER_SYSTEMD_SERVICE, 'stop')
         if server_rc != 0:
             print(f'systemctl stop failed for report server (exit '
                   f'{server_rc}).', file=sys.stderr)
 
     if rc == 0 and server_rc == 0:
-        if args.workers_only:
-            print('Supervisor stopped.')
-        else:
-            print('Supervisor and report server stopped.')
+        print(f'{_service_scope_noun(args)} stopped.')
     else:
         sys.exit(rc or server_rc)
 
 
 def cmd_restart(args):
-    """Restart the supervisor via systemd, and the report web server too
-    unless --workers-only is given (stop + start in one step, per service)."""
+    """Restart the supervisor and the report web server via systemd, scoped by
+    --swarm-only / --web-only (stop + start in one step, per service)."""
     _start_or_restart_services(args, 'restart')
 
 
@@ -991,27 +1014,21 @@ def main():
         'start',
         help='Start the supervisor and the report web server via systemd '
              '(systemctl --user start wordle-erd wordle-report-server)')
-    p_start.add_argument('--workers-only', action='store_true',
-                          help='Start the supervisor only; leave the report '
-                               'web server alone')
+    _add_service_scope_flags(p_start, 'Start')
 
     # -- stop --
     p_stop = sub.add_parser(
         'stop',
         help='Stop the supervisor and the report web server via systemd '
              '(systemctl --user stop wordle-erd wordle-report-server)')
-    p_stop.add_argument('--workers-only', action='store_true',
-                         help='Stop the supervisor only; leave the report '
-                              'web server running')
+    _add_service_scope_flags(p_stop, 'Stop')
 
     # -- restart --
     p_restart = sub.add_parser(
         'restart',
         help='Restart the supervisor and the report web server via systemd '
              '(systemctl --user restart wordle-erd wordle-report-server)')
-    p_restart.add_argument('--workers-only', action='store_true',
-                            help='Restart the supervisor only; leave the '
-                                 'report web server alone')
+    _add_service_scope_flags(p_restart, 'Restart')
 
     # -- queue reset-stale --
     p_rst = qsub.add_parser('reset-stale',

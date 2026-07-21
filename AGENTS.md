@@ -243,13 +243,22 @@ pip install -r requirements.txt       # runtime only (numpy)
   matching browser revisions. Without the package the browser tests skip; set
   `REQUIRE_PLAYWRIGHT_BROWSER=1` to make them hard-fail instead of skipping.
 
+  **On rocky, playwright is installed only under `python3.13`** (in
+  `~/.local/lib/python3.13/site-packages`). The default `python`/`python3` is
+  3.9, which has numpy but **not** playwright — run the suite under it and the
+  browser tests silently skip. Run with `python3.13` to actually exercise
+  `tests/test_report_client.py`.
+
 ## Before committing and pushing
 
 Always run the test suite before committing and pushing:
 
 ```
-python -m unittest discover -s tests -t . -p 'test_*.py'
+python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
 ```
+
+Use `python3.13`, not the default `python` (3.9): only 3.13 has playwright, so
+under 3.9 the browser contract tests skip rather than run.
 
 Commits with failing tests must not be pushed.
 

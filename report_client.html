@@ -290,8 +290,9 @@
     }
     function workerCard(worker,previous,generatedAt){
       const age=Math.max(0,generatedAt-worker.updated_at);
-      // The model computes the one worker state (see report_model.worker_state);
-      // the card only chooses a border for the states that warrant one.
+      // The model computes the one worker state (see report_model.worker_state),
+      // including working vs coordinating; the card only chooses a border for
+      // the states that warrant one.
       const workerState=worker.state||"working";
       const stateClass=["dead","transitioning","finalizing","stale"].includes(workerState)?workerState:"";
       const card=element("article",("card worker "+stateClass+" "+workerChangeClass(worker,previous)).trim());card.dataset.identity=worker.worker_id;

@@ -14,8 +14,8 @@ from unittest.mock import patch
 import erd_search
 
 
-def _args(workers_only=False):
-    return SimpleNamespace(workers_only=workers_only)
+def _args(swarm_only=False, web_only=False):
+    return SimpleNamespace(swarm_only=swarm_only, web_only=web_only)
 
 
 def _services_acted_on(run):
@@ -32,10 +32,18 @@ class CmdStartTest(unittest.TestCase):
         run.assert_any_call(
             erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager')
 
-    def test_workers_only_skips_report_server(self):
+    def test_swarm_only_skips_report_server(self):
         with patch.object(erd_search, '_run_systemctl', return_value=0) as run:
-            erd_search.cmd_start(_args(workers_only=True))
+            erd_search.cmd_start(_args(swarm_only=True))
         self.assertEqual(_services_acted_on(run), {erd_search._SYSTEMD_SERVICE})
+
+    def test_web_only_skips_supervisor(self):
+        with patch.object(erd_search, '_run_systemctl', return_value=0) as run:
+            erd_search.cmd_start(_args(web_only=True))
+        self.assertEqual(
+            _services_acted_on(run),
+            {erd_search._REPORT_SERVER_SYSTEMD_SERVICE},
+        )
 
     def test_aborts_before_report_server_when_supervisor_fails(self):
         def fake(service, action, *extra):
@@ -82,15 +90,28 @@ class CmdStopTest(unittest.TestCase):
         run.assert_any_call(erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'stop')
         self.assertIn('Supervisor and report server stopped.', out.getvalue())
 
-    def test_workers_only_skips_report_server_and_message(self):
+    def test_swarm_only_skips_report_server_and_message(self):
         with (
             patch.object(erd_search, '_run_systemctl', return_value=0) as run,
             patch('sys.stdout', io.StringIO()) as out,
         ):
-            erd_search.cmd_stop(_args(workers_only=True))
+            erd_search.cmd_stop(_args(swarm_only=True))
         self.assertEqual(_services_acted_on(run), {erd_search._SYSTEMD_SERVICE})
         self.assertIn('Supervisor stopped.', out.getvalue())
         self.assertNotIn('report server', out.getvalue())
+
+    def test_web_only_skips_supervisor_and_message(self):
+        with (
+            patch.object(erd_search, '_run_systemctl', return_value=0) as run,
+            patch('sys.stdout', io.StringIO()) as out,
+        ):
+            erd_search.cmd_stop(_args(web_only=True))
+        self.assertEqual(
+            _services_acted_on(run),
+            {erd_search._REPORT_SERVER_SYSTEMD_SERVICE},
+        )
+        self.assertIn('Report server stopped.', out.getvalue())
+        self.assertNotIn('Supervisor', out.getvalue())
 
     def test_attempts_report_server_even_if_supervisor_stop_fails(self):
         def fake(service, action, *extra):
@@ -113,10 +134,18 @@ class CmdRestartTest(unittest.TestCase):
         run.assert_any_call(erd_search._SYSTEMD_SERVICE, 'restart')
         run.assert_any_call(erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'restart')
 
-    def test_workers_only_skips_report_server(self):
+    def test_swarm_only_skips_report_server(self):
         with patch.object(erd_search, '_run_systemctl', return_value=0) as run:
-            erd_search.cmd_restart(_args(workers_only=True))
+            erd_search.cmd_restart(_args(swarm_only=True))
         self.assertEqual(_services_acted_on(run), {erd_search._SYSTEMD_SERVICE})
+
+    def test_web_only_skips_supervisor(self):
+        with patch.object(erd_search, '_run_systemctl', return_value=0) as run:
+            erd_search.cmd_restart(_args(web_only=True))
+        self.assertEqual(
+            _services_acted_on(run),
+            {erd_search._REPORT_SERVER_SYSTEMD_SERVICE},
+        )
 
     def test_aborts_before_report_server_when_supervisor_fails(self):
         def fake(service, action, *extra):
@@ -133,23 +162,40 @@ class CmdRestartTest(unittest.TestCase):
 
 
 class StartStopRestartCliParsingTest(unittest.TestCase):
-    """--workers-only must parse on all three lifecycle subcommands."""
+    """--swarm-only / --web-only must parse on all three lifecycle subcommands
+    and be mutually exclusive."""
 
-    def test_workers_only_flag_parses_and_dispatches(self):
+    def test_scope_flags_parse_and_dispatch(self):
         for subcommand, handler_name in (
             ('start', 'cmd_start'),
             ('stop', 'cmd_stop'),
             ('restart', 'cmd_restart'),
         ):
+            for flag, attribute in (
+                ('--swarm-only', 'swarm_only'),
+                ('--web-only', 'web_only'),
+            ):
+                with self.subTest(subcommand=subcommand, flag=flag):
+                    with (
+                        patch('sys.argv',
+                              ['erd_search.py', subcommand, flag]),
+                        patch.object(erd_search, handler_name) as handler,
+                    ):
+                        erd_search.main()
+                    args = handler.call_args.args[0]
+                    self.assertTrue(getattr(args, attribute))
+
+    def test_scope_flags_are_mutually_exclusive(self):
+        for subcommand in ('start', 'stop', 'restart'):
             with self.subTest(subcommand=subcommand):
                 with (
-                    patch('sys.argv',
-                          ['erd_search.py', subcommand, '--workers-only']),
-                    patch.object(erd_search, handler_name) as handler,
+                    patch('sys.argv', ['erd_search.py', subcommand,
+                                       '--swarm-only', '--web-only']),
+                    patch('sys.stderr', io.StringIO()),
+                    self.assertRaises(SystemExit) as raised,
                 ):
                     erd_search.main()
-                args = handler.call_args.args[0]
-                self.assertTrue(args.workers_only)
+                self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == '__main__':

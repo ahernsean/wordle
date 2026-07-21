@@ -607,15 +607,20 @@ class SemanticReportTest(unittest.TestCase):
         # worker-6 names a branch that has no active row, as after a finalize
         # removes the branch while the worker moves to its next claim.
         removed_key = b"voidremove"
-        for worker_id, branch_key in (
-            ("worker-1", active_key),
-            ("worker-2", None),
-            ("worker-3", finalizing_key),
-            ("worker-4", active_key),
-            ("worker-5", other_key),
-            ("worker-6", removed_key),
+        # worker-7 holds an active branch but names no candidate: coordinating.
+        for worker_id, branch_key, candidate in (
+            ("worker-1", active_key, "crane"),
+            ("worker-2", None, None),
+            ("worker-3", finalizing_key, "crane"),
+            ("worker-4", active_key, "crane"),
+            ("worker-5", other_key, "crane"),
+            ("worker-6", removed_key, "crane"),
+            ("worker-7", active_key, None),
         ):
-            queue.heartbeat(worker_id, int(worker_id.split("-")[1]), branch_key, 2, now, 0)
+            queue.heartbeat(
+                worker_id, int(worker_id.split("-")[1]), branch_key, 2, now, 0,
+                cur_candidate=candidate,
+            )
         queue._conn.execute(
             "UPDATE worker_heartbeat SET updated_at = ? WHERE worker_id = 'worker-4'",
             (now - 25,),
@@ -633,11 +638,11 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(
             state_counts,
             {
-                "working": 1, "idle": 1, "transitioning": 1,
+                "working": 1, "coordinating": 1, "idle": 1, "transitioning": 1,
                 "finalizing": 1, "stale": 1, "dead": 1,
             },
         )
-        self.assertEqual(sum(state_counts.values()), 6)
+        self.assertEqual(sum(state_counts.values()), 7)
 
         tree_report = collect_report(self.sources, ReportRequest(
             report_kind="workers", tree=True, worker_id="1"

@@ -501,6 +501,11 @@ def worker_state(worker, generated_at, branch_phase):
         return "transitioning"
     if branch_phase == "finalizing":
         return "finalizing"
+    # Holding a branch but naming no candidate: between candidates on a
+    # coordination wait (all siblings' claims taken, or awaiting a rival's
+    # finalize), not evaluating.
+    if not worker["current_candidate"]:
+        return "coordinating"
     return "working"
 
 
@@ -1540,6 +1545,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
         }
         by_state = {
             "working": 0,
+            "coordinating": 0,
             "idle": 0,
             "transitioning": 0,
             "finalizing": 0,

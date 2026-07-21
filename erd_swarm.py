@@ -511,6 +511,10 @@ class _BranchWorker:
         self._last_wal_ceiling_check = 0.0
         self._wal_ceiling_hit = False
         self._cand_max_depth = 0     # deepest guess_depth reached this candidate
+        # The candidate under evaluation right now, or None when no work is in
+        # flight (idle, or coordinating without a candidate).  A heartbeat
+        # reports this; it is not re-supplied per call.
+        self._cur_candidate = None
         # Live search probe (transparency): a monotonic node counter plus the
         # active descent spine, so a long candidate evaluation never looks
         # frozen — node count climbs every heartbeat even mid-candidate.
@@ -905,7 +909,7 @@ class _BranchWorker:
 
     def _heartbeat(self, branch_key, n_words, claim_idx, claim_started_at,
                    best_guess, best_erd, force=False,
-                   bound_erd=None, cur_candidate=None):
+                   bound_erd=None):
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
         self._nodes += 1
@@ -941,19 +945,19 @@ class _BranchWorker:
             cache_misses=self.score_cache.read_misses,
             n_cutoff=self.n_cutoff, n_pruned=self.n_pruned, n_ok=self.n_ok,
             best_guess=best_guess, best_erd=best_erd, bound_erd=bound_erd,
-            cur_candidate=cur_candidate,
+            cur_candidate=self._cur_candidate,
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._hb_spine_str())
         self._hb_max_spine = {}
-        if cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
+        if self._cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
             self._last_progress_log = now
             be = f'{best_erd:.4f}' if best_erd is not None else '-'
             bg = (best_guess or '-').upper()
             logger.info('%s claim %d: %s in progress  '
                         'guess_depth=%d path=%s  %.1fM nodes %.0fk/s  best=%s %s',
                         self.name, claim_idx,
-                        cur_candidate.upper(),
+                        self._cur_candidate.upper(),
                         self._cand_max_depth, self._log_spine_str(),
                         self._nodes / 1e6, node_rate / 1e3, bg, be)
             self._log_max_spine = {}
@@ -1060,6 +1064,7 @@ class _BranchWorker:
         branch — see ERDQueue.mark_branch_tainted).
         """
         candidate = self.all_words[idx]
+        self._cur_candidate = candidate
         self._hb_max_spine = {}
         self._log_max_spine = {}
         local_candidate, local_best, branch_ceiling = \
@@ -1104,8 +1109,7 @@ class _BranchWorker:
         # evaluate in microseconds.  Liveness and the cur_candidate display come
         # from the throttled per-node heartbeat inside evaluate_candidate.
         self._heartbeat(branch_key, n_words, idx, claim_started,
-                        local_candidate, local_best,
-                        bound_erd=_eff_bound(), cur_candidate=candidate)
+                        local_candidate, local_best, bound_erd=_eff_bound())
 
         if self.cancel():
             return False
@@ -1145,8 +1149,7 @@ class _BranchWorker:
             pattern_matrix=self.pattern_matrix,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
-                local_candidate, local_best, bound_erd=_eff_bound(),
-                cur_candidate=candidate))
+                local_candidate, local_best, bound_erd=_eff_bound()))
         cand_elapsed = time.time() - cand_t0
         self._eval_seconds += cand_elapsed
         if cand_elapsed > 10:  # pragma: no cover
@@ -1469,6 +1472,7 @@ class _BranchWorker:
         and must not get this worker's parent claims reclaimed), then reopen
         the row once it has been 'finalized' past FINALIZE_TAKEOVER_SECONDS
         and complete the finalize from its intact claims and meta."""
+        self._cur_candidate = None      # coordinating, no candidate in flight
         self._heartbeat(branch_key, n_words, None, None, None, None,
                         force=True)
         if self.queue.reclaim_stale_finalize(branch_key,
@@ -1704,6 +1708,7 @@ class _BranchWorker:
                     # itself presumed dead while it waits), then free any claim whose
                     # holder has died so we can re-claim it rather than wait forever
                     # — there may be no supervisor in the standalone solve path.
+                    self._cur_candidate = None  # coordinating, no candidate in flight
                     self._heartbeat(branch_key, n_words, None, None,
                                     None, None, force=True)
                     self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
@@ -1792,6 +1797,7 @@ class _BranchWorker:
                 # Nothing claimable: queue empty or all candidates in flight.
                 if idle_since is None:
                     idle_since = time.time()
+                self._cur_candidate = None      # idle, no candidate in flight
                 self._heartbeat(None, None, None, None,
                                 None, None, force=True)
                 time.sleep(0.5)
@@ -1854,6 +1860,7 @@ class _BranchWorker:
                     self._await_rival_finalize(branch_key, words,
                                                branch['n_words'], n_candidates)
                     continue
+                self._cur_candidate = None      # coordinating, no candidate in flight
                 self._heartbeat(branch_key, branch['n_words'], None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
