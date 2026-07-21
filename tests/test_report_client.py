@@ -26,6 +26,47 @@ CLIENT_PATH = os.path.join(ROOT, "report_client.html")
 REQUIRE_PLAYWRIGHT_BROWSER = os.environ.get("REQUIRE_PLAYWRIGHT_BROWSER") == "1"
 
 
+def _preinstalled_chromium():
+    """Path to a Chromium shipped under PLAYWRIGHT_BROWSERS_PATH, if any.
+
+    The managed environment provides a Chromium build whose revision need not
+    match the installed playwright package, so `playwright install` is neither
+    available nor wanted.  Launching that build by path decouples the browser
+    tests from the package's bundled-browser revision.
+    """
+    import glob
+    base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not base or not os.path.isdir(base):
+        return None
+    for pattern in (
+        "chromium-*/chrome-linux/chrome",
+        "chromium_headless_shell-*/chrome-linux/headless_shell",
+        "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell",
+    ):
+        matches = sorted(glob.glob(os.path.join(base, pattern)))
+        if matches:
+            return matches[-1]
+    return None
+
+
+def _launch_chromium(playwright):
+    """Launch headless Chromium, falling back to a pre-installed build.
+
+    The default launch uses the revision bundled with the playwright package;
+    when that is absent (the common case in the managed environment) it retries
+    with the Chromium already present under PLAYWRIGHT_BROWSERS_PATH.
+    """
+    try:
+        return playwright.chromium.launch(headless=True)
+    except Exception:
+        executable = _preinstalled_chromium()
+        if executable is None:
+            raise
+        return playwright.chromium.launch(
+            headless=True, executable_path=executable
+        )
+
+
 class _ResourceParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -105,7 +146,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         cls.base_url = cls.server_context.__enter__()
         cls.playwright = sync_playwright().start()
         try:
-            cls.browser = cls.playwright.chromium.launch(headless=True)
+            cls.browser = _launch_chromium(cls.playwright)
         except Exception as error:
             cls.playwright.stop()
             cls.server_context.__exit__(None, None, None)
@@ -203,6 +244,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("transitioning", result["className"])
         self.assertIn("transitioning", result["text"])
         self.assertNotIn("working", result["text"])
+
+    def test_workers_tab_renders_removed_branch_worker_as_transitioning(self):
+        result = self.page.evaluate("""async () => {
+          const state={...__reportClient.getState(),kind:'workers'};
+          const workers=await (await fetch('/api/view/workers')).json();
+          const stray={...workers.data.rows[0],worker_id:'worker-9',worker_number:'9',
+            branch_key_hex:'ff',branch_reference:'ffffffffffff',is_live:true,
+            on_live_branch:false,state:'transitioning'};
+          const next=structuredClone(workers);next.data.rows=[...workers.data.rows,stray];
+          applyReport(next,workers,state);
+          const card=document.querySelector('[data-identity="worker-9"]');
+          return {className:card.className,text:card.innerText};
+        }""")
+        self.assertIn("transitioning", result["className"])
+        self.assertIn("transitioning", result["text"])
 
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []

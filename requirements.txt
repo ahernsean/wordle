@@ -1,0 +1,4 @@
+# Runtime dependencies for the Wordle solver.
+# NumPy is a hard requirement on every target: the kernel (pattern_matrix.py)
+# is the engine's sole NumPy import point and the vectorized paths assume it.
+numpy>=1.21

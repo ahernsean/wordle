@@ -288,12 +288,12 @@
       if(!selector&&row.node_id&&!row.node_id.startsWith("unknown:"))selector=row.node_id.split("/").flatMap(step=>step.split(":")).join(" ");
       selector=selector||"@"+row.branch_reference;setState({...currentState,kind:"auto",selector,tree:false,claims:false,answers:false});
     }
-    function workerCard(worker,previous,generatedAt,branchPhase=null,onLiveBranch=true){
+    function workerCard(worker,previous,generatedAt,branchPhase=null){
       const age=Math.max(0,generatedAt-worker.updated_at);
-      // Live worker still naming a branch that is no longer among the shown
-      // active branches: its branch was finalized and removed, and it is
-      // between branches until its next heartbeat.
-      const transitioning=worker.is_live&&!!worker.branch_key_hex&&onLiveBranch===false;
+      // Live worker still naming a branch whose active row is gone: its branch
+      // was finalized and removed, and it is between branches until its next
+      // heartbeat.
+      const transitioning=worker.is_live&&!!worker.branch_key_hex&&worker.on_live_branch===false;
       const stateClass=!worker.is_live?"dead":transitioning?"transitioning":branchPhase==="finalizing"?"finalizing":age>20?"stale":"";
       const workerState=!worker.is_live?"dead":!worker.branch_key_hex?"idle":transitioning?"transitioning":branchPhase==="finalizing"?"finalizing":(age>20?"stale":"working");
       const card=element("article",("card worker "+stateClass+" "+workerChangeClass(worker,previous)).trim());card.dataset.identity=worker.worker_id;
@@ -367,7 +367,7 @@
       const previousWorkersById=previousBy(previous,"workers","worker_id");
       const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex)),liveWorkersByBranch.get(String(row.branch_key_hex))||[],previousWorkersById));fragment.append(branches,element("h2","","Workers"));
       const branchPhases=new Map((report.data.branches||[]).map(branch=>[branch.branch_key_hex,branch.branch_phase]));
-      const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state)){const onLiveBranch=row.on_live_branch!==undefined?row.on_live_branch:branchPhases.has(String(row.branch_key_hex));workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at,branchPhases.get(row.branch_key_hex),onLiveBranch));}fragment.append(workers);return fragment;
+      const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at,branchPhases.get(row.branch_key_hex)));fragment.append(workers);return fragment;
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;fragment.append(element("h2","",candidateText(data.word,data.word_is_answer)),renderSpine(data.context?.spine));

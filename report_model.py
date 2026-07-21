@@ -452,6 +452,10 @@ def _normalize_worker(row, generated_at, answer_set):
         "is_live": generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS,
         "branch_reference": branch_reference(branch_key) if branch_key else None,
         "branch_key_hex": branch_key.hex() if branch_key else None,
+        # True while the worker's branch still has an active row; False once it
+        # has been finalized and removed, which lags the heartbeat by up to one
+        # interval and leaves the worker naming a branch no report will list.
+        "on_live_branch": bool(_row_value(row, "on_live_branch", 1)),
         "candidate_index": _row_value(row, "claim_idx"),
         "claim_started_at": _row_value(row, "claim_started_at"),
         "completed_claim_count": _row_value(row, "claims_done", 0),
@@ -582,22 +586,6 @@ def _queue_overview(sources, generated_at, answer_set, report):
             _normalize_worker(row, generated_at, answer_set) for row in heartbeats
         ]
         workers.sort(key=_worker_sort_key)
-        # A worker's heartbeat can still name a branch that has since been
-        # finalized and removed from the queue, until its next heartbeat.  Such
-        # a branch has no active row, so the branch panel omits it; on_live_branch
-        # marks whether the worker's branch is still one of those shown active
-        # branches, so a display can show the worker transitioning between
-        # branches rather than implying work on a branch that is not listed.
-        active_branch_keys = {
-            branch["branch_key_hex"]
-            for branch in normalized_rows
-            if branch["branch_status"] == "active"
-        }
-        for worker in workers:
-            worker["on_live_branch"] = (
-                worker["branch_key_hex"] is not None
-                and worker["branch_key_hex"] in active_branch_keys
-            )
         worker_total_keys = tuple(report["data"]["worker_totals"])
         worker_totals = {
             key: sum(worker[key] for worker in workers if worker["is_live"])
@@ -1519,6 +1507,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
         by_state = {
             "live": 0,
             "idle": 0,
+            "transitioning": 0,
             "finalizing": 0,
             "stale": 0,
             "dead": 0,
@@ -1531,6 +1520,8 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
                 state = "stale"
             elif worker["branch_key_hex"] is None:
                 state = "idle"
+            elif not worker["on_live_branch"]:
+                state = "transitioning"
             elif phase_by_key.get(worker["branch_key_hex"]) == "finalizing":
                 state = "finalizing"
             else:

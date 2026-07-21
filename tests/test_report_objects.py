@@ -604,12 +604,16 @@ class SemanticReportTest(unittest.TestCase):
             finalizing_key, 2, 4, budget=5, spine="CRANE y----"
         )
         queue.try_finalize_branch(finalizing_key)
+        # worker-6 names a branch that has no active row, as after a finalize
+        # removes the branch while the worker moves to its next claim.
+        removed_key = b"voidremove"
         for worker_id, branch_key in (
             ("worker-1", active_key),
             ("worker-2", None),
             ("worker-3", finalizing_key),
             ("worker-4", active_key),
             ("worker-5", other_key),
+            ("worker-6", removed_key),
         ):
             queue.heartbeat(worker_id, int(worker_id.split("-")[1]), branch_key, 2, now, 0)
         queue._conn.execute(
@@ -628,9 +632,12 @@ class SemanticReportTest(unittest.TestCase):
         state_counts = workers_report["data"]["summary"]["worker_count_by_state"]
         self.assertEqual(
             state_counts,
-            {"live": 1, "idle": 1, "finalizing": 1, "stale": 1, "dead": 1},
+            {
+                "live": 1, "idle": 1, "transitioning": 1,
+                "finalizing": 1, "stale": 1, "dead": 1,
+            },
         )
-        self.assertEqual(sum(state_counts.values()), 5)
+        self.assertEqual(sum(state_counts.values()), 6)
 
         tree_report = collect_report(self.sources, ReportRequest(
             report_kind="workers", tree=True, worker_id="1"

@@ -222,6 +222,27 @@ should always be left in a reviewable state.
 
 ---
 
+## Development environment setup
+
+Dependencies are pinned in two files:
+
+```
+pip install -r requirements-dev.txt   # runtime + test deps
+pip install -r requirements.txt       # runtime only (numpy)
+```
+
+- **NumPy** is a hard runtime requirement (`pattern_matrix.py`). The suite fails
+  to import `erd_swarm`/`erd_search` without it.
+- **Playwright** drives the browser contract tests in
+  `tests/test_report_client.py`. Install the Python package (in
+  `requirements-dev.txt`) but do **not** run `playwright install` in the managed
+  environment: a Chromium build is already present under
+  `PLAYWRIGHT_BROWSERS_PATH`. The browser tests launch the default bundled
+  revision when present and otherwise fall back to that pre-installed build by
+  path (`_launch_chromium`), so any installed playwright version works without
+  matching browser revisions. Without the package the browser tests skip; set
+  `REQUIRE_PLAYWRIGHT_BROWSER=1` to make them hard-fail instead of skipping.
+
 ## Before committing and pushing
 
 Always run the test suite before committing and pushing:

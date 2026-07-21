@@ -1037,7 +1037,11 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             ordered_workers, previous_workers, report["generated_at"],
             (previous_report or report)["generated_at"], width,
             indent="  ", color=color,
-            state=lambda worker: "active" if worker["is_live"] else "dead",
+            state=lambda worker: (
+                "dead" if not worker["is_live"]
+                else "transitioning" if not worker.get("on_live_branch", True)
+                else "active"
+            ),
         ))
     else:
         worker_lines.append("  none")
