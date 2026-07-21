@@ -44,13 +44,14 @@ systemctl --user status wordle-report-server  # raw systemd status
 ```
 
 `start`, `stop`, and `restart` all act on both services, whichever of them
-isn't already in the target state.  Pass `--workers-only` to any of the three
-to act on the supervisor alone and leave the report web server untouched:
+isn't already in the target state.  Pass `--swarm-only` to any of the three to
+act on the supervisor alone and leave the report web server untouched, or
+`--web-only` to act on the report web server alone (handy for iterating on the
+web interface without disturbing the swarm):
 
 ```bash
-python3.13 erd_search.py start --workers-only
-python3.13 erd_search.py stop --workers-only
-python3.13 erd_search.py restart --workers-only
+python3.13 erd_search.py restart --swarm-only  # supervisor only
+python3.13 erd_search.py restart --web-only    # report web server only
 ```
 
 `restart` is a stop followed by a start in one step, per service.  Like
