@@ -2779,7 +2779,7 @@ class ERDQueue:
             raise ValueError("coordination hotspots cannot be attributed to a spine")
         if field == "cut-reuse" and spine_prefix and branch_key is None:
             raise ValueError(
-                "cut-reuse hotspots require a singular branch selector"
+                "cut-reuse hotspots require a singular branch target"
             )
         table = {
             "evaluated-candidates": "branch_finalize_log",

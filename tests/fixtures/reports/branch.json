@@ -2,7 +2,7 @@
   "schema_version": 2,
   "report_kind": "branch",
   "generated_at": 1000,
-  "selector": {"kind": "branch", "steps": [{"word": "raise", "pattern": "-----"}], "trailing_word": null, "branch_reference": null, "input_text": "RAISE -----"},
+  "branch_target": {"kind": "branch", "steps": [{"word": "raise", "pattern": "-----"}], "trailing_word": null, "branch_reference": null, "input_text": "RAISE -----"},
   "filters": {},
   "tree": false,
   "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},

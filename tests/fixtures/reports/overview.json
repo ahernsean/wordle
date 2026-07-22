@@ -2,7 +2,7 @@
   "schema_version": 2,
   "report_kind": "overview",
   "generated_at": 1000,
-  "selector": null,
+  "branch_target": null,
   "filters": {"branch_statuses": ["active"], "branch_phases": []},
   "tree": false,
   "sources": {

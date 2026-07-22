@@ -101,7 +101,7 @@ Default inferred report. Query parameters:
 
 | Parameter | Mapping |
 |---|---|
-| `selector` | full inferred spine/reference string; omitted means root |
+| `branch_target` | full inferred spine/reference string; omitted means root |
 | `tree` | boolean |
 | `branch_status` | comma-separated `active`, `pending`, `done`, `unqueued`, or `all` |
 | `branch_phase` | comma-separated `queued`, `evaluating`, `finalizing`, `complete`, or `all` |
@@ -118,14 +118,14 @@ Default inferred report. Query parameters:
     GET /api/view/cache
     GET /api/view/hotspots
 
-These accept the same compatible selector/filter parameters. A single worker
+These accept the same compatible branch_target/filter parameters. A single worker
 uses `worker=N` on the workers endpoint.
 
 The root overview defaults to `branch_status=active`. An explicit `all`
 disables that axis's filter. Other report kinds default to all statuses.
 
 Do not expose positional reserved path names for word/branch reports. They
-remain inferred through `selector` on `/api/view`, so the HTTP and CLI grammar
+remain inferred through `branch_target` on `/api/view`, so the HTTP and CLI grammar
 cannot drift.
 
 ### Static client
@@ -146,7 +146,7 @@ Use `urllib.parse.urlsplit` and `parse_qs(..., keep_blank_values=True)`.
 - Reject unknown parameters.
 - Apply the same minimum/maximum bounds as terminal argparse.
 - Reject URL/request targets longer than 8192 bytes.
-- Pass the selector string to `parse_report_selector` unchanged after URL
+- Pass the branch_target string to `parse_report_branch_target` unchanged after URL
   decoding.
 - Convert validation failures to 400 JSON:
 
@@ -185,7 +185,7 @@ choosing a fixture. Invalid combinations fail exactly as live requests do.
 
 Fixture selection is ordered:
 
-1. On `/api/view`, no selector/root uses `overview.json`, inferred word uses
+1. On `/api/view`, no branch_target/root uses `overview.json`, inferred word uses
    `word.json`, and inferred branch uses `branch.json`; valid `tree=1` takes
    precedence and uses `tree.json`.
 2. Explicit non-tree kinds use their matching filename.
@@ -194,7 +194,7 @@ Fixture selection is ordered:
 4. `cache?tree=1` and `hotspots?tree=1` are invalid and return 400 before
    fixture lookup.
 
-Thus positional selectors `CACHE` and `QUEUE` are inferred as words before
+Thus positional branch_targets `CACHE` and `QUEUE` are inferred as words before
 fixture selection and use `word.json`, never explicit-kind fixtures.
 
 Read and `json.loads` each fixture at server startup, require its
@@ -229,16 +229,16 @@ Required cases:
 
 1. Live root view over temporary fresh databases equals a direct
    `collect_report` call in contract shape.
-2. Selector inference returns word and branch reports from the same endpoint.
+2. BranchTarget inference returns word and branch reports from the same endpoint.
 3. Tree and comma-separated branch filters reach normalized request state.
 4. Every explicit report endpoint returns its kind.
-5. CACHE and QUEUE selector requests return word fixtures, never cache/queue
+5. CACHE and QUEUE branch_target requests return word fixtures, never cache/queue
    report fixtures.
 6. Inferred tree, queue tree, and workers tree use distinct fixtures;
    cache/hotspot tree requests return 400 before fixture lookup.
 7. Comma-separated status and phase values are accepted; repeated scalar and unknown parameters are
    rejected.
-8. Invalid booleans, integers, selector, limit, sample, and overlong target
+8. Invalid booleans, integers, branch_target, limit, sample, and overlong target
    return 400.
 9. Unknown branch reference returns 404.
 10. Fixture startup validates all files and fixture requests open no SQLite

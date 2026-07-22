@@ -1,6 +1,6 @@
 {
   "schema_version": 2, "report_kind": "workers", "generated_at": 1000,
-  "selector": {"kind": "root", "steps": [], "trailing_word": null, "branch_reference": null, "input_text": ""},
+  "branch_target": {"kind": "root", "steps": [], "trailing_word": null, "branch_reference": null, "input_text": ""},
   "filters": {}, "tree": true,
   "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
   "data": {"root": {"kind": "root"}, "topology_source": "queue", "tree_available": true, "unavailable_reason": null, "nodes": [{"node_id": "root", "parent_node_id": null, "step": null, "branch_key_hex": null, "branch_reference": null, "branch_status": null, "branch_phase": null, "answer_count": null, "guess_depth": 0, "worker_count": 0, "completed_candidate_count": null, "candidate_count": null, "is_context": true}, {"node_id": "raise:-----", "parent_node_id": "root", "step": {"word": "raise", "pattern": "-----"}, "branch_key_hex": "02", "branch_reference": "222222222222", "branch_status": "active", "branch_phase": "evaluating", "answer_count": 8, "guess_depth": 1, "worker_count": 2, "completed_candidate_count": 20, "candidate_count": 50, "is_context": false}], "workers": [{"worker_id": "worker-0", "worker_number": "0", "branch_key_hex": "02", "branch_reference": "222222222222", "is_live": true, "on_active_branch": true}]}

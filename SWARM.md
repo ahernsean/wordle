@@ -99,7 +99,7 @@ back, Space refreshes, and `q` quits. Non-TTY text and structured output remain
 noninteractive. The overview includes filesystem fullness, queue WAL size, and
 a fresh fill-rate estimate with time remaining to the disk-stop threshold.
 
-Semantic selectors infer words and branches from spine form:
+Semantic branch targets infer words and branches from spine form:
 
 ```bash
 python3.13 erd_search.py view CRANE
@@ -111,6 +111,12 @@ python3.13 erd_search.py view "CRANE .y..g ALIBI g.g.." --claims
 A trailing word reports its response groups. A trailing pattern reports the
 resulting branch. Pattern syntax is `g` for green, `y` for yellow, and `.` or
 `-` for gray. A displayed branch reference can also select a queued branch.
+
+These are two forms of one thing: a **branch target** names a single branch by
+either its **spine** — the explicit word/pattern steps — or a **branch
+reference**, the `@`-prefixed hash handle shown in reports. A spine resolves
+from the answer list alone and is durable; a reference resolves only while the
+branch is still in the queue.
 
 Focused collections and live topology use the same report model:
 
@@ -270,7 +276,7 @@ stopped and you want to inspect or requeue before restarting.
 
 ## Cache operations
 
-Cache coverage inspection uses `erd_search.py view --cache` with an optional semantic selector.
+Cache coverage inspection uses `erd_search.py view --cache` with an optional semantic branch target.
 
 ### Export for the iPhone
 

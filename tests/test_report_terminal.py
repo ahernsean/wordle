@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 import erd_search
 import report_terminal
-from report_model import ReportFilters, parse_report_selector
+from report_model import ReportFilters, parse_report_branch_target
 from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
 
 
@@ -19,7 +19,7 @@ def overview_report():
         "schema_version": 2,
         "report_kind": "overview",
         "generated_at": 1000,
-        "selector": None,
+        "branch_target": None,
         "filters": {},
         "sources": {
             "queue": {
@@ -646,7 +646,7 @@ class CandidateSweepBarTest(unittest.TestCase):
             "schema_version": 2,
             "report_kind": "branch",
             "generated_at": 1000,
-            "selector": None,
+            "branch_target": None,
             "filters": {},
             "sources": {
                 "queue": {"path": "q", "ok": True, "error": None},
@@ -709,7 +709,7 @@ class CollectionRendererTest(unittest.TestCase):
         report = overview_report()
         report.update({
             "report_kind": report_kind,
-            "selector": {
+            "branch_target": {
                 "kind": "root", "steps": [], "trailing_word": None,
                 "branch_reference": None, "input_text": "",
             },
@@ -974,8 +974,8 @@ class ViewSessionTest(unittest.TestCase):
             self.assertTrue(session._wait_for_refresh())
         branch_request = session.current_request
         self.assertEqual(branch_request.report_kind, "auto")
-        self.assertEqual(branch_request.selector.kind, "branch")
-        self.assertEqual(len(branch_request.selector.steps), 2)
+        self.assertEqual(branch_request.branch_target.kind, "branch")
+        self.assertEqual(len(branch_request.branch_target.steps), 2)
 
         session._navigate_back()
         session._update_navigation_targets(report)
@@ -1050,7 +1050,7 @@ class ViewSessionTest(unittest.TestCase):
         )
         session = WatchSession(view_args(
             watch=1.0,
-            selector=parse_report_selector("CRANE"),
+            branch_target=parse_report_branch_target("CRANE"),
             report_kind="queue",
             tree=True,
             filters=filters,
@@ -1169,7 +1169,7 @@ class ViewParserTest(unittest.TestCase):
         self.assertEqual(args.format, "jsonl")
         self.assertIsNone(args.watch)
 
-    def test_queue_and_cache_positionals_are_word_selectors(self):
+    def test_queue_and_cache_positionals_are_word_branch_targets(self):
         for word in ("QUEUE", "CACHE"):
             with self.subTest(word=word):
                 with (
@@ -1177,9 +1177,9 @@ class ViewParserTest(unittest.TestCase):
                     patch("report_terminal.run_view") as run_view,
                 ):
                     erd_search.main()
-                selector = run_view.call_args.args[0].selector
-                self.assertEqual(selector.kind, "word")
-                self.assertEqual(selector.trailing_word, word.lower())
+                branch_target = run_view.call_args.args[0].branch_target
+                self.assertEqual(branch_target.kind, "word")
+                self.assertEqual(branch_target.trailing_word, word.lower())
 
     def test_collection_options_dispatch_explicit_kinds(self):
         cases = [

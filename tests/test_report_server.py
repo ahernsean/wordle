@@ -103,11 +103,11 @@ class ReportServerTest(unittest.TestCase):
         direct.pop("generated_at")
         self.assertEqual(served, direct)
 
-    def test_selector_inference_uses_one_endpoint(self):
+    def test_branch_target_inference_uses_one_endpoint(self):
         with running_server(fixture_configuration()) as base_url:
-            word = json.loads(request(base_url, "/api/view?selector=CACHE")[2])
+            word = json.loads(request(base_url, "/api/view?branch_target=CACHE")[2])
             branch = json.loads(request(
-                base_url, "/api/view?selector=RAISE%20....."
+                base_url, "/api/view?branch_target=RAISE%20....."
             )[2])
         self.assertEqual(word["report_kind"], "word")
         self.assertEqual(branch["report_kind"], "branch")
@@ -129,15 +129,15 @@ class ReportServerTest(unittest.TestCase):
     def test_root_overview_defaults_to_active_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
         all_request = parse_report_request("/api/view", "branch_status=all")
-        word_request = parse_report_request("/api/view", "selector=RAISE")
+        word_request = parse_report_request("/api/view", "branch_target=RAISE")
         self.assertEqual(default_request.filters.branch_statuses, ("active",))
         self.assertEqual(all_request.filters.branch_statuses, ())
         self.assertEqual(word_request.filters.branch_statuses, ())
 
     def test_http_and_terminal_compatibility_validation_is_shared(self):
         invalid_requests = (
-            ("/api/view", "selector=RAISE%20.....&tree=1&claims=1"),
-            ("/api/view", "selector=RAISE&sort=nodes"),
+            ("/api/view", "branch_target=RAISE%20.....&tree=1&claims=1"),
+            ("/api/view", "branch_target=RAISE&sort=nodes"),
         )
         for path, query in invalid_requests:
             with self.subTest(query=query), self.assertRaises(InvalidRequest):
@@ -151,18 +151,18 @@ class ReportServerTest(unittest.TestCase):
                     self.assertEqual(status, 200)
                     self.assertEqual(json.loads(body)["report_kind"], kind)
 
-    def test_queue_and_cache_selectors_are_words(self):
+    def test_queue_and_cache_branch_targets_are_words(self):
         with running_server(fixture_configuration()) as base_url:
-            for selector in ("QUEUE", "CACHE"):
+            for branch_target in ("QUEUE", "CACHE"):
                 report = json.loads(request(
-                    base_url, f"/api/view?selector={selector}"
+                    base_url, f"/api/view?branch_target={branch_target}"
                 )[2])
                 self.assertEqual(report["report_kind"], "word")
 
     def test_tree_fixture_selection_and_invalid_tree_kinds(self):
         with running_server(fixture_configuration()) as base_url:
             inferred = json.loads(request(
-                base_url, "/api/view?selector=RAISE%20.....&tree=1"
+                base_url, "/api/view?branch_target=RAISE%20.....&tree=1"
             )[2])
             queue = json.loads(request(base_url, "/api/view/queue?tree=1")[2])
             workers = json.loads(request(base_url, "/api/view/workers?tree=1")[2])
@@ -190,7 +190,7 @@ class ReportServerTest(unittest.TestCase):
 
     def test_invalid_values_and_overlong_target_return_400(self):
         invalid_queries = (
-            "tree=yes", "limit=x", "selector=BAD", "limit=0",
+            "tree=yes", "limit=x", "branch_target=BAD", "limit=0",
             "sample_size=0", "minimum_answer_count=5&maximum_answer_count=2",
             "branch_status=active,active", "branch_status=all,pending",
             "branch_phase=evaluating,", "branch_phase=working",
@@ -201,13 +201,13 @@ class ReportServerTest(unittest.TestCase):
                     path = "/api/view/hotspots?" + query if "sample" in query else "/api/view?" + query
                     self.assertEqual(request(base_url, path)[0], 400)
             self.assertEqual(
-                request(base_url, "/api/view?selector=" + "A" * 8200)[0], 400
+                request(base_url, "/api/view?branch_target=" + "A" * 8200)[0], 400
             )
 
     def test_unknown_branch_reference_returns_404(self):
         with running_server(self.live_configuration) as base_url:
             status, _headers, body = request(
-                base_url, "/api/view?selector=%401234"
+                base_url, "/api/view?branch_target=%401234"
             )
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(body)["error"]["kind"], "not_found")
@@ -259,7 +259,7 @@ class ReportServerTest(unittest.TestCase):
     def test_static_client_and_unknown_path(self):
         with running_server(fixture_configuration()) as base_url:
             status, headers, body = request(base_url, "/")
-            deep_link = request(base_url, "/?selector=CRANE&tree=1")
+            deep_link = request(base_url, "/?branch_target=CRANE&tree=1")
             missing = request(base_url, "/report_client.html")
         self.assertEqual(status, 200)
         self.assertEqual(headers.get_content_type(), "text/html")

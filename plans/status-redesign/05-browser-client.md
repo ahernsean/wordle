@@ -6,7 +6,7 @@ merged.
 ## Goal
 
 Replace the placeholder with one self-contained responsive browser client
-that can navigate the same inferred selectors and report kinds as the
+that can navigate the same inferred branch_targets and report kinds as the
 terminal:
 
 - operational overview;
@@ -53,30 +53,30 @@ font, and the Wordle palette:
 Top-level controls:
 
 1. Report navigation buttons: Overview, Queue, Workers, Cache, Hotspots.
-2. One selector input labeled “Spine or @branch reference.”
+2. One branch_target input labeled “Spine or @branch reference.”
 3. Apply and Back buttons.
 4. Tree toggle.
 5. Expandable filters for branch status, branch phase, answer count, budget, priority, sort,
    limit, hotspot field/epoch/window.
 6. Connection chip and generated timestamp.
 
-The selector input always uses inference:
+The branch_target input always uses inference:
 
 - `CRANE` opens a word report;
 - `CRANE -y--g` opens branch detail;
-- Tree changes layout without changing selector;
+- Tree changes layout without changing branch_target;
 - the UI never asks the user to choose word versus branch.
 
-Overview and entering a selector switch to inferred mode. Clicking
+Overview and entering a branch_target switch to inferred mode. Clicking
 Queue/Workers/Cache/Hotspots selects the corresponding explicit kind; the
-selector may remain as scope when compatible. Navigation retains only filters
+branch_target may remain as scope when compatible. Navigation retains only filters
 valid for the destination report.
 
 ## URL state
 
 Encode navigation in `location.search`:
 
-    ?selector=CRANE+-y--g
+    ?branch_target=CRANE+-y--g
     &kind=auto
     &tree=1
     &branch_status=active,pending
@@ -122,7 +122,7 @@ Assign all three to `window` for Playwright.
 The poll loop:
 
 - fetches the URL from `buildAPIURL`;
-- remembers the previous report only when report kind, selector, and filters
+- remembers the previous report only when report kind, branch_target, and filters
   are the same comparison context;
 - calls `applyReport`;
 - polls every `poll` milliseconds, default 2000;
@@ -137,7 +137,7 @@ row as newly added.
 
 Every report renders:
 
-- report kind and selector;
+- report kind and branch_target;
 - generated local time;
 - queue, telemetry, and cache source paths;
 - telemetry epoch/label/revision;
@@ -159,7 +159,7 @@ Render:
   `max_remaining_depth`, workers, and
   branch reference.
 
-Click/tap a response group appends its pattern to the selector and navigates
+Click/tap a response group appends its pattern to the branch_target and navigates
 to branch detail. No separate “open branch” mode chooser appears.
 
 Branch filters hide unmatched response rows but leave the unfiltered summary
@@ -204,7 +204,7 @@ nodes.
 - Unknown legacy spine segments render as `?` at their known
   `guess_depth`.
 - Clicking a branch node removes tree mode and navigates to its semantic
-  selector when available, otherwise its `@branch_reference`.
+  branch_target when available, otherwise its `@branch_reference`.
 - Tree collapse state is keyed by stable `node_id` and survives polling.
 - Below 480 px, descendants begin collapsed but the context path remains
   visible.
@@ -232,7 +232,7 @@ descent. Clicking its branch navigates to branch detail.
 
 ### Cache
 
-Global exact/loss/recent totals and distributions, or selector-scoped cache
+Global exact/loss/recent totals and distributions, or branch_target-scoped cache
 coverage/detail. Never label a cut as cached.
 
 ### Hotspots
@@ -309,9 +309,9 @@ loopback port. Use a fresh page per test.
 
 Required cases:
 
-1. Selector parser/UI infers CRANE as word and CRANE -y--g as branch without a
+1. BranchTarget parser/UI infers CRANE as word and CRANE -y--g as branch without a
    type chooser.
-2. CACHE and QUEUE positional selectors request inferred word reports;
+2. CACHE and QUEUE positional branch_targets request inferred word reports;
    navigation buttons request explicit cache/queue endpoints.
 3. Tree and comma-separated branch filters alter URL/API state and keep the context node.
 4. Clicking a word response group navigates to its full branch spine.
@@ -338,10 +338,10 @@ Required cases:
 
 ## Manual checklist
 
-- [ ] On the actual iPhone, selector entry, Back, filters, tree collapse, and
+- [ ] On the actual iPhone, branch_target entry, Back, filters, tree collapse, and
       branch disclosures are comfortable.
 - [ ] Against live databases, browser and terminal JSON reports agree for the
-      same selector/filter request.
+      same branch_target/filter request.
 - [ ] A two-second overview poll does not create visible queue contention or
       sustained telemetry scans.
 - [ ] Navigating to a claim-heavy branch loads detail only on expansion.
@@ -349,7 +349,7 @@ Required cases:
 ## Acceptance checklist
 
 - [ ] One self-contained browser client supports every report kind.
-- [ ] Word versus branch is inferred only from selector form.
+- [ ] Word versus branch is inferred only from branch_target form.
 - [ ] Tree and branch status/phase are ordinary shared controls.
 - [ ] URL state is deep-linkable and browser-history aware.
 - [ ] Semantic identity/change behavior matches the terminal contract.

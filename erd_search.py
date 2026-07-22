@@ -63,7 +63,7 @@ from report_model import (
     ReportRequest,
     WORKER_LIVENESS_SECONDS,
     parse_branch_filter,
-    parse_report_selector,
+    parse_report_branch_target,
     parse_rich_spine as _parse_spine,
     validate_report_request,
 )
@@ -1045,7 +1045,7 @@ def main():
         parser.error('--format json cannot be used with --watch; use jsonl')
     if args.cmd == 'view':
         try:
-            args.selector = parse_report_selector(args.spine)
+            args.branch_target = parse_report_branch_target(args.spine)
         except ValueError as error:
             parser.error(str(error))
         if args.limit is not None and args.limit < 1:
@@ -1078,7 +1078,7 @@ def main():
             branch_statuses = (
                 ("active",)
                 if (args.report_kind == "auto"
-                    and args.selector.kind == "root" and not args.tree)
+                    and args.branch_target.kind == "root" and not args.tree)
                 else ()
             )
         args.filters = ReportFilters(
@@ -1097,7 +1097,7 @@ def main():
         try:
             validate_report_request(ReportRequest(
                 report_kind=args.report_kind,
-                selector=args.selector,
+                branch_target=args.branch_target,
                 include_claims=args.claims,
                 include_answers=args.answers,
                 tree=args.tree,

@@ -168,14 +168,14 @@ class ReportClientBrowserTest(unittest.TestCase):
     def tearDown(self):
         self.page.close()
 
-    def apply_selector(self, selector):
-        self.page.locator("#selector-input").fill(selector)
+    def apply_branch_target(self, branch_target):
+        self.page.locator("#branch-target-input").fill(branch_target)
         self.page.locator("#apply").click()
 
-    def test_selector_inference_has_no_type_chooser(self):
-        self.apply_selector("CRANE")
+    def test_branch_target_inference_has_no_type_chooser(self):
+        self.apply_branch_target("CRANE")
         self.page.wait_for_selector("text=word report")
-        self.apply_selector("CRANE .y..g")
+        self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
         self.assertEqual(self.page.locator("[data-kind]").count(), 5)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
@@ -183,15 +183,15 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
         overview_button = self.page.locator("[data-overview]")
         self.assertEqual(overview_button.get_attribute("aria-current"), "page")
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=branch report")
         self.assertEqual(overview_button.get_attribute("aria-current"), "false")
-        self.apply_selector("")
+        self.apply_branch_target("")
         self.page.wait_for_selector("text=overview report")
         self.assertEqual(overview_button.get_attribute("aria-current"), "page")
 
     def test_answer_word_count_is_shown_before_expansion(self):
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=branch report")
         summary = self.page.locator("summary:has-text('Answer words')")
         self.assertEqual(summary.inner_text(), "Answer words (8)")
@@ -199,8 +199,8 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_positional_cache_queue_and_explicit_navigation_urls(self):
         result = self.page.evaluate("""() => ({
-          inferredCache: buildAPIURL(parsePageState({search:'?selector=CACHE'})),
-          inferredQueue: buildAPIURL(parsePageState({search:'?selector=QUEUE'})),
+          inferredCache: buildAPIURL(parsePageState({search:'?branch_target=CACHE'})),
+          inferredQueue: buildAPIURL(parsePageState({search:'?branch_target=QUEUE'})),
           explicitCache: buildAPIURL(parsePageState({search:'?kind=cache'})),
           explicitQueue: buildAPIURL(parsePageState({search:'?kind=queue'})),
           defaultOverview: buildAPIURL(parsePageState({search:''})),
@@ -214,7 +214,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["allOverview"], "/api/view?branch_status=all")
 
     def test_tree_branch_status_filter_and_context_node(self):
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.locator("#tree-button").click()
         self.page.wait_for_selector("text=Live queue tree")
         self.assertIn("tree=1", self.page.url)
@@ -222,10 +222,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertGreater(self.page.locator("text=pending").count(), 0)
 
     def test_word_group_click_builds_full_branch_spine(self):
-        self.apply_selector("CACHE")
+        self.apply_branch_target("CACHE")
         self.page.wait_for_selector("text=word report")
         self.page.locator("article.card.clickable").first.click()
-        self.assertIn("selector=CACHE+-----", self.page.url)
+        self.assertIn("branch_target=CACHE+-----", self.page.url)
 
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
@@ -301,7 +301,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Candidate detail")
         text = self.page.locator("section:has-text('Candidate detail')").inner_text()
         # A summary of provenance and per-worker contribution, never a row per
@@ -318,10 +318,10 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_branch_surfaces_missing_best_and_rounds_bounds(self):
         text = self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.queue.best_guess=null;branch.data.queue.best_erd=null;
           branch.data.queue.ceiling=2.793103449275866;
-          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("none yet", text)
@@ -329,7 +329,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("2.793103449275866", text)
 
     def test_finalizations_are_glossed_and_timestamped(self):
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")
         text = self.page.locator("section:has-text('Recent finalizations')").inner_text()
         self.assertIn("Cut — best line exceeds the budget", text)
@@ -360,7 +360,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("2.517241380310347", result["hotspot"])
 
     def test_finalization_outcomes_and_cut_reuse_are_distinct(self):
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")
         self.assertEqual(self.page.locator(".outcome-exact").count(), 1)
         self.assertEqual(self.page.locator(".outcome-cut").count(), 2)
@@ -386,19 +386,19 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(changedTree,tree,{...state,tree:true});
           result.tree=document.querySelector('[data-identity="raise:-----/alibi:y----"]').className;
 
-          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.workers=[{worker_id:'worker-12',updated_at:990,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',current_candidate:'crane',current_max_guess_depth:2,nodes_per_second:10}];
           const changedBranch=structuredClone(branch);changedBranch.data.workers[0].current_candidate='slate';
-          applyReport(changedBranch,branch,{...state,selector:'RAISE .....'});
+          applyReport(changedBranch,branch,{...state,branch_target:'RAISE .....'});
           result.branch=document.querySelector('[data-identity="worker-12"]').className;
           const deadBranch=structuredClone(branch);deadBranch.data.workers[0].is_live=false;
-          applyReport(deadBranch,branch,{...state,selector:'RAISE .....'});
+          applyReport(deadBranch,branch,{...state,branch_target:'RAISE .....'});
           result.deadWorker=document.querySelector('[data-identity="worker-12"]').className;
           const heartbeatOnly=structuredClone(branch);heartbeatOnly.data.workers[0].updated_at=995;heartbeatOnly.data.workers[0].nodes_per_second=99;
-          applyReport(heartbeatOnly,branch,{...state,selector:'RAISE .....'});
+          applyReport(heartbeatOnly,branch,{...state,branch_target:'RAISE .....'});
           result.heartbeatWorker=document.querySelector('[data-identity="worker-12"]').className;
           const switchedBranch=structuredClone(branch);switchedBranch.data.workers[0].branch_key_hex='02';switchedBranch.data.workers[0].branch_reference='222222222222';
-          applyReport(switchedBranch,branch,{...state,selector:'RAISE .....'});
+          applyReport(switchedBranch,branch,{...state,branch_target:'RAISE .....'});
           result.switchedWorker=document.querySelector('[data-identity="worker-12"]').className;
 
           const cache=await (await fetch('/api/view/cache')).json(),changedCache=structuredClone(cache);
@@ -469,36 +469,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("disconnected", chip.get_attribute("class") or "")
         self.assertEqual(chip.inner_text(), "●")
 
-    def test_branch_view_pins_selector_to_its_spine(self):
+    def test_branch_view_pins_branch_target_to_its_spine(self):
         # Navigating by a queue reference resolves once; the client then pins
         # the view to the branch's spine so later polls never depend on the
         # reference (which 404s after finalization).
-        self.page.goto(self.base_url + "?selector=@0123456789ab")
+        self.page.goto(self.base_url + "?branch_target=@0123456789ab")
         self.page.wait_for_selector("text=branch report")
         self.page.wait_for_function(
-            "() => __reportClient.getState().selector === 'raise -----'"
+            "() => __reportClient.getState().branch_target === 'raise -----'"
         )
-        self.assertIn("selector=raise", self.page.url)
+        self.assertIn("branch_target=raise", self.page.url)
         self.assertNotIn("0123456789ab", self.page.url)
-        self.assertEqual(self.page.locator("#selector-input").input_value(), "raise -----")
+        self.assertEqual(self.page.locator("#branch-target-input").input_value(), "raise -----")
 
-    def test_filter_change_leaves_typed_selector_untouched(self):
+    def test_filter_change_leaves_typed_branch_target_untouched(self):
         # A spine typed but not sent with Go stays uncommitted; toggling a
         # filter applies against the current view, never navigating to the typed
         # text nor erasing it from the box.
         self.page.goto(self.base_url)
         self.page.wait_for_selector("h1")
-        self.page.locator("#selector-input").fill("CRANE")
+        self.page.locator("#branch-target-input").fill("CRANE")
         self.page.locator("details.filters").evaluate("node => node.open = true")
         self.page.locator('[data-branch-status][value="pending"]').check()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_status.includes('pending')"
         )
         self.assertEqual(
-            self.page.evaluate("() => __reportClient.getState().selector"), ""
+            self.page.evaluate("() => __reportClient.getState().branch_target"), ""
         )
         self.assertNotIn("CRANE", self.page.url)
-        self.assertEqual(self.page.locator("#selector-input").input_value(), "CRANE")
+        self.assertEqual(self.page.locator("#branch-target-input").input_value(), "CRANE")
 
     def test_view_fields_appear_only_where_the_kind_can_use_them(self):
         self.page.locator("[data-kind=hotspots]").click()
@@ -533,7 +533,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             ),
         )
         self.page.evaluate(
-            "__reportClient.setState({...__reportClient.getState(),kind:'auto',selector:'@dead'})"
+            "__reportClient.setState({...__reportClient.getState(),kind:'auto',branch_target:'@dead'})"
         )
         self.page.wait_for_selector("#report .error")
         self.assertIn("not found", self.page.locator("#report .error").inner_text())
@@ -557,7 +557,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["leaveClones"], 1)
 
     def test_republished_candidates_render_as_summary_not_raw_list(self):
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Bundle and republish")
         text = self.page.locator("#report").inner_text()
         self.assertIn("re-queued", text)
@@ -577,8 +577,8 @@ class ReportClientBrowserTest(unittest.TestCase):
           overview: parsePageState({search:''}),
           all: parsePageState({search:'?branch_status=all'}),
           historical: parsePageState({search:'?kind=hotspots&by=coordination&branch_status=pending&branch_phase=evaluating'}),
-          tree: parsePageState({search:'?selector=RAISE%20.....&tree=1&claims=1&answers=1'}),
-          word: parsePageState({search:'?selector=RAISE&sort=nodes'})
+          tree: parsePageState({search:'?branch_target=RAISE%20.....&tree=1&claims=1&answers=1'}),
+          word: parsePageState({search:'?branch_target=RAISE&sort=nodes'})
         })""")
         self.assertEqual(states["overview"]["branch_status"], ["active"])
         self.assertEqual(states["all"]["branch_status"], [])
@@ -590,11 +590,11 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_word_summary_keeps_unfiltered_totals(self):
         text = self.page.evaluate("""async () => {
-          const report=await (await fetch('/api/view?selector=QUEUE')).json();
+          const report=await (await fetch('/api/view?branch_target=QUEUE')).json();
           const done=structuredClone(report);
           done.data.total_rows=4;done.data.matched_rows=3;
           done.data.response_groups=done.data.response_groups.filter(row=>row.branch_status==='done');
-          applyReport(done,null,{...__reportClient.getState(),selector:'QUEUE',branch_status:['done']});
+          applyReport(done,null,{...__reportClient.getState(),branch_target:'QUEUE',branch_status:['done']});
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("Shown 3 of 3 matched · 4 total response groups", text)
@@ -602,10 +602,10 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_selected_detail_remains_visible_after_leaving_parent_filter(self):
         text = self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.branch.branch_status='done';branch.data.branch.branch_phase='complete';
           branch.data.queue.branch_status='done';branch.data.queue.branch_phase='complete';
-          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....',branch_status:['active'],branch_phase:[]});
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....',branch_status:['active'],branch_phase:[]});
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("status done", text)
@@ -617,10 +617,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(root,null,{...__reportClient.getState(),kind:'cache'});
           const rootIdentities=[...document.querySelectorAll('[data-identity]')].map(node=>node.dataset.identity);
           const word=structuredClone(root);word.data={summary:{response_group_count:1},rows:[{branch_key_hex:'word-key',branch_reference:'word-ref',cache_state:'missing'}]};
-          applyReport(word,null,{...__reportClient.getState(),kind:'cache',selector:'RAISE'});
+          applyReport(word,null,{...__reportClient.getState(),kind:'cache',branch_target:'RAISE'});
           const wordIdentities=[...document.querySelectorAll('[data-identity]')].map(node=>node.dataset.identity);
           const branch=structuredClone(root);branch.data={branch_key_hex:'branch-key',branch_reference:'branch-ref',cache:{cache_state:'exact',best_guess:'crane',best_erd:2.1}};
-          applyReport(branch,null,{...__reportClient.getState(),kind:'cache',selector:'RAISE .....'});
+          applyReport(branch,null,{...__reportClient.getState(),kind:'cache',branch_target:'RAISE .....'});
           return {rootIdentities,wordIdentities,branchIdentities:[...document.querySelectorAll('[data-identity]')].map(node=>node.dataset.identity)};
         }""")
         self.assertEqual(identities["rootIdentities"], ["01", "02"])
@@ -631,20 +631,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         result = self.page.evaluate("""async () => {
           const originalFetch=window.fetch.bind(window);
           const overview=await (await originalFetch('/api/view')).json();
-          const branch=await (await originalFetch('/api/view?selector=RAISE%20.....')).json();
+          const branch=await (await originalFetch('/api/view?branch_target=RAISE%20.....')).json();
           let releaseOverview;
-          window.fetch=(url)=>url.includes('selector=RAISE')
+          window.fetch=(url)=>url.includes('branch_target=RAISE')
             ? Promise.resolve(new Response(JSON.stringify(branch),{status:200,headers:{'Content-Type':'application/json'}}))
             : new Promise(resolve=>{releaseOverview=()=>resolve(new Response(JSON.stringify(overview),{status:200,headers:{'Content-Type':'application/json'}}));});
-          __reportClient.setState({...__reportClient.getState(),kind:'auto',selector:''});
-          __reportClient.setState({...__reportClient.getState(),kind:'auto',selector:'RAISE .....'});
+          __reportClient.setState({...__reportClient.getState(),kind:'auto',branch_target:''});
+          __reportClient.setState({...__reportClient.getState(),kind:'auto',branch_target:'RAISE .....'});
           await new Promise(resolve=>setTimeout(resolve,20));
           releaseOverview();await new Promise(resolve=>setTimeout(resolve,20));
           window.fetch=originalFetch;
-          return {heading:document.querySelector('h1').textContent,selector:__reportClient.getState().selector};
+          return {heading:document.querySelector('h1').textContent,branch_target:__reportClient.getState().branch_target};
         }""")
         self.assertEqual(result["heading"], "branch report")
-        self.assertEqual(result["selector"], "RAISE .....")
+        self.assertEqual(result["branch_target"], "RAISE .....")
 
     def test_malicious_text_is_literal_and_inert(self):
         result = self.page.evaluate("""async () => {
@@ -658,7 +658,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("<img id=", result["text"])
 
     def test_tile_colors_match_wordle_palette(self):
-        self.apply_selector("CACHE")
+        self.apply_branch_target("CACHE")
         self.page.wait_for_selector(".tile")
         colors = self.page.evaluate("""() => {
           const result={};
@@ -680,10 +680,10 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.completed_candidate_indexes=[...Array(50).keys()];
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
-          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const cells=[...document.querySelectorAll('.sweep-cell')];
           return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),fills:cells.map(cell=>Number.parseInt(cell.style.getPropertyValue('--fill'),10)),markers:[...document.querySelectorAll('.sweep-marker')].map(marker=>marker.dataset.workerNumber)};
         }""")
@@ -707,19 +707,19 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_worker_marker_slides_between_cells_on_progress(self):
         result = self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           const makeWorker=index=>({worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:index,current_candidate:'crane',current_candidate_is_answer:true});
           branch.data.workers=[makeWorker(10)];
-          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const moved=structuredClone(branch);moved.data.workers=[makeWorker(80)];
-          applyReport(moved,branch,{...__reportClient.getState(),selector:'RAISE .....'});
+          applyReport(moved,branch,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const marker=document.querySelector('.sweep-marker');
           const during=Number.parseFloat(getComputedStyle(marker).left);
           await new Promise(resolve=>setTimeout(resolve,700));
           const settled=Number.parseFloat(getComputedStyle(marker).left);
 
           const rebranched=structuredClone(branch);rebranched.data.workers=[{...makeWorker(80),branch_key_hex:'02',branch_reference:'222222222222'}];
-          applyReport(rebranched,branch,{...__reportClient.getState(),selector:'RAISE .....'});
+          applyReport(rebranched,branch,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const jumped=document.querySelector('.sweep-marker');
           const immediate=Number.parseFloat(getComputedStyle(jumped).left);
           const fadingIn=getComputedStyle(jumped).opacity;
@@ -748,12 +748,12 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_spine_words_never_separate_from_their_patterns(self):
         result = self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
-          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const groups=[...document.querySelectorAll('.tiles .step-group')];
           const spineGroups=groups.map(group=>({text:group.textContent,hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
           const tree=await (await fetch('/api/view?tree=1')).json();
-          applyReport(tree,null,{...__reportClient.getState(),selector:'',tree:true});
+          applyReport(tree,null,{...__reportClient.getState(),branch_target:'',tree:true});
           const treeGroups=[...document.querySelectorAll('summary .step-group')].map(group=>({hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
           return {spineGroups,treeGroupCount:treeGroups.length,treeAllNoWrap:treeGroups.every(group=>group.noWrap)};
         }""")
@@ -765,7 +765,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertTrue(result["treeAllNoWrap"])
 
     def test_integers_use_comma_separators(self):
-        self.apply_selector("RAISE .....")
+        self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=branch report")
         text = self.page.locator("#report").inner_text()
         self.assertIn("12,000", text)
@@ -773,9 +773,9 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_candidates_are_uppercase_with_answer_asterisk(self):
         text = self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?selector=RAISE%20.....')).json();
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',current_candidate:'crane',current_candidate_is_answer:true,current_max_guess_depth:2,nodes_per_second:10}];
-          applyReport(branch,null,{...__reportClient.getState(),selector:'RAISE .....'});
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("CRANE*", text)
@@ -814,8 +814,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for width in (390, 1200):
                 for name, path in (
-                    ("overview", ""), ("word", "?selector=CACHE"),
-                    ("branch", "?selector=RAISE+....."),
+                    ("overview", ""), ("word", "?branch_target=CACHE"),
+                    ("branch", "?branch_target=RAISE+....."),
                     ("tree", "?kind=queue&tree=1"),
                 ):
                     self.page.set_viewport_size({"width": width, "height": 900})

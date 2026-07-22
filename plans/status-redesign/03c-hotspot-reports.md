@@ -64,7 +64,7 @@ epoch, and evaluated versus bulk-completed candidate counts.
 
 `claim_telemetry` has no branch key. Coordination hotspots rank
 answer-count/worker-count workload buckets, not branches, and reject a spine
-selector rather than pretending attribution exists.
+branch_target rather than pretending attribution exists.
 
 Phase 3b filters apply to the current-queue hotspot kinds. Historical
 finalization, cut-reuse, and coordination populations do not carry a current

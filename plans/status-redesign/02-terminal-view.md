@@ -18,7 +18,7 @@ output, and refresh without the terminal owning any database assembly.
 
 ## Non-goals
 
-- No positional selector or object-report flags yet; phases 3a–3c add them.
+- No positional branch_target or object-report flags yet; phases 3a–3c add them.
 - Do not remove `status` or read-only `queue` commands yet.
 - No branch/worker drill-down hotkeys yet.
 - No HTTP or browser code.

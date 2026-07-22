@@ -17,7 +17,7 @@ from report_model import (
     ReportSources,
     WORKER_STALE_SECONDS,
     collect_report,
-    parse_report_selector,
+    parse_report_branch_target,
 )
 
 
@@ -147,7 +147,7 @@ def _display_reference(branch_reference):
 
     Collisions among the few dozen simultaneously live branches are
     vanishingly unlikely over a 16-bit space, and any prefix remains a valid
-    @reference selector.
+    @reference branch_target.
     """
     return branch_reference[:4]
 
@@ -1347,7 +1347,7 @@ class WatchSession:
         self.branch_hotkeys = {}
         self.worker_hotkeys = {}
         self.branch_letter_by_key = {}
-        self.branch_selectors = {}
+        self.branch_targets = {}
         self.previous_sections = []
         self.terminal_settings = None
         self.cursor_hidden = False
@@ -1367,10 +1367,10 @@ class WatchSession:
         )
 
     def _request_from_args(self):
-        selector = getattr(self.args, "selector", None)
+        branch_target = getattr(self.args, "branch_target", None)
         return ReportRequest(
             report_kind=getattr(self.args, "report_kind", "auto"),
-            selector=selector if selector is not None else ReportRequest().selector,
+            branch_target=branch_target if branch_target is not None else ReportRequest().branch_target,
             include_claims=getattr(self.args, "claims", False),
             include_answers=getattr(self.args, "answers", False),
             tree=getattr(self.args, "tree", False),
@@ -1415,8 +1415,8 @@ class WatchSession:
     def _update_navigation_targets(self, report):
         branch_rows = self._identity_rows(report, "branch_key_hex")
         branch_keys = [row["branch_key_hex"] for row in branch_rows]
-        self.branch_selectors = {
-            row["branch_key_hex"]: self._branch_selector(row)
+        self.branch_targets = {
+            row["branch_key_hex"]: self._branch_target(row)
             for row in branch_rows
         }
         retained_letters = {
@@ -1446,38 +1446,38 @@ class WatchSession:
             if worker_number.isdigit():
                 self.worker_hotkeys[worker_number] = worker["worker_id"]
 
-    def _branch_selector(self, row):
+    def _branch_target(self, row):
         spine = row.get("spine")
         if isinstance(spine, list):
-            selector_text = " ".join(
+            branch_target_text = " ".join(
                 token
                 for step in spine
                 for token in (step["word"], step["pattern"])
             )
-            if selector_text:
-                return parse_report_selector(selector_text)
+            if branch_target_text:
+                return parse_report_branch_target(branch_target_text)
         if isinstance(spine, str) and spine.strip():
             try:
-                selector = parse_report_selector(spine)
-                if selector.kind == "branch":
-                    return selector
+                branch_target = parse_report_branch_target(spine)
+                if branch_target.kind == "branch":
+                    return branch_target
             except ValueError:
                 pass
         if (
-            self.current_request.selector.kind == "word"
+            self.current_request.branch_target.kind == "word"
             and row.get("pattern") is not None
         ):
             parts = [
                 token
-                for step in self.current_request.selector.steps
+                for step in self.current_request.branch_target.steps
                 for token in (step.word, step.pattern)
             ]
-            parts.extend((self.current_request.selector.trailing_word, row["pattern"]))
-            return parse_report_selector(parts)
+            parts.extend((self.current_request.branch_target.trailing_word, row["pattern"]))
+            return parse_report_branch_target(parts)
         branch_digest = hashlib.sha1(
             bytes.fromhex(row["branch_key_hex"])
         ).hexdigest()
-        return parse_report_selector("@" + branch_digest)
+        return parse_report_branch_target("@" + branch_digest)
 
     def _navigation_section(self):
         # Branch hotkey letters appear inline as [x] on their own rows; worker
@@ -1528,7 +1528,7 @@ class WatchSession:
         request = replace(
             self.current_request,
             report_kind="auto",
-            selector=self.branch_selectors[branch_key_hex],
+            branch_target=self.branch_targets[branch_key_hex],
             tree=False,
             worker_id=None,
             hotspot_field=None,
@@ -1543,7 +1543,7 @@ class WatchSession:
         request = replace(
             self.current_request,
             report_kind="workers",
-            selector=parse_report_selector(None),
+            branch_target=parse_report_branch_target(None),
             tree=False,
             worker_id=worker_id,
             hotspot_field=None,
