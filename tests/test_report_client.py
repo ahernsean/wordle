@@ -482,6 +482,46 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("0123456789ab", self.page.url)
         self.assertEqual(self.page.locator("#selector-input").input_value(), "raise -----")
 
+    def test_filter_change_applies_without_navigating_to_typed_selector(self):
+        # A spine typed but not sent with Go stays uncommitted; toggling a
+        # filter applies against the current view and never navigates to it.
+        self.page.goto(self.base_url)
+        self.page.wait_for_selector("h1")
+        self.page.locator("#selector-input").fill("CRANE")
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.page.locator('[data-branch-status][value="pending"]').check()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_status.includes('pending')"
+        )
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().selector"), ""
+        )
+        self.assertNotIn("CRANE", self.page.url)
+
+    def test_view_fields_appear_only_where_the_kind_can_use_them(self):
+        self.page.locator("[data-kind=hotspots]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'hotspots'"
+        )
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.assertFalse(self.page.locator("#by-field").is_hidden())
+        self.assertFalse(self.page.locator("#epoch-field").is_hidden())
+        self.assertFalse(self.page.locator("#since-seconds-field").is_hidden())
+        self.assertTrue(self.page.locator("#sort-field").is_hidden())
+        self.page.locator("[data-kind=cache]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'cache'"
+        )
+        self.assertTrue(self.page.locator("#filters-group").is_hidden())
+        self.assertTrue(self.page.locator("#sort-field").is_hidden())
+
+    def test_refresh_popover_toggles_open_and_closed(self):
+        self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
+        self.page.locator("#connection").click()
+        self.assertEqual(self.page.locator(".conn-wrap.open").count(), 1)
+        self.page.keyboard.press("Escape")
+        self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
+
     def test_unresolvable_reference_reports_error_not_a_fake_report(self):
         self.page.route(
             "**/api/view**",

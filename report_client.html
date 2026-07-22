@@ -134,10 +134,10 @@
     <div class="nav" id="report-nav">
       <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button id="tree-button" aria-pressed="false">Tree</button>
       <span class="conn-wrap">
-        <span id="connection">●</span>
+        <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
           <span class="cap">Refresh every</span>
-          <input id="poll" type="number" min="200">
+          <input id="poll" type="number" min="200" aria-label="Refresh interval (ms)">
           <span class="cap">ms</span>
         </div>
       </span>
@@ -526,7 +526,7 @@
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
       return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
     }
-    function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;chip.title=ok?"connected":message;}
+    function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     async function fetchReport(){
       if(document.hidden)return;
       if(activeRequestController){
@@ -583,10 +583,12 @@
       currentState=parsePageState(location);syncControls();
       byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("selector-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
       byId("tree-button").addEventListener("click",()=>setState({...readControls(),tree:!currentState.tree}));
-      // Filters and view controls commit on change; the selector still commits
-      // only on Go/Enter, so a filter tweak never navigates.
-      document.querySelector("details.filters").addEventListener("change",()=>setState(readControls()));
-      byId("poll").addEventListener("change",()=>setState(readControls()));
+      // Filters and view controls commit on change against the committed
+      // selector, so a filter tweak never navigates to text typed but not yet
+      // sent with Go/Enter.  replaceState keeps a run of tweaks to one Back step.
+      const commitControls=()=>setState({...readControls(),selector:currentState.selector},false);
+      document.querySelector("details.filters").addEventListener("change",commitControls);
+      byId("poll").addEventListener("change",commitControls);
       const connWrap=byId("connection").closest(".conn-wrap"),connDot=byId("connection");
       connDot.setAttribute("role","button");connDot.setAttribute("tabindex","0");connDot.setAttribute("aria-expanded","false");
       const setRefreshOpen=open=>{connWrap.classList.toggle("open",open);connDot.setAttribute("aria-expanded",open?"true":"false");};
