@@ -271,14 +271,25 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         tmp_dir = shm if (os.path.isdir(shm) and os.access(shm, os.W_OK)) else None
         self._tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(self._tmp.cleanup)
-        with open(DEFAULT_ANSWER_LIST_PATH) as f:
-            nyt = [l.strip() for l in f if l.strip()]
-        with open(DEFAULT_CANDIDATE_LIST_PATH) as f:
-            wl = [l.strip() for l in f if l.strip()]
-        self._pool = nyt[:self._N_BRANCHES * self._BRANCH_SIZE]
+        # A frozen word sample (tests/fixtures/drain_smoke/), not the live
+        # lists: this measures the coordination floor, which is a constant, so
+        # the workload must stay identical across vocabulary changes rather
+        # than resampling by list position. Regenerate the fixture only to
+        # deliberately refresh the sample, never on a routine list update.
+        fixture_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "fixtures", "drain_smoke")
+        with open(os.path.join(fixture_dir, "pool.txt")) as f:
+            pool = [l.strip() for l in f if l.strip()]
+        with open(os.path.join(fixture_dir, "candidates.txt")) as f:
+            candidates = [l.strip() for l in f if l.strip()]
+        need_pool = self._N_BRANCHES * self._BRANCH_SIZE
+        assert len(pool) >= need_pool and len(candidates) >= self._N_CANDIDATES, (
+            "drain_smoke fixture is smaller than the test's parameters; "
+            "regenerate tests/fixtures/drain_smoke/")
+        self._pool = pool[:need_pool]
         self._branches = [self._pool[i * self._BRANCH_SIZE:(i + 1) * self._BRANCH_SIZE]
                           for i in range(self._N_BRANCHES)]
-        self._candidates = wl[:self._N_CANDIDATES]
+        self._candidates = candidates[:self._N_CANDIDATES]
         af = os.path.join(self._tmp.name, "answers.txt")
         wf = os.path.join(self._tmp.name, "words.txt")
         with open(af, "w") as f:
@@ -457,13 +468,18 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
             tN, t1 * self._SPEEDUP_RATIO,
             f"{n} workers ({tN:.3f}s) not fast enough vs "
             f"1 worker ({t1:.3f}s); expected < {t1 * self._SPEEDUP_RATIO:.3f}s")
-        # Sanity: every branch must also have produced a valid cache entry.
+        # Every branch must have resolved to a best row or a proven loss; a
+        # branch with neither is a genuine gap the drain left behind. A loss is
+        # a valid terminal result (a branch unsolvable within budget from this
+        # test's deliberately small candidate set), not a missing entry.
         sc = ScoreCache(rN['cache'], self._pool)
-        missing = [bw for bw in self._branches
-                   if sc.read(encode_subset(bw), ERD_ALL) is None]
+        unresolved = [bw for bw in self._branches
+                      if sc.read(encode_subset(bw), ERD_ALL) is None
+                      and sc.read_loss(encode_subset(bw), ERD_ALL) is None]
         sc.close()
-        self.assertEqual(missing, [],
-                         f"{len(missing)} branches missing from cache")
+        self.assertEqual(unresolved, [],
+                         f"{len(unresolved)} branches unresolved "
+                         f"(neither best row nor proven loss)")
 
 
 @unittest.skipUnless(SCALING_SMOKE_REQS_MET, SCALING_SMOKE_SKIP_REASON)
