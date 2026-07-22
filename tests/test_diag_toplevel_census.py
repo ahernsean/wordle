@@ -12,6 +12,7 @@ import numpy as np
 
 import diag_toplevel_census
 from erd_queue import cost_size_bucket
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from pattern_matrix import PatternMatrix
 from wordle_engine import calculate_response, _encode_response, load_word_list
 
@@ -37,8 +38,8 @@ class CensusTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         random_generator = random.Random(7)
-        answer_words = load_word_list('NYT_wordlist.txt')
-        opener_words = load_word_list('wordle.txt')
+        answer_words = load_word_list(DEFAULT_ANSWER_LIST_PATH)
+        opener_words = load_word_list(DEFAULT_CANDIDATE_LIST_PATH)
         cls.answer_words = sorted(random_generator.sample(answer_words, 60))
         cls.opener_words = sorted(
             set(random_generator.sample(opener_words, 25))

@@ -50,7 +50,9 @@ import time
 from cache_sqlite import ScoreCache
 from wordle_engine import load_word_list
 
-ANSWER_FILE = 'NYT_wordlist.txt'
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH
+
+ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 BATCH = 20000   # rows per progress step / commit
 
 TABLES = [

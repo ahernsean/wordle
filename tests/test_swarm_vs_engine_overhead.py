@@ -29,6 +29,7 @@ import unittest
 from unittest import mock
 
 from cache_sqlite import ScoreCache
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
 import pattern_matrix as pattern_matrix_module
 import erd_swarm
@@ -54,9 +55,9 @@ class TestSwarmVsDirectEngineOverhead(unittest.TestCase):
         tmp_dir = shm if (os.path.isdir(shm) and os.access(shm, os.W_OK)) else None
         self._tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(self._tmp.cleanup)
-        with open("NYT_wordlist.txt") as f:
+        with open(DEFAULT_ANSWER_LIST_PATH) as f:
             answers = [l.strip() for l in f if l.strip()]
-        with open("wordle.txt") as f:
+        with open(DEFAULT_CANDIDATE_LIST_PATH) as f:
             guesses = [l.strip() for l in f if l.strip()]
         [self._branch] = build_trap_branches(answers, 1, self._BRANCH_SIZE)
         self._candidates = build_candidates(guesses, [self._branch],

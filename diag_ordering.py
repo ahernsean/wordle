@@ -29,8 +29,10 @@ DEADLINE_S = 90.0
 ORDER_ON = 8
 ORDER_OFF = 10 ** 9   # gate so high ordering never triggers
 
-answers = load_word_list('NYT_wordlist.txt')
-vocab = load_word_list('wordle.txt')
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+answers = load_word_list(DEFAULT_ANSWER_LIST_PATH)
+vocab = load_word_list(DEFAULT_CANDIDATE_LIST_PATH)
 
 # Read branch keys (read-only), smallest-first, excluding the 238-word branch.
 q = sqlite3.connect('erd_queue.sqlite3', timeout=10); q.row_factory = sqlite3.Row

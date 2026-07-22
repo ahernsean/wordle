@@ -53,8 +53,10 @@ from erd_queue import (ERDQueue, decode_subset, encode_subset,
                        DEFAULT_REPUBLISH_LIMIT)
 from wordle_ui import fmt_pattern
 
-ANSWER_FILE = 'NYT_wordlist.txt'
-WORDS_FILE = 'wordle.txt'
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
+WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 
 BEST_REFRESH_SECONDS = 0.25   # how often a worker re-reads the shared bound
 HB_SECONDS = 2.0              # liveness heartbeat cadence during a long candidate evaluation

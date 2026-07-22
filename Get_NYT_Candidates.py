@@ -5,6 +5,8 @@ import re
 import ssl
 import urllib.request
 
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
 WORDLE_PAGE_URL = "https://www.nytimes.com/games/wordle/index.html"
 CHUNK_URL_PATTERN = re.compile(
     r'(?:src|href)="(https://www\.nytimes\.com/games-assets/v2/(?!vendor/|metadata/)[^"]*\.js[^"]*)"'
@@ -69,10 +71,10 @@ def _validate_against_answer_list(candidate_words: list[str]) -> None:
     words than to invent new well-formed ones, so a missing answer word is
     the cheapest available signal that the scrape should not be trusted.
     An absent answer-list file is itself suspicious (wrong working
-    directory, or a rename this literal missed), so it raises rather than
-    silently skipping the gate.
+    directory, or a misconfigured answer-list path), so it raises rather
+    than silently skipping the gate.
     """
-    with open("NYT_wordlist.txt") as f:
+    with open(DEFAULT_ANSWER_LIST_PATH) as f:
         answer_words = f.read().split()
     missing = sorted(set(answer_words) - set(candidate_words))
     if missing:
@@ -87,5 +89,5 @@ if __name__ == "__main__":
     words = get_NYT_candidate_words()
     _validate_against_answer_list(words)
     print(f"Found {len(words)} words")
-    with open("wordle.txt", "w") as f:
-        f.write("\n".join(words))
+    with open(DEFAULT_CANDIDATE_LIST_PATH, "w") as f:
+        f.write("\n".join(words) + "\n")

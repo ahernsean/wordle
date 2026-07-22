@@ -1,9 +1,9 @@
-# Full best-ERD tree for all ~13k openers — implementation plan
+# Full best-ERD tree for all ~15k openers — implementation plan
 
 The goal: populate `branch_best_by_policy` (policy `ERD_ALL`) with the best-ERD
-result for every response branch of every opener in `wordle.txt` (~12,972
-words), on one small Linux box, in weeks rather than years — and make the
-result usable from the iPhone.
+result for every response branch of every opener in `all_candidates.txt`
+(~14,855 words), on one small Linux box, in weeks rather than years — and make
+the result usable from the iPhone.
 
 This document is written to be executed section-by-section by lower-capability
 agents. Part I is shared context every implementer must read. Part II is the
@@ -925,7 +925,7 @@ must run before any sync to the phone.
 
 **8a. `export_cache.py --reachable-only`.**
 - **Seed set:** every (opener, pattern) branch with ≥ 2 answer words, for
-  **every opener in `wordle.txt`** — this is what makes Mode C's "any first
+  **every opener in `all_candidates.txt`** — this is what makes Mode C's "any first
   guess" work (C4). Enumerate via decomposition blobs (or the §2 matrix);
   the seed *keys* are exactly the census (§7a) population.
 - **BFS:** for each seed present in the cache: read its `best_guess`,

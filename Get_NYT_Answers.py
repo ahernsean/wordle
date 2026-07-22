@@ -4,6 +4,8 @@ import ssl
 import urllib.request
 import re
 
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH
+
 def get_NYT_answer_words() -> list[str]:
     req = urllib.request.Request(
         "https://wordletools.azurewebsites.net/weightedbottles",
@@ -21,10 +23,10 @@ def get_NYT_answer_words() -> list[str]:
         and re.fullmatch(r"\d+(?:\.\d+)?%", tds[1].get_text(strip=True))
     ]
     
-    return(words)
-    
+    return sorted(set(word.lower() for word in words))
+
 if __name__ == "__main__":
     words = get_NYT_answer_words()
     print(f"Found {len(words)} words")
-    with open("NYT_wordlist.txt", "w") as f:
-        f.write("\n".join(word.lower() for word in words))
+    with open(DEFAULT_ANSWER_LIST_PATH, "w") as f:
+        f.write("\n".join(words) + "\n")

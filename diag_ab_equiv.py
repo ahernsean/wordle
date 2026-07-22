@@ -21,8 +21,10 @@ def _load_old():
 
 old_eng = _load_old()
 
-answers = new_eng.load_word_list('NYT_wordlist.txt')
-vocab = new_eng.load_word_list('wordle.txt')
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+answers = new_eng.load_word_list(DEFAULT_ANSWER_LIST_PATH)
+vocab = new_eng.load_word_list(DEFAULT_CANDIDATE_LIST_PATH)
 # Bounded guess vocabulary (same for both engines) to keep the check fast.
 guess_vocab = sorted(set(vocab[:250]) | set(answers[:60]))
 

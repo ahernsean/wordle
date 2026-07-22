@@ -43,8 +43,56 @@ Operating decisions already made:
 
 - The phone stays on the old lists — no pull from origin — until the uplift
   is entirely done. The Linux side flips wholesale when execution starts.
-- The epoch swarm is already stopped for the duration; epoch testing
-  resumes after retirement.
+- The epoch swarm must be stopped for any phase that reads or writes the
+  cache, and epoch testing resumes only after retirement. Its state is never
+  assumed, though: it may be run opportunistically to warm the cache between
+  work sessions, and a reboot restarts it via its `wordle-erd` systemd unit —
+  so every phase opens with the machine-state check below.
+
+### Standing machine-state check (run at the start of every phase)
+
+Never trust a written "the swarm is stopped" claim, and never trust a single
+signal:
+
+1. `erd_search.py view --workers` — necessary but not sufficient. Its worker
+   view is served by the report web server (`wordle-report-server`); if that
+   server is down, it reports **zero workers even while the swarm is
+   running**. A zero here proves nothing on its own.
+2. Cross-check the process list, which needs no report server:
+   `ps -ef | grep -E 'erd_search.py run|swarm_worker'`. The supervisor runs
+   as the `wordle-erd` systemd user unit, so it also survives reboots.
+
+If either signal shows the swarm running, stop it — the operator CLI wraps
+`systemctl --user`:
+
+- **For any active uplift phase (anything touching the cache or queue): full
+  `erd_search.py stop`.** This also stops the report web server, which reads
+  the production database; keep it down so nothing reads the DB mid-migration
+  or mid-sweep. `view` goes dark during the hold — verify via the process
+  list instead.
+- `erd_search.py stop --swarm-only` is only for a transient look where you
+  want `view` to stay up and accept the report server reading the DB. Do not
+  use it as the posture for a phase that mutates the cache.
+
+Re-verify both signals after stopping, then proceed.
+
+**Reboot-proofing: the disk-stop latch.** A full stop does not survive a
+reboot — the `wordle-erd` unit is `enabled` with `Restart=on-failure`, so a
+reboot restarts the swarm. For any hold that must survive a reboot (most of
+this uplift, and especially the multi-day Part 3 sweep), engage the disk-stop
+latch: a row in the queue DB, durable across reboots and systemd restarts. On
+startup `run` reads it and refuses with a clean exit (no `Restart` loop),
+until it is released with `erd_search.py queue clear-disk-stop`. There is
+currently **no CLI to set it** (only to clear — it is normally written by the
+disk-fill guard), so set it with a one-off:
+`ERDQueue(DEFAULT_QUEUE_PATH).set_disk_stop('<reason>')`. Adding a
+`queue set-disk-stop` command would make this symmetric and is worth doing if
+the latch is engaged more than once. Releasing the latch is a required first
+step of resuming the swarm (Phase 7).
+
+This is a correctness requirement, not hygiene: Part 3 shows a live worker
+can silently serve a not-yet-recertified `ERD_ALL` row as exact, and a worker
+on stale code writes under the wrong `answer_list_id`.
 
 ## Part 1 — Foundations (unchanged by the second discovery)
 
@@ -513,7 +561,9 @@ list-and-rename flip (Phase 0) is the one exception and goes through a PR.
 
 ### Phase 1 — Freeze and back up
 
-1. Swarm already stopped; confirm no live claims (`erd_search.py view`).
+1. Run the standing machine-state check (both signals; stop with
+   `erd_search.py stop --swarm-only` if the swarm is running). Then confirm
+   no live claims.
 2. Checkpoint and back up `wordle_cache.sqlite3` and `erd_queue.sqlite3`.
 3. Check disk headroom: retained tables roughly double until retirement.
 
@@ -534,10 +584,11 @@ list-and-rename flip (Phase 0) is the one exception and goes through a PR.
 1. Write the sweep extension (inline solves of missing sub-branches,
    tainted-child re-solves; Part 3) as a committed change to
    `verify_erd_cache.py`, through a PR.
-2. Confirm the swarm is idle (`erd_search.py view --workers --format json`
-   — check, don't assume) before starting; keep it stopped for the whole
-   phase. Required, not just operational hygiene: Part 3 explains why a
-   live worker could silently serve a not-yet-recertified row as exact.
+2. Run the standing machine-state check before starting — both signals, since
+   `view --workers` alone can report a false zero when the report server is
+   down — and keep the swarm stopped for the whole phase. Required, not just
+   operational hygiene: Part 3 explains why a live worker could silently serve
+   a not-yet-recertified row as exact.
 3. Run the extended sweep leaves-first to completion (~3–8.7 days on 6
    workers, ~5.4 days central estimate — measured directly, Part 3; no
    further sample-wave timing needed). Monitor via the sweep's own
@@ -606,7 +657,9 @@ of the 14 rescued guess words:
 
 1. Delete old-`answer_list_id` rows from all four tables;
    vacuum/checkpoint; re-sync the phone.
-2. Resume epoch testing (fresh `telemetry_epoch`).
+2. Release the disk-stop latch (`erd_search.py queue clear-disk-stop`) —
+   `run` refuses to start while it is set — then resume epoch testing (fresh
+   `telemetry_epoch`).
 
 ## Open items
 
