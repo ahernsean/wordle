@@ -14,15 +14,46 @@
     button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:#edf5ec; }
     input[type="checkbox"] { min-height:auto; accent-color:var(--green); }
     header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
-    .nav, .selector, .filter-grid, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
+    .nav, .selector, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
     .selector { margin-top:.35rem; flex-wrap:nowrap; }
     #selector-input { flex:1 1 8rem; min-width:6rem; }
-    details.filters { margin-top:.3rem; color:var(--dim); }
-    .filter-grid { padding:.5rem 0; align-items:end; }
-    .field { display:grid; gap:.15rem; color:var(--dim); min-width:7rem; flex:1 1 8rem; }
-    .statuses { display:flex; flex-wrap:wrap; gap:.5rem; padding:.2rem 0; }
-    #connection { margin-left:auto; color:var(--green); padding:.1rem .3rem; white-space:nowrap; }
+    details.filters { margin-top:.35rem; color:var(--dim); }
+    details.filters > summary { cursor:pointer; padding:.1rem 0; }
+    .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
+    .control-group[hidden] { display:none; }
+    .group-head { display:flex; align-items:baseline; gap:.5rem; }
+    .group-head .gname { font-weight:700; color:var(--text); }
+    .group-head .ghint { color:var(--dim); font-size:.82rem; }
+    /* Fields size to their content and wrap; a numeric input is capped to its
+       magnitude rather than stretched to a shared column width. */
+    .field-flow { display:flex; flex-wrap:wrap; gap:.4rem .85rem; align-items:end; margin-top:.35rem; }
+    .field-flow input[type="number"] { width:4.2rem; text-align:right; padding-left:.35rem; padding-right:.35rem; }
+    .field-flow input.narrow { width:2.9rem; } .field-flow input.medium { width:3.4rem; }
+    .field { display:grid; gap:.1rem; color:var(--dim); }
+    .field[hidden] { display:none; }
+    .fieldlabel { display:flex; align-items:baseline; gap:.3rem; }
+    .hinttag { font-size:.68rem; color:var(--amber); border:1px solid #e6dcae; background:#fbf6e2; border-radius:3px; padding:0 .3rem; white-space:nowrap; }
+    .status-line { display:flex; flex-wrap:wrap; gap:.4rem; align-items:baseline; padding:.15rem 0; }
+    .status-line > .label { color:var(--dim); }
+    .statuses { display:flex; flex-wrap:wrap; gap:.5rem; align-items:baseline; }
+    .statuses label { display:inline-flex; gap:.25rem; align-items:center; white-space:nowrap; }
+    .conn-wrap { position:relative; margin-left:auto; }
+    #connection { color:var(--green); padding:.1rem .3rem; white-space:nowrap; cursor:pointer; border-radius:4px; user-select:none; }
     #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
+    #connection:focus-visible { outline:2px solid var(--green); outline-offset:1px; }
+    .conn-wrap.open #connection:not(.disconnected) { background:#edf5ec; }
+    .refresh-pop { position:absolute; top:100%; right:0; z-index:20; margin-top:.2rem; padding:.35rem .5rem; background:#ffffff; border:1px solid var(--border); border-radius:6px; box-shadow:0 5px 16px rgba(0,0,0,.14); display:flex; align-items:center; gap:.4rem; white-space:nowrap; color:var(--text); opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .12s ease, transform .12s ease, visibility .12s; }
+    .refresh-pop .cap { color:var(--dim); font-size:.8rem; }
+    .refresh-pop input { width:4.5rem; text-align:right; }
+    .conn-wrap.open .refresh-pop { opacity:1; visibility:visible; transform:none; }
+    /* Where the pointer can hover, opening on hover is layered on top of the
+       tap-toggle; a transparent bridge spans the gap so crossing to the panel
+       does not dismiss it. */
+    @media (hover:hover) and (pointer:fine) {
+      .refresh-pop::before { content:""; position:absolute; left:0; right:0; top:-.4rem; height:.4rem; }
+      .conn-wrap:hover #connection:not(.disconnected) { background:#edf5ec; }
+      .conn-wrap:hover .refresh-pop, .refresh-pop:hover { opacity:1; visibility:visible; transform:none; }
+    }
     main { width:min(1200px,100%); margin:auto; padding:.5rem clamp(.5rem,1.5vw,1rem) 2rem; }
     .report-meta { display:flex; flex-wrap:wrap; gap:.2rem .6rem; align-items:baseline; margin:.2rem 0 .35rem; }
     details.source-paths { display:inline-block; }
@@ -102,29 +133,42 @@
   <header>
     <div class="nav" id="report-nav">
       <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button id="tree-button" aria-pressed="false">Tree</button>
-      <span id="connection">●</span>
+      <span class="conn-wrap">
+        <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
+        <div class="refresh-pop">
+          <span class="cap">Refresh every</span>
+          <input id="poll" type="number" min="200" aria-label="Refresh interval (ms)">
+          <span class="cap">ms</span>
+        </div>
+      </span>
     </div>
     <div class="selector">
       <input id="selector-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
-      <button id="apply">Apply</button><button id="back">Back</button>
+      <button id="apply">Go</button><button id="back">Back</button>
     </div>
-    <details class="filters"><summary>Filters</summary>
-      <div class="field">Branch status <span class="statuses" id="branch-statuses"></span></div>
-      <div class="field">Branch phase <span class="statuses" id="branch-phases"></span></div>
-      <div class="dim">No selection means all values on that axis.</div>
-      <div class="filter-grid">
-        <label class="field">Minimum answers<input id="minimum-answer-count" type="number"></label>
-        <label class="field">Maximum answers<input id="maximum-answer-count" type="number"></label>
-        <label class="field">Budget<input id="budget" type="number"></label>
-        <label class="field">Priority<input id="priority" type="number"></label>
-        <label class="field">Sort<select id="sort"><option value="">default</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>nodes</option><option>slowest</option></select></label>
-        <label class="field">Limit<input id="limit" type="number" min="1"></label>
-        <label class="field">Hotspot field<select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>bulk-completed-candidates</option><option>cut-reuse</option><option>coordination</option></select></label>
-        <label class="field">Epoch<input id="epoch" type="number"></label>
-        <label class="field">Window seconds<input id="since-seconds" type="number" min="1"></label>
-        <label class="field">Poll milliseconds<input id="poll" type="number" min="200"></label>
+    <details class="filters"><summary>Filters &amp; view</summary>
+      <div class="control-group" id="filters-group">
+        <div class="group-head"><span class="gname">Filters</span><span class="ghint">narrow the branches — applied as you change them</span></div>
+        <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
+        <div class="status-line"><span class="label">Branch phase</span><span class="statuses" id="branch-phases"></span></div>
+        <div class="dim">No selection means all values on that axis.</div>
+        <div class="field-flow">
+          <label class="field">Min answers<input id="minimum-answer-count" type="number"></label>
+          <label class="field">Max answers<input id="maximum-answer-count" type="number"></label>
+          <label class="field">Budget<input id="budget" class="narrow" type="number"></label>
+          <label class="field">Priority<input id="priority" class="medium" type="number"></label>
+        </div>
       </div>
-      <button id="apply-filters">Apply filters</button>
+      <div class="control-group" id="view-group">
+        <div class="group-head"><span class="gname">View</span><span class="ghint">order &amp; scope what's shown</span></div>
+        <div class="field-flow">
+          <label class="field" id="sort-field"><span class="fieldlabel">Sort <span class="hinttag">default = natural order</span></span><select id="sort"><option value="">default</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>nodes</option><option>slowest</option></select></label>
+          <label class="field"><span id="limit-label">Branches shown</span><input id="limit" type="number" min="1"></label>
+          <label class="field" id="by-field"><span class="fieldlabel">Hotspot field</span><select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>bulk-completed-candidates</option><option>cut-reuse</option><option>coordination</option></select></label>
+          <label class="field" id="epoch-field">Epoch<input id="epoch" class="narrow" type="number"></label>
+          <label class="field" id="since-seconds-field"><span class="fieldlabel">Stats window (s)</span><input id="since-seconds" type="number" min="1" title="time window for hotspot aggregation"></label>
+        </div>
+      </div>
     </details>
   </header>
   <main id="report"><p class="empty">Loading report…</p></main>
@@ -138,7 +182,7 @@
     const treelessKinds=new Set(["cache","hotspots"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), stickyOrders=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownSelector=null;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -205,7 +249,10 @@
       syncControls(); fetchReport(); schedulePoll();
     }
     function syncControls(){
-      byId("selector-input").value=currentState.selector;byId("poll").value=currentState.poll;
+      // Repaint the selector box only when the committed selector changed, so a
+      // filter commit never overwrites a spine typed but not yet sent with Go.
+      if(currentState.selector!==shownSelector){byId("selector-input").value=currentState.selector;shownSelector=currentState.selector;}
+      byId("poll").value=currentState.poll;
       const treeButton=byId("tree-button");
       treeButton.hidden=treelessKinds.has(currentState.kind);
       treeButton.setAttribute("aria-pressed",currentState.tree?"true":"false");
@@ -215,6 +262,12 @@
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
+      const kind=currentState.kind, isHotspots=kind==="hotspots";
+      const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(currentState.by);
+      byId("filters-group").hidden=kind==="cache"||historicalHotspot;
+      byId("sort-field").hidden=kind==="cache"||isHotspots;
+      byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
+      byId("limit-label").textContent=kind==="auto"?"Branches shown":"Rows shown";
     }
     function readControls(){return {...currentState,selector:byId("selector-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value};}
 
@@ -476,7 +529,7 @@
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
       return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
     }
-    function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;chip.title=ok?"connected":message;}
+    function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     async function fetchReport(){
       if(document.hidden)return;
       if(activeRequestController){
@@ -524,7 +577,7 @@
       const query=stateQuery(currentState,true).toString();
       history.replaceState(null,"",location.pathname+(query?"?"+query:""));
       lastContext=contextKey(currentState);
-      byId("selector-input").value=currentState.selector;
+      byId("selector-input").value=currentState.selector;shownSelector=currentState.selector;
     }
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
@@ -532,7 +585,20 @@
       addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-phases",branchPhaseNames,"branchPhase");
       currentState=parsePageState(location);syncControls();
       byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("selector-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
-      byId("tree-button").addEventListener("click",()=>setState({...readControls(),tree:!currentState.tree}));byId("apply-filters").addEventListener("click",()=>setState(readControls()));
+      byId("tree-button").addEventListener("click",()=>setState({...readControls(),tree:!currentState.tree}));
+      // Filters and view controls commit on change against the committed
+      // selector, so a filter tweak never navigates to text typed but not yet
+      // sent with Go/Enter.  replaceState keeps a run of tweaks to one Back step.
+      const commitControls=()=>setState({...readControls(),selector:currentState.selector},false);
+      document.querySelector("details.filters").addEventListener("change",commitControls);
+      byId("poll").addEventListener("change",commitControls);
+      const connWrap=byId("connection").closest(".conn-wrap"),connDot=byId("connection");
+      connDot.setAttribute("role","button");connDot.setAttribute("tabindex","0");connDot.setAttribute("aria-expanded","false");
+      const setRefreshOpen=open=>{connWrap.classList.toggle("open",open);connDot.setAttribute("aria-expanded",open?"true":"false");};
+      connDot.addEventListener("click",event=>{event.stopPropagation();setRefreshOpen(!connWrap.classList.contains("open"));});
+      connDot.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();setRefreshOpen(!connWrap.classList.contains("open"));}});
+      document.addEventListener("click",event=>{if(!connWrap.contains(event.target))setRefreshOpen(false);});
+      document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,selector:overview?"":currentState.selector,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false});}));
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
