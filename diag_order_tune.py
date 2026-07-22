@@ -22,8 +22,10 @@ REPEATS = 3
 BUDGET = 5
 DEADLINE_S = 150.0
 
-answers = load_word_list('NYT_wordlist.txt')
-vocab = load_word_list('wordle.txt')
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+answers = load_word_list(DEFAULT_ANSWER_LIST_PATH)
+vocab = load_word_list(DEFAULT_CANDIDATE_LIST_PATH)
 
 q = sqlite3.connect('erd_queue.sqlite3', timeout=10); q.row_factory = sqlite3.Row
 branches = []

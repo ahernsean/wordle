@@ -1,6 +1,6 @@
 """diag_toplevel_census.py -- §7a top-level branch census (resolves U7 exactly).
 
-For every opener in wordle.txt, partitions the NYT answer list by response
+For every opener in all_candidates.txt, partitions the NYT answer list by response
 pattern using the pattern matrix, then counts the distinct branches (answer
 subsets with >= 2 words) across ALL openers: the same subset reached from two
 different openers counts once. Reports the aggregate distinct count, two
@@ -38,8 +38,10 @@ import pattern_matrix
 from erd_queue import cost_size_bucket
 from wordle_engine import load_word_list
 
-OPENER_LIST_PATH = 'wordle.txt'
-ANSWER_LIST_PATH = 'NYT_wordlist.txt'
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+OPENER_LIST_PATH = DEFAULT_CANDIDATE_LIST_PATH
+ANSWER_LIST_PATH = DEFAULT_ANSWER_LIST_PATH
 
 # (low, high) inclusive branch-size buckets; high=None means unbounded.
 # The 201-300 / 301-500 boundary is aligned to the over-300 regime line.

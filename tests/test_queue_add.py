@@ -14,7 +14,7 @@ from wordle_engine import ResponseCache, load_word_list
 from cache_sqlite import ScoreCache
 
 # "fuzzy"'s all-gray branch (code 0) has ~1,868 answer words in
-# NYT_wordlist.txt -- well over the old 300-word default cap.
+# all_answers.txt -- well over the old 300-word default cap.
 LARGE_BRANCH_WORD = 'fuzzy'
 
 

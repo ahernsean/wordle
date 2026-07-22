@@ -82,8 +82,8 @@ membership, not by any depth.
 
 Two files at startup:
 
-- **`NYT_wordlist.txt`** — ~3,200 answer words (the set the NYT Wordle draws from).
-- **`wordle.txt`** — ~12,972 valid guess words (superset including answers).
+- **`all_answers.txt`** — ~3,209 answer words (the set the NYT Wordle draws from).
+- **`all_candidates.txt`** — ~14,855 valid guess words (superset including answers).
 
 Answers are the universe for "what is the answer?"; the full word list is the
 universe for "what should I guess next?" The two are kept separate throughout.

@@ -16,6 +16,7 @@ import tempfile
 import unittest
 
 from cache_sqlite import ScoreCache
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from pattern_matrix import PatternMatrix
 from wordle_engine import (
     ResponseCache,
@@ -34,8 +35,8 @@ def _load_words(path):
         return [line.strip() for line in fh if line.strip()]
 
 
-_ALL_GUESS_WORDS = _load_words(os.path.join(_REPO_DIR, "wordle.txt"))
-_ALL_ANSWER_WORDS = _load_words(os.path.join(_REPO_DIR, "NYT_wordlist.txt"))
+_ALL_GUESS_WORDS = _load_words(os.path.join(_REPO_DIR, DEFAULT_CANDIDATE_LIST_PATH))
+_ALL_ANSWER_WORDS = _load_words(os.path.join(_REPO_DIR, DEFAULT_ANSWER_LIST_PATH))
 
 
 def _dump_cache_tables(score_cache):

@@ -23,6 +23,7 @@ from unittest import mock
 import numpy as np
 
 import pattern_matrix
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from pattern_matrix import (
     CandidateStats, PatternMatrix, _COUNT_CHUNK_ROWS, _compute_answer_list_id,
 )
@@ -36,8 +37,8 @@ def _load_words(path):
 
 # Paths relative to the repo root (runner cwd is the repo root).
 _REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_ALL_GUESS_WORDS = _load_words(os.path.join(_REPO_DIR, "wordle.txt"))
-_ALL_ANSWER_WORDS = _load_words(os.path.join(_REPO_DIR, "NYT_wordlist.txt"))
+_ALL_GUESS_WORDS = _load_words(os.path.join(_REPO_DIR, DEFAULT_CANDIDATE_LIST_PATH))
+_ALL_ANSWER_WORDS = _load_words(os.path.join(_REPO_DIR, DEFAULT_ANSWER_LIST_PATH))
 
 
 class TestMatrixCorrectness(unittest.TestCase):

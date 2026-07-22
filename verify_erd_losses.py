@@ -60,8 +60,10 @@ from wordle_engine import ERD_ALL, ResponseCache, load_word_list, min_expected_g
 from erd_queue import decode_subset
 from pattern_matrix import PatternMatrix
 
-ANSWER_FILE = 'NYT_wordlist.txt'
-WORDS_FILE = 'wordle.txt'
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
+WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 DEFAULT_CACHE = 'wordle_cache.sqlite3'
 DEFAULT_TELEMETRY = 'erd_queue_telemetry.sqlite3'
 DEFAULT_LOG = 'verify_erd_losses.log'

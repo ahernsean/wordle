@@ -15,7 +15,7 @@ diag_*.py scripts) -- run directly with `python3 diag_kernel_bench.py`.
 DIAG_BRANCH_SIZES / DIAG_BUDGET / DIAG_DEADLINE_S / DIAG_SEED env vars
 override the defaults below, for a quick sanity check on small branches
 without editing the file. DIAG_VOCAB_SAMPLE further shrinks the guess
-vocabulary (0 = full wordle.txt) so the matrix build itself stays fast when
+vocabulary (0 = full all_candidates.txt) so the matrix build itself stays fast when
 no pre-warmed decomposition cache is available -- the real bench run on the
 box should leave it at 0 against a warm production decomposition table.
 """
@@ -36,8 +36,10 @@ DEADLINE_S = float(os.environ.get('DIAG_DEADLINE_S', '60'))
 SEED = int(os.environ.get('DIAG_SEED', '0'))
 VOCAB_SAMPLE = int(os.environ.get('DIAG_VOCAB_SAMPLE', '0'))
 
-answers = eng.load_word_list('NYT_wordlist.txt')
-vocab = eng.load_word_list('wordle.txt')
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+answers = eng.load_word_list(DEFAULT_ANSWER_LIST_PATH)
+vocab = eng.load_word_list(DEFAULT_CANDIDATE_LIST_PATH)
 rng = random.Random(SEED)
 if VOCAB_SAMPLE:
     answers = sorted(rng.sample(answers, min(VOCAB_SAMPLE, len(answers))))

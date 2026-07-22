@@ -43,8 +43,10 @@ from wordle_engine import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-ANSWER_FILE = "NYT_wordlist.txt"
-WORDS_FILE = "wordle.txt"
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+
+ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
+WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = "wordle_debug.log"
 BUILD = "b136"

@@ -202,10 +202,10 @@ python3.13 erd_search.py queue add --word salet --pattern .....
 # All words in a file (queues every branch for every word, unbounded --
 # including each opener's monster all-gray branch; pass --max-branch-size
 # to bound a bulk run):
-python3.13 erd_search.py queue add --word-list wordle.txt
+python3.13 erd_search.py queue add --word-list all_candidates.txt
 
 # All words in a file, with a subset prioritized (others queued at 0):
-python3.13 erd_search.py queue add --word-list wordle.txt \
+python3.13 erd_search.py queue add --word-list all_candidates.txt \
     --priority-words salet crane --priority 1
 
 # Bound a deliberately limited run to branches of at most 300 answer words:

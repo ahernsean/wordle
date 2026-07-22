@@ -38,6 +38,7 @@ import unittest
 from unittest import mock
 
 from cache_sqlite import ScoreCache
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET
@@ -270,9 +271,9 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         tmp_dir = shm if (os.path.isdir(shm) and os.access(shm, os.W_OK)) else None
         self._tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(self._tmp.cleanup)
-        with open("NYT_wordlist.txt") as f:
+        with open(DEFAULT_ANSWER_LIST_PATH) as f:
             nyt = [l.strip() for l in f if l.strip()]
-        with open("wordle.txt") as f:
+        with open(DEFAULT_CANDIDATE_LIST_PATH) as f:
             wl = [l.strip() for l in f if l.strip()]
         self._pool = nyt[:self._N_BRANCHES * self._BRANCH_SIZE]
         self._branches = [self._pool[i * self._BRANCH_SIZE:(i + 1) * self._BRANCH_SIZE]
@@ -507,9 +508,9 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
         tmp_dir = shm if (os.path.isdir(shm) and os.access(shm, os.W_OK)) else None
         self._tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(self._tmp.cleanup)
-        with open("NYT_wordlist.txt") as f:
+        with open(DEFAULT_ANSWER_LIST_PATH) as f:
             answers = [l.strip() for l in f if l.strip()]
-        with open("wordle.txt") as f:
+        with open(DEFAULT_CANDIDATE_LIST_PATH) as f:
             guesses = [l.strip() for l in f if l.strip()]
         self._branches = build_trap_branches(answers, self._N_BRANCHES,
                                              self._BRANCH_SIZE)
