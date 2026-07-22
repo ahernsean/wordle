@@ -2,7 +2,7 @@
 
 Covers: cmd_guess, cmd_include, cmd_exclude, cmd_reset, cmd_undo, cmd_answer,
 cmd_wordcount, cmd_candidates, cmd_help, cmd_display, and the pick_one/
-pick_one_or_all selectors they share.
+pick_one_or_all branch_targets they share.
 """
 import unittest
 

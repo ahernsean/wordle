@@ -99,7 +99,7 @@ back, Space refreshes, and `q` quits. Non-TTY text and structured output remain
 noninteractive. The overview includes filesystem fullness, queue WAL size, and
 a fresh fill-rate estimate with time remaining to the disk-stop threshold.
 
-Semantic selectors infer words and branches from spine form:
+Semantic branch targets infer words and branches from spine form:
 
 ```bash
 python3.13 erd_search.py view CRANE
@@ -270,7 +270,7 @@ stopped and you want to inspect or requeue before restarting.
 
 ## Cache operations
 
-Cache coverage inspection uses `erd_search.py view --cache` with an optional semantic selector.
+Cache coverage inspection uses `erd_search.py view --cache` with an optional semantic branch target.
 
 ### Export for the iPhone
 

@@ -2,7 +2,7 @@
   "schema_version": 2,
   "report_kind": "word",
   "generated_at": 1000,
-  "selector": {"kind": "word", "steps": [], "trailing_word": "queue", "branch_reference": null, "input_text": "QUEUE"},
+  "branch_target": {"kind": "word", "steps": [], "trailing_word": "queue", "branch_reference": null, "input_text": "QUEUE"},
   "filters": {},
   "tree": false,
   "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},

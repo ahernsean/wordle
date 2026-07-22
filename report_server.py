@@ -21,7 +21,7 @@ from report_model import (
     ReportSources,
     collect_report,
     parse_branch_filter,
-    parse_report_selector,
+    parse_report_branch_target,
     validate_report_request,
 )
 from runtime_paths import DEFAULT_CACHE_PATH, DEFAULT_QUEUE_PATH
@@ -45,7 +45,7 @@ INTEGER_PARAMETERS = {
     "limit", "epoch", "since_seconds", "sample_size",
 }
 SCALAR_PARAMETERS = {
-    "selector", "sort", "by", "worker", "branch_status", "branch_phase",
+    "branch_target", "sort", "by", "worker", "branch_status", "branch_phase",
     *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
 }
@@ -117,7 +117,7 @@ def parse_report_request(path, query):
         _single_value(parameters, name)
 
     try:
-        selector = parse_report_selector(_single_value(parameters, "selector"))
+        branch_target = parse_report_branch_target(_single_value(parameters, "branch_target"))
     except ValueError as error:
         raise InvalidRequest(str(error)) from error
     tree = _boolean_value(parameters, "tree")
@@ -133,7 +133,7 @@ def parse_report_request(path, query):
             if branch_status_value is not None
             else (
                 ("active",)
-                if explicit_kind == "auto" and selector.kind == "root" and not tree
+                if explicit_kind == "auto" and branch_target.kind == "root" and not tree
                 else ()
             )
         )
@@ -189,13 +189,13 @@ def parse_report_request(path, query):
         raise InvalidRequest("worker requires the workers endpoint")
     if include_claims and (
         explicit_kind != "auto"
-        or selector.kind not in ("branch", "branch_reference")
+        or branch_target.kind not in ("branch", "branch_reference")
     ):
-        raise InvalidRequest("claims requires a singular branch selector")
+        raise InvalidRequest("claims requires a singular branch target")
     if include_answers and (
         tree
         or explicit_kind in ("queue", "workers")
-        or (explicit_kind == "auto" and selector.kind == "root")
+        or (explicit_kind == "auto" and branch_target.kind == "root")
     ):
         raise InvalidRequest("answers requires a word or branch report without tree")
     if explicit_kind == "hotspots" and limit is None:
@@ -213,7 +213,7 @@ def parse_report_request(path, query):
     )
     request = ReportRequest(
         report_kind=explicit_kind,
-        selector=selector,
+        branch_target=branch_target,
         include_claims=include_claims,
         include_answers=include_answers,
         tree=tree,
@@ -240,7 +240,7 @@ def fixture_name_for_request(path, request):
             "word": "word.json",
             "branch": "branch.json",
             "branch_reference": "branch.json",
-        }[request.selector.kind]
+        }[request.branch_target.kind]
     kind = request.report_kind
     if request.tree:
         return f"{kind}-tree.json"

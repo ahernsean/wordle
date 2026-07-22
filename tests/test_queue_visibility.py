@@ -175,7 +175,7 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(
             [row["branch_key"] for row in result["rows"]], [self.user_key]
         )
-        with self.assertRaisesRegex(ValueError, "singular branch selector"):
+        with self.assertRaisesRegex(ValueError, "singular branch target"):
             self.q.report_hotspots(
                 "cut-reuse", epoch=0, since=now - 60,
                 sample_size=10, limit=10, spine_prefix="CRANE",

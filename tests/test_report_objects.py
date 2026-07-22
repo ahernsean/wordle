@@ -15,9 +15,9 @@ from report_model import (
     WORKER_LIVENESS_SECONDS,
     branch_reference,
     collect_report,
-    parse_report_selector,
+    parse_report_branch_target,
     resolve_branch_reference,
-    resolve_selector_branch,
+    resolve_branch_target,
 )
 from wordle_engine import ERD_ALL, ResponseCache
 from wordle_ui import fmt_pattern
@@ -65,12 +65,12 @@ class SemanticReportTest(unittest.TestCase):
         )
         return pattern_code, answer_words, ScoreCache.encode_subset(answer_words)
 
-    def test_selector_inference_and_normalization(self):
-        root = parse_report_selector(None)
-        word = parse_report_selector("CRANE")
-        nested_word = parse_report_selector(["CRANE", ".y..g", "ALIBI"])
-        branch = parse_report_selector("CRANE -y--g ALIBI g-g--")
-        reference = parse_report_selector("@8B31")
+    def test_branch_target_inference_and_normalization(self):
+        root = parse_report_branch_target(None)
+        word = parse_report_branch_target("CRANE")
+        nested_word = parse_report_branch_target(["CRANE", ".y..g", "ALIBI"])
+        branch = parse_report_branch_target("CRANE -y--g ALIBI g-g--")
+        reference = parse_report_branch_target("@8B31")
         self.assertEqual(root.kind, "root")
         self.assertEqual(word.kind, "word")
         self.assertEqual(word.trailing_word, "crane")
@@ -81,7 +81,7 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(reference.kind, "branch_reference")
         self.assertEqual(reference.branch_reference, "8b31")
         with self.assertRaisesRegex(ValueError, "five-character response pattern"):
-            parse_report_selector("CRANE ALIBI")
+            parse_report_branch_target("CRANE ALIBI")
 
     def test_semantic_queue_programming_errors_propagate(self):
         with patch.object(
@@ -89,14 +89,14 @@ class SemanticReportTest(unittest.TestCase):
         ):
             with self.assertRaises(KeyError):
                 collect_report(self.sources, ReportRequest(
-                    selector=parse_report_selector("RAISE")
+                    branch_target=parse_report_branch_target("RAISE")
                 ))
 
     def test_queue_and_cache_are_unreserved_words(self):
         for word in ("QUEUE", "CACHE"):
-            selector = parse_report_selector(word)
-            self.assertEqual(selector.kind, "word")
-            self.assertEqual(selector.trailing_word, word.lower())
+            branch_target = parse_report_branch_target(word)
+            self.assertEqual(branch_target.kind, "word")
+            self.assertEqual(branch_target.trailing_word, word.lower())
 
     def test_word_report_combines_queue_cache_and_trivial_groups(self):
         pattern_code, answer_words, branch_key = self._largest_group()
@@ -112,7 +112,7 @@ class SemanticReportTest(unittest.TestCase):
         )
         cache.close()
 
-        request = ReportRequest(selector=parse_report_selector("RAISE"))
+        request = ReportRequest(branch_target=parse_report_branch_target("RAISE"))
         report = collect_report(self.sources, request)
         row = next(
             row for row in report["data"]["response_groups"]
@@ -144,7 +144,7 @@ class SemanticReportTest(unittest.TestCase):
 
     def test_semantic_cache_only_branch_and_optional_answers(self):
         pattern_code, answer_words, branch_key = self._largest_group()
-        selector = parse_report_selector(f"RAISE {fmt_pattern(pattern_code)}")
+        branch_target = parse_report_branch_target(f"RAISE {fmt_pattern(pattern_code)}")
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write(
             branch_key, ERD_ALL, "cigar", 2.2,
@@ -153,7 +153,7 @@ class SemanticReportTest(unittest.TestCase):
         cache.close()
         report = collect_report(
             self.sources,
-            ReportRequest(selector=selector, include_answers=True),
+            ReportRequest(branch_target=branch_target, include_answers=True),
         )
         self.assertEqual(report["report_kind"], "branch")
         self.assertIsNone(report["data"]["queue"])
@@ -164,10 +164,10 @@ class SemanticReportTest(unittest.TestCase):
         self.assertIsNone(report["data"]["claims"])
 
     def test_semantic_resolution_never_opens_persistent_cache(self):
-        selector = parse_report_selector("RAISE -----")
+        branch_target = parse_report_branch_target("RAISE -----")
         with patch.object(ScoreCache, "__init__", side_effect=AssertionError):
-            resolved = resolve_selector_branch(selector, ANSWERS)
-        self.assertEqual(resolved.steps, selector.steps)
+            resolved = resolve_branch_target(branch_target, ANSWERS)
+        self.assertEqual(resolved.steps, branch_target.steps)
 
     def test_digest_resolution_rejects_zero_and_multiple_matches(self):
         no_matches = unittest.mock.Mock()
@@ -214,10 +214,10 @@ class SemanticReportTest(unittest.TestCase):
         ])
         queue.mark_done(branch_key)
         queue.close()
-        selector = parse_report_selector("@" + branch_reference(branch_key)[:6])
+        branch_target = parse_report_branch_target("@" + branch_reference(branch_key)[:6])
         report = collect_report(
             self.sources,
-            ReportRequest(selector=selector, include_answers=True),
+            ReportRequest(branch_target=branch_target, include_answers=True),
         )
         self.assertEqual(report["report_kind"], "branch")
         self.assertEqual(report["data"]["queue"]["branch_status"], "done")
@@ -264,9 +264,9 @@ class SemanticReportTest(unittest.TestCase):
             bulk_done_candidates=1,
         )
         queue.close()
-        selector = parse_report_selector(f"RAISE {pattern}")
+        branch_target = parse_report_branch_target(f"RAISE {pattern}")
         report = collect_report(
-            self.sources, ReportRequest(selector=selector, include_claims=True)
+            self.sources, ReportRequest(branch_target=branch_target, include_claims=True)
         )
         claims = {
             claim["candidate_index"]: claim for claim in report["data"]["claims"]
@@ -292,7 +292,7 @@ class SemanticReportTest(unittest.TestCase):
             [{"worker_id": "worker-3", "done_count": 1}],
         )
         summary_without_detail = collect_report(
-            self.sources, ReportRequest(selector=selector)
+            self.sources, ReportRequest(branch_target=branch_target)
         )["data"]["claim_summary"]
         self.assertEqual(summary_without_detail["done_count"], 3)
         self.assertNotIn("answer_words", report["data"]["branch"])
@@ -472,12 +472,12 @@ class SemanticReportTest(unittest.TestCase):
             b"focalserve", 2, 4, budget=5, spine="STINK g----"
         )
         queue.close()
-        for selector_text, expected_word in (
+        for branch_target_text, expected_word in (
             ("", None), ("RAISE", "raise"), ("RAISE -----", "raise"),
         ):
-            with self.subTest(selector=selector_text):
+            with self.subTest(branch_target=branch_target_text):
                 report = collect_report(self.sources, ReportRequest(
-                    selector=parse_report_selector(selector_text), tree=True
+                    branch_target=parse_report_branch_target(branch_target_text), tree=True
                 ))
                 self.assertTrue(report["data"]["tree_available"])
                 node_ids = {node["node_id"] for node in report["data"]["nodes"]}
@@ -503,7 +503,7 @@ class SemanticReportTest(unittest.TestCase):
         )
         queue.close()
         report = collect_report(self.sources, ReportRequest(
-            selector=parse_report_selector("RAISE -----"),
+            branch_target=parse_report_branch_target("RAISE -----"),
             tree=True,
             filters=ReportFilters(minimum_answer_count=100),
         ))
@@ -518,12 +518,12 @@ class SemanticReportTest(unittest.TestCase):
 
     def test_cache_only_tree_is_unavailable_and_legacy_spine_is_unknown(self):
         pattern_code, answer_words, branch_key = self._largest_group()
-        selector = parse_report_selector(f"RAISE {fmt_pattern(pattern_code)}")
+        branch_target = parse_report_branch_target(f"RAISE {fmt_pattern(pattern_code)}")
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write(branch_key, ERD_ALL, "cigar", 2.0, max_depth=2)
         cache.close()
         report = collect_report(
-            self.sources, ReportRequest(selector=selector, tree=True)
+            self.sources, ReportRequest(branch_target=branch_target, tree=True)
         )
         self.assertFalse(report["data"]["tree_available"])
         self.assertEqual(report["data"]["nodes"], [])
@@ -670,7 +670,7 @@ class SemanticReportTest(unittest.TestCase):
 
         report = collect_report(self.sources, ReportRequest(
             report_kind="cache",
-            selector=parse_report_selector(
+            branch_target=parse_report_branch_target(
                 "@" + branch_reference(branch_key)[:6]
             ),
         ))
@@ -687,7 +687,7 @@ class SemanticReportTest(unittest.TestCase):
         queue.heartbeat("worker-1", 1, branch_key, 1, int(time.time()), 0)
         queue.close()
         report = collect_report(self.sources, ReportRequest(
-            selector=parse_report_selector("RAISE"),
+            branch_target=parse_report_branch_target("RAISE"),
             filters=ReportFilters(branch_statuses=("active",)),
         ))
         self.assertEqual(report["data"]["matched_rows"], 1)
@@ -732,24 +732,24 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(len(data["rows"]), 1)
         self.assertEqual(data["rows"][0]["evaluated_candidate_count"], 9)
 
-    def test_cut_reuse_hotspot_honors_singular_branch_selector(self):
-        selector = parse_report_selector("RAISE -----")
-        selected_key = resolve_selector_branch(selector, ANSWERS).branch_key
+    def test_cut_reuse_hotspot_honors_singular_branch_target(self):
+        branch_target = parse_report_branch_target("RAISE -----")
+        selected_key = resolve_branch_target(branch_target, ANSWERS).branch_key
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.add_cut_reuse_miss(selected_key, 3, 4, None, 2.5, 3)
         queue.add_cut_reuse_miss(b"other", 2, 4, None, 2.0, 3)
         queue.close()
         report = collect_report(self.sources, ReportRequest(
             report_kind="hotspots",
-            selector=selector,
+            branch_target=branch_target,
             hotspot_field="cut-reuse",
         ))
         self.assertEqual(len(report["data"]["rows"]), 1)
         self.assertEqual(report["data"]["rows"][0]["branch_key_hex"], selected_key.hex())
-        with self.assertRaisesRegex(ValueError, "singular branch selector"):
+        with self.assertRaisesRegex(ValueError, "singular branch target"):
             collect_report(self.sources, ReportRequest(
                 report_kind="hotspots",
-                selector=parse_report_selector("RAISE"),
+                branch_target=parse_report_branch_target("RAISE"),
                 hotspot_field="cut-reuse",
             ))
 

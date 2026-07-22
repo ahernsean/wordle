@@ -14,9 +14,9 @@
     button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:#edf5ec; }
     input[type="checkbox"] { min-height:auto; accent-color:var(--green); }
     header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
-    .nav, .selector, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
-    .selector { margin-top:.35rem; flex-wrap:nowrap; }
-    #selector-input { flex:1 1 8rem; min-width:6rem; }
+    .nav, .branch-target, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
+    .branch-target { margin-top:.35rem; flex-wrap:nowrap; }
+    #branch-target-input { flex:1 1 8rem; min-width:6rem; }
     details.filters { margin-top:.35rem; color:var(--dim); }
     details.filters > summary { cursor:pointer; padding:.1rem 0; }
     .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
@@ -142,8 +142,8 @@
         </div>
       </span>
     </div>
-    <div class="selector">
-      <input id="selector-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
+    <div class="branch-target">
+      <input id="branch-target-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
       <button id="apply">Go</button><button id="back">Back</button>
     </div>
     <details class="filters"><summary>Filters &amp; view</summary>
@@ -182,7 +182,7 @@
     const treelessKinds=new Set(["cache","hotspots"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), stickyOrders=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownSelector=null;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -202,31 +202,31 @@
     const branchValues=(value,allowed)=>value===undefined?undefined:[...(value||[])].filter(item=>allowed.includes(item));
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",selector:(state.selector||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims};
-      if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.selector===""&&!normalized.tree?["active"]:[];
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims};
+      if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree?["active"]:[];
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
-      if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.selector="";
+      if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
       if(normalized.tree){normalized.claims=false;normalized.answers=false;}
       if(normalized.kind==="queue"||normalized.kind==="workers"){normalized.claims=false;normalized.answers=false;}
-      if(normalized.kind==="auto"&&normalized.selector===""){normalized.answers=false;normalized.claims=false;}
-      const selectorTokens=normalized.selector.split(/\s+/).filter(Boolean),inferredWord=normalized.kind==="auto"&&selectorTokens.length%2===1&&!normalized.selector.startsWith("@");
+      if(normalized.kind==="auto"&&normalized.branch_target===""){normalized.answers=false;normalized.claims=false;}
+      const branchTargetTokens=normalized.branch_target.split(/\s+/).filter(Boolean),inferredWord=normalized.kind==="auto"&&branchTargetTokens.length%2===1&&!normalized.branch_target.startsWith("@");
       if(inferredWord&&!['','default','size','workers','priority'].includes(normalized.sort))normalized.sort="";
       return normalized;
     }
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",selector:query.get("selector")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims"))});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims"))});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
-      if(state.selector)query.set("selector",state.selector); if(state.kind!=="auto")query.set("kind",state.kind);
+      if(state.branch_target)query.set("branch_target",state.branch_target); if(state.kind!=="auto")query.set("kind",state.kind);
       for(const name of ["tree","answers","claims"])if(state[name])query.set(name,"1");
-      const defaultStatuses=state.kind==="auto"&&state.selector===""&&!state.tree?["active"]:[];
+      const defaultStatuses=state.kind==="auto"&&state.branch_target===""&&!state.tree?["active"]:[];
       const addBranchFilter=(name,values,defaults)=>{if(JSON.stringify(values)===JSON.stringify(defaults))return;query.set(name,values.length?values.join(","):"all");};
       addBranchFilter("branch_status",state.branch_status,defaultStatuses);
       addBranchFilter("branch_phase",state.branch_phase,[]);
@@ -249,16 +249,16 @@
       syncControls(); fetchReport(); schedulePoll();
     }
     function syncControls(){
-      // Repaint the selector box only when the committed selector changed, so a
+      // Repaint the branch_target box only when the committed branch_target changed, so a
       // filter commit never overwrites a spine typed but not yet sent with Go.
-      if(currentState.selector!==shownSelector){byId("selector-input").value=currentState.selector;shownSelector=currentState.selector;}
+      if(currentState.branch_target!==shownBranchTarget){byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;}
       byId("poll").value=currentState.poll;
       const treeButton=byId("tree-button");
       treeButton.hidden=treelessKinds.has(currentState.kind);
       treeButton.setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
       byId("sort").value=currentState.sort;byId("by").value=currentState.by;
-      const isOverview=currentState.kind==="auto"&&currentState.selector===""&&!currentState.tree;
+      const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
@@ -269,7 +269,7 @@
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
       byId("limit-label").textContent=kind==="auto"?"Branches shown":"Rows shown";
     }
-    function readControls(){return {...currentState,selector:byId("selector-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -309,7 +309,7 @@
     function branchClass(row){return row.is_live===false?"dead":row.branch_phase==="finalizing"?"finalizing":row.branch_status||"";}
     function reportHeader(report,state){
       const meta=element("section","report-meta");
-      meta.append(element("h1","",report.report_kind+" report"),element("span","dim",state.selector||"root"),element("span","dim",new Date(report.generated_at*1000).toLocaleTimeString()));
+      meta.append(element("h1","",report.report_kind+" report"),element("span","dim",state.branch_target||"root"),element("span","dim",new Date(report.generated_at*1000).toLocaleTimeString()));
       const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.append(summary);
       for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}
       if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));
@@ -337,10 +337,10 @@
       card.addEventListener("click",()=>navigateBranch(row));return card;
     }
     function navigateBranch(row){
-      let selector=row.spine;
-      if(Array.isArray(selector))selector=selector.flatMap(step=>[step.word,step.pattern]).join(" ");
-      if(!selector&&row.node_id&&!row.node_id.startsWith("unknown:"))selector=row.node_id.split("/").flatMap(step=>step.split(":")).join(" ");
-      selector=selector||"@"+row.branch_reference;setState({...currentState,kind:"auto",selector,tree:false,claims:false,answers:false});
+      let branch_target=row.spine;
+      if(Array.isArray(branch_target))branch_target=branch_target.flatMap(step=>[step.word,step.pattern]).join(" ");
+      if(!branch_target&&row.node_id&&!row.node_id.startsWith("unknown:"))branch_target=row.node_id.split("/").flatMap(step=>step.split(":")).join(" ");
+      branch_target=branch_target||"@"+row.branch_reference;setState({...currentState,kind:"auto",branch_target,tree:false,claims:false,answers:false});
     }
     function workerCard(worker,previous,generatedAt){
       const age=Math.max(0,generatedAt-worker.updated_at);
@@ -426,7 +426,7 @@
       const groupCountLabels={response_group_count:"response groups",trivial_response_group_count:"trivial",queued_response_group_count:"queued",active_response_group_count:"active",exact_response_group_count:"exact",loss_response_group_count:"loss",missing_response_group_count:"missing"};
       const summary=element("div","metrics");for(const [key,value] of Object.entries(data.response_group_counts||{}))summary.append(metric(groupCountLabels[key]||label(key),value));fragment.append(summary);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??data.response_group_counts?.response_group_count??matchedRows;fragment.append(element("p","dim","Shown "+shownRows.length+" of "+matchedRows+" matched · "+totalRows+" total response groups"));
-      const grid=element("div","grid"),previousRows=previousBy(previous,"response_groups","branch_key_hex");for(const row of ordered(shownRows,"branch_key_hex","response-groups",state)){const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;const title=element("div","card-title");title.append(patternTiles(row.pattern),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));card.append(title);const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+valueOrDash(row.cache_state)];const best=bestText(row);if(best)parts.push(best);if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)parts.push("max remaining depth "+row.max_remaining_depth);if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));parts.push("@"+shortReference(valueOrDash(row.branch_reference)));card.append(statLine(parts));card.addEventListener("click",()=>setState({...state,kind:"auto",selector:(state.selector+" "+row.pattern).trim(),tree:false}));grid.append(card);}fragment.append(grid);return fragment;
+      const grid=element("div","grid"),previousRows=previousBy(previous,"response_groups","branch_key_hex");for(const row of ordered(shownRows,"branch_key_hex","response-groups",state)){const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;const title=element("div","card-title");title.append(patternTiles(row.pattern),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));card.append(title);const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+valueOrDash(row.cache_state)];const best=bestText(row);if(best)parts.push(best);if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)parts.push("max remaining depth "+row.max_remaining_depth);if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));parts.push("@"+shortReference(valueOrDash(row.branch_reference)));card.append(statLine(parts));card.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:(state.branch_target+" "+row.pattern).trim(),tree:false}));grid.append(card);}fragment.append(grid);return fragment;
     }
     function section(title,content,className=""){const node=element("section","section "+className);node.append(element("h2","",title));if(content)node.append(content);return node;}
     function renderBranch(report,previous,state){
@@ -562,34 +562,34 @@
       // A branch reference is a one-way hash the queue must invert, so it stops
       // resolving (404) once the branch finalizes out of the queue.  A branch's
       // spine resolves from the answer list alone — queue-independent — so once
-      // a branch view has loaded, pin the selector to its spine.  Polling then
+      // a branch view has loaded, pin the branch_target to its spine.  Polling then
       // keeps returning cache-only state on a normal 200 through finalization,
       // and a 404 stays meaningful: a reference that never resolved.
       if(report.report_kind!=="branch"||report.tree)return;
       // Only a queue reference needs replacing; a spine the user typed is
       // already stable, so leave its wording untouched.
-      if(!/^@/.test((state.selector||"").trim()))return;
+      if(!/^@/.test((state.branch_target||"").trim()))return;
       const spine=report.data&&report.data.branch&&report.data.branch.spine;
       if(!Array.isArray(spine)||!spine.length)return;
       const canonical=spine.flatMap(step=>[step.word,step.pattern]).join(" ");
-      if(!canonical||canonical===state.selector)return;
-      currentState=normalizeState({...currentState,selector:canonical});
+      if(!canonical||canonical===state.branch_target)return;
+      currentState=normalizeState({...currentState,branch_target:canonical});
       const query=stateQuery(currentState,true).toString();
       history.replaceState(null,"",location.pathname+(query?"?"+query:""));
       lastContext=contextKey(currentState);
-      byId("selector-input").value=currentState.selector;shownSelector=currentState.selector;
+      byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;
     }
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
       const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
       addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-phases",branchPhaseNames,"branchPhase");
       currentState=parsePageState(location);syncControls();
-      byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("selector-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
+      byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
       byId("tree-button").addEventListener("click",()=>setState({...readControls(),tree:!currentState.tree}));
       // Filters and view controls commit on change against the committed
-      // selector, so a filter tweak never navigates to text typed but not yet
+      // branch_target, so a filter tweak never navigates to text typed but not yet
       // sent with Go/Enter.  replaceState keeps a run of tweaks to one Back step.
-      const commitControls=()=>setState({...readControls(),selector:currentState.selector},false);
+      const commitControls=()=>setState({...readControls(),branch_target:currentState.branch_target},false);
       document.querySelector("details.filters").addEventListener("change",commitControls);
       byId("poll").addEventListener("change",commitControls);
       const connWrap=byId("connection").closest(".conn-wrap"),connDot=byId("connection");
@@ -599,7 +599,7 @@
       connDot.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();setRefreshOpen(!connWrap.classList.contains("open"));}});
       document.addEventListener("click",event=>{if(!connWrap.contains(event.target))setRefreshOpen(false);});
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
-      document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,selector:overview?"":currentState.selector,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false});}));
+      document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false});}));
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.applyReport=applyReport;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
