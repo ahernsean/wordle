@@ -182,7 +182,7 @@
     const treelessKinds=new Set(["cache","hotspots"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), stickyOrders=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownSelector=null;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -249,7 +249,10 @@
       syncControls(); fetchReport(); schedulePoll();
     }
     function syncControls(){
-      byId("selector-input").value=currentState.selector;byId("poll").value=currentState.poll;
+      // Repaint the selector box only when the committed selector changed, so a
+      // filter commit never overwrites a spine typed but not yet sent with Go.
+      if(currentState.selector!==shownSelector){byId("selector-input").value=currentState.selector;shownSelector=currentState.selector;}
+      byId("poll").value=currentState.poll;
       const treeButton=byId("tree-button");
       treeButton.hidden=treelessKinds.has(currentState.kind);
       treeButton.setAttribute("aria-pressed",currentState.tree?"true":"false");
@@ -574,7 +577,7 @@
       const query=stateQuery(currentState,true).toString();
       history.replaceState(null,"",location.pathname+(query?"?"+query:""));
       lastContext=contextKey(currentState);
-      byId("selector-input").value=currentState.selector;
+      byId("selector-input").value=currentState.selector;shownSelector=currentState.selector;
     }
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){

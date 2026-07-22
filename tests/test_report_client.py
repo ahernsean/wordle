@@ -482,9 +482,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("0123456789ab", self.page.url)
         self.assertEqual(self.page.locator("#selector-input").input_value(), "raise -----")
 
-    def test_filter_change_applies_without_navigating_to_typed_selector(self):
+    def test_filter_change_leaves_typed_selector_untouched(self):
         # A spine typed but not sent with Go stays uncommitted; toggling a
-        # filter applies against the current view and never navigates to it.
+        # filter applies against the current view, never navigating to the typed
+        # text nor erasing it from the box.
         self.page.goto(self.base_url)
         self.page.wait_for_selector("h1")
         self.page.locator("#selector-input").fill("CRANE")
@@ -497,6 +498,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.page.evaluate("() => __reportClient.getState().selector"), ""
         )
         self.assertNotIn("CRANE", self.page.url)
+        self.assertEqual(self.page.locator("#selector-input").input_value(), "CRANE")
 
     def test_view_fields_appear_only_where_the_kind_can_use_them(self):
         self.page.locator("[data-kind=hotspots]").click()
