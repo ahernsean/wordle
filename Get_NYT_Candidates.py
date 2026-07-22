@@ -90,4 +90,4 @@ if __name__ == "__main__":
     _validate_against_answer_list(words)
     print(f"Found {len(words)} words")
     with open(DEFAULT_CANDIDATE_LIST_PATH, "w") as f:
-        f.write("\n".join(words))
+        f.write("\n".join(words) + "\n")
