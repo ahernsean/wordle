@@ -271,7 +271,7 @@ def parse_report_branch_target(parts: list[str] | str | None) -> ReportBranchTar
     if len(normalized_words) == step_count:
         return ReportBranchTarget("branch", steps, None, None, input_text)
     raise ValueError(
-        f"invalid branch_target {input_text!r}: expected alternating word and response pattern"
+        f"invalid branch target {input_text!r}: expected alternating word and response pattern"
     )
 
 
