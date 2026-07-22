@@ -62,12 +62,33 @@ signal:
    `ps -ef | grep -E 'erd_search.py run|swarm_worker'`. The supervisor runs
    as the `wordle-erd` systemd user unit, so it also survives reboots.
 
-If either signal shows the swarm running, stop the workers with
-`erd_search.py stop --swarm-only` — the operator CLI (it wraps
-`systemctl --user`). `--swarm-only` leaves the report server up so `view`
-stays trustworthy; a plain `erd_search.py stop` takes the report server down
-too and reintroduces exactly the false-zero above. Re-verify both signals,
-then proceed.
+If either signal shows the swarm running, stop it — the operator CLI wraps
+`systemctl --user`:
+
+- **For any active uplift phase (anything touching the cache or queue): full
+  `erd_search.py stop`.** This also stops the report web server, which reads
+  the production database; keep it down so nothing reads the DB mid-migration
+  or mid-sweep. `view` goes dark during the hold — verify via the process
+  list instead.
+- `erd_search.py stop --swarm-only` is only for a transient look where you
+  want `view` to stay up and accept the report server reading the DB. Do not
+  use it as the posture for a phase that mutates the cache.
+
+Re-verify both signals after stopping, then proceed.
+
+**Reboot-proofing: the disk-stop latch.** A full stop does not survive a
+reboot — the `wordle-erd` unit is `enabled` with `Restart=on-failure`, so a
+reboot restarts the swarm. For any hold that must survive a reboot (most of
+this uplift, and especially the multi-day Part 3 sweep), engage the disk-stop
+latch: a row in the queue DB, durable across reboots and systemd restarts. On
+startup `run` reads it and refuses with a clean exit (no `Restart` loop),
+until it is released with `erd_search.py queue clear-disk-stop`. There is
+currently **no CLI to set it** (only to clear — it is normally written by the
+disk-fill guard), so set it with a one-off:
+`ERDQueue(DEFAULT_QUEUE_PATH).set_disk_stop('<reason>')`. Adding a
+`queue set-disk-stop` command would make this symmetric and is worth doing if
+the latch is engaged more than once. Releasing the latch is a required first
+step of resuming the swarm (Phase 7).
 
 This is a correctness requirement, not hygiene: Part 3 shows a live worker
 can silently serve a not-yet-recertified `ERD_ALL` row as exact, and a worker
@@ -636,7 +657,9 @@ of the 14 rescued guess words:
 
 1. Delete old-`answer_list_id` rows from all four tables;
    vacuum/checkpoint; re-sync the phone.
-2. Resume epoch testing (fresh `telemetry_epoch`).
+2. Release the disk-stop latch (`erd_search.py queue clear-disk-stop`) —
+   `run` refuses to start while it is set — then resume epoch testing (fresh
+   `telemetry_epoch`).
 
 ## Open items
 
