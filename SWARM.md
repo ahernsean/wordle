@@ -112,6 +112,12 @@ A trailing word reports its response groups. A trailing pattern reports the
 resulting branch. Pattern syntax is `g` for green, `y` for yellow, and `.` or
 `-` for gray. A displayed branch reference can also select a queued branch.
 
+These are two forms of one thing: a **branch target** names a single branch by
+either its **spine** — the explicit word/pattern steps — or a **branch
+reference**, the `@`-prefixed hash handle shown in reports. A spine resolves
+from the answer list alone and is durable; a reference resolves only while the
+branch is still in the queue.
+
 Focused collections and live topology use the same report model:
 
 ```bash

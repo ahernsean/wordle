@@ -246,7 +246,7 @@ Return every top-level key even under partial failure:
         "schema_version": SCHEMA_VERSION,
         "report_kind": "overview",
         "generated_at": generated_at,
-        "selector": null,
+        "branch_target": null,
         "filters": {},
         "sources": {
             "queue": {

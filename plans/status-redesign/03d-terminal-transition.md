@@ -88,7 +88,7 @@ Retain:
 
 - `start`, `stop`, `restart`, and `run`;
 - `queue add/remove/clear/priority/reset-stale`;
-- queue branch-reference behavior only through the semantic selector path.
+- queue branch-reference behavior only through the semantic branch_target path.
 
 Update `AGENTS.md` and `SWARM.md` in the same commit so no documented command
 is left broken. Queue documentation describes mutations only; reporting
@@ -100,7 +100,7 @@ Required coverage:
 
 1. TTY branch and worker navigation builds report requests rather than calling
    legacy handlers.
-2. Back restores the prior selector, kind, filters, and tree state.
+2. Back restores the prior branch_target, kind, filters, and tree state.
 3. A selected branch remains pinned through finalization by full identity.
 4. Non-TTY and structured output remain noninteractive and contain no cursor
    control sequences.

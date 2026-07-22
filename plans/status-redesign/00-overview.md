@@ -74,7 +74,7 @@ cache-parent migration, or inferred historical tree in this plan.
 |---|---|---|
 | `01-report-model.md` | shared path ownership, report envelope, normalized overview entities, branch status/phase semantics, and overview collector | — |
 | `02-terminal-view.md` | terminal overview renderer with text, JSON, and optional watch | 01 |
-| `03a-semantic-reports.md` | selector model plus inferred word and branch reports | 02 |
+| `03a-semantic-reports.md` | branch_target model plus inferred word and branch reports | 02 |
 | `03b-collection-reports.md` | collection filters, queue/worker/cache reports, and live queue tree layout | 03a |
 | `03c-hotspot-reports.md` | bounded branch telemetry and hotspot reports | 03b |
 | `03d-terminal-transition.md` | TTY navigation, legacy read-command removal, and operator-documentation cutover | 03c |
@@ -138,7 +138,7 @@ discrepancy rather than improvising across phase boundaries.
 |---|---|
 | report | One presentation-neutral, JSON-serializable result for a report request. |
 | report envelope | The shared top-level structure surrounding report-specific data. |
-| selector | Semantic input identifying the root, a word within branch context, a branch spine, or a queue branch reference. |
+| branch_target | Semantic input identifying the root, a word within branch context, a branch spine, or a queue branch reference. |
 | spine | Guesses played from the root to a branch, represented as word/pattern pairs. |
 | descent | A worker's live recursion path below its claimed branch. |
 | tree layout | Hierarchical presentation of extant queue rows and their recorded spines. |

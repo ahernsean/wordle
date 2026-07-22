@@ -31,17 +31,17 @@ Add semantic work exploration without removing any legacy inspection command:
 - `tests/test_report_terminal.py`
 - `tests/test_report_objects.py` — new
 
-## Request and selector model
+## Request and branch_target model
 
 Extend `report_model.py` with:
 
-    parse_report_selector(parts: list[str] | str | None) -> ReportSelector
+    parse_report_branch_target(parts: list[str] | str | None) -> ReportBranchTarget
 
 And these frozen dataclasses:
 
     SpineStep(word: str, pattern: str)
 
-    ReportSelector(
+    ReportBranchTarget(
         kind: str,                    # root | word | branch | branch_reference
         steps: tuple[SpineStep, ...],
         trailing_word: str | None,
@@ -49,27 +49,27 @@ And these frozen dataclasses:
         input_text: str,
     )
 
-    ReportSelector.root() -> ReportSelector
+    ReportBranchTarget.root() -> ReportBranchTarget
 
 Supersede phase 1's overview-only request with:
 
     ReportRequest(
         report_kind: str = "auto",
-        selector: ReportSelector = ReportSelector.root(),
+        branch_target: ReportBranchTarget = ReportBranchTarget.root(),
         include_claims: bool = False,
         include_answers: bool = False,
     )
 
 Use `dataclasses.field(default_factory=...)` for dataclass instance defaults.
-`ReportSelector.root()` returns the normalized empty selector. The default
+`ReportBranchTarget.root()` returns the normalized empty branch_target. The default
 `report_kind` intentionally changes from `overview` to `auto`; root inference
 still produces the operational overview. Update phase 1 and 2 tests that
 assert the request's echoed default while preserving their observable
 overview behavior.
 
-### Selector grammar
+### BranchTarget grammar
 
-`parse_report_selector` accepts a string or already-tokenized parts. When
+`parse_report_branch_target` accepts a string or already-tokenized parts. When
 given a list, join it with spaces before parsing so CLI and later HTTP clients
 use identical behavior. Normalize words to lowercase and patterns to five
 characters using `g`/`y`/`-`; a dot normalizes to `-`.
@@ -106,12 +106,12 @@ Extend phase 2's `view` parser with positional `SPINE` using `nargs="*"` and:
     --answers
 
 When a dash-leading response pattern would confuse argparse, the documented
-forms are one quoted selector string or dot-gray syntax. Preserve support for
-`--` before positional selector parts.
+forms are one quoted branch_target string or dot-gray syntax. Preserve support for
+`--` before positional branch_target parts.
 
 Dispatch without an explicit report kind:
 
-| Selector | Collector |
+| BranchTarget | Collector |
 |---|---|
 | root | overview |
 | word | word |
@@ -119,11 +119,11 @@ Dispatch without an explicit report kind:
 
 The envelope's `report_kind` is the inferred domain kind.
 
-## Selector resolution
+## BranchTarget resolution
 
 Add presentation-neutral resolver functions to `report_model.py`:
 
-    resolve_selector_branch(selector, all_answers) -> ResolvedBranch
+    resolve_branch_target(branch_target, all_answers) -> ResolvedBranch
     resolve_branch_reference(queue, digest_prefix) -> bytes
 
 `ResolvedBranch` contains selected answer words, encoded branch key,
@@ -132,7 +132,7 @@ normalized complete spine, and an optional trailing word.
 For a semantic spine, start with all answers loaded from
 `ReportSources.answer_list_path` and apply each guess/pattern response group
 in order through `ResponseCache(all_answers, score_cache=None)`. Use the pure
-reference path so selector resolution never reads or writes persistent cache
+reference path so branch_target resolution never reads or writes persistent cache
 state. Produce the encoded branch key with the static
 `ScoreCache.encode_subset` helper. An empty response group is a valid resolved
 branch with zero answers; report it rather than treating it as parse failure.
@@ -174,7 +174,7 @@ word-report workload. No cache schema change belongs in this phase.
 
 ## Word report
 
-For a trailing-word selector:
+For a trailing-word branch_target:
 
 1. Resolve the preceding patterned spine to `branch_words`.
 2. Partition those answers by the trailing word.
@@ -305,7 +305,7 @@ Required coverage:
 4. Word coverage combines current queue and cache states and handles trivial
    groups.
 5. Semantic branch selection works when the branch is cache-only.
-6. Semantic selector resolution performs no persistent cache read or write.
+6. Semantic branch_target resolution performs no persistent cache read or write.
 7. Digest resolution rejects zero and multiple matches.
 8. The queue prefix helper and model resolver have distinct names and return
    contracts.
@@ -320,7 +320,7 @@ Required coverage:
 
 ## Acceptance checklist
 
-- [ ] Users never specify `word` versus `branch`; selector form infers it.
+- [ ] Users never specify `word` versus `branch`; branch_target form infers it.
 - [ ] Word reports join current queue and cache coverage.
 - [ ] Branch detail works for queued, active, done, and cache-only branches.
 - [ ] Claim provenance distinguishes evaluated and bulk-eliminated work.

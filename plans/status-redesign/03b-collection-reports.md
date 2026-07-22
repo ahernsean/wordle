@@ -69,7 +69,7 @@ Extend `view` with:
 
 Keep all phase 2 and 3a options. `--queue`, `--workers`, `--worker`, and
 `--cache` are mutually exclusive. `--worker N` selects the workers report and
-filters it to that worker. A positional selector may scope any compatible
+filters it to that worker. A positional branch_target may scope any compatible
 kind. Reject meaningless combinations with a specific argparse error.
 
 Status and phase values are comma-separated. `all` alone disables that axis's
@@ -81,15 +81,15 @@ report kinds default to all branch statuses.
 
 Extend `collect_report`:
 
-| Explicit kind | Selector | Collector |
+| Explicit kind | BranchTarget | Collector |
 |---|---|---|
 | none | root, no `--tree` | overview |
 | none | word | word |
 | none | branch/reference | branch |
 | none | any + `--tree` | live queue tree scoped by selection |
-| `--queue` | optional, with optional `--tree` | queue inventory scoped by selector |
-| `--workers` / `--worker` | optional, with optional `--tree` | workers scoped by selector or placed on live queue topology |
-| `--cache` | optional | cache summary/coverage scoped by selector |
+| `--queue` | optional, with optional `--tree` | queue inventory scoped by branch_target |
+| `--workers` / `--worker` | optional, with optional `--tree` | workers scoped by branch_target or placed on live queue topology |
+| `--cache` | optional | cache summary/coverage scoped by branch_target |
 
 The envelope's `report_kind` is the inferred or explicit domain kind. Echoed
 request state records tree layout; there is no `tree` domain object. Reject
@@ -97,10 +97,10 @@ request state records tree layout; there is no `tree` domain object. Reject
 
 Collection scoping is consistent:
 
-- root selector: complete report population;
-- trailing-word selector: derived response branches for word coverage, or
+- root branch_target: complete report population;
+- trailing-word branch_target: derived response branches for word coverage, or
   only matching extant queue rows where descendants are included;
-- branch selector/reference: selected branch plus recorded queued descendants.
+- branch_target/reference: selected branch plus recorded queued descendants.
 
 A singular branch report still describes only its selected branch. Scoping
 never uses cache rows to create descendants.
@@ -120,7 +120,7 @@ Collection reports return:
 
 When selected context is represented by queue-derived topology, retain it
 even when it does not match the row filter and mark `is_context=true`.
-Selector context remains in root metadata when no queue node is available.
+BranchTarget context remains in root metadata when no queue node is available.
 
 Branch filters apply to queue rows, word response branches, tree descendants,
 and worker-associated branches. They do not remove singular branch detail,
@@ -168,7 +168,7 @@ branch.
 Return a flat, identity-addressable node array:
 
     {
-        "root": normalized selector context,
+        "root": normalized branch_target context,
         "topology_source": "queue",
         "tree_available": bool,
         "unavailable_reason": str | null,
@@ -194,7 +194,7 @@ Return a flat, identity-addressable node array:
 Semantics:
 
 - Root: extant queue rows and recorded spines form the tree.
-- Word: the word is selector context; nodes contain only its extant queued
+- Word: the word is branch_target context; nodes contain only its extant queued
   response branches and descendants.
 - Branch: include context when a matching row or descendant spine establishes
   it, then include recorded descendants.
@@ -219,8 +219,8 @@ Default output is summary plus filtered inventory. Sort choices are:
 
 ### `--workers` / `--worker N`
 
-Show live, idle, finalizing, stale, and dead workers. A branch selector limits
-workers to that branch and descendants; a word selector limits workers to its
+Show live, idle, finalizing, stale, and dead workers. A branch_target limits
+workers to that branch and descendants; a word branch_target limits workers to its
 extant response branches. Detail includes absolute `guess_depth`, current
 candidate, held bundle/claim, node rate, cache/prune counters, and live
 descent. In tree layout, workers annotate queue-derived nodes.
@@ -254,7 +254,7 @@ complete. Summary dictionaries wrap across lines at entry boundaries.
 Required coverage:
 
 1. `view --queue`, `--workers`, `--worker`, and `--cache` dispatch correctly;
-   positional `QUEUE` and `CACHE` remain word selectors.
+   positional `QUEUE` and `CACHE` remain word branch_targets.
 2. Status and phase filters accept comma-separated values and enforce the
    constrained status/phase combinations.
 3. Filtering occurs before limit and summaries count the unpaginated

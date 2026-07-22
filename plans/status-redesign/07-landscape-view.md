@@ -46,8 +46,8 @@ Consequences:
 ## Navigation continuity
 
 Opening the landscape from a word, branch, queue, or worker report preserves
-the current semantic selector. The selected context remains anchored while
-the user pans and zooms, and a copied URL preserves selector and viewport.
+the current semantic branch_target. The selected context remains anchored while
+the user pans and zooms, and a copied URL preserves branch_target and viewport.
 
 The shared collection filters continue to apply according to phase 3b. They
 change which live rows are emphasized or included without changing branch
