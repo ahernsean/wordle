@@ -54,17 +54,23 @@ Operating decisions already made:
 ### Standing machine-state check (run at the start of every phase)
 
 Never trust a written "the swarm is stopped" claim, and never trust a single
-signal:
+signal. All three checks must agree:
 
 1. `erd_search.py view --workers` against the queue path the supervisor is
    expected to use. This reads queue heartbeats directly, but a missing,
    stale, or wrong-path queue can still show no live workers.
-2. Cross-check the process list, which needs no queue or report server:
-   `ps -ef | grep -E 'erd_search.py run|swarm_worker'`. The supervisor runs
-   as the `wordle-erd` systemd user unit, so it also survives reboots.
+2. Query both systemd user services independently:
+   `systemctl --user is-active wordle-erd wordle-report-server`. Neither may
+   be active; the report server reads the production cache even when no worker
+   heartbeat exists.
+3. Cross-check for manually started or orphaned processes with a
+   self-excluding match:
+   `ps -ef | grep -E '[e]rd_search.py run|[s]warm_worker|[r]eport_server.py'`.
+   This check needs neither queue nor systemd state and does not match its own
+   `grep` command.
 
-If either signal shows the swarm running, stop it — the operator CLI wraps
-`systemctl --user`:
+If any check shows a service or process running, stop it — the operator CLI
+wraps `systemctl --user`:
 
 - **Before any active uplift phase (anything touching the cache or queue): full
   `erd_search.py stop`.** This also stops the report web server, which reads
@@ -75,7 +81,7 @@ If either signal shows the swarm running, stop it — the operator CLI wraps
   want `view` to stay up and accept the report server reading the DB. Do not
   use it as the posture for a phase that mutates the cache.
 
-Re-verify both signals after stopping, then proceed.
+Re-run all three checks after stopping, then proceed.
 
 **Reboot-proofing: the disk-stop latch.** A full stop does not survive a
 reboot — the `wordle-erd` unit is `enabled` with `Restart=on-failure`, so a
@@ -300,6 +306,26 @@ budget cannot finalize a larger-budget attempt. Existing exact untainted
 children remain reusable; budget-specific children follow the ordinary cache
 reuse rules.
 
+**A certified row cannot be downgraded.** The current primary key stores only
+one best row for `(branch_key, policy, answer_list_id)`, so persistent cache
+writes use untainted-wins conflict semantics:
+
+- an incoming untainted row may replace a tainted row;
+- an incoming tainted row never replaces an existing untainted row, even when
+  the untainted strategy's `max_remaining_depth` exceeds the caller's budget;
+  and
+- the same decision governs both SQLite and `_mem_cache`, so a process does
+  not hide its durable certificate behind a weaker session-local value.
+
+The smaller-budget solve still returns its computed result to its immediate
+caller; only persistence is suppressed. This deliberately gives up reuse of
+that weaker result rather than losing the canonical certificate. A future
+schema may version best rows by budget if measurement shows that suppressed
+tainted writes make Phase 4 materially expensive. The baseline avoids that
+schema expansion; the production gate stops for a plan revision rather than
+accepting material repeated work. Loss rows already have a monotone
+representation: `write_loss` retains the greatest proven `loss_budget`.
+
 This retains the depth floor as a practical guard while still producing
 canonical unconstrained rows. It also has a finite correctness endpoint:
 every informative guess strictly shrinks its branch, and answer words are
@@ -309,7 +335,10 @@ Keys still tainted at the pilot-selected maximum become durably **deferred**,
 with their last budget and reason recorded. They remain absent or
 budget-specific in the current namespace and are safe to revisit through a
 higher finite ladder. No worker automatically falls through to
-`budget=None`.
+`budget=None`. Only a completed final-budget attempt that produced a tainted
+best row or finite-budget loss may become deferred. A deadline, cancellation,
+or worker death leaves the key retrying; absence of a result is not a terminal
+classification.
 
 ERD pruning still applies recursively at every level. Each descended branch
 orders its own candidates, establishes its own incumbent, applies its own
@@ -355,7 +384,9 @@ admits size `n + 1` only after:
 
 1. every size-`n` pending/active attempt is terminal;
 2. every manifest key in that wave is either certified by a current-ID
-   untainted exact row or durably deferred after the final ladder budget; and
+   untainted exact row or durably deferred after a completed final-budget
+   attempt, with the deferred entry pointing to its tainted best row or loss
+   proof; and
 3. certified, deferred, retrying, and total counts reconcile with the
    manifest histogram.
 
@@ -366,7 +397,8 @@ recursively under the parent's current certification budget; retaining a
 budget-specific child never makes it unconstrained exact. Bounded admission
 avoids duplicating all 3.6 million branch blobs in the queue at once; the
 current-ID cache plus the queue's deferred ledger are the durable completion
-record.
+record. A manifest key has exactly one terminal class: certified or deferred,
+never both.
 
 ### Monitoring
 
@@ -379,6 +411,7 @@ recertification overview, selected from `run_meta.run_kind`, with:
 - manifest processed, certified, retrying, and deferred counts;
 - floor-tainted and budget-specific-loss counts by certification budget;
 - `max_remaining_depth` distribution for certified rows;
+- suppressed tainted-overwrite count;
 - current and rolling rows/hour;
 - ETA by both row count and measured work;
 - unchanged/improved result counts;
@@ -396,31 +429,41 @@ candidate claim remains an ordinary swarm branch.
 Before the production pilot:
 
 1. A migration fixture proves Phase 2 copies compliant best/loss rows and
-   candidate scores but no `ERD_ALL` best or loss row.
+   candidate scores but no `ERD_ALL` best or loss row. Collision cases cover
+   both directions: incoming untainted versus existing tainted and incoming
+   tainted versus existing untainted best rows, plus incoming narrower and
+   wider loss proofs. The untainted best and greatest `loss_budget` survive.
 2. A finite-budget complete candidate scan with no depth floor writes
    `solve_budget=NULL`, records the winning strategy's
    `max_remaining_depth`, matches an unconstrained reference solve, and
    reuses at every budget that fits it.
-3. A floor-tainted result or finite-budget loss remains budget-specific,
+3. After a child is certified, solving it below its stored
+   `max_remaining_depth` may return a tainted result to that caller but cannot
+   replace the untainted row in SQLite or `_mem_cache`.
+4. A floor-tainted result or finite-budget loss remains budget-specific,
    schedules a clean higher-budget attempt generation, and cannot increment
    the certified count. Reaching the final ladder budget produces a normal
-   deferred state rather than an error or an automatic unlimited solve.
-4. Manifest admission reads old-ID keys without reading old scores into any
+   deferred state rather than an error or an automatic unlimited solve; an
+   aborted attempt remains retrying.
+5. Manifest admission reads old-ID keys without reading old scores into any
    search bound, never writes the old namespace, and cannot advance a wave
    with an unaccounted key.
-5. Restart tests cover a worker dying before its cache write, after its cache
+6. Restart tests cover a worker dying before its cache write, after its cache
    write but before queue completion, and during candidate evaluation; each
    resumes the correct attempt generation without accepting an old-ID value
    or losing a candidate claim.
-6. Startup rejects mismatched old/new answer IDs, candidate digest/count,
+7. Startup rejects mismatched old/new answer IDs, candidate digest/count,
    queue run kind, or implementation revision with all conflicting values in
    the error.
-7. Recertification reports expose source identity, wave/overall progress,
+8. Recertification reports expose source identity, wave/overall progress,
    certification budgets, retries, deferred keys, certified
    `max_remaining_depth`, workers, rate, ETA, and partial-source failures in
    text, JSON, and watched JSON Lines. Text remains useful at 50–60 columns
    through the shared adaptive terminal layout.
-8. The full suite and the scratch correctness/throughput pilot pass before
+9. Terminal reconciliation maps every manifest key to exactly one of an
+   untainted current-ID best row or a durable deferred entry backed by its
+   final tainted row/loss, and admits only the first class to the sandwich.
+10. The full suite and the scratch correctness/throughput pilot pass before
    production cache or queue paths are accepted.
 
 **Missing sub-branches are the common case, not an edge case — and that's
@@ -481,9 +524,12 @@ budget and re-evaluate complete candidate coverage.
 Measure the certified, retrying, and deferred fractions by branch size;
 `max_remaining_depth` among certified rows; time and nodes per attempt;
 completed rows/hour; worker CPU utilization; queue coordination time; and
-queue WAL growth. Include every production manifest key above 200 answers in
-the pilot rather than extrapolating the sparse largest tail. Freeze the
-ladder and its maximum only after this measurement.
+queue WAL growth. Count suppressed tainted overwrites and repeated
+smaller-budget solves during later waves and a scratch Phase 4 root/cone
+sample; if they are a material share of work, revise the cache to version
+budget-specific rows before production. Include every production manifest key
+above 200 answers in the pilot rather than extrapolating the sparse largest
+tail. Freeze the ladder and its maximum only after this measurement.
 
 At each budget the swarm profile must sustain at least 80% of the direct
 pool's aggregate attempts/hour; otherwise tune its top-level branch
@@ -726,10 +772,10 @@ remaining uplift.
 
 ### Phase 1 — Freeze and back up
 
-1. Run the standing machine-state check (both signals; stop with full
-   `erd_search.py stop` if either service or workers are running). Then confirm
-   no live claims and engage the disk-stop latch in the default queue so the
-   ordinary systemd swarm cannot restart during recertification.
+1. Run the standing machine-state check (all three checks; stop with full
+   `erd_search.py stop` if any service, process, or heartbeat is active). Then
+   confirm no live claims and engage the disk-stop latch in the default queue
+   so the ordinary systemd swarm cannot restart during recertification.
 2. Checkpoint and back up `wordle_cache.sqlite3` and `erd_queue.sqlite3`.
 3. Record the old `answer_list_id`, its `ERD_ALL` row count, and its per-size
    histogram in the migration ledger.
@@ -740,16 +786,25 @@ remaining uplift.
 
 1. Open the cache once with the new answer list so
    `ScoreCache._ensure_answer_list` registers the new `answer_list_id`.
-2. `INSERT OR IGNORE` old-id → new-id:
-   - `branch_best_by_policy`: `erd_answers_compliant` rows only (exact).
-   - `branch_loss_by_policy`: `erd_answers_compliant` only.
-   - `candidate_scores`: all rows.
+2. Copy old-id → new-id with table-specific conflict handling:
+   - `branch_best_by_policy`: `erd_answers_compliant` rows only. Use the same
+     untainted-wins rule as the live cache: an incoming untainted row upgrades
+     an existing tainted row; an existing untainted row rejects an incoming
+     tainted row. Other collisions keep the target and are counted in the
+     migration ledger.
+   - `branch_loss_by_policy`: `erd_answers_compliant` only. On collision store
+     `MAX(target.loss_budget, source.loss_budget)`, the widest reusable proof.
+   - `candidate_scores`: all rows via `INSERT OR IGNORE`.
 3. Copy **no** `ERD_ALL` best rows or losses. Copy nothing for
    `erd_answers_unfiltered`.
 4. Reconcile that the new-ID `ERD_ALL` population is empty before Phase 3.
    Any row there means the namespaces are no longer a trustworthy
    completion boundary; stop and investigate rather than deleting blindly.
-5. Old-id rows stay intact as the manifest and rollback path until retirement.
+5. Reconcile compliant inserts, untainted upgrades, retained target rows, and
+   widened loss proofs against the source and target collision counts. Phase 0
+   is already live on Linux, so pre-existing new-ID compliant rows are expected
+   input to this reconciliation rather than assumed absent.
+6. Old-id rows stay intact as the manifest and rollback path until retirement.
 
 ### Phase 3 — `ERD_ALL` recertification swarm
 
@@ -758,6 +813,7 @@ remaining uplift.
      spine;
    - attempt generations and clean candidate-claim reset on every
      higher-budget retry;
+   - untainted-wins best-row writes in both SQLite and `_mem_cache`;
    - untainted exact, retrying, budget-specific loss, and deferred terminal
      states with `max_remaining_depth` retained for certified rows;
    - the old-ID manifest reader and strict ascending-size admission controller;
@@ -774,7 +830,7 @@ remaining uplift.
    reaches the required fraction of direct-pool throughput. If worker
    concentration fails the gate, allow multiple ordinary top-level branches
    to remain active and repeat the measurement.
-3. Run the standing machine-state check before production — both signals —
+3. Run the standing machine-state check before production — all three checks —
    and confirm the default queue's disk-stop latch remains set. The ordinary
    epoch swarm and report server stay stopped; only the direct recertification
    supervisor may write the production cache.
@@ -819,10 +875,19 @@ remaining uplift.
 ### Phase 5 — Reverification
 
 1. **Structural reconciliation.** Row counts per (policy, answer_list_id)
-   match the copy/seed/rebuild ledger. For `ERD_ALL`, join the old-ID manifest
-   keys to current-ID rows and require complete key coverage; do not require
-   total current-ID row count to equal the manifest count, because recursive
-   solves legitimately create additional new partition keys.
+   match the copy/seed/rebuild ledger. For `ERD_ALL`, map every old-ID manifest
+   key to exactly one terminal class:
+   - **certified:** one current-ID best row with `solve_budget IS NULL` and
+     non-NULL `max_remaining_depth`, and no deferred ledger entry; or
+   - **deferred:** one durable deferred ledger entry naming its final
+     certification budget, attempt generation, and reason, backed by either a
+     current-ID tainted best row at that budget or a current-ID loss proof
+     whose `loss_budget` covers it, and no untainted best row.
+
+   Reject missing, doubly classified, or unbacked keys. Do not require total
+   current-ID best-row count to equal the manifest count, because deferred
+   losses have no best row and recursive solves legitimately create additional
+   new partition keys. Only the certified class is eligible for the sandwich.
 2. **Sampled exactness check** (`erd_answers_compliant` and seeded
    unfiltered rows): fresh from-scratch solve per sampled branch; require
    `best_score` equality against the fresh solve; then verify the stored
@@ -832,9 +897,10 @@ remaining uplift.
    different guess may carry a different worst case — so the stored pair,
    which is what the row asserts, is what gets checked.)
 3. **Recertification audit.** Use `verify_erd_cache.py` in read-only audit mode
-   over a stratified random sample of recertified `ERD_ALL` rows, with fresh
-   solves and the same stored-pair discipline. The verifier is an independent
-   checker, not the production computation path.
+   over a stratified random sample of certified `ERD_ALL` rows, with fresh
+   solves and the same stored-pair discipline. Separately sample deferred
+   entries and verify their final tainted-row/loss backing. The verifier is an
+   independent checker, not the production computation path.
 4. **Loss sweep.** `verify_erd_losses.py` over retained compliant losses.
 5. **Test suite.**
    `python3.13 -m unittest discover -s tests -t . -p 'test_*.py'`.
@@ -851,14 +917,12 @@ separate, decoupled mechanisms on this project, not one combined step:
    `wordle_cache.sqlite3` (`wordle_cache.sqlite3` itself is not tracked in
    git, so step 1 alone never touches it).
 
-Order between the two doesn't threaten correctness either way:
-`_ensure_answer_list` always computes `answer_list_id` fresh from whichever
-list files are currently loaded, and every read filters on that id, so an
-old-code/new-cache or new-code/old-cache mismatch just produces cache
-misses (the engine falls through to computing on the fly) rather than a
-wrong answer. Do step 1 before step 2 anyway, for a mundane reason: no
-sense importing a multi-gigabyte database before the code that can make use
-of its new-id rows is even in place.
+The order is mandatory: complete step 1 before step 2. The new cache-writing
+code preserves untainted certificates from lower-budget overwrites; old phone
+code does not. `answer_list_id` scoping still prevents cross-vocabulary reads,
+but it does not protect a current-ID untainted row after the phone has both the
+new lists and the imported cache. Deploy the untainted-wins behavior before
+placing those rows on the phone.
 
 No schema change and no `schema_migrations` entry either way — this is a
 data and file-content migration, not a structural one.
@@ -918,9 +982,12 @@ production estimate.
   A floor-free attempt writes an untainted unconstrained exact row; a
   floor-tainted result retries under the frozen finite ladder and becomes
   durably deferred at its measured maximum rather than falling through to
-  `budget=None`. Missing children solve inline, leaves-first admission makes
-  certified retained children warm, and `verify_erd_cache.py` remains an
-  independent audit tool. Prior unlimited-depth samples estimate
+  `budget=None`. Untainted-wins writes prevent later smaller-budget work from
+  downgrading a certificate, and the terminal ledger classifies every manifest
+  key as exactly certified or deferred. Missing children solve inline,
+  leaves-first admission makes certified retained children warm, and
+  `verify_erd_cache.py` remains an independent audit tool. Prior
+  unlimited-depth samples estimate
   **3.0–8.7 days of stress-path work on 6 workers, ~5.4 days central**; the
   production pilot measures the ladder's throughput, retry and deferred
   fractions, certified `max_remaining_depth`, and concurrent top-level branch
