@@ -43,33 +43,34 @@ Operating decisions already made:
 
 - The phone stays on the old lists — no pull from origin — until the uplift
   is entirely done. The Linux side flips wholesale when execution starts.
-- The epoch swarm must be stopped for any phase that reads or writes the
-  cache, and epoch testing resumes only after retirement. Its state is never
-  assumed, though: it may be run opportunistically to warm the cache between
-  work sessions, and a reboot restarts it via its `wordle-erd` systemd unit —
-  so every phase opens with the machine-state check below.
+- The ordinary epoch swarm must be stopped before any uplift phase reads or
+  writes the cache, and epoch testing resumes only after retirement. Phase 3's
+  dedicated recertification supervisor and Phase 4's controlled root/cone run
+  are the only planned worker pools; each has exclusive cache ownership while
+  it runs. Machine state is never assumed: the ordinary swarm may have been
+  run opportunistically between work sessions, and a reboot restarts it via
+  its `wordle-erd` systemd unit, so every phase opens with the check below.
 
 ### Standing machine-state check (run at the start of every phase)
 
 Never trust a written "the swarm is stopped" claim, and never trust a single
 signal:
 
-1. `erd_search.py view --workers` — necessary but not sufficient. Its worker
-   view is served by the report web server (`wordle-report-server`); if that
-   server is down, it reports **zero workers even while the swarm is
-   running**. A zero here proves nothing on its own.
-2. Cross-check the process list, which needs no report server:
+1. `erd_search.py view --workers` against the queue path the supervisor is
+   expected to use. This reads queue heartbeats directly, but a missing,
+   stale, or wrong-path queue can still show no live workers.
+2. Cross-check the process list, which needs no queue or report server:
    `ps -ef | grep -E 'erd_search.py run|swarm_worker'`. The supervisor runs
    as the `wordle-erd` systemd user unit, so it also survives reboots.
 
 If either signal shows the swarm running, stop it — the operator CLI wraps
 `systemctl --user`:
 
-- **For any active uplift phase (anything touching the cache or queue): full
+- **Before any active uplift phase (anything touching the cache or queue): full
   `erd_search.py stop`.** This also stops the report web server, which reads
   the production database; keep it down so nothing reads the DB mid-migration
-  or mid-sweep. `view` goes dark during the hold — verify via the process
-  list instead.
+  or mid-recertification. The CLI `view` remains available as a direct,
+  read-only queue/cache inspector when explicit paths are supplied.
 - `erd_search.py stop --swarm-only` is only for a transient look where you
   want `view` to stay up and accept the report server reading the DB. Do not
   use it as the posture for a phase that mutates the cache.
@@ -79,20 +80,24 @@ Re-verify both signals after stopping, then proceed.
 **Reboot-proofing: the disk-stop latch.** A full stop does not survive a
 reboot — the `wordle-erd` unit is `enabled` with `Restart=on-failure`, so a
 reboot restarts the swarm. For any hold that must survive a reboot (most of
-this uplift, and especially the multi-day Part 3 sweep), engage the disk-stop
-latch: a row in the queue DB, durable across reboots and systemd restarts. On
-startup `run` reads it and refuses with a clean exit (no `Restart` loop),
-until it is released with `erd_search.py queue clear-disk-stop`. There is
-currently **no CLI to set it** (only to clear — it is normally written by the
-disk-fill guard), so set it with a one-off:
+this uplift, and especially the multi-day Part 3 run), engage the disk-stop
+latch in the **default** queue: a row durable across reboots and systemd
+restarts. On startup the ordinary service reads it and refuses with a clean
+exit (no `Restart` loop), until it is released with `erd_search.py queue
+clear-disk-stop`. The dedicated recertification supervisor uses its explicit
+alternate queue path and its own disk guard; the default latch remains set
+throughout Phase 3. There is currently **no CLI to set it** (only to clear —
+it is normally written by the disk-fill guard), so set it with a one-off:
 `ERDQueue(DEFAULT_QUEUE_PATH).set_disk_stop('<reason>')`. Adding a
-`queue set-disk-stop` command would make this symmetric and is worth doing if
-the latch is engaged more than once. Releasing the latch is a required first
-step of resuming the swarm (Phase 7).
+`queue set-disk-stop` command is part of Phase 3's implementation because the
+procedure engages the latch more than once. Releasing the latch is required
+before each controlled ordinary-swarm run (Phase 4 and, finally, Phase 7).
 
-This is a correctness requirement, not hygiene: Part 3 shows a live worker
-can silently serve a not-yet-recertified `ERD_ALL` row as exact, and a worker
-on stale code writes under the wrong `answer_list_id`.
+This is a correctness requirement, not hygiene: concurrent ordinary and
+recertification supervisors could evaluate current-ID branches under
+different budgets and queue ownership, while a worker on stale code can write
+under the wrong `answer_list_id`. One explicitly selected supervisor owns the
+cache at a time.
 
 ## Part 1 — Foundations (unchanged by the second discovery)
 
@@ -188,8 +193,8 @@ keys' *values* still serve depends on the vocabulary analysis below.)
 | Policy | Guess vocabulary | Effect of combined change | Disposition |
 |---|---|---|---|
 | `erd_answers_compliant` (`ERD_ANSWERS`) | the branch words themselves (`guesses=None` ⇒ `candidate_list = branch_words`, recursively) | pure function of `branch_key`; neither list enters: **exact** | retain — the only fully exact ERD namespace |
-| `erd_words_unfiltered` (`ERD_ALL`) | `all_candidates.txt` (formerly `wordle.txt`) — grew by 1,883, 0 removals (confirmed) | growth-only case applies: rows demote to **upper bounds** (legal best_guess, valid incumbent); losses **invalid** regardless | retain rows as **recertification seeds**, not servable truths; drop losses |
-| `erd_answers_unfiltered` (`ERD_ANSWERS_UNFILTERED`) | answer list — grew by 9 | rows demote to upper bounds; losses invalid | rebuild via sandwich seeding (Part 4) after the `ERD_ALL` sweep |
+| `erd_words_unfiltered` (`ERD_ALL`) | `all_candidates.txt` (formerly `wordle.txt`) — grew by 1,883, 0 removals (confirmed) | growth-only case applies: rows demote to **upper bounds** (legal best_guess, valid incumbent); losses **invalid** regardless | leave old rows under the old `answer_list_id` as the recertification manifest and rollback copy; populate the new namespace through the recertification swarm; copy no losses |
+| `erd_answers_unfiltered` (`ERD_ANSWERS_UNFILTERED`) | answer list — grew by 9 | rows demote to upper bounds; losses invalid | rebuild via sandwich seeding (Part 4) after `ERD_ALL` recertification |
 | `erd_words_compliant` (`ERD_CONSTRAINED`) | path-dependent | never persisted | n/a |
 
 Other tables:
@@ -208,97 +213,184 @@ Other tables:
   so a splice is not the cheap shortcut it sounds like — see Mechanism 4.
   Rebuild.
 
-## Part 3 — The `ERD_ALL` recertification sweep (the centerpiece)
+## Part 3 — The `ERD_ALL` recertification swarm (the centerpiece)
 
-`verify_erd_cache.py` supplies the sweep's skeleton: it walks every
-`erd_words_unfiltered` row leaves-first (ascending branch size, so
-corrected child values are in place before any parent is re-evaluated),
-re-scores each row by scanning the complete candidate vocabulary with
-sub-branch costs read from the cache, and corrects rows in place. It opens
-the cache by loading `ANSWER_FILE`/`WORDS_FILE` (`cache_sqlite.py`'s
-`answer_list_id` scoping then confines every query to that namespace), so
-after Phase 0's rename those two constants point at the corrected files.
+### The old namespace is the manifest, not a seed cache
 
-**Unmodified, though, the tool audits — it does not recertify.** Two of
-its behaviours, both harmless for its original purpose (detecting
-possibly-corrupted values under an *unchanged* vocabulary), are unsound
-here:
+The corrected answer list has a different content-addressed
+`answer_list_id`. `ScoreCache` reads and writes only rows carrying the ID of
+the answer list with which it was opened. Do **not** copy old `ERD_ALL` rows
+to the new ID in Phase 2. Leave them under the old ID and use their
+`branch_key` values as the immutable recertification manifest.
 
-1. **It silently skips any candidate with an uncached response group**
-   (`_erd_from_cache`: `if cached is None: return None`). The 1,883 added
-   candidates have never been evaluated anywhere, so their partitions of
-   existing branches are mostly keys that never arose in prior search —
-   the loop iterates all 14,855 words but silently declines to evaluate
-   precisely the candidates whose addition is the reason for the sweep.
-   A row logged CONFIRMED means only "no *evaluable* candidate beats it."
-2. **Its cache reads are taint-blind.** A tainted child (`solve_budget`
-   set) holds a budget-limited value — an upper bound on the unconstrained
-   optimum — and any evaluation through it inherits that one-sidedness.
+There were no answer removals, so every old manifest key still names a valid
+branch within the corrected answer list. The manifest intentionally does not
+contain branch keys introduced by the nine added answers; Phase 4's root
+census and answer cones create those keys after the fixed old-key population
+has been recertified.
 
-Both failures point the same direction: post-sweep values would remain
-*upper bounds*, not exact — and an upper bound recorded as exact is
-precisely the failure mode Part 4's pinch cannot tolerate (a skipped
-candidate can hide a lower true `ERD_ALL′`, so a pinched seed would
-overstate the optimum). Exactness also propagates: a row's re-scored value
-is exact only if every child value consulted past the admissible pre-gate
-was itself exact and present, so one unresolved child taints every
-ancestor whose scan reads it.
+This namespace shortcut is specific to the combined uplift: the answer-list
+change gives the corrected candidate vocabulary a fresh cache namespace for
+free. A future candidate-only change with an unchanged answer list would not
+get a new `answer_list_id`; it would require an explicit candidate-vocabulary
+identity in the cache schema or another fresh namespace before ordinary reuse
+could be sound.
 
-**Decided design: solve missing sub-branches inline.** Extend the sweep —
-a committed extension to `verify_erd_cache.py`, written at Phase 3 time —
-so that a candidate's missing sub-branch triggers an engine solve at
-unconstrained budget (a warm-cache solve per Mechanism 1, writing a
-legitimate new row) instead of skipping the candidate, and a tainted child
-read likewise triggers an unconstrained re-solve instead of silent
-acceptance. Leaves-first order then maintains the invariant that every
-consulted child is exact, so every completed row is exact and Part 4's
-pinch may use any post-sweep value.
+This removes the ambiguity that forced the standalone design in an earlier
+draft. Under the new ID:
+
+- an absent row is work still to do;
+- a present row was solved against the corrected answer list and candidate
+  vocabulary and is exact;
+- ordinary `_cache_reuse` is sound; and
+- a worker restarting after writing the cache row but before completing the
+  queue row can safely observe the cache hit and mark the queue row done.
+
+The old row's score is not copied or consulted by the solver. Direct
+measurement found no net benefit from evaluating the old best guess merely
+to seed a ceiling; the old cache's useful assets are the branch-key
+population and its ascending-size schedule. Reporting may compare a completed
+new score with the old score after finalization, but the old value never
+affects search. Keeping the result namespaces disjoint gives the scheduling
+benefits without ever making an upper bound look exact.
+
+### Each recertification target is an ordinary swarm branch
+
+A manifest `branch_key` decodes to the same ordinary branch word set the
+engine and swarm already solve. Recertification describes *why that branch
+was admitted*, not a different recurrence or result type. Once admitted
+under the new ID, the branch uses the normal swarm contract:
+
+1. workers claim disjoint candidates from the complete corrected candidate
+   vocabulary;
+2. `evaluate_candidate` recursively prices every response group;
+3. missing sub-branches solve inline and write legitimate current-ID rows;
+4. the running best is shared through `active_branches`; and
+5. full candidate coverage finalizes one exact `ERD_ALL` row.
+
+The recertification run uses an **unlimited-remaining-depth exact profile**.
+The ordinary game-tree swarm derives a remaining-depth budget from a branch's
+spine; these manifest branches have no unique historical spine, and the
+recertification value must be the unconstrained optimum. The worker profile
+therefore treats the active row's NULL budget as explicit unlimited remaining
+depth rather than as a legacy row requiring a root-budget fallback.
+
+The engine must also retain `max_remaining_depth` while solving with
+`budget=None`. The current unlimited-remaining-depth path suppresses that
+bookkeeping and writes NULL; recertification instead records the worst-case
+line length of the ERD-winning strategy while leaving `solve_budget` NULL.
+This does not impose a budget —
+it records the strategy already found — and lets later budgeted root/cone
+work reuse every recertified row whose `max_remaining_depth` fits.
+
+Recursive cooperative promotion stays disabled in this profile. The top
+branch is already split across workers by candidate claims, while missing
+children follow the decided inline-solve behavior. This avoids giving
+unlimited solves artificial spine/budget semantics and avoids adapting the
+transient cut channel, whose reuse rules are budget-indexed. A later measured
+optimization may add unlimited recursive promotion, but it is not required
+for correctness or for moving the hard candidate scans into the swarm.
+
+### Dedicated queue and leaves-first admission
+
+Set aside `erd_queue.sqlite3` unchanged and run the recertification swarm
+against `erd_recertification_queue.sqlite3`. The dedicated queue uses the
+ordinary `ERDQueue` branch, candidate-claim, heartbeat, recovery, WAL, and
+disk-stop mechanisms. Its `run_meta` records at least:
+
+- run kind (`erd_all_recertification`);
+- old and new `answer_list_id`;
+- corrected candidate-list digest and count;
+- manifest row count and per-size histogram;
+- current branch-size wave; and
+- the implementation Git revision.
+
+Startup refuses to resume if any recorded identity differs from the current
+files or cache. This prevents a partially completed queue from silently
+mixing vocabularies or implementations.
+
+An admission controller reads old-ID manifest keys in ascending branch size
+and adds only the current size wave to the dedicated queue, in bounded
+batches. It admits size `n + 1` only after:
+
+1. every size-`n` pending/active row is done;
+2. every manifest key in that wave has a current-ID exact row; and
+3. the wave counts reconcile with the manifest histogram.
+
+Every informative response group is strictly smaller than its parent, so
+the barrier guarantees that retained children are exact before a parent can
+reuse them. A missing child created by a newly added candidate is solved
+recursively against already-exact smaller rows. Bounded admission avoids
+duplicating all 3.6 million branch blobs in the queue at once; completed
+current-ID cache rows are the durable completion ledger.
+
+### Monitoring
+
+`erd_search.py view` accepts the dedicated queue and production cache paths,
+so recertification workers, current candidates, branch coverage, queue WAL,
+disk state, and recent finalizations use the normal report pipeline. Add a
+recertification overview, selected from `run_meta.run_kind`, with:
+
+- current wave and wave completion;
+- manifest completion across all waves;
+- current and rolling rows/hour;
+- ETA by both row count and measured work;
+- unchanged/improved result counts;
+- active branch references and answer counts; and
+- source-health and identity fields for both vocabularies.
+
+Spine/tree layout is unavailable for manifest roots because a
+content-addressed branch can be reached through many historical spines and
+the cache does not store a canonical one. That is a presentation limitation,
+not a different branch-solving contract: each active item and every
+candidate claim remains an ordinary swarm branch.
+
+### Implementation acceptance
+
+Before the production pilot:
+
+1. A migration fixture proves Phase 2 copies compliant best/loss rows and
+   candidate scores but no `ERD_ALL` best or loss row.
+2. Unlimited-remaining-depth engine solves preserve the same ERD while
+   recording the winning strategy's `max_remaining_depth` and leaving
+   `solve_budget` NULL; the row reuses at every budget that fits it.
+3. A recertification worker treats a NULL active-branch budget as
+   `budget=None`, evaluates the complete candidate vocabulary, disables
+   adaptive recursive promotion, and finalizes through the ordinary cache
+   write and queue cleanup path.
+4. Manifest admission reads old-ID keys without reading old scores into any
+   search bound, never writes the old namespace, and cannot advance a wave
+   with a missing current-ID result.
+5. Restart tests cover a worker dying before its cache write, after its cache
+   write but before queue completion, and during candidate evaluation; each
+   resumes without accepting an old-ID value or losing a candidate claim.
+6. Startup rejects mismatched old/new answer IDs, candidate digest/count,
+   queue run kind, or implementation revision with all conflicting values in
+   the error.
+7. Recertification reports expose source identity, wave/overall progress,
+   workers, rate, ETA, and partial-source failures in text, JSON, and watched
+   JSON Lines. Text remains useful at 50–60 columns through the shared
+   adaptive terminal layout.
+8. The full suite and the scratch correctness/throughput pilot pass before
+   production cache or queue paths are accepted.
 
 **Missing sub-branches are the common case, not an edge case — and that's
-fine.** Direct measurement (below) confirms why: a new candidate's response
+fine.** Direct measurement confirms why: a new candidate's response
 partition of an existing branch is a *combination* of old answer words that
 essentially never coincides with a partition any old candidate produced, so
 most candidates against most branches hit an uncached sub-branch. In
-practice this means most rows cost close to a full fresh solve rather than
-a cheap audit-and-skip — measured and priced below, and still a tractable
-overnight-class run, not a blocker. The read-only-certified fallback
-described in an earlier draft (defer uncertified rows, keep the sweep pure
-read-only) is no longer the live design: at the measured cost there is no
-need to trade correctness coverage for speed. Retained only as a
-contingency if a production wave runs materially slower than sampled.
+practice this means most rows cost close to a full fresh solve. The swarm
+does that work explicitly rather than treating an uncached group as a reason
+to skip a candidate.
 
 The scan covers every candidate, not just the added ones: an *old*
 candidate's cost depends recursively on its response-groups' cached ERDs,
-so when the leaves-first sweep lowers a child, a previously-losing old
+so when leaves-first recertification lowers a child, a previously-losing old
 candidate can newly win even though no added word is involved. An
 "added-candidates-only" shortcut misses that case (an earlier draft
 claimed it at ~15% of full cost; withdrawn).
 
-**Why this must stay a standalone forced-recompute pass, never the normal
-swarm.** `branch_best_by_policy` keys rows on `(branch_key, policy,
-answer_list_id)` only — there is no guess-vocabulary component in the
-schema (confirmed by inspection of `cache_sqlite.py`'s table definitions).
-`_cache_reuse` (`wordle_engine.py`) has no notion of "verified under the
-current vocabulary" either — it accepts any present, untainted-or-
-appropriately-tainted row at face value. So a Phase-2-copied-forward row is
-indistinguishable, to any ordinary read, from one the sweep has already
-recertified: a normal swarm worker claiming that branch would serve the
-stale value as if exact. Only an explicit delete-then-resolve pass (what
-`verify_erd_cache.py` and this section's extension both do) forces
-recomputation. This is also why Phase 4's normal-swarm root-census-and-
-cones work is safe *after* Part 3 finishes but the swarm must stay off
-this table before then — not just an operational rule (Phase 3 step 3
-already says so) but a correctness requirement.
-
-**Monitoring differs between the two halves of the uplift.** The sweep
-(this Part) runs as a standalone script — its own worker pool, its own
-`--log` file, its own stdout progress lines — and does **not** register
-with `erd_search.py view --workers`, since it never touches
-`erd_queue.sqlite3`. Watch its log/stdout directly. Phase 4's root-census-
-and-cones work, by contrast, *is* routed through the normal swarm and is
-fully visible through the usual `erd_search.py view` reports.
-
-### Cost: measured directly (2026-07-19/20, idle machine, two sampling passes)
+### Cost and throughput gate
 
 `verify_erd_cache.py` ran a full sweep of the whole `ERD_ALL` cache once
 before, for an unrelated reason (the reclaim-while-alive bug fix, completed
@@ -318,13 +410,27 @@ production histogram's largest concentration — 1.15M of 3.6M rows) with
 exact per-size row-count weighting, since that bucket's cost turned out to
 be the dominant source of uncertainty.
 
-**Result: 3.0–8.7 days on 6 workers; 5.4 days is the central estimate**
+The direct-solve samples estimate **3.0–8.7 days on 6 independent workers;
+5.4 days is the central estimate**
 (780 serial hours, trimmed-mean method). The spread comes from a genuine
 heavy tail — most branches solve in under a second, but near-exact-tie
 branches (alpha-beta gets no early cutoff) can take tens to low hundreds of
 seconds, and 4.2% of the 16–30-word bucket didn't finish within a 90s
 per-branch cap in the second pass. Plan for the low end of a week; budget
-for the full week as a ceiling.
+for the full week as a ceiling. That is a work estimate, not yet a measured
+wall-time promise for candidate-cooperative swarm scheduling.
+
+Before the production run, compare the recertification profile with the
+six-process direct engine on the same scratch-cache samples and vocabulary.
+Require exact agreement on best score, then evaluate each path's stored best
+guess directly and require it to attain its stored score and
+`max_remaining_depth`; equally optimal guesses need not match. Measure
+completed rows/hour, worker CPU utilization, queue coordination time, and
+queue WAL growth. The swarm profile
+must sustain at least 80% of the direct pool's aggregate rows/hour; otherwise
+tune its top-level branch concentration so multiple ordinary branches can be
+active concurrently, and repeat the gate. Do not weaken candidate coverage,
+the leaves-first barrier, or unlimited exactness to meet the throughput gate.
 
 **Correctness, corroborated empirically.** Across both passes, 432 branches
 completed a fresh solve; 28 (6.5%) produced a strictly better ERD than the
@@ -348,7 +454,7 @@ touch the mechanism's *correctness*, only its practical payoff here.
 
 ## Part 4 — Rebuilding `erd_answers_unfiltered`
 
-### The vocabulary-inclusion sandwich — gated, and only post-sweep
+### The vocabulary-inclusion sandwich — gated, and only post-recertification
 
 With the corrected lists, verify (do not assume): every answer word ∈ new
 `all_candidates.txt`. Then for any branch B, B ⊆ answers′ ⊆ all-words′, and
@@ -356,17 +462,18 @@ the theorem gives:
 
     ERD_ALL′(B)  ≤  ERD_ANSWERS_UNFILTERED′(B)  ≤  ERD_ANSWERS(B)
 
-**The left value must be a post-sweep `ERD_ALL` value that is exact** —
-under the inline-solve sweep, any completed row; under the read-only
-fallback, only rows the sweep certified (Part 3). A merely-demoted upper
-bound on the left can equal `ERD_ANSWERS(B)` while the true `ERD_ALL′(B)`
-is lower, in which case the pinch conclusion fails and the seed would
-overstate the optimum while recorded as exact. The sandwich was also
-unsound against the old cache for two independent reasons: the old
-`ERD_ALL` values were computed over a vocabulary that did not contain the
-answer list (14 missing words — the inclusion simply failed), and the
-vocabulary has now changed besides. All of this is repaired only after
-Phase 0 fixes the lists and Phase 3's sweep produces exact values.
+**The left value must be a current-ID `ERD_ALL` row produced by the
+recertification swarm.** Because Phase 2 copies no old `ERD_ALL` rows into
+that namespace, every present current-ID row is exact; there is no certified
+subset hidden among stale seeds. A merely-demoted old-ID upper bound on the
+left can equal `ERD_ANSWERS(B)` while the true `ERD_ALL′(B)` is lower, in
+which case the pinch conclusion fails and the seed would overstate the
+optimum while recorded as exact. The sandwich was also unsound against the
+old cache for two independent reasons: the old `ERD_ALL` values were computed
+over a vocabulary that did not contain the answer list (14 missing words —
+the inclusion simply failed), and the vocabulary has now changed besides.
+All of this is repaired only after Phase 0 fixes the lists and Phase 3
+populates the new namespace with exact values.
 
 Where the outer values are equal, seed the row by **copying the entire
 `erd_answers_compliant` row** (best_guess, best_score, max_depth): its
@@ -377,9 +484,10 @@ reused at budgeted queries). Guard the pinch on `solve_budget IS NULL` on
 both sides: tainted rows hold budget-specific values and pin nothing.
 
 Do **not** seed losses from old `ERD_ALL` losses (invalid under growth).
-Once the sweep re-proves an `ERD_ALL` loss under the new vocabulary, it
-transfers validly (loss over the superset vocabulary implies loss over
-answers′ ⊆ all-words′).
+An unlimited recertification branch always has a strategy, so Phase 3 does
+not write losses. Once later budgeted root/cone work proves an `ERD_ALL` loss
+under the new vocabulary, it transfers validly (loss over the superset
+vocabulary implies loss over answers′ ⊆ all-words′).
 
 ### Cost model
 
@@ -390,7 +498,7 @@ sweeps:
     rebuild time ≈ (rows where ERD_ALL′(B) ≠ ERD_ANSWERS(B), untainted)
                    / (unfiltered sweeps per day on current engine)
 
-Numerator: one SQL join after the Phase 3 sweep. Denominator: time a
+Numerator: one SQL join after Phase 3. Denominator: time a
 sample. If the un-pinched population is large, seed the pinched rows
 (zero search) and leave the rest lazy.
 
@@ -400,14 +508,14 @@ G′ = G ∪ {added words} denotes a grown branch, G its retained base.
 
 ### Mechanism 1 — Recurrence-level reuse (automatic)
 
-To evaluate a candidate c on G′, `_solve_subset` needs each response
-group's ERD; the added words land in few groups, and every unchanged group
-is the identical word set with a cached row read instead of recursed into.
-Per-candidate cost = cached lookups + recursive solves of the few changed
-groups, memoized across candidates. A cache-missed key near the root is a
-solve against a warm cache. This is also what keeps the sweep's inline
-solves of missing sub-branches cheap (Part 3) — the sweep's read-only scan
-itself never recurses.
+To evaluate a candidate c on G′, `_solve_subset` needs each response group's
+ERD; the added words land in few groups, and every unchanged group is the
+identical word set. During Phase 3 it is a current-ID cache hit once its
+smaller-size manifest wave has completed. Per-candidate cost = cached
+lookups + recursive solves of the few new partition keys, memoized across
+candidates. A cache-missed key near the root is a solve against a warm
+current-ID cache. This is what keeps the recertification swarm's inline
+solves of missing sub-branches tractable.
 
 ### Mechanism 2 — O(1) transfer bounds (scoped; measured not worth building)
 
@@ -440,7 +548,7 @@ losses), with k added words:
 
 - **Loss transfer.** A proven loss for G within b is a proven loss for G′
   within b (restriction). Valid only when the loss itself is valid under
-  the current vocabulary — post-sweep losses, not pre-uplift ones.
+  the current vocabulary — post-uplift losses, not pre-uplift ones.
 - **Feasibility (one-sided).** The cached md is the worst case *of the
   ERD-optimal strategy*, an upper bound on the true worst-case optimum. So
   budget ≥ md(G) + k ⇒ G′ feasible (extend the cached strategy: run each
@@ -452,7 +560,7 @@ losses), with k added words:
   infeasibility.
 - **ERD envelope.** (n·E + k)/(n + k) ≤ ERD(G′) ≤
   (n·E + k·md(G) + k(k+1)/2)/(n + k). The lower bound requires E ≤ true
-  ERD(G) — i.e. an exact (post-sweep, certified) or lower-bound E; a
+  ERD(G) — i.e. an exact current-ID or lower-bound E; a
   demoted upper-bound E inflates the floor, making it inadmissible and
   able to prune the true optimum. Same discipline as the loss-transfer
   bullet. The upper bound needs no such gate (it extends an actual cached
@@ -493,7 +601,11 @@ completion; the mechanisms make each scan cheap, not skippable.
 One-time operations run from the scratchpad and are never committed; the
 list-and-rename flip (Phase 0) is the one exception and goes through a PR.
 
-### Phase 0 — Source, rename, and land the corrected vocabularies
+### Phase 0 — Source, rename, and land the corrected vocabularies — complete
+
+Completed by PR #158. The checklist remains as the source/provenance and
+consumer inventory for the landed file transition; do not rerun it during the
+remaining uplift.
 
 1. Source the current 14,855-word NYT full dictionary — **done**.
    `Get_NYT_Candidates.py` (new script, mirrors `Get_NYT_Answers.py`'s
@@ -508,7 +620,7 @@ list-and-rename flip (Phase 0) is the one exception and goes through a PR.
 3. Gates confirmed: new answer list ⊆ new candidate list (the 14 words
    included, plus all 9 PSHAW-era words); both source lists sorted, unique,
    5-letter lowercase.
-4. **Rename** `wordle.txt` → `all_candidates.txt` and `NYT_wordlist.txt` →
+4. **Renamed** `wordle.txt` → `all_candidates.txt` and `NYT_wordlist.txt` →
    `all_answers.txt`, landing the corrected content under the new names in
    the same PR (no separate rename pass). `all_candidates.txt` names the
    file for what it is — the universe the anchored **candidate** vocabulary
@@ -520,97 +632,126 @@ list-and-rename flip (Phase 0) is the one exception and goes through a PR.
    filenames, not reconstructed from memory — an earlier draft of this
    list was incomplete):
 
-   - **Routes through `runtime_paths.py` already — edit only the one file.**
+   - **Routed through `runtime_paths.py` already — only that file changed.**
      `erd_search.py` imports `DEFAULT_ANSWER_LIST_PATH`/
      `DEFAULT_CANDIDATE_LIST_PATH` rather than hardcoding either name, so
-     updating `runtime_paths.py` alone is sufficient for it.
-   - **Hardcode their own `ANSWER_FILE`/`WORDS_FILE` (or equivalent)
-     literals — each needs a direct edit:** `wordle.py`, `erd_swarm.py`,
-     `verify_erd_cache.py`, `verify_erd_losses.py` (hardcodes both names;
-     Phase 5 runs it, so a missed edit surfaces there, not earlier),
-     `import_cache.py` (hardcodes `NYT_wordlist.txt`; feeds the Phase 6
-     cache-import workflow), `diag_ab_equiv.py`, `diag_ab_wall.py`,
+     updating `runtime_paths.py` alone covered it.
+   - **Had their own `ANSWER_FILE`/`WORDS_FILE` (or equivalent) literals and
+     were edited directly:** `wordle.py`, `erd_swarm.py`,
+     `verify_erd_cache.py`, `verify_erd_losses.py`, `import_cache.py`,
+     `diag_ab_equiv.py`, `diag_ab_wall.py`,
      `diag_kernel_bench.py`, `diag_ordering.py`, `diag_order_tune.py`,
-     `diag_toplevel_census.py`, `Get_NYT_Answers.py` (its hardcoded
-     `NYT_wordlist.txt` write target), and `Get_NYT_Candidates.py` (its
-     hardcoded `wordle.txt` write target, plus its answer-list
-     plausibility check, which reads `NYT_wordlist.txt` directly and
-     raises — rather than silently skipping the gate — when the file is
-     absent, so a missed edit here fails as loudly as the rest of this
-     list). None of these currently import from `runtime_paths.py`;
-     centralizing them through it instead of editing each literal is a
-     legitimate alternative Phase 0 can choose at execution time, but
-     that's a separate, larger decision this plan doesn't make now.
-   - **Test files with hardcoded literals:**
+     `diag_toplevel_census.py`, `Get_NYT_Answers.py`, and
+     `Get_NYT_Candidates.py` (including its answer-list plausibility check).
+     These consumers still do not import from `runtime_paths.py`;
+     centralizing them remains a separate optional cleanup.
+   - **Test files whose literals were updated:**
      `tests/test_diag_toplevel_census.py`, `tests/test_erd_scaling.py`,
      `tests/test_kernel_equivalence.py`, `tests/test_pattern_matrix.py`,
      `tests/test_swarm_vs_engine_overhead.py`.
-   - **Prose only — won't break, but will go stale:** `design.md`,
+   - **Prose updated with the code:** `design.md`,
      `full_tree_plan.md`, `SWARM.md`, and a comment in
      `tests/test_queue_add.py`.
 
-   No `schema_migrations` entry — this is a file rename, not a cache
-   schema change. Run the full test suite after the rename lands, before
-   any later phase begins; a missed hardcoded reference fails loudly there
-   (`FileNotFoundError`) rather than silently.
-5. Land the rename plus the corrected content as one PR. No temporary
-   dated-capture file is kept once landed — git history holds the old
+   No `schema_migrations` entry was added — this was a file rename, not a
+   cache schema change. The full test suite passed before merge.
+5. The rename and corrected content landed together. No temporary
+   dated-capture file remains — git history holds the old
    content, and the old-`answer_list_id` cache rows (Phase 2 onward) hold
    the old world's computed results; neither needs a parallel on-disk file
    to survive through the soak. The phone does not pull until Phase 6.
 
 ### Phase 1 — Freeze and back up
 
-1. Run the standing machine-state check (both signals; stop with
-   `erd_search.py stop --swarm-only` if the swarm is running). Then confirm
-   no live claims.
+1. Run the standing machine-state check (both signals; stop with full
+   `erd_search.py stop` if either service or workers are running). Then confirm
+   no live claims and engage the disk-stop latch in the default queue so the
+   ordinary systemd swarm cannot restart during recertification.
 2. Checkpoint and back up `wordle_cache.sqlite3` and `erd_queue.sqlite3`.
-3. Check disk headroom: retained tables roughly double until retirement.
+3. Record the old `answer_list_id`, its `ERD_ALL` row count, and its per-size
+   histogram in the migration ledger.
+4. Check disk headroom: retained tables roughly double until retirement, and
+   the dedicated recertification queue adds temporary coordination state.
 
 ### Phase 2 — Re-tag migration
 
 1. Open the cache once with the new answer list so
    `ScoreCache._ensure_answer_list` registers the new `answer_list_id`.
 2. `INSERT OR IGNORE` old-id → new-id:
-   - `branch_best_by_policy`: `erd_answers_compliant` rows (exact) and
-     `erd_words_unfiltered` rows (recertification seeds).
+   - `branch_best_by_policy`: `erd_answers_compliant` rows only (exact).
    - `branch_loss_by_policy`: `erd_answers_compliant` only.
    - `candidate_scores`: all rows.
-3. Copy nothing for `erd_answers_unfiltered`; copy no `ERD_ALL` losses.
-4. Old-id rows stay intact — rollback path until retirement.
+3. Copy **no** `ERD_ALL` best rows or losses. Copy nothing for
+   `erd_answers_unfiltered`.
+4. Reconcile that the new-ID `ERD_ALL` population is empty before Phase 3.
+   Any row there means the namespaces are no longer a trustworthy
+   completion boundary; stop and investigate rather than deleting blindly.
+5. Old-id rows stay intact as the manifest and rollback path until retirement.
 
-### Phase 3 — `ERD_ALL` recertification sweep
+### Phase 3 — `ERD_ALL` recertification swarm
 
-1. Write the sweep extension (inline solves of missing sub-branches,
-   tainted-child re-solves; Part 3) as a committed change to
-   `verify_erd_cache.py`, through a PR.
-2. Run the standing machine-state check before starting — both signals, since
-   `view --workers` alone can report a false zero when the report server is
-   down — and keep the swarm stopped for the whole phase. Required, not just
-   operational hygiene: Part 3 explains why a live worker could silently serve
-   a not-yet-recertified row as exact.
-3. Run the extended sweep leaves-first to completion (~3–8.7 days on 6
-   workers, ~5.4 days central estimate — measured directly, Part 3; no
-   further sample-wave timing needed). Monitor via the sweep's own
-   `--log` file and stdout, not `erd_search.py view` (Part 3 — it doesn't
-   run through the queue). No `ERD_ALL` row is served to a user before its
-   wave completes (phone is frozen; Linux use during the sweep is
-   at-your-own-risk and confined to swept sizes).
+1. Land the persistent recertification support through a PR:
+   - unlimited-remaining-depth swarm rows whose NULL budget is explicit, not
+     a legacy root-budget fallback;
+   - `max_remaining_depth` tracking for unlimited solves;
+   - the old-ID manifest reader and strict ascending-size admission controller;
+   - run-identity validation and restart recovery on a dedicated queue path;
+   - adaptive recursive promotion disabled for this profile; and
+   - the recertification overview in the shared report pipeline; and
+   - `queue set-disk-stop`, since the procedure now deliberately engages the
+     default latch before Phase 3 and again before Phase 5.
+2. Against scratch cache and queue copies, run the Part 3 correctness and
+   throughput gate. Do not begin production until exact results agree and the
+   swarm reaches the required fraction of direct-pool throughput. If worker
+   concentration fails the gate, allow multiple ordinary top-level branches
+   to remain active and repeat the measurement.
+3. Run the standing machine-state check before production — both signals —
+   and confirm the default queue's disk-stop latch remains set. The ordinary
+   epoch swarm and report server stay stopped; only the direct recertification
+   supervisor may write the production cache.
+4. Initialize `erd_recertification_queue.sqlite3` from the recorded old/new
+   IDs, candidate-list digest, manifest histogram, and implementation revision.
+   Refuse a nonempty queue whose identity does not match exactly.
+5. Start six recertification workers against the dedicated queue and the
+   production cache. Admit one answer-count wave at a time in bounded batches.
+   Monitor through:
+
+       python3.13 erd_search.py view \
+           --queue-path erd_recertification_queue.sqlite3 \
+           --cache-path wordle_cache.sqlite3 --watch
+
+6. At every wave boundary, reconcile queue completion, current-ID cache rows,
+   and the old-ID manifest count before admitting the next size. Resume from
+   the dedicated queue after a clean or unclean stop; never use a manual
+   `--start-size` assertion as a substitute for the durable ledger.
+7. Run to full manifest completion. The direct-solve estimate remains
+   3.0–8.7 days on six workers with a 5.4-day center, but replace it with the
+   pilot's measured swarm rate for the production ETA. The phone remains
+   frozen, and no user-facing solve reads the partially populated new
+   namespace during this phase.
 
 ### Phase 4 — Recompute and seed
 
-1. Clear and re-seed the queue from the new 3,209-word root; the swarm
-   computes the root census and the 9 answer-cones (all against the new
-   candidate universe, warm via Mechanism 1).
-2. Sandwich-seed `erd_answers_unfiltered` per Part 4 (exact post-sweep
-   values only — certified rows if the fallback sweep ran — untainted
-   guard, full compliant-row copy, no loss seeding).
-3. Run the un-pinched count; decide eager rebuild vs. lazy.
+1. Stop the recertification supervisor cleanly and reconcile the entire old-ID
+   manifest against current-ID exact rows. Retain the dedicated queue through
+   reverification as the execution ledger.
+2. Clear and re-seed the default queue from the new 3,209-word root. Release
+   its disk-stop latch and run the controlled ordinary swarm to compute the
+   root census and the 9 answer cones against the new candidate universe,
+   warm via Mechanism 1.
+3. Sandwich-seed `erd_answers_unfiltered` per Part 4 using current-ID exact,
+   untainted outer rows; copy the full compliant row and seed no losses.
+4. Run the un-pinched count; decide eager rebuild vs. lazy.
+5. After the controlled queue drains, stop both services and re-engage the
+   default queue's disk-stop latch so Phase 5 has exclusive, stable inputs.
 
 ### Phase 5 — Reverification
 
 1. **Structural reconciliation.** Row counts per (policy, answer_list_id)
-   match the copy/seed/rebuild ledger.
+   match the copy/seed/rebuild ledger. For `ERD_ALL`, join the old-ID manifest
+   keys to current-ID rows and require complete key coverage; do not require
+   total current-ID row count to equal the manifest count, because recursive
+   solves legitimately create additional new partition keys.
 2. **Sampled exactness check** (`erd_answers_compliant` and seeded
    unfiltered rows): fresh from-scratch solve per sampled branch; require
    `best_score` equality against the fresh solve; then verify the stored
@@ -619,11 +760,13 @@ list-and-rename flip (Phase 0) is the one exception and goes through a PR.
    (Fresh-solve max_depth equality is tie-dependent — an equally-optimal
    different guess may carry a different worst case — so the stored pair,
    which is what the row asserts, is what gets checked.)
-3. **Sweep audit.** Re-run the Phase 3 sweep's verifier mode over a random
-   sample of swept `ERD_ALL` rows with fresh solves (same stored-pair
-   discipline).
+3. **Recertification audit.** Use `verify_erd_cache.py` in read-only audit mode
+   over a stratified random sample of recertified `ERD_ALL` rows, with fresh
+   solves and the same stored-pair discipline. The verifier is an independent
+   checker, not the production computation path.
 4. **Loss sweep.** `verify_erd_losses.py` over retained compliant losses.
-5. **Test suite.** `python -m unittest discover -s tests -t . -p 'test_*.py'`.
+5. **Test suite.**
+   `python3.13 -m unittest discover -s tests -t . -p 'test_*.py'`.
 
 ### Phase 6 — Phone catch-up
 
@@ -633,7 +776,7 @@ separate, decoupled mechanisms on this project, not one combined step:
 1. **Code and lists.** The phone (Working Copy) pulls `main` — a plain git
    pull, picking up the Phase 0 rename/content PR and everything since.
 2. **Cache.** The already-established export/import dance brings the
-   phone's database in line with rocky's post-migration, post-sweep
+   phone's database in line with rocky's post-migration, post-recertification
    `wordle_cache.sqlite3` (`wordle_cache.sqlite3` itself is not tracked in
    git, so step 1 alone never touches it).
 
@@ -657,7 +800,9 @@ of the 14 rescued guess words:
 
 1. Delete old-`answer_list_id` rows from all four tables;
    vacuum/checkpoint; re-sync the phone.
-2. Release the disk-stop latch (`erd_search.py queue clear-disk-stop`) —
+2. Archive or remove `erd_recertification_queue.sqlite3` and its telemetry
+   only after the soak no longer needs its execution evidence.
+3. Release the disk-stop latch (`erd_search.py queue clear-disk-stop`) —
    `run` refuses to start while it is set — then resume epoch testing (fresh
    `telemetry_epoch`).
 
@@ -665,18 +810,17 @@ of the 14 rescued guess words:
 
 - Eager vs. lazy for the un-pinched `erd_answers_unfiltered` remainder.
 - Soak length before retirement.
-- Whether to centralize the hardcoded `ANSWER_FILE`/`WORDS_FILE`-style
-  consumers listed in Phase 0 through `runtime_paths.py` now, or just edit
-  each literal — noted there as a real but separate decision.
+- Whether to centralize the remaining `ANSWER_FILE`/`WORDS_FILE`-style
+  consumers listed in Phase 0 through `runtime_paths.py` as a later cleanup.
 
-Resolved since the last revision (previously open): sweep cost (measured,
-Part 3), inline-solve vs. read-only-certified fallback (inline-solve
-chosen — affordable at the measured cost), whether Mechanism 2's
-ceiling-injection machinery is worth building (measured negligible payoff;
-proofs retained, implementation deferred), and whether Part 3 can run
-through the normal swarm/queue (no — schema has no guess-vocabulary
-scoping, so a live worker can't distinguish a certified row from a
-copied-forward one; see Part 3).
+Resolved since the last revision (previously open): direct-solve work cost
+(measured, Part 3), inline-solving missing children (retained inside ordinary
+swarm candidate evaluation), whether Mechanism 2's ceiling-injection
+machinery is worth building (measured negligible payoff; proofs retained,
+implementation deferred), and whether Phase 3 branches fit the swarm (yes —
+leave old `ERD_ALL` rows under the old `answer_list_id`, admit their keys into
+a dedicated queue, and every current-ID cache hit becomes an ordinary exact
+result; see Part 3).
 
 ## Resolved
 
@@ -685,29 +829,24 @@ copied-forward one; see Part 3).
 - **`wordle.txt` removal set**: 0 removals (1,883 additions only) — the
   growth-only case applies throughout; no mixed-case handling is needed.
 - **File naming**: `wordle.txt`/`NYT_wordlist.txt` → `all_candidates.txt`/
-  `all_answers.txt`, folded into Phase 0, with an exhaustive (grep-verified)
-  inventory of every consumer. Both scraper scripts already carry their
-  permanent names (`Get_NYT_Wordlist.py` → `Get_NYT_Answers.py`,
-  `Get_NYT_Words.py` → `Get_NYT_Candidates.py`) — only their write-target
-  string literals (and `Get_NYT_Candidates.py`'s new answer-list check)
-  still need updating at Phase 0.
+  `all_answers.txt`, completed in Phase 0 with an exhaustive (grep-verified)
+  consumer update. The scraper scripts carry their permanent names
+  (`Get_NYT_Wordlist.py` → `Get_NYT_Answers.py`, `Get_NYT_Words.py` →
+  `Get_NYT_Candidates.py`) and their write targets and plausibility checks
+  now use the corrected filenames.
 - **Phone sync mechanism**: git pull (Working Copy) for code and lists;
   the existing manual export/import dance for the cache, independently —
   see Phase 6.
-- **Recertification sweep implementation**: `verify_erd_cache.py` is the
-  skeleton but must be extended — unmodified it silently skips candidates
-  with uncached sub-branches and reads tainted children as if exact, so it
-  audits rather than recertifies. Decided design: inline-solve missing
-  sub-branches at unconstrained budget (committed extension, written at
-  Phase 3 time). Measured cost (2026-07-19/20, idle machine, 432 sampled
-  branches across two passes): **3.0–8.7 days on 6 workers, ~5.4 days
-  central estimate** — affordable outright, so the read-only-certified
-  fallback is no longer the live design (contingency only). Must run
-  standalone, never through the normal swarm/queue: `branch_best_by_policy`
-  has no guess-vocabulary scoping, so `_cache_reuse` cannot tell a
-  recertified row from a copied-forward one — only explicit
-  delete-then-resolve forces recomputation (Part 3).
-- **Old cache reused as ceiling ("hint") for the sweep — measured, not
+- **Recertification execution**: old `ERD_ALL` rows remain exclusively under
+  the old content-addressed `answer_list_id`; only their branch keys feed the
+  dedicated recertification queue. The current-ID namespace begins empty, so
+  each target is an ordinary unlimited-remaining-depth swarm branch and every
+  resulting cache hit is exact. Missing children solve inline, leaves-first
+  admission makes retained children warm, and `verify_erd_cache.py` remains an
+  independent audit tool. Direct samples estimate **3.0–8.7 days of work on
+  6 workers, ~5.4 days central**, with a production pilot required to measure
+  candidate-cooperative throughput and tune concurrent top-level branches.
+- **Old cache reused as ceiling ("hint") for recertification — measured, not
   worth it**: pricing the old `best_guess` and passing its cost as an
   alpha-beta ceiling gave no net speedup (181 branches: 71 faster, 110
   flat-or-slower, totals within 0.2%) — the engine's built-in Σk²
