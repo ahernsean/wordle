@@ -241,10 +241,11 @@ draft. Under the new ID:
 
 - an absent row is work still to do;
 - a present row was solved against the corrected answer list and candidate
-  vocabulary and is exact;
+  vocabulary; `solve_budget IS NULL` identifies an unconstrained exact row,
+  while an integer `solve_budget` remains an ordinary budget-specific result;
 - ordinary `_cache_reuse` is sound; and
 - a worker restarting after writing the cache row but before completing the
-  queue row can safely observe the cache hit and mark the queue row done.
+  queue row can safely recover the attempt from the row's `solve_budget`.
 
 The old row's score is not copied or consulted by the solver. Direct
 measurement found no net benefit from evaluating the old best guess merely
@@ -266,30 +267,66 @@ under the new ID, the branch uses the normal swarm contract:
 2. `evaluate_candidate` recursively prices every response group;
 3. missing sub-branches solve inline and write legitimate current-ID rows;
 4. the running best is shared through `active_branches`; and
-5. full candidate coverage finalizes one exact `ERD_ALL` row.
+5. full candidate coverage finalizes either an unconstrained exact row or a
+   budget-specific row that the controller schedules for a higher-budget
+   attempt.
 
-The recertification run uses an **unlimited-remaining-depth exact profile**.
+### Finite-budget certification ladder
+
 The ordinary game-tree swarm derives a remaining-depth budget from a branch's
-spine; these manifest branches have no unique historical spine, and the
-recertification value must be the unconstrained optimum. The worker profile
-therefore treats the active row's NULL budget as explicit unlimited remaining
-depth rather than as a legacy row requiring a root-budget fallback.
+spine. Manifest branches have no unique historical spine, so the
+recertification controller assigns a **certification budget** instead. Start
+at 5, then retry floor-tainted branches at successively larger finite budgets.
+The scratch pilot chooses and freezes the remaining ladder before production;
+`5, 6, 8, 12` is the initial schedule to measure, not a correctness constant.
 
-The engine must also retain `max_remaining_depth` while solving with
-`budget=None`. The current unlimited-remaining-depth path suppresses that
-bookkeeping and writes NULL; recertification instead records the worst-case
-line length of the ERD-winning strategy while leaving `solve_budget` NULL.
-This does not impose a budget —
-it records the strategy already found — and lets later budgeted root/cone
-work reuse every recertified row whose `max_remaining_depth` fits.
+A finite-budget result certifies the unconstrained optimum when the complete
+candidate scan finishes without any depth floor:
 
-Recursive cooperative promotion stays disabled in this profile. The top
-branch is already split across workers by candidate claims, while missing
-children follow the decided inline-solve behavior. This avoids giving
-unlimited solves artificial spine/budget semantics and avoids adapting the
-transient cut channel, whose reuse rules are budget-indexed. A later measured
-optimization may add unlimited recursive promotion, but it is not required
-for correctness or for moving the hard candidate scans into the swarm.
+- `solve_budget IS NULL` means depth pruning never affected the result. The
+  row is unconstrained exact, records the winning strategy's
+  `max_remaining_depth`, and is reusable at every budget that fits it.
+- An integer `solve_budget` means at least one otherwise-unresolved candidate
+  hit the depth floor. The row is exact only at that certification budget and
+  does not complete recertification.
+- A loss at a finite certification budget likewise proves only a loss at that
+  budget. It schedules a higher-budget attempt rather than completing the
+  manifest key.
+
+Each retry is a new attempt generation. Candidate claims, the shared
+incumbent, and completion counts are scoped by `(branch_key,
+certification_budget, attempt_generation)` so work or bounds from a smaller
+budget cannot finalize a larger-budget attempt. Existing exact untainted
+children remain reusable; budget-specific children follow the ordinary cache
+reuse rules.
+
+This retains the depth floor as a practical guard while still producing
+canonical unconstrained rows. It also has a finite correctness endpoint:
+every informative guess strictly shrinks its branch, and answer words are
+legal candidates, so a branch of `n` answers always has a strategy of at most
+`n` remaining guesses. Production does not jump to that theoretical cap.
+Keys still tainted at the pilot-selected maximum become durably **deferred**,
+with their last budget and reason recorded. They remain absent or
+budget-specific in the current namespace and are safe to revisit through a
+higher finite ladder. No worker automatically falls through to
+`budget=None`.
+
+ERD pruning still applies recursively at every level. Each descended branch
+orders its own candidates, establishes its own incumbent, applies its own
+candidate lower bounds and accumulated-cost cutoffs, and may inherit a tighter
+ceiling from its parent. A 10-, 20-, or 50-guess tail can survive only if the
+candidate remains ERD-competitive at every descended branch. That makes such
+tails unlikely, but not impossible: the winning strategy's surviving path
+must still be evaluated exactly, and the first incumbent-building candidate
+may begin without a finite ERD ceiling. The certification ladder treats that
+rare case as observable deferred work rather than assuming it away.
+
+Recursive cooperative promotion stays disabled for the first implementation.
+The top branch is already split across workers by candidate claims, while
+missing children follow the ordinary inline-solve behavior under the current
+certification budget. The pilot measures long inline claims; if they dominate,
+recursive promotion is a measured follow-up rather than a prerequisite for
+correctness.
 
 ### Dedicated queue and leaves-first admission
 
@@ -302,7 +339,8 @@ disk-stop mechanisms. Its `run_meta` records at least:
 - old and new `answer_list_id`;
 - corrected candidate-list digest and count;
 - manifest row count and per-size histogram;
-- current branch-size wave; and
+- frozen certification-budget ladder and deferred-key policy;
+- current branch-size wave, certification budget, and attempt generation; and
 - the implementation Git revision.
 
 Startup refuses to resume if any recorded identity differs from the current
@@ -311,18 +349,24 @@ mixing vocabularies or implementations.
 
 An admission controller reads old-ID manifest keys in ascending branch size
 and adds only the current size wave to the dedicated queue, in bounded
-batches. It admits size `n + 1` only after:
+batches. Within a wave it runs the frozen certification ladder, retrying only
+keys whose preceding attempt was floor-tainted or a budget-specific loss. It
+admits size `n + 1` only after:
 
-1. every size-`n` pending/active row is done;
-2. every manifest key in that wave has a current-ID exact row; and
-3. the wave counts reconcile with the manifest histogram.
+1. every size-`n` pending/active attempt is terminal;
+2. every manifest key in that wave is either certified by a current-ID
+   untainted exact row or durably deferred after the final ladder budget; and
+3. certified, deferred, retrying, and total counts reconcile with the
+   manifest histogram.
 
 Every informative response group is strictly smaller than its parent, so
-the barrier guarantees that retained children are exact before a parent can
-reuse them. A missing child created by a newly added candidate is solved
-recursively against already-exact smaller rows. Bounded admission avoids
-duplicating all 3.6 million branch blobs in the queue at once; completed
-current-ID cache rows are the durable completion ledger.
+the barrier maximizes exact-child reuse before a parent starts. Certified
+children are ordinary cache hits. A deferred or newly created child is solved
+recursively under the parent's current certification budget; retaining a
+budget-specific child never makes it unconstrained exact. Bounded admission
+avoids duplicating all 3.6 million branch blobs in the queue at once; the
+current-ID cache plus the queue's deferred ledger are the durable completion
+record.
 
 ### Monitoring
 
@@ -331,8 +375,10 @@ so recertification workers, current candidates, branch coverage, queue WAL,
 disk state, and recent finalizations use the normal report pipeline. Add a
 recertification overview, selected from `run_meta.run_kind`, with:
 
-- current wave and wave completion;
-- manifest completion across all waves;
+- current wave, certification budget, attempt generation, and wave completion;
+- manifest processed, certified, retrying, and deferred counts;
+- floor-tainted and budget-specific-loss counts by certification budget;
+- `max_remaining_depth` distribution for certified rows;
 - current and rolling rows/hour;
 - ETA by both row count and measured work;
 - unchanged/improved result counts;
@@ -351,26 +397,29 @@ Before the production pilot:
 
 1. A migration fixture proves Phase 2 copies compliant best/loss rows and
    candidate scores but no `ERD_ALL` best or loss row.
-2. Unlimited-remaining-depth engine solves preserve the same ERD while
-   recording the winning strategy's `max_remaining_depth` and leaving
-   `solve_budget` NULL; the row reuses at every budget that fits it.
-3. A recertification worker treats a NULL active-branch budget as
-   `budget=None`, evaluates the complete candidate vocabulary, disables
-   adaptive recursive promotion, and finalizes through the ordinary cache
-   write and queue cleanup path.
+2. A finite-budget complete candidate scan with no depth floor writes
+   `solve_budget=NULL`, records the winning strategy's
+   `max_remaining_depth`, matches an unconstrained reference solve, and
+   reuses at every budget that fits it.
+3. A floor-tainted result or finite-budget loss remains budget-specific,
+   schedules a clean higher-budget attempt generation, and cannot increment
+   the certified count. Reaching the final ladder budget produces a normal
+   deferred state rather than an error or an automatic unlimited solve.
 4. Manifest admission reads old-ID keys without reading old scores into any
    search bound, never writes the old namespace, and cannot advance a wave
-   with a missing current-ID result.
+   with an unaccounted key.
 5. Restart tests cover a worker dying before its cache write, after its cache
    write but before queue completion, and during candidate evaluation; each
-   resumes without accepting an old-ID value or losing a candidate claim.
+   resumes the correct attempt generation without accepting an old-ID value
+   or losing a candidate claim.
 6. Startup rejects mismatched old/new answer IDs, candidate digest/count,
    queue run kind, or implementation revision with all conflicting values in
    the error.
 7. Recertification reports expose source identity, wave/overall progress,
-   workers, rate, ETA, and partial-source failures in text, JSON, and watched
-   JSON Lines. Text remains useful at 50–60 columns through the shared
-   adaptive terminal layout.
+   certification budgets, retries, deferred keys, certified
+   `max_remaining_depth`, workers, rate, ETA, and partial-source failures in
+   text, JSON, and watched JSON Lines. Text remains useful at 50–60 columns
+   through the shared adaptive terminal layout.
 8. The full suite and the scratch correctness/throughput pilot pass before
    production cache or queue paths are accepted.
 
@@ -410,27 +459,37 @@ production histogram's largest concentration — 1.15M of 3.6M rows) with
 exact per-size row-count weighting, since that bucket's cost turned out to
 be the dominant source of uncertainty.
 
-The direct-solve samples estimate **3.0–8.7 days on 6 independent workers;
-5.4 days is the central estimate**
-(780 serial hours, trimmed-mean method). The spread comes from a genuine
-heavy tail — most branches solve in under a second, but near-exact-tie
-branches (alpha-beta gets no early cutoff) can take tens to low hundreds of
-seconds, and 4.2% of the 16–30-word bucket didn't finish within a 90s
-per-branch cap in the second pass. Plan for the low end of a week; budget
-for the full week as a ceiling. That is a work estimate, not yet a measured
-wall-time promise for candidate-cooperative swarm scheduling.
+Those unlimited-depth direct solves estimated **3.0–8.7 days on 6 independent
+workers; 5.4 days was the central estimate** (780 serial hours, trimmed-mean
+method). They remain useful as a stress reference, not as the production
+ladder's ETA. The sample did not record `max_remaining_depth`, and its heavy
+tail was censored: most branches solved in under a second, but near-exact-tie
+branches took tens to low hundreds of seconds, and 4.2% of the 16–30-word
+bucket did not finish within a 90s per-branch cap in the second pass. It
+therefore does not justify starting every production branch with
+`budget=None`.
 
 Before the production run, compare the recertification profile with the
-six-process direct engine on the same scratch-cache samples and vocabulary.
-Require exact agreement on best score, then evaluate each path's stored best
-guess directly and require it to attain its stored score and
-`max_remaining_depth`; equally optimal guesses need not match. Measure
-completed rows/hour, worker CPU utilization, queue coordination time, and
-queue WAL growth. The swarm profile
-must sustain at least 80% of the direct pool's aggregate rows/hour; otherwise
-tune its top-level branch concentration so multiple ordinary branches can be
-active concurrently, and repeat the gate. Do not weaken candidate coverage,
-the leaves-first barrier, or unlimited exactness to meet the throughput gate.
+six-process direct engine on the same scratch-cache samples and vocabulary at
+each proposed certification budget. For rows reported untainted, require
+exact agreement with an unconstrained reference score, then evaluate each
+stored best guess directly and require it to attain its stored score and
+`max_remaining_depth`; equally optimal guesses need not match. For tainted
+rows and losses, require the next attempt generation to use the next frozen
+budget and re-evaluate complete candidate coverage.
+
+Measure the certified, retrying, and deferred fractions by branch size;
+`max_remaining_depth` among certified rows; time and nodes per attempt;
+completed rows/hour; worker CPU utilization; queue coordination time; and
+queue WAL growth. Include every production manifest key above 200 answers in
+the pilot rather than extrapolating the sparse largest tail. Freeze the
+ladder and its maximum only after this measurement.
+
+At each budget the swarm profile must sustain at least 80% of the direct
+pool's aggregate attempts/hour; otherwise tune its top-level branch
+concentration so multiple ordinary branches can be active concurrently, and
+repeat the gate. Do not weaken candidate coverage, exact-row qualification,
+or durable accounting of deferred keys to meet the throughput gate.
 
 **Correctness, corroborated empirically.** Across both passes, 432 branches
 completed a fresh solve; 28 (6.5%) produced a strictly better ERD than the
@@ -464,16 +523,17 @@ the theorem gives:
 
 **The left value must be a current-ID `ERD_ALL` row produced by the
 recertification swarm.** Because Phase 2 copies no old `ERD_ALL` rows into
-that namespace, every present current-ID row is exact; there is no certified
-subset hidden among stale seeds. A merely-demoted old-ID upper bound on the
-left can equal `ERD_ANSWERS(B)` while the true `ERD_ALL′(B)` is lower, in
-which case the pinch conclusion fails and the seed would overstate the
-optimum while recorded as exact. The sandwich was also unsound against the
-old cache for two independent reasons: the old `ERD_ALL` values were computed
-over a vocabulary that did not contain the answer list (14 missing words —
-the inclusion simply failed), and the vocabulary has now changed besides.
-All of this is repaired only after Phase 0 fixes the lists and Phase 3
-populates the new namespace with exact values.
+that namespace, every `solve_budget IS NULL` current-ID row is an
+unconstrained exact result rather than a stale seed. Budget-specific and
+deferred rows are excluded from the sandwich. A merely-demoted old-ID upper
+bound on the left can equal `ERD_ANSWERS(B)` while the true `ERD_ALL′(B)` is
+lower, in which case the pinch conclusion fails and the seed would overstate
+the optimum while recorded as exact. The sandwich was also unsound against
+the old cache for two independent reasons: the old `ERD_ALL` values were
+computed over a vocabulary that did not contain the answer list (14 missing
+words — the inclusion simply failed), and the vocabulary has now changed
+besides. All of this is repaired only after Phase 0 fixes the lists and Phase
+3 produces the certified exact subset.
 
 Where the outer values are equal, seed the row by **copying the entire
 `erd_answers_compliant` row** (best_guess, best_score, max_depth): its
@@ -484,9 +544,10 @@ reused at budgeted queries). Guard the pinch on `solve_budget IS NULL` on
 both sides: tainted rows hold budget-specific values and pin nothing.
 
 Do **not** seed losses from old `ERD_ALL` losses (invalid under growth).
-An unlimited recertification branch always has a strategy, so Phase 3 does
-not write losses. Once later budgeted root/cone work proves an `ERD_ALL` loss
-under the new vocabulary, it transfers validly (loss over the superset
+Phase 3 may write finite-budget losses while climbing the certification
+ladder, but they do not complete recertification and do not participate in
+the sandwich. Once budgeted root/cone work proves an `ERD_ALL` loss under the
+new vocabulary, it transfers validly at that budget (loss over the superset
 vocabulary implies loss over answers′ ⊆ all-words′).
 
 ### Cost model
@@ -511,11 +572,13 @@ G′ = G ∪ {added words} denotes a grown branch, G its retained base.
 To evaluate a candidate c on G′, `_solve_subset` needs each response group's
 ERD; the added words land in few groups, and every unchanged group is the
 identical word set. During Phase 3 it is a current-ID cache hit once its
-smaller-size manifest wave has completed. Per-candidate cost = cached
-lookups + recursive solves of the few new partition keys, memoized across
-candidates. A cache-missed key near the root is a solve against a warm
-current-ID cache. This is what keeps the recertification swarm's inline
-solves of missing sub-branches tractable.
+smaller-size manifest key has certified at a compatible budget. Deferred
+children and new partition keys solve recursively under the parent's
+certification budget and remain governed by the same taint rules.
+Per-candidate cost = compatible cached lookups + recursive solves of the
+remaining keys, memoized across candidates. A cache-missed key near the root
+is a solve against a mostly warm current-ID cache. This is what keeps the
+recertification swarm's inline solves of missing sub-branches tractable.
 
 ### Mechanism 2 — O(1) transfer bounds (scoped; measured not worth building)
 
@@ -691,9 +754,12 @@ remaining uplift.
 ### Phase 3 — `ERD_ALL` recertification swarm
 
 1. Land the persistent recertification support through a PR:
-   - unlimited-remaining-depth swarm rows whose NULL budget is explicit, not
-     a legacy root-budget fallback;
-   - `max_remaining_depth` tracking for unlimited solves;
+   - finite certification budgets assigned independently of a historical
+     spine;
+   - attempt generations and clean candidate-claim reset on every
+     higher-budget retry;
+   - untainted exact, retrying, budget-specific loss, and deferred terminal
+     states with `max_remaining_depth` retained for certified rows;
    - the old-ID manifest reader and strict ascending-size admission controller;
    - run-identity validation and restart recovery on a dedicated queue path;
    - adaptive recursive promotion disabled for this profile; and
@@ -701,8 +767,11 @@ remaining uplift.
    - `queue set-disk-stop`, since the procedure now deliberately engages the
      default latch before Phase 3 and again before Phase 5.
 2. Against scratch cache and queue copies, run the Part 3 correctness and
-   throughput gate. Do not begin production until exact results agree and the
-   swarm reaches the required fraction of direct-pool throughput. If worker
+   throughput gate at each proposed certification budget, including every
+   manifest key above 200 answers. Do not begin production until certified
+   results agree with unconstrained references, tainted attempts retry
+   cleanly, the ladder maximum has a measured deferred rate, and the swarm
+   reaches the required fraction of direct-pool throughput. If worker
    concentration fails the gate, allow multiple ordinary top-level branches
    to remain active and repeat the measurement.
 3. Run the standing machine-state check before production — both signals —
@@ -710,8 +779,9 @@ remaining uplift.
    epoch swarm and report server stay stopped; only the direct recertification
    supervisor may write the production cache.
 4. Initialize `erd_recertification_queue.sqlite3` from the recorded old/new
-   IDs, candidate-list digest, manifest histogram, and implementation revision.
-   Refuse a nonempty queue whose identity does not match exactly.
+   IDs, candidate-list digest, manifest histogram, frozen certification ladder
+   and deferred policy, and implementation revision. Refuse a nonempty queue
+   whose identity does not match exactly.
 5. Start six recertification workers against the dedicated queue and the
    production cache. Admit one answer-count wave at a time in bounded batches.
    Monitor through:
@@ -720,21 +790,22 @@ remaining uplift.
            --queue-path erd_recertification_queue.sqlite3 \
            --cache-path wordle_cache.sqlite3 --watch
 
-6. At every wave boundary, reconcile queue completion, current-ID cache rows,
-   and the old-ID manifest count before admitting the next size. Resume from
-   the dedicated queue after a clean or unclean stop; never use a manual
-   `--start-size` assertion as a substitute for the durable ledger.
-7. Run to full manifest completion. The direct-solve estimate remains
-   3.0–8.7 days on six workers with a 5.4-day center, but replace it with the
-   pilot's measured swarm rate for the production ETA. The phone remains
-   frozen, and no user-facing solve reads the partially populated new
-   namespace during this phase.
+6. At every wave and certification-budget boundary, reconcile exact,
+   retrying, budget-specific-loss, and deferred queue states against
+   current-ID cache rows and the old-ID manifest count before advancing.
+   Resume from the dedicated queue after a clean or unclean stop; never use a
+   manual `--start-size` assertion as a substitute for the durable ledger.
+7. Run until every manifest key is certified or durably deferred. Use the
+   pilot's measured attempts/hour, retry fractions, and deferred fraction for
+   the production ETA; the earlier 3.0–8.7-day unlimited-depth estimate is
+   only a stress reference. The phone remains frozen, and no user-facing solve
+   reads the partially populated new namespace during this phase.
 
 ### Phase 4 — Recompute and seed
 
 1. Stop the recertification supervisor cleanly and reconcile the entire old-ID
-   manifest against current-ID exact rows. Retain the dedicated queue through
-   reverification as the execution ledger.
+   manifest against current-ID certified or deferred terminal states. Retain
+   the dedicated queue through reverification as the execution ledger.
 2. Clear and re-seed the default queue from the new 3,209-word root. Release
    its disk-stop latch and run the controlled ordinary swarm to compute the
    root census and the 9 answer cones against the new candidate universe,
@@ -810,17 +881,20 @@ of the 14 rescued guess words:
 
 - Eager vs. lazy for the un-pinched `erd_answers_unfiltered` remainder.
 - Soak length before retirement.
+- Certification budgets after the initial budget 5, the production ladder
+  maximum, and the acceptable deferred fraction; freeze all three from the
+  Part 3 scratch pilot.
 - Whether to centralize the remaining `ANSWER_FILE`/`WORDS_FILE`-style
   consumers listed in Phase 0 through `runtime_paths.py` as a later cleanup.
 
-Resolved since the last revision (previously open): direct-solve work cost
-(measured, Part 3), inline-solving missing children (retained inside ordinary
-swarm candidate evaluation), whether Mechanism 2's ceiling-injection
-machinery is worth building (measured negligible payoff; proofs retained,
-implementation deferred), and whether Phase 3 branches fit the swarm (yes —
-leave old `ERD_ALL` rows under the old `answer_list_id`, admit their keys into
-a dedicated queue, and every current-ID cache hit becomes an ordinary exact
-result; see Part 3).
+Resolved since the earlier standalone design: inline-solving missing children
+(retained inside ordinary swarm candidate evaluation), whether Mechanism 2's
+ceiling-injection machinery is worth building (measured negligible payoff;
+proofs retained, implementation deferred), and whether Phase 3 branches fit
+the swarm (yes — leave old `ERD_ALL` rows under the old `answer_list_id` and
+admit their keys into a dedicated queue). The earlier unlimited-depth cost
+sample remains evidence about the stress path; it is not the finite ladder's
+production estimate.
 
 ## Resolved
 
@@ -840,12 +914,17 @@ result; see Part 3).
 - **Recertification execution**: old `ERD_ALL` rows remain exclusively under
   the old content-addressed `answer_list_id`; only their branch keys feed the
   dedicated recertification queue. The current-ID namespace begins empty, so
-  each target is an ordinary unlimited-remaining-depth swarm branch and every
-  resulting cache hit is exact. Missing children solve inline, leaves-first
-  admission makes retained children warm, and `verify_erd_cache.py` remains an
-  independent audit tool. Direct samples estimate **3.0–8.7 days of work on
-  6 workers, ~5.4 days central**, with a production pilot required to measure
-  candidate-cooperative throughput and tune concurrent top-level branches.
+  each target is an ordinary swarm branch run first at certification budget 5.
+  A floor-free attempt writes an untainted unconstrained exact row; a
+  floor-tainted result retries under the frozen finite ladder and becomes
+  durably deferred at its measured maximum rather than falling through to
+  `budget=None`. Missing children solve inline, leaves-first admission makes
+  certified retained children warm, and `verify_erd_cache.py` remains an
+  independent audit tool. Prior unlimited-depth samples estimate
+  **3.0–8.7 days of stress-path work on 6 workers, ~5.4 days central**; the
+  production pilot measures the ladder's throughput, retry and deferred
+  fractions, certified `max_remaining_depth`, and concurrent top-level branch
+  concentration.
 - **Old cache reused as ceiling ("hint") for recertification — measured, not
   worth it**: pricing the old `best_guess` and passing its cost as an
   alpha-beta ceiling gave no net speedup (181 branches: 71 faster, 110
