@@ -84,27 +84,29 @@ report server), then re-run all three checks.
 
 ## Procedure
 
-### 1. Land the taint-join fix (small PR, before anything else)
+### 1. Deploy the taint-join fix — landed in this PR
 
-`evaluate_candidate` discards a sub-branch's `sub_budget_tainted` when the
-sub-branch returns `OVER_ERD_LIMIT` (`wordle_engine.py`: the early return in
-the sub-branch loop runs before the `floor = floor or sub_budget_tainted`
-join). A floor-tainted child's ceiling refutation is budget-contaminated —
-an unconstrained strategy below the floor could beat the ceiling — so the
-cutoff must carry the child's taint. Without the fix, a branch can be
-written `solve_budget IS NULL` (claimed unconstrained-exact, reusable at any
-budget ≥ `max_depth`) when the floor in fact pruned its search. That false
-certificate would poison a fresh rebuild exactly as it would have poisoned
-recertification.
+`evaluate_candidate` was discarding a sub-branch's `sub_budget_tainted` when
+the sub-branch returned `OVER_ERD_LIMIT` (`wordle_engine.py`: the early
+return in the sub-branch loop ran before the `floor = floor or
+sub_budget_tainted` join). A floor-tainted child's ceiling refutation is
+budget-contaminated — an unconstrained strategy below the floor could beat
+the ceiling — so the cutoff must carry the child's taint. Without the fix, a
+branch could be written `solve_budget IS NULL` (claimed unconstrained-exact,
+reusable at any budget ≥ `max_depth`) when the floor in fact pruned its
+search. That false certificate would poison a fresh rebuild exactly as it
+would have poisoned recertification.
 
-The fix joins the child's taint before every dispatch on the child's status.
-It ships with a deterministic test: force a child to encounter the
-remaining-depth floor and then return `OVER_ERD_LIMIT` under its parent's
-ceiling, and require the taint to reach the candidate result, the top-level
-branch, and the cache write.
+The fix joins the child's taint before every dispatch on the child's status,
+with a deterministic test forcing a child to encounter the remaining-depth
+floor and then return `OVER_ERD_LIMIT` under its parent's ceiling, verifying
+the taint reaches the candidate result, the top-level branch, and the cache
+write. The same gap existed on the swarm's ceilinged-cut sharing path
+(`cut_results`); fixed with a `tainted` column threaded through publish and
+both consumption sites, with an idempotent migration.
 
-Deploy to rocky before the rebuild starts (stale workers are stopped in
-step 2 regardless).
+Deploy to rocky (a normal `git pull` of `main` after merge) before the
+rebuild starts — stale workers are stopped in step 2 regardless.
 
 ### 2. Freeze
 
