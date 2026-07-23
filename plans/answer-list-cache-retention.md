@@ -318,22 +318,36 @@ The scratch pilot chooses and freezes the remaining ladder before production;
 The implementation starts from an explicit result model. These states are not
 interchangeable:
 
-| State | Meaning | Durable representation | Reuse |
-|---|---|---|---|
-| **unconstrained exact** | Complete candidate coverage proved the global ERD optimum without any remaining-depth floor | canonical `branch_best_by_policy` row with `solve_budget IS NULL` | unlimited queries, and any finite budget at least its `max_remaining_depth` |
-| **budget-specific exact at b** | Complete candidate coverage proved the optimum among strategies feasible at budget b, but some explored path encountered the remaining-depth floor | `branch_best_by_policy_and_budget` row keyed by `solve_budget=b` | exactly budget b in the baseline contract |
-| **loss at b** | Complete candidate coverage proved that no strategy is feasible at budget b | `branch_loss_by_policy`, retaining the greatest `loss_budget` | every query budget at most b |
-| **ceiling cutoff at (b, c)** | An admissible lower bound proved only that the current candidate or branch cannot beat ERD ceiling c during the attempt at b | transient `OVER_ERD_LIMIT`; never a cache row or terminal class | none |
-| **abort** | Deadline, cancellation, worker death, or another interrupted attempt | retrying queue state only | none |
+| State | Meaning | Durable representation | Exact reuse | Feasibility witness |
+|---|---|---|---|---|
+| **unconstrained exact** | Complete candidate coverage proved the global ERD optimum without any remaining-depth floor; the stored strategy has `max_remaining_depth=m` | canonical `branch_best_by_policy` row with `solve_budget IS NULL` | unlimited, and every finite budget `q >= m` | every `q >= m` |
+| **budget-specific exact at b** | Complete candidate coverage proved `E_b`, the optimum among strategies feasible at budget b; the winning strategy has `max_remaining_depth=m <= b`, but some explored path encountered the remaining-depth floor | `branch_best_by_policy_and_budget` row keyed by `solve_budget=b` | every `q` in the closed interval `m <= q <= b` | every `q >= m`; above b its score is only a feasible upper bound |
+| **loss at b** | Complete candidate coverage proved that no strategy is feasible at budget b | `branch_loss_by_policy`, retaining the greatest `loss_budget` | every query budget `q <= b` returns loss | none |
+| **ceiling cutoff at (b, c)** | An admissible lower bound proved only that the current candidate or branch cannot beat ERD ceiling c during the attempt at b | transient `OVER_ERD_LIMIT`; never a cache row or terminal class | none | none |
+| **abort** | Deadline, cancellation, worker death, or another interrupted attempt | retrying queue state only | none | none |
 
-For a fixed branch and policy, let `E_b` be the budget-specific exact ERD at
-budget b and `E_*` the unconstrained exact ERD. Increasing b expands the set
-of feasible strategies, so `E_b` is nonincreasing until it reaches `E_*`.
-That monotonicity does **not** make two finite-budget rows substitutes for one
-another: a strategy winning at b may be infeasible below b, while a result at
-b need not have considered strategies admitted only above b. The baseline
-therefore reuses `E_b` only at b. A loss has the opposite safe range: loss at
-b implies loss at every smaller budget.
+The finite row's interval follows from the strategy it stores, not from a
+cache policy choice. Let `F_q` be the strategies whose
+`max_remaining_depth <= q`, and let a row solved at b store strategy `T_b`,
+score `e_b = E_b`, and `max_remaining_depth=m`. For every `q` with
+`m <= q <= b`, `T_b` belongs to `F_q` while `F_q` is a subset of `F_b`.
+Therefore:
+
+    E_b <= E_q <= cost(T_b) = E_b
+
+so `E_q = E_b`. For `q > b`, `T_b` still proves feasibility and supplies an
+upper bound, but the larger strategy set may contain a better result. For
+`q < m`, this stored strategy does not prove feasibility. The canonical row
+is the same argument with no upper end to its exactness interval.
+
+Consequently a finite-budget lookup at q uses any canonical or
+budget-versioned row whose exactness interval contains q. All such rows must
+have the same score. A finite row solved above q is therefore reusable when
+its stored strategy fits q; lookup is not restricted to
+`solve_budget == q`. A row solved below q whose strategy fits remains an
+optional incumbent only, never an exact cache hit. Unlimited lookup still
+uses only the canonical row. A loss has the opposite safe range: loss at b
+implies loss at every smaller budget.
 
 A finite-budget attempt certifies `E_*` only when all of these proof
 obligations hold:
@@ -376,11 +390,15 @@ must not also act as a lossy register for many `E_b` values. Add:
         branch_key       BLOB    NOT NULL,
         policy           TEXT    NOT NULL,
         answer_list_id   TEXT    NOT NULL,
-        solve_budget     INTEGER NOT NULL,
+        solve_budget     INTEGER NOT NULL CHECK (solve_budget >= 1),
         best_guess       TEXT    NOT NULL,
         best_score       REAL    NOT NULL,
         updated_at       INTEGER NOT NULL,
         max_remaining_depth INTEGER NOT NULL,
+        CHECK (
+            max_remaining_depth >= 1
+            AND max_remaining_depth <= solve_budget
+        ),
         PRIMARY KEY (
             branch_key, policy, answer_list_id, solve_budget
         )
@@ -390,58 +408,155 @@ The schema and cache contracts are:
 
 - `solve_budget IS NULL` writes go only to
   `branch_best_by_policy`. Integer-budget writes go only to
-  `branch_best_by_policy_and_budget`; finite budgets never compete with one
-  another or overwrite the canonical certificate.
+  `branch_best_by_policy_and_budget`; finite budgets never compete for one
+  storage slot or overwrite the canonical certificate, while the recorder
+  still enforces their mathematical relations.
 - Unlimited reads consult only the canonical table. A finite-budget read
-  first uses a canonical row if its `max_remaining_depth` fits, otherwise it
-  looks up the exact requested budget in the versioned table. Legacy canonical
-  rows with NULL `max_depth` remain unavailable to finite-budget reuse.
+  uses a canonical row whose `max_remaining_depth` fits or a versioned row
+  satisfying `max_remaining_depth <= query_budget <= solve_budget`. If
+  several rows qualify, their scores must agree before one is returned.
+  Legacy canonical rows with NULL `max_depth` remain unavailable to
+  finite-budget reuse.
 - SQLite and the process-local cache use the same composite identity,
   including `solve_budget` for finite results. A read or write at one finite
   budget cannot hide a row at another budget.
-- Repeating a write to the same finite-budget key is deterministic. The exact
-  score must agree within the solver's comparison tolerance; the winning
-  guess and its `max_remaining_depth` may differ only under an exactly tied
-  optimum.
-  A disagreement is a correctness failure, not a last-writer-wins event.
 - `branch_loss_by_policy` remains the monotone loss representation:
   `write_loss` keeps the greatest proven `loss_budget`.
 
-The stored rows must also satisfy cross-state invariants, checked on writes,
-startup, and Phase 5:
+For one `(branch_key, policy, answer_list_id)`, write `U=(e_*,m_*)` for the
+canonical row and `R_b=(e_b,m_b)` for a finite row. The complete stored-state
+invariants, all within the solver's score-comparison tolerance, are:
 
-- every budget-versioned winning strategy has
-  `max_remaining_depth <= solve_budget`;
-- for two stored exact budgets `b1 < b2`, `E_b2 <= E_b1` within comparison
-  tolerance;
-- a loss through b cannot coexist with an exact row at any budget at most b;
-  it also cannot coexist with a canonical row whose `max_remaining_depth`
-  fits b; and
-- a finite loss below a canonical strategy's `max_remaining_depth`, or below
-  an exact row at a larger budget, is not inherently contradictory.
+- **Row validity:** every ERD row left in the canonical table has
+  `solve_budget IS NULL`; every `R_b` is in the versioned table with positive
+  b and `1 <= m_b <= b`; every nonlegacy canonical row has `m_* >= 1`.
+- **Same budget:** two computations of `R_b` have equal scores. Tied winning
+  strategies may have different guesses and `max_remaining_depth` values.
+- **Finite-budget order:** for `b1 < b2`, `e_b2 <= e_b1`. If
+  `m_b2 <= b1`, the higher-budget winning strategy also fits the lower
+  budget, so equality is required.
+- **Canonical overlap:** `e_* <= e_b` for every finite b. If `m_* <= b`, the
+  canonical strategy fits b, so equality is required.
+- **Loss versus every strategy:** a loss through l requires `l < m` for every
+  stored winning row whose `max_remaining_depth=m` is known, canonical or
+  budget-versioned, regardless of that row's `solve_budget`. Any row with
+  `m <= l` is a concrete strategy disproving the loss.
 
-Conflicting exact and loss evidence is a correctness failure. It is never
-resolved by last-write-wins deletion.
+These relations cover every overlap: two finite exactness intervals that
+overlap must have equal scores, and a retained historical finite row must
+agree with a later canonical row wherever their intervals overlap. A loss
+below every stored strategy's `max_remaining_depth` is not inherently
+contradictory; a loss at or above any one of them is. Conflicting exact
+scores or exact-versus-loss evidence is a correctness failure. It is never
+resolved by last-write-wins deletion or by ignoring the incoming evidence.
+
+The pairwise closure is exhaustive:
+
+| Evidence pair | Required relation |
+|---|---|
+| canonical / canonical | equal score; consolidate tied strategies by proof strength |
+| canonical `U` / finite `R_b` | `e_* <= e_b`; equality when `m_* <= b` |
+| canonical `U` / loss `L_l` | require unknown `m_*` or `l < m_*` |
+| finite `R_b` / finite `R_b` | equal score; consolidate tied strategies by proof strength |
+| finite `R_b1` / finite `R_b2`, `b1 < b2` | `e_b2 <= e_b1`; equality when `m_b2 <= b1` |
+| finite `R_b` / loss `L_l` | require `l < m_b`, regardless of b |
+| loss / loss | retain the greater `loss_budget` after validating it against every strategy |
+
+There is no unlisted canonical/finite/loss pairing for a row family. Cutoffs
+and aborts never enter the durable family.
+
+### Make invariant preservation atomic
+
+All ERD canonical, budget-versioned, and loss writes use one family-validation
+and consolidation primitive. The live result recorder starts
+`BEGIN IMMEDIATE`, invokes that primitive for `(branch_key, policy,
+answer_list_id)`, commits, and only then updates `MemoryScoreCache` or permits
+queue finalization. Bulk schema/namespace migrations start one outer
+transaction and call the same primitive without nesting transactions.
+SQLite's write lock serializes the six processes: a second writer validates
+against the first writer's committed result rather than against a stale miss.
+The pure in-memory implementation holds one lock across the equivalent family
+validation and mutation.
+
+For a repeated canonical or same-budget result with equal score, retain the
+strategy with known `max_remaining_depth` over a legacy NULL value, then the
+smaller known `max_remaining_depth`, then a deterministic best-guess tie
+break. The incoming strategy is still checked against the loss row before
+consolidation: silently retaining a weaker existing strategy must not hide the
+fact that a newly computed smaller-`max_remaining_depth` strategy disproves a
+stored loss.
+
+A conditional UPSERT may enforce same-table equality, but it is insufficient
+by itself because exact rows and losses occupy different tables. The
+transaction covers both tables and both write directions:
+
+- an exact-result write rejects a loss whose `loss_budget` reaches the
+  incoming strategy's `max_remaining_depth`;
+- a loss write rejects every canonical or finite strategy whose
+  `max_remaining_depth <= incoming loss_budget`; and
+- either write revalidates finite-budget ordering and canonical overlap after
+  applying its proposed change.
+
+Ordinary SQLite lock contention retries without finalizing the queue attempt.
+An invariant violation names both pieces of conflicting evidence, stops the
+run as a correctness failure, and is never swallowed as a routine cache-write
+failure. Read races may miss a newly committed reusable result and recompute,
+but atomic writes ensure they cannot observe a committed contradictory state.
+Every permitted commit is proof-monotone: it adds a consistent budget row,
+widens a consistent loss, or replaces a tied strategy with one having no
+larger `max_remaining_depth`. It never invalidates an older exact result or
+loss. Therefore another process's stale positive in its local cache remains
+sound; a stale miss or weaker interval only causes extra work.
 
 Implement this as an idempotent, `schema_migrations`-guarded
 `ScoreCache._ensure_schema` migration. It creates the versioned table and
 indexes, validates that every existing `branch_best_by_policy` row with
-`solve_budget IS NOT NULL` has a positive budget and non-NULL
-`max_remaining_depth`, copies it to the matching budget key, verifies source
-and destination counts and values, then deletes only those migrated finite
-rows from the canonical table. Invalid legacy finite rows stop migration with
-their identities; they are not silently coerced. A rerun is a no-op with the
-same verified state.
-The migration applies to every answer-list ID and ERD policy, not merely this
-recertification run. `MemoryScoreCache`, import/export, reporting, audit
-queries, and phone consumers receive the same two-store contract.
+`solve_budget IS NOT NULL` satisfies
+`1 <= max_remaining_depth <= solve_budget`, copies it to the matching budget
+key, verifies source and destination counts and values, then deletes only
+those migrated finite rows from the canonical table. Invalid legacy finite
+rows stop migration with their identities; they are not silently coerced. A
+rerun is a no-op with the same verified state. Before committing the schema
+migration, validate the complete post-move row family—including loss
+conflicts—under the same invariants. The migration applies to every
+answer-list ID and ERD policy, not merely this recertification run.
+`MemoryScoreCache`, import/export, reporting, audit queries, and phone
+consumers receive the same interval and atomic-write contract.
+The implementation inventory explicitly covers `ScoreCache` reads/writes,
+`MemoryScoreCache`, `import_cache.py`, `export_cache.py`,
+`verify_erd_cache.py`, `verify_erd_losses.py`, cache/report queries, and the
+diagnostic scratch-cache reset helpers. No direct SQL result insertion may
+bypass the family validator; scratch reset paths clear canonical,
+budget-versioned, loss, and process-local result state together.
+
+### Closure audit: every operation that combines result evidence
+
+The implementation review is organized around operations, not around the four
+tables in isolation:
+
+| Operation | Required invariant boundary | Safe non-result |
+|---|---|---|
+| finite-budget read | return exact only from an interval containing the query; all qualifying rows agree; a strategy above its solve budget is at most an incumbent | cache miss and recompute |
+| unlimited read | canonical row only | cache miss and recompute |
+| exact-result write | atomic full-family validation, including incoming strategy versus loss | lock-contention retry; invariant conflict stops the run |
+| loss write | atomic comparison with every known strategy `max_remaining_depth` | lock-contention retry; invariant conflict stops the run |
+| legacy schema migration | validate the complete family after moving finite rows and before commit | transaction rollback |
+| old-ID → new-ID result merge | validate the combined source/target family, not either namespace separately | transaction rollback before any queue work |
+| worker recovery | accept only a committed row whose interval proves the attempt budget, or a covering loss | retry the same attempt generation |
+| deferred → certified promotion | validate the new canonical row against every historical interval and loss before superseding the ledger entry | abort remains deferred; invariant conflict stops the run |
+| import/export and phone sync | copy both result tables and losses, run schema migration and the complete state gate before use | reject the imported cache |
+| sandwich seed | canonical unconstrained rows only; finite intervals never establish the unlimited outer value | leave the branch unseeded |
+
+Every implementation PR must trace each row in this table to code and a test.
+Passing the four new regression examples without completing this operation
+matrix is not sufficient acceptance.
 
 Each retry is a new attempt generation. Candidate claims, the shared
 incumbent, and completion counts are scoped by `(branch_key,
 certification_budget, attempt_generation)` so work or bounds from a smaller
 budget cannot finalize a larger-budget attempt. Existing unconstrained exact
 children remain reusable from the canonical table; budget-specific children
-follow the exact-budget reuse rule.
+follow the exactness-interval reuse rule.
 
 This retains the depth floor as a practical guard while still producing
 canonical unconstrained rows. It also has a finite correctness endpoint:
@@ -453,10 +568,10 @@ with their last budget and reason recorded. Their final-budget `E_b` cannot be
 overwritten by a later solve at another budget because the budget is part of
 the row identity. They are safe to revisit through a higher finite ladder. No
 worker automatically falls through to `budget=None`. Only a completed
-final-budget attempt backed by the exact matching budget row or a loss proof
-covering that budget may become deferred. A ceiling cutoff, deadline,
-cancellation, or worker death leaves the key retrying; absence of a result is
-not a terminal classification.
+final-budget attempt backed by a finite row whose exactness interval contains
+that budget, or a loss proof covering it, may become deferred. A ceiling
+cutoff, deadline, cancellation, or worker death leaves the key retrying;
+absence of a result is not a terminal classification.
 
 ERD pruning still applies recursively at every level. Each descended branch
 orders its own candidates, establishes its own incumbent, applies its own
@@ -536,7 +651,8 @@ recertification overview, selected from `run_meta.run_kind`, with:
 - floor-tainted and budget-specific-loss counts by certification budget;
 - eligible-manifest and excluded-fallback counts and identities;
 - `max_remaining_depth` distribution for certified rows;
-- budget-versioned row counts and cache-hit counts by budget;
+- budget-versioned row counts and interval cache hits by query budget and
+  source `solve_budget`;
 - current and rolling rows/hour;
 - ETA by both row count and measured work;
 - unchanged/improved result counts;
@@ -558,63 +674,104 @@ Before the production pilot:
    moved exactly once from source column `max_depth` to
    `branch_best_by_policy_and_budget.max_remaining_depth` while unconstrained
    and non-ERD rows retained their values. Source/destination reconciliation,
-   indexes, and the `schema_migrations` guard are verified.
-2. Cache tests write one unconstrained row and several finite-budget rows for
-   the same branch and policy in every order. SQLite and `MemoryScoreCache`
-   retain all versions. Unlimited lookup sees only the unconstrained row;
-   finite lookup prefers a fitting unconstrained row and otherwise sees only
-   the exact requested budget.
-3. A finite-budget complete candidate scan with no remaining-depth floor
+   indexes, the complete post-move cross-state gate, and the
+   `schema_migrations` guard are verified.
+2. Exactness-interval lookup stores `R_8` with
+   `max_remaining_depth=4`: budgets 4 through 8 reuse its exact score, budget
+   3 does not reuse it, and budget 9 may use its strategy only as an incumbent.
+   A fitting canonical row takes precedence and agrees with every overlapping
+   finite row. Unlimited lookup sees only the canonical row. SQLite and
+   `MemoryScoreCache` produce identical decisions.
+3. Table-driven invariant tests cover the full relation, not only individual
+   examples: finite-score monotonicity; equality when the higher-budget
+   strategy fits the lower budget; the canonical lower bound and equality
+   over its overlap; and loss rejection against every canonical or finite
+   strategy whose `max_remaining_depth` fits the loss budget. In particular,
+   `R_8` with `max_remaining_depth=4` rejects `loss_budget=5`.
+4. Two independent SQLite connections race to record different scores at the
+   same finite budget. The first commit wins the write lock and the second
+   observes and rejects the disagreement; no last-writer replacement occurs.
+   Equal-score tied strategies converge deterministically to the smaller
+   `max_remaining_depth` and then the best-guess tie break.
+5. Two-connection races record an exact result and a conflicting loss in both
+   commit orders, for canonical and budget-versioned rows. Exactly one piece
+   of contradictory evidence can commit; the other raises the named
+   correctness failure. Lock contention itself retries as an ordinary state,
+   and `MemoryScoreCache` changes only after commit. A peer retaining an older
+   positive cache entry after a consistent strengthening still returns sound
+   evidence; a stale miss only recomputes.
+6. A finite-budget complete candidate scan with no remaining-depth floor
    writes the canonical `solve_budget=NULL` row, records the winning
    strategy's `max_remaining_depth`, matches an unconstrained reference solve,
    and reuses at every budget that fits it.
-4. A deterministic nested solve forces a child to encounter the
+7. A deterministic nested solve forces a child to encounter the
    remaining-depth floor and then return `OVER_ERD_LIMIT` under its parent's
    ceiling. The child's taint reaches the candidate, top branch, cache write,
    and queue result: no level may write or count an unconstrained certificate.
    Companion tests cover each normal early-return status and prove taint is a
    monotone OR across completed descendant work.
-5. A floor-tainted exact result writes only its matching budget version; a
+8. A floor-tainted exact result writes only its matching budget version; a
    finite-budget loss widens only `loss_budget`. Each schedules a clean
    higher-budget attempt generation and cannot increment the certified count.
    A cutoff or abort writes no result and remains retrying.
-6. A final-budget tainted row backs a deferred entry, then a later parent
+9. A final-budget tainted row backs a deferred entry, then a later parent
    solves the child at both a smaller and a larger budget. Every finite row
-   remains addressable and the deferred backing still resolves to the exact
-   final budget. If later work produces an unconstrained row, reconciliation
-   promotes the key to certified and marks the deferred entry superseded.
-7. A manifest fixture contains an ordinary answer branch, a well-formed
+   remains addressable, interval reuse is correct, and the deferred backing
+   row's exactness interval still contains the final certification budget. If
+   later work produces an unconstrained row, its score is checked against
+   every overlapping historical interval before reconciliation promotes the
+   key to certified and marks the deferred entry superseded.
+10. A manifest fixture contains an ordinary answer branch, a well-formed
    interactive fallback branch containing a guess-only word, and a malformed
    key. The ordinary key is admitted, the fallback key is excluded and
    accounted without reaching `PatternMatrix.answer_indices`, and the
    malformed key aborts extraction. With only well-formed rows, source count
    equals eligible plus excluded and both digests reproduce across restart.
-8. The Phase 2 migration fixture copies compliant canonical, budget-versioned,
-   and loss rows plus candidate scores, but no `ERD_ALL` canonical,
-   budget-versioned, or loss row. Same-key/same-budget collisions verify exact
-   score agreement; loss collisions retain the greatest `loss_budget`.
-9. Manifest admission never reads old scores into a search bound, never writes
-   the old namespace, and cannot advance a wave with an unaccounted eligible
-   key. A completed final-budget attempt becomes deferred only when its exact
-   budget row or covering loss proof exists.
-10. Restart tests cover a worker dying before its cache write, after its cache
+11. The Phase 2 merge fixture copies compliant canonical, budget-versioned,
+    and loss rows plus candidate scores, but no `ERD_ALL` canonical,
+    budget-versioned, or loss row. It covers source-exact/target-loss and
+    source-loss/target-exact conflicts for both canonical and finite rows,
+    including a larger-budget row whose strategy fits the loss budget. It
+    also covers canonical/finite interval overlap across the two namespaces.
+12. After every Phase 2 fixture, a full combined-state gate runs against the
+    new answer-list ID before commit. A valid union commits; any score-order,
+    overlap, or exact-versus-loss contradiction rolls the result-table merge
+    back and names both source records. Running the gate before the copy, while
+    the rows still have different answer-list IDs, is explicitly insufficient.
+13. Export includes `branch_best_by_policy`,
+    `branch_best_by_policy_and_budget`, and `branch_loss_by_policy` in one
+    consistent snapshot. Import proposes attached-source result families
+    through the same validator, with fixtures for source-exact/target-loss and
+    source-loss/target-exact in both table directions. A conflict leaves every
+    committed target family valid, retains the source file, and prevents the
+    imported cache from being declared ready.
+14. Manifest admission never reads old scores into a search bound, never writes
+    the old namespace, and cannot advance a wave with an unaccounted eligible
+    key. A completed final-budget attempt becomes deferred only when a finite
+    row whose exactness interval contains that budget or a covering loss proof
+    exists.
+15. Restart tests cover a worker dying before its cache write, after its cache
     write but before queue completion, and during candidate evaluation; each
     resumes the correct attempt generation without accepting an old-ID value
     or losing a candidate claim.
-11. Startup rejects mismatched old/new answer IDs, eligible or excluded
+16. Startup rejects mismatched old/new answer IDs, eligible or excluded
     manifest identity, candidate digest/count, queue run kind, or
-    implementation revision with all conflicting values in the error.
-12. Recertification reports expose source inventory, eligible/excluded
+    implementation revision with all conflicting values in the error. Queue
+    resume validates every recovered branch's complete row family and reruns
+    the current wave gate before admitting new work; it does not rescan
+    unrelated millions of rows on every ordinary process start.
+17. Recertification reports expose source inventory, eligible/excluded
     identities, wave/overall progress, certification budgets, retries,
     deferred and superseded keys, certified `max_remaining_depth`, workers,
     rate, ETA, and partial-source failures in text, JSON, and watched JSON
     Lines. Text remains useful at 50–60 columns through the shared adaptive
     terminal layout.
-13. Terminal reconciliation maps every eligible manifest key to exactly one
+18. Terminal reconciliation maps every eligible manifest key to exactly one
     current class: an unconstrained current-ID best row, or a nonsuperseded
-    durable deferred entry backed by the exact final-budget row or covering
-    loss proof. Only the first class enters the sandwich.
-14. The full suite and the scratch correctness/throughput pilot pass before
+    durable deferred entry backed by a finite row whose exactness interval
+    contains the final certification budget or by a covering loss proof. Only
+    the first class enters the sandwich.
+19. The full suite and the scratch correctness/throughput pilot pass before
     production cache or queue paths are accepted.
 
 **Missing sub-branches are the common case, not an edge case — and that's
@@ -676,12 +833,12 @@ Measure the certified, retrying, and deferred fractions by branch size;
 `max_remaining_depth` among certified rows; time and nodes per attempt;
 completed rows/hour; worker CPU utilization; queue coordination time; and
 queue WAL growth. Measure budget-versioned table growth, per-budget hit rates,
-and repeated work where no exact requested-budget row exists during later
-waves and a scratch Phase 4 root/cone sample. Storage or cache-hit results may
-change the operational ladder, but they cannot collapse incomparable budgets
-back into one row. Include every production manifest key above 200 answers in
-the pilot rather than extrapolating the sparse largest tail. Freeze the ladder
-and its maximum only after this measurement.
+and repeated work where no stored exactness interval contains the requested
+budget during later waves and a scratch Phase 4 root/cone sample. Storage or
+cache-hit results may change the operational ladder, but they cannot collapse
+incomparable budgets back into one row. Include every production manifest key
+above 200 answers in the pilot rather than extrapolating the sparse largest
+tail. Freeze the ladder and its maximum only after this measurement.
 
 At each budget the swarm profile must sustain at least 80% of the direct
 pool's aggregate attempts/hour; otherwise tune its top-level branch
@@ -950,34 +1107,50 @@ remaining uplift.
    migration is a no-op before continuing.
 3. Open the cache with the new answer list so
    `ScoreCache._ensure_answer_list` registers the new `answer_list_id`.
-4. Copy old-id → new-id with table-specific conflict handling:
-   - `branch_best_by_policy`: canonical `erd_answers_compliant` rows only. On
-     a target collision, require exact `best_score` agreement within solver
-     tolerance; a tied `best_guess` or its strategy's
-     `max_remaining_depth` may differ. Retain the target after verification.
+4. Start one `BEGIN IMMEDIATE` transaction for the compliant result-table
+   merge. Copy old-id → new-id by proposing each source row to the same
+   family-validation and consolidation primitive used inside the live atomic
+   recorder, without starting nested transactions:
+   - `branch_best_by_policy`: canonical `erd_answers_compliant` rows only.
+     Validate the canonical score against every target finite row, requiring
+     equality wherever the canonical strategy's exactness interval overlaps.
    - `branch_best_by_policy_and_budget`: budget-specific
-     `erd_answers_compliant` rows only. Compare only the identical
-     `solve_budget`; require the same score agreement and retain the target
-     after verification.
-   - `branch_loss_by_policy`: `erd_answers_compliant` only. On collision store
-     `MAX(target.loss_budget, source.loss_budget)`, the widest reusable proof.
-   - `candidate_scores`: all rows via `INSERT OR IGNORE`.
-5. Copy **no** `ERD_ALL` canonical, budget-versioned, or loss row. Copy
+     `erd_answers_compliant` rows only. Validate same-budget equality,
+     finite-budget order and interval overlap against every target finite row,
+     and the canonical relation when a target canonical row exists.
+   - `branch_loss_by_policy`: `erd_answers_compliant` only. Propose
+     `MAX(target.loss_budget, source.loss_budget)`, then reject it if any
+     source or target winning strategy has
+     `max_remaining_depth <= proposed loss_budget`.
+
+   Source-exact/target-loss and source-loss/target-exact pairs do not share a
+   primary key, so per-table collision handling is not a correctness gate.
+   The recorder validates the combined cross-table state in both directions.
+5. Before committing that transaction, scan the complete merged
+   `erd_answers_compliant` row families under the new answer-list ID and
+   recheck row validity, finite order and overlap, canonical relations, and
+   every loss against every stored strategy. On any conflict, roll back the
+   result-table merge and report the branch, source/target identities, budgets,
+   scores, and `max_remaining_depth` values. No queue or user solve may read
+   the new namespace between merge and gate.
+6. Copy `candidate_scores` separately via `INSERT OR IGNORE`; they do not
+   participate in the ERD result-state invariants.
+7. Copy **no** `ERD_ALL` canonical, budget-versioned, or loss row. Copy
    nothing for `erd_answers_unfiltered`.
-6. Reconcile that the new-ID `ERD_ALL` population is empty in both best-row
+8. Reconcile that the new-ID `ERD_ALL` population is empty in both best-row
    tables and the loss table before Phase 3. Any row there means the
    namespaces are no longer a trustworthy completion boundary; stop and
    investigate rather than deleting blindly.
-7. Extract and freeze the eligible manifest and excluded-fallback inventory
+9. Extract and freeze the eligible manifest and excluded-fallback inventory
    from the union of old-ID canonical and budget-versioned `ERD_ALL` best-row
    keys. Old losses are invalid under candidate-vocabulary growth and do not
    add targets. Reconcile source, eligible, excluded, and malformed counts
    before creating the dedicated queue.
-8. Reconcile compliant inserts, verified canonical and same-budget
-   collisions, retained target rows, and widened loss proofs against the
-   source and target counts. Phase 0 is already live on Linux, so pre-existing
-   new-ID compliant rows are expected input rather than assumed absent.
-9. Old-ID rows stay intact as source inventory and rollback data until
+10. Reconcile compliant inserts, exact-row consolidations, retained target
+    rows, widened loss proofs, and the combined-state gate against source and
+    target counts. Phase 0 is already live on Linux, so pre-existing new-ID
+    compliant rows are expected input rather than assumed absent.
+11. Old-ID rows stay intact as source inventory and rollback data until
    retirement.
 
 ### Phase 3 — `ERD_ALL` recertification swarm
@@ -989,6 +1162,10 @@ remaining uplift.
      higher-budget retry;
    - canonical and budget-versioned best-row identities in both SQLite and
      `MemoryScoreCache`;
+   - exactness-interval lookup and the complete canonical, finite, and loss
+     invariant set;
+   - one atomic multi-process recorder for exact and loss evidence, with queue
+     finalization only after commit;
    - floor-taint propagation through every normal child status, especially
      `OVER_ERD_LIMIT`;
    - unconstrained exact, budget-specific exact, retrying, loss, deferred,
@@ -1023,10 +1200,16 @@ remaining uplift.
            --queue-path erd_recertification_queue.sqlite3 \
            --cache-path wordle_cache.sqlite3 --watch
 
-6. At every wave and certification-budget boundary, reconcile unconstrained
-   exact, budget-specific exact, retrying, loss, deferred, and superseded
-   states against current-ID cache rows and the eligible manifest count before
-   advancing. Resolve every deferred backing reference at its exact budget.
+6. At every wave and certification-budget boundary, revalidate every eligible
+   manifest family in that wave plus every family recovered after a restart,
+   then reconcile unconstrained exact, budget-specific exact, retrying, loss,
+   deferred, and superseded states against current-ID cache rows and the
+   eligible manifest count before advancing. Inline child families need no
+   separate change log: the sole write path validates their complete family
+   atomically, and no direct SQL writer may bypass it. Full global scans remain
+   mandatory at schema migration, namespace merge, import, and Phase 5.
+   Resolve every deferred backing reference through an interval or loss
+   covering its final certification budget.
    Resume from the dedicated queue after a clean or unclean stop; never use a
    manual `--start-size` assertion as a substitute for the durable ledger.
 7. Run until every eligible manifest key is certified or durably deferred.
@@ -1046,7 +1229,9 @@ remaining uplift.
    its disk-stop latch and run the controlled ordinary swarm to compute the
    root census and the 9 answer cones against the new candidate universe,
    warm via Mechanism 1. If this work creates an unconstrained exact row for a
-   deferred manifest key, promote it to certified and mark its deferred entry
+   deferred manifest key, atomically validate its score against every
+   overlapping historical finite row and its strategy against the loss proof
+   before promoting it to certified and marking its deferred entry
    superseded.
 3. Sandwich-seed `erd_answers_unfiltered` per Part 4 using current-ID exact,
    untainted outer rows; copy the full compliant row and seed no losses.
@@ -1058,6 +1243,10 @@ remaining uplift.
 
 1. **Structural reconciliation.** Row counts per table, policy, and
    `answer_list_id` match the schema-migration and copy/seed/rebuild ledgers.
+   Run the complete result-state invariant gate over every current-ID ERD row
+   family: finite row validity and order, all overlapping exactness intervals,
+   every canonical/finite relation, and every loss against every strategy's
+   `max_remaining_depth`.
    Reproduce the eligible and excluded manifest digests from untouched old-ID
    rows. For `ERD_ALL`, map every eligible key to exactly one current class:
    - **certified:** one current-ID canonical best row with
@@ -1065,9 +1254,9 @@ remaining uplift.
      deferred ledger entry is marked superseded; or
    - **deferred:** one nonsuperseded durable deferred entry naming its final
      certification budget, attempt generation, and reason, backed by either
-     the current-ID budget-versioned best row at exactly that budget or a
-     current-ID loss proof whose `loss_budget` covers it, and no canonical
-     best row.
+     a current-ID budget-versioned best row whose exactness interval contains
+     that budget or a current-ID loss proof whose `loss_budget` covers it, and
+     no canonical best row.
 
    Reject missing, doubly current, or unbacked keys. Require every excluded
    fallback key to remain outside the eligible queue ledger. Do not require
@@ -1086,10 +1275,12 @@ remaining uplift.
 3. **Recertification audit.** Use `verify_erd_cache.py` in read-only audit mode
    over a stratified random sample of certified `ERD_ALL` rows, with fresh
    solves and the same stored-pair discipline. Separately sample deferred
-   entries and resolve their exact final-budget row/loss backing. Sample
-   budget-versioned rows at several budgets against fresh finite-budget solves,
-   including a forced floor-then-ceiling-cutoff case. The verifier is an
-   independent checker, not the production computation path.
+   entries and resolve their interval-containing finite-row/loss backing.
+   Sample budget-versioned rows at several budgets against fresh finite-budget
+   solves, including interval reuse above and below their
+   `max_remaining_depth`, canonical-overlap cases, and a forced
+   floor-then-ceiling-cutoff case. The verifier is an independent checker, not
+   the production computation path.
 4. **Loss sweep.** `verify_erd_losses.py` over retained compliant losses.
 5. **Test suite.**
    `python3.13 -m unittest discover -s tests -t . -p 'test_*.py'`.
@@ -1104,15 +1295,20 @@ separate, decoupled mechanisms on this project, not one combined step:
 2. **Cache.** The already-established export/import dance brings the
    phone's database in line with rocky's post-migration, post-recertification
    `wordle_cache.sqlite3` (`wordle_cache.sqlite3` itself is not tracked in
-   git, so step 1 alone never touches it).
+   git, so step 1 alone never touches it). Extend the snapshot inventory to
+   include `branch_best_by_policy_and_budget` and
+   `branch_loss_by_policy` alongside `branch_best_by_policy`; import all three
+   through the atomic family validator rather than independent per-table
+   `INSERT OR IGNORE` passes.
 
 The order is mandatory: complete step 1 before step 2. The new cache-writing
 code understands both canonical and budget-versioned rows; old phone code
 does not know the new table or lookup contract. `answer_list_id` scoping
 prevents cross-vocabulary reads but cannot supply missing schema support.
 Deploy the new code to the phone and let its idempotent `_ensure_schema`
-migration complete before placing the migrated Linux database on it. Never
-repair the phone schema with manual SQL.
+migration complete before placing the migrated Linux database on it. The
+import path then runs the complete result-state gate before the cache is
+available to solves. Never repair the phone schema with manual SQL.
 
 ### Phase 7 — Retirement
 
@@ -1175,12 +1371,20 @@ production estimate.
   preserved even through ceiling cutoffs, then retries under the frozen ladder
   and becomes durably deferred at its measured maximum rather than falling
   through to `budget=None`. Budget-versioned storage prevents solves at other
-  budgets from destroying either a certificate or deferred backing. The
-  terminal ledger classifies every eligible manifest key as currently
-  certified or deferred and permits a later certificate to supersede a
-  deferred entry. Missing children solve inline, leaves-first admission makes
-  certified retained children warm, and `verify_erd_cache.py` remains an
-  independent audit tool. Prior
+  budgets from destroying either a certificate or deferred backing. Each
+  finite row is exact throughout the interval from its strategy's
+  `max_remaining_depth` through its `solve_budget`, and remains a feasibility
+  witness above that interval. One serialized recorder atomically enforces
+  finite ordering and overlap, canonical overlap, and loss consistency across
+  both result tables. Full combined-state gates run after schema migration,
+  namespace merge, import, and before phone use; each wave revalidates its
+  manifest and recovered families while atomic writes protect inline children.
+  The terminal ledger
+  classifies every eligible manifest key as currently certified or deferred
+  and permits a later, invariant-checked certificate to supersede a deferred
+  entry. Missing children solve inline, leaves-first admission makes certified
+  retained children warm, and `verify_erd_cache.py` remains an independent
+  audit tool. Prior
   unlimited-depth samples estimate
   **3.0–8.7 days of stress-path work on 6 workers, ~5.4 days central**; the
   production pilot measures the ladder's throughput, retry and deferred
