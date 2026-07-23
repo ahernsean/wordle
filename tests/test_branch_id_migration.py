@@ -159,7 +159,7 @@ class TestBranchIdMigration(unittest.TestCase):
             q._conn.execute(
                 "SELECT count FROM candidate_republish "
                 "WHERE branch_id = ? AND idx = 1", (id_a,)).fetchone()[0], 3)
-        self.assertEqual(q.read_cut_result(self.key_b), (2.5, 3))
+        self.assertEqual(q.read_cut_result(self.key_b), (2.5, 3, False))
 
         # active_branches / pending_branches survive, keyed by branch_id, with
         # branch_key reachable only through the registry.

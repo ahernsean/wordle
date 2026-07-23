@@ -609,7 +609,7 @@ class TestCutResults(_TmpQueue):
 
     def test_round_trip(self):
         self.q.add_cut_result(self.key, budget=4, bound=2.5)
-        self.assertEqual(self.q.read_cut_result(self.key), (2.5, 4))
+        self.assertEqual(self.q.read_cut_result(self.key), (2.5, 4, False))
 
     def test_missing_key_reads_none(self):
         self.assertIsNone(self.q.read_cut_result(b"notakey"))
@@ -617,7 +617,11 @@ class TestCutResults(_TmpQueue):
     def test_replace_supersedes(self):
         self.q.add_cut_result(self.key, budget=4, bound=2.5)
         self.q.add_cut_result(self.key, budget=5, bound=3.0)
-        self.assertEqual(self.q.read_cut_result(self.key), (3.0, 5))
+        self.assertEqual(self.q.read_cut_result(self.key), (3.0, 5, False))
+
+    def test_tainted_round_trip(self):
+        self.q.add_cut_result(self.key, budget=4, bound=2.5, tainted=True)
+        self.assertEqual(self.q.read_cut_result(self.key), (2.5, 4, True))
 
     def test_recover_active_branches_clears_cut_results(self):
         self.q.add_cut_result(self.key, budget=4, bound=2.5)
