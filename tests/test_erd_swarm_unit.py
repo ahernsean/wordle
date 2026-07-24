@@ -1813,17 +1813,25 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
 
     def test_satisfying_cut_short_circuits(self):
         w = self._worker()
-        w.queue.read_cut_result.return_value = (3.0, 5)
+        w.queue.read_cut_result.return_value = (3.0, 5, False)
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         self.assertEqual(result, (OVER_ERD_LIMIT, 3.0, None, False))
         w.queue.create_branch.assert_not_called()
         w.queue.add_cut_reuse_miss.assert_not_called()
 
+    def test_satisfying_tainted_cut_joins_taint(self):
+        # The cut's own proof involved the remaining-depth floor, so a
+        # consumer that reuses it must not report an untainted result.
+        w = self._worker()
+        w.queue.read_cut_result.return_value = (3.0, 5, True)
+        result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+        self.assertEqual(result, (OVER_ERD_LIMIT, 3.0, None, True))
+
     def test_cut_at_smaller_budget_is_a_miss(self):
         # The bound was proven at budget 3; at budget 4 more strategies exist,
         # so it proves nothing — logged as a reuse miss and re-solved.
         w = self._worker()
-        w.queue.read_cut_result.return_value = (3.0, 3)
+        w.queue.read_cut_result.return_value = (3.0, 3, False)
         w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         w.queue.add_cut_reuse_miss.assert_called_once_with(
             mock.ANY, len(BRANCH), 4, 2.5, 3.0, 3)
@@ -1831,14 +1839,14 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
 
     def test_cut_below_wanted_ceiling_is_a_miss(self):
         w = self._worker()
-        w.queue.read_cut_result.return_value = (2.0, 5)
+        w.queue.read_cut_result.return_value = (2.0, 5, False)
         w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         w.queue.add_cut_reuse_miss.assert_called_once_with(
             mock.ANY, len(BRANCH), 4, 2.5, 2.0, 5)
 
     def test_exact_consumer_never_satisfied_by_cut(self):
         w = self._worker()
-        w.queue.read_cut_result.return_value = (3.0, 5)
+        w.queue.read_cut_result.return_value = (3.0, 5, False)
         w.cooperative_solve(BRANCH, 4)   # no ceiling: exact required
         w.queue.add_cut_reuse_miss.assert_called_once_with(
             mock.ANY, len(BRANCH), 4, None, 3.0, 5)
@@ -1923,7 +1931,8 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         key = ScoreCache.encode_subset(BRANCH)
         w = self._worker((None, None, None, False, 4, 2.5, True))
         w.maybe_finalize(key, BRANCH, len(CANDIDATES))
-        w.queue.add_cut_result.assert_called_once_with(key, 4, 2.5)
+        w.queue.add_cut_result.assert_called_once_with(
+            key, 4, 2.5, tainted=False)
         w.score_cache.write.assert_not_called()
         w.score_cache.write_loss.assert_not_called()
         w.queue.requeue_pending.assert_called_once_with(key)
@@ -1938,6 +1947,16 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         sample = w.queue.add_cost_sample.call_args
         self.assertEqual(sample.args[3], "cut")
         self.assertEqual(sample.kwargs["censored"], 1)
+
+    def test_tainted_branch_publishes_tainted_cut(self):
+        # meta's tainted field (index 3) is the branch's own floor taint; a
+        # ceilinged solve that hit the floor must publish a tainted cut so a
+        # consumer joins it rather than treating the bound as unconstrained.
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, True, 4, 2.5, True))
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.queue.add_cut_result.assert_called_once_with(
+            key, 4, 2.5, tainted=True)
 
     def test_loss_path_unchanged_without_cut_flag(self):
         key = ScoreCache.encode_subset(BRANCH)
@@ -2097,7 +2116,7 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         finally:
             w.close()
         q = ERDQueue(self.queue_path)
-        self.assertEqual(q.read_cut_result(self.key), (2.5, 4))
+        self.assertEqual(q.read_cut_result(self.key), (2.5, 4, False))
         self.assertIsNone(q.get_branch(self.key))
         row = q._conn.execute(
             "SELECT outcome, ceiling FROM telemetry.branch_finalize_log"

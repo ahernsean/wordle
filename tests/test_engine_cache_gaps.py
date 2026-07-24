@@ -24,6 +24,7 @@ from wordle_engine import (
     evaluate_candidate, _solve_subset, min_expected_guesses, verify_erd_cache,
     cache_all_scores, ERD_ANSWERS,
 )
+import wordle_engine
 from cache_sqlite import ScoreCache, MemoryScoreCache, _is_disk_io_error
 
 
@@ -551,6 +552,64 @@ class TestCacheAllScoresMemoryCacheSkip(unittest.TestCase):
         key = ScoreCache.encode_subset(["crane", "slate"])
         # Should simply return without error.
         cache_all_scores("crane", ["crane", "slate"], mc, key, cache=cache)
+
+
+class TestOverErdLimitTaintJoin(unittest.TestCase):
+    """A floor-tainted sub-branch that returns OVER_ERD_LIMIT under its
+    parent's ceiling must taint the candidate, the top-level branch, and the
+    cache write: the child's ceiling refutation holds only among
+    budget-feasible strategies, so an untainted result would falsely claim
+    the unconstrained optimum."""
+
+    # "crane" splits [slate, stale, tales] into a 2-word group (slate/stale
+    # share a response) plus a singleton, so evaluating it recurses at least
+    # once — the recursion is stubbed to simulate the tainted child.
+    BRANCH = ["crane", "slate", "stale", "tales"]
+
+    def test_candidate_result_carries_child_taint(self):
+        with mock.patch.object(
+                wordle_engine, "_solve_subset",
+                return_value=(OVER_ERD_LIMIT, None, None, True)):
+            status, cost, md, floor = evaluate_candidate(
+                self.BRANCH, "crane", None, None,
+                guesses=None, policy=ERD_ANSWERS, budget=5)
+        self.assertEqual(status, OVER_ERD_LIMIT)
+        self.assertTrue(floor)
+
+    def test_untainted_child_cutoff_stays_clean(self):
+        with mock.patch.object(
+                wordle_engine, "_solve_subset",
+                return_value=(OVER_ERD_LIMIT, None, None, False)):
+            status, cost, md, floor = evaluate_candidate(
+                self.BRANCH, "crane", None, None,
+                guesses=None, policy=ERD_ANSWERS, budget=5)
+        self.assertEqual(status, OVER_ERD_LIMIT)
+        self.assertFalse(floor)
+
+    def test_taint_reaches_top_level_and_cache_write(self):
+        """One candidate's tainted cutoff forces the branch row to carry
+        solve_budget (budget-specific), never a solve_budget=NULL
+        unconstrained certificate."""
+        sc = MemoryScoreCache()
+        calls = []
+
+        def fake_solve_subset(branch_words, *args, **kwargs):
+            calls.append(list(branch_words))
+            if len(calls) == 1:
+                return (OVER_ERD_LIMIT, None, None, True)
+            return (SOLVED, 1.0, 1, False)
+
+        with mock.patch.object(
+                wordle_engine, "_solve_subset", side_effect=fake_solve_subset):
+            status, cost, md, floor = _solve_subset(
+                self.BRANCH, None, sc, 5, None, None, ERD_ANSWERS,
+                None, None, None, None)
+        self.assertEqual(status, SOLVED)
+        self.assertTrue(floor)
+        key = ScoreCache.encode_subset(self.BRANCH)
+        best_guess, best_score, max_depth, solve_budget = sc.read_with_depth(
+            key, ERD_ANSWERS)
+        self.assertEqual(solve_budget, 5)
 
 
 if __name__ == "__main__":

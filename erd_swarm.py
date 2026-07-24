@@ -1404,7 +1404,8 @@ class _BranchWorker:
             # nodes_spent is right-censored (the exact solve was never run), so
             # it must not fold into the cost model as a completed-solve sample;
             # the raw sample is kept for offline survival analysis.
-            self.queue.add_cut_result(branch_key, budget, ceiling)
+            self.queue.add_cut_result(branch_key, budget, ceiling,
+                                      tainted=tainted)
             if self._adaptive and nodes_spent > 0:
                 self.queue.add_cost_sample(ERD_ALL, len(words), nodes_spent,
                                            'cut', budget=budget, censored=1,
@@ -1577,9 +1578,12 @@ class _BranchWorker:
         cut = self.queue.read_cut_result(branch_key)
         if cut is None:
             return None
-        cut_bound, cut_budget = cut
+        cut_bound, cut_budget, cut_tainted = cut
         if budget <= cut_budget and cut_bound >= ceiling:
-            return (OVER_ERD_LIMIT, cut_bound, None, False)
+            # A tainted cut's bound holds only among budget-feasible
+            # strategies; the consumer joins the taint so its own result
+            # cannot claim the unconstrained optimum.
+            return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
         return None
 
     def cooperative_solve(self, words, budget, ceiling=float('inf')):
@@ -1596,8 +1600,9 @@ class _BranchWorker:
         finite ceiling is stored on the branch so every helper prunes against
         it; the solve then ends either exact (best found below the ceiling —
         cached and returned as SOLVED) or cut (everything priced out at >=
-        ceiling — returned as (OVER_ERD_LIMIT, bound, None, False) via the
-        cut_results channel, never cached).  A branch that already exists with
+        ceiling — returned as (OVER_ERD_LIMIT, bound, None, tainted) via the
+        cut_results channel, never cached; tainted carries the ceilinged
+        solve's floor taint into the consumer).  A branch that already exists with
         a TIGHTER ceiling than the caller's cannot serve this caller (its cut
         would prove too little); this method then returns None and the engine
         solves the frame inline under its own ceiling — always correct, just
@@ -1627,10 +1632,10 @@ class _BranchWorker:
             # of the ceiling ledger, logged for the reuse-payback question.
             cut = self.queue.read_cut_result(branch_key)
             if cut is not None:
-                cut_bound, cut_budget = cut
+                cut_bound, cut_budget, cut_tainted = cut
                 if (ceiling != float('inf') and budget <= cut_budget
                         and cut_bound >= ceiling):
-                    return (OVER_ERD_LIMIT, cut_bound, None, False)
+                    return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
                 self.queue.add_cut_reuse_miss(
                     branch_key, n_words, budget,
                     None if ceiling == float('inf') else ceiling,

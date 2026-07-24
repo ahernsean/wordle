@@ -1270,12 +1270,15 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
+        floor = floor or sub_budget_tainted
         if sub_status == OVER_ERD_LIMIT:
             # Sub-branch search stopped at >= its ceiling: this candidate's cost
             # is therefore >= best_erd.  Discard it (sub_cost is only a lower
-            # bound) WITHOUT marking taint — we never proved infeasibility.
+            # bound), keeping the sub-branch's floor taint: a floored child's
+            # ceiling refutation holds only among budget-feasible strategies,
+            # so an untainted result here would falsely claim no unconstrained
+            # strategy was pruned.
             return (OVER_ERD_LIMIT, None, cand_max_remaining_depth, floor)
-        floor = floor or sub_budget_tainted
         if sub_status == OVER_DEPTH_BUDGET:
             # Sub-branch unsolvable within budget — this candidate is infeasible.
             return (OVER_DEPTH_BUDGET, None, None, True)

@@ -319,6 +319,7 @@ CREATE TABLE IF NOT EXISTS cut_results (
     branch_id  INTEGER PRIMARY KEY,
     budget     INTEGER NOT NULL,
     bound      REAL    NOT NULL,
+    tainted    INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
 
@@ -1003,6 +1004,13 @@ class ERDQueue:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
             "ON candidate_claims(branch_id, bundle_id)")
+
+        # cut_results.tainted: after the branch_key rebuild above so the column
+        # lands whether the table is fresh, upgraded, or already migrated.
+        # Legacy rows default to 0: cut_results is transient (cleared on
+        # supervisor restart), so no backfill question arises.
+        self._add_columns("cut_results", {
+            "tainted": "INTEGER NOT NULL DEFAULT 0"})
 
         if normalized_tables:
             # DROP TABLE hands the fat-blob pages to the free-list, not the OS,
@@ -1854,33 +1862,40 @@ class ERDQueue:
                 bool(row["tainted"]), row["budget"], row["ceiling"],
                 bool(row["cut_occurred"]))
 
-    def add_cut_result(self, branch_key, budget, bound):
+    def add_cut_result(self, branch_key, budget, bound, tainted=False):
         """Publish a ceilinged solve's CUT: the branch's true ERD at `budget`
         is proven >= bound.  INSERT OR REPLACE: a newer cut for the same branch
         supersedes (bounds from different ceilings are all true; the latest is
-        the one current waiters are waiting for)."""
+        the one current waiters are waiting for).
+
+        tainted records whether the cut's proof involved the remaining-depth
+        floor anywhere: a tainted bound holds only among budget-feasible
+        strategies, so a consumer must join it into its own floor taint."""
         now = int(time.time())
         branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("""
-            INSERT OR REPLACE INTO cut_results (branch_id, budget, bound, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (branch_id, budget, bound, now))
+            INSERT OR REPLACE INTO cut_results
+                (branch_id, budget, bound, tainted, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (branch_id, budget, bound, int(bool(tainted)), now))
 
     def read_cut_result(self, branch_key):
-        """Return (bound, budget) of the branch's recorded cut, or None.
+        """Return (bound, budget, tainted) of the branch's recorded cut, or
+        None.
 
         The caller applies the validity rules: the bound holds at any budget
         <= the recorded one (fewer guesses cannot beat it), and satisfies a
-        consumer whose ceiling is <= bound."""
+        consumer whose ceiling is <= bound.  A tainted cut must taint the
+        consumer's own result (see add_cut_result)."""
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
             return None
         row = self._conn.execute(
-            "SELECT bound, budget FROM cut_results WHERE branch_id = ?",
+            "SELECT bound, budget, tainted FROM cut_results WHERE branch_id = ?",
             (branch_id,)).fetchone()
         if row is None:
             return None
-        return (row["bound"], row["budget"])
+        return (row["bound"], row["budget"], bool(row["tainted"]))
 
     def has_pending_row(self, branch_key) -> bool:
         """True if the branch is user-queued (has a pending_branches row in any
