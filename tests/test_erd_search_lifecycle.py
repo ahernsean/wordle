@@ -7,11 +7,16 @@ reaches this logic.
 """
 
 import io
+import json
+import os
+import tempfile
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import erd_search
+from erd_queue import ERDQueue
 
 
 def _args(swarm_only=False, web_only=False):
@@ -196,6 +201,76 @@ class StartStopRestartCliParsingTest(unittest.TestCase):
                 ):
                     erd_search.main()
                 self.assertEqual(raised.exception.code, 2)
+
+
+class EpochCommandTest(unittest.TestCase):
+    def setUp(self):
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self.queue_path = os.path.join(
+            self._temporary_directory.name, 'queue.sqlite3'
+        )
+
+    def test_show_prints_active_epoch_metadata(self):
+        queue = ERDQueue(self.queue_path)
+        queue.set_epoch(8, label='claiming-regime', git_sha='abcdef12',
+                        notes='fresh measurements')
+        queue.close()
+
+        with patch('sys.stdout', io.StringIO()) as output:
+            erd_search.cmd_epoch_show(SimpleNamespace(queue=self.queue_path))
+
+        self.assertEqual(json.loads(output.getvalue()), {
+            'epoch': 8,
+            'label': 'claiming-regime',
+            'git_sha': 'abcdef12',
+            'started_at': ANY,
+            'notes': 'fresh measurements',
+        })
+
+    def test_set_refuses_when_worker_heartbeat_is_live(self):
+        queue = ERDQueue(self.queue_path)
+        queue.heartbeat('worker-1', 1, None, 0, int(time.time()), 0)
+        queue.close()
+        args = SimpleNamespace(
+            queue=self.queue_path, epoch=8, label=None, git_sha=None,
+            notes=None, force=False,
+        )
+
+        with patch('sys.stderr', io.StringIO()) as error:
+            self.assertEqual(erd_search.cmd_epoch_set(args), 1)
+
+        self.assertIn('worker-1', error.getvalue())
+        queue = ERDQueue(self.queue_path)
+        self.assertEqual(queue.epoch, 0)
+        queue.close()
+
+    def test_set_force_changes_epoch_and_uses_current_git_sha(self):
+        queue = ERDQueue(self.queue_path)
+        queue.heartbeat('worker-1', 1, None, 0, int(time.time()), 0)
+        queue.close()
+        args = SimpleNamespace(
+            queue=self.queue_path, epoch=8, label='claiming-regime',
+            git_sha=None, notes='fresh measurements', force=True,
+        )
+
+        with (
+            patch.object(erd_search, '_current_git_sha', return_value='abcdef12'),
+            patch('sys.stdout', io.StringIO()) as output,
+        ):
+            self.assertEqual(erd_search.cmd_epoch_set(args), 0)
+
+        self.assertEqual(json.loads(output.getvalue())['git_sha'], 'abcdef12')
+
+    def test_epoch_cli_parses_nested_queue_path_and_dispatches(self):
+        with (
+            patch('sys.argv', [
+                'erd_search.py', 'epoch', 'set', '8', '--queue', 'custom.sqlite3',
+            ]),
+            patch.object(erd_search, 'cmd_epoch_set') as handler,
+        ):
+            erd_search.main()
+        self.assertEqual(handler.call_args.args[0].queue, 'custom.sqlite3')
 
 
 if __name__ == '__main__':

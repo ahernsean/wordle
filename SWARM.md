@@ -185,6 +185,39 @@ claims held by processes that stopped are made available again.
 
 ---
 
+## Telemetry epochs
+
+An epoch is the validity key for comparing swarm telemetry. Change it when a
+claiming-regime change would make new measurements incomparable with the old
+ones; this is the regime boundary described by the `telemetry_epoch` schema.
+
+Inspect the active epoch and its label, Git SHA, start time, and notes with:
+
+```bash
+python3.13 erd_search.py epoch show
+```
+
+To create a new regime, stop the swarm, set the epoch, then start it again:
+
+```bash
+python3.13 erd_search.py stop --swarm-only
+python3.13 erd_search.py epoch set 8 --label "healthy-post-145-redesign" \
+    --notes "claiming-regime change"
+python3.13 erd_search.py start --swarm-only
+```
+
+When run from a checkout, `epoch set` records the current abbreviated Git SHA
+unless `--git-sha SHA` supplies one. Use `--label TEXT` and `--notes TEXT` to
+describe the regime.
+
+Every `ERDQueue` connection caches its epoch when it opens. `epoch set` refuses
+while a worker heartbeat is live, because changing the database pointer before
+workers restart would stamp two regimes during the recycle window. Stop the
+swarm first. `--force` overrides that protection only for an intentional live
+cutover; restart every worker immediately afterward.
+
+---
+
 ## Queue mutations
 
 Read-only queue reporting uses `view --queue`. The `queue` group contains only
