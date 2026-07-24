@@ -1096,6 +1096,7 @@ class ViewParserTest(unittest.TestCase):
             "cmd_start", "cmd_stop", "cmd_restart", "cmd_run", "cmd_view",
             "cmd_queue_add", "cmd_queue_clear", "cmd_queue_remove",
             "cmd_queue_priority", "cmd_reset_stale", "cmd_queue_clear_disk_stop",
+            "cmd_queue_set_disk_stop",
         )
         patches = [patch.object(erd_search, name) for name in handler_names]
         started_patches = [handler_patch.start() for handler_patch in patches]
@@ -1125,6 +1126,15 @@ class ViewParserTest(unittest.TestCase):
                     erd_search.main()
                 self.assertEqual(raised.exception.code, 2)
 
+    def test_set_disk_stop_requires_reason(self):
+        with (
+            patch("sys.argv", ["erd_search.py", "queue", "set-disk-stop"]),
+            patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            erd_search.main()
+        self.assertEqual(raised.exception.code, 2)
+
     def test_lifecycle_and_queue_mutation_commands_still_dispatch(self):
         cases = [
             (["start"], "cmd_start"),
@@ -1138,6 +1148,8 @@ class ViewParserTest(unittest.TestCase):
             (["queue", "priority", "--word", "raise", "--pattern", ".....",
               "--priority", "3"], "cmd_queue_priority"),
             (["queue", "reset-stale"], "cmd_reset_stale"),
+            (["queue", "set-disk-stop", "--reason", "maintenance hold"],
+             "cmd_queue_set_disk_stop"),
         ]
         for arguments, handler_name in cases:
             with self.subTest(arguments=arguments):
