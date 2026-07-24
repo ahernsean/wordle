@@ -180,6 +180,16 @@ python3.13 erd_search.py queue clear-disk-stop
 systemctl --user start wordle-erd
 ```
 
+To hold the swarm down for maintenance across a reboot or systemd restart, set
+the latch with a reason:
+
+```bash
+python3.13 erd_search.py queue set-disk-stop --reason "maintenance hold"
+```
+
+An existing latch remains unchanged so an automatic disk-fill or WAL-ceiling
+reason is never replaced.
+
 Completed candidate claims and the running best survive the restart; only
 claims held by processes that stopped are made available again.
 

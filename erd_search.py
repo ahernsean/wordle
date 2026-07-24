@@ -41,6 +41,9 @@ queue priority  Change the priority of a queued branch.  Higher numbers are
 epoch           Show or change the telemetry epoch used to compare swarm
                 telemetry from one claiming regime.
 
+queue set-disk-stop
+                Keep the swarm down across reboots and systemd restarts.
+
 For exporting a trimmed cache snapshot to sync to the iPhone, or importing
 one from another machine, see export_cache.py and import_cache.py — the
 cache is shared with interactive play (wordle.py), not swarm-specific.
@@ -236,6 +239,20 @@ def cmd_queue_clear_disk_stop(args):
                   f'{100 * DISK_STOP_FRACTION:.0f}% stop threshold — '
                   f'run will refuse to start until space is freed.',
                   file=sys.stderr)
+    finally:
+        queue.close()
+
+
+def cmd_queue_set_disk_stop(args):
+    """Latch the swarm down without replacing an existing latch reason."""
+    queue = ERDQueue(args.queue)
+    try:
+        if queue.set_disk_stop_if_unset(args.reason):
+            print(f'Disk-stop latch set: {args.reason}.')
+            return
+        latch = queue.disk_stop()
+        print(f'Disk-stop latch is already set ({latch["reason"]}); '
+              'it remains unchanged.')
     finally:
         queue.close()
 
@@ -1104,6 +1121,14 @@ def main():
     )
     p_cds.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
+    p_sds = qsub.add_parser(
+        'set-disk-stop',
+        help='Keep the swarm down across reboots and systemd restarts',
+    )
+    p_sds.add_argument('--reason', required=True, metavar='TEXT',
+                       help='Reason shown when run refuses to start')
+    p_sds.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+
     # -- epoch --
     p_epoch = sub.add_parser(
         'epoch', help='Show or change the telemetry epoch'
@@ -1210,6 +1235,7 @@ def main():
             'priority': cmd_queue_priority,
             'reset-stale': cmd_reset_stale,
             'clear-disk-stop': cmd_queue_clear_disk_stop,
+            'set-disk-stop': cmd_queue_set_disk_stop,
         }
         qdispatch[args.queue_cmd](args)
         return

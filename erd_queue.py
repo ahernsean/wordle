@@ -2982,6 +2982,18 @@ class ERDQueue:
         self.set_meta("disk_stop",
                       json.dumps({"at": int(time.time()), "reason": reason}))
 
+    def set_disk_stop_if_unset(self, reason: str) -> bool:
+        """Latch the swarm down unless a latch reason is already recorded.
+
+        Returns True when this call created the latch.  A manual hold must not
+        replace a disk-fill or WAL-ceiling reason recorded concurrently.
+        """
+        payload = json.dumps({"at": int(time.time()), "reason": reason})
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO run_meta (key, value) VALUES ('disk_stop', ?)",
+            (payload,))
+        return cursor.rowcount == 1
+
     def disk_stop(self):
         """The latch payload as a dict, or None when not latched."""
         value = self.get_meta("disk_stop")
