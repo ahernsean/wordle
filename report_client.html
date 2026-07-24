@@ -80,6 +80,8 @@
     .chip.exact, .outcome-exact { border-color:var(--green); color:#3e7c3a; }
     .chip.cut, .outcome-cut { border-color:var(--amber); color:#7d6812; }
     .chip.loss, .outcome-loss { border-color:var(--red); color:#a32c2c; }
+    .chip.historical { border-color:var(--dim); color:var(--dim); background:#ffffff; }
+    .card.historical { border-style:dashed; background:#f3f4f6; }
     .tiles { display:flex; flex-wrap:wrap; gap:.15rem .5rem; align-items:center; margin:.2rem 0; }
     .step-group { display:inline-flex; gap:.3rem; align-items:center; white-space:nowrap; }
     .step { display:inline-flex; gap:.1rem; white-space:nowrap; }
@@ -192,6 +194,7 @@
     const fixed=(value,digits=3)=>value===null||value===undefined?null:Number(value).toFixed(digits);
     const displayValue=(key,value)=>key==="best_guess"&&value?String(value).toUpperCase():boundFields.has(key)&&typeof value==="number"?fixed(value):value;
     const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
+    const displayTimedValue=(key,value,now)=>key.endsWith("_at")&&typeof value==="number"?relativeAge(value,now):displayValue(key,value);
     const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts)if(part)node.append(element("span","",part));return node;};
     const label=key=>String(key).replaceAll("_"," ");
     const shortReference=reference=>String(reference).slice(0,4);
@@ -306,6 +309,39 @@
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
     function patternTiles(pattern){const step=element("span","step");for(const character of pattern||"?????")step.append(element("span","tile "+(character==="g"?"g":character==="y"?"y":""),character));return step;}
     function renderSpine(spine){const node=element("div","tiles");for(const step of spine||[]){const group=element("span","step-group");group.append(element("span","",String(step.word||"?").toUpperCase()),patternTiles(step.pattern));node.append(group);}return node;}
+    function branchContextSummary(worker){
+      if(Array.isArray(worker.branch_context)&&worker.branch_context.length){
+        return renderSpine(worker.branch_context);
+      }
+      return element("span","dim",worker.branch_reference?"@"+shortReference(worker.branch_reference):"unknown branch");
+    }
+    function ownershipRow(labelText,workers,options={}){
+      const row=element("div","status-line");
+      row.append(element("span","label",labelText));
+      if(!workers?.length){
+        row.append(element("span","dim","None"));
+        return row;
+      }
+      const entries=element("span","statuses");
+      for(const worker of workers){
+        const entry=element("span","step-group");
+        const workerChip=element("button","",""+workerName(worker));
+        workerChip.addEventListener("click",()=>navigateBranch(worker));
+        entry.append(workerChip);
+        if(options.showBranch){
+          entry.append(element("span","dim","on"));
+          const branchNode=branchContextSummary(worker);
+          if(worker.branch_reference){
+            branchNode.classList.add("clickable");
+            branchNode.addEventListener("click",()=>navigateBranch(worker));
+          }
+          entry.append(branchNode);
+        }
+        entries.append(entry);
+      }
+      row.append(entries);
+      return row;
+    }
     function branchClass(row){return row.is_live===false?"dead":row.branch_phase==="finalizing"?"finalizing":row.branch_status||"";}
     function reportHeader(report,state){
       const meta=element("section","report-meta");
@@ -433,14 +469,27 @@
       const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};if(branch.spine?.length)fragment.append(section("Identity",renderSpine(branch.spine)));
       fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
-      fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[label(key),displayValue(key,value)]))));
+      fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[label(key),displayTimedValue(key,value,report.generated_at)]))));
+      const ownership=data.branch_ownership||{};
+      const ownershipSection=element("section","section");
+      ownershipSection.append(
+        element("h2","","Branch ownership"),
+        ownershipRow("Live workers",ownership.live_workers||[]),
+        ownershipRow("Claim holders off-branch",ownership.claim_holders_off_branch||[],{showBranch:true}),
+      );
+      fragment.append(ownershipSection);
       if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
       if(data.recent_finalizations?.length){
         const outcomeGloss={exact:"Exact — solved within budget",cut:"Cut — best line exceeds the budget",loss:"Loss — unsolvable in the game",unknown:"Finalized"};
         const finalizations=element("div","grid");
+        const activeEpoch=report.sources?.queue?.epoch;
         for(const row of data.recent_finalizations){
-          const card=element("article","card outcome-"+row.outcome);
-          card.append(element("h3","",outcomeGloss[row.outcome]||row.outcome));
+          const historical=row.epoch!==null&&activeEpoch!==null&&row.epoch!==activeEpoch;
+          const card=element("article","card outcome-"+row.outcome+(historical?" historical":""));
+          const title=element("div","card-title");
+          title.append(element("h3","",outcomeGloss[row.outcome]||row.outcome));
+          if(historical)title.append(element("span","chip historical","Historical"));
+          card.append(title);
           card.append(statLine(["budget "+valueOrDash(row.budget),"epoch "+valueOrDash(row.epoch),relativeAge(row.recorded_at,report.generated_at)]));
           const facts=[];
           if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ceiling "+fixed(row.ceiling));

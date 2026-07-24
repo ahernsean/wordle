@@ -1344,6 +1344,7 @@ class ERDQueue:
             SELECT h.*,
                    bk.branch_key AS current_branch_key,
                    b.priority,
+                   b.spine,
                    b.source_word,
                    b.source_pattern,
                    b.branch_id IS NOT NULL AS on_active_branch
