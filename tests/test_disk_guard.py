@@ -6,11 +6,13 @@ row, not as an exception), the checkpoint_pause quiesce flag, the disk-stop
 latch, the supervisor's _disk_guard / _supervisor_checkpoint, and the report
 view's disk line.
 """
+import io
 import os
 import sqlite3
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import erd_search
@@ -101,6 +103,34 @@ class TestDiskStopLatch(_TmpQueue):
         self.assertEqual(len(samples), DISK_SAMPLE_KEEP)
         # Oldest entries fell off the front; the newest is last.
         self.assertEqual(samples[-1][1], 1000 - (DISK_SAMPLE_KEEP + 4))
+
+    def test_set_if_unset_preserves_existing_reason(self):
+        self.assertTrue(self.q.set_disk_stop_if_unset("manual hold"))
+        self.assertFalse(self.q.set_disk_stop_if_unset("later manual hold"))
+        self.assertEqual(self.q.disk_stop()["reason"], "manual hold")
+
+
+class TestSetDiskStopCommand(_TmpQueue):
+    def _args(self, reason):
+        return SimpleNamespace(queue=self.path, reason=reason)
+
+    def test_sets_manual_latch(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            erd_search.cmd_queue_set_disk_stop(self._args("maintenance hold"))
+        self.assertEqual(self.q.disk_stop()["reason"], "maintenance hold")
+        self.assertEqual(stdout.getvalue(),
+                         "Disk-stop latch set: maintenance hold.\n")
+
+    def test_preserves_existing_latch_reason(self):
+        self.q.set_disk_stop("supervisor: disk 91.0% full")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            erd_search.cmd_queue_set_disk_stop(self._args("maintenance hold"))
+        self.assertEqual(self.q.disk_stop()["reason"],
+                         "supervisor: disk 91.0% full")
+        self.assertEqual(
+            stdout.getvalue(),
+            "Disk-stop latch is already set (supervisor: disk 91.0% full); "
+            "it remains unchanged.\n")
 
 
 class TestDiskGuard(_TmpQueue):
