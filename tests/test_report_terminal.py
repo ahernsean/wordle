@@ -1096,6 +1096,7 @@ class ViewParserTest(unittest.TestCase):
             "cmd_start", "cmd_stop", "cmd_restart", "cmd_run", "cmd_view",
             "cmd_queue_add", "cmd_queue_clear", "cmd_queue_remove",
             "cmd_queue_priority", "cmd_reset_stale", "cmd_queue_clear_disk_stop",
+            "cmd_epoch_show", "cmd_epoch_set",
         )
         patches = [patch.object(erd_search, name) for name in handler_names]
         started_patches = [handler_patch.start() for handler_patch in patches]

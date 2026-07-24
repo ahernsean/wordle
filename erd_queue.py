@@ -2913,13 +2913,16 @@ class ERDQueue:
             return None
         epoch = int(epoch_text)
         row = self._conn.execute(
-            "SELECT label, git_sha FROM main.telemetry_epoch WHERE epoch = ?",
+            "SELECT label, git_sha, started_at, notes "
+            "FROM main.telemetry_epoch WHERE epoch = ?",
             (epoch,),
         ).fetchone()
         return {
             "epoch": epoch,
             "label": row["label"] if row else None,
             "git_sha": row["git_sha"] if row else None,
+            "started_at": row["started_at"] if row else None,
+            "notes": row["notes"] if row else None,
         }
 
     def delete_meta(self, key: str):

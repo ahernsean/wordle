@@ -38,6 +38,9 @@ queue remove    Remove a pending branch from the queue.  Use --force to also
 queue priority  Change the priority of a queued branch.  Higher numbers are
                 worked sooner; 0 is the default.
 
+epoch           Show or change the telemetry epoch used to compare swarm
+                telemetry from one claiming regime.
+
 For exporting a trimmed cache snapshot to sync to the iPhone, or importing
 one from another machine, see export_cache.py and import_cache.py — the
 cache is shared with interactive play (wordle.py), not swarm-specific.
@@ -46,6 +49,7 @@ cache is shared with interactive play (wordle.py), not swarm-specific.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import multiprocessing
 import os
@@ -834,6 +838,66 @@ def _normalize_queue_cli_args(args):
         args.queue = args.queue_path or DEFAULT_QUEUE
 
 
+def _normalize_epoch_cli_args(args):
+    """Apply the epoch-level path to nested epoch commands."""
+    if args.cmd != 'epoch':
+        return
+    if not hasattr(args, 'queue'):
+        args.queue = args.queue_path or DEFAULT_QUEUE
+
+
+# ---------------------------------------------------------------------------
+# telemetry epoch
+# ---------------------------------------------------------------------------
+
+def _current_git_sha():
+    """Return the current checkout's abbreviated commit SHA, if available."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True, check=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def cmd_epoch_show(args):
+    queue = ERDQueue(args.queue)
+    try:
+        print(json.dumps(queue.epoch_metadata(), sort_keys=True))
+    finally:
+        queue.close()
+
+
+def cmd_epoch_set(args):
+    queue = ERDQueue(args.queue)
+    try:
+        now = int(time.time())
+        live_workers = [
+            row for row in queue.heartbeats_with_branch()
+            if now - row['updated_at'] <= WORKER_LIVENESS_SECONDS
+        ]
+        if live_workers and not args.force:
+            worker_ids = ', '.join(row['worker_id'] for row in live_workers)
+            print(
+                f'Refusing to change telemetry epoch while live workers are '
+                f'heartbeating: {worker_ids}. Stop the swarm first, or use '
+                f'--force to override.',
+                file=sys.stderr,
+            )
+            return 1
+        git_sha = args.git_sha if args.git_sha is not None else _current_git_sha()
+        queue.set_epoch(
+            args.epoch, label=args.label, git_sha=git_sha, notes=args.notes,
+        )
+        print(json.dumps(queue.epoch_metadata(), sort_keys=True))
+        return 0
+    finally:
+        queue.close()
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -1040,6 +1104,31 @@ def main():
     )
     p_cds.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
+    # -- epoch --
+    p_epoch = sub.add_parser(
+        'epoch', help='Show or change the telemetry epoch'
+    )
+    p_epoch.add_argument('--queue', dest='queue_path', default=None, metavar='PATH')
+    esub = p_epoch.add_subparsers(dest='epoch_cmd', required=True)
+
+    p_epoch_show = esub.add_parser(
+        'show', help='Print the active telemetry epoch metadata'
+    )
+    p_epoch_show.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+
+    p_epoch_set = esub.add_parser(
+        'set', help='Change the active telemetry epoch while workers are stopped'
+    )
+    p_epoch_set.add_argument('epoch', type=int, metavar='N')
+    p_epoch_set.add_argument('--label', metavar='TEXT')
+    p_epoch_set.add_argument('--git-sha', metavar='SHA')
+    p_epoch_set.add_argument('--notes', metavar='TEXT')
+    p_epoch_set.add_argument(
+        '--force', action='store_true',
+        help='Allow the change despite live worker heartbeats',
+    )
+    p_epoch_set.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+
     args = parser.parse_args()
     if args.cmd == 'view' and args.format == 'json' and args.watch is not None:
         parser.error('--format json cannot be used with --watch; use jsonl')
@@ -1111,6 +1200,7 @@ def main():
         except ValueError as error:
             parser.error(str(error))
     _normalize_queue_cli_args(args)
+    _normalize_epoch_cli_args(args)
 
     if args.cmd == 'queue':
         qdispatch = {
@@ -1122,6 +1212,16 @@ def main():
             'clear-disk-stop': cmd_queue_clear_disk_stop,
         }
         qdispatch[args.queue_cmd](args)
+        return
+
+    if args.cmd == 'epoch':
+        epoch_dispatch = {
+            'show': cmd_epoch_show,
+            'set': cmd_epoch_set,
+        }
+        exit_code = epoch_dispatch[args.epoch_cmd](args)
+        if isinstance(exit_code, int) and exit_code != 0:
+            sys.exit(exit_code)
         return
 
     dispatch = {
