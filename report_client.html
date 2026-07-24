@@ -182,7 +182,7 @@
     const treelessKinds=new Set(["cache","hotspots"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), stickyOrders=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -310,7 +310,7 @@
     function reportHeader(report,state){
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"),element("span","dim",state.branch_target||"root"),element("span","dim",new Date(report.generated_at*1000).toLocaleTimeString()));
-      const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.append(summary);
+      const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.open=sourcePathsOpen;details.addEventListener("toggle",()=>{sourcePathsOpen=details.open;});details.append(summary);
       for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}
       if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));
       details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);return meta;
