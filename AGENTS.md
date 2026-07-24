@@ -336,7 +336,24 @@ them. If you are finding you are running short on tokens, reduce your work.
 Err on the side of writing scripts to process data instead of consuming tokens
 reading output files in their entirety yourself.
 
-## Other info
-If you are on the rocky machine, you can find other agent memory files in:
+---
 
+## Cross-agent memory (read-only)
+
+If you are running on this physical machine (the "rocky" box), regardless of
+which agent or tool you are (Claude Code, Codex, or otherwise), consult:
+
+```
 /home/ahern/.claude/projects/-home-ahern-work-wordle/memory/
+```
+
+`MEMORY.md` in that directory indexes topic files covering the user's setup,
+standing feedback on how to work in this repo, and ongoing-project state that
+is not derivable from the code or git history alone. Reading it before
+starting non-trivial work will surface context you would otherwise have to
+re-derive.
+
+**That directory is read-only to every agent except Claude Code**, which owns
+it as its persistent memory store. Unless you are Claude Code, do not create,
+edit, or delete files there under any circumstances — treat it the same as
+any other tool's private state you happen to have filesystem access to.
