@@ -1444,6 +1444,7 @@ class _BranchWorker:
                 total_bundle_wall_millis=total_bundle_wall_millis,
                 censored_units=censored_units, ceiling=ceiling,
                 bulk_done_candidates=bulk_done_candidates,
+                best_guess=best_guess, best_erd=best_erd,
                 outcome='cut' if cut else
                         ('exact' if best_guess is not None else 'loss'))
         except Exception:

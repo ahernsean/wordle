@@ -261,7 +261,7 @@ class SemanticReportTest(unittest.TestCase):
         queue.add_branch_finalize_log(
             branch_key, f"RAISE {pattern}", len(answer_words), 5,
             now - 10, now, 500, 2, outcome="exact",
-            bulk_done_candidates=1,
+            bulk_done_candidates=1, best_guess="cigar", best_erd=1.875,
         )
         queue.close()
         branch_target = parse_report_branch_target(f"RAISE {pattern}")
@@ -309,6 +309,14 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(
             report["data"]["recent_finalizations"][0]["bulk_completed_candidate_count"],
             1,
+        )
+        self.assertEqual(
+            report["data"]["recent_finalizations"][0]["best_guess"],
+            "cigar",
+        )
+        self.assertEqual(
+            report["data"]["recent_finalizations"][0]["best_erd"],
+            1.875,
         )
 
     def test_cache_state_obeys_budget_reuse_rules(self):

@@ -489,6 +489,10 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     -- The exact/cut split per (n_words, budget) is the payoff measurement for
     -- ceiling propagation.
     outcome                 TEXT,
+    -- Solved branch result captured at finalize time.  NULL when the finalize
+    -- row predates these columns or when the outcome was not an exact solve.
+    best_guess              TEXT,
+    best_erd                REAL,
     recorded_at             INTEGER NOT NULL
 );
 
@@ -798,6 +802,8 @@ class ERDQueue:
             "ceiling": "REAL",
             "outcome": "TEXT",
             "bulk_done_candidates": "INTEGER",
+            "best_guess": "TEXT",
+            "best_erd": "REAL",
         }, schema="telemetry")
 
         report_indexes = (
@@ -2714,6 +2720,8 @@ class ERDQueue:
                 "finalization_id": row["id"],
                 "outcome": self._report_finalization_outcome(row),
                 "ceiling": row["ceiling"],
+                "best_guess": row["best_guess"],
+                "best_erd": row["best_erd"],
                 "budget": row["budget"],
                 "answer_count": row["n_words"],
                 "search_node_count": row["nodes_spent"],
@@ -3390,7 +3398,8 @@ class ERDQueue:
                                 n_bundles=None, max_bundle_nodes=None,
                                 total_bundle_wall_millis=None, censored_units=None,
                                 ceiling=None, outcome=None,
-                                bulk_done_candidates=None):
+                                bulk_done_candidates=None, best_guess=None,
+                                best_erd=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -3400,8 +3409,10 @@ class ERDQueue:
         claims a bundle).  ceiling is the alpha-beta ceiling the branch was
         solved under (NULL = exact solve); outcome is 'exact', 'cut', or 'loss'.
         bulk_done_candidates preserves the aggregate eliminated count without
-        restoring per-candidate telemetry writes.  If a bulk sweep supersedes
-        an in-flight claim that later finishes, n_claims excludes that overlap
+        restoring per-candidate telemetry writes.  best_guess/best_erd capture
+        the exact solved line at finalize time so later reports do not need to
+        infer it from mutable cache state.  If a bulk sweep supersedes an
+        in-flight claim that later finishes, n_claims excludes that overlap
         even though its per-claim telemetry row still exists.
         """
         now = int(time.time())
@@ -3410,12 +3421,13 @@ class ERDQueue:
                 (branch_key, spine, n_words, budget, epoch, created_at,
                  finalized_at, nodes_spent, n_claims, n_bundles,
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
-                 ceiling, outcome, bulk_done_candidates, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ceiling, outcome, bulk_done_candidates, best_guess, best_erd,
+                 recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
-              bulk_done_candidates, now))
+              bulk_done_candidates, best_guess, best_erd, now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

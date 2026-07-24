@@ -157,7 +157,8 @@ class TestTelemetryInserts(_TmpQueue):
     def test_branch_finalize_log_persists_branch_timing(self):
         self.q.add_branch_finalize_log(
             b"key", "SALET --g-- ", 30, 4, created_at=100,
-            finalized_at=160, nodes_spent=12345, n_claims=2315)
+            finalized_at=160, nodes_spent=12345, n_claims=2315,
+            best_guess="crane", best_erd=1.75)
         row = self.q._conn.execute(
             "SELECT * FROM branch_finalize_log").fetchone()
         self.assertEqual(row["n_words"], 30)
@@ -165,6 +166,8 @@ class TestTelemetryInserts(_TmpQueue):
         self.assertEqual(row["nodes_spent"], 12345)
         self.assertEqual(row["n_claims"], 2315)
         self.assertEqual(row["epoch"], 0)
+        self.assertEqual(row["best_guess"], "crane")
+        self.assertAlmostEqual(row["best_erd"], 1.75)
         # Packer-era columns stay NULL under single-candidate claiming.
         self.assertIsNone(row["max_bundle_nodes"])
 

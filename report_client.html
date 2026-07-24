@@ -492,6 +492,15 @@
           card.append(title);
           card.append(statLine(["budget "+valueOrDash(row.budget),"epoch "+valueOrDash(row.epoch),relativeAge(row.recorded_at,report.generated_at)]));
           const facts=[];
+          if(row.outcome==="exact"){
+            if(row.best_guess){
+              let solved="solved "+candidateText(row.best_guess,false);
+              if(row.best_erd!==null&&row.best_erd!==undefined)solved+=" / ERD "+fixed(row.best_erd);
+              facts.push(solved);
+            }else{
+              facts.push("solution not recorded");
+            }
+          }
           if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ceiling "+fixed(row.ceiling));
           facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.bulk_completed_candidate_count)+" bulk proofs",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");

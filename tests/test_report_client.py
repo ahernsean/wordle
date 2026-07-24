@@ -372,9 +372,24 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("Cut — best line exceeds the budget", text)
         self.assertIn("Exact — solved within budget", text)
         self.assertIn("Loss — unsolvable in the game", text)
+        self.assertIn("solution not recorded", text)
         self.assertIn("newest first", text)
         self.assertIn("ago", text)
         self.assertIn("budget", text)
+
+    def test_exact_finalization_shows_recorded_solution(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.recent_finalizations[0]={
+            ...branch.data.recent_finalizations[0],
+            best_guess:'cigar',
+            best_erd:1.875,
+          };
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("solved CIGAR / ERD 1.875", text)
+        self.assertNotIn("solution not recorded", text)
 
     def test_old_epoch_finalizations_are_marked_historical(self):
         self.page.evaluate("""async () => {
