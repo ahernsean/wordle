@@ -55,8 +55,9 @@ production milestone — the SALET tree on the phone — earliest).
 1. **The taint-join engine fix** — the one code change this rebuild needs
    (step 1 below).
 2. **The standing machine-state check** (below, verbatim in substance).
-3. **The disk-stop latch discipline**, with a newly confirmed gotcha
-   (step 4).
+3. **The disk-stop latch discipline** — now a real command
+   (`queue set-disk-stop`, step 2) instead of a one-off, with a newly
+   confirmed gotcha about `queue clear` releasing it (step 4).
 4. **The two-mechanism phone sync and its hard boundary** (step 10).
 5. **Provenance**: `Get_NYT_Candidates.py` / `Get_NYT_Answers.py` re-scrape
    the sources by shape, not filename, and remain the way to re-verify the
@@ -113,6 +114,17 @@ rebuild starts — stale workers are stopped in step 2 regardless.
 Run the standing machine-state check; full `erd_search.py stop` if anything
 is live. Re-run the checks.
 
+Optionally guard the freeze window (steps 3–6 take minutes, but a reboot
+mid-window would auto-start `wordle-erd` against a half-migrated state):
+
+```
+python3.13 erd_search.py queue set-disk-stop --reason "vocabulary uplift: fresh rebuild in progress"
+```
+
+This is idempotent against a concurrent disk-fill or WAL-ceiling latch — it
+never replaces an existing reason, only sets one if none is recorded. Release
+it right before step 7 with `erd_search.py queue clear-disk-stop`.
+
 ### 3. Archive the old cache
 
 ```
@@ -137,22 +149,26 @@ python3.13 erd_search.py queue clear --yes
 
 **Gotcha (confirmed in code):** `queue clear` deletes the whole `run_meta`
 table, which holds both the **disk-stop latch** and the **telemetry epoch
-pointer**. After this command the latch engaged on 2026-07-22 is gone, so a
-reboot would auto-start `wordle-erd`. Post-archive this is safe — the
-service would find corrected lists, a fresh cache, and an empty queue — but
-do this step only after step 3, never before.
+pointer**. If step 2's optional latch was engaged, this command silently
+releases it (`queue set-disk-stop` again to re-engage before starting the
+swarm, or just proceed straight to step 7 — the freeze window is over).
+Post-archive this is safe either way — the service would find corrected
+lists, a fresh cache, and an empty queue — but do this step only after
+step 3, never before.
 
 ### 5. Set a fresh telemetry epoch (optional, recommended)
 
-Keeps rebuild telemetry windowable apart from epoch 8's baseline. There is
-no CLI (issues #147/#159); run a one-off from the scratchpad:
+Keeps rebuild telemetry windowable apart from epoch 8's baseline:
 
-```python
-from erd_queue import ERDQueue
-from runtime_paths import DEFAULT_QUEUE_PATH
-q = ERDQueue(DEFAULT_QUEUE_PATH)
-q.set_epoch(9, label="fresh-rebuild-salet", notes="vocabulary uplift rebuild")
 ```
+python3.13 erd_search.py epoch set 9 --label fresh-rebuild-salet --notes "vocabulary uplift rebuild"
+```
+
+Refuses while worker heartbeats are live (the swarm is already stopped from
+step 2, so this should never fire; `--force` overrides). `--git-sha` defaults
+to the current checkout's short SHA. `erd_search.py epoch show` prints the
+active epoch's metadata at any time — including right after this command, to
+confirm it took.
 
 ### 6. Seed SALET only
 
