@@ -524,6 +524,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.keyboard.press("Escape")
         self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
 
+    def test_sources_and_filters_disclosure_stays_open_across_refresh(self):
+        self.page.goto(self.base_url + "?kind=cache&branch_target=SALET")
+        self.page.wait_for_selector("text=cache report")
+        details = self.page.locator(".report-meta details.source-paths")
+        details.locator("summary").click()
+        self.assertIsNotNone(details.get_attribute("open"))
+        self.page.evaluate("""async () => {
+          await __reportClient.fetchReport();
+        }""")
+        self.page.wait_for_selector("text=cache report")
+        self.assertIsNotNone(
+            self.page.locator(".report-meta details.source-paths").get_attribute("open")
+        )
+
     def test_unresolvable_reference_reports_error_not_a_fake_report(self):
         self.page.route(
             "**/api/view**",
