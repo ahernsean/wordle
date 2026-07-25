@@ -365,6 +365,17 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("10s ago", text)
         self.assertNotIn("990", text)
 
+    def test_cache_view_updated_at_is_human_readable(self):
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/cache')).json();
+          report.data.recent_rows[0].updated_at=990;
+          applyReport(report,null,{...__reportClient.getState(),kind:'cache'});
+        }""")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("updated at", text)
+        self.assertIn("10s ago", text)
+        self.assertNotIn("990", text)
+
     def test_finalizations_are_glossed_and_timestamped(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")
