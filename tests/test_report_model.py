@@ -21,6 +21,7 @@ from report_model import (
     collect_report,
     normalize_worker_descent,
     parse_rich_spine,
+    parse_report_branch_target,
 )
 from wordle_engine import ERD_ALL
 
@@ -253,6 +254,49 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(
             report["data"]["queue_counts"]["evaluating_cooperative_branch_count"], 1
         )
+
+    def test_branch_report_lists_live_off_branch_claim_holders(self):
+        now = int(time.time())
+        parent_key = b"parent-branch"
+        child_key = b"child-branch"
+        queue = self._open_queue()
+        queue.create_branch(
+            parent_key, 3, 10, source_word="SALET", source_pattern=0, budget=5
+        )
+        queue.create_branch(
+            child_key, 2, 10, source_word="SALET", source_pattern=6, budget=4
+        )
+        parent_id = queue._intern_branch(parent_key)
+        queue._conn.execute(
+            "INSERT INTO candidate_claims "
+            "(branch_id, idx, claimed_by, claimed_at, done) "
+            "VALUES (?, 17, 'worker-5', ?, 0)",
+            (parent_id, now),
+        )
+        queue.heartbeat(
+            "worker-5", pid=55, current_branch_key=child_key, n_words=2,
+            started_at=now, claims_done=9, claim_idx=3, claim_started_at=now,
+            cur_candidate="BEEFY", cur_max_depth=5,
+        )
+        queue.close()
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="auto",
+            branch_target=parse_report_branch_target(
+                "@" + branch_reference(parent_key)
+            ),
+            filters=ReportFilters(),
+        ))
+        ownership = report["data"]["branch_ownership"]
+        self.assertEqual(ownership["live_workers"], [])
+        self.assertEqual(
+            [worker["worker_id"] for worker in ownership["claim_holders_off_branch"]],
+            ["worker-5"],
+        )
+        off_branch_holder = ownership["claim_holders_off_branch"][0]
+        self.assertEqual(off_branch_holder["branch_reference"], branch_reference(child_key))
+        self.assertEqual(off_branch_holder["in_flight_claim_count"], 1)
+        self.assertEqual(off_branch_holder["branch_context"][0]["word"], "salet")
+        self.assertEqual(off_branch_holder["branch_context"][0]["pattern"], "---g-")
 
     def test_finalizing_branch_remains_visible_after_worker_departure(self):
         now = int(time.time())

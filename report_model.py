@@ -452,6 +452,7 @@ def _normalize_worker(row, generated_at, answer_set):
         "is_live": generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS,
         "branch_reference": branch_reference(branch_key) if branch_key else None,
         "branch_key_hex": branch_key.hex() if branch_key else None,
+        "branch_context": _normalized_branch_spine(row, answer_set),
         # True while the worker's branch still has an active row; False once it
         # has been finalized and removed, which lags the heartbeat by up to one
         # interval and leaves the worker naming a branch no report will list.
@@ -507,6 +508,41 @@ def worker_state(worker, generated_at, branch_phase):
     if not worker["current_candidate"]:
         return "coordinating"
     return "working"
+
+
+def _branch_ownership(branch_workers, all_workers, normalized_claims, branch_key_hex):
+    """Summarize who still owns this branch's unfinished work.
+
+    live_workers are current branch heartbeats. claim_holders_off_branch are
+    live workers that still own unfinished claims on this branch while their
+    current heartbeat names some other branch.
+    """
+    unfinished_claim_counts = {}
+    for claim in normalized_claims:
+        if claim["state"] != "in_flight" or not claim["worker_id"]:
+            continue
+        worker_id = claim["worker_id"]
+        unfinished_claim_counts[worker_id] = (
+            unfinished_claim_counts.get(worker_id, 0) + 1
+        )
+    live_workers = [worker for worker in branch_workers if worker["is_live"]]
+    live_workers.sort(key=_worker_sort_key)
+    off_branch_holders = []
+    worker_by_id = {worker["worker_id"]: worker for worker in all_workers}
+    for worker_id, in_flight_claim_count in unfinished_claim_counts.items():
+        worker = worker_by_id.get(worker_id)
+        if worker is None or not worker["is_live"]:
+            continue
+        if worker["branch_key_hex"] == branch_key_hex:
+            continue
+        off_branch_holder = dict(worker)
+        off_branch_holder["in_flight_claim_count"] = in_flight_claim_count
+        off_branch_holders.append(off_branch_holder)
+    off_branch_holders.sort(key=_worker_sort_key)
+    return {
+        "live_workers": live_workers,
+        "claim_holders_off_branch": off_branch_holders,
+    }
 
 
 def _worker_sort_key(worker):
@@ -1063,6 +1099,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     pending_row = None
     active_row = None
     heartbeat_rows = []
+    all_heartbeat_rows = []
     claim_rows = []
     republish_rows = []
     branch_telemetry = {
@@ -1088,8 +1125,9 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             branch_key = resolved.branch_key
         pending_row = queue.get_pending_branch(branch_key)
         active_row = queue.get_active_branch(branch_key)
+        all_heartbeat_rows = queue.heartbeats_with_branch()
         heartbeat_rows = [
-            row for row in queue.heartbeats_with_branch()
+            row for row in all_heartbeat_rows
             if row["current_branch_key"] is not None
             and bytes(row["current_branch_key"]) == branch_key
         ]
@@ -1171,6 +1209,13 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         _normalize_claim(row, republish_by_index.get(row["idx"], 0))
         for row in claim_rows
     ]
+    all_workers = [
+        _normalize_worker(row, generated_at, answer_set)
+        for row in all_heartbeat_rows
+    ]
+    ownership = _branch_ownership(
+        workers, all_workers, normalized_claims, branch_key.hex()
+    )
     provenance_unknown = any(
         claim["state"] == "done" and claim["completion_kind"] is None
         for claim in normalized_claims
@@ -1189,6 +1234,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ),
         "claims": normalized_claims if request.include_claims else None,
         "claim_summary": _summarize_claims(normalized_claims),
+        "branch_ownership": ownership,
         "provenance_unknown": provenance_unknown,
         **branch_telemetry,
     }

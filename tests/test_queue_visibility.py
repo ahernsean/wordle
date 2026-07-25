@@ -75,6 +75,8 @@ class QueueVisibilityTests(unittest.TestCase):
                 total_bundle_wall_millis=30, censored_units=1,
                 ceiling=2.5 if outcome == "cut" else None,
                 outcome=outcome, bulk_done_candidates=bulk,
+                best_guess="crane" if outcome == "exact" else None,
+                best_erd=1.5 if outcome == "exact" else None,
             )
         self.q.add_cut_reuse_miss(self.user_key, 5, 4, None, 2.5, 3)
         telemetry = self.q.report_branch_telemetry(self.user_key, limit=2)
@@ -89,6 +91,8 @@ class QueueVisibilityTests(unittest.TestCase):
             loss["evaluated_candidate_count"],
             loss["bulk_completed_candidate_count"],
         )
+        self.assertIsNone(loss["best_guess"])
+        self.assertIsNone(loss["best_erd"])
         self.assertEqual(len(telemetry["cut_reuse_misses"]), 1)
 
     def test_historical_hotspots_are_bounded_and_coordination_is_bucketed(self):

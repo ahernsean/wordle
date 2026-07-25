@@ -316,6 +316,30 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertFalse(any("claims=1" in url for url in requested))
         self.assertLess(self.page.locator("section:has-text('Candidate detail') .card").count(), 1)
 
+    def test_branch_ownership_stays_visible_and_names_off_branch_claim_holders(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.workers=[];
+          branch.data.branch_ownership={
+            live_workers:[],
+            claim_holders_off_branch:[{
+              worker_id:'worker-5',
+              worker_number:'5',
+              branch_reference:'eb81eb81eb81',
+              branch_context:[{word:'salet',pattern:'---g-',word_is_answer:true}],
+            }],
+          };
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("Branch ownership", text)
+        self.assertIn("Live workers", text)
+        self.assertIn("None", text)
+        self.assertIn("Claim holders off-branch", text)
+        self.assertIn("w5", text)
+        self.assertIn("SALET", text)
+        self.assertIn("\ng\n", text)
+
     def test_branch_surfaces_missing_best_and_rounds_bounds(self):
         text = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
@@ -328,6 +352,19 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("2.793", text)
         self.assertNotIn("2.793103449275866", text)
 
+    def test_branch_cache_updated_at_is_human_readable(self):
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.cache.updated_at=990;
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        text = self.page.locator("section.section").filter(
+            has=self.page.locator("h2", has_text="Cache")
+        ).inner_text()
+        self.assertIn("updated at", text)
+        self.assertIn("10s ago", text)
+        self.assertNotIn("990", text)
+
     def test_finalizations_are_glossed_and_timestamped(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")
@@ -335,10 +372,40 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("Cut — best line exceeds the budget", text)
         self.assertIn("Exact — solved within budget", text)
         self.assertIn("Loss — unsolvable in the game", text)
+        self.assertIn("solution not recorded", text)
         self.assertIn("newest first", text)
         self.assertIn("ago", text)
         self.assertIn("budget", text)
-        self.assertNotIn("2.2000", text)
+
+    def test_exact_finalization_shows_recorded_solution(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.recent_finalizations[0]={
+            ...branch.data.recent_finalizations[0],
+            best_guess:'cigar',
+            best_erd:1.875,
+          };
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("solved CIGAR / ERD 1.875", text)
+        self.assertNotIn("solution not recorded", text)
+
+    def test_old_epoch_finalizations_are_marked_historical(self):
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          const activeEpoch=branch.sources.queue.epoch;
+          branch.data.recent_finalizations=[
+            {...branch.data.recent_finalizations[0], epoch:activeEpoch},
+            {...branch.data.recent_finalizations[1], epoch:activeEpoch-1},
+          ];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        cards = self.page.locator("section:has-text('Recent finalizations') .card")
+        self.assertNotIn("Historical", cards.nth(0).inner_text())
+        self.assertNotIn("historical", cards.nth(0).get_attribute("class"))
+        self.assertIn("Historical", cards.nth(1).inner_text())
+        self.assertIn("historical", cards.nth(1).get_attribute("class"))
 
     def test_erd_and_bounds_round_in_cache_and_hotspot_views(self):
         result = self.page.evaluate("""async () => {

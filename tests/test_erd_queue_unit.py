@@ -670,12 +670,15 @@ class TestCeilingTelemetry(_TmpQueue):
     def test_finalize_log_records_ceiling_and_outcome(self):
         self.q.add_branch_finalize_log(
             self.key, "SALET -g-g-", len(WORDS), 4, 100, 200, 5000, 3,
-            ceiling=2.5, outcome="cut")
+            ceiling=2.5, outcome="cut", best_guess="crane", best_erd=1.75)
         row = self.q._conn.execute(
-            "SELECT ceiling, outcome FROM telemetry.branch_finalize_log"
+            "SELECT ceiling, outcome, best_guess, best_erd "
+            "FROM telemetry.branch_finalize_log"
         ).fetchone()
         self.assertAlmostEqual(row["ceiling"], 2.5)
         self.assertEqual(row["outcome"], "cut")
+        self.assertEqual(row["best_guess"], "crane")
+        self.assertAlmostEqual(row["best_erd"], 1.75)
 
     def test_cut_reuse_miss_row(self):
         self.q.set_epoch(7)
