@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 
 # Wordle runtime files
+wordle_cache_pre_uplift_2026-07-23.sqlite3
 wordle_cache.sqlite3
 wordle_cache.sqlite3-shm
 wordle_cache.sqlite3-wal
