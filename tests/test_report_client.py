@@ -361,7 +361,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = self.page.locator("section.section").filter(
             has=self.page.locator("h2", has_text="Cache")
         ).inner_text()
-        self.assertIn("updated at", text)
+        self.assertIn("updated", text)
+        self.assertNotIn("updated at", text)
         self.assertIn("10s ago", text)
         self.assertNotIn("990", text)
 
@@ -372,7 +373,8 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(report,null,{...__reportClient.getState(),kind:'cache'});
         }""")
         text = self.page.locator("#report").inner_text()
-        self.assertIn("updated at", text)
+        self.assertIn("updated", text)
+        self.assertNotIn("updated at", text)
         self.assertIn("10s ago", text)
         self.assertNotIn("990", text)
 
