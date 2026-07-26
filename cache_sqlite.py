@@ -136,6 +136,17 @@ class ScoreCache:
         # O(1) hit instead of a fresh exhaustive disproof.
         self._loss_mem_cache = _LRUDict(max_size=max_mem_entries)
 
+    def __del__(self):
+        conn = getattr(self, '_conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.ProgrammingError:
+                # conn was created on a different thread than the one
+                # finalizing it; SQLite connections are thread-affine, so
+                # closing here is impossible.
+                pass
+
     def _is_migration_done(self, name):
         """Return True if migration `name` has been recorded as complete."""
         return self._conn.execute(

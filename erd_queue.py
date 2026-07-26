@@ -629,6 +629,17 @@ class ERDQueue:
         # registry is append-only, so a cached id never goes stale.
         self._branch_id_cache = {}
 
+    def __del__(self):
+        conn = getattr(self, '_conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.ProgrammingError:
+                # conn was created on a different thread than the one
+                # finalizing it; SQLite connections are thread-affine, so
+                # closing here is impossible.
+                pass
+
     def _tally_wal_traffic(self, category: str, rows: int, approx_bytes: int):
         """Attribute `rows`/`approx_bytes` of WAL traffic to `category`.
 

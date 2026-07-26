@@ -99,6 +99,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
     # ---- write() ----
     def test_write_swallows_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         def boom(*a, **k):
@@ -113,6 +114,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
 
     def test_write_reraises_non_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         def boom(*a, **k):
@@ -125,6 +127,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
     # ---- write_loss() ----
     def test_write_loss_swallows_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         def boom(*a, **k):
@@ -139,6 +142,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
 
     def test_write_loss_reraises_non_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         def boom(*a, **k):
@@ -151,6 +155,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
     # ---- write_decomposition() ----
     def test_write_decomposition_swallows_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
 
         def boom(*a, **k):
             raise sqlite3.OperationalError("disk I/O error")
@@ -162,6 +167,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
 
     def test_write_decomposition_reraises_non_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
 
         def boom(*a, **k):
             raise sqlite3.OperationalError("database is locked")
@@ -173,6 +179,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
     # ---- write_scores() incl. ROLLBACK path ----
     def test_write_scores_swallows_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         # BEGIN (execute) succeeds; the bulk executemany raises the disk-I/O
@@ -189,6 +196,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
     def test_write_scores_swallows_disk_io_with_failing_rollback(self):
         """ROLLBACK itself raising OperationalError is swallowed (pass)."""
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
         real = sc._conn
 
@@ -208,6 +216,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
 
     def test_write_scores_reraises_non_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         def boom(*a, **k):
@@ -221,6 +230,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
         """A non-OperationalError (e.g. a programming error) in the bulk write
         hits the bare `except Exception` ROLLBACK+raise path (537-539)."""
         sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
         key = ScoreCache.encode_subset(["crane", "slate"])
 
         def boom(*a, **k):
