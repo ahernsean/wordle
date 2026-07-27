@@ -223,6 +223,12 @@ Always update the PR title and description when pushing new commits. Never
 leave a PR state that describes only a proper subset of the commits. A PR
 should always be left in a reviewable state.
 
+**Always subscribe to a PR's activity immediately after publishing it** — no
+need to ask first. This is standing authorization for that one action; it
+does not extend to autofixing CI failures or replying to review comments
+without checking in, which stay governed by whatever the agent's normal
+watch/babysit behavior specifies.
+
 ---
 
 ## Development environment setup
