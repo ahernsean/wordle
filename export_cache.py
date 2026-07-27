@@ -17,6 +17,11 @@ the export sees a consistent snapshot without stopping anything. Re-running
 is incremental: INSERT OR IGNORE skips rows already present, so you can
 refresh the export file at any time.
 
+--since UNIXTIME restricts every table with an updated_at column to rows
+newer than that watermark, for a delta export. answer_list has no
+updated_at (it's one tiny row per answer list, the namespace key), so it is
+always copied in full regardless of --since.
+
 Import the result into another cache with import_cache.py.
 """
 
@@ -41,6 +46,8 @@ def cmd_export(args):
 
     print(f'Source : {cache_path}')
     print(f'Export : {export_path}')
+    if args.since is not None:
+        print(f'Since  : {args.since}')
     print()
 
     conn = sqlite3.connect(export_path, timeout=30.0, isolation_level=None)
@@ -90,10 +97,17 @@ def cmd_export(args):
 
             cols = [r[1] for r in conn.execute(f'PRAGMA table_info({table})')]
             col_list = ', '.join(cols)
-            conn.execute(f"""
-                INSERT OR IGNORE INTO main.{table} ({col_list})
-                SELECT {col_list} FROM src.{table}
-            """)
+            if args.since is not None and 'updated_at' in cols:
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO main.{table} ({col_list})
+                    SELECT {col_list} FROM src.{table}
+                    WHERE updated_at > ?
+                """, (args.since,))
+            else:
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO main.{table} ({col_list})
+                    SELECT {col_list} FROM src.{table}
+                """)
             n = conn.execute('SELECT changes()').fetchone()[0]
             total = conn.execute(
                 f'SELECT COUNT(*) FROM {table}').fetchone()[0]
@@ -130,6 +144,9 @@ def main():  # pragma: no cover
                         help=f'Source cache (default: {DEFAULT_CACHE})')
     parser.add_argument('--output', default=DEFAULT_EXPORT, metavar='PATH',
                         help=f'Output file (default: {DEFAULT_EXPORT})')
+    parser.add_argument('--since', type=int, default=None, metavar='UNIXTIME',
+                        help='Only copy rows updated after UNIXTIME '
+                             '(default: full export)')
     args = parser.parse_args()
     cmd_export(args)
 
