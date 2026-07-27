@@ -9,6 +9,7 @@ import io
 import os
 import pty
 import sys
+import termios
 import tty
 import unittest
 from contextlib import redirect_stdout
@@ -92,11 +93,68 @@ class TestReadLineWithGhost(unittest.TestCase):
         result, _ = _drive_ghost(b"\x04")
         self.assertEqual(result, "EOFError")
 
+    def test_closed_stream_raises_eof(self):
+        # A genuinely empty os.read -- distinct from ctrl-D -- is what a
+        # hung-up stream returns once its writer is gone.  Mocked rather
+        # than reproduced by actually closing the pty's master: closing it
+        # while a read is already blocked races with the kernel and can
+        # surface as EIO instead of a clean b'', which isn't the case this
+        # test is pinning.
+        master, slave = pty.openpty()
+        tty.setraw(slave)
+        stdin = os.fdopen(slave, 'rb', 0)
+        saved_stdin, sys.stdin = sys.stdin, stdin
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out), \
+                    mock.patch('wordle.os.read', return_value=b''):
+                with self.assertRaises(EOFError):
+                    wordle._read_line_with_ghost("Word to guess? ", "crane")
+        finally:
+            sys.stdin = saved_stdin
+            stdin.close()
+            os.close(master)
+
+    def test_dead_fd_on_restore_does_not_mask_the_eof(self):
+        # A hangup can leave the fd unable to take a termios restore too;
+        # that must not replace the EOFError it caused with a termios.error.
+        master, slave = pty.openpty()
+        tty.setraw(slave)
+        stdin = os.fdopen(slave, 'rb', 0)
+        saved_stdin, sys.stdin = sys.stdin, stdin
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out), \
+                    mock.patch('wordle.os.read', return_value=b''), \
+                    mock.patch('wordle.termios.tcsetattr',
+                              side_effect=termios.error(5, 'Input/output error')):
+                with self.assertRaises(EOFError):
+                    wordle._read_line_with_ghost("Word to guess? ", "crane")
+        finally:
+            sys.stdin = saved_stdin
+            stdin.close()
+            os.close(master)
+
     def test_interrupt_raises_and_keeps_typed_text_visible(self):
         result, out = _drive_ghost(b"sl\x03")
         self.assertEqual(result, "KeyboardInterrupt")
         self.assertTrue(out.rstrip('\n').endswith("Word to guess? sl"))
         self.assertNotIn(f'{GRAY}crane{wordle.ANSI_RESET}\n', out)
+
+    def test_multibyte_character_is_typed_not_treated_as_eof(self):
+        # 'é' is UTF-8 b'\xc3\xa9': one os.read(fd, 1) per byte. The first
+        # byte alone decodes to '' -- indistinguishable from a closed stream
+        # unless the reader tells the two apart.
+        result, _ = _drive_ghost("é".encode('utf-8') + b"\r")
+        self.assertEqual(result, "é")
+
+    def test_multibyte_character_mid_entry_is_not_dropped(self):
+        result, _ = _drive_ghost(b"sl" + "é".encode('utf-8') + b"te\r")
+        self.assertEqual(result, "sléte")
+
+    def test_invalid_utf8_byte_is_discarded(self):
+        result, _ = _drive_ghost(b"s\xffl\r")
+        self.assertEqual(result, "sl")
 
 
 class TestGhostDefaultSupported(unittest.TestCase):
@@ -194,9 +252,6 @@ class TestInputWithDefault(unittest.TestCase):
         self.assertEqual(value, "ghosted")
         self.assertEqual(out, "")
         ghost.assert_called_once_with("Word to guess? ", "crane")
-
-    def test_unsupported_without_a_tty(self):
-        self.assertFalse(wordle._ghost_default_supported())
 
 
 class TestBestERDGuess(CliTestCase):

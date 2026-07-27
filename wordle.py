@@ -7,6 +7,7 @@ When running a single game, redundant prompts are skipped
 for a streamlined experience.
 """
 
+import codecs
 import os
 import sys
 import shutil
@@ -393,6 +394,7 @@ def _read_line_with_ghost(prompt, ghost):
     saved = termios.tcgetattr(fd)
     typed = []
     accepted = False
+    decoder = codecs.getincrementaldecoder('utf-8')()
 
     def redraw():
         # Rewrite from column 0 rather than tracking cursor deltas: the
@@ -417,8 +419,22 @@ def _read_line_with_ghost(prompt, ghost):
             if pushback:
                 ch, pushback = pushback, ''
             else:
-                ch = os.read(fd, 1).decode('utf-8', errors='ignore')
-            if ch in ('', '\x04') and not typed:
+                # A single byte off a UTF-8 multi-byte character decodes to
+                # '' too -- the same string a closed stream reads as. Read
+                # raw bytes and let the incremental decoder tell them apart:
+                # only a genuinely empty os.read is end of input; a '' from
+                # the decoder means more bytes of this character are coming.
+                raw = os.read(fd, 1)
+                if not raw:
+                    raise EOFError
+                try:
+                    ch = decoder.decode(raw)
+                except UnicodeDecodeError:
+                    decoder.reset()
+                    continue
+                if not ch:
+                    continue
+            if ch == '\x04' and not typed:
                 raise EOFError
             if ch in ('\r', '\n'):
                 accepted = True
@@ -439,7 +455,12 @@ def _read_line_with_ghost(prompt, ghost):
                 typed.append(ch)
                 redraw()
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        except termios.error:
+            # The stream hung up mid-read (EOFError above): fd is already
+            # gone, so there is no terminal mode left to restore.
+            pass
         # Leave the transcript reading as though the value taken had been
         # typed — the default still gray, so it stays visible that it came
         # from the placeholder.  An abandoned line (interrupt, end of input)
