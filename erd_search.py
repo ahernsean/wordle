@@ -18,7 +18,8 @@ restart         Restart the supervisor and the report web server via systemd
 view            Shared swarm reports in text, JSON, or watched JSON Lines.
 
 run             Start the supervisor directly (without systemd), for
-                development or one-shot use.  All output goes to erd_search.log.
+                development or one-shot use.  All output goes to
+                runtime/erd_search.log.
 
 queue           Queue mutation operations.
 queue add       Add branches for a word or word list to the work queue.
@@ -624,7 +625,7 @@ def _enforce_wal_hard_ceiling(queue, procs) -> bool:
     logger.critical(
         'Queue WAL %.2f GB breached hard ceiling %.2f GB — TRUNCATE never '
         'reclaimed it. Latching swarm down before the disk fills. Per-table '
-        'WAL attribution and worker stacks are in the erd_worker_*.log files.',
+        'WAL attribution and worker stacks are in the runtime/erd_worker_*.log files.',
         wal_bytes / 1e9, QUEUE_WAL_HARD_CEILING_BYTES / 1e9)
     now = time.time()
     for h in queue.heartbeats_with_branch():

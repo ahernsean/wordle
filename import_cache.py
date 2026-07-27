@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.13
-"""import_cache.py — Import a source wordle_cache.sqlite3 into the local one.
+"""import_cache.py — Import a source wordle_cache.sqlite3 into runtime/wordle_cache.sqlite3.
 
 Usage
 -----
