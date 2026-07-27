@@ -11,6 +11,23 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
 fi
 
+# The hook event arrives as JSON on stdin.  A compact or a clear keeps the
+# same container, whose dependencies are already installed; only a fresh
+# start or a resume onto a rebuilt container needs the install.
+payload=""
+[ -t 0 ] || payload=$(cat)
+event_source=$(printf '%s' "$payload" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin).get("source",""))' \
+    2>/dev/null) || event_source=""
+case "$event_source" in
+  compact|clear) exit 0 ;;
+esac
+
+# Run in the background so the session starts immediately.  The session can
+# therefore reach for numpy or playwright before the install finishes; a
+# failure that looks like a missing dependency is worth re-checking once.
+echo '{"async": true, "asyncTimeout": 300000}'
+
 cd "${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 # 3.13 is what the repo targets: wordle.py's shebang, the CI matrix, and the

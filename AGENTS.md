@@ -254,10 +254,16 @@ pip install -r requirements.txt       # runtime only (numpy)
 
 **Claude Code on the web** starts from a bare image with neither dependency
 installed. `.claude/hooks/session-start.sh` installs them into `python3.13`
-before the session begins and sets `REQUIRE_PLAYWRIGHT_BROWSER=1`, so the
-browser tests fail loudly there rather than skipping. It no-ops on a local
-checkout (`CLAUDE_CODE_REMOTE`), which keeps whatever environment the
-developer set up.
+and sets `REQUIRE_PLAYWRIGHT_BROWSER=1`, so the browser tests fail loudly
+there rather than skipping. It no-ops on a local checkout
+(`CLAUDE_CODE_REMOTE`), which keeps whatever environment the developer set
+up.
+
+The hook runs asynchronously: the session starts immediately and the install
+lands a few seconds later, so a `ModuleNotFoundError` for numpy or playwright
+in the first moments of a session means the install is still in flight — wait
+and retry rather than installing by hand. It skips the reinstall on a compact
+or a clear, which keep the same container.
 
 ## Before committing and pushing
 
