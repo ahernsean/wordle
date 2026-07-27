@@ -240,7 +240,19 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("@0123", output)
         self.assertIn("w2", output)
         self.assertIn("Ref", output)
-        self.assertIn("State", output)
+        self.assertIn("Phase", output)
+
+    def test_branch_table_shows_phase_not_status(self):
+        report = overview_report()
+        branch = report["data"]["branches"][0]
+        branch["branch_status"] = "active"
+        branch["branch_phase"] = "finalizing"
+        output = render_overview(report, color=False, width=100)
+        branch_line = next(
+            line for line in output.splitlines() if "@0123" in line
+        )
+        self.assertIn("final", branch_line)
+        self.assertNotIn("active", branch_line)
 
     def test_progress_is_highlighted_by_cell_rules(self):
         previous = overview_report()
@@ -311,21 +323,21 @@ class OverviewRendererTest(unittest.TestCase):
         })
 
         expected_branch_headings = {
-            50: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
-            55: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
-            59: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
-            60: ("Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk"),
+            50: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
+            55: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
+            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk"),
+            60: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk"),
             79: (
-                "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
-                "Best", "MaxRD", "ETA",
+                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk",
+                "Best", "MaxRD",
             ),
             80: (
-                "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
-                "Best", "MaxRD", "ETA",
+                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk",
+                "Best", "MaxRD",
             ),
             120: (
-                "Ref", "GuessD", "State", "Done", "W", "Ans", "Bulk",
-                "Best", "MaxRD", "ETA", "Spine",
+                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk",
+                "Best", "MaxRD", "ETA",
             ),
         }
         for width, expected_headings in expected_branch_headings.items():
@@ -335,7 +347,7 @@ class OverviewRendererTest(unittest.TestCase):
                     all(len(line) <= width for line in output.splitlines())
                 )
                 self.assertIn("@0123", output)
-                self.assertIn("12616/12972", output)
+                self.assertIn("12,616/12,972", output)
                 self.assertIn("w12", output)
                 self.assertNotIn("guess_depth=", output)
                 self.assertNotIn("candidate=", output)
@@ -349,7 +361,7 @@ class OverviewRendererTest(unittest.TestCase):
         narrow_branch_header = next(
             line for line in narrow.splitlines() if "Ref" in line and "GuessD" in line
         )
-        self.assertIn("State", narrow_branch_header)
+        self.assertIn("Phase", narrow_branch_header)
         self.assertIn("Done", narrow_branch_header)
         self.assertNotIn("Spine", narrow_branch_header)
 
