@@ -254,7 +254,7 @@ pip install -r requirements.txt       # runtime only (numpy)
 
 ## Before committing and pushing
 
-Always run the test suite before committing and pushing:
+Run the test suite before committing and pushing any change that touches code:
 
 ```
 python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
@@ -264,6 +264,13 @@ Use `python3.13`, not the default `python` (3.9): only 3.13 has playwright, so
 under 3.9 the browser contract tests skip rather than run.
 
 Commits with failing tests must not be pushed.
+
+A commit whose diff is entirely markdown, documentation, or other non-code
+files cannot change test outcomes, so the suite is not required for it. Push it
+as is; do not fix unrelated pre-existing failures to clear the gate. If the
+diff touches code at all — including test files, build configuration, or a code
+snippet embedded in a doc that the suite executes — the rule above applies in
+full.
 
 **Stage files explicitly, by path.  `git add -A`, `git add .`, `git add -u`,
 and `git commit -a` are prohibited — no exceptions.**  The working tree
