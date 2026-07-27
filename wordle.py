@@ -28,7 +28,7 @@ except ImportError:
 try:
     import termios
     import tty
-except ImportError:  # Pythonista and other non-POSIX consoles
+except ImportError:  # pragma: no cover - Pythonista and other non-POSIX consoles
     termios = None
     tty = None
 
@@ -366,16 +366,19 @@ def _drain_escape(fd):
     """Swallow the bytes trailing an ESC — arrow keys, Home, function keys —
     so they are not mistaken for typed letters.
 
-    Consumes exactly one control sequence: an introducer (CSI '[' or SS3 'O')
-    followed by bytes up to and including a final byte in 0x40-0x7E.  A bare
-    Escape keypress, with nothing behind it, consumes nothing further.
+    Consumes one control sequence: an introducer (CSI '[' or SS3 'O') and
+    everything up to and including a final byte in 0x40-0x7E.  Returns '',
+    unless the key after the ESC was no introducer at all — a bare Escape
+    keypress followed by ordinary typing — in which case that key is handed
+    back for the caller to act on rather than eaten.
     """
-    if _pending_key(fd) not in ('[', 'O'):
-        return
+    ch = _pending_key(fd)
+    if ch not in ('[', 'O'):
+        return ch
     while True:
         ch = _pending_key(fd)
         if not ch or '\x40' <= ch <= '\x7e':
-            return
+            return ''
 
 
 def _read_line_with_ghost(prompt, ghost):
@@ -409,8 +412,12 @@ def _read_line_with_ghost(prompt, ghost):
         # the whole guess ahead of the prompt keeps it, as with input().
         tty.setcbreak(fd, termios.TCSANOW)
         redraw()
+        pushback = ''
         while True:
-            ch = os.read(fd, 1).decode('utf-8', errors='ignore')
+            if pushback:
+                ch, pushback = pushback, ''
+            else:
+                ch = os.read(fd, 1).decode('utf-8', errors='ignore')
             if ch in ('', '\x04') and not typed:
                 raise EOFError
             if ch in ('\r', '\n'):
@@ -427,7 +434,7 @@ def _read_line_with_ghost(prompt, ghost):
                     del typed[:]
                     redraw()
             elif ch == '\x1b':
-                _drain_escape(fd)
+                pushback = _drain_escape(fd)
             elif ch.isprintable():
                 typed.append(ch)
                 redraw()

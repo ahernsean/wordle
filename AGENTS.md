@@ -252,6 +252,13 @@ pip install -r requirements.txt       # runtime only (numpy)
   browser tests silently skip. Run with `python3.13` to actually exercise
   `tests/test_report_client.py`.
 
+**Claude Code on the web** starts from a bare image with neither dependency
+installed. `.claude/hooks/session-start.sh` installs them into `python3.13`
+before the session begins and sets `REQUIRE_PLAYWRIGHT_BROWSER=1`, so the
+browser tests fail loudly there rather than skipping. It no-ops on a local
+checkout (`CLAUDE_CODE_REMOTE`), which keeps whatever environment the
+developer set up.
+
 ## Before committing and pushing
 
 Always run the test suite before committing and pushing:

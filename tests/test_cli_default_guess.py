@@ -77,6 +77,17 @@ class TestReadLineWithGhost(unittest.TestCase):
         result, _ = _drive_ghost(b"\x1b[Aslate\r")
         self.assertEqual(result, "slate")
 
+    def test_typing_through_a_bare_escape_loses_nothing(self):
+        result, _ = _drive_ghost(b"\x1bslate\r")
+        self.assertEqual(result, "slate")
+
+    def test_editing_an_empty_entry_leaves_the_ghost_alone(self):
+        # Backspace and ctrl-U on an empty line, then an unprintable key:
+        # none of them disturb the placeholder.
+        result, out = _drive_ghost(b"\x7f\x15\x01\r")
+        self.assertEqual(result, "crane")
+        self.assertEqual(out.count(f'{GRAY}crane'), 2)  # initial, final
+
     def test_end_of_input_raises(self):
         result, _ = _drive_ghost(b"\x04")
         self.assertEqual(result, "EOFError")
@@ -86,6 +97,68 @@ class TestReadLineWithGhost(unittest.TestCase):
         self.assertEqual(result, "KeyboardInterrupt")
         self.assertTrue(out.rstrip('\n').endswith("Word to guess? sl"))
         self.assertNotIn(f'{GRAY}crane{wordle.ANSI_RESET}\n', out)
+
+
+class TestGhostDefaultSupported(unittest.TestCase):
+    """The capability probe, with SUPPORTS_COLOR forced on: what remains is
+    the tty question."""
+
+    @staticmethod
+    def _probe(stdin, stdout):
+        with mock.patch.object(wordle, 'SUPPORTS_COLOR', True), \
+                mock.patch.object(wordle, 'IS_PYTHONISTA', False), \
+                mock.patch.object(wordle, 'sys') as fake_sys:
+            fake_sys.stdin, fake_sys.stdout = stdin, stdout
+            return wordle._ghost_default_supported()
+
+    def test_supported_when_both_ends_are_ttys(self):
+        tty_stream = mock.Mock(isatty=lambda: True)
+        self.assertTrue(self._probe(tty_stream, tty_stream))
+
+    def test_unsupported_when_output_is_redirected(self):
+        self.assertFalse(self._probe(mock.Mock(isatty=lambda: True),
+                                     mock.Mock(isatty=lambda: False)))
+
+    def test_unsupported_when_the_stream_is_closed(self):
+        closed = mock.Mock(isatty=mock.Mock(side_effect=ValueError))
+        self.assertFalse(self._probe(closed, closed))
+
+    def test_unsupported_without_ansi_color(self):
+        with mock.patch.object(wordle, 'SUPPORTS_COLOR', False):
+            self.assertFalse(wordle._ghost_default_supported())
+
+
+class TestEscapeSequences(unittest.TestCase):
+    """_pending_key and _drain_escape against a pty holding known bytes.
+
+    _drain_escape runs with the ESC itself already read, so `_fd` holds only
+    what follows it.
+    """
+
+    def _fd(self, after_escape):
+        master, slave = pty.openpty()
+        tty.setraw(slave)
+        os.write(master, after_escape)
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        return slave
+
+    def test_pending_key_is_empty_when_nothing_is_typed(self):
+        self.assertEqual(wordle._pending_key(self._fd(b""), timeout=0.01), '')
+
+    def test_key_after_a_bare_escape_is_handed_back(self):
+        fd = self._fd(b"s")  # Escape pressed on its own, then a guess letter
+        self.assertEqual(wordle._drain_escape(fd), 's')
+
+    def test_truncated_sequence_ends_at_end_of_input(self):
+        fd = self._fd(b"[")
+        # Returns rather than blocking for a final byte that never comes.
+        self.assertEqual(wordle._drain_escape(fd), '')
+
+    def test_sequence_is_consumed_up_to_its_final_byte(self):
+        fd = self._fd(b"[1;2Bs")  # shift-Down, then a guess letter
+        self.assertEqual(wordle._drain_escape(fd), '')
+        self.assertEqual(wordle._pending_key(fd), 's')
 
 
 class TestInputWithDefault(unittest.TestCase):
