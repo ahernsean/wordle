@@ -22,6 +22,7 @@ def _make_args(tmp_dir, **overrides):
     args = types.SimpleNamespace(
         cache=os.path.join(tmp_dir, 'cache.sqlite3'),
         output=os.path.join(tmp_dir, 'export.sqlite3'),
+        since=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -97,6 +98,96 @@ class TestExportCandidateScores(unittest.TestCase):
         out_conn.close()
         self.assertNotIn("response_decomposition", tables)
         self.assertIn("candidate_scores", tables)
+
+    def test_since_excludes_rows_not_updated_after_watermark(self):
+        args = _make_args(self._tmp.name)
+        self._seed_candidate_scores(args.cache)
+        conn = sqlite3.connect(args.cache)
+        conn.execute(
+            "UPDATE candidate_scores SET updated_at = 100 WHERE word = 'crane'")
+        conn.execute(
+            "UPDATE candidate_scores SET updated_at = 200 WHERE word = 'slate'")
+        conn.commit()
+        conn.close()
+
+        args.since = 100
+        export_cache.cmd_export(args)
+
+        out_conn = sqlite3.connect(args.output)
+        rows = out_conn.execute(
+            "SELECT word FROM candidate_scores ORDER BY word").fetchall()
+        out_conn.close()
+        self.assertEqual(rows, [('slate',)])
+
+    def test_since_still_copies_answer_list_in_full(self):
+        # answer_list has no updated_at column, so it is always copied whole
+        # regardless of --since -- it's the tiny namespace key row, not a
+        # growing result table.
+        args = _make_args(self._tmp.name)
+        self._seed_candidate_scores(args.cache)
+
+        args.since = 2**31  # far future: no candidate_scores row qualifies
+        export_cache.cmd_export(args)
+
+        out_conn = sqlite3.connect(args.output)
+        answer_rows = out_conn.execute(
+            "SELECT COUNT(*) FROM answer_list").fetchone()[0]
+        score_rows = out_conn.execute(
+            "SELECT COUNT(*) FROM candidate_scores").fetchone()[0]
+        out_conn.close()
+        self.assertEqual(answer_rows, 1)
+        self.assertEqual(score_rows, 0)
+
+    def test_since_none_is_a_full_export(self):
+        args = _make_args(self._tmp.name)
+        self._seed_candidate_scores(args.cache)
+        conn = sqlite3.connect(args.cache)
+        conn.execute("UPDATE candidate_scores SET updated_at = 100")
+        conn.commit()
+        conn.close()
+
+        export_cache.cmd_export(args)
+
+        out_conn = sqlite3.connect(args.output)
+        n = out_conn.execute(
+            "SELECT COUNT(*) FROM candidate_scores").fetchone()[0]
+        out_conn.close()
+        self.assertEqual(n, 2)
+
+    def test_second_delta_only_carries_rows_newer_than_first_watermark(self):
+        # Simulates two successive deltas: the second, using the first
+        # delta's watermark, must not re-carry rows the first already sent.
+        args = _make_args(self._tmp.name)
+        self._seed_candidate_scores(args.cache)
+        conn = sqlite3.connect(args.cache)
+        conn.execute(
+            "UPDATE candidate_scores SET updated_at = 100 WHERE word = 'crane'")
+        conn.execute(
+            "UPDATE candidate_scores SET updated_at = 200 WHERE word = 'slate'")
+        conn.commit()
+        conn.close()
+
+        first_output = os.path.join(self._tmp.name, 'export1.sqlite3')
+        args.output = first_output
+        args.since = 0
+        export_cache.cmd_export(args)
+
+        second_output = os.path.join(self._tmp.name, 'export2.sqlite3')
+        args.output = second_output
+        args.since = 150
+        export_cache.cmd_export(args)
+
+        first_conn = sqlite3.connect(first_output)
+        first_words = {r[0] for r in first_conn.execute(
+            "SELECT word FROM candidate_scores")}
+        first_conn.close()
+        second_conn = sqlite3.connect(second_output)
+        second_words = {r[0] for r in second_conn.execute(
+            "SELECT word FROM candidate_scores")}
+        second_conn.close()
+
+        self.assertEqual(first_words, {'crane', 'slate'})
+        self.assertEqual(second_words, {'slate'})
 
     def test_error_mid_export_rolls_back_and_reraises(self):
         args = _make_args(self._tmp.name)
