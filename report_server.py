@@ -24,7 +24,7 @@ from report_model import (
     parse_report_branch_target,
     validate_report_request,
 )
-from runtime_paths import DEFAULT_CACHE_PATH, DEFAULT_QUEUE_PATH
+from runtime_paths import DEFAULT_CACHE_PATH, DEFAULT_QUEUE_PATH, ensure_runtime_dir
 
 
 FIXTURE_FILENAMES = (
@@ -374,6 +374,7 @@ def main():
     parser.add_argument("--cache-path", default=DEFAULT_CACHE_PATH, metavar="PATH")
     parser.add_argument("--fixture-directory", metavar="PATH")
     args = parser.parse_args()
+    ensure_runtime_dir()
     configuration = build_configuration(
         args.queue_path, args.cache_path, args.fixture_directory
     )

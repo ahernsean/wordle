@@ -53,7 +53,11 @@ from erd_queue import (ERDQueue, decode_subset, encode_subset,
                        DEFAULT_REPUBLISH_LIMIT)
 from wordle_ui import fmt_pattern
 
-from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+from runtime_paths import (
+    DEFAULT_ANSWER_LIST_PATH,
+    DEFAULT_CANDIDATE_LIST_PATH,
+    worker_log_path,
+)
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
@@ -1915,9 +1919,7 @@ def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no co
 def _setup_logging(worker_id):  # pragma: no cover
     for h in logger.handlers[:]:
         logger.removeHandler(h)
-    log_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        f'erd_worker_{worker_id}.log')
+    log_path = worker_log_path(worker_id)
     h = logging.FileHandler(log_path)
     h.setFormatter(logging.Formatter('%(asctime)s %(levelname)-7s %(message)s'))
     logger.addHandler(h)

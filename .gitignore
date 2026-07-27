@@ -2,28 +2,14 @@
 __pycache__/
 *.py[codz]
 
-# Wordle runtime files
+# Wordle runtime directory (cache, queue, telemetry, logs, pattern matrix)
 wordle_cache_pre_uplift_2026-07-23.sqlite3
-wordle_cache.sqlite3
-wordle_cache.sqlite3-shm
-wordle_cache.sqlite3-wal
-wordle_debug.log
+runtime/
 
-# ERD parallel precache runtime files
-erd_queue.sqlite3
-erd_queue.sqlite3-shm
-erd_queue.sqlite3-wal
-erd_queue_telemetry.sqlite3
-erd_queue_telemetry.sqlite3-shm
-erd_queue_telemetry.sqlite3-wal
-erd_search.log
-erd_worker_*.log
-verify_erd_cache.log
+# Transitory export/import snapshot (stays at the repo root)
 wordle_erd_export.sqlite3
 wordle_erd_export.sqlite3-shm
 wordle_erd_export.sqlite3-wal
-pattern_matrix_*.npy
-pattern_matrix_*.npy.*
 
 # Coverage artifacts
 .coverage

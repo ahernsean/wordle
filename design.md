@@ -332,14 +332,15 @@ against a branch is slow, multiple workers cooperate:
 
 ### Architecture
 
-- `erd_queue.sqlite3` — coordination-only database (separate from `wordle_cache.sqlite3`
-  to avoid contention). Contains the `pending_subgroups` table of branches to solve,
-  candidate claims, heartbeats, and done flags.
+- `runtime/erd_queue.sqlite3` — coordination-only database (separate from
+  `runtime/wordle_cache.sqlite3` to avoid contention). Contains the `pending_subgroups`
+  table of branches to solve, candidate claims, heartbeats, and done flags.
 - `_BranchWorker` (`erd_swarm.py`) — one per OS process. Claims one candidate at a time,
-  evaluates it, writes sub-branch results to `wordle_cache.sqlite3`, and updates claim
-  state in `erd_queue.sqlite3`.
-- `ERDQueue` (`erd_queue.py`) — single writer to `erd_queue.sqlite3`. Used by workers to
-  claim candidates, record heartbeats, mark claims done, and promote large sub-branches to the queue.
+  evaluates it, writes sub-branch results to `runtime/wordle_cache.sqlite3`, and updates
+  claim state in `runtime/erd_queue.sqlite3`.
+- `ERDQueue` (`erd_queue.py`) — single writer to `runtime/erd_queue.sqlite3`. Used by
+  workers to claim candidates, record heartbeats, mark claims done, and promote large
+  sub-branches to the queue.
 
 ### Branch lifecycle
 

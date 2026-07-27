@@ -79,6 +79,8 @@ from runtime_paths import (
     DEFAULT_CACHE_PATH,
     DEFAULT_CANDIDATE_LIST_PATH,
     DEFAULT_QUEUE_PATH,
+    DEFAULT_SEARCH_LOG_PATH,
+    ensure_runtime_dir,
 )
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
 from erd_queue import (
@@ -826,8 +828,7 @@ def _spawn_worker(worker_id: int, args, stop_event):
 
 
 def _setup_supervisor_logging():
-    log_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'erd_search.log')
+    log_path = DEFAULT_SEARCH_LOG_PATH
     h = logging.FileHandler(log_path)
     h.setFormatter(logging.Formatter(
         '%(asctime)s %(levelname)-7s %(message)s'))
@@ -1155,6 +1156,7 @@ def main():
     p_epoch_set.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     args = parser.parse_args()
+    ensure_runtime_dir()
     if args.cmd == 'view' and args.format == 'json' and args.watch is not None:
         parser.error('--format json cannot be used with --watch; use jsonl')
     if args.cmd == 'view':
