@@ -223,6 +223,12 @@ Always update the PR title and description when pushing new commits. Never
 leave a PR state that describes only a proper subset of the commits. A PR
 should always be left in a reviewable state.
 
+**Always subscribe to a PR's activity immediately after publishing it** — no
+need to ask first. This is standing authorization for that one action; it
+does not extend to autofixing CI failures or replying to review comments
+without checking in, which stay governed by whatever the agent's normal
+watch/babysit behavior specifies.
+
 ---
 
 ## Development environment setup
@@ -251,6 +257,19 @@ pip install -r requirements.txt       # runtime only (numpy)
   3.9, which has numpy but **not** playwright — run the suite under it and the
   browser tests silently skip. Run with `python3.13` to actually exercise
   `tests/test_report_client.py`.
+
+**Claude Code on the web** starts from a bare image with neither dependency
+installed. `.claude/hooks/session-start.sh` installs them into `python3.13`
+and sets `REQUIRE_PLAYWRIGHT_BROWSER=1`, so the browser tests fail loudly
+there rather than skipping. It no-ops on a local checkout
+(`CLAUDE_CODE_REMOTE`), which keeps whatever environment the developer set
+up.
+
+The hook runs asynchronously: the session starts immediately and the install
+lands a few seconds later, so a `ModuleNotFoundError` for numpy or playwright
+in the first moments of a session means the install is still in flight — wait
+and retry rather than installing by hand. It skips the reinstall on a compact
+or a clear, which keep the same container.
 
 ## Before committing and pushing
 

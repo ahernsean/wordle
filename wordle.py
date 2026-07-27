@@ -7,12 +7,14 @@ When running a single game, redundant prompts are skipped
 for a streamlined experience.
 """
 
+import codecs
 import os
 import sys
 import shutil
 import sqlite3
 import logging
 import platform
+import select
 import threading
 import time
 from collections import defaultdict
@@ -23,6 +25,13 @@ try:
     import console  # Pythonista
 except ImportError:
     console = None
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Pythonista and other non-POSIX consoles
+    termios = None
+    tty = None
 
 import wordle_engine
 import pattern_matrix as pattern_matrix_module
@@ -49,7 +58,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = "wordle_debug.log"
-BUILD = "b136"
+BUILD = "b137"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -310,6 +319,158 @@ def print_error(msg):
 def print_success(msg):
     with colored_text("green"):
         print(msg)
+
+
+# ---------------------------------------------------------------------------
+# Prompts offering a default
+# ---------------------------------------------------------------------------
+
+def _ghost_default_supported():
+    """True when the default can be drawn as gray placeholder text.
+
+    Needs a POSIX tty on both ends (raw mode for character-at-a-time reads,
+    cursor control to park the cursor at the start of the placeholder) plus
+    ANSI color for the gray itself.
+    """
+    if termios is None or IS_PYTHONISTA or not SUPPORTS_COLOR:
+        return False
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def input_with_default(prompt, default):
+    """Read a line, substituting `default` when the entry is empty.
+
+    On a capable terminal the default appears in gray at the cursor and
+    vanishes as soon as anything is typed; elsewhere it is offered as
+    `[default]` in the prompt text.  `default` of None or '' just prompts.
+    """
+    if not default:
+        print(prompt, end="")
+        return input()
+    if not _ghost_default_supported():
+        print(f'{prompt}[{default}] ', end="")
+        return input() or default
+    return _read_line_with_ghost(prompt, default)
+
+
+def _pending_key(fd, timeout=0.05):
+    """The next key if one is already on its way, else ''."""
+    if not select.select([fd], [], [], timeout)[0]:
+        return ''
+    return os.read(fd, 1).decode('utf-8', errors='ignore')
+
+
+def _drain_escape(fd):
+    """Swallow the bytes trailing an ESC — arrow keys, Home, function keys —
+    so they are not mistaken for typed letters.
+
+    Consumes one control sequence: an introducer (CSI '[' or SS3 'O') and
+    everything up to and including a final byte in 0x40-0x7E.  Returns '',
+    unless the key after the ESC was no introducer at all — a bare Escape
+    keypress followed by ordinary typing — in which case that key is handed
+    back for the caller to act on rather than eaten.
+    """
+    ch = _pending_key(fd)
+    if ch not in ('[', 'O'):
+        return ch
+    while True:
+        ch = _pending_key(fd)
+        if not ch or '\x40' <= ch <= '\x7e':
+            return ''
+
+
+def _read_line_with_ghost(prompt, ghost):
+    """Read a line in raw mode with `ghost` shown as gray placeholder text.
+
+    The placeholder occupies the space the entry will fill, with the cursor
+    on its first character; it is gone from the moment the line is non-empty
+    and back again whenever editing empties it.  Enter on an empty line
+    returns `ghost`.
+    """
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    typed = []
+    accepted = False
+    decoder = codecs.getincrementaldecoder('utf-8')()
+
+    def redraw():
+        # Rewrite from column 0 rather than tracking cursor deltas: the
+        # prompt and a five-letter word always fit one line.
+        line = ['\r\033[K', prompt, ''.join(typed)]
+        if not typed:
+            line.append(f"{ANSI_COLORS['gray']}{ghost}{ANSI_RESET}"
+                        f'\033[{len(ghost)}D')
+        sys.stdout.write(''.join(line))
+        sys.stdout.flush()
+
+    try:
+        # cbreak, not raw: keys arrive one at a time and unechoed, while
+        # output post-processing stays on, so a background solver thread that
+        # prints a heartbeat here still gets properly terminated lines.
+        # TCSANOW, not tty.setcbreak's TCSAFLUSH default: a player who types
+        # the whole guess ahead of the prompt keeps it, as with input().
+        tty.setcbreak(fd, termios.TCSANOW)
+        redraw()
+        pushback = ''
+        while True:
+            if pushback:
+                ch, pushback = pushback, ''
+            else:
+                # A single byte off a UTF-8 multi-byte character decodes to
+                # '' too -- the same string a closed stream reads as. Read
+                # raw bytes and let the incremental decoder tell them apart:
+                # only a genuinely empty os.read is end of input; a '' from
+                # the decoder means more bytes of this character are coming.
+                raw = os.read(fd, 1)
+                if not raw:
+                    raise EOFError
+                try:
+                    ch = decoder.decode(raw)
+                except UnicodeDecodeError:
+                    decoder.reset()
+                    continue
+                if not ch:
+                    continue
+            if ch == '\x04' and not typed:
+                raise EOFError
+            if ch in ('\r', '\n'):
+                accepted = True
+                break
+            if ch == '\x03':
+                raise KeyboardInterrupt
+            if ch in ('\x7f', '\x08'):
+                if typed:
+                    typed.pop()
+                    redraw()
+            elif ch == '\x15':  # ctrl-U clears the entry
+                if typed:
+                    del typed[:]
+                    redraw()
+            elif ch == '\x1b':
+                pushback = _drain_escape(fd)
+            elif ch.isprintable():
+                typed.append(ch)
+                redraw()
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        except termios.error:
+            # The stream hung up mid-read (EOFError above): fd is already
+            # gone, so there is no terminal mode left to restore.
+            pass
+        # Leave the transcript reading as though the value taken had been
+        # typed — the default still gray, so it stays visible that it came
+        # from the placeholder.  An abandoned line (interrupt, end of input)
+        # keeps whatever was actually typed.
+        entry = ''.join(typed)
+        if accepted and not entry:
+            entry = f"{ANSI_COLORS['gray']}{ghost}{ANSI_RESET}"
+        sys.stdout.write(f'\r\033[K{prompt}{entry}\n')
+        sys.stdout.flush()
+    return ''.join(typed) or ghost
 
 
 # ---------------------------------------------------------------------------
@@ -780,8 +941,18 @@ def cmd_guess(gs):
         else:
             local_solns = [(key, val)]
 
-    print("Word to guess? ", end="")
-    try_word = input().strip().lower()
+    # A known best-ERD word is the guess the player is being advised to
+    # play, so it is what a bare Enter plays.  Only a single solution has
+    # one: across several boards the best guess differs per board, and the
+    # prompt takes one word for all of them.
+    default_guess = None
+    if len(local_solns) == 1:
+        hit = _best_erd_guess(gs, local_solns[0][1])
+        if hit is not None:
+            default_guess = hit[0]
+
+    try_word = input_with_default(
+        "Word to guess? ", default_guess).strip().lower()
     if len(try_word) != 5:
         print_error("Word must be 5 letters.")
         return
@@ -1033,6 +1204,22 @@ def _erd_cache_and_policy(gs, soln):
     """
     cfg = _erd_mode_config(gs)
     return cfg.cache(gs, soln), cfg.policy
+
+
+def _best_erd_guess(gs, soln):
+    """The cached (word, ERD) for a solution's current branch, or None when
+    no ERD is known for it yet.
+
+    This is the value print_status tags the status line with, and the guess
+    a bare Enter at the guess prompt plays.
+    """
+    words = soln.current_words
+    if len(words) < 2:
+        return None
+    score_cache, policy = _erd_cache_and_policy(gs, soln)
+    if score_cache is None:
+        return None
+    return score_cache.read(ScoreCache.encode_subset(words), policy)
 
 
 def _format_cache_timestamp(mtime):
@@ -2341,7 +2528,7 @@ def cmd_help(gs):
     la_rows, ws_rows, rd_rows, mtime = lc.stats()
     cache_ts = _format_cache_timestamp(mtime)
     print(f"""
-  g = Guess a word
+  g = Guess a word (Enter alone plays the best ERD word, when known)
   s = Solve (find best guess)
   b = Board (entropy vs max group size)
   l = Lookahead (two-step entropy)
@@ -2464,19 +2651,17 @@ def print_status(gs, solver=None):
             label = "guess" if nguesses == 1 else "guesses"
             line = f"{n:,} words left | {nguesses} {label} so far"
             scan_lines = []
-            erd_sc, erd_pol = _erd_cache_and_policy(gs, soln)
-            if erd_sc is not None:
-                hit = erd_sc.read(ScoreCache.encode_subset(words), erd_pol)
-                if hit is not None:
-                    line += f' | {hit[1]:.3f} {hit[0].upper()}'
-                elif solver is not None and set(solver._words) == set(words):
-                    if solver.root_total == 0:
-                        scan_lines = ['ERD: ordering candidates...']
-                    elif solver.root_total > 0:
-                        scan_lines = _format_scan_progress(
-                            solver.root_done, solver.root_total,
-                            solver.root_best, solver.culled,
-                            solver.current_word_tag(), suffix=' cands')
+            hit = _best_erd_guess(gs, soln)
+            if hit is not None:
+                line += f' | {hit[1]:.3f} {hit[0].upper()}'
+            elif solver is not None and set(solver._words) == set(words):
+                if solver.root_total == 0:
+                    scan_lines = ['ERD: ordering candidates...']
+                elif solver.root_total > 0:
+                    scan_lines = _format_scan_progress(
+                        solver.root_done, solver.root_total,
+                        solver.root_best, solver.culled,
+                        solver.current_word_tag(), suffix=' cands')
             # Scoring method cache status: one LIMIT 1 probe per method.
             if soln.score_cache is not None:
                 branch_key = ScoreCache.encode_subset(words)
