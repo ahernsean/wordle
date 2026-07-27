@@ -706,12 +706,9 @@ def _branch_columns(display_order):
             required=True,
         ),
         TerminalColumn("GuessD", "guess_depth", required=True, alignment="right"),
-        TerminalColumn("State", "display_state", required=True),
+        TerminalColumn("Phase", "display_phase", required=True),
         TerminalColumn(
-            "Done", lambda row: (
-                f"{row['completed_candidate_count']}/"
-                f"{row['candidate_count'] if row['candidate_count'] is not None else '—'}"
-            ), required=True, alignment="right",
+            "Done", _display_done, required=True, alignment="right",
             highlight_rule=_count_increase_rule("completed_candidate_count"),
         ),
         TerminalColumn("W", "worker_count", required=True, alignment="right"),
@@ -740,6 +737,12 @@ def _branch_columns(display_order):
     return columns
 
 
+def _display_done(row):
+    candidate_count = row["candidate_count"]
+    total = f"{candidate_count:,}" if candidate_count is not None else "—"
+    return f"{row['completed_candidate_count']:,}/{total}"
+
+
 def _display_best(row):
     if not row.get("best_guess"):
         return "—"
@@ -756,9 +759,9 @@ def _branch_display_row(branch, generated_at, display_order):
     branch_row["display_hotkey"] = _hotkey_label(
         display_order, branch["branch_key_hex"]
     )
-    branch_row["display_state"] = {
+    branch_row["display_phase"] = {
         "finalizing": "final",
-    }.get(branch["branch_status"], branch["branch_status"])
+    }.get(branch["branch_phase"], branch["branch_phase"] or "—")
     branch_row["display_best"] = _display_best(branch)
     branch_row["display_eta"] = _abbreviate_duration(
         _branch_eta(branch, generated_at)
