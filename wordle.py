@@ -57,7 +57,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = "wordle_debug.log"
-BUILD = "b136"
+BUILD = "b137"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
