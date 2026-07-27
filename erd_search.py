@@ -18,7 +18,8 @@ restart         Restart the supervisor and the report web server via systemd
 view            Shared swarm reports in text, JSON, or watched JSON Lines.
 
 run             Start the supervisor directly (without systemd), for
-                development or one-shot use.  All output goes to erd_search.log.
+                development or one-shot use.  All output goes to
+                runtime/erd_search.log.
 
 queue           Queue mutation operations.
 queue add       Add branches for a word or word list to the work queue.
@@ -79,6 +80,8 @@ from runtime_paths import (
     DEFAULT_CACHE_PATH,
     DEFAULT_CANDIDATE_LIST_PATH,
     DEFAULT_QUEUE_PATH,
+    DEFAULT_SEARCH_LOG_PATH,
+    ensure_runtime_dir,
 )
 from wordle_engine import ERD_ALL, ResponseCache, load_word_list
 from erd_queue import (
@@ -622,7 +625,7 @@ def _enforce_wal_hard_ceiling(queue, procs) -> bool:
     logger.critical(
         'Queue WAL %.2f GB breached hard ceiling %.2f GB — TRUNCATE never '
         'reclaimed it. Latching swarm down before the disk fills. Per-table '
-        'WAL attribution and worker stacks are in the erd_worker_*.log files.',
+        'WAL attribution and worker stacks are in the runtime/erd_worker_*.log files.',
         wal_bytes / 1e9, QUEUE_WAL_HARD_CEILING_BYTES / 1e9)
     now = time.time()
     for h in queue.heartbeats_with_branch():
@@ -826,8 +829,7 @@ def _spawn_worker(worker_id: int, args, stop_event):
 
 
 def _setup_supervisor_logging():
-    log_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'erd_search.log')
+    log_path = DEFAULT_SEARCH_LOG_PATH
     h = logging.FileHandler(log_path)
     h.setFormatter(logging.Formatter(
         '%(asctime)s %(levelname)-7s %(message)s'))
@@ -1155,6 +1157,7 @@ def main():
     p_epoch_set.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
     args = parser.parse_args()
+    ensure_runtime_dir()
     if args.cmd == 'view' and args.format == 'json' and args.watch is not None:
         parser.error('--format json cannot be used with --watch; use jsonl')
     if args.cmd == 'view':

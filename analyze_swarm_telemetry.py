@@ -30,6 +30,7 @@ import statistics
 import sqlite3
 
 from erd_queue import cost_size_bucket, _COST_MODEL_MIN_WEIGHT, _AGGREGATE_BUDGET
+from runtime_paths import DEFAULT_QUEUE_PATH
 from wordle_engine import (ERD_ALL, estimate_candidate_work,
                            estimate_candidate_work_cutoff)
 
@@ -199,7 +200,7 @@ def estimate_claim_reduction(conn, epoch, small_count, count_cap):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--queue", default="erd_queue.sqlite3")
+    ap.add_argument("--queue", default=DEFAULT_QUEUE_PATH)
     ap.add_argument("--epoch", type=int, default=0)
     ap.add_argument("--small-nodes", type=int, default=10)
     ap.add_argument("--strong", type=float, default=0.5)

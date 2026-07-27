@@ -319,11 +319,11 @@ class TestLoadOrBuild(unittest.TestCase):
         self.addCleanup(self.score_cache.close)
 
     def _expected_matrix_path(self):
-        from pattern_matrix import _compute_guess_vocabulary_id
+        from pattern_matrix import _compute_guess_vocabulary_id, _matrix_filename
         return os.path.join(
             self._tmp.name,
-            f"pattern_matrix_{self.score_cache.answer_list_id}"
-            f"_{_compute_guess_vocabulary_id(self.guess_words)}.npy")
+            _matrix_filename(self.score_cache.answer_list_id,
+                             _compute_guess_vocabulary_id(self.guess_words)) + ".npy")
 
     def test_cold_start_builds_and_persists(self):
         self.assertFalse(os.path.exists(self._expected_matrix_path()))

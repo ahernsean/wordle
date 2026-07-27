@@ -42,6 +42,17 @@ def _compute_guess_vocabulary_id(guess_words):
     return hashlib.sha256("\n".join(guess_words).encode()).hexdigest()
 
 
+# Hex characters of each SHA-256 id kept in the matrix filename: 64 bits of
+# entropy, far beyond the collision risk for the handful of answer-list and
+# guess-vocabulary identities this project ever has in play at once.
+_FILENAME_HASH_LENGTH = 16
+
+
+def _matrix_filename(answer_list_id, guess_vocabulary_id):
+    return (f'pattern_matrix_{answer_list_id[:_FILENAME_HASH_LENGTH]}'
+            f'_{guess_vocabulary_id[:_FILENAME_HASH_LENGTH]}')
+
+
 def _stable_pattern_segments(pattern_values):
     """Split pattern_values into contiguous same-value runs via a stable
     mergesort argsort, returning (sorted_order, sorted_patterns, segment_starts,
@@ -135,23 +146,23 @@ class PatternMatrix:
         """This process's PatternMatrix: load()ed from disk, or build()+save()d
         on a miss.
 
-        The .npy path sits alongside cache_path and embeds both the
-        answer-list identity and the guess-vocabulary identity, so neither a
-        different answer universe nor a different (or reordered) guess list
-        of the same length ever loads a stale matrix — the load() shape
-        check alone only catches a different row/column *count*, not two
-        same-size, different-content vocabularies. Multiple processes (swarm
-        workers, an interactive session) may race to build on a cold start or
-        a rebuild; each writes to its own PID-suffixed temp file and renames
-        into place, so a racing build only wastes CPU — it can never
-        truncate a file another process still has mmap'd, which an in-place
-        save() could.
+        The .npy path sits alongside cache_path and embeds a prefix of both
+        the answer-list identity and the guess-vocabulary identity, so
+        neither a different answer universe nor a different (or reordered)
+        guess list of the same length ever loads a stale matrix — the
+        load() shape check alone only catches a different row/column
+        *count*, not two same-size, different-content vocabularies.
+        Multiple processes (swarm workers, an interactive session) may race
+        to build on a cold start or a rebuild; each writes to its own
+        PID-suffixed temp file and renames into place, so a racing build
+        only wastes CPU — it can never truncate a file another process
+        still has mmap'd, which an in-place save() could.
         """
         matrix_dir = os.path.dirname(os.path.abspath(cache_path))
         matrix_path = os.path.join(
             matrix_dir,
-            f'pattern_matrix_{score_cache.answer_list_id}'
-            f'_{_compute_guess_vocabulary_id(guess_words)}')
+            _matrix_filename(score_cache.answer_list_id,
+                             _compute_guess_vocabulary_id(guess_words)))
         matrix = cls.load(matrix_path, guess_words, answer_words)
         if matrix is not None:
             return matrix

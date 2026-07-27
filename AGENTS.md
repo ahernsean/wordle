@@ -331,14 +331,14 @@ tension to the user instead.
 
 ## Schema coordination (Linux + phone)
 
-The cache (`wordle_cache.sqlite3`) is shared between Linux and the iOS app. Any
-schema change must:
+The cache (`runtime/wordle_cache.sqlite3`) is shared between Linux and the iOS
+app. Any schema change must:
 1. Be implemented as an idempotent migration in `ScoreCache._ensure_schema`,
    guarded by the `schema_migrations` table
 2. Deploy new code to the phone **before** syncing a migrated Linux database to it
 3. Never require manual SQL — migrations run automatically on first open
 
-The queue (`erd_queue.sqlite3`) is Linux-only; its migrations live in
+The queue (`runtime/erd_queue.sqlite3`) is Linux-only; its migrations live in
 `ERDQueue._migrate()`.
 
 ---

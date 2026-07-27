@@ -4,12 +4,12 @@ The ERD_ALL precache is built by `erd_search.py`, a CLI that manages a
 supervisor process and its worker pool.  All commands run from the `wordle/`
 directory with `python3.13 erd_search.py <subcommand>`.
 
-Two SQLite files are involved:
+Two SQLite files are involved, both under `runtime/`:
 
 | File | Purpose |
 |---|---|
-| `wordle_cache.sqlite3` | Durable ERD results; shared with the iPhone |
-| `erd_queue.sqlite3` | Transient coordination only (queue, candidate claims, heartbeats) |
+| `runtime/wordle_cache.sqlite3` | Durable ERD results; shared with the iPhone |
+| `runtime/erd_queue.sqlite3` | Transient coordination only (queue, candidate claims, heartbeats) |
 
 `queue clear` wipes only the queue file — the cache is never touched by any
 queue command.
@@ -68,7 +68,7 @@ cleanly.  The supervisor waits up to 120 s before killing stragglers.
 python3.13 erd_search.py run --workers 6
 ```
 
-Output goes to `erd_search.log`.  Ctrl-C signals a clean shutdown identical to
+Output goes to `runtime/erd_search.log`.  Ctrl-C signals a clean shutdown identical to
 SIGTERM.  Useful flags:
 
 | Flag | Default | Effect |
@@ -145,12 +145,12 @@ only extant queue topology; cache rows never reconstruct historical trees.
 
 | File | Content |
 |---|---|
-| `erd_search.log` | Supervisor spawn, recycle, and queue-empty events |
-| `erd_worker_N.log` | Per-worker candidate timing, finalize events, and RAM warnings |
+| `runtime/erd_search.log` | Supervisor spawn, recycle, and queue-empty events |
+| `runtime/erd_worker_N.log` | Per-worker candidate timing, finalize events, and RAM warnings |
 
 ```bash
-tail -f erd_search.log
-tail -f erd_worker_0.log
+tail -f runtime/erd_search.log
+tail -f runtime/erd_worker_0.log
 ```
 
 ---
@@ -302,7 +302,7 @@ python3.13 erd_search.py queue clear --yes # skip prompt
 ```
 
 Wipes pending, in-progress, done branches, candidate claims, heartbeats, and run
-metadata.  The ERD cache (`wordle_cache.sqlite3`) is not touched.
+metadata.  The ERD cache (`runtime/wordle_cache.sqlite3`) is not touched.
 
 ### Reset stuck in-progress rows
 
@@ -339,7 +339,7 @@ incremental (INSERT OR IGNORE skips rows already present).
 ### Import a cache from another machine
 
 ```bash
-python3.13 import_cache.py <source_db> [--target wordle_cache.sqlite3] [--dry-run]
+python3.13 import_cache.py <source_db> [--target runtime/wordle_cache.sqlite3] [--dry-run]
 ```
 
 Creates the target cache if it doesn't exist yet, or merges into it if it

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.13
-"""import_cache.py — Import a source wordle_cache.sqlite3 into the local one.
+"""import_cache.py — Import a source wordle_cache.sqlite3 into runtime/wordle_cache.sqlite3.
 
 Usage
 -----
@@ -50,7 +50,7 @@ import time
 from cache_sqlite import ScoreCache
 from wordle_engine import load_word_list
 
-from runtime_paths import DEFAULT_ANSWER_LIST_PATH
+from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CACHE_PATH, ensure_runtime_dir
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 BATCH = 20000   # rows per progress step / commit
@@ -62,7 +62,7 @@ TABLES = [
     'candidate_scores',
 ]
 
-DEFAULT_TARGET = 'wordle_cache.sqlite3'
+DEFAULT_TARGET = DEFAULT_CACHE_PATH
 
 # Columns the untainted-preference UPSERT for branch_best_by_policy needs.
 _ERD_UPSERT_COLS = {'branch_key', 'policy', 'answer_list_id', 'solve_budget',
@@ -232,6 +232,7 @@ def main():  # pragma: no cover
                         help='Keep the source file after a successful merge '
                              '(the default deletes it)')
     args = parser.parse_args()
+    ensure_runtime_dir()
 
     if not os.path.exists(args.source):
         # ATTACH would silently create an empty database for a missing path,

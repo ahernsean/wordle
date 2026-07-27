@@ -52,12 +52,18 @@ from wordle_engine import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+from runtime_paths import (
+    DEFAULT_ANSWER_LIST_PATH,
+    DEFAULT_CACHE_PATH,
+    DEFAULT_CANDIDATE_LIST_PATH,
+    DEFAULT_DEBUG_LOG_PATH,
+    ensure_runtime_dir,
+)
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
-LOG_FILE = "wordle_debug.log"
+LOG_FILE = DEFAULT_DEBUG_LOG_PATH
 BUILD = "b137"
 
 # Diagnostic log for background solver threads (ERDSolver,
@@ -833,9 +839,10 @@ class GameState:
     """Shared state for all command handlers."""
 
     def __init__(self, all_answers, all_words):
+        ensure_runtime_dir()
         self.all_answers = all_answers
         self.all_words = all_words
-        self.score_cache_path = os.path.abspath("wordle_cache.sqlite3")
+        self.score_cache_path = os.path.abspath(DEFAULT_CACHE_PATH)
         self.score_cache = ScoreCache(
             self.score_cache_path,
             all_answers,
@@ -3282,6 +3289,7 @@ class BranchPrecacheSolver(threading.Thread):
 
 
 def main():  # pragma: no cover - interactive REPL loop, exercised manually
+    ensure_runtime_dir()
     log_path = os.path.abspath(LOG_FILE)
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(logging.Formatter(

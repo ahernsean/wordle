@@ -212,7 +212,8 @@ One `ResponseCache` instance is shared across all `Solution` objects for the ses
 
 ## ScoreCache (SQLite)
 
-Defined in `cache_sqlite.py`. Shared between Linux and the iOS app via iCloud sync.
+Defined in `cache_sqlite.py`. Shared between Linux and the iOS app via a Tailscale
+export/import snapshot (`export_cache.py` / `import_cache.py`), not a live-synced file.
 
 ```python
 class ScoreCache:
@@ -278,7 +279,9 @@ depth-limited queries and recomputed.
 
 ### Schema coordination (Linux + phone)
 
-The cache file is synced via iCloud between Linux and the iOS Pythonista app. Any schema change must:
+The cache is exchanged between Linux and the iOS Pythonista app as a trimmed
+Tailscale-transferred snapshot (`export_cache.py` on Linux, `import_cache.py` on the
+phone), not synced live. Any schema change must:
 1. Be implemented as an idempotent migration in `ScoreCache._ensure_schema`, guarded by `schema_migrations`
 2. Deploy new code to the phone **before** syncing a migrated Linux database to it
 3. Never require manual SQL — migrations run automatically on first open
@@ -332,14 +335,15 @@ against a branch is slow, multiple workers cooperate:
 
 ### Architecture
 
-- `erd_queue.sqlite3` — coordination-only database (separate from `wordle_cache.sqlite3`
-  to avoid contention). Contains the `pending_subgroups` table of branches to solve,
-  candidate claims, heartbeats, and done flags.
+- `runtime/erd_queue.sqlite3` — coordination-only database (separate from
+  `runtime/wordle_cache.sqlite3` to avoid contention). Contains the `pending_subgroups`
+  table of branches to solve, candidate claims, heartbeats, and done flags.
 - `_BranchWorker` (`erd_swarm.py`) — one per OS process. Claims one candidate at a time,
-  evaluates it, writes sub-branch results to `wordle_cache.sqlite3`, and updates claim
-  state in `erd_queue.sqlite3`.
-- `ERDQueue` (`erd_queue.py`) — single writer to `erd_queue.sqlite3`. Used by workers to
-  claim candidates, record heartbeats, mark claims done, and promote large sub-branches to the queue.
+  evaluates it, writes sub-branch results to `runtime/wordle_cache.sqlite3`, and updates
+  claim state in `runtime/erd_queue.sqlite3`.
+- `ERDQueue` (`erd_queue.py`) — single writer to `runtime/erd_queue.sqlite3`. Used by
+  workers to claim candidates, record heartbeats, mark claims done, and promote large
+  sub-branches to the queue.
 
 ### Branch lifecycle
 

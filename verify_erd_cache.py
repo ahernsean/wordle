@@ -36,12 +36,18 @@ from wordle_engine import ERD_ALL, ResponseCache, load_word_list, _ALL_GREEN_PAT
 from erd_queue import decode_subset
 from erd_swarm import ROOT_BUDGET
 
-from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+from runtime_paths import (
+    DEFAULT_ANSWER_LIST_PATH,
+    DEFAULT_CACHE_PATH,
+    DEFAULT_CANDIDATE_LIST_PATH,
+    DEFAULT_VERIFY_CACHE_LOG_PATH,
+    ensure_runtime_dir,
+)
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
-DEFAULT_CACHE = 'wordle_cache.sqlite3'
-DEFAULT_LOG = 'verify_erd_cache.log'
+DEFAULT_CACHE = DEFAULT_CACHE_PATH
+DEFAULT_LOG = DEFAULT_VERIFY_CACHE_LOG_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +243,7 @@ def main():
                              'smaller waves are already verified; appends to '
                              'the existing log.  (default: 2 = full run)')
     args = parser.parse_args()
+    ensure_runtime_dir()
 
     print(f'Cache    : {os.path.abspath(args.cache)}')
     print(f'Log      : {os.path.abspath(args.log)}')

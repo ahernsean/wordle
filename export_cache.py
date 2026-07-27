@@ -32,7 +32,9 @@ import os
 import re
 import sqlite3
 
-DEFAULT_CACHE = 'wordle_cache.sqlite3'
+from runtime_paths import DEFAULT_CACHE_PATH
+
+DEFAULT_CACHE = DEFAULT_CACHE_PATH
 DEFAULT_EXPORT = 'wordle_erd_export.sqlite3'
 
 EXPORT_TABLES = ['answer_list', 'response_decomposition',

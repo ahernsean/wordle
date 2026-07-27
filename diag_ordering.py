@@ -29,13 +29,18 @@ DEADLINE_S = 90.0
 ORDER_ON = 8
 ORDER_OFF = 10 ** 9   # gate so high ordering never triggers
 
-from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
+from runtime_paths import (
+    DEFAULT_ANSWER_LIST_PATH,
+    DEFAULT_CACHE_PATH,
+    DEFAULT_CANDIDATE_LIST_PATH,
+    DEFAULT_QUEUE_PATH,
+)
 
 answers = load_word_list(DEFAULT_ANSWER_LIST_PATH)
 vocab = load_word_list(DEFAULT_CANDIDATE_LIST_PATH)
 
 # Read branch keys (read-only), smallest-first, excluding the 238-word branch.
-q = sqlite3.connect('erd_queue.sqlite3', timeout=10); q.row_factory = sqlite3.Row
+q = sqlite3.connect(DEFAULT_QUEUE_PATH, timeout=10); q.row_factory = sqlite3.Row
 branches = []
 for sz in SIZES:
     row = q.execute("""SELECT branch_key, n_words FROM pending_branches
@@ -51,7 +56,7 @@ print(f'branches: {[n for _, n in branches]}  budget={BUDGET} deadline={DEADLINE
 cache_tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False); cache_tmp.close()
 ScoreCache(cache_tmp.name, answers).close()
 c = sqlite3.connect(cache_tmp.name)
-c.execute("ATTACH 'wordle_cache.sqlite3' AS prod")
+c.execute(f"ATTACH '{DEFAULT_CACHE_PATH}' AS prod")
 c.execute("INSERT OR IGNORE INTO response_decomposition SELECT * FROM prod.response_decomposition")
 c.commit(); c.execute("DETACH prod"); c.close()
 
