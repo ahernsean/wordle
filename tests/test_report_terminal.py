@@ -397,6 +397,60 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertNotIn("sources ok", output)
         self.assertIn("exact 200", output)
 
+    def _word_report(self, erd_summary):
+        report = overview_report()
+        report["report_kind"] = "word"
+        report["data"] = {
+            "word": "salet",
+            "word_is_answer": False,
+            "context": {
+                "branch_reference": "rootrootroot", "branch_key_hex": "root",
+                "spine": [], "guess_depth": 0, "answer_count": 20,
+            },
+            "response_group_counts": {
+                "response_group_count": erd_summary["response_group_count"],
+                "trivial_response_group_count": 0,
+                "queued_response_group_count": 0,
+                "active_response_group_count": 0,
+                "exact_response_group_count": 0,
+                "loss_response_group_count": 0,
+                "missing_response_group_count": 0,
+            },
+            "erd_summary": erd_summary,
+            "response_groups": [],
+        }
+        return report
+
+    def test_word_report_renders_complete_erd_and_rounds(self):
+        report = self._word_report({
+            "state": "complete", "erd": 3.564102564102564,
+            "max_remaining_depth": 6, "resolved_group_count": 4,
+            "infeasible_group_count": 0, "response_group_count": 4,
+        })
+        output = render_report(report, width=100)
+        self.assertIn("ERD 3.564  max-d=6", output)
+        self.assertNotIn("3.564102564102564", output)
+
+    def test_word_report_renders_pending_erd(self):
+        report = self._word_report({
+            "state": "pending", "erd": None, "max_remaining_depth": None,
+            "resolved_group_count": 2, "infeasible_group_count": 0,
+            "response_group_count": 4,
+        })
+        output = render_report(report, width=100)
+        self.assertIn("ERD pending — 2 of 4 response groups solved", output)
+
+    def test_word_report_renders_infeasible_erd(self):
+        report = self._word_report({
+            "state": "infeasible", "erd": None, "max_remaining_depth": None,
+            "resolved_group_count": 2, "infeasible_group_count": 1,
+            "response_group_count": 4,
+        })
+        output = render_report(report, width=100)
+        self.assertIn(
+            "ERD ∞ — 1 of 4 response groups unsolvable within budget", output
+        )
+
     def test_watched_word_groups_preserve_full_identity_order(self):
         first = overview_report()
         first["report_kind"] = "word"
@@ -418,6 +472,11 @@ class OverviewRendererTest(unittest.TestCase):
                 "exact_response_group_count": 0,
                 "loss_response_group_count": 0,
                 "missing_response_group_count": 2,
+            },
+            "erd_summary": {
+                "state": "pending", "erd": None, "max_remaining_depth": None,
+                "resolved_group_count": 0, "infeasible_group_count": 0,
+                "response_group_count": 2,
             },
             "response_groups": [
                 {

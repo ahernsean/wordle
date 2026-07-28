@@ -836,7 +836,10 @@ def _mark_queue_source_error(report, error):
     report["sources"]["telemetry"]["error"] = message
 
 
-def _candidate_erd_summary(response_groups):
+_ALL_GREEN_PATTERN_TEXT = fmt_pattern(3 ** 5 - 1)
+
+
+def _candidate_erd_summary(response_groups, group_budget):
     """Fold a candidate's response groups into its own ERD and worst-case line.
 
     Playing the candidate spends one guess from this branch's budget; each
@@ -844,13 +847,16 @@ def _candidate_erd_summary(response_groups):
     answer-weighted mean of the groups' ERDs plus one, and its worst-case line
     is the deepest group line plus one.  A single remaining answer is solved by
     playing it (one more guess) unless the candidate itself was the answer
-    (all-green response, zero more guesses).
+    (all-green response, zero more guesses) — but that one guess needs a guess
+    left, so with `group_budget < 1` a lone survivor is a proven loss, matching
+    `wordle_engine.evaluate_candidate`, which checks the budget floor before its
+    n == 1 shortcut.
 
     The fold reports one of three states.  It is `complete` — an exact ERD and
     worst-case line — only once every group is solved.  A group proven
-    unsolvable within budget (a loss) makes the candidate `infeasible`: its ERD
-    is unbounded and no further search changes that.  A group still being
-    searched leaves the candidate `pending`.
+    unsolvable within budget (a loss, or a lone survivor with no guess left)
+    makes the candidate `infeasible`: its ERD is unbounded and no further search
+    changes that.  A group still being searched leaves the candidate `pending`.
     """
     total_answers = sum(group["answer_count"] for group in response_groups)
     weighted_remaining_depth = 0.0
@@ -863,10 +869,13 @@ def _candidate_erd_summary(response_groups):
         max_remaining_depth = group["max_remaining_depth"]
         if best_erd is None:
             if group["answer_count"] < 2:
-                solved_by_candidate = group["pattern"] == "ggggg"
+                solved_by_candidate = group["pattern"] == _ALL_GREEN_PATTERN_TEXT
+                if not solved_by_candidate and group_budget < 1:
+                    infeasible_group_count += 1
+                    continue
                 best_erd = 0.0 if solved_by_candidate else 1.0
                 max_remaining_depth = 0 if solved_by_candidate else 1
-            elif group.get("cache_state") == "loss":
+            elif group["cache_state"] == "loss":
                 infeasible_group_count += 1
                 continue
             else:
@@ -1064,7 +1073,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             row["cache_state"] == "missing" for row in all_response_groups
         ),
     }
-    data["erd_summary"] = _candidate_erd_summary(all_response_groups)
+    data["erd_summary"] = _candidate_erd_summary(all_response_groups, group_budget)
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = (
@@ -1779,7 +1788,7 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
                     "max_remaining_depth": state["max_remaining_depth"],
                     "cache_state": state["cache_state"],
                 })
-            summary = _candidate_erd_summary(response_groups)
+            summary = _candidate_erd_summary(response_groups, group_budget)
             counts[summary["state"]] += 1
             if summary["state"] == "complete":
                 ranked_rows.append({
