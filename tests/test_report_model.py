@@ -24,7 +24,7 @@ from report_model import (
     parse_rich_spine,
     parse_report_branch_target,
 )
-from wordle_engine import ERD_ALL
+from wordle_engine import ERD_ALL, GAME_GUESSES
 
 
 ANSWERS = ["salet", "crane", "nurdy", "khaki"]
@@ -73,7 +73,7 @@ class ReportModelTest(unittest.TestCase):
             self._group("-----", 8, 2.1, 3),
             self._group("----g", 2, 1.5, 2),
             self._group("ggggg", 1, None, None),
-        ])
+        ], 5)
         # 1 (the candidate's own guess) + weighted mean of remaining depth; the
         # all-green group is the candidate itself, contributing zero.
         self.assertEqual(summary["state"], "complete")
@@ -87,7 +87,7 @@ class ReportModelTest(unittest.TestCase):
             self._group("-----", 8, 2.1, 3),
             self._group("y----", 5, None, None, cache_state="missing"),
             self._group("ggggg", 1, None, None),
-        ])
+        ], 5)
         self.assertEqual(summary["state"], "pending")
         self.assertIsNone(summary["erd"])
         self.assertIsNone(summary["max_remaining_depth"])
@@ -100,7 +100,7 @@ class ReportModelTest(unittest.TestCase):
             self._group("-----", 8, 2.1, 3),
             self._group("yy---", 5, None, None, cache_state="loss"),
             self._group("-y---", 3, None, None, cache_state="missing"),
-        ])
+        ], 5)
         # A proven loss has no finite line: infeasible, not pending, and it
         # dominates a still-unsolved group.
         self.assertEqual(summary["state"], "infeasible")
@@ -109,10 +109,23 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["infeasible_group_count"], 1)
 
     def test_candidate_erd_summary_solves_a_lone_survivor_in_one_more_guess(self):
-        summary = _candidate_erd_summary([self._group("----y", 1, None, None)])
+        summary = _candidate_erd_summary([self._group("----y", 1, None, None)], 5)
         self.assertEqual(summary["state"], "complete")
         self.assertEqual(summary["erd"], 2.0)
         self.assertEqual(summary["max_remaining_depth"], 2)
+
+    def test_candidate_erd_summary_lone_survivor_is_infeasible_with_no_guess_left(self):
+        # A lone survivor needs one guess to play; at group_budget 0 there is no
+        # guess left, so it is a proven loss — matching evaluate_candidate's
+        # budget floor, checked before its n == 1 shortcut.
+        summary = _candidate_erd_summary([self._group("----y", 1, None, None)], 0)
+        self.assertEqual(summary["state"], "infeasible")
+        self.assertEqual(summary["infeasible_group_count"], 1)
+        # The all-green group was already solved by the guess that reached it,
+        # so it stays complete even with no budget.
+        solved = _candidate_erd_summary([self._group("ggggg", 1, None, None)], 0)
+        self.assertEqual(solved["state"], "complete")
+        self.assertEqual(solved["erd"], 1.0)
 
     def test_collect_word_report_populates_candidate_erd_summary(self):
         request = ReportRequest(
@@ -126,6 +139,29 @@ class ReportModelTest(unittest.TestCase):
         })
         self.assertIn(summary["state"], {"complete", "pending", "infeasible"})
         # The fold walks every response group, not the filtered/limited view.
+        self.assertEqual(
+            summary["response_group_count"],
+            report["data"]["response_group_counts"]["response_group_count"],
+        )
+
+    def test_collect_word_report_folds_candidate_erd_below_the_root(self):
+        # A one-step spine: SALET/-y--- leaves {khaki}, and CRANE is the
+        # candidate folded at guess_depth 1.  The fold measures depth from this
+        # branch, not from the root — CRANE splits {khaki} into a lone survivor,
+        # so its ERD is 2.0 (play CRANE, then khaki), not the 3.0 a
+        # depth-from-root fold would give (SALET, CRANE, khaki).
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet -y--- crane"),
+        )
+        report = collect_report(self.sources, request)
+        context = report["data"]["context"]
+        self.assertEqual(context["guess_depth"], 1)
+        # The branch answer set is smaller than the full list.
+        self.assertLess(context["answer_count"], len(ANSWERS))
+        summary = report["data"]["erd_summary"]
+        self.assertEqual(summary["state"], "complete")
+        self.assertEqual(summary["erd"], 2.0)
+        self.assertLessEqual(summary["erd"], GAME_GUESSES - context["guess_depth"])
         self.assertEqual(
             summary["response_group_count"],
             report["data"]["response_group_counts"]["response_group_count"],
