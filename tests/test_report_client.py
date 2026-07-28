@@ -896,7 +896,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # reached phone widths overflowing because it was never measured here.
         for path in (
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
-            "?kind=queue&tree=1", "?branch_target=RAISE+.....",
+            "?kind=leaderboard", "?kind=queue&tree=1", "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
         ):
             self.page.goto(self.base_url + path)
