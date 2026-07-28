@@ -230,6 +230,43 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual([row["rank"] for row in data["rows"]],
                          list(range(1, len(data["rows"]) + 1)))
 
+    def test_leaderboard_builds_matrix_beside_the_cache_not_the_cwd(self):
+        # load_or_build derives the matrix directory from the cache *path*;
+        # passing a directory would apply dirname twice and strand a .npy in the
+        # cwd while never finding the swarm's matrix.
+        import glob
+        import report_model
+        report_model._candidate_skeleton_memo = None
+        before = set(glob.glob("*.npy"))
+        sources = self._leaderboard_sources(["crane", "slate"], ["crane", "slate"])
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self.assertEqual(set(glob.glob("*.npy")), before)  # nothing stray in cwd
+        cache_directory = os.path.dirname(sources.cache_path)
+        self.assertTrue(glob.glob(os.path.join(cache_directory, "*.npy")))
+
+    def test_leaderboard_reports_honest_empty_on_cache_error(self):
+        # A mid-build cache failure must not publish a truncated ranking that
+        # reads as complete; the report is empty with the error on the source.
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise"]
+        )
+        with patch.object(
+            ScoreCache, "report_branch_row_maps",
+            side_effect=sqlite3.OperationalError("cache read failed"),
+        ):
+            report = collect_report(
+                sources, ReportRequest(report_kind="leaderboard")
+            )
+        self.assertFalse(report["sources"]["cache"]["ok"])
+        self.assertIn("cache read failed", report["sources"]["cache"]["error"])
+        data = report["data"]
+        self.assertEqual(data["rows"], [])
+        self.assertEqual(data["total_rows"], 0)
+        self.assertEqual(
+            data["counts"], {"complete": 0, "pending": 0, "infeasible": 0}
+        )
+        self.assertEqual(data["candidate_count"], 3)
+
     def test_rich_spine_parser_preserves_legacy_tuple_contract(self):
         path = "3:KHAKI:--y--/33→4:NURDY:---y-/17"
         expected = [

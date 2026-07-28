@@ -451,6 +451,49 @@ class OverviewRendererTest(unittest.TestCase):
             "ERD ∞ — 1 of 4 response groups unsolvable within budget", output
         )
 
+    @staticmethod
+    def _leaderboard_report(rows, counts):
+        report = overview_report()
+        report["report_kind"] = "leaderboard"
+        report["data"] = {
+            "candidate_count": 14855,
+            "counts": counts,
+            "total_rows": len(rows),
+            "matched_rows": len(rows),
+            "rows": rows,
+        }
+        return report
+
+    def test_leaderboard_report_renders_ranked_table_aligned(self):
+        report = self._leaderboard_report(
+            [
+                {"word": "salet", "word_is_answer": False, "erd": 3.5643502648,
+                 "max_remaining_depth": 6, "rank": 1},
+                {"word": "crane", "word_is_answer": True, "erd": 3.712,
+                 "max_remaining_depth": 5, "rank": 2},
+            ],
+            {"complete": 2, "pending": 14852, "infeasible": 1},
+        )
+        output = render_report(report, width=100)
+        self.assertIn("Opener leaderboard", output)
+        self.assertIn("complete 2", output)
+        self.assertIn("3.564", output)
+        self.assertNotIn("3.5643502648", output)
+        self.assertIn("CRANE*", output)  # word_is_answer renders the asterisk
+        # The MaxRD header column sits directly over its values.
+        lines = output.splitlines()
+        header = next(line for line in lines if "MaxRD" in line)
+        row = next(line for line in lines if line.strip().startswith("1")).rstrip()
+        value_column = len(row) - len(row.split()[-1])
+        self.assertEqual(header.index("MaxRD"), value_column)
+
+    def test_leaderboard_report_renders_empty_fallback(self):
+        report = self._leaderboard_report(
+            [], {"complete": 0, "pending": 14855, "infeasible": 0}
+        )
+        output = render_report(report, width=100)
+        self.assertIn("none complete yet", output)
+
     def test_watched_word_groups_preserve_full_identity_order(self):
         first = overview_report()
         first["report_kind"] = "word"
