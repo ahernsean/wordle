@@ -268,10 +268,16 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("CRANE*", text)  # word_is_answer renders the asterisk
 
     def test_slow_view_switch_shows_a_computing_notice(self):
-        # Hold the leaderboard response open so the slow-request timer fires on
-        # the view switch; the leaderboard folds every candidate and can take
-        # several seconds. The handler never resolves, so the request hangs.
-        self.page.route("**/api/view/leaderboard*", lambda route: None)
+        # Delay only the leaderboard fetch on the client so the slow-request
+        # timer fires on the view switch (the fold can take several seconds).
+        # The fetch still resolves, so nothing is left pending — unlike a hung
+        # route, which is cancelled at teardown and logs an asyncio error.
+        self.page.evaluate(
+            "() => { const real = window.fetch.bind(window);"
+            " window.fetch = (url, opts) => String(url).includes('/leaderboard')"
+            " ? new Promise(r => setTimeout(() => r(real(url, opts)), 4000))"
+            " : real(url, opts); }"
+        )
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector("text=Computing leaderboard…", timeout=5000)
 
