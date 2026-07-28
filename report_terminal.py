@@ -1115,6 +1115,21 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     ]
 
 
+def _base_word_groups(base_nodes):
+    """Base nodes in payload order, gathered under the word that was played.
+
+    A node with no recorded guess has no word to gather under and stands alone
+    under a None key.
+    """
+    groups = {}
+    for node in base_nodes:
+        step = node["step"]
+        word = step["word"] if step is not None else None
+        key = node["node_id"] if word is None else word
+        groups.setdefault(key, (word, []))[1].append(node)
+    return list(groups.values())
+
+
 def _render_tree_sections(report, width, display_order):
     data = report["data"]
     header = _semantic_header(report, "Live queue tree", width)
@@ -1132,29 +1147,19 @@ def _render_tree_sections(report, width, display_order):
                 node["branch_key_hex"] or "",
             ))
 
-        ordered_nodes = []
         visited_node_ids = set()
 
-        def append_node_and_descendants(node):
+        def append_node_and_descendants(node, level, carries_word=True):
             if node["node_id"] in visited_node_ids:
                 return
             visited_node_ids.add(node["node_id"])
-            ordered_nodes.append(node)
-            for child in children_by_parent.get(node["node_id"], []):
-                append_node_and_descendants(child)
-
-        for base_word in children_by_parent.get(None, []):
-            append_node_and_descendants(base_word)
-        for node in data["nodes"]:
-            if node["node_id"] not in visited_node_ids:
-                append_node_and_descendants(node)
-
-        for node in ordered_nodes:
-            indent = "  " * (node["guess_depth"] - 1)
             step = node["step"]
             label = "unknown"
             if step is not None:
-                label = f"{step['word'].upper()} {step['pattern']}"
+                label = (
+                    f"{step['word'].upper()} {step['pattern']}" if carries_word
+                    else step["pattern"]
+                )
             detail = ""
             if node["branch_reference"]:
                 detail = (
@@ -1166,7 +1171,27 @@ def _render_tree_sections(report, width, display_order):
                 detail += "  [context]"
             hotkey = _hotkey_label(display_order, node.get("branch_key_hex"))
             hotkey_prefix = f"{hotkey} " if hotkey else ""
-            lines.append(_fit(f"{indent}{hotkey_prefix}{label}{detail}", width))
+            lines.append(_fit(f"{'  ' * level}{hotkey_prefix}{label}{detail}", width))
+            for child in children_by_parent.get(node["node_id"], []):
+                append_node_and_descendants(child, level + 1)
+
+        # Every base word is a group, including the one-pattern case: the word
+        # is named once and its response patterns are the rows beneath it.
+        for word, group_nodes in _base_word_groups(children_by_parent.get(None, [])):
+            if word is None:
+                append_node_and_descendants(group_nodes[0], 0)
+                continue
+            branch_count = len(group_nodes)
+            lines.append(_fit(
+                f"{word.upper()}  {branch_count} "
+                f"{'branch' if branch_count == 1 else 'branches'}",
+                width,
+            ))
+            for node in group_nodes:
+                append_node_and_descendants(node, 1, carries_word=False)
+        for node in data["nodes"]:
+            if node["node_id"] not in visited_node_ids:
+                append_node_and_descendants(node, 0)
     return [("header", header), ("tree", lines)]
 
 

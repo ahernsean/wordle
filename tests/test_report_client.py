@@ -224,8 +224,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertGreater(base_words.count(), 0)
         self.assertEqual(
             base_words.count(),
-            self.page.locator("ul.tree > li > details > summary .step").count(),
+            self.page.locator("ul.tree > li.base-word").count(),
         )
+
+    def test_tree_groups_base_patterns_under_their_word(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#tree-button").click()
+        self.page.wait_for_selector("ul.tree > li.base-word")
+        group = self.page.locator("ul.tree > li.base-word")
+        self.assertEqual(group.count(), 1)
+        self.assertEqual(
+            " ".join(group.locator("> details > summary").inner_text().split()),
+            "RAISE 1 branch",
+        )
+        rows = group.locator("> details > ul > li")
+        self.assertEqual(rows.count(), 1)
+        # The group names the word, so its rows carry only the response pattern.
+        row_summary = rows.locator("> details > summary")
+        self.assertNotIn("RAISE", row_summary.inner_text())
+        self.assertEqual(row_summary.locator(".step").count(), 1)
 
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
