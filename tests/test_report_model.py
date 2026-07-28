@@ -16,7 +16,7 @@ from report_model import (
     ReportRequest,
     ReportSources,
     WORKER_LIVENESS_SECONDS,
-    _opener_erd_summary,
+    _candidate_erd_summary,
     branch_reference,
     collect_overview_report,
     collect_report,
@@ -58,45 +58,78 @@ class ReportModelTest(unittest.TestCase):
         return ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
 
     @staticmethod
-    def _group(pattern, answer_count, best_erd, max_remaining_depth):
+    def _group(pattern, answer_count, best_erd, max_remaining_depth,
+               cache_state="exact"):
         return {
             "pattern": pattern,
             "answer_count": answer_count,
             "best_erd": best_erd,
             "max_remaining_depth": max_remaining_depth,
+            "cache_state": cache_state,
         }
 
-    def test_opener_erd_summary_folds_solved_groups_with_opener_guess(self):
-        summary = _opener_erd_summary([
+    def test_candidate_erd_summary_folds_solved_groups_with_the_candidate_guess(self):
+        summary = _candidate_erd_summary([
             self._group("-----", 8, 2.1, 3),
             self._group("----g", 2, 1.5, 2),
             self._group("ggggg", 1, None, None),
         ])
-        # 1 (opener) + weighted mean of remaining depth; the all-green group is
-        # the opener itself, contributing zero remaining guesses.
-        self.assertTrue(summary["complete"])
+        # 1 (the candidate's own guess) + weighted mean of remaining depth; the
+        # all-green group is the candidate itself, contributing zero.
+        self.assertEqual(summary["state"], "complete")
         self.assertAlmostEqual(summary["erd"], 1.0 + (8 * 2.1 + 2 * 1.5) / 11)
         self.assertEqual(summary["max_remaining_depth"], 4)
         self.assertEqual(summary["resolved_group_count"], 3)
         self.assertEqual(summary["response_group_count"], 3)
 
-    def test_opener_erd_summary_is_incomplete_while_a_group_is_unsolved(self):
-        summary = _opener_erd_summary([
+    def test_candidate_erd_summary_is_pending_while_a_group_is_unsolved(self):
+        summary = _candidate_erd_summary([
             self._group("-----", 8, 2.1, 3),
-            self._group("y----", 5, None, None),
+            self._group("y----", 5, None, None, cache_state="missing"),
             self._group("ggggg", 1, None, None),
         ])
-        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["state"], "pending")
         self.assertIsNone(summary["erd"])
         self.assertIsNone(summary["max_remaining_depth"])
         self.assertEqual(summary["resolved_group_count"], 2)
+        self.assertEqual(summary["infeasible_group_count"], 0)
         self.assertEqual(summary["response_group_count"], 3)
 
-    def test_opener_erd_summary_solves_a_lone_survivor_in_one_more_guess(self):
-        summary = _opener_erd_summary([self._group("----y", 1, None, None)])
-        self.assertTrue(summary["complete"])
+    def test_candidate_erd_summary_is_infeasible_when_a_group_is_a_proven_loss(self):
+        summary = _candidate_erd_summary([
+            self._group("-----", 8, 2.1, 3),
+            self._group("yy---", 5, None, None, cache_state="loss"),
+            self._group("-y---", 3, None, None, cache_state="missing"),
+        ])
+        # A proven loss has no finite line: infeasible, not pending, and it
+        # dominates a still-unsolved group.
+        self.assertEqual(summary["state"], "infeasible")
+        self.assertIsNone(summary["erd"])
+        self.assertIsNone(summary["max_remaining_depth"])
+        self.assertEqual(summary["infeasible_group_count"], 1)
+
+    def test_candidate_erd_summary_solves_a_lone_survivor_in_one_more_guess(self):
+        summary = _candidate_erd_summary([self._group("----y", 1, None, None)])
+        self.assertEqual(summary["state"], "complete")
         self.assertEqual(summary["erd"], 2.0)
         self.assertEqual(summary["max_remaining_depth"], 2)
+
+    def test_collect_word_report_populates_candidate_erd_summary(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+        )
+        report = collect_report(self.sources, request)
+        summary = report["data"]["erd_summary"]
+        self.assertEqual(set(summary), {
+            "state", "erd", "max_remaining_depth", "resolved_group_count",
+            "infeasible_group_count", "response_group_count",
+        })
+        self.assertIn(summary["state"], {"complete", "pending", "infeasible"})
+        # The fold walks every response group, not the filtered/limited view.
+        self.assertEqual(
+            summary["response_group_count"],
+            report["data"]["response_group_counts"]["response_group_count"],
+        )
 
     def test_rich_spine_parser_preserves_legacy_tuple_contract(self):
         path = "3:KHAKI:--y--/33→4:NURDY:---y-/17"
