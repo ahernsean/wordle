@@ -9,7 +9,14 @@ import sqlite3
 import time
 from typing import Optional, Tuple
 
+import os
+
 from cache_sqlite import ScoreCache
+from pattern_matrix import (
+    PatternMatrix,
+    _compute_answer_list_id,
+    _compute_guess_vocabulary_id,
+)
 from erd_queue import (
     DISK_STOP_FRACTION,
     DISK_WARN_FRACTION,
@@ -160,7 +167,7 @@ def validate_report_request(request: ReportRequest) -> None:
     """Reject report options that have no meaning for the selected report."""
     report_kind = request.report_kind
     branch_target_kind = request.branch_target.kind
-    if request.tree and report_kind in ("cache", "hotspots"):
+    if request.tree and report_kind in ("cache", "hotspots", "leaderboard"):
         raise ValueError(f"--tree cannot be used with --{report_kind}")
     if request.include_claims and (
         request.tree
@@ -170,7 +177,7 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("--claims requires a singular branch target")
     if request.include_answers and (
         request.tree
-        or report_kind in ("queue", "workers")
+        or report_kind in ("queue", "workers", "leaderboard")
         or (report_kind == "auto" and branch_target_kind == "root")
     ):
         raise ValueError(
@@ -865,6 +872,10 @@ def _candidate_erd_summary(response_groups):
             else:
                 pending_group_count += 1
                 continue
+        elif max_remaining_depth is None:
+            # An ERD with no proven worst-case line cannot complete the fold.
+            pending_group_count += 1
+            continue
         resolved_group_count += 1
         weighted_remaining_depth += group["answer_count"] * best_erd
         max_group_remaining_depth = max(max_group_remaining_depth, max_remaining_depth)
@@ -1682,6 +1693,123 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
+_CANDIDATE_SKELETON_CACHE = {}
+
+
+def _candidate_group_skeletons(all_answers, all_candidates, cache, matrix_directory):
+    """Per-candidate top-level response groups as (pattern, count, branch_key).
+
+    Partitioning every candidate against the answer list is the expensive part
+    of the leaderboard and depends only on the vocabulary, not the cache, so it
+    is memoized by (answer list, guess vocabulary) and reused across builds
+    within a process.  Only the cache reads that follow change between builds.
+    """
+    memo_key = (
+        _compute_answer_list_id(all_answers),
+        _compute_guess_vocabulary_id(all_candidates),
+    )
+    cached = _CANDIDATE_SKELETON_CACHE.get(memo_key)
+    if cached is not None:
+        return cached
+    matrix = PatternMatrix.load_or_build(
+        matrix_directory, all_candidates, all_answers, cache
+    )
+    branch_indices = matrix.answer_indices(all_answers)
+    branch_words = list(all_answers)
+    skeletons = [
+        (
+            candidate,
+            [
+                (fmt_pattern(pattern), len(words), ScoreCache.encode_subset(words))
+                for pattern, words in matrix.group_words(
+                    candidate, branch_words, branch_indices
+                ).items()
+                if words
+            ],
+        )
+        for candidate in all_candidates
+    ]
+    _CANDIDATE_SKELETON_CACHE[memo_key] = skeletons
+    return skeletons
+
+
+def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -> dict:
+    """Rank every candidate opener by its own ERD, folded on read.
+
+    Each candidate's ERD is computed exactly as the word report computes it
+    (`_candidate_erd_summary`), reusing the cache's reusability gate so the
+    numbers agree with `view WORD`.  Only openers whose whole tree is solved
+    have a finite ERD and appear ranked; the rest are summarized as pending or
+    infeasible.  Nothing is persisted — the ranking is recomputed from current
+    cache state.
+    """
+    generated_at = int(time.time())
+    all_answers = load_word_list(sources.answer_list_path)
+    all_candidates = load_word_list(sources.candidate_list_path)
+    answer_set = set(all_answers)
+    data = {}
+    report = _semantic_report(
+        "leaderboard", sources, request.branch_target, generated_at, data, request
+    )
+    group_budget = GAME_GUESSES - 1
+    counts = {"complete": 0, "pending": 0, "infeasible": 0}
+    ranked_rows = []
+    cache = None
+    try:
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+        skeletons = _candidate_group_skeletons(
+            all_answers, all_candidates, cache, os.path.dirname(sources.cache_path)
+        )
+        exact_by_key, loss_by_key = cache.report_branch_row_maps(ERD_ALL)
+        for candidate, groups in skeletons:
+            response_groups = []
+            for pattern, answer_count, branch_key in groups:
+                state = ScoreCache._report_cache_state_from_rows(
+                    branch_key,
+                    exact_by_key.get(branch_key),
+                    loss_by_key.get(branch_key),
+                    group_budget,
+                )
+                response_groups.append({
+                    "pattern": pattern,
+                    "answer_count": answer_count,
+                    "best_erd": state["best_erd"],
+                    "max_remaining_depth": state["max_remaining_depth"],
+                    "cache_state": state["cache_state"],
+                })
+            summary = _candidate_erd_summary(response_groups)
+            counts[summary["state"]] += 1
+            if summary["state"] == "complete":
+                ranked_rows.append({
+                    "word": candidate,
+                    "word_is_answer": candidate in answer_set,
+                    "erd": summary["erd"],
+                    "max_remaining_depth": summary["max_remaining_depth"],
+                })
+        report["sources"]["cache"]["ok"] = True
+    except (sqlite3.Error, OSError) as error:
+        report["sources"]["cache"]["error"] = str(error)
+    finally:
+        if cache is not None:
+            cache.close()
+    ranked_rows.sort(
+        key=lambda row: (row["erd"], row["max_remaining_depth"], row["word"])
+    )
+    for rank, row in enumerate(ranked_rows, start=1):
+        row["rank"] = rank
+    limit = request.filters.limit
+    data.update({
+        "candidate_count": len(all_candidates),
+        "counts": counts,
+        "total_rows": len(ranked_rows),
+        "matched_rows": len(ranked_rows),
+        "rows": ranked_rows[:limit] if limit is not None else ranked_rows,
+    })
+    return report
+
+
 def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -1902,4 +2030,6 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
         return collect_cache_report(sources, request)
     if report_kind == "hotspots":
         return collect_hotspot_report(sources, request)
+    if report_kind == "leaderboard":
+        return collect_leaderboard_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")

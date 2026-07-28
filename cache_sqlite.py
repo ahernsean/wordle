@@ -922,6 +922,36 @@ class ScoreCache:
             for key in keys
         }
 
+    def report_branch_row_maps(self, policy):
+        """Bulk-load every exact and loss row for a policy, keyed by branch_key.
+
+        Folding a whole candidate vocabulary at once would otherwise need one
+        `IN (...)` query per candidate; loading the full maps once and looking
+        up in memory keeps the leaderboard a single pass over the cache.  The
+        rows carry the same columns `_report_cache_state_from_rows` reads, so
+        the caller reuses that reusability gate unchanged.
+        """
+        exact_by_key = {
+            bytes(row["branch_key"]): row
+            for row in self._conn.execute(
+                """SELECT branch_key, best_guess, best_score, updated_at,
+                          max_depth, solve_budget
+                   FROM branch_best_by_policy
+                   WHERE policy = ? AND answer_list_id = ?""",
+                (policy, self.answer_list_id),
+            )
+        }
+        loss_by_key = {
+            bytes(row["branch_key"]): row
+            for row in self._conn.execute(
+                """SELECT branch_key, loss_budget, updated_at
+                   FROM branch_loss_by_policy
+                   WHERE policy = ? AND answer_list_id = ?""",
+                (policy, self.answer_list_id),
+            )
+        }
+        return exact_by_key, loss_by_key
+
     def report_recent_rows(self, policy, since, limit) -> list[dict]:
         """Return bounded recently updated exact branch rows."""
         rows = self._conn.execute("""

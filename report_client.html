@@ -134,7 +134,7 @@
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button id="tree-button" aria-pressed="false">Tree</button>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><button id="tree-button" aria-pressed="false">Tree</button>
       <span class="conn-wrap">
         <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
@@ -180,7 +180,7 @@
     const SCHEMA_VERSION=2, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
-    const explicitKinds=new Set(["queue","workers","cache","hotspots"]);
+    const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard"]);
     const treelessKinds=new Set(["cache","hotspots"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), stickyOrders=new Map();
@@ -211,6 +211,7 @@
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
+      if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_phase=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;normalized.tree=false;}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
@@ -543,6 +544,17 @@
     function renderWorkers(report,previous,state){const grid=element("div","grid workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(report.data.rows||[],"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;}
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}
     function displayEntries(row,generatedAt){return Object.entries(row).filter(([key])=>!["row_id","branch_key_hex","branch_reference","spine"].includes(key)).map(([key,value])=>[timeLabel(key),displayTimedValue(key,value,generatedAt)]);}
+    function renderLeaderboard(report,previous,state){
+      const data=report.data,fragment=document.createDocumentFragment(),counts=data.counts||{},metrics=element("div","metrics");
+      metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("infeasible",counts.infeasible),metric("candidates",data.candidate_count));
+      fragment.append(element("h2","","Opener leaderboard"),metrics);
+      const rows=data.rows||[];
+      fragment.append(element("p","dim","Ranked by ERD · showing "+rows.length+" of "+(data.total_rows??rows.length)+" complete"));
+      if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
+      const grid=element("div","grid"),previousRows=previousBy(previous,"rows","word");
+      for(const row of rows){const card=element("article","card "+changeClass(row,previousRows.get(String(row.word))));card.dataset.identity=row.word;const title=element("div","card-title");title.append(element("span","chip","#"+row.rank),element("span","",candidateText(row.word,row.word_is_answer)));card.append(title,statLine(["ERD "+fixed(row.erd,3),"max remaining depth "+row.max_remaining_depth]));grid.append(card);}
+      fragment.append(grid);return fragment;
+    }
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),kv(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),kv(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
     function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=element("div","grid"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,kv(displayEntries(row,report.generated_at)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
     function captureGridCards(root){
@@ -579,7 +591,7 @@
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
       const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
-      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport));else throw new Error("Unknown report kind");
+      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else throw new Error("Unknown report kind");
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;

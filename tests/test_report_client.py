@@ -177,7 +177,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(self.page.locator("[data-kind]").count(), 5)
+        self.assertEqual(self.page.locator("[data-kind]").count(), 6)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
@@ -257,6 +257,15 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("3.564", text)
         self.assertNotIn("3.564102564102564", text)
         self.assertIn("max remaining depth", text)
+
+    def test_leaderboard_tab_ranks_openers_and_rounds_erd(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("SALET", text)
+        self.assertIn("3.564", text)
+        self.assertNotIn("3.5643502648", text)
+        self.assertIn("CRANE*", text)  # word_is_answer renders the asterisk
 
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
