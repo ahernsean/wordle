@@ -227,6 +227,37 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("article.card.clickable").first.click()
         self.assertIn("branch_target=CACHE+-----", self.page.url)
 
+    def test_word_view_shows_infeasible_erd_for_a_proven_loss(self):
+        # Served straight from the fixture (loss group present), so this pins
+        # the renderer to the model's real erd_summary field names.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("1 of 4 response groups unsolvable within budget", text)
+
+    def test_word_view_shows_pending_erd_while_a_group_is_unsolved(self):
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=SALET')).json();
+          report.data.erd_summary={state:'pending',erd:null,max_remaining_depth:null,
+            resolved_group_count:2,infeasible_group_count:0,response_group_count:4};
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'SALET'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("2 of 4 response groups solved", text)
+
+    def test_word_view_shows_erd_and_max_depth_when_solved(self):
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=SALET')).json();
+          report.data.erd_summary={state:'complete',erd:3.564102564102564,
+            max_remaining_depth:6,resolved_group_count:4,infeasible_group_count:0,
+            response_group_count:4};
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'SALET'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("3.564", text)
+        self.assertNotIn("3.564102564102564", text)
+        self.assertIn("max remaining depth", text)
+
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#tree-button").click()
