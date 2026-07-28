@@ -490,9 +490,11 @@ class SemanticReportTest(unittest.TestCase):
                 self.assertTrue(report["data"]["tree_available"])
                 node_ids = {node["node_id"] for node in report["data"]["nodes"]}
                 for node in report["data"]["nodes"]:
-                    if node["parent_node_id"] is not None:
+                    if node["parent_node_id"] is None:
+                        self.assertEqual(node["guess_depth"], 1)
+                    else:
                         self.assertIn(node["parent_node_id"], node_ids)
-                    self.assertGreaterEqual(node["guess_depth"], 0)
+                    self.assertGreaterEqual(node["guess_depth"], 1)
                     if expected_word and node["step"] is not None:
                         self.assertEqual(node["node_id"].split(":", 1)[0], expected_word)
 

@@ -216,10 +216,16 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_tree_branch_status_filter_and_context_node(self):
         self.apply_branch_target("RAISE .....")
         self.page.locator("#tree-button").click()
-        self.page.wait_for_selector("text=Live queue tree")
+        self.page.wait_for_selector("ul.tree > li")
         self.assertIn("tree=1", self.page.url)
         self.assertIn("branch_status=active", self.page.url)
         self.assertGreater(self.page.locator("text=pending").count(), 0)
+        base_words = self.page.locator("ul.tree > li")
+        self.assertGreater(base_words.count(), 0)
+        self.assertEqual(
+            base_words.count(),
+            self.page.locator("ul.tree > li > details > summary .step").count(),
+        )
 
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
@@ -462,7 +468,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         classes = self.page.evaluate("""async () => {
           const state=__reportClient.getState(),result={};
           const tree=await (await fetch('/api/view?tree=1')).json(),changedTree=structuredClone(tree);
-          changedTree.data.nodes[2].completed_candidate_count++;
+          changedTree.data.nodes[1].completed_candidate_count++;
           applyReport(changedTree,tree,{...state,tree:true});
           result.tree=document.querySelector('[data-identity="raise:-----/alibi:y----"]').className;
 
@@ -897,7 +903,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=queue report")
         self.assertTrue(tree_button.is_visible())
         tree_button.click()
-        self.page.wait_for_selector("text=Live queue tree")
+        self.page.wait_for_selector("ul.tree > li")
         self.assertEqual(tree_button.get_attribute("aria-pressed"), "true")
         tree_button.click()
         self.page.wait_for_timeout(150)

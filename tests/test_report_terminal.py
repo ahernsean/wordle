@@ -749,16 +749,15 @@ class CollectionRendererTest(unittest.TestCase):
                 "worker_count": 0,
                 "completed_candidate_count": 0,
                 "candidate_count": 4,
-                "is_context": node_id == "root",
+                "is_context": False,
             }
 
         report = self._report("queue", {
             "tree_available": True,
             "unavailable_reason": None,
             "nodes": [
-                node("root", None, 0),
-                node("raise:-----", "root", 1, "raise", "-----"),
-                node("stink:g----", "root", 1, "stink", "g----"),
+                node("raise:-----", None, 1, "raise", "-----"),
+                node("stink:g----", None, 1, "stink", "g----"),
                 node(
                     "raise:-----/crane:y----", "raise:-----", 2,
                     "crane", "y----",
@@ -770,6 +769,14 @@ class CollectionRendererTest(unittest.TestCase):
             ],
         }, tree=True)
         output = render_report(report, width=120)
+        tree_lines = [
+            line for line in output.splitlines()
+            if any(word in line for word in ("RAISE", "STINK", "CRANE", "MOUNT"))
+        ]
+        self.assertEqual(len(tree_lines), 4)
+        for line in tree_lines:
+            indent = len(line) - len(line.lstrip())
+            self.assertEqual(indent, 0 if line.lstrip()[:5] in ("RAISE", "STINK") else 2)
         self.assertLess(output.index("RAISE -----"), output.index("CRANE y----"))
         self.assertLess(output.index("CRANE y----"), output.index("STINK g----"))
         self.assertLess(output.index("STINK g----"), output.index("MOUNT -y---"))

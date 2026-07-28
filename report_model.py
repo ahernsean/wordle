@@ -1371,7 +1371,15 @@ def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict
 
 
 def _tree_node_id(steps):
-    return "/".join(f"{step.word}:{step.pattern}" for step in steps) or "root"
+    return "/".join(f"{step.word}:{step.pattern}" for step in steps)
+
+
+def _spine_steps(spine):
+    tokens = (spine or "").split()
+    return [
+        SpineStep(tokens[index].lower(), _normalized_pattern(tokens[index + 1]))
+        for index in range(0, len(tokens) - 1, 2)
+    ]
 
 
 def _tree_layout(rows, request, prefix, unfiltered_rows):
@@ -1400,54 +1408,38 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
             "nodes": [],
         }
 
-    nodes = {
-        "root": {
-            "node_id": "root",
-            "parent_node_id": None,
-            "step": None,
-            "branch_key_hex": None,
-            "branch_reference": None,
-            "branch_status": None,
-            "branch_phase": None,
-            "answer_count": None,
-            "guess_depth": 0,
-            "worker_count": 0,
-            "completed_candidate_count": None,
-            "candidate_count": None,
-            "is_context": request.branch_target.kind == "root",
-        }
-    }
+    # A node is a played guess, so the shallowest nodes are the base words the
+    # search starts from; the forest has no node above them.
+    nodes = {}
     for row in rows:
-        spine = row.get("spine")
-        if spine:
-            tokens = spine.split()
-            steps = []
-            for index in range(0, len(tokens) - 1, 2):
-                step = SpineStep(tokens[index].lower(), _normalized_pattern(tokens[index + 1]))
-                parent_id = _tree_node_id(tuple(steps))
-                steps.append(step)
-                node_id = _tree_node_id(tuple(steps))
+        steps = _spine_steps(row.get("spine"))
+        if steps:
+            parent_id = None
+            for guess_depth_value in range(1, len(steps) + 1):
+                step = steps[guess_depth_value - 1]
+                node_id = _tree_node_id(steps[:guess_depth_value])
                 nodes.setdefault(node_id, {
                     "node_id": node_id,
-                    "parent_node_id": parent_id if parent_id != node_id else None,
+                    "parent_node_id": parent_id,
                     "step": {"word": step.word, "pattern": step.pattern},
                     "branch_key_hex": None,
                     "branch_reference": None,
                     "branch_status": None,
                     "branch_phase": None,
                     "answer_count": None,
-                    "guess_depth": len(steps),
+                    "guess_depth": guess_depth_value,
                     "worker_count": 0,
                     "completed_candidate_count": None,
                     "candidate_count": None,
                     "is_context": False,
                 })
-            final_node = nodes[_tree_node_id(tuple(steps))]
+                parent_id = node_id
+            final_node = nodes[parent_id]
         else:
             guess_depth = (
                 GAME_GUESSES - row["budget"] if row.get("budget") is not None else 1
             )
-            parent_id = "root"
+            parent_id = None
             for guess_depth_value in range(1, max(guess_depth, 1) + 1):
                 node_id = f"unknown:{guess_depth_value}:{row['branch_key_hex']}"
                 nodes.setdefault(node_id, {

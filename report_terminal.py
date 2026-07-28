@@ -1122,7 +1122,6 @@ def _render_tree_sections(report, width, display_order):
     if not data["tree_available"]:
         lines.append(f"  unavailable: {data['unavailable_reason']}")
     else:
-        nodes_by_id = {node["node_id"]: node for node in data["nodes"]}
         children_by_parent = {}
         for node in data["nodes"]:
             children_by_parent.setdefault(node["parent_node_id"], []).append(node)
@@ -1144,17 +1143,16 @@ def _render_tree_sections(report, width, display_order):
             for child in children_by_parent.get(node["node_id"], []):
                 append_node_and_descendants(child)
 
-        root = nodes_by_id.get("root")
-        if root is not None:
-            append_node_and_descendants(root)
+        for base_word in children_by_parent.get(None, []):
+            append_node_and_descendants(base_word)
         for node in data["nodes"]:
             if node["node_id"] not in visited_node_ids:
                 append_node_and_descendants(node)
 
         for node in ordered_nodes:
-            indent = "  " * node["guess_depth"]
+            indent = "  " * (node["guess_depth"] - 1)
             step = node["step"]
-            label = "root" if node["guess_depth"] == 0 else "unknown"
+            label = "unknown"
             if step is not None:
                 label = f"{step['word'].upper()} {step['pattern']}"
             detail = ""
