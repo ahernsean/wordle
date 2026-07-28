@@ -833,7 +833,7 @@ class CollectionRendererTest(unittest.TestCase):
         })
         return report
 
-    def test_tree_renders_each_child_beneath_its_parent(self):
+    def test_tree_groups_base_patterns_under_their_word(self):
         def node(node_id, parent_node_id, guess_depth, word=None, pattern=None):
             return {
                 "node_id": node_id,
@@ -851,16 +851,16 @@ class CollectionRendererTest(unittest.TestCase):
                 "worker_count": 0,
                 "completed_candidate_count": 0,
                 "candidate_count": 4,
-                "is_context": node_id == "root",
+                "is_context": False,
             }
 
         report = self._report("queue", {
             "tree_available": True,
             "unavailable_reason": None,
             "nodes": [
-                node("root", None, 0),
-                node("raise:-----", "root", 1, "raise", "-----"),
-                node("stink:g----", "root", 1, "stink", "g----"),
+                node("raise:-----", None, 1, "raise", "-----"),
+                node("raise:y----", None, 1, "raise", "y----"),
+                node("stink:g----", None, 1, "stink", "g----"),
                 node(
                     "raise:-----/crane:y----", "raise:-----", 2,
                     "crane", "y----",
@@ -872,9 +872,35 @@ class CollectionRendererTest(unittest.TestCase):
             ],
         }, tree=True)
         output = render_report(report, width=120)
-        self.assertLess(output.index("RAISE -----"), output.index("CRANE y----"))
-        self.assertLess(output.index("CRANE y----"), output.index("STINK g----"))
-        self.assertLess(output.index("STINK g----"), output.index("MOUNT -y---"))
+        # A word is named once, by its group, at every level; the rows beneath
+        # carry only the response pattern.  One pattern still gets a group.
+        self.assertIn("RAISE  2 branches", output)
+        self.assertIn("STINK  1 branch", output)
+        self.assertIn("CRANE  1 branch", output)
+        self.assertNotIn("RAISE -----", output)
+        self.assertNotIn("CRANE y----", output)
+        indents = {
+            line.strip(): len(line) - len(line.lstrip())
+            for line in output.splitlines() if line.strip()
+        }
+
+        def indent_of(prefix):
+            return indents[next(key for key in indents if key.startswith(prefix))]
+
+        # One space per level: word group, its patterns, their word groups.
+        self.assertEqual(indents["RAISE  2 branches"], 0)
+        self.assertEqual(indents["STINK  1 branch"], 0)
+        self.assertEqual(indent_of("-----"), 1)
+        self.assertEqual(indents["CRANE  1 branch"], 2)
+        # RAISE y---- is a base pattern; CRANE y---- is a pattern of a group one
+        # level down, and they render the same but for their indent.
+        self.assertEqual(sorted(
+            len(line) - len(line.lstrip())
+            for line in output.splitlines() if line.strip().startswith("y----")
+        ), [1, 3])
+        self.assertLess(output.index("RAISE  2 branches"), output.index("CRANE  1 branch"))
+        self.assertLess(output.index("CRANE  1 branch"), output.index("STINK  1 branch"))
+        self.assertLess(output.index("STINK  1 branch"), output.index("MOUNT  1 branch"))
 
     def test_queue_worker_and_cache_collections_are_semantically_formatted(self):
         queue_report = self._report("queue", {
