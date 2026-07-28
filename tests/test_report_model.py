@@ -114,6 +114,13 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["erd"], 2.0)
         self.assertEqual(summary["max_remaining_depth"], 2)
 
+    def test_candidate_erd_summary_treats_erd_without_worst_case_as_pending(self):
+        # An ERD present but no proven worst-case line cannot complete the fold;
+        # it must not crash the max() and must not read as complete.
+        summary = _candidate_erd_summary([self._group("-----", 8, 2.1, None)], 5)
+        self.assertEqual(summary["state"], "pending")
+        self.assertIsNone(summary["max_remaining_depth"])
+
     def test_candidate_erd_summary_lone_survivor_is_infeasible_with_no_guess_left(self):
         # A lone survivor needs one guess to play; at group_budget 0 there is no
         # guess left, so it is a proven loss — matching evaluate_candidate's
@@ -166,6 +173,99 @@ class ReportModelTest(unittest.TestCase):
             summary["response_group_count"],
             report["data"]["response_group_counts"]["response_group_count"],
         )
+
+    def _leaderboard_sources(self, answers, candidates):
+        directory = self.temporary_directory.name
+        answer_path = os.path.join(directory, "lb_answers.txt")
+        candidate_path = os.path.join(directory, "lb_candidates.txt")
+        with open(answer_path, "w") as answer_file:
+            answer_file.write("\n".join(answers) + "\n")
+        with open(candidate_path, "w") as candidate_file:
+            candidate_file.write("\n".join(candidates) + "\n")
+        return ReportSources(
+            queue_path=self.queue_path,
+            cache_path=self.cache_path,
+            answer_list_path=answer_path,
+            candidate_list_path=candidate_path,
+            telemetry_path=self.telemetry_path,
+        )
+
+    def test_leaderboard_ranks_complete_openers_by_erd(self):
+        # With two answers, an opener that separates them into singletons is
+        # complete with no cache reads at all: crane/slate are also answers
+        # (all-green self group contributes 0 → ERD 1.5), raise is not
+        # (two size-1 groups → ERD 2.0), and howdy shares no letters so both
+        # answers collide in one unsolved group → pending.
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        report = collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self.assertEqual(report["report_kind"], "leaderboard")
+        data = report["data"]
+        self.assertEqual(data["candidate_count"], 4)
+        self.assertEqual(
+            data["counts"], {"complete": 3, "pending": 1, "infeasible": 0}
+        )
+        self.assertEqual([row["word"] for row in data["rows"]],
+                         ["crane", "slate", "raise"])
+        self.assertEqual([row["rank"] for row in data["rows"]], [1, 2, 3])
+        self.assertAlmostEqual(data["rows"][0]["erd"], 1.5)
+        self.assertAlmostEqual(data["rows"][2]["erd"], 2.0)
+        self.assertTrue(data["rows"][0]["word_is_answer"])
+        self.assertFalse(data["rows"][2]["word_is_answer"])
+
+    def test_leaderboard_report_counts_partition_the_candidate_list(self):
+        report = collect_report(
+            self.sources, ReportRequest(report_kind="leaderboard")
+        )
+        data = report["data"]
+        counts = data["counts"]
+        self.assertEqual(
+            counts["complete"] + counts["pending"] + counts["infeasible"],
+            data["candidate_count"],
+        )
+        self.assertEqual(len(data["rows"]), counts["complete"])
+        erds = [row["erd"] for row in data["rows"]]
+        self.assertEqual(erds, sorted(erds))
+        self.assertEqual([row["rank"] for row in data["rows"]],
+                         list(range(1, len(data["rows"]) + 1)))
+
+    def test_leaderboard_builds_matrix_beside_the_cache_not_the_cwd(self):
+        # load_or_build derives the matrix directory from the cache *path*;
+        # passing a directory would apply dirname twice and strand a .npy in the
+        # cwd while never finding the swarm's matrix.
+        import glob
+        import report_model
+        report_model._candidate_skeleton_memo = None
+        before = set(glob.glob("*.npy"))
+        sources = self._leaderboard_sources(["crane", "slate"], ["crane", "slate"])
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self.assertEqual(set(glob.glob("*.npy")), before)  # nothing stray in cwd
+        cache_directory = os.path.dirname(sources.cache_path)
+        self.assertTrue(glob.glob(os.path.join(cache_directory, "*.npy")))
+
+    def test_leaderboard_reports_honest_empty_on_cache_error(self):
+        # A mid-build cache failure must not publish a truncated ranking that
+        # reads as complete; the report is empty with the error on the source.
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise"]
+        )
+        with patch.object(
+            ScoreCache, "report_branch_row_maps",
+            side_effect=sqlite3.OperationalError("cache read failed"),
+        ):
+            report = collect_report(
+                sources, ReportRequest(report_kind="leaderboard")
+            )
+        self.assertFalse(report["sources"]["cache"]["ok"])
+        self.assertIn("cache read failed", report["sources"]["cache"]["error"])
+        data = report["data"]
+        self.assertEqual(data["rows"], [])
+        self.assertEqual(data["total_rows"], 0)
+        self.assertEqual(
+            data["counts"], {"complete": 0, "pending": 0, "infeasible": 0}
+        )
+        self.assertEqual(data["candidate_count"], 3)
 
     def test_rich_spine_parser_preserves_legacy_tuple_contract(self):
         path = "3:KHAKI:--y--/33→4:NURDY:---y-/17"

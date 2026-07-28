@@ -1318,6 +1318,37 @@ def _render_hotspot_sections(report, width, display_order):
     return [("header", header), ("hotspots", lines)]
 
 
+def _render_leaderboard_sections(report, width):
+    data = report["data"]
+    counts = data["counts"]
+    header = _semantic_header(
+        report,
+        f"Opener leaderboard  candidates={data['candidate_count']}",
+        width,
+    )
+    summary = [
+        "Ranked by ERD",
+        _fit(
+            f"  complete {counts['complete']}  "
+            f"pending {counts['pending']}  "
+            f"infeasible {counts['infeasible']}  "
+            f"(showing {len(data['rows'])} of {data['total_rows']})",
+            width,
+        ),
+    ]
+    rows = ["Rank  Opener   ERD    MaxRD"]
+    for row in data["rows"]:
+        word = row["word"].upper() + ("*" if row["word_is_answer"] else "")
+        rows.append(_fit(
+            f"{row['rank']:>4}  {word:<7}  {row['erd']:.3f}  "
+            f"{row['max_remaining_depth']}",
+            width,
+        ))
+    if len(rows) == 1:
+        rows.append("none complete yet")
+    return [("header", header), ("summary", summary), ("leaderboard", rows)]
+
+
 def _report_sections(report, previous_report, color, width, display_order):
     if report.get("tree"):
         return _render_tree_sections(report, width, display_order)
@@ -1343,6 +1374,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_cache_collection_sections(report, width, display_order)
     if report["report_kind"] == "hotspots":
         return _render_hotspot_sections(report, width, display_order)
+    if report["report_kind"] == "leaderboard":
+        return _render_leaderboard_sections(report, width)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 

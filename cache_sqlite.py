@@ -922,6 +922,57 @@ class ScoreCache:
             for key in keys
         }
 
+    def report_branch_row_maps(self, policy):
+        """Bulk-load every exact and loss row for a policy, keyed by branch_key.
+
+        Folding a whole candidate vocabulary at once would otherwise need one
+        `IN (...)` query per candidate; loading the full maps once and looking
+        up in memory keeps the leaderboard a single pass over the cache.  The
+        rows carry the same columns `_report_cache_state_from_rows` reads, so
+        the caller reuses that reusability gate unchanged.
+        """
+        exact_by_key = {
+            bytes(row["branch_key"]): row
+            for row in self._conn.execute(
+                """SELECT branch_key, best_guess, best_score, updated_at,
+                          max_depth, solve_budget
+                   FROM branch_best_by_policy
+                   WHERE policy = ? AND answer_list_id = ?""",
+                (policy, self.answer_list_id),
+            )
+        }
+        loss_by_key = {
+            bytes(row["branch_key"]): row
+            for row in self._conn.execute(
+                """SELECT branch_key, loss_budget, updated_at
+                   FROM branch_loss_by_policy
+                   WHERE policy = ? AND answer_list_id = ?""",
+                (policy, self.answer_list_id),
+            )
+        }
+        return exact_by_key, loss_by_key
+
+    def report_branch_states_from_maps(
+        self, branch_keys, exact_by_key, loss_by_key, budget=None
+    ) -> dict:
+        """Reusable cache states for keys, from pre-loaded row maps.
+
+        `report_branch_row_maps` loads every exact/loss row for a policy once;
+        this applies the same reusability gate `report_branch_states` uses
+        without a per-key query, so a whole candidate vocabulary folds in one
+        pass.  The maps must carry the columns the gate reads, which is exactly
+        what `report_branch_row_maps` returns.
+        """
+        return {
+            bytes(branch_key): self._report_cache_state_from_rows(
+                bytes(branch_key),
+                exact_by_key.get(bytes(branch_key)),
+                loss_by_key.get(bytes(branch_key)),
+                budget,
+            )
+            for branch_key in branch_keys
+        }
+
     def report_recent_rows(self, policy, since, limit) -> list[dict]:
         """Return bounded recently updated exact branch rows."""
         rows = self._conn.execute("""
