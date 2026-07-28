@@ -300,6 +300,35 @@ then name every file: `git add <path> <path> ...`.
 
 ---
 
+## A screenshot is not evidence about layout width
+
+A full-page screenshot (`full_page=True`) sizes the image to the page's
+`scrollWidth`, not to the viewport it was captured at. A page that overflows
+horizontally therefore renders as a *wider image whose contents look correctly
+laid out* — every row fits, nothing is clipped, and the defect is encoded in
+the image's dimensions rather than anywhere in the picture. Reading that
+screenshot as "the phone layout is fine" is reading the overflow as the design.
+
+So a rendering never settles a question about width. Measure:
+
+```python
+page.evaluate("() => [document.documentElement.scrollWidth,"
+              " document.documentElement.clientWidth]")
+```
+
+`scrollWidth > clientWidth` at any required width (375, 390, 480, 800, 1200) is
+a horizontal-scroll regression.
+`test_no_horizontal_scroll_at_required_widths` measures exactly this across
+every view; run it when a change touches layout, and extend it when a view it
+does not visit is added — a guard that never navigates to a view has never
+covered it.
+
+When a screenshot is still the clearest way to show a rendering, confirm its
+width equals the viewport width before concluding anything from it, and say
+which width it was captured at.
+
+---
+
 ## Respond to what's actually being asked
 
 Before acting, classify the request:
