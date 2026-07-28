@@ -3221,18 +3221,30 @@ class ERDQueue:
         inline before overrun fired.  Uses INSERT OR REPLACE so a racing
         in-flight (done=0) claim from another worker is superseded by the
         authoritative done=1 record — the evaluation already happened.
+
+        A branch with no active_branches row has already finalized, so
+        delete_branch has cleared its claims and cached its result; recording
+        more candidates against it would orphan claim rows past the branch they
+        belong to.  The INSERT is gated on the active row's existence so such a
+        write is a quiet no-op.  A publisher call racing finalization is a
+        routine outcome, not an error.
         """
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return
         now = int(time.time())
         indices = list(indices)
-        branch_id = self._intern_branch(branch_key, create=True)
+        before = self._conn.total_changes
         self._conn.executemany("""
             INSERT OR REPLACE INTO candidate_claims
                 (branch_id, idx, claimed_by, claimed_at, done, done_at)
-            VALUES (?, ?, 'publisher', ?, 1, ?)
-        """, [(branch_id, idx, now, now) for idx in indices])
+            SELECT ?, ?, 'publisher', ?, 1, ?
+            WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_id = ?)
+        """, [(branch_id, idx, now, now, branch_id) for idx in indices])
+        written = self._conn.total_changes - before
         self._tally_wal_traffic(
-            'candidate_claims/publisher-mark-done', len(indices),
-            len(indices) * _CLAIM_ROW_WAL_BYTES)
+            'candidate_claims/publisher-mark-done', written,
+            written * _CLAIM_ROW_WAL_BYTES)
 
     def add_nodes_spent(self, branch_key: bytes, delta: int):
         """Increment nodes_spent on an active branch for cost-model sampling."""

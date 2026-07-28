@@ -507,17 +507,9 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
     _BUDGET = 4
     # Required t1/tN speedup by worker count.  These sit far above the ~1.25x
     # coordination floor, so a regression into coordination-bound behaviour
-    # fails unambiguously.
+    # fails unambiguously.  Do NOT lower these to make a regressed run pass —
+    # that buries the signal this guard exists to raise.
     _MIN_SPEEDUP = {2: 1.3, 3: 1.5, 4: 1.7}
-    # Issue #122: the current claim granularity makes 4 workers measurably
-    # SLOWER than 1 on this workload (~0.9x).  While True, a below-threshold
-    # speedup becomes a loud skip instead of a failure (correctness assertions
-    # still enforce), and the CI validate step reports the measured value
-    # without failing the build.  The claim-granularity redesign flips this to
-    # False as its acceptance criterion; the threshold then enforces
-    # permanently.  Do NOT lower _MIN_SPEEDUP to make this pass — that buries
-    # the signal this test exists to raise.
-    _SPEEDUP_ASSERTION_INTENTIONALLY_DISABLED_BECAUSE_SCALING_IS_CURRENTLY_BROKEN = True
 
     def setUp(self):
         shm = '/dev/shm'
@@ -599,13 +591,7 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             json.dump(result, f)
         summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
         if summary_path:
-            if result['passed']:
-                status = '✅ PASSED'
-            elif result['scaling_currently_broken']:
-                status = ('⚠️ ASSERTION DISABLED — SCALING CURRENTLY '
-                          'BROKEN (issue #122)')
-            else:
-                status = '❌ FAILED'
+            status = '✅ PASSED' if result['passed'] else '❌ FAILED'
             with open(summary_path, 'a') as f:
                 f.write(
                     f"## Solve-dominated strong scaling — {status}\n\n"
@@ -648,8 +634,6 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             'speedup': speedup,
             'min_speedup': min_speedup,
             'passed': passed,
-            'scaling_currently_broken':
-                self._SPEEDUP_ASSERTION_INTENTIONALLY_DISABLED_BECAUSE_SCALING_IS_CURRENTLY_BROKEN,
             'cpu_count': os.cpu_count(),
             'n_branches': self._N_BRANCHES,
             'branch_size': self._BRANCH_SIZE,
@@ -674,14 +658,6 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             self.assertEqual(unresolved, [],
                              f"{len(unresolved)} branches never resolved "
                              f"in the {tag} leg")
-        if not passed and \
-                self._SPEEDUP_ASSERTION_INTENTIONALLY_DISABLED_BECAUSE_SCALING_IS_CURRENTLY_BROKEN:
-            self.skipTest(
-                f"SPEEDUP ASSERTION INTENTIONALLY DISABLED: scaling is "
-                f"currently BROKEN (issue #122) — {speedup:.2f}x at {n} "
-                f"workers, below the {min_speedup:.2f}x threshold; the "
-                f"claim-granularity redesign flips the class flag to arm "
-                f"this guard")
         self.assertGreaterEqual(
             speedup, min_speedup,
             f"{n} workers achieved only {speedup:.2f}x over 1 worker "

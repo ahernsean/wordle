@@ -499,6 +499,15 @@ class TestCostModel(_TmpQueue):
         done = {r['idx'] for r in rows if r['done'] == 1}
         self.assertEqual(done, {0, 2, 4})
 
+    def test_mark_claims_done_skips_finalized_branch(self):
+        # A publisher call that races finalization must not re-create claim
+        # rows: delete_branch has removed the active row, so a fresh insert
+        # would orphan the rows past the branch they belong to.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.q.delete_branch(self.key)
+        self.q.mark_claims_done(self.key, [0, 2, 4])
+        self.assertEqual(self.q.claims_for_branch(self.key), [])
+
     def test_add_nodes_spent_accumulates(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
         self.q.add_nodes_spent(self.key, 100)
