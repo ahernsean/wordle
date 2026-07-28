@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "report_kind": "leaderboard",
+  "generated_at": 1000,
+  "branch_target": null,
+  "filters": {},
+  "tree": false,
+  "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": false, "error": null, "epoch": null, "label": null, "git_sha": null}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": false, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
+  "data": {
+    "candidate_count": 14855,
+    "counts": {"complete": 2, "pending": 14852, "infeasible": 1},
+    "total_rows": 2,
+    "matched_rows": 2,
+    "rows": [
+      {"word": "salet", "word_is_answer": false, "erd": 3.5643502648, "max_remaining_depth": 6, "rank": 1},
+      {"word": "crane", "word_is_answer": true, "erd": 3.7124567, "max_remaining_depth": 5, "rank": 2}
+    ]
+  }
+}

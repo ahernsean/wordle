@@ -1003,6 +1003,7 @@ def main():
     view_kind.add_argument('--worker', metavar='N')
     view_kind.add_argument('--cache', dest='view_cache', action='store_true')
     view_kind.add_argument('--hotspots', action='store_true')
+    view_kind.add_argument('--leaderboard', action='store_true')
     p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
         help='Comma-separated active,pending,done,unqueued, or all')
@@ -1175,7 +1176,8 @@ def main():
             'queue' if args.view_queue else
             'workers' if args.workers or args.worker is not None else
             'cache' if args.view_cache else
-            'hotspots' if args.hotspots else 'auto'
+            'hotspots' if args.hotspots else
+            'leaderboard' if args.leaderboard else 'auto'
         )
         if args.by is not None and not args.hotspots:
             parser.error('--by requires --hotspots')

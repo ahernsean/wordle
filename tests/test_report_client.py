@@ -177,7 +177,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(self.page.locator("[data-kind]").count(), 5)
+        self.assertEqual(self.page.locator("[data-kind]").count(), 6)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
@@ -298,6 +298,60 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.page.locator("article.card.clickable").first.click()
         self.assertIn("branch_target=CACHE+-----", self.page.url)
+
+    def test_word_view_shows_infeasible_erd_for_a_proven_loss(self):
+        # Served straight from the fixture (loss group present), so this pins
+        # the renderer to the model's real erd_summary field names.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("1 of 4 response groups unsolvable within budget", text)
+
+    def test_word_view_shows_pending_erd_while_a_group_is_unsolved(self):
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=SALET')).json();
+          report.data.erd_summary={state:'pending',erd:null,max_remaining_depth:null,
+            resolved_group_count:2,infeasible_group_count:0,response_group_count:4};
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'SALET'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("2 of 4 response groups solved", text)
+
+    def test_word_view_shows_erd_and_max_depth_when_solved(self):
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=SALET')).json();
+          report.data.erd_summary={state:'complete',erd:3.564102564102564,
+            max_remaining_depth:6,resolved_group_count:4,infeasible_group_count:0,
+            response_group_count:4};
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'SALET'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("3.564", text)
+        self.assertNotIn("3.564102564102564", text)
+        self.assertIn("max remaining depth", text)
+
+    def test_leaderboard_tab_ranks_openers_and_rounds_erd(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("SALET", text)
+        self.assertIn("3.564", text)
+        self.assertNotIn("3.5643502648", text)
+        self.assertIn("CRANE*", text)  # word_is_answer renders the asterisk
+
+    def test_slow_view_switch_shows_a_computing_notice(self):
+        # Delay only the leaderboard fetch on the client so the slow-request
+        # timer fires on the view switch (the fold can take several seconds).
+        # The fetch still resolves, so nothing is left pending — unlike a hung
+        # route, which is cancelled at teardown and logs an asyncio error.
+        self.page.evaluate(
+            "() => { const real = window.fetch.bind(window);"
+            " window.fetch = (url, opts) => String(url).includes('/leaderboard')"
+            " ? new Promise(r => setTimeout(() => r(real(url, opts)), 4000))"
+            " : real(url, opts); }"
+        )
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Computing leaderboard…", timeout=5000)
 
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
