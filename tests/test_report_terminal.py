@@ -770,28 +770,35 @@ class CollectionRendererTest(unittest.TestCase):
             ],
         }, tree=True)
         output = render_report(report, width=120)
-        # A word is named once, by its group; the rows beneath carry only the
-        # response pattern.  One pattern still gets a group.
+        # A word is named once, by its group, at every level; the rows beneath
+        # carry only the response pattern.  One pattern still gets a group.
         self.assertIn("RAISE  2 branches", output)
         self.assertIn("STINK  1 branch", output)
+        self.assertIn("CRANE  1 branch", output)
         self.assertNotIn("RAISE -----", output)
-        self.assertNotIn("STINK g----", output)
+        self.assertNotIn("CRANE y----", output)
         indents = {
             line.strip(): len(line) - len(line.lstrip())
             for line in output.splitlines() if line.strip()
         }
+
+        def indent_of(prefix):
+            return indents[next(key for key in indents if key.startswith(prefix))]
+
+        # One space per level: word group, its patterns, their word groups.
         self.assertEqual(indents["RAISE  2 branches"], 0)
         self.assertEqual(indents["STINK  1 branch"], 0)
-        for pattern in ("-----", "y----", "g----"):
-            self.assertEqual(indents[
-                next(key for key in indents if key.startswith(pattern))
-            ], 2)
-        self.assertEqual(indents[
-            next(key for key in indents if key.startswith("CRANE y----"))
-        ], 4)
-        self.assertLess(output.index("RAISE  2 branches"), output.index("CRANE y----"))
-        self.assertLess(output.index("CRANE y----"), output.index("STINK  1 branch"))
-        self.assertLess(output.index("STINK  1 branch"), output.index("MOUNT -y---"))
+        self.assertEqual(indent_of("-----"), 1)
+        self.assertEqual(indents["CRANE  1 branch"], 2)
+        # RAISE y---- is a base pattern; CRANE y---- is a pattern of a group one
+        # level down, and they render the same but for their indent.
+        self.assertEqual(sorted(
+            len(line) - len(line.lstrip())
+            for line in output.splitlines() if line.strip().startswith("y----")
+        ), [1, 3])
+        self.assertLess(output.index("RAISE  2 branches"), output.index("CRANE  1 branch"))
+        self.assertLess(output.index("CRANE  1 branch"), output.index("STINK  1 branch"))
+        self.assertLess(output.index("STINK  1 branch"), output.index("MOUNT  1 branch"))
 
     def test_queue_worker_and_cache_collections_are_semantically_formatted(self):
         queue_report = self._report("queue", {

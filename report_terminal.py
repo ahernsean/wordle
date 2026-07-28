@@ -1115,14 +1115,14 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     ]
 
 
-def _base_word_groups(base_nodes):
-    """Base nodes in payload order, gathered under the word that was played.
+def _word_groups(siblings):
+    """Sibling nodes in payload order, gathered under the word that was played.
 
     A node with no recorded guess has no word to gather under and stands alone
     under a None key.
     """
     groups = {}
-    for node in base_nodes:
+    for node in siblings:
         step = node["step"]
         word = step["word"] if step is not None else None
         key = node["node_id"] if word is None else word
@@ -1171,24 +1171,29 @@ def _render_tree_sections(report, width, display_order):
                 detail += "  [context]"
             hotkey = _hotkey_label(display_order, node.get("branch_key_hex"))
             hotkey_prefix = f"{hotkey} " if hotkey else ""
-            lines.append(_fit(f"{'  ' * level}{hotkey_prefix}{label}{detail}", width))
-            for child in children_by_parent.get(node["node_id"], []):
-                append_node_and_descendants(child, level + 1)
+            lines.append(_fit(f"{' ' * level}{hotkey_prefix}{label}{detail}", width))
+            children = children_by_parent.get(node["node_id"], [])
+            if children:
+                append_word_groups(children, level + 1)
 
-        # Every base word is a group, including the one-pattern case: the word
-        # is named once and its response patterns are the rows beneath it.
-        for word, group_nodes in _base_word_groups(children_by_parent.get(None, [])):
-            if word is None:
-                append_node_and_descendants(group_nodes[0], 0)
-                continue
-            branch_count = len(group_nodes)
-            lines.append(_fit(
-                f"{word.upper()}  {branch_count} "
-                f"{'branch' if branch_count == 1 else 'branches'}",
-                width,
-            ))
-            for node in group_nodes:
-                append_node_and_descendants(node, 1, carries_word=False)
+        # Every word is a group at every level, including the one-pattern case:
+        # the word is named once and its response patterns are the rows beneath
+        # it.
+        def append_word_groups(siblings, level):
+            for word, group_nodes in _word_groups(siblings):
+                if word is None:
+                    append_node_and_descendants(group_nodes[0], level)
+                    continue
+                branch_count = len(group_nodes)
+                lines.append(_fit(
+                    f"{' ' * level}{word.upper()}  {branch_count} "
+                    f"{'branch' if branch_count == 1 else 'branches'}",
+                    width,
+                ))
+                for node in group_nodes:
+                    append_node_and_descendants(node, level + 1, carries_word=False)
+
+        append_word_groups(children_by_parent.get(None, []), 0)
         for node in data["nodes"]:
             if node["node_id"] not in visited_node_ids:
                 append_node_and_descendants(node, 0)

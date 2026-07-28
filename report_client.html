@@ -95,8 +95,11 @@
        Each fact is its own nowrap span, so a number never breaks mid-digit and
        "best CRANE*" never splits from its value. */
     .stat-line { display:flex; flex-wrap:wrap; font-size:.8rem; margin-top:.15rem; }
-    .stat-line > span { white-space:nowrap; }
-    .stat-line > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
+    /* The same packing inline, where facts follow an identity on its own line
+       instead of starting a row of their own. */
+    .inline-facts { margin-left:.35rem; }
+    .stat-line > span, .inline-facts > span { white-space:nowrap; }
+    .stat-line > span:not(:last-child)::after, .inline-facts > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
     .progress-line .sweep { height:1rem; margin:0 0 .3rem; }
     .sweep-cell { flex:1 1 0; min-width:2px; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
@@ -120,6 +123,9 @@
        it separates siblings from the guess they branch off. */
     .tree { list-style:none; margin:0; padding:0; }
     .tree ul { list-style:none; margin:.2rem 0 .2rem .5rem; padding-left:.6rem; border-left:1px solid var(--border); }
+    /* A word and its response patterns are one unit, so the rail marks descent
+       into a branch and never the step from a word to its own patterns. */
+    .tree ul.patterns { margin-left:.3rem; padding-left:.5rem; border-left:none; }
     .tree summary { cursor:pointer; min-height:28px; padding:.15rem 0; }
     .clickable { cursor:pointer; }
     .clickable:hover { border-color:var(--green); }
@@ -186,7 +192,7 @@
     const explicitKinds=new Set(["queue","workers","cache","hotspots"]);
     const treelessKinds=new Set(["cache","hotspots"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
-    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedBaseWords=new Set(), stickyOrders=new Map();
+    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), stickyOrders=new Map();
     let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
@@ -534,12 +540,12 @@
       }
       return fragment;
     }
-    /* Base nodes in payload order, gathered under the word that was played.  A
-       node with no recorded guess has no word to gather under and stands alone
-       under a null key. */
-    function baseWordGroups(baseNodes){
+    /* Sibling nodes in payload order, gathered under the word that was played.
+       A node with no recorded guess has no word to gather under and stands
+       alone under a null key. */
+    function wordGroups(siblings){
       const groups=new Map();
-      for(const node of baseNodes){
+      for(const node of siblings){
         const word=node.step?String(node.step.word):null;
         const key=word===null?node.node_id:word;
         if(!groups.has(key))groups.set(key,[word,[]]);
@@ -551,20 +557,27 @@
       const fragment=document.createDocumentFragment(),data=report.data;if(!data.tree_available){fragment.append(element("p","empty",data.unavailable_reason||"No extant queue topology"));return fragment;}
       const children=new Map();for(const node of data.nodes||[]){const parent=node.parent_node_id||"__base__";if(!children.has(parent))children.set(parent,[]);children.get(parent).push(node);}
       const previousNodes=previousBy(previous,"nodes","node_id");
-      const build=(node,carriesWord=true)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const details=element("details");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);if(matchMedia("(max-width:479px)").matches&&node.guess_depth>1&&!node.is_context)collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const summary=element("summary","clickable"),labelText=node.step?String(node.step.word).toUpperCase():"?",headGroup=element("span","step-group");if(carriesWord)headGroup.append(element("span","",labelText));if(node.step)headGroup.append(patternTiles(node.step.pattern));summary.append(headGroup);summary.append(element("span","dim"," d"+node.guess_depth+" · "+valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase)+" · "+valueOrDash(node.answer_count)+" answers · "+valueOrDash(node.worker_count)+" workers · "+valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count)+" · "+(node.branch_reference?"@"+shortReference(node.branch_reference):"structure")));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});summary.append(openButton);}details.addEventListener("toggle",()=>details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id));details.append(summary);const list=element("ul");for(const child of children.get(node.node_id)||[])list.append(build(child));if(list.children.length)details.append(list);item.append(details);return item;};
-      // Every base word is a group, including the one-pattern case: the word is
-      // named once and its response patterns are the rows beneath it.
-      const tree=element("ul","tree");
-      for(const [word,groupNodes] of baseWordGroups(children.get("__base__")||[])){
-        if(word===null){tree.append(build(groupNodes[0]));continue;}
-        const item=element("li","base-word");item.dataset.identity="base-word:"+word;
-        const details=element("details");details.open=!collapsedBaseWords.has(word);
-        const summary=element("summary","clickable");
-        summary.append(element("span","",word.toUpperCase()),element("span","dim"," "+numText(groupNodes.length)+(groupNodes.length===1?" branch":" branches")));
-        details.addEventListener("toggle",()=>details.open?collapsedBaseWords.delete(word):collapsedBaseWords.add(word));
-        const patterns=element("ul");for(const node of groupNodes)patterns.append(build(node,false));
-        details.append(summary,patterns);item.append(details);tree.append(item);
-      }
+      const build=(node,carriesWord=true)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const details=element("details");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);if(matchMedia("(max-width:479px)").matches&&node.guess_depth>1&&!node.is_context)collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const summary=element("summary","clickable"),labelText=node.step?String(node.step.word).toUpperCase():"?",headGroup=element("span","step-group");if(carriesWord)headGroup.append(element("span","",labelText));if(node.step)headGroup.append(patternTiles(node.step.pattern));summary.append(headGroup);const facts=element("span","dim inline-facts");for(const fact of ["d"+node.guess_depth,valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase),valueOrDash(node.answer_count)+" answers",valueOrDash(node.worker_count)+" workers",valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count),node.branch_reference?"@"+shortReference(node.branch_reference):"structure"])facts.append(element("span","",fact));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});headGroup.append(openButton);}summary.append(facts);details.addEventListener("toggle",()=>details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id));details.append(summary);const childNodes=children.get(node.node_id)||[];if(childNodes.length)details.append(buildGroupedList(childNodes,node.node_id,""));item.append(details);return item;};
+      // Every word is a group at every level, including the one-pattern case:
+      // the word is named once and its response patterns are the rows beneath
+      // it.  Collapse state is keyed by parent, so the same word appearing
+      // under two parents collapses independently.
+      const buildGroupedList=(siblings,parentKey,className)=>{
+        const list=element("ul",className);
+        for(const [word,groupNodes] of wordGroups(siblings)){
+          if(word===null){list.append(build(groupNodes[0]));continue;}
+          const groupKey=parentKey+"/"+word,item=element("li","word-group");
+          item.dataset.identity="word-group:"+groupKey;
+          const details=element("details");details.open=!collapsedWordGroups.has(groupKey);
+          const summary=element("summary","clickable");
+          summary.append(element("span","",word.toUpperCase()),element("span","dim"," "+numText(groupNodes.length)+(groupNodes.length===1?" branch":" branches")));
+          details.addEventListener("toggle",()=>details.open?collapsedWordGroups.delete(groupKey):collapsedWordGroups.add(groupKey));
+          const patterns=element("ul","patterns");for(const node of groupNodes)patterns.append(build(node,false));
+          details.append(summary,patterns);item.append(details);list.append(item);
+        }
+        return list;
+      };
+      const tree=buildGroupedList(children.get("__base__")||[],"","tree");
       fragment.append(tree);return fragment;
     }
     function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=element("div","grid"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}

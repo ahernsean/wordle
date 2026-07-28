@@ -224,25 +224,57 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertGreater(base_words.count(), 0)
         self.assertEqual(
             base_words.count(),
-            self.page.locator("ul.tree > li.base-word").count(),
+            self.page.locator("ul.tree > li.word-group").count(),
         )
 
-    def test_tree_groups_base_patterns_under_their_word(self):
+    def test_tree_groups_patterns_under_their_word_at_every_level(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#tree-button").click()
-        self.page.wait_for_selector("ul.tree > li.base-word")
-        group = self.page.locator("ul.tree > li.base-word")
+        self.page.wait_for_selector("ul.tree > li.word-group")
+        group = self.page.locator("ul.tree > li.word-group")
         self.assertEqual(group.count(), 1)
         self.assertEqual(
             " ".join(group.locator("> details > summary").inner_text().split()),
             "RAISE 1 branch",
         )
-        rows = group.locator("> details > ul > li")
+        rows = group.locator("> details > ul.patterns > li")
         self.assertEqual(rows.count(), 1)
         # The group names the word, so its rows carry only the response pattern.
         row_summary = rows.locator("> details > summary")
         self.assertNotIn("RAISE", row_summary.inner_text())
         self.assertEqual(row_summary.locator(".step").count(), 1)
+        # A row's own children are grouped by word the same way.
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("ul.tree > li.word-group")
+        nested = self.page.locator(
+            "ul.tree > li.word-group > details > ul.patterns > li"
+            " > details > ul > li.word-group"
+        )
+        self.assertEqual(nested.count(), 1)
+        self.assertEqual(
+            " ".join(nested.locator("> details > summary").inner_text().split()),
+            "ALIBI 1 branch",
+        )
+        nested_rows = nested.locator("> details > ul.patterns > li")
+        self.assertEqual(nested_rows.count(), 1)
+        self.assertNotIn(
+            "ALIBI", nested_rows.locator("> details > summary").inner_text()
+        )
+
+    def test_tree_row_facts_never_split_a_number_from_its_noun(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#tree-button").click()
+        self.page.wait_for_selector("ul.tree .inline-facts")
+        facts = self.page.locator("ul.tree li:not(.word-group) > details > summary .inline-facts").first
+        self.assertEqual(
+            [" ".join(text.split()) for text in facts.locator("> span").all_inner_texts()],
+            ["d1", "active / evaluating", "8 answers", "2 workers", "20/50", "@2222"],
+        )
+        self.assertTrue(all(
+            style == "nowrap" for style in facts.locator("> span").evaluate_all(
+                "spans => spans.map(span => getComputedStyle(span).whiteSpace)"
+            )
+        ))
 
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
