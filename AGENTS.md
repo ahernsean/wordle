@@ -341,6 +341,17 @@ app. Any schema change must:
 The queue (`runtime/erd_queue.sqlite3`) is Linux-only; its migrations live in
 `ERDQueue._migrate()`.
 
+Swarm telemetry lives in a **separate** Linux-only file,
+`runtime/erd_queue_telemetry.sqlite3` (`<stem>_telemetry<ext>`, computed by
+`derive_telemetry_path`), which `ERDQueue` opens as an attached schema named
+`telemetry`. The `claim_telemetry` and `branch_finalize_log` tables are there, not
+in the main queue file — `add_claim_telemetry` and `add_branch_finalize_log` write
+`telemetry.<table>`, and reads join through the `telemetry.` prefix. Because
+attached-schema tables do not appear in the main file's `sqlite_master`, running
+`.tables` on `runtime/erd_queue.sqlite3` shows no telemetry tables; open the
+telemetry file directly (or query through a live `ERDQueue`) to inspect them. Rows
+are fenced by the active telemetry epoch (`erd_search.py epoch show`).
+
 ---
 
 ## Claude token usage
