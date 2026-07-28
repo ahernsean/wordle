@@ -19,7 +19,7 @@ from report_model import (
     resolve_branch_reference,
     resolve_branch_target,
 )
-from wordle_engine import ERD_ALL, ResponseCache
+from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache
 from wordle_ui import fmt_pattern
 
 
@@ -550,6 +550,26 @@ class SemanticReportTest(unittest.TestCase):
         ]
         self.assertEqual(len(unknown_nodes), 3)
         self.assertTrue(all(node["step"] is None for node in unknown_nodes))
+
+    def test_spine_recording_no_complete_guess_is_unknown_not_a_parentless_branch(self):
+        # A word with no pattern records no guess, so the row has no step to
+        # place it by and lands on an unknown chain like a spine-less row.
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.create_branch(b"onetokenspine01", 3, 4, budget=5, spine="RAISE")
+        queue.close()
+        report = collect_report(self.sources, ReportRequest(tree=True))
+        nodes = report["data"]["nodes"]
+        self.assertTrue(nodes)
+        for node in nodes:
+            self.assertTrue(node["node_id"].startswith("unknown:"), node["node_id"])
+            self.assertIsNone(node["step"])
+        # The deepest node carries the branch; no node stands above the base.
+        carrying = [node for node in nodes if node["branch_key_hex"] is not None]
+        self.assertEqual(len(carrying), 1)
+        self.assertEqual(carrying[0]["guess_depth"], GAME_GUESSES - 5)
+        self.assertEqual(
+            min(node["guess_depth"] for node in nodes), 1
+        )
 
     def test_cache_distribution_helpers_name_reuse_axes(self):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)

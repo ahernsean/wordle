@@ -96,8 +96,10 @@
        "best CRANE*" never splits from its value. */
     .stat-line { display:flex; flex-wrap:wrap; font-size:.8rem; margin-top:.15rem; }
     /* The same packing inline, where facts follow an identity on its own line
-       instead of starting a row of their own. */
-    .inline-facts { margin-left:.35rem; }
+       instead of starting a row of their own.  The flex container is what
+       creates the break opportunities between facts: adjacent nowrap spans
+       with no text node between them are one unbreakable inline box. */
+    .inline-facts { display:inline-flex; flex-wrap:wrap; margin-left:.35rem; }
     .stat-line > span, .inline-facts > span { white-space:nowrap; }
     .stat-line > span:not(:last-child)::after, .inline-facts > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
@@ -565,7 +567,7 @@
       const buildGroupedList=(siblings,parentKey,className)=>{
         const list=element("ul",className);
         for(const [word,groupNodes] of wordGroups(siblings)){
-          if(word===null){list.append(build(groupNodes[0]));continue;}
+          if(word===null){for(const node of groupNodes)list.append(build(node));continue;}
           const groupKey=parentKey+"/"+word,item=element("li","word-group");
           item.dataset.identity="word-group:"+groupKey;
           const details=element("details");details.open=!collapsedWordGroups.has(groupKey);

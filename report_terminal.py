@@ -1182,7 +1182,8 @@ def _render_tree_sections(report, width, display_order):
         def append_word_groups(siblings, level):
             for word, group_nodes in _word_groups(siblings):
                 if word is None:
-                    append_node_and_descendants(group_nodes[0], level)
+                    for node in group_nodes:
+                        append_node_and_descendants(node, level)
                     continue
                 branch_count = len(group_nodes)
                 lines.append(_fit(

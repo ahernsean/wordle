@@ -279,6 +279,19 @@ class ReportClientBrowserTest(unittest.TestCase):
                 "spans => spans.map(span => getComputedStyle(span).whiteSpace)"
             )
         ))
+        # Facts kept whole are only half the contract: the container must still
+        # break *between* them, or a row cannot fit a narrow screen at all.
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        self.assertGreater(
+            len(set(facts.locator("> span").evaluate_all(
+                "spans => spans.map(span => span.getBoundingClientRect().top)"
+            ))),
+            1,
+        )
+        self.assertLessEqual(*self.page.evaluate(
+            "() => [document.documentElement.scrollWidth,"
+            " document.documentElement.clientWidth]"
+        ))
 
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
@@ -825,11 +838,23 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(colors["gray"], "rgb(120, 124, 126)")
 
     def test_no_horizontal_scroll_at_required_widths(self):
-        for width in (375, 390, 480, 800, 1200):
-            with self.subTest(width=width):
-                self.page.set_viewport_size({"width": width, "height": 800})
-                overflow = self.page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth")
-                self.assertFalse(overflow)
+        # Every view, not just whichever one setUp left loaded: the tree view
+        # reached phone widths overflowing because it was never measured here.
+        for path in (
+            "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
+            "?kind=queue&tree=1", "?branch_target=RAISE+.....",
+            "?branch_target=RAISE+.....&tree=1",
+        ):
+            self.page.goto(self.base_url + path)
+            self.page.wait_for_selector("h1")
+            for width in (375, 390, 480, 800, 1200):
+                with self.subTest(path=path or "overview", width=width):
+                    self.page.set_viewport_size({"width": width, "height": 800})
+                    measured = self.page.evaluate(
+                        "() => ({scroll: document.documentElement.scrollWidth,"
+                        " client: document.documentElement.clientWidth})"
+                    )
+                    self.assertLessEqual(measured["scroll"], measured["client"])
 
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {

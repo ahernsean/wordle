@@ -1002,14 +1002,22 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     return report
 
 
+def _spine_steps(spine):
+    """The guesses a spine records, as (word, pattern) steps.
+
+    Tokens pair up as word then pattern; a trailing unpaired token records no
+    guess and is dropped, so a spine of one token yields no steps at all.
+    """
+    tokens = (spine or "").split()
+    return tuple(
+        SpineStep(tokens[index].lower(), _normalized_pattern(tokens[index + 1]))
+        for index in range(0, len(tokens) - 1, 2)
+    )
+
+
 def _steps_from_queue_row(row):
-    spine = row.get("spine")
-    if spine:
-        tokens = spine.split()
-        return tuple(
-            SpineStep(tokens[index].lower(), _normalized_pattern(tokens[index + 1]))
-            for index in range(0, len(tokens) - 1, 2)
-        )
+    if row.get("spine"):
+        return _spine_steps(row["spine"])
     source_word = row.get("source_word")
     source_pattern = row.get("source_pattern")
     if source_word and source_pattern is not None:
@@ -1372,14 +1380,6 @@ def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict
 
 def _tree_node_id(steps):
     return "/".join(f"{step.word}:{step.pattern}" for step in steps)
-
-
-def _spine_steps(spine):
-    tokens = (spine or "").split()
-    return [
-        SpineStep(tokens[index].lower(), _normalized_pattern(tokens[index + 1]))
-        for index in range(0, len(tokens) - 1, 2)
-    ]
 
 
 def _tree_layout(rows, request, prefix, unfiltered_rows):
