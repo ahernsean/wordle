@@ -177,14 +177,14 @@
   <script>
   (() => {
     "use strict";
-    const SCHEMA_VERSION=2, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000;
+    const SCHEMA_VERSION=2, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard"]);
     const treelessKinds=new Set(["cache","hotspots"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), stickyOrders=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -245,7 +245,8 @@
       return endpoint+(query.size?"?"+query.toString():"");
     }
     function contextKey(state){return buildAPIURL(state);}
-    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}}
+    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}clearSlowRequestNotice();}
+    function clearSlowRequestNotice(){if(slowRequestTimer){clearTimeout(slowRequestTimer);slowRequestTimer=null;}}
     function setState(next,push=true){
       abortActiveRequest();
       currentState=normalizeState(next); const query=stateQuery(currentState,true).toString();
@@ -610,6 +611,12 @@
       }
       const state=normalizeState(currentState),context=contextKey(state),generation=++requestGeneration,controller=new AbortController();
       activeRequestController=controller;activeRequestStartedAt=Date.now();
+      // On a view switch (new context), a slow report — the leaderboard folds
+      // every candidate — would otherwise leave a blank pane; show a notice if
+      // it has not arrived within SLOW_REQUEST_MILLIS.  Same-context polls keep
+      // the current data on screen and never show it.
+      clearSlowRequestNotice();
+      if(context!==lastContext){slowRequestTimer=setTimeout(()=>{if(generation===requestGeneration)byId("report").replaceChildren(element("p","dim","Computing "+(state.kind==="leaderboard"?"leaderboard":"report")+"…"));},SLOW_REQUEST_MILLIS);}
       try{
         const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});
         if(generation!==requestGeneration)return;
@@ -628,7 +635,7 @@
           if(navigated||!lastReport)byId("report").replaceChildren(element("p","error",error.message));
         }
       }
-      finally{if(activeRequestController===controller)activeRequestController=null;}
+      finally{clearSlowRequestNotice();if(activeRequestController===controller)activeRequestController=null;}
     }
     function pinBranchToSpine(report,state){
       // A branch reference is a one-way hash the queue must invert, so it stops

@@ -267,6 +267,14 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("3.5643502648", text)
         self.assertIn("CRANE*", text)  # word_is_answer renders the asterisk
 
+    def test_slow_view_switch_shows_a_computing_notice(self):
+        # Hold the leaderboard response open so the slow-request timer fires on
+        # the view switch; the leaderboard folds every candidate and can take
+        # several seconds. The handler never resolves, so the request hangs.
+        self.page.route("**/api/view/leaderboard*", lambda route: None)
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Computing leaderboard…", timeout=5000)
+
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#tree-button").click()
