@@ -829,6 +829,58 @@ def _mark_queue_source_error(report, error):
     report["sources"]["telemetry"]["error"] = message
 
 
+def _opener_erd_summary(response_groups):
+    """Fold an opener's response groups into its own ERD and worst-case line.
+
+    Playing the opener is the first guess; each response group is then solved
+    independently.  So the opener's ERD is the answer-weighted mean of the
+    groups' ERDs plus one, and its worst-case line is the deepest group line
+    plus one.  A single remaining answer is solved by playing it (one more
+    guess) unless the opener itself was the answer (all-green response, zero
+    more guesses).
+
+    The aggregate is exact only once every group is solved.  While any group
+    still lacks an ERD — unsolved, or a loss with no finite line under the
+    depth cap — the opener's ERD and worst case are unknown, reported as None
+    with the count of groups already resolved.
+    """
+    total_answers = sum(group["answer_count"] for group in response_groups)
+    weighted_remaining_depth = 0.0
+    worst_remaining_depth = 0
+    resolved_group_count = 0
+    complete = total_answers > 0
+    for group in response_groups:
+        best_erd = group["best_erd"]
+        max_remaining_depth = group["max_remaining_depth"]
+        if best_erd is None:
+            if group["answer_count"] < 2:
+                solved_by_opener = group["pattern"] == "ggggg"
+                best_erd = 0.0 if solved_by_opener else 1.0
+                max_remaining_depth = 0 if solved_by_opener else 1
+            else:
+                complete = False
+                continue
+        resolved_group_count += 1
+        weighted_remaining_depth += group["answer_count"] * best_erd
+        if max_remaining_depth is not None:
+            worst_remaining_depth = max(worst_remaining_depth, max_remaining_depth)
+    if not complete:
+        return {
+            "complete": False,
+            "erd": None,
+            "max_remaining_depth": None,
+            "resolved_group_count": resolved_group_count,
+            "response_group_count": len(response_groups),
+        }
+    return {
+        "complete": True,
+        "erd": 1.0 + weighted_remaining_depth / total_answers,
+        "max_remaining_depth": 1 + worst_remaining_depth,
+        "resolved_group_count": resolved_group_count,
+        "response_group_count": len(response_groups),
+    }
+
+
 def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -993,6 +1045,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             row["cache_state"] == "missing" for row in all_response_groups
         ),
     }
+    data["erd_summary"] = _opener_erd_summary(all_response_groups)
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = (

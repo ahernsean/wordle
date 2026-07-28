@@ -460,6 +460,7 @@
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;fragment.append(element("h2","",candidateText(data.word,data.word_is_answer)),renderSpine(data.context?.spine));
+      const erd=data.erd_summary;if(erd){const erdMetrics=element("div","metrics");if(erd.complete){erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("worst-case",erd.max_remaining_depth+" guesses"));}else{erdMetrics.append(element("p","dim","ERD pending — "+erd.resolved_group_count+" of "+erd.response_group_count+" response groups solved"));}fragment.append(erdMetrics);}
       const groupCountLabels={response_group_count:"response groups",trivial_response_group_count:"trivial",queued_response_group_count:"queued",active_response_group_count:"active",exact_response_group_count:"exact",loss_response_group_count:"loss",missing_response_group_count:"missing"};
       const summary=element("div","metrics");for(const [key,value] of Object.entries(data.response_group_counts||{}))summary.append(metric(groupCountLabels[key]||label(key),value));fragment.append(summary);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??data.response_group_counts?.response_group_count??matchedRows;fragment.append(element("p","dim","Shown "+shownRows.length+" of "+matchedRows+" matched · "+totalRows+" total response groups"));

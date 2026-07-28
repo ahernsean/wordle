@@ -888,6 +888,20 @@ def _semantic_header(report, title, width):
     return header
 
 
+def _word_erd_line(erd_summary):
+    if not erd_summary:
+        return "ERD —"
+    if not erd_summary.get("complete"):
+        return (
+            f"ERD — (partial: {erd_summary['resolved_group_count']} of "
+            f"{erd_summary['response_group_count']} response groups solved)"
+        )
+    return (
+        f"ERD {erd_summary['erd']:.3f}  "
+        f"worst-case {erd_summary['max_remaining_depth']} guesses"
+    )
+
+
 def _render_word_sections(report, previous_report, color, width, display_order):
     data = report["data"]
     response_groups = data["response_groups"]
@@ -911,6 +925,7 @@ def _render_word_sections(report, previous_report, color, width, display_order):
         f"n={context['answer_count']} d={context['guess_depth']}",
         width,
     )
+    header.append(_fit("  " + _word_erd_line(data.get("erd_summary")), width))
     counts = data["response_group_counts"]
     summary = [
         "Response groups",

@@ -227,6 +227,24 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("article.card.clickable").first.click()
         self.assertIn("branch_target=CACHE+-----", self.page.url)
 
+    def test_word_view_shows_pending_erd_while_groups_are_unsolved(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("2 of 4 response groups solved", text)
+
+    def test_word_view_shows_opener_erd_and_worst_case_when_solved(self):
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=SALET')).json();
+          report.data.erd_summary={complete:true,erd:3.564102564102564,
+            max_remaining_depth:6,resolved_group_count:4,response_group_count:4};
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'SALET'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("3.564", text)
+        self.assertNotIn("3.564102564102564", text)
+        self.assertIn("6 guesses", text)
+
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#tree-button").click()
