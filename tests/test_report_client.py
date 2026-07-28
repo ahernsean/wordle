@@ -243,13 +243,17 @@ class ReportClientBrowserTest(unittest.TestCase):
         row_summary = rows.locator("> details > summary")
         self.assertNotIn("RAISE", row_summary.inner_text())
         self.assertEqual(row_summary.locator(".step").count(), 1)
-        # A row's own children are grouped by word the same way.
-        self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("ul.tree > li.word-group")
-        nested = self.page.locator(
+        # A row's own children are grouped by word the same way.  The branch
+        # tree is awaited by its nested group: a bare top-level group is
+        # already on the page from the queue tree, so waiting for one would
+        # match the view being navigated away from.
+        nested_selector = (
             "ul.tree > li.word-group > details > ul.patterns > li"
             " > details > ul > li.word-group"
         )
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector(nested_selector)
+        nested = self.page.locator(nested_selector)
         self.assertEqual(nested.count(), 1)
         self.assertEqual(
             " ".join(nested.locator("> details > summary").inner_text().split()),
