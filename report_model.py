@@ -1189,6 +1189,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     branch_telemetry = {
         "bundle_summary": None,
         "recent_finalizations": [],
+        "finalization_total_count": 0,
         "cut_reuse_misses": [],
     }
     queue_error = None
@@ -1218,7 +1219,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         claim_rows = list(queue.claims_for_branch(branch_key))
         republish_rows = queue.candidate_republish_for_branch(branch_key)
         branch_telemetry = queue.report_branch_telemetry(
-            branch_key, request.filters.limit or 5
+            branch_key, request.filters.limit or 10
         )
     except (sqlite3.Error, OSError) as error:
         queue_error = error

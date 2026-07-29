@@ -546,6 +546,23 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("Historical", cards.nth(1).inner_text())
         self.assertIn("historical", cards.nth(1).get_attribute("class"))
 
+    def test_finalization_spines_and_overflow_note_render(self):
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.finalization_total_count=17;
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        text = self.page.locator(
+            "section:has-text('Recent finalizations')"
+        ).inner_text()
+        # Each finalization discloses the spine that reached this answer set.
+        self.assertIn("CRIMP", text)
+        self.assertIn("DUCHY", text)
+        self.assertIn("WRUNG", text)
+        # 17 total, 3 shown -> 14 more, with the URL knob to widen the view.
+        self.assertIn("14 more", text)
+        self.assertIn("limit=17", text)
+
     def test_erd_and_bounds_round_in_cache_and_hotspot_views(self):
         result = self.page.evaluate("""async () => {
           const out={};

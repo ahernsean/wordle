@@ -1111,12 +1111,22 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         telemetry_lines.extend(
             _inline_section("  active bundles:", bundle_fields, width)
         )
-    for finalization in data.get("recent_finalizations", []):
+    finalizations = data.get("recent_finalizations", [])
+    for finalization in finalizations:
+        spine = finalization.get("spine") or "(spine unknown)"
         telemetry_lines.append(_fit(
-            f"  {finalization['outcome']} epoch={finalization['epoch']} "
+            f"  {spine}  {finalization['outcome']} "
+            f"epoch={finalization['epoch']} "
             f"nodes={_abbreviate_number(finalization['search_node_count'])} "
             f"evaluated={finalization['evaluated_candidate_count']} "
             f"bulk={finalization['bulk_completed_candidate_count']}",
+            width,
+        ))
+    finalization_total = data.get("finalization_total_count", len(finalizations))
+    if finalization_total > len(finalizations):
+        telemetry_lines.append(_fit(
+            f"  … and {finalization_total - len(finalizations)} more reaching "
+            f"this same answer set; view --limit {finalization_total} to see all",
             width,
         ))
     for miss in data.get("cut_reuse_misses", []):
