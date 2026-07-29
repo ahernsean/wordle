@@ -125,6 +125,30 @@ NO_INFORMATION_GAINED = 5  # a response group is the whole branch: split gained 
 _ABORT_STATUSES = frozenset({DEADLINE_EXCEEDED, CANCEL_RECVD})
 
 
+def erd_numerator(value, n_answers):
+    """Exact integer numerator of an ERD value for an n_answers-word branch.
+
+    A branch's ERD at any budget is (sum of integer line lengths) / n_answers,
+    so every ERD value — and every alpha-beta ceiling, which lands on the same
+    grid — is exactly k/n_answers.  Carried as float64 it accumulates ~1e-9 of
+    rounding noise; multiplying by n_answers and rounding recovers the exact k
+    (residual is < 1e-6 for every n_answers up to the answer-list size, far
+    inside the 0.5 rounding margin)."""
+    numerator = value * n_answers
+    rounded = round(numerator)
+    assert abs(numerator - rounded) < 1e-3, (
+        f'off-grid ERD value {value!r} for n_answers={n_answers}: '
+        f'{numerator!r} is not within 1e-3 of an integer')
+    return rounded
+
+
+def erd_ge(a, b, n_answers):
+    """True iff ERD value a >= b for two values of an n_answers-word branch,
+    compared at exact rational precision so float64 noise cannot force a
+    spurious cut re-solve.  Callers must pass only finite values."""
+    return erd_numerator(a, n_answers) >= erd_numerator(b, n_answers)
+
+
 # Admissible ceiling on how many answer words any strategy can guarantee to
 # resolve within a given guess budget.  A guess yields at most 3**5 = 243
 # distinct response patterns; the all-green pattern resolves the guessed word

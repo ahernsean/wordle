@@ -39,6 +39,7 @@ from wordle_engine import (
     OVER_ERD_LIMIT,
     NO_INFORMATION_GAINED,
     _ABORT_STATUSES,
+    erd_ge,
     cache_all_scores,
     evaluate_candidate,
     estimate_candidate_work,
@@ -358,7 +359,7 @@ class _MidLoopPublisher:
         # do so per candidate, forever.  Disarm the token and finish inline.
         ours = best_erd if frame_ceilinged else None
         joinable = row_budget == budget and (
-            row_ceiling is None or (ours is not None and row_ceiling >= ours))
+            row_ceiling is None or (ours is not None and erd_ge(row_ceiling, ours, n)))
         if not joinable:
             token[5] = False
             return None
@@ -1574,7 +1575,7 @@ class _BranchWorker:
             return None
         return self.cooperative_solve(words, budget, ceiling)
 
-    def _read_satisfying_cut(self, branch_key, budget, ceiling):
+    def _read_satisfying_cut(self, branch_key, budget, ceiling, n_words):
         """The engine tuple for a recorded cut that satisfies this consumer, or
         None.  Satisfying = proven at a budget >= ours (the bound then holds at
         ours) with a bound >= our ceiling (so it proves what the parent asked)."""
@@ -1584,7 +1585,7 @@ class _BranchWorker:
         if cut is None:
             return None
         cut_bound, cut_budget, cut_tainted = cut
-        if budget <= cut_budget and cut_bound >= ceiling:
+        if budget <= cut_budget and erd_ge(cut_bound, ceiling, n_words):
             # A tainted cut's bound holds only among budget-feasible
             # strategies; the consumer joins the taint so its own result
             # cannot claim the unconstrained optimum.
@@ -1639,7 +1640,7 @@ class _BranchWorker:
             if cut is not None:
                 cut_bound, cut_budget, cut_tainted = cut
                 if (ceiling != float('inf') and budget <= cut_budget
-                        and cut_bound >= ceiling):
+                        and erd_ge(cut_bound, ceiling, n_words)):
                     return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
                 self.queue.add_cut_reuse_miss(
                     branch_key, n_words, budget,
@@ -1678,7 +1679,7 @@ class _BranchWorker:
                     row_ceiling = row['ceiling']
                     ours = None if ceiling == float('inf') else ceiling
                     if row_ceiling is not None and (
-                            ours is None or row_ceiling < ours):
+                            ours is None or not erd_ge(row_ceiling, ours, n_words)):
                         return None
             # Descents into this branch promote grandchildren relative to its spine.
             self._claimed_branch_spine = child_spine
@@ -1690,14 +1691,14 @@ class _BranchWorker:
                     self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
                 if reuse is not None:
                     return (SOLVED, *reuse)
-                cut = self._read_satisfying_cut(branch_key, budget, ceiling)
+                cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                 if cut is not None:
                     return cut
                 if self.queue.get_branch(branch_key) is None:
                     # Finalized + deleted: a cut lands in cut_results just
                     # before the delete, so re-check once before concluding
                     # the branch was a loss.
-                    cut = self._read_satisfying_cut(branch_key, budget, ceiling)
+                    cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                     if cut is not None:
                         return cut
                     break                       # finalized as a loss + deleted
