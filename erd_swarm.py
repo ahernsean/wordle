@@ -399,7 +399,7 @@ class _MidLoopPublisher:
         #   racing creator may have won with a looser or absent ceiling — skip
         #   the marks then and let the branch redo the prefix.
         if frame_ceilinged:
-            sound_to_mark = row_ceiling is not None and row_ceiling <= best_erd
+            sound_to_mark = row_ceiling is not None and erd_ge(best_erd, row_ceiling, n)
         else:
             sound_to_mark = True
         if sound_to_mark:

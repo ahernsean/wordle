@@ -424,6 +424,19 @@ class TestErdGe(unittest.TestCase):
         self.assertTrue(erd_ge(value, nudged, 5))
         self.assertTrue(erd_ge(nudged, value, 5))
 
+    def test_off_grid_value_returns_no_numerator(self):
+        # 2.5 is not on the 5-word k/5 grid (12.5 is not near an integer).
+        self.assertIsNone(erd_numerator(2.5, 5))
+        self.assertEqual(erd_numerator(2.4, 5), 12)
+
+    def test_off_grid_operand_falls_back_to_raw_float_compare(self):
+        # An off-grid operand must never raise: erd_ge degrades to the
+        # pre-fix float compare instead of crashing the caller, since this
+        # comparison only ever gates reuse of already-proven work.
+        self.assertTrue(erd_ge(3.0, 2.5, 5))     # raw: 3.0 >= 2.5
+        self.assertFalse(erd_ge(2.0, 2.5, 5))    # raw: 2.0 >= 2.5
+        self.assertTrue(erd_ge(2.5, 2.5, 5))     # both off-grid, equal raw
+
 
 if __name__ == "__main__":
     unittest.main()

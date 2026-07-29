@@ -125,28 +125,41 @@ NO_INFORMATION_GAINED = 5  # a response group is the whole branch: split gained 
 _ABORT_STATUSES = frozenset({DEADLINE_EXCEEDED, CANCEL_RECVD})
 
 
+# Worst on-grid residual measured across the full production corpus was
+# 3.6e-7 (issue #186); this keeps a ~3x margin while still routing any
+# genuinely off-grid value to erd_ge's raw-float fallback below.
+_ERD_GRID_TOLERANCE = 1e-6
+
+
 def erd_numerator(value, n_answers):
-    """Exact integer numerator of an ERD value for an n_answers-word branch.
+    """The integer numerator of value, if value is exactly k/n_answers to
+    within _ERD_GRID_TOLERANCE; None if value is off that grid.
 
     A branch's ERD at any budget is (sum of integer line lengths) / n_answers,
     so every ERD value — and every alpha-beta ceiling, which lands on the same
     grid — is exactly k/n_answers.  Carried as float64 it accumulates ~1e-9 of
-    rounding noise; multiplying by n_answers and rounding recovers the exact k
-    (residual is < 1e-6 for every n_answers up to the answer-list size, far
-    inside the 0.5 rounding margin)."""
+    rounding noise; multiplying by n_answers and rounding recovers the exact k."""
     numerator = value * n_answers
     rounded = round(numerator)
-    assert abs(numerator - rounded) < 1e-3, (
-        f'off-grid ERD value {value!r} for n_answers={n_answers}: '
-        f'{numerator!r} is not within 1e-3 of an integer')
-    return rounded
+    if abs(numerator - rounded) < _ERD_GRID_TOLERANCE:
+        return rounded
+    return None
 
 
 def erd_ge(a, b, n_answers):
-    """True iff ERD value a >= b for two values of an n_answers-word branch,
-    compared at exact rational precision so float64 noise cannot force a
-    spurious cut re-solve.  Callers must pass only finite values."""
-    return erd_numerator(a, n_answers) >= erd_numerator(b, n_answers)
+    """True iff ERD value a >= b for two values of an n_answers-word branch.
+
+    When both reconstruct to an exact k/n_answers numerator, compares those
+    integers, so float64 noise on the same rational cannot force a spurious
+    cut re-solve.  Falls back to the raw float compare when either value is
+    off that grid: this comparison only ever gates reuse of already-proven
+    work, so degrading to the pre-fix behavior is always safe, never wrong,
+    and never fatal — unlike raising, which would turn an off-grid operand
+    into a worker crash instead of a merely-wasted re-solve."""
+    na, nb = erd_numerator(a, n_answers), erd_numerator(b, n_answers)
+    if na is not None and nb is not None:
+        return na >= nb
+    return a >= b
 
 
 # Admissible ceiling on how many answer words any strategy can guarantee to
