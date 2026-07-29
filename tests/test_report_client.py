@@ -546,6 +546,23 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("Historical", cards.nth(1).inner_text())
         self.assertIn("historical", cards.nth(1).get_attribute("class"))
 
+    def test_branch_identity_is_content_and_spine_is_reached_via(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Identity')")
+        identity = self.page.locator(
+            "section:has-text('Identity')"
+        ).first.inner_text()
+        # Identity is the content branch: its @-reference, word count, budget.
+        self.assertIn("@1111", identity)
+        self.assertIn("words", identity)
+        self.assertIn("8", identity)
+        # The spine is demoted to one path, not the branch's identity.
+        reached = self.page.locator(
+            "section:has-text('Reached via')"
+        ).inner_text()
+        self.assertIn("RAISE", reached)
+        self.assertIn("One path to this answer set", reached)
+
     def test_finalization_spines_and_overflow_note_render(self):
         self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();

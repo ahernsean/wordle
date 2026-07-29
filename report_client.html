@@ -482,7 +482,11 @@
     }
     function section(title,content,className=""){const node=element("section","section "+className);node.append(element("h2","",title));if(content)node.append(content);return node;}
     function renderBranch(report,previous,state){
-      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};if(branch.spine?.length)fragment.append(section("Identity",renderSpine(branch.spine)));
+      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};
+      const identityMetrics=element("div","metrics");
+      identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count),metric("budget",branch.budget));
+      fragment.append(section("Identity",identityMetrics));
+      if(branch.spine?.length){const via=element("div");via.append(renderSpine(branch.spine),element("p","dim","One path to this answer set."));fragment.append(section("Reached via",via));}
       fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
       fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[timeLabel(key),displayTimedValue(key,value,report.generated_at)]))));
