@@ -552,16 +552,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         identity = self.page.locator(
             "section:has-text('Identity')"
         ).first.inner_text()
-        # Identity is the content branch: its @-reference, word count, budget.
+        # Identity is the content branch: its @-reference and word count.
+        # Budget is not part of branch_key, so it does not appear here.
         self.assertIn("@1111", identity)
         self.assertIn("words", identity)
         self.assertIn("8", identity)
-        # The spine is demoted to one path, not the branch's identity.
+        self.assertNotIn("budget", identity)
+        # The spine is not the identity: absent from the top meta line, shown
+        # only under "Reached via".
+        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
+        self.assertFalse(any("RAISE" in text for text in meta_spans))
         reached = self.page.locator(
             "section:has-text('Reached via')"
         ).inner_text()
         self.assertIn("RAISE", reached)
-        self.assertIn("One path to this answer set", reached)
 
     def test_finalization_spines_and_overflow_note_render(self):
         self.page.evaluate("""async () => {
