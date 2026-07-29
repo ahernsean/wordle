@@ -89,12 +89,6 @@ class TestCmdSolve(CliTestCase):
         out = self.run_cmd(wordle.cmd_solve, inputs=["1"])
         self.assertIn("scanning root", out)
 
-    def test_menu_progress_not_ready(self):
-        # root_total < 0 -> the 'not ready' progress label.
-        self.gs.last_erd_root_progress = (0, -1, None)
-        out = self.run_cmd(wordle.cmd_solve, inputs=["1"])
-        self.assertIn("not ready", out)
-
     def test_cached_entropy_shows_max_ent(self):
         # ENTROPY_GAIN cached fast path prints the max-entropy annotation.
         self.run_cmd(wordle.cmd_solve, inputs=["2"])

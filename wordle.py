@@ -1375,9 +1375,7 @@ def cmd_solve(gs):
         print(f"  {erd_idx}. ERD: expected remaining depth (v) [{erd_root[1]:.3f}]")
     else:
         root_done, root_total, root_best = gs.last_erd_root_progress
-        if root_total < 0:
-            prog = 'not ready'
-        elif root_total == 0:
+        if root_total == 0:
             prog = 'ordering candidates...'
         elif root_best is not None:
             bw, bs = root_best
@@ -2664,7 +2662,7 @@ def print_status(gs, solver=None):
             elif solver is not None and set(solver._words) == set(words):
                 if solver.root_total == 0:
                     scan_lines = ['ERD: ordering candidates...']
-                elif solver.root_total > 0:
+                else:
                     scan_lines = _format_scan_progress(
                         solver.root_done, solver.root_total,
                         solver.root_best, solver.culled,
@@ -2758,7 +2756,7 @@ class ERDSolver(threading.Thread):
         self._paused = threading.Event()
         self._paused.set()  # initially running (not paused)
         self.root_done = 0        # candidates fully scored so far in the root scan
-        self.root_total = 0       # size of the root scan; 0 means not started yet; -1 = trivial
+        self.root_total = 0       # size of the root scan; 0 means not started yet
         self.root_best = None     # (word, erd) — best candidate found so far
         self.culled = 0           # top-level candidates pruned without recursing
         self.word_stats = []      # [(rank, word, wall_s, cpu_s, hits, misses), ...]
@@ -2790,8 +2788,13 @@ class ERDSolver(threading.Thread):
 
     def run(self):
         if len(self._words) <= 2:
-            self.root_total = -1  # sentinel: trivial position, no scan needed
-            return
+            # A guess outside branch_words is never itself the answer, so
+            # both response outcomes still cost >= 1 further guess — no
+            # outside word can beat (or tie) the 1.5 average a branch word
+            # achieves. Restrict the root scan to branch_words: the true
+            # optimum is found (and cached) almost instantly instead of
+            # scanning the full guess vocabulary for a foregone conclusion.
+            self._effective_guesses = self._words
         if self._persist:
             score_cache = ScoreCache(self._cache_path, self._all_answers)
         else:
@@ -2806,10 +2809,40 @@ class ERDSolver(threading.Thread):
         self._rcache = ResponseCache(self._all_answers,
                                      score_cache if self._persist else None)
         try:
-            self._scan(score_cache)
+            if len(self._words) == 1:
+                self._solve_singleton(score_cache)
+            else:
+                self._scan(score_cache)
         finally:
             if self._persist:
                 score_cache.close()
+
+    def _solve_singleton(self, score_cache):
+        """Record and announce the closed-form ERD (1.0, the word itself)
+        for a branch already narrowed to one answer.
+
+        min_expected_guesses/_solve_subset short-circuits n==1 without
+        touching score_cache at all — every leaf of a full solve is a
+        singleton, so caching each one there would bloat the table for no
+        benefit. The interactive per-position solver has the opposite
+        shape (one specific singleton, visited once), so it writes the row
+        itself: without it, cmd_scores' cache read for this branch would
+        never succeed and its ERD option would report "not ready" forever.
+        Assumes self._budget (already spent down to reach a single
+        remaining candidate) still allows at least one more guess, which
+        the game's own GAME_GUESSES bound guarantees whenever this branch
+        is reachable at all.
+        """
+        word = self._words[0]
+        branch_key = ScoreCache.encode_subset(self._words)
+        if score_cache.read(branch_key, self._policy) is None:
+            score_cache.write(branch_key, self._policy, word, 1.0, max_depth=1)
+        self.root_done = 1
+        self.root_total = 1
+        self.root_best = (word, 1.0)
+        if not self._cancel.is_set():
+            print(f'\n  [ERD ready: 1.000 {word.upper()}]', flush=True)
+            logger.info("ERD ready: 1.000 %s", word.upper())
 
     def _ranked_root_guesses(self, score_cache):
         """Order root-scan candidates so a still-incomplete scan's running
