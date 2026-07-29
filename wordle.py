@@ -2787,7 +2787,15 @@ class ERDSolver(threading.Thread):
         self._paused.set()
 
     def run(self):
-        if len(self._words) <= 2:
+        if not self._words:
+            # No candidates at all (e.g. a contradictory response the
+            # fallback couldn't recover from) — nothing to search.
+            # _solve_subset has no n==0 guard, only n==1, so falling
+            # through to _scan would spin _scan's retry loop forever: every
+            # min_expected_guesses([], ...) call returns None with no loss
+            # ever recorded to trip the budget-floor exit.
+            return
+        if len(self._words) == 2:
             # A guess outside branch_words is never itself the answer, so
             # both response outcomes still cost >= 1 further guess — no
             # outside word can beat (or tie) the 1.5 average a branch word
@@ -2828,10 +2836,14 @@ class ERDSolver(threading.Thread):
         shape (one specific singleton, visited once), so it writes the row
         itself: without it, cmd_scores' cache read for this branch would
         never succeed and its ERD option would report "not ready" forever.
-        Assumes self._budget (already spent down to reach a single
-        remaining candidate) still allows at least one more guess, which
-        the game's own GAME_GUESSES bound guarantees whenever this branch
-        is reachable at all.
+
+        Reports cost 1.0 unconditionally, without checking self._budget: a
+        singleton always takes exactly one more guess to play regardless of
+        the cap, and nothing elsewhere in the CLI enforces the GAME_GUESSES
+        cap either (cmd_guess only refuses a further guess once
+        current_words is already down to 1, never on guess count), so
+        there is no existing convention here for a budget-exhausted branch
+        to match.
         """
         word = self._words[0]
         branch_key = ScoreCache.encode_subset(self._words)

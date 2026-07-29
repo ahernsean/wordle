@@ -10,6 +10,7 @@ open/close edges.
 """
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -78,6 +79,19 @@ class TestERDSolverEdges(unittest.TestCase):
         self.assertEqual(
             s._seed_mem_cache.read(ScoreCache.encode_subset(words), ERD_ALL),
             (_w(0), 1.0))
+
+    def test_run_no_candidates_returns_without_hanging(self):
+        # An empty branch (e.g. a contradictory response the fallback
+        # couldn't recover from) must return promptly: _solve_subset has
+        # no n==0 guard, so falling through to _scan's retry loop would
+        # spin forever (min_expected_guesses([], ...) always returns None,
+        # and no loss is ever recorded to trip the budget-floor exit).
+        s = self._solver(words=[])
+        thread = threading.Thread(target=s.run)
+        thread.start()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "ERDSolver.run() hung on n==0")
+        self.assertEqual(s.root_total, 0)
 
     def test_run_persist_opens_and_closes_cache(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
