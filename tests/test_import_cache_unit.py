@@ -183,7 +183,8 @@ class TestDroppableIndexes(_TmpDB):
             conn.close()
         names = {name for name, _ in indexes}
         self.assertEqual(
-            names, {"idx_branch_best_by_policy", "idx_branch_updated"})
+            names, {"idx_branch_best_by_policy", "idx_branch_best_by_policy_reference",
+                    "idx_branch_updated"})
 
     def test_returns_empty_for_table_with_only_a_primary_key(self):
         sc = self._cache("c.sqlite3")
@@ -332,7 +333,8 @@ class TestMergeTable(_TmpDB):
         finally:
             conn.close()
         self.assertEqual(
-            final_indexes, {"idx_branch_best_by_policy", "idx_branch_updated"})
+            final_indexes, {"idx_branch_best_by_policy", "idx_branch_best_by_policy_reference",
+                            "idx_branch_updated"})
 
     def test_does_not_defer_indexes_for_an_already_populated_target(self):
         self._make_src_with_entry()
@@ -367,7 +369,8 @@ class TestMergeTable(_TmpDB):
         # Target already had rows: indexes must stay live throughout.
         self.assertEqual(
             seen_indexes_during_copy["branch_best_by_policy"],
-            {"idx_branch_best_by_policy", "idx_branch_updated"})
+            {"idx_branch_best_by_policy", "idx_branch_best_by_policy_reference",
+             "idx_branch_updated"})
 
 
 class TestLegacyTableNameRegression(_TmpDB):

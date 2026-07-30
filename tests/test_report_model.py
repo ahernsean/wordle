@@ -23,6 +23,7 @@ from report_model import (
     normalize_worker_descent,
     parse_rich_spine,
     parse_report_branch_target,
+    resolve_branch_reference,
 )
 from wordle_engine import ERD_ALL, GAME_GUESSES
 
@@ -697,6 +698,84 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(ReportRequest().report_kind, "auto")
         with self.assertRaisesRegex(ValueError, "unsupported report kind: hotspot"):
             collect_report(self.sources, ReportRequest("hotspot"))
+
+    def test_cache_reference_resolves_finalized_branch_without_a_spine(self):
+        branch_key = b"finalized branch"
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(branch_key, ERD_ALL, "salet", 2.0)
+        reference = branch_reference(branch_key)
+        queue = self._open_queue()
+        resolved = resolve_branch_reference(queue, reference[:8], cache)
+        self.assertEqual(bytes(resolved["branch_key"]), branch_key)
+        self.assertIsNone(resolved["spine"])
+        queue.close()
+        cache.close()
+
+    def test_branch_reference_migration_backfills_once(self):
+        branch_key = b"pre-migration branch"
+        connection = sqlite3.connect(self.cache_path)
+        connection.execute(
+            "CREATE TABLE schema_migrations "
+            "(name TEXT PRIMARY KEY, completed_at INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE branch_best_by_policy "
+            "(branch_key BLOB NOT NULL, policy TEXT NOT NULL, "
+            "answer_list_id TEXT NOT NULL, best_guess TEXT NOT NULL, "
+            "best_score REAL NOT NULL, updated_at INTEGER NOT NULL, "
+            "PRIMARY KEY (branch_key, policy, answer_list_id))"
+        )
+        connection.execute(
+            "CREATE TABLE branch_loss_by_policy "
+            "(branch_key BLOB NOT NULL, policy TEXT NOT NULL, "
+            "answer_list_id TEXT NOT NULL, loss_budget INTEGER NOT NULL, "
+            "updated_at INTEGER NOT NULL, "
+            "PRIMARY KEY (branch_key, policy, answer_list_id))"
+        )
+        connection.execute(
+            "INSERT INTO branch_best_by_policy VALUES (?, 'policy', 'answers', "
+            "'salet', 2.0, 1)", (branch_key,)
+        )
+        connection.commit()
+        connection.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        migration_count = cache._conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations "
+            "WHERE name = 'add_branch_references'"
+        ).fetchone()[0]
+        indexes = {row[1] for row in cache._conn.execute(
+            "PRAGMA index_list(branch_best_by_policy)"
+        )}
+        self.assertEqual(migration_count, 1)
+        self.assertIn("idx_branch_best_by_policy_reference", indexes)
+        self.assertEqual(cache._conn.execute(
+            "SELECT branch_reference FROM branch_best_by_policy"
+        ).fetchone()[0], branch_reference(branch_key))
+        cache.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        self.assertEqual(cache._conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations "
+            "WHERE name = 'add_branch_references'"
+        ).fetchone()[0], 1)
+        cache.close()
+
+    def test_cache_reference_reports_ambiguous_prefix_without_a_spine(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        first_key = second_key = None
+        keys_by_prefix = {}
+        for index in range(10000):
+            branch_key = f"branch {index}".encode()
+            prefix = branch_reference(branch_key)[:4]
+            if prefix in keys_by_prefix:
+                first_key, second_key = keys_by_prefix[prefix], branch_key
+                break
+            keys_by_prefix[prefix] = branch_key
+        self.assertIsNotNone(first_key)
+        cache.write(first_key, ERD_ALL, "salet", 2.0)
+        cache.write_loss(second_key, ERD_ALL, 3)
+        with self.assertRaisesRegex(ValueError, "ambiguous.*unknown spine"):
+            resolve_branch_reference(None, branch_reference(first_key)[:4], cache)
+        cache.close()
 
 
 if __name__ == "__main__":

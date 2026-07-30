@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import hashlib
 import os
 import re
 import sqlite3
 import time
 from typing import Optional, Tuple
 
-from cache_sqlite import ScoreCache
+from cache_sqlite import ScoreCache, branch_reference
 from pattern_matrix import PatternMatrix
 from erd_queue import (
     DISK_STOP_FRACTION,
@@ -296,13 +295,16 @@ def resolve_branch_target(
     )
 
 
-def resolve_branch_reference(queue, digest_prefix) -> dict:
-    matches = queue.branch_rows_for_reference_prefix(digest_prefix)
+def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
+    matches = [] if queue is None else queue.branch_rows_for_reference_prefix(digest_prefix)
+    cache_matches = [] if matches or cache is None else cache.branch_keys_for_reference_prefix(
+        digest_prefix
+    )
     if not matches:
-        raise ValueError(
-            f"branch reference @{digest_prefix} not found; use the branch spine "
-            "for cache-only state after queue completion"
-        )
+        if not cache_matches:
+            raise ValueError(f"No queued @{digest_prefix} branch found")
+        if len(cache_matches) == 1:
+            return {"branch_key": cache_matches[0], "spine": None}
     if len(matches) > 1:
         descriptions = []
         for row in matches:
@@ -313,11 +315,13 @@ def resolve_branch_reference(queue, digest_prefix) -> dict:
             f"branch reference @{digest_prefix} is ambiguous: "
             + "; ".join(descriptions)
         )
+    if len(cache_matches) > 1:
+        raise ValueError(
+            f"branch reference @{digest_prefix} is ambiguous: "
+            + "; ".join(f"@{branch_reference(key)} unknown spine"
+                        for key in cache_matches)
+        )
     return matches[0]
-
-
-def branch_reference(branch_key: bytes) -> str:
-    return hashlib.sha1(bytes(branch_key)).hexdigest()[:12]
 
 
 def parse_rich_spine(path: str | None) -> list[RichSpineStep]:
@@ -1197,11 +1201,19 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     }
     queue_error = None
     referenced_row = None
+    cache = None
+    cache_error = None
+    try:
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+    except (sqlite3.Error, OSError) as error:
+        cache_error = error
     try:
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
         if request.branch_target.kind == "branch_reference":
             referenced_row = resolve_branch_reference(
-                queue, request.branch_target.branch_reference
+                queue, request.branch_target.branch_reference, cache
             )
             branch_key = bytes(referenced_row["branch_key"])
             resolved = ResolvedBranch(
@@ -1239,9 +1251,18 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     except (sqlite3.Error, OSError) as error:
         queue_error = error
         if request.branch_target.kind == "branch_reference":
-            raise
-        resolved = resolve_branch_target(request.branch_target, all_answers)
-        branch_key = resolved.branch_key
+            if cache is None:
+                raise
+            referenced_row = resolve_branch_reference(
+                None, request.branch_target.branch_reference, cache
+            )
+            branch_key = bytes(referenced_row["branch_key"])
+            resolved = ResolvedBranch(
+                _decode_branch_key(branch_key), branch_key, (), None,
+            )
+        else:
+            resolved = resolve_branch_target(request.branch_target, all_answers)
+            branch_key = resolved.branch_key
     finally:
         if queue is not None:
             queue.close()
@@ -1346,11 +1367,9 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     else:
         _mark_queue_source_error(report, queue_error)
 
-    cache = None
     try:
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        if cache is None:
+            raise cache_error
         data["cache"] = cache.report_branch_state(branch_key, ERD_ALL, budget)
         branch_status, branch_phase = branch_status_and_phase(
             _row_value(pending_row, "status"),

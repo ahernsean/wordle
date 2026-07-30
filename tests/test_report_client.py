@@ -567,6 +567,10 @@ class ReportClientBrowserTest(unittest.TestCase):
             "section:has-text('Reached via')"
         ).inner_text()
         self.assertIn("RAISE", reached)
+        copy_button = self.page.locator(
+            "section:has-text('Reached via') button:has-text('Copy spine')"
+        )
+        self.assertTrue(copy_button.is_visible())
 
     def test_branch_target_subtitle_returns_in_tree_layout(self):
         self.apply_branch_target("RAISE .....")

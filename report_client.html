@@ -217,7 +217,7 @@
     const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts)if(part)node.append(element("span","",part));return node;};
     const label=key=>String(key).replaceAll("_"," ");
     const timeLabel=key=>key.endsWith("_at")?label(String(key).slice(0,-3)):label(key);
-    const shortReference=reference=>String(reference).slice(0,4);
+    const shortReference=reference=>String(reference).slice(0,8);
     const workerName=worker=>{const number=String(worker.worker_number??String(worker.worker_id).split("-").pop());return /^[0-9]+$/.test(number)?"w"+number:String(worker.worker_id);};
     const candidateText=(word,isAnswer)=>word?String(word).toUpperCase()+(isAnswer?"*":""):"—";
     const bool=value=>value==="1"||value==="true";
@@ -497,7 +497,7 @@
       const identityMetrics=element("div","metrics");
       identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
       fragment.append(section("Identity",identityMetrics));
-      if(branch.spine?.length)fragment.append(section("Reached via",renderSpine(branch.spine)));
+      if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine");copyButton.addEventListener("click",()=>navigator.clipboard.writeText(branch.spine.flatMap(step=>[step.word,step.pattern]).join(" ")));spineSection.append(copyButton);fragment.append(spineSection);}
       fragment.append(section("Queue",data.queue?kv([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
       fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[timeLabel(key),displayTimedValue(key,value,report.generated_at)]))));
@@ -760,12 +760,9 @@
       finally{clearSlowRequestNotice();if(activeRequestController===controller)activeRequestController=null;}
     }
     function pinBranchToSpine(report,state){
-      // A branch reference is a one-way hash the queue must invert, so it stops
-      // resolving (404) once the branch finalizes out of the queue.  A branch's
-      // spine resolves from the answer list alone — queue-independent — so once
-      // a branch view has loaded, pin the branch_target to its spine.  Polling then
-      // keeps returning cache-only state on a normal 200 through finalization,
-      // and a 404 stays meaningful: a reference that never resolved.
+      // A spine remains the preferred URL because it resolves from the answer
+      // list alone. Cache-resolved branches without a known spine keep their
+      // durable reference instead.
       if(report.report_kind!=="branch"||report.tree)return;
       // Only a queue reference needs replacing; a spine the user typed is
       // already stable, so leave its wording untouched.
