@@ -234,37 +234,40 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("ul.tree > li.word-group")
         group = self.page.locator("ul.tree > li.word-group")
         self.assertEqual(group.count(), 1)
+        self.assertIsNone(group.locator("> details").get_attribute("open"))
         self.assertEqual(
             " ".join(group.locator("> details > summary").inner_text().split()),
             "RAISE 1 branch",
         )
-        rows = group.locator("> details > ul.patterns > li")
+        rows = group.locator("> details > .tree-pattern-page > ul.patterns > li")
         self.assertEqual(rows.count(), 1)
         # The group names the word, so its rows carry only the response pattern.
         row_summary = rows.locator("> details > summary")
         self.assertNotIn("RAISE", row_summary.inner_text())
         self.assertEqual(row_summary.locator(".step").count(), 1)
-        # A row's own children are grouped by word the same way.  The branch
-        # tree is awaited by its nested group: a bare top-level group is
-        # already on the page from the queue tree, so waiting for one would
-        # match the view being navigated away from.
-        nested_selector = (
-            "ul.tree > li.word-group > details > ul.patterns > li"
-            " > details > ul > li.word-group"
+
+    def test_tree_pages_response_patterns_inside_a_word_group(self):
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/queue?tree=1')).json();
+          const template=report.data.nodes[0];
+          report.data.nodes=Array.from({length:30},(_,index)=>({
+            ...template,node_id:'raise:pattern-'+index,branch_reference:'1111111111'+String(index).padStart(2,'0')
+          }));
+          report.data.paging={parent_spine:'',cursor:null,page_size:10,returned_group_count:1,total_group_count:1,next_cursor:null};
+          applyReport(report,null,parsePageState({search:'?kind=queue&tree=1&limit=10'}));
+        }""")
+        group = self.page.locator("ul.tree > li.word-group")
+        self.assertIsNone(group.locator("> details").get_attribute("open"))
+        group.locator("> details > summary").click()
+        rows = group.locator("> details > .tree-pattern-page > ul.patterns > li")
+        self.page.wait_for_selector(
+            "ul.tree > li.word-group > details > .tree-pattern-page > ul.patterns > li"
         )
-        self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector(nested_selector)
-        nested = self.page.locator(nested_selector)
-        self.assertEqual(nested.count(), 1)
-        self.assertEqual(
-            " ".join(nested.locator("> details > summary").inner_text().split()),
-            "ALIBI 1 branch",
-        )
-        nested_rows = nested.locator("> details > ul.patterns > li")
-        self.assertEqual(nested_rows.count(), 1)
-        self.assertNotIn(
-            "ALIBI", nested_rows.locator("> details > summary").inner_text()
-        )
+        self.assertEqual(rows.count(), 10, self.page.locator("#report").inner_html())
+        self.assertIn("Showing 1–10 of 30 branches", group.inner_text())
+        group.locator(".tree-pager button", has_text="Next").click()
+        self.assertEqual(rows.count(), 10)
+        self.assertIn("Showing 11–20 of 30 branches", group.inner_text())
 
     def test_tree_row_facts_never_split_a_number_from_its_noun(self):
         self.page.locator("[data-kind=queue]").click()
