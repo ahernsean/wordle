@@ -582,22 +582,51 @@ class ReportClientBrowserTest(unittest.TestCase):
         meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
         self.assertTrue(any("RAISE" in text for text in meta_spans))
 
-    def test_finalization_spines_and_overflow_note_render(self):
+    def test_finalization_spines_and_pager_range_render(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        text = section.inner_text()
+        # Each finalization discloses the spine that reached this answer set.
+        self.assertIn("CRIMP", text)
+        self.assertIn("DUCHY", text)
+        self.assertIn("WRUNG", text)
+        # 3 shown of 3 total -> both Prev and Next are dead ends.
+        self.assertIn("of 3", text)
+        self.assertTrue(section.locator("button:has-text('Prev')").is_disabled())
+        self.assertTrue(section.locator("button:has-text('Next')").is_disabled())
+
+    def test_finalization_pager_enables_next_when_more_remain(self):
+        self.apply_branch_target("RAISE .....")
         self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.finalization_total_count=17;
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
         }""")
-        text = self.page.locator(
-            "section:has-text('Recent finalizations')"
-        ).inner_text()
-        # Each finalization discloses the spine that reached this answer set.
-        self.assertIn("CRIMP", text)
-        self.assertIn("DUCHY", text)
-        self.assertIn("WRUNG", text)
-        # 17 total, 3 shown -> 14 more, with the URL knob to widen the view.
-        self.assertIn("14 more", text)
-        self.assertIn("limit=17", text)
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        self.assertIn("of 17", section.inner_text())
+        self.assertTrue(section.locator("button:has-text('Prev')").is_disabled())
+        self.assertFalse(section.locator("button:has-text('Next')").is_disabled())
+
+    def test_finalization_pager_next_advances_offset_and_url(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.finalization_total_count=17;
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        section.locator("button:has-text('Next')").click()
+        self.assertIn("finalization_offset=10", self.page.url)
+        # The click's own state update lands synchronously (asserted above);
+        # the re-render only lands once the follow-up fetch resolves. The
+        # fixture server ignores query params, so its real response reverts
+        # the patched total from 17 back to 3 -- a reliable signal that the
+        # post-click render has actually landed.
+        self.page.wait_for_function(
+            "() => document.querySelector('#report').innerText.includes('of 3')"
+        )
+        self.assertFalse(section.locator("button:has-text('Prev')").is_disabled())
 
     def test_erd_and_bounds_round_in_cache_and_hotspot_views(self):
         result = self.page.evaluate("""async () => {

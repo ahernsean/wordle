@@ -97,6 +97,7 @@ class ReportFilters:
     priority: int | None = None
     sort: str | None = None
     limit: int | None = None
+    finalization_offset: int | None = None
 
 
 BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
@@ -1219,7 +1220,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         claim_rows = list(queue.claims_for_branch(branch_key))
         republish_rows = queue.candidate_republish_for_branch(branch_key)
         branch_telemetry = queue.report_branch_telemetry(
-            branch_key, request.filters.limit or 10
+            branch_key, request.filters.limit or 10,
+            request.filters.finalization_offset or 0,
         )
     except (sqlite3.Error, OSError) as error:
         queue_error = error

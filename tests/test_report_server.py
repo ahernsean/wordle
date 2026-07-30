@@ -126,6 +126,14 @@ class ReportServerTest(unittest.TestCase):
         )
         self.assertEqual(report_request.filters.limit, 4)
 
+    def test_finalization_offset_is_parsed_into_filters(self):
+        default_request = parse_report_request("/api/view", "")
+        offset_request = parse_report_request(
+            "/api/view", "branch_target=RAISE%20.....&finalization_offset=20"
+        )
+        self.assertIsNone(default_request.filters.finalization_offset)
+        self.assertEqual(offset_request.filters.finalization_offset, 20)
+
     def test_root_overview_defaults_to_active_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
         all_request = parse_report_request("/api/view", "branch_status=all")
@@ -194,6 +202,7 @@ class ReportServerTest(unittest.TestCase):
             "sample_size=0", "minimum_answer_count=5&maximum_answer_count=2",
             "branch_status=active,active", "branch_status=all,pending",
             "branch_phase=evaluating,", "branch_phase=working",
+            "finalization_offset=-1",
         )
         with running_server(fixture_configuration()) as base_url:
             for query in invalid_queries:

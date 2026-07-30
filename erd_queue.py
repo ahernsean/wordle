@@ -2762,8 +2762,12 @@ class ERDQueue:
             return outcome
         return "cut" if row["ceiling"] is not None else "unknown"
 
-    def report_branch_telemetry(self, branch_key, limit) -> dict:
-        """Return bounded current and historical telemetry for one branch."""
+    def report_branch_telemetry(self, branch_key, limit, offset=0) -> dict:
+        """Return bounded current and historical telemetry for one branch.
+
+        offset pages through recent_finalizations, newest first; it does not
+        apply to cut_reuse_misses, which always shows the most recent window.
+        """
         bundle_row = self._conn.execute("""
             SELECT COUNT(*) AS bundle_count,
                    SUM(nodes) AS node_count,
@@ -2782,8 +2786,8 @@ class ERDQueue:
         finalization_rows = self._conn.execute("""
             SELECT * FROM telemetry.branch_finalize_log
             WHERE branch_key = ?
-            ORDER BY recorded_at DESC, id DESC LIMIT ?
-        """, (branch_key, limit)).fetchall()
+            ORDER BY recorded_at DESC, id DESC LIMIT ? OFFSET ?
+        """, (branch_key, limit, offset)).fetchall()
         finalizations = []
         for row in finalization_rows:
             finalizations.append({

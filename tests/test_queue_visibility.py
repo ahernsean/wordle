@@ -100,6 +100,26 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertIsNone(loss["best_erd"])
         self.assertEqual(len(telemetry["cut_reuse_misses"]), 1)
 
+    def test_branch_report_telemetry_offset_pages_past_the_first_window(self):
+        self.q.create_branch(self.user_key, len(WORDS), 10)
+        for outcome in ("exact", "cut", "loss"):
+            self.q.add_branch_finalize_log(
+                self.user_key, "CRANE -----", 5, 5,
+                10, 20, 100, 7,
+                n_bundles=2, max_bundle_nodes=60,
+                total_bundle_wall_millis=30, censored_units=1,
+                ceiling=2.5 if outcome == "cut" else None,
+                outcome=outcome, bulk_done_candidates=1,
+                best_guess="crane" if outcome == "exact" else None,
+                best_erd=1.5 if outcome == "exact" else None,
+            )
+        telemetry = self.q.report_branch_telemetry(self.user_key, limit=2, offset=2)
+        self.assertEqual(telemetry["finalization_total_count"], 3)
+        self.assertEqual(len(telemetry["recent_finalizations"]), 1)
+        # Newest-first with limit=2 covers loss, cut; offset=2 lands on the
+        # oldest remaining row: the first one recorded, exact.
+        self.assertEqual(telemetry["recent_finalizations"][0]["outcome"], "exact")
+
     def test_historical_hotspots_are_bounded_and_coordination_is_bucketed(self):
         now = int(time.time())
         for index in range(5):
