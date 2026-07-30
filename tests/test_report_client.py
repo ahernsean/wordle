@@ -258,9 +258,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(report,null,parsePageState({search:'?kind=queue&tree=1&limit=10'}));
         }""")
         group = self.page.locator("ul.tree > li.word-group")
-        self.assertEqual(self.page.locator("#tree-page-size").input_value(), "10")
+        page_size_select = group.locator(".tree-pager .tree-page-size")
+        self.assertEqual(page_size_select.input_value(), "10")
         self.assertEqual(
-            self.page.locator("#tree-page-size option").all_text_contents(),
+            page_size_select.locator("option").all_text_contents(),
             ["10", "25", "50", "100"],
         )
         self.assertIsNone(group.locator("> details").get_attribute("open"))
@@ -274,6 +275,18 @@ class ReportClientBrowserTest(unittest.TestCase):
         group.locator(".tree-pager button", has_text="Next").click()
         self.assertEqual(rows.count(), 10)
         self.assertIn("Showing 11–20 of 30 branches", group.inner_text())
+        page_size_select.select_option("25")
+        self.assertIn("limit=25", self.page.url)
+        self.assertEqual(self.page.evaluate("__reportClient.getState().limit"), 25)
+
+    def test_entering_tree_uses_ten_items_per_page(self):
+        state = self.page.evaluate("""() => {
+          __reportClient.setState({...__reportClient.getState(),kind:'queue',limit:25});
+          document.querySelector('#layout-tree').click();
+          return __reportClient.getState();
+        }""")
+        self.assertTrue(state["tree"])
+        self.assertEqual(state["limit"], 10)
 
     def test_tree_row_facts_never_split_a_number_from_its_noun(self):
         self.page.locator("[data-kind=queue]").click()
