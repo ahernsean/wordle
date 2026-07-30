@@ -593,8 +593,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("DUCHY", text)
         self.assertIn("WRUNG", text)
         # 3 shown, fewer than a full (default 10) page -> both Prev and Next
-        # are dead ends; the total is informational only, not exact ("~3").
-        self.assertIn("Showing 3 of ~3 total", text)
+        # are dead ends; the total is an exact COUNT(*) at query time.
+        self.assertIn("Showing 3 of 3 total", text)
         self.assertTrue(section.locator("button:has-text('Prev')").is_disabled())
         self.assertTrue(section.locator("button:has-text('Next')").is_disabled())
 
@@ -614,7 +614,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
         }""")
         section = self.page.locator("section:has-text('Recent finalizations')")
-        self.assertIn("Showing 10 of ~17 total", section.inner_text())
+        self.assertIn("Showing 10 of 17 total", section.inner_text())
         self.assertTrue(section.locator("button:has-text('Prev')").is_disabled())
         self.assertFalse(section.locator("button:has-text('Next')").is_disabled())
 
@@ -640,7 +640,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # the patched data back to the 3-row fixture -- a reliable signal
         # that the post-click render has actually landed.
         self.page.wait_for_function(
-            "() => document.querySelector('#report').innerText.includes('of ~3')"
+            "() => document.querySelector('#report').innerText.includes('of 3')"
         )
         self.assertFalse(section.locator("button:has-text('Prev')").is_disabled())
 

@@ -546,7 +546,7 @@
         const shownCount=data.recent_finalizations.length,totalCount=data.finalization_total_count??shownCount;
         const pageSize=currentState.limit||10;
         const pager=element("div","status-line finalization-pager");
-        pager.append(element("span","dim",shownCount?"Showing "+numText(shownCount)+" of ~"+numText(totalCount)+" total":"No finalizations here, of ~"+numText(totalCount)+" total"));
+        pager.append(element("span","dim",shownCount?"Showing "+numText(shownCount)+" of "+numText(totalCount)+" total":"No finalizations here, of "+numText(totalCount)+" total"));
         const pageSizeLabel=element("label","dim");
         const pageSizeSelect=element("select","");
         for(const size of [...new Set([10,25,50,100,pageSize])].sort((a,b)=>a-b)){
