@@ -307,9 +307,9 @@ def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
     if len(matches) + len(cache_only_keys) > 1:
         candidates = [
             {"branch_reference": branch_reference(bytes(row["branch_key"])),
-             "spine": queue.row_spine_text(row)} for row in matches
+             "branch_key": bytes(row["branch_key"]), "spine": queue.row_spine_text(row)} for row in matches
         ]
-        candidates.extend({"branch_reference": branch_reference(key), "spine": None}
+        candidates.extend({"branch_reference": branch_reference(key), "branch_key": key, "spine": None}
                           for key in cache_only_keys)
         error = ValueError(f"branch reference @{digest_prefix} is ambiguous")
         error.candidates = candidates
@@ -320,10 +320,15 @@ def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
 
 
 def collect_ambiguous_branch_reference_report(sources, request, error):
+    candidates = [{
+        "branch_reference": candidate["branch_reference"],
+        "spine": candidate["spine"],
+        "answer_count": len(_decode_branch_key(candidate["branch_key"])),
+    } for candidate in error.candidates]
     report = _semantic_report("branch_reference_matches", sources,
                               request.branch_target, int(time.time()), {
                                   "branch_reference": request.branch_target.branch_reference,
-                                  "candidates": error.candidates,
+                                  "candidates": candidates,
                               }, request)
     report["sources"]["queue"]["ok"] = True
     report["sources"]["cache"]["ok"] = True

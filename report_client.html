@@ -611,7 +611,7 @@
       }
       return fragment;
     }
-    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches. Choose one:"));const rows=element("div","grid");for(const candidate of data.candidates){const card=element("article","card clickable");card.append(element("h2","","@"+candidate.branch_reference));if(candidate.spine)card.append(renderSpine(spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
+    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches. Choose one:"));const rows=element("div","grid");for(const candidate of data.candidates){const card=element("article","card clickable");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words")]));if(candidate.spine)card.append(renderSpine(spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
     /* Sibling nodes in payload order, gathered under the word that was played.
        A node with no recorded guess has no word to gather under and stands
        alone under a null key. */
@@ -706,7 +706,7 @@
     }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
-      const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
+      const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;if(report.report_kind!=="branch_reference_matches")content.append(reportHeader(report,state));
       if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else throw new Error("Unknown report kind");
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
