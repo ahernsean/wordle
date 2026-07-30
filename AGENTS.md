@@ -37,6 +37,10 @@ consistently and do not substitute synonyms.
 candidate becomes the guess when it wins. |
 | **branch** | The remaining answer words after a guess + response. Identified
 by a (guess, pattern) pair at each level. |
+| **spine** | The sequence of (guess, pattern) pairs played to reach a branch:
+one *path* to it, not the branch itself. The same branch — its remaining answer
+set — can be reached by multiple spines, and those spines may be of different
+lengths. |
 
 The phase boundary between candidate and guess is explicit in the code:
 ```python

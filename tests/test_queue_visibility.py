@@ -82,6 +82,11 @@ class QueueVisibilityTests(unittest.TestCase):
         telemetry = self.q.report_branch_telemetry(self.user_key, limit=2)
         self.assertEqual(telemetry["bundle_summary"]["bundle_count"], 1)
         self.assertEqual(len(telemetry["recent_finalizations"]), 2)
+        self.assertEqual(telemetry["finalization_total_count"], 3)
+        self.assertEqual(
+            {row["spine"] for row in telemetry["recent_finalizations"]},
+            {"CRANE -----"},
+        )
         self.assertEqual(
             {row["outcome"] for row in telemetry["recent_finalizations"]},
             {"cut", "loss"},

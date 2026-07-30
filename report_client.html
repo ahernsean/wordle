@@ -12,6 +12,13 @@
     button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:#ffffff; color:var(--text); font:inherit; padding:.25rem .5rem; }
     button { cursor:pointer; }
     button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:#edf5ec; }
+    .layout-toggle { display:inline-flex; align-items:center; gap:.35rem; margin-left:.25rem; padding-left:.6rem; border-left:1px solid var(--border); }
+    .layout-toggle[hidden] { display:none; }
+    .layout-toggle .cap { color:var(--dim); font-size:.8rem; white-space:nowrap; }
+    .layout-toggle .seg { display:inline-flex; }
+    .layout-toggle .seg button { border-radius:0; }
+    .layout-toggle .seg button:first-child { border-radius:5px 0 0 5px; }
+    .layout-toggle .seg button:last-child { border-radius:0 5px 5px 0; margin-left:-1px; }
     input[type="checkbox"] { min-height:auto; accent-color:var(--green); }
     header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
     .nav, .branch-target, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
@@ -145,7 +152,7 @@
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><button id="tree-button" aria-pressed="false">Tree</button>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
       <span class="conn-wrap">
         <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
@@ -192,7 +199,7 @@
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard"]);
-    const treelessKinds=new Set(["cache","hotspots"]);
+    const treelessKinds=new Set(["cache","hotspots","leaderboard"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), stickyOrders=new Map();
     let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false;
@@ -222,7 +229,7 @@
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
-      if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_phase=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;normalized.tree=false;}
+      if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_phase=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
@@ -270,9 +277,9 @@
       // filter commit never overwrites a spine typed but not yet sent with Go.
       if(currentState.branch_target!==shownBranchTarget){byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;}
       byId("poll").value=currentState.poll;
-      const treeButton=byId("tree-button");
-      treeButton.hidden=treelessKinds.has(currentState.kind);
-      treeButton.setAttribute("aria-pressed",currentState.tree?"true":"false");
+      byId("layout-toggle").hidden=treelessKinds.has(currentState.kind);
+      byId("layout-flat").setAttribute("aria-pressed",currentState.tree?"false":"true");
+      byId("layout-tree").setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
       byId("sort").value=currentState.sort;byId("by").value=currentState.by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
@@ -323,6 +330,7 @@
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
     function patternTiles(pattern){const step=element("span","step");for(const character of pattern||"?????")step.append(element("span","tile "+(character==="g"?"g":character==="y"?"y":""),character));return step;}
     function renderSpine(spine){const node=element("div","tiles");for(const step of spine||[]){const group=element("span","step-group");group.append(element("span","",String(step.word||"?").toUpperCase()),patternTiles(step.pattern));node.append(group);}return node;}
+    function spineFromText(text){const parts=String(text||"").trim().split(/\s+/).filter(Boolean);const steps=[];for(let i=0;i+1<parts.length;i+=2)steps.push({word:parts[i],pattern:parts[i+1]});return steps;}
     function branchContextSummary(worker){
       if(Array.isArray(worker.branch_context)&&worker.branch_context.length){
         return renderSpine(worker.branch_context);
@@ -359,7 +367,9 @@
     function branchClass(row){return row.is_live===false?"dead":row.branch_phase==="finalizing"?"finalizing":row.branch_status||"";}
     function reportHeader(report,state){
       const meta=element("section","report-meta");
-      meta.append(element("h1","",report.report_kind+" report"),element("span","dim",state.branch_target||"root"),element("span","dim","generated "+relativeAge(report.generated_at,report.generated_at)));
+      meta.append(element("h1","",report.report_kind+" report"));
+      if(report.report_kind!=="branch"||report.tree)meta.append(element("span","dim",state.branch_target||"root"));
+      meta.append(element("span","dim","generated "+relativeAge(report.generated_at,report.generated_at)));
       const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.open=sourcePathsOpen;details.addEventListener("toggle",()=>{sourcePathsOpen=details.open;});details.append(summary);
       for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}
       if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));
@@ -481,8 +491,12 @@
     }
     function section(title,content,className=""){const node=element("section","section "+className);node.append(element("h2","",title));if(content)node.append(content);return node;}
     function renderBranch(report,previous,state){
-      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};if(branch.spine?.length)fragment.append(section("Identity",renderSpine(branch.spine)));
-      fragment.append(section("Queue",data.queue?kv([["branch","@"+shortReference(valueOrDash(branch.branch_reference))],["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
+      const data=report.data,fragment=document.createDocumentFragment(),branch=data.branch||{};
+      const identityMetrics=element("div","metrics");
+      identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
+      fragment.append(section("Identity",identityMetrics));
+      if(branch.spine?.length)fragment.append(section("Reached via",renderSpine(branch.spine)));
+      fragment.append(section("Queue",data.queue?kv([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
       fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[timeLabel(key),displayTimedValue(key,value,report.generated_at)]))));
       const ownership=data.branch_ownership||{};
@@ -505,6 +519,8 @@
           title.append(element("h3","",outcomeGloss[row.outcome]||row.outcome));
           if(historical)title.append(element("span","chip historical","Historical"));
           card.append(title);
+          const spineSteps=spineFromText(row.spine);
+          card.append(spineSteps.length?renderSpine(spineSteps):element("div","dim","spine unknown"));
           card.append(statLine(["budget "+valueOrDash(row.budget),"epoch "+valueOrDash(row.epoch),relativeAge(row.recorded_at,report.generated_at)]));
           const facts=[];
           if(row.outcome==="exact"){
@@ -524,7 +540,12 @@
           finalizations.append(card);
         }
         const wrap=element("section","section");
-        wrap.append(element("h2","","Recent finalizations"),element("p","dim","Attempts to resolve the whole branch within its depth budget, newest first."),finalizations);
+        wrap.append(element("h2","","Recent finalizations"),element("p","dim","Every path that reached this same answer set, newest first — each spine is a different route to the identical branch."),finalizations);
+        const shownCount=data.recent_finalizations.length,totalCount=data.finalization_total_count??shownCount;
+        if(totalCount>shownCount){
+          const more=totalCount-shownCount;
+          wrap.append(element("p","dim","… and "+numText(more)+" more reaching this same answer set. Append &limit="+totalCount+" to the URL to see all."));
+        }
         fragment.append(wrap);
       }
       if(data.cut_reuse_misses?.length){const misses=element("div","grid");for(const row of data.cut_reuse_misses)misses.append(element("article","card outcome-cut","cut reuse · available "+fixed(row.available_bound)+" · budget "+valueOrDash(row.available_budget)));fragment.append(section("Cut-reuse misses",misses));}
@@ -708,7 +729,8 @@
       addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-phases",branchPhaseNames,"branchPhase");
       currentState=parsePageState(location);syncControls();
       byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
-      byId("tree-button").addEventListener("click",()=>setState({...readControls(),tree:!currentState.tree}));
+      byId("layout-flat").addEventListener("click",()=>setState({...readControls(),tree:false}));
+      byId("layout-tree").addEventListener("click",()=>setState({...readControls(),tree:true}));
       // Filters and view controls commit on change against the committed
       // branch_target, so a filter tweak never navigates to text typed but not yet
       // sent with Go/Enter.  replaceState keeps a run of tweaks to one Back step.
