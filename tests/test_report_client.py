@@ -278,6 +278,8 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_tree_row_facts_never_split_a_number_from_its_noun(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#layout-tree").click()
+        group = self.page.locator("ul.tree > li.word-group").first
+        group.locator("> details > summary").click()
         self.page.wait_for_selector("ul.tree .inline-facts")
         facts = self.page.locator("ul.tree li:not(.word-group) > .clickable .inline-facts").first
         self.assertEqual(
@@ -366,6 +368,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#layout-tree").click()
+        self.page.locator("ul.tree > li.word-group > details > summary").first.click()
         self.page.wait_for_selector(".tree button")
         self.page.locator(".tree button").first.click()
         self.page.wait_for_selector("text=branch report")
@@ -851,13 +854,14 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_tree_collapse_and_browser_back_survive_poll(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#layout-tree").click()
-        self.page.wait_for_selector(".tree details")
-        details = self.page.locator(".tree details").first
-        details.locator("summary").first.click()
-        self.assertFalse(details.get_attribute("open") is not None)
+        details = self.page.locator(".tree > li.word-group > details").first
+        details.locator("summary").click()
+        self.assertIsNotNone(details.get_attribute("open"))
+        details.locator("summary").click()
+        self.assertIsNone(details.get_attribute("open"))
         self.page.evaluate("__reportClient.fetchReport()")
         self.page.wait_for_timeout(100)
-        self.assertIsNone(self.page.locator(".tree details").first.get_attribute("open"))
+        self.assertIsNone(self.page.locator(".tree > li.word-group > details").first.get_attribute("open"))
         self.page.go_back()
         self.assertIn("kind=queue", self.page.url)
 
@@ -1188,7 +1192,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const spineGroups=groups.map(group=>({text:group.textContent,hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
           const tree=await (await fetch('/api/view?tree=1')).json();
           applyReport(tree,null,{...__reportClient.getState(),branch_target:'',tree:true});
-          const treeGroups=[...document.querySelectorAll('summary .step-group')].map(group=>({hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
+          const treeGroups=[...document.querySelectorAll('.tree .step-group')].map(group=>({hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
           return {spineGroups,treeGroupCount:treeGroups.length,treeAllNoWrap:treeGroups.every(group=>group.noWrap)};
         }""")
         self.assertTrue(result["spineGroups"])
