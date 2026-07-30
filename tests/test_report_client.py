@@ -667,6 +667,19 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("available 2.200 at budget 4", text)
         self.assertIn("epoch 4", text)
 
+    def test_focused_page_size_select_survives_a_poll_refresh(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        select = self.page.locator("section:has-text('Recent finalizations') select")
+        select.click()
+        select.evaluate("(el) => el.dataset.testMarker = 'still-here'")
+        # A poll refresh while the select has focus must not tear out and
+        # rebuild the branch section -- there is no DOM state that lets a
+        # native <select>'s open dropdown survive its element being replaced.
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(select.get_attribute("data-test-marker"), "still-here")
+        self.assertTrue(select.evaluate("(el) => el === document.activeElement"))
+
     def test_finalization_page_size_selector_changes_limit_and_resets_offset(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")

@@ -693,6 +693,10 @@
       }
       setTimeout(()=>layer.remove(),350);
     }
+    function reportHasFocusedControl(){
+      const active=document.activeElement;
+      return !!active&&["SELECT","INPUT","TEXTAREA"].includes(active.tagName)&&byId("report").contains(active);
+    }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
       const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;content.append(reportHeader(report,state));
@@ -726,7 +730,16 @@
         if(generation!==requestGeneration)return;
         if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
         const report=await response.json();if(generation!==requestGeneration)return;
-        const previous=context===lastContext?lastReport:null;applyReport(report,previous,state);lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
+        const previous=context===lastContext?lastReport:null;
+        // A background poll must never yank a control out from under an
+        // in-progress interaction -- a native <select>'s open dropdown has no
+        // DOM state to restore once its element is destroyed, so replacing it
+        // mid-interaction just closes the menu on the user.  Skip the visual
+        // apply while focus is on such a control; lastReport/lastContext still
+        // advance, so the next poll (once focus moves on) renders current data
+        // rather than replaying this skipped one.
+        if(!reportHasFocusedControl())applyReport(report,previous,state);
+        lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }
       catch(error){
