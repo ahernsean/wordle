@@ -313,14 +313,20 @@ CREATE TABLE IF NOT EXISTS branches (
 -- out at >= bound; true ERD of this branch is >= bound" — is delivered to
 -- waiting parents through this table instead.  A cut proven at `budget` is
 -- valid at any budget <= it (fewer guesses cannot beat the bound), mirroring
--- the score cache's loss-reuse rule.  Transient coordination data: cleared on
--- supervisor restart (recover_active_branches), never synced anywhere.
+-- the score cache's loss-reuse rule.  Keyed by (branch_id, budget, tainted):
+-- a bound proven at a lower budget does not dominate one proven at a higher
+-- budget (it serves fewer consumers), and a tainted bound does not dominate
+-- an untainted one (it constrains more consumers), so neither axis may evict
+-- the other's row — each class keeps its own maximum bound instead.  A row is
+-- a durable proof and survives a supervisor restart (recover_active_branches
+-- only drops in-flight claims, not this table); never synced anywhere.
 CREATE TABLE IF NOT EXISTS cut_results (
-    branch_id  INTEGER PRIMARY KEY,
+    branch_id  INTEGER NOT NULL,
     budget     INTEGER NOT NULL,
     bound      REAL    NOT NULL,
     tainted    INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (branch_id, budget, tainted)
 );
 
 -- One row per claimed candidate of a branch.  A row's existence is an
@@ -1029,7 +1035,35 @@ class ERDQueue:
         self._add_columns("cut_results", {
             "tainted": "INTEGER NOT NULL DEFAULT 0"})
 
-        if normalized_tables:
+        # cut_results re-key (issue #185): branch_id alone -> (branch_id,
+        # budget, tainted).  The old single-row-per-branch shape made every
+        # add_cut_result an overwrite, discarding a bound already proven
+        # whenever a later write for a different budget or taint class
+        # landed on the same row.  Detected by budget/tainted not being part
+        # of the primary key yet (pk=0); after the branch_key rebuild above
+        # and the tainted add above, so this runs whether the database is
+        # fresh, upgraded once, or upgraded from both legacy shapes at once.
+        cut_results_pk = {r["name"] for r in
+                          self._conn.execute("PRAGMA table_info(cut_results)")
+                          if r["pk"] > 0}
+        if cut_results_pk == {"branch_id"}:
+            self._conn.executescript("""
+                CREATE TABLE cut_results_rekeyed (
+                    branch_id  INTEGER NOT NULL,
+                    budget     INTEGER NOT NULL,
+                    bound      REAL    NOT NULL,
+                    tainted    INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch_id, budget, tainted)
+                );
+                INSERT INTO cut_results_rekeyed
+                    SELECT branch_id, budget, bound, tainted, created_at
+                    FROM cut_results;
+                DROP TABLE cut_results;
+                ALTER TABLE cut_results_rekeyed RENAME TO cut_results;
+            """)
+
+        if normalized_tables or cut_results_pk == {"branch_id"}:
             # DROP TABLE hands the fat-blob pages to the free-list, not the OS,
             # so the file stays bloated until compacted.  This one-time upgrade
             # runs with workers stopped, so reclaim the space now.  Best-effort:
@@ -1882,9 +1916,14 @@ class ERDQueue:
 
     def add_cut_result(self, branch_key, budget, bound, tainted=False):
         """Publish a ceilinged solve's CUT: the branch's true ERD at `budget`
-        is proven >= bound.  INSERT OR REPLACE: a newer cut for the same branch
-        supersedes (bounds from different ceilings are all true; the latest is
-        the one current waiters are waiting for).
+        is proven >= bound.  Upserts by (branch_id, budget, tainted), keeping
+        MAX(existing bound, new bound): a cut is a durable proof, so a higher
+        bound already on record for the same budget/taint class is never
+        superseded by a lower one, and never discarded.
+
+        A bound proven for a different budget, or with different taint, is
+        kept in its own row rather than overwriting this one — see
+        read_cut_result for why neither axis dominates the other.
 
         tainted records whether the cut's proof involved the remaining-depth
         floor anywhere: a tainted bound holds only among budget-feasible
@@ -1892,28 +1931,39 @@ class ERDQueue:
         now = int(time.time())
         branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("""
-            INSERT OR REPLACE INTO cut_results
-                (branch_id, budget, bound, tainted, created_at)
+            INSERT INTO cut_results (branch_id, budget, bound, tainted, created_at)
             VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (branch_id, budget, tainted)
+            DO UPDATE SET bound = MAX(bound, excluded.bound),
+                          created_at = excluded.created_at
         """, (branch_id, budget, bound, int(bool(tainted)), now))
 
     def read_cut_result(self, branch_key):
-        """Return (bound, budget, tainted) of the branch's recorded cut, or
-        None.
+        """Every cut recorded for this branch, one row per (budget, tainted)
+        class it has been proven under, as (bound, budget, tainted) tuples
+        ordered most-useful-first (largest budget, then untainted, then
+        largest bound). Empty list if none.
 
-        The caller applies the validity rules: the bound holds at any budget
-        <= the recorded one (fewer guesses cannot beat it), and satisfies a
-        consumer whose ceiling is <= bound.  A tainted cut must taint the
-        consumer's own result (see add_cut_result)."""
+        A bound proven at a given budget holds at any consumer budget <= it
+        (fewer guesses cannot beat it) but says nothing at a larger one, so a
+        bound proven at a lower budget does not dominate one proven at a
+        higher budget; a tainted bound holds only among budget-feasible
+        strategies (see add_cut_result), so it does not dominate an untainted
+        one either. Each (budget, tainted) class therefore keeps its own row,
+        and the caller — the only side that knows its own budget and ceiling
+        — scans for the first row satisfying `consumer_budget <= budget and
+        bound >= ceiling`, or logs the first (most-useful) row as the closest
+        miss when none does."""
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
-            return None
-        row = self._conn.execute(
-            "SELECT bound, budget, tainted FROM cut_results WHERE branch_id = ?",
-            (branch_id,)).fetchone()
-        if row is None:
-            return None
-        return (row["bound"], row["budget"], bool(row["tainted"]))
+            return []
+        rows = self._conn.execute("""
+            SELECT bound, budget, tainted FROM cut_results
+            WHERE branch_id = ?
+            ORDER BY budget DESC, tainted ASC, bound DESC
+        """, (branch_id,)).fetchall()
+        return [(row["bound"], row["budget"], bool(row["tainted"]))
+                for row in rows]
 
     def has_pending_row(self, branch_key) -> bool:
         """True if the branch is user-queued (has a pending_branches row in any
@@ -2143,6 +2193,9 @@ class ERDQueue:
         reset_stale_in_progress(), so a worker re-promotes them; the
         re-promotion joins the preserved row rather than starting over.
 
+        cut_results also survives untouched: each row is a proof, not
+        in-flight state.
+
         Returns (n_branches_resumed, n_claims_freed).
         """
         # A row stuck in status='finalized' had its finalizer killed between
@@ -2156,11 +2209,13 @@ class ERDQueue:
             "WHERE status = 'finalized'")
         n_branches_resumed = self._conn.execute(
             "SELECT COUNT(*) FROM active_branches").fetchone()[0]
-        # Cut results are a delivery channel to waiting parents, and a restart
-        # killed every waiter.  The bounds are still true, but stale rows would
-        # short-circuit future ceilinged solves against ceilings nobody asked
-        # for yet; drop them and let the new run derive its own.
-        self._conn.execute("DELETE FROM cut_results")
+        # cut_results rows are left alone: a restart kills every *waiter*, but
+        # a cut bound is also a proof ("true ERD >= bound"), and a proof stays
+        # true across a restart exactly like a score-cache loss, which is also
+        # not cleared here.  A stale row cannot short-circuit a ceilinged solve
+        # against a ceiling nobody asked for — a consumer only reuses a row
+        # whose recorded budget and bound satisfy its own budget and ceiling
+        # (see read_cut_result); it never blocks a solve, only saves one.
         cur = self._conn.execute(
             "DELETE FROM candidate_claims WHERE done = 0")
         return n_branches_resumed, cur.rowcount

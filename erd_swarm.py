@@ -1578,18 +1578,18 @@ class _BranchWorker:
     def _read_satisfying_cut(self, branch_key, budget, ceiling, n_words):
         """The engine tuple for a recorded cut that satisfies this consumer, or
         None.  Satisfying = proven at a budget >= ours (the bound then holds at
-        ours) with a bound >= our ceiling (so it proves what the parent asked)."""
+        ours) with a bound >= our ceiling (so it proves what the parent asked).
+        A branch can carry several cuts (one per budget/taint class it has
+        been proven under, see read_cut_result); the first satisfying one is
+        used, whichever budget or taint class it comes from."""
         if ceiling == float('inf'):
             return None
-        cut = self.queue.read_cut_result(branch_key)
-        if cut is None:
-            return None
-        cut_bound, cut_budget, cut_tainted = cut
-        if budget <= cut_budget and erd_ge(cut_bound, ceiling, n_words):
-            # A tainted cut's bound holds only among budget-feasible
-            # strategies; the consumer joins the taint so its own result
-            # cannot claim the unconstrained optimum.
-            return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
+        for cut_bound, cut_budget, cut_tainted in self.queue.read_cut_result(branch_key):
+            if budget <= cut_budget and erd_ge(cut_bound, ceiling, n_words):
+                # A tainted cut's bound holds only among budget-feasible
+                # strategies; the consumer joins the taint so its own result
+                # cannot claim the unconstrained optimum.
+                return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
         return None
 
     def cooperative_solve(self, words, budget, ceiling=float('inf')):
@@ -1631,21 +1631,31 @@ class _BranchWorker:
             loss_budget = self.score_cache.read_loss(branch_key, ERD_ALL)
             if loss_budget is not None and budget <= loss_budget:
                 return (OVER_DEPTH_BUDGET, float('inf'), None, True)
-            # Already cut at a bound this caller's ceiling accepts?  The bound
-            # was proven at the recorded budget, so it holds at any budget <=
-            # it; a satisfying row costs nothing to reuse.  An unsatisfying row
-            # means someone is about to redo this branch's work — the cost side
-            # of the ceiling ledger, logged for the reuse-payback question.
-            cut = self.queue.read_cut_result(branch_key)
-            if cut is not None:
-                cut_bound, cut_budget, cut_tainted = cut
-                if (ceiling != float('inf') and budget <= cut_budget
-                        and erd_ge(cut_bound, ceiling, n_words)):
+            # Already cut at a bound this caller's ceiling accepts?  A branch
+            # can carry several cuts, one per budget/taint class it has been
+            # proven under (see read_cut_result); each holds at any consumer
+            # budget <= its own, so any row satisfying that plus our ceiling
+            # costs nothing to reuse.  No satisfying row (including the
+            # exact-consumer case, ceiling == inf) means someone is about to
+            # redo this branch's work — the cost side of the ceiling ledger,
+            # logged against the most-useful row on record for the
+            # reuse-payback question.
+            cuts = self.queue.read_cut_result(branch_key)
+            if cuts:
+                satisfying = None
+                if ceiling != float('inf'):
+                    for cut_bound, cut_budget, cut_tainted in cuts:
+                        if budget <= cut_budget and erd_ge(cut_bound, ceiling, n_words):
+                            satisfying = (cut_bound, cut_tainted)
+                            break
+                if satisfying is not None:
+                    cut_bound, cut_tainted = satisfying
                     return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
+                top_bound, top_budget, _ = cuts[0]
                 self.queue.add_cut_reuse_miss(
                     branch_key, n_words, budget,
                     None if ceiling == float('inf') else ceiling,
-                    cut_bound, cut_budget)
+                    top_bound, top_budget)
 
             # A user-queued branch always has an exact-result consumer, so it
             # is never solved under a ceiling: this parent shares the exact
