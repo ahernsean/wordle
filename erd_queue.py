@@ -2775,6 +2775,10 @@ class ERDQueue:
         bundle_summary = None
         if bundle_row["bundle_count"]:
             bundle_summary = dict(bundle_row)
+        finalization_total_count = self._conn.execute(
+            "SELECT COUNT(*) FROM telemetry.branch_finalize_log "
+            "WHERE branch_key = ?",
+            (branch_key,)).fetchone()[0]
         finalization_rows = self._conn.execute("""
             SELECT * FROM telemetry.branch_finalize_log
             WHERE branch_key = ?
@@ -2784,6 +2788,7 @@ class ERDQueue:
         for row in finalization_rows:
             finalizations.append({
                 "finalization_id": row["id"],
+                "spine": row["spine"],
                 "outcome": self._report_finalization_outcome(row),
                 "ceiling": row["ceiling"],
                 "best_guess": row["best_guess"],
@@ -2820,6 +2825,7 @@ class ERDQueue:
         return {
             "bundle_summary": bundle_summary,
             "recent_finalizations": finalizations,
+            "finalization_total_count": finalization_total_count,
             "cut_reuse_misses": cut_reuse_misses,
         }
 

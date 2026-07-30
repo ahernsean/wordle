@@ -215,7 +215,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_branch_status_filter_and_context_node(self):
         self.apply_branch_target("RAISE .....")
-        self.page.locator("#tree-button").click()
+        self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree > li")
         self.assertIn("tree=1", self.page.url)
         self.assertIn("branch_status=active", self.page.url)
@@ -229,7 +229,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_groups_patterns_under_their_word_at_every_level(self):
         self.page.locator("[data-kind=queue]").click()
-        self.page.locator("#tree-button").click()
+        self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree > li.word-group")
         group = self.page.locator("ul.tree > li.word-group")
         self.assertEqual(group.count(), 1)
@@ -267,7 +267,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_row_facts_never_split_a_number_from_its_noun(self):
         self.page.locator("[data-kind=queue]").click()
-        self.page.locator("#tree-button").click()
+        self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree .inline-facts")
         facts = self.page.locator("ul.tree li:not(.word-group) > details > summary .inline-facts").first
         self.assertEqual(
@@ -355,7 +355,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_branch_click_opens_detail(self):
         self.page.locator("[data-kind=queue]").click()
-        self.page.locator("#tree-button").click()
+        self.page.locator("#layout-tree").click()
         self.page.wait_for_selector(".tree button")
         self.page.locator(".tree button").first.click()
         self.page.wait_for_selector("text=branch report")
@@ -546,6 +546,59 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("Historical", cards.nth(1).inner_text())
         self.assertIn("historical", cards.nth(1).get_attribute("class"))
 
+    def test_branch_identity_is_content_and_spine_is_reached_via(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Identity')")
+        identity = self.page.locator(
+            "section:has-text('Identity')"
+        ).first.inner_text()
+        # Identity is the content branch: its @-reference and word count.
+        # Budget is not part of branch_key, so it does not appear here.
+        self.assertIn("@1111", identity)
+        self.assertIn("words", identity)
+        self.assertIn("8", identity)
+        self.assertNotIn("budget", identity)
+        # The spine is not the identity: absent from the top meta line, shown
+        # only under "Reached via".
+        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
+        self.assertFalse(any("RAISE" in text for text in meta_spans))
+        reached = self.page.locator(
+            "section:has-text('Reached via')"
+        ).inner_text()
+        self.assertIn("RAISE", reached)
+
+    def test_branch_target_subtitle_returns_in_tree_layout(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Identity')")
+        # Flat branch view: the Identity section names the branch, so the meta
+        # subtitle omits the spine.
+        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
+        self.assertFalse(any("RAISE" in text for text in meta_spans))
+        # Tree layout routes to renderTree and never renders the Identity /
+        # "Reached via" sections, so the meta subtitle must name the branch
+        # target again — otherwise nothing on the page identifies the branch.
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector("ul.tree > li")
+        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
+        self.assertTrue(any("RAISE" in text for text in meta_spans))
+
+    def test_finalization_spines_and_overflow_note_render(self):
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.finalization_total_count=17;
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        text = self.page.locator(
+            "section:has-text('Recent finalizations')"
+        ).inner_text()
+        # Each finalization discloses the spine that reached this answer set.
+        self.assertIn("CRIMP", text)
+        self.assertIn("DUCHY", text)
+        self.assertIn("WRUNG", text)
+        # 17 total, 3 shown -> 14 more, with the URL knob to widen the view.
+        self.assertIn("14 more", text)
+        self.assertIn("limit=17", text)
+
     def test_erd_and_bounds_round_in_cache_and_hotspot_views(self):
         result = self.page.evaluate("""async () => {
           const out={};
@@ -648,7 +701,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tree_collapse_and_browser_back_survive_poll(self):
         self.page.locator("[data-kind=queue]").click()
-        self.page.locator("#tree-button").click()
+        self.page.locator("#layout-tree").click()
         self.page.wait_for_selector(".tree details")
         details = self.page.locator(".tree details").first
         details.locator("summary").first.click()
@@ -1025,21 +1078,32 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("branch key hex", cache_text)
         self.assertNotIn("branch_key_hex", cache_text)
 
-    def test_tree_toggle_is_hidden_for_treeless_kinds(self):
-        tree_button = self.page.locator("#tree-button")
-        self.assertTrue(tree_button.is_visible())
-        self.page.locator("[data-kind=cache]").click()
-        self.page.wait_for_selector("text=cache report")
-        self.assertFalse(tree_button.is_visible())
+    def test_layout_toggle_is_hidden_where_there_is_no_topology(self):
+        toggle = self.page.locator("#layout-toggle")
+        flat = self.page.locator("#layout-flat")
+        tree = self.page.locator("#layout-tree")
+        self.assertTrue(toggle.is_visible())
+        # Cache, hotspots, and leaderboard have no branch topology, so the
+        # layout switch is hidden entirely rather than shown-but-inert.
+        for treeless in ("cache", "hotspots", "leaderboard"):
+            self.page.locator(f"[data-kind={treeless}]").click()
+            self.page.wait_for_selector(f"text={treeless} report")
+            self.assertFalse(toggle.is_visible())
         self.page.locator("[data-kind=queue]").click()
         self.page.wait_for_selector("text=queue report")
-        self.assertTrue(tree_button.is_visible())
-        tree_button.click()
+        self.assertTrue(toggle.is_visible())
+        # Flat is the selected layout by default; Tree is not.
+        self.assertEqual(flat.get_attribute("aria-pressed"), "true")
+        self.assertEqual(tree.get_attribute("aria-pressed"), "false")
+        tree.click()
         self.page.wait_for_selector("ul.tree > li")
-        self.assertEqual(tree_button.get_attribute("aria-pressed"), "true")
-        tree_button.click()
+        self.assertEqual(tree.get_attribute("aria-pressed"), "true")
+        self.assertEqual(flat.get_attribute("aria-pressed"), "false")
+        self.assertIn("tree=1", self.page.url)
+        flat.click()
         self.page.wait_for_timeout(150)
-        self.assertEqual(tree_button.get_attribute("aria-pressed"), "false")
+        self.assertEqual(tree.get_attribute("aria-pressed"), "false")
+        self.assertEqual(flat.get_attribute("aria-pressed"), "true")
         self.assertNotIn("tree=1", self.page.url)
 
     def test_review_screenshots_are_written(self):
