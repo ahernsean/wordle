@@ -273,7 +273,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         facts = self.page.locator("ul.tree li:not(.word-group) > details > summary .inline-facts").first
         self.assertEqual(
             [" ".join(text.split()) for text in facts.locator("> span").all_inner_texts()],
-            ["d1", "active / evaluating", "8 answers", "2 workers", "20/50", "@2222"],
+            ["d1", "active / evaluating", "8 answers", "2 workers", "20/50", "@22222222"],
         )
         self.assertTrue(all(
             style == "nowrap" for style in facts.locator("> span").evaluate_all(
@@ -567,6 +567,36 @@ class ReportClientBrowserTest(unittest.TestCase):
             "section:has-text('Reached via')"
         ).inner_text()
         self.assertIn("RAISE", reached)
+        copy_button = self.page.locator(
+            "section:has-text('Reached via') button:has-text('Copy spine')"
+        )
+        self.assertTrue(copy_button.is_visible())
+        self.page.evaluate("""() => {
+          navigator.clipboard = undefined;
+          window.__copiedSpine = false;
+          document.execCommand = command => {
+            window.__copiedSpine = command === 'copy';
+            return window.__copiedSpine;
+          };
+        }""")
+        copy_button.click()
+        self.page.wait_for_function(
+            "() => window.__copiedSpine === true"
+        )
+
+    def test_branch_reference_matches_hide_filters_and_view(self):
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          applyReport({
+            ...report,
+            report_kind:'branch_reference_matches',
+            data:{branch_reference:'aaaa',candidates:[
+              {branch_reference:'aaaa3c008711',answer_count:3,
+               answer_preview:['audio','avoid','among'],spine:null},
+            ]},
+          },null,{...__reportClient.getState(),branch_target:'@aaaa'});
+        }""")
+        self.assertTrue(self.page.locator("details.filters").is_hidden())
 
     def test_branch_target_subtitle_returns_in_tree_layout(self):
         self.apply_branch_target("RAISE .....")

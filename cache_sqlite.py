@@ -12,6 +12,11 @@ from pathlib import Path
 logger = logging.getLogger("wordle")
 
 
+def branch_reference(branch_key: bytes) -> str:
+    """Return the stable handle for one encoded branch answer set."""
+    return hashlib.sha1(bytes(branch_key)).hexdigest()[:12]
+
+
 class _LRUDict:
     """Fixed-capacity LRU cache backed by an OrderedDict.
 
@@ -216,6 +221,7 @@ class ScoreCache:
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS branch_best_by_policy (
                 branch_key   BLOB NOT NULL,
+                branch_reference TEXT,
                 policy       TEXT NOT NULL,
                 answer_list_id TEXT NOT NULL,
                 best_guess   TEXT NOT NULL,
@@ -245,6 +251,7 @@ class ScoreCache:
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS branch_loss_by_policy (
                 branch_key     BLOB    NOT NULL,
+                branch_reference TEXT,
                 policy         TEXT    NOT NULL,
                 answer_list_id TEXT    NOT NULL,
                 loss_budget    INTEGER NOT NULL,
@@ -431,6 +438,27 @@ class ScoreCache:
         # rows under either name are useless regardless of age.
         self._purge_legacy_rows("policy = ?", ('erd_hard',),
                                 migration_name='purge_policy_erd_hard')
+        if not self._is_migration_done('add_branch_references'):
+            for table_name in ('branch_best_by_policy', 'branch_loss_by_policy'):
+                columns = {row["name"] for row in self._conn.execute(
+                    f"PRAGMA table_info({table_name})")}
+                if "branch_reference" not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN branch_reference TEXT")
+                rows = self._conn.execute(
+                    f"SELECT rowid, branch_key FROM {table_name} "
+                    "WHERE branch_reference IS NULL"
+                ).fetchall()
+                self._conn.executemany(
+                    f"UPDATE {table_name} SET branch_reference = ? WHERE rowid = ?",
+                    [(branch_reference(row["branch_key"]), row["rowid"])
+                     for row in rows],
+                )
+                self._conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}_reference "
+                    f"ON {table_name}(branch_reference)"
+                )
+            self._mark_migration_done('add_branch_references')
 
     def _purge_legacy_rows(self, where, params, migration_name=None):
         """One-time cleanup of stale branch_best_by_policy rows.
@@ -584,10 +612,10 @@ class ScoreCache:
         try:
             self._conn.execute("""
                 INSERT OR REPLACE INTO branch_best_by_policy
-                    (branch_key, policy, answer_list_id,
+                    (branch_key, branch_reference, policy, answer_list_id,
                      best_guess, best_score, updated_at, max_depth, solve_budget)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (branch_key, policy, self.answer_list_id,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (branch_key, branch_reference(branch_key), policy, self.answer_list_id,
                   best_guess, best_score, now, max_depth, solve_budget))
             self.write_count += 1
         except sqlite3.OperationalError as exc:
@@ -636,12 +664,14 @@ class ScoreCache:
         try:
             self._conn.execute("""
                 INSERT INTO branch_loss_by_policy
-                    (branch_key, policy, answer_list_id, loss_budget, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (branch_key, branch_reference, policy, answer_list_id,
+                     loss_budget, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT (branch_key, policy, answer_list_id)
                 DO UPDATE SET loss_budget = MAX(loss_budget, excluded.loss_budget),
                               updated_at  = excluded.updated_at
-            """, (branch_key, policy, self.answer_list_id, budget, now))
+            """, (branch_key, branch_reference(branch_key), policy,
+                  self.answer_list_id, budget, now))
             self.write_count += 1
         except sqlite3.OperationalError as exc:
             if not _is_disk_io_error(exc):
@@ -663,6 +693,19 @@ class ScoreCache:
             WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
         """, (branch_key, policy, self.answer_list_id))
         self._loss_mem_cache.pop((branch_key, policy), None)
+
+    def branch_keys_for_reference_prefix(self, digest_prefix):
+        """Return distinct branch keys whose durable handles match a prefix."""
+        upper_bound = digest_prefix[:-1] + chr(ord(digest_prefix[-1]) + 1)
+        rows = self._conn.execute(
+            """SELECT branch_key FROM branch_best_by_policy
+               WHERE branch_reference >= ? AND branch_reference < ?
+               UNION
+               SELECT branch_key FROM branch_loss_by_policy
+               WHERE branch_reference >= ? AND branch_reference < ?""",
+            (digest_prefix, upper_bound, digest_prefix, upper_bound),
+        ).fetchall()
+        return [bytes(row["branch_key"]) for row in rows]
 
     def read_detail(self, branch_key, policy):
         """Like read(), but also returns the unix timestamp of the last write.

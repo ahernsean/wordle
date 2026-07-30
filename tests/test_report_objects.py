@@ -172,9 +172,10 @@ class SemanticReportTest(unittest.TestCase):
     def test_digest_resolution_rejects_zero_and_multiple_matches(self):
         no_matches = unittest.mock.Mock()
         no_matches.branch_rows_for_reference_prefix.return_value = []
-        with self.assertRaisesRegex(ValueError, "not found") as raised:
+        with self.assertRaisesRegex(
+            ValueError, "No queued or cached @1234 branch found"
+        ):
             resolve_branch_reference(no_matches, "1234")
-        self.assertIn("cache-only state", str(raised.exception))
 
         multiple = unittest.mock.Mock()
         multiple.branch_rows_for_reference_prefix.return_value = [
@@ -183,7 +184,10 @@ class SemanticReportTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "ambiguous") as raised:
             resolve_branch_reference(multiple, "1234")
-        self.assertIn("@" + branch_reference(b"cigarrebut"), str(raised.exception))
+        self.assertEqual(
+            raised.exception.candidates[0]["branch_reference"],
+            branch_reference(b"cigarrebut"),
+        )
 
     def test_queue_prefix_helper_has_bounded_candidate_contract(self):
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)

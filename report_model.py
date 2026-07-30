@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import hashlib
 import os
 import re
 import sqlite3
 import time
 from typing import Optional, Tuple
 
-from cache_sqlite import ScoreCache
+from cache_sqlite import ScoreCache, branch_reference
 from pattern_matrix import PatternMatrix
 from erd_queue import (
     DISK_STOP_FRACTION,
@@ -296,28 +295,48 @@ def resolve_branch_target(
     )
 
 
-def resolve_branch_reference(queue, digest_prefix) -> dict:
-    matches = queue.branch_rows_for_reference_prefix(digest_prefix)
-    if not matches:
-        raise ValueError(
-            f"branch reference @{digest_prefix} not found; use the branch spine "
-            "for cache-only state after queue completion"
-        )
-    if len(matches) > 1:
-        descriptions = []
-        for row in matches:
-            reference = branch_reference(bytes(row["branch_key"]))
-            spine = queue.row_spine_text(row) or "unknown spine"
-            descriptions.append(f"@{reference} {spine}")
-        raise ValueError(
-            f"branch reference @{digest_prefix} is ambiguous: "
-            + "; ".join(descriptions)
-        )
-    return matches[0]
+def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
+    matches = [] if queue is None else queue.branch_rows_for_reference_prefix(digest_prefix)
+    cache_matches = [] if cache is None else cache.branch_keys_for_reference_prefix(
+        digest_prefix
+    )
+    queue_keys = {bytes(row["branch_key"]) for row in matches}
+    cache_only_keys = [key for key in cache_matches if key not in queue_keys]
+    if not matches and not cache_only_keys:
+        raise ValueError(f"No queued or cached @{digest_prefix} branch found")
+    if len(matches) + len(cache_only_keys) > 1:
+        candidates = [
+            {"branch_reference": branch_reference(bytes(row["branch_key"])),
+             "branch_key": bytes(row["branch_key"]), "spine": queue.row_spine_text(row)} for row in matches
+        ]
+        candidates.extend({"branch_reference": branch_reference(key), "branch_key": key, "spine": None}
+                          for key in cache_only_keys)
+        error = ValueError(f"branch reference @{digest_prefix} is ambiguous")
+        error.candidates = candidates
+        raise error
+    if matches:
+        return matches[0]
+    return {"branch_key": cache_only_keys[0], "spine": None}
 
 
-def branch_reference(branch_key: bytes) -> str:
-    return hashlib.sha1(bytes(branch_key)).hexdigest()[:12]
+def collect_ambiguous_branch_reference_report(sources, request, error):
+    candidates = []
+    for candidate in error.candidates:
+        answer_words = sorted(_decode_branch_key(candidate["branch_key"]))
+        candidates.append({
+            "branch_reference": candidate["branch_reference"],
+            "spine": candidate["spine"],
+            "answer_count": len(answer_words),
+            "answer_preview": answer_words[:3],
+        })
+    report = _semantic_report("branch_reference_matches", sources,
+                              request.branch_target, int(time.time()), {
+                                  "branch_reference": request.branch_target.branch_reference,
+                                  "candidates": candidates,
+                              }, request)
+    report["sources"]["queue"]["ok"] = True
+    report["sources"]["cache"]["ok"] = True
+    return report
 
 
 def parse_rich_spine(path: str | None) -> list[RichSpineStep]:
@@ -1197,11 +1216,19 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     }
     queue_error = None
     referenced_row = None
+    cache = None
+    cache_error = None
+    try:
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+    except (sqlite3.Error, OSError) as error:
+        cache_error = error
     try:
         queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
         if request.branch_target.kind == "branch_reference":
             referenced_row = resolve_branch_reference(
-                queue, request.branch_target.branch_reference
+                queue, request.branch_target.branch_reference, cache
             )
             branch_key = bytes(referenced_row["branch_key"])
             resolved = ResolvedBranch(
@@ -1239,9 +1266,18 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     except (sqlite3.Error, OSError) as error:
         queue_error = error
         if request.branch_target.kind == "branch_reference":
-            raise
-        resolved = resolve_branch_target(request.branch_target, all_answers)
-        branch_key = resolved.branch_key
+            if cache is None:
+                raise
+            referenced_row = resolve_branch_reference(
+                None, request.branch_target.branch_reference, cache
+            )
+            branch_key = bytes(referenced_row["branch_key"])
+            resolved = ResolvedBranch(
+                _decode_branch_key(branch_key), branch_key, (), None,
+            )
+        else:
+            resolved = resolve_branch_target(request.branch_target, all_answers)
+            branch_key = resolved.branch_key
     finally:
         if queue is not None:
             queue.close()
@@ -1346,11 +1382,9 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     else:
         _mark_queue_source_error(report, queue_error)
 
-    cache = None
     try:
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        if cache is None:
+            raise cache_error
         data["cache"] = cache.report_branch_state(branch_key, ERD_ALL, budget)
         branch_status, branch_phase = branch_status_and_phase(
             _row_value(pending_row, "status"),
