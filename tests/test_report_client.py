@@ -232,17 +232,18 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree > li.word-group")
+        self.assertEqual(self.page.locator("text=Sources and filters").count(), 0)
         group = self.page.locator("ul.tree > li.word-group")
         self.assertEqual(group.count(), 1)
         self.assertIsNone(group.locator("> details").get_attribute("open"))
         self.assertEqual(
             " ".join(group.locator("> details > summary").inner_text().split()),
-            "RAISE 1 branch",
+            "RAISE 1 branch · 0 workers",
         )
         rows = group.locator("> details > .tree-pattern-page > ul.patterns > li")
         self.assertEqual(rows.count(), 1)
         # The group names the word, so its rows carry only the response pattern.
-        row_summary = rows.locator("> details > summary")
+        row_summary = rows.locator("> .clickable")
         self.assertNotIn("RAISE", row_summary.inner_text())
         self.assertEqual(row_summary.locator(".step").count(), 1)
 
@@ -278,7 +279,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree .inline-facts")
-        facts = self.page.locator("ul.tree li:not(.word-group) > details > summary .inline-facts").first
+        facts = self.page.locator("ul.tree li:not(.word-group) > .clickable .inline-facts").first
         self.assertEqual(
             [" ".join(text.split()) for text in facts.locator("> span").all_inner_texts()],
             ["d1", "active / evaluating", "8 answers", "2 workers", "20/50", "@22222222"],

@@ -478,11 +478,12 @@ class SemanticReportTest(unittest.TestCase):
         )
         queue.create_branch(
             b"awakeblush", 2, 4, budget=4,
-            spine="RAISE ----- CRANE y----",
+            spine="RAISE ----- CRANE y----", priority=37,
         )
         queue.create_branch(
             b"focalserve", 2, 4, budget=5, spine="STINK g----"
         )
+        queue.heartbeat("worker-1", 1, b"awakeblush", 0, int(time.time()), 0)
         queue.close()
         for branch_target_text, expected_word in (
             ("", None), ("RAISE", "raise"), ("RAISE -----", "crane"),
@@ -500,6 +501,17 @@ class SemanticReportTest(unittest.TestCase):
                     self.assertGreaterEqual(node["guess_depth"], 1)
                     if expected_word and node["step"] is not None:
                         self.assertEqual(node["step"]["word"], expected_word)
+                if branch_target_text == "RAISE -----":
+                    branch_node = report["data"]["nodes"][0]
+                    self.assertEqual(branch_node["priority"], 37)
+                    self.assertEqual(branch_node["subtree_worker_count"], 1)
+        root_report = collect_report(self.sources, ReportRequest(tree=True))
+        raise_node = next(
+            node for node in root_report["data"]["nodes"]
+            if node["step"]["word"] == "raise"
+        )
+        self.assertEqual(raise_node["child_count"], 1)
+        self.assertEqual(raise_node["subtree_worker_count"], 1)
 
     def test_tree_page_applies_filters_to_immediate_children(self):
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)

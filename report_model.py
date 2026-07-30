@@ -1546,6 +1546,9 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
                     "answer_count": None,
                     "guess_depth": guess_depth_value,
                     "worker_count": 0,
+                    "subtree_worker_count": 0,
+                    "child_count": 0,
+                    "priority": None,
                     "completed_candidate_count": None,
                     "candidate_count": None,
                     "is_context": False,
@@ -1574,6 +1577,9 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
                     "answer_count": None,
                     "guess_depth": guess_depth_value,
                     "worker_count": 0,
+                    "subtree_worker_count": 0,
+                    "child_count": 0,
+                    "priority": None,
                     "completed_candidate_count": None,
                     "candidate_count": None,
                     "is_context": False,
@@ -1588,6 +1594,7 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
             "branch_phase": row["branch_phase"],
             "answer_count": row["answer_count"],
             "worker_count": row["worker_count"],
+            "priority": row["priority"],
             "completed_candidate_count": row["completed_candidate_count"],
             "candidate_count": row["candidate_count"],
             "is_context": bool(row.get("is_context")),
@@ -1598,6 +1605,17 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
     }
     for node in nodes.values():
         node["has_children"] = node["node_id"] in parent_node_ids
+        node["child_count"] = sum(
+            candidate["parent_node_id"] == node["node_id"]
+            for candidate in nodes.values()
+        )
+    for node in nodes.values():
+        worker_count = node["worker_count"]
+        current_node = node
+        while current_node is not None:
+            current_node["subtree_worker_count"] += worker_count
+            parent_node_id = current_node["parent_node_id"]
+            current_node = nodes.get(parent_node_id)
     parent_spine = request.tree_parent or prefix
     parent_id = _tree_node_id(_spine_steps(parent_spine)) if parent_spine else None
     direct_nodes = [
