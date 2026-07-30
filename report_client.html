@@ -214,6 +214,7 @@
     const fixed=(value,digits=3)=>value===null||value===undefined?null:Number(value).toFixed(digits);
     const displayValue=(key,value)=>key==="best_guess"&&value?String(value).toUpperCase():boundFields.has(key)&&typeof value==="number"?fixed(value):value;
     const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
+    const absoluteTime=seconds=>seconds===null||seconds===undefined?"unknown time":new Date(seconds*1000).toLocaleString(undefined,{dateStyle:"medium",timeStyle:"medium"});
     const displayTimedValue=(key,value,now)=>key.endsWith("_at")&&typeof value==="number"?relativeAge(value,now):displayValue(key,value);
     const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts)if(part)node.append(element("span","",part));return node;};
     const label=key=>String(key).replaceAll("_"," ");
@@ -377,11 +378,15 @@
       return row;
     }
     function branchClass(row){return row.is_live===false?"dead":row.branch_phase==="finalizing"?"finalizing":row.branch_status||"";}
+    function refreshTreeSnapshot(){
+      for(const details of byId("report").querySelectorAll("details[open]"))details.open=false;
+      treePageHistory.clear();treeGroupPages.clear();abortActiveRequest();fetchReport();
+    }
     function reportHeader(report,state){
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"));
       if(report.report_kind!=="branch"||report.tree)meta.append(element("span","dim",state.branch_target||"root"));
-      meta.append(element("span","dim","generated "+relativeAge(report.generated_at,report.generated_at)));
+      if(report.tree){meta.append(element("span","dim","snapshot "+absoluteTime(report.generated_at)));const refreshButton=element("button","","Refresh tree");refreshButton.addEventListener("click",refreshTreeSnapshot);meta.append(refreshButton);}
       if(!(report.tree&&report.report_kind==="queue")){const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.open=sourcePathsOpen;details.addEventListener("toggle",()=>{sourcePathsOpen=details.open;});details.append(summary);for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);}return meta;
     }
     function bestText(row){
