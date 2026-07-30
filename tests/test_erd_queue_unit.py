@@ -613,29 +613,57 @@ class TestBranchCeiling(_TmpQueue):
 
 
 class TestCutResults(_TmpQueue):
-    """cut_results: the delivery channel for ceilinged solves that ended as a
-    lower bound instead of an exact optimum."""
+    """cut_results: the durable-proof channel for ceilinged solves that ended
+    as a lower bound instead of an exact optimum.  Keyed by (branch_id,
+    budget, tainted); each class keeps its own maximum bound (issue #185)."""
 
     def test_round_trip(self):
         self.q.add_cut_result(self.key, budget=4, bound=2.5)
-        self.assertEqual(self.q.read_cut_result(self.key), (2.5, 4, False))
+        self.assertEqual(self.q.read_cut_result(self.key), [(2.5, 4, False)])
 
-    def test_missing_key_reads_none(self):
-        self.assertIsNone(self.q.read_cut_result(b"notakey"))
+    def test_missing_key_reads_empty(self):
+        self.assertEqual(self.q.read_cut_result(b"notakey"), [])
 
-    def test_replace_supersedes(self):
+    def test_higher_bound_at_same_budget_and_taint_wins(self):
         self.q.add_cut_result(self.key, budget=4, bound=2.5)
-        self.q.add_cut_result(self.key, budget=5, bound=3.0)
-        self.assertEqual(self.q.read_cut_result(self.key), (3.0, 5, False))
+        self.q.add_cut_result(self.key, budget=4, bound=3.0)
+        self.assertEqual(self.q.read_cut_result(self.key), [(3.0, 4, False)])
+
+    def test_lower_bound_at_same_budget_and_taint_does_not_regress(self):
+        self.q.add_cut_result(self.key, budget=4, bound=3.0)
+        self.q.add_cut_result(self.key, budget=4, bound=2.5)
+        self.assertEqual(self.q.read_cut_result(self.key), [(3.0, 4, False)])
+
+    def test_different_budgets_kept_as_separate_rows(self):
+        # A higher bound proven at a lower budget must not evict a lower
+        # bound proven at a higher budget: only the budget-5 row can serve a
+        # budget-5 consumer.
+        self.q.add_cut_result(self.key, budget=2, bound=5.0)
+        self.q.add_cut_result(self.key, budget=5, bound=1.0)
+        self.assertEqual(
+            sorted(self.q.read_cut_result(self.key)),
+            sorted([(5.0, 2, False), (1.0, 5, False)]))
+
+    def test_different_taint_kept_as_separate_rows(self):
+        # A higher tainted bound must not evict a lower untainted one at the
+        # same budget: the untainted row serves a consumer for free, while
+        # the tainted row forces the consumer to inherit the taint.
+        self.q.add_cut_result(self.key, budget=4, bound=2.0, tainted=False)
+        self.q.add_cut_result(self.key, budget=4, bound=5.0, tainted=True)
+        self.assertEqual(
+            sorted(self.q.read_cut_result(self.key)),
+            sorted([(2.0, 4, False), (5.0, 4, True)]))
 
     def test_tainted_round_trip(self):
         self.q.add_cut_result(self.key, budget=4, bound=2.5, tainted=True)
-        self.assertEqual(self.q.read_cut_result(self.key), (2.5, 4, True))
+        self.assertEqual(self.q.read_cut_result(self.key), [(2.5, 4, True)])
 
-    def test_recover_active_branches_clears_cut_results(self):
+    def test_recover_active_branches_preserves_cut_results(self):
+        # A cut bound is a proof, not in-flight state: a restart kills
+        # waiters, but the proof stays true.
         self.q.add_cut_result(self.key, budget=4, bound=2.5)
         self.q.recover_active_branches()
-        self.assertIsNone(self.q.read_cut_result(self.key))
+        self.assertEqual(self.q.read_cut_result(self.key), [(2.5, 4, False)])
 
 
 class TestPendingRowHelpers(_TmpQueue):

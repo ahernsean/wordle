@@ -205,7 +205,7 @@ class TestPromotedSpine(unittest.TestCase):
                     w._note_depth(entry_budget, 5, guess, pattern)
                 w.score_cache.read_with_depth.return_value = None
                 w.score_cache.read_loss.return_value = None
-                w.queue.read_cut_result.return_value = None
+                w.queue.read_cut_result.return_value = []
                 w.queue.has_pending_row.return_value = False
                 w.queue.create_branch.return_value = True
                 w.queue.get_branch.return_value = None
@@ -1804,7 +1804,7 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         w.score_cache = mock.MagicMock()
         w.score_cache.read_with_depth.return_value = None
         w.score_cache.read_loss.return_value = None
-        w.queue.read_cut_result.return_value = None
+        w.queue.read_cut_result.return_value = []
         w.queue.has_pending_row.return_value = False
         w.queue.create_branch.return_value = True
         # Exit the help loop immediately wherever it is reached: these tests
@@ -1814,7 +1814,7 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
 
     def test_satisfying_cut_short_circuits(self):
         w = self._worker()
-        w.queue.read_cut_result.return_value = (3.0, 5, False)
+        w.queue.read_cut_result.return_value = [(3.0, 5, False)]
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.4)
         self.assertEqual(result, (OVER_ERD_LIMIT, 3.0, None, False))
         w.queue.create_branch.assert_not_called()
@@ -1824,7 +1824,7 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         # The cut's own proof involved the remaining-depth floor, so a
         # consumer that reuses it must not report an untainted result.
         w = self._worker()
-        w.queue.read_cut_result.return_value = (3.0, 5, True)
+        w.queue.read_cut_result.return_value = [(3.0, 5, True)]
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.4)
         self.assertEqual(result, (OVER_ERD_LIMIT, 3.0, None, True))
 
@@ -1837,7 +1837,7 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         stored_bound = 13 / n_words
         wanted_ceiling = math.nextafter(stored_bound, math.inf)
         self.assertNotEqual(stored_bound, wanted_ceiling)
-        w.queue.read_cut_result.return_value = (stored_bound, 5, False)
+        w.queue.read_cut_result.return_value = [(stored_bound, 5, False)]
         result = w.cooperative_solve(BRANCH, 4, ceiling=wanted_ceiling)
         self.assertEqual(result, (OVER_ERD_LIMIT, stored_bound, None, False))
         w.queue.create_branch.assert_not_called()
@@ -1847,7 +1847,7 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         # The bound was proven at budget 3; at budget 4 more strategies exist,
         # so it proves nothing — logged as a reuse miss and re-solved.
         w = self._worker()
-        w.queue.read_cut_result.return_value = (3.0, 3, False)
+        w.queue.read_cut_result.return_value = [(3.0, 3, False)]
         w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         w.queue.add_cut_reuse_miss.assert_called_once_with(
             mock.ANY, len(BRANCH), 4, 2.5, 3.0, 3)
@@ -1855,14 +1855,14 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
 
     def test_cut_below_wanted_ceiling_is_a_miss(self):
         w = self._worker()
-        w.queue.read_cut_result.return_value = (2.0, 5, False)
+        w.queue.read_cut_result.return_value = [(2.0, 5, False)]
         w.cooperative_solve(BRANCH, 4, ceiling=2.4)
         w.queue.add_cut_reuse_miss.assert_called_once_with(
             mock.ANY, len(BRANCH), 4, 2.4, 2.0, 5)
 
     def test_exact_consumer_never_satisfied_by_cut(self):
         w = self._worker()
-        w.queue.read_cut_result.return_value = (3.0, 5, False)
+        w.queue.read_cut_result.return_value = [(3.0, 5, False)]
         w.cooperative_solve(BRANCH, 4)   # no ceiling: exact required
         w.queue.add_cut_reuse_miss.assert_called_once_with(
             mock.ANY, len(BRANCH), 4, None, 3.0, 5)
@@ -2174,7 +2174,7 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         finally:
             w.close()
         q = ERDQueue(self.queue_path)
-        self.assertEqual(q.read_cut_result(self.key), (2.5, 4, False))
+        self.assertEqual(q.read_cut_result(self.key), [(2.5, 4, False)])
         self.assertIsNone(q.get_branch(self.key))
         row = q._conn.execute(
             "SELECT outcome, ceiling FROM telemetry.branch_finalize_log"
@@ -2196,7 +2196,7 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         finally:
             w.close()
         q = ERDQueue(self.queue_path)
-        self.assertIsNone(q.read_cut_result(self.key))
+        self.assertEqual(q.read_cut_result(self.key), [])
         row = q._conn.execute(
             "SELECT outcome, ceiling FROM telemetry.branch_finalize_log"
         ).fetchone()

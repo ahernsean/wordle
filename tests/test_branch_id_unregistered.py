@@ -26,7 +26,7 @@ class TestUnregisteredBranchKey(unittest.TestCase):
         self.assertIsNone(self.q.get_pending_branch(self.key))
         self.assertEqual(self.q.read_branch_best(self.key), (None, None, None))
         self.assertIsNone(self.q.read_branch_meta(self.key))
-        self.assertIsNone(self.q.read_cut_result(self.key))
+        self.assertEqual(self.q.read_cut_result(self.key), [])
         self.assertEqual(self.q.branch_done_candidates(self.key), 0)
         self.assertEqual(self.q.branch_bulk_done_candidates(self.key), 0)
         self.assertFalse(self.q.has_pending_row(self.key))
