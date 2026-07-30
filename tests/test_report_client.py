@@ -680,6 +680,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(select.get_attribute("data-test-marker"), "still-here")
         self.assertTrue(select.evaluate("(el) => el === document.activeElement"))
 
+    def test_focused_tree_summary_survives_a_poll_refresh(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector(".tree details summary")
+        summary = self.page.locator(".tree details summary").first
+        summary.click()
+        self.assertTrue(summary.evaluate("(el) => el === document.activeElement"))
+        summary.evaluate("(el) => el.dataset.testMarker = 'still-here'")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(summary.get_attribute("data-test-marker"), "still-here")
+        self.assertTrue(summary.evaluate("(el) => el === document.activeElement"))
+
+    def test_navigation_rerenders_even_with_a_stale_focused_control(self):
+        # sameView polls skip their visual apply while focus sits on a
+        # select/input/textarea/summary (verified above); a real navigation
+        # must always render regardless, since replacing the old view is the
+        # point.  Drive it through setState directly rather than a Playwright
+        # click, which would itself move focus off the summary and mask the
+        # bug this guards against.
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector(".tree details summary")
+        summary = self.page.locator(".tree details summary").first
+        summary.click()
+        self.assertTrue(summary.evaluate("(el) => el === document.activeElement"))
+        self.page.evaluate(
+            "() => __reportClient.setState({...__reportClient.getState(), kind:'workers', tree:false})"
+        )
+        self.page.wait_for_selector("text=workers report")
+
     def test_finalization_page_size_selector_changes_limit_and_resets_offset(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")
