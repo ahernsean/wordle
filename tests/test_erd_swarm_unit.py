@@ -1829,10 +1829,9 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         self.assertEqual(result, (OVER_ERD_LIMIT, 3.0, None, True))
 
     def test_satisfying_cut_survives_ulp_noise(self):
-        # The exact bug this fix targets: the stored cut bound and the wanted
-        # ceiling are the same rational (k / len(BRANCH)) but differ by one
-        # ULP in float64. Before the fix, cut_bound >= ceiling was False and
-        # the branch was re-solved to re-prove a bound already proven.
+        # The stored cut bound and the wanted ceiling are the same rational
+        # (k / len(BRANCH)) but differ by one ULP in float64; erd_ge must
+        # treat them as equal rather than triggering a re-solve.
         w = self._worker()
         n_words = len(BRANCH)
         stored_bound = 13 / n_words
@@ -1917,6 +1916,19 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": 3.0, "budget": 4}
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.4)
+        self.assertIsNotNone(result)   # proceeded to the loop (cancelled out)
+
+    def test_join_allowed_when_existing_ceiling_is_ulp_apart(self):
+        # The row's ceiling and ours are the same rational (k / len(BRANCH))
+        # but differ by one ULP in float64; erd_ge must treat them as equal
+        # rather than refusing a join that should succeed.
+        w = self._worker()
+        row_ceiling = 13 / len(BRANCH)
+        ours = math.nextafter(row_ceiling, math.inf)
+        self.assertNotEqual(row_ceiling, ours)
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": row_ceiling, "budget": 4}
+        result = w.cooperative_solve(BRANCH, 4, ceiling=ours)
         self.assertIsNotNone(result)   # proceeded to the loop (cancelled out)
 
     def test_join_allowed_on_exact_branch(self):
@@ -2084,6 +2096,35 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         self.assertFalse(token[5])
         w.queue.mark_claims_done.assert_not_called()
         w.cooperative_solve.assert_not_called()
+
+    def test_race_to_ulp_apart_ceiling_joins(self):
+        # The raced row's ceiling and ours are the same rational one ULP
+        # apart in float64; erd_ge must treat them as equal so the frame
+        # still joins rather than declining as though the row's ceiling
+        # were strictly tighter.
+        pub, w, token = self._overrunning()
+        w.queue.create_branch.return_value = False
+        row_ceiling = 13 / len(BRANCH[:6])
+        ours = math.nextafter(row_ceiling, math.inf)
+        self.assertNotEqual(row_ceiling, ours)
+        w.queue.get_branch.return_value = {"ceiling": row_ceiling, "budget": 5}
+        result = pub.check(token, CANDIDATES, 1, None, ours, 5)
+        self.assertIsNotNone(result)
+        w.cooperative_solve.assert_called_once_with(BRANCH[:6], 5, ceiling=ours)
+
+    def test_sound_to_mark_survives_ulp_noise(self):
+        # The raced row's ceiling and this frame's own best_erd are the same
+        # rational one ULP apart in float64; erd_ge must treat them as equal
+        # so the prefix marks are still recorded as sound rather than
+        # skipped.
+        pub, w, token = self._overrunning()
+        w.queue.create_branch.return_value = False
+        best_erd = 13 / len(BRANCH[:6])
+        row_ceiling = math.nextafter(best_erd, math.inf)
+        self.assertNotEqual(best_erd, row_ceiling)
+        w.queue.get_branch.return_value = {"ceiling": row_ceiling, "budget": 5}
+        pub.check(token, CANDIDATES, 1, None, best_erd, 5)
+        w.queue.mark_claims_done.assert_called_once()
 
 
 class TestCeilingFinalizeIntegration(unittest.TestCase):
