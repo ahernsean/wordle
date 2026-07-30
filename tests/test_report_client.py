@@ -584,6 +584,20 @@ class ReportClientBrowserTest(unittest.TestCase):
             "() => window.__copiedSpine === true"
         )
 
+    def test_branch_reference_matches_hide_filters_and_view(self):
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          applyReport({
+            ...report,
+            report_kind:'branch_reference_matches',
+            data:{branch_reference:'aaaa',candidates:[
+              {branch_reference:'aaaa3c008711',answer_count:3,
+               answer_preview:['audio','avoid','among'],spine:null},
+            ]},
+          },null,{...__reportClient.getState(),branch_target:'@aaaa'});
+        }""")
+        self.assertTrue(self.page.locator("details.filters").is_hidden())
+
     def test_branch_target_subtitle_returns_in_tree_layout(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("section:has-text('Identity')")
