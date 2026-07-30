@@ -635,12 +635,14 @@ class ReportClientBrowserTest(unittest.TestCase):
         # page stable while the swarm keeps appending finalizations.
         self.assertIn("finalization_cursor=after:991:109", unquote(self.page.url))
         # The click's own state update lands synchronously (asserted above);
-        # the re-render only lands once the follow-up fetch resolves. The
-        # fixture server ignores query params, so its real response reverts
-        # the patched data back to the 3-row fixture -- a reliable signal
-        # that the post-click render has actually landed.
+        # the re-render only lands once the follow-up fetch resolves.  The
+        # fixture server ignores query params, so its response reverts the
+        # patched 10 rows back to the 3-row fixture: wait on the whole
+        # post-fetch sentence, not a fragment like "of 3" that the patched
+        # "Showing 10 of 3 total" already satisfies before the fetch lands.
         self.page.wait_for_function(
-            "() => document.querySelector('#report').innerText.includes('of 3')"
+            "() => document.querySelector('#report')"
+            ".innerText.includes('Showing 3 of 3 total')"
         )
         self.assertFalse(section.locator("button:has-text('Prev')").is_disabled())
 
