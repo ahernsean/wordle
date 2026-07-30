@@ -126,6 +126,24 @@ class ReportServerTest(unittest.TestCase):
         )
         self.assertEqual(report_request.filters.limit, 4)
 
+    def test_finalization_cursor_is_parsed_into_filters(self):
+        default_request = parse_report_request("/api/view", "")
+        after_request = parse_report_request(
+            "/api/view",
+            "branch_target=RAISE%20.....&finalization_cursor=after:1700000000:42",
+        )
+        before_request = parse_report_request(
+            "/api/view",
+            "branch_target=RAISE%20.....&finalization_cursor=before:1700000000:42",
+        )
+        self.assertIsNone(default_request.filters.finalization_cursor_direction)
+        self.assertEqual(after_request.filters.finalization_cursor_direction, "after")
+        self.assertEqual(
+            after_request.filters.finalization_cursor_recorded_at, 1700000000
+        )
+        self.assertEqual(after_request.filters.finalization_cursor_id, 42)
+        self.assertEqual(before_request.filters.finalization_cursor_direction, "before")
+
     def test_root_overview_defaults_to_active_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
         all_request = parse_report_request("/api/view", "branch_status=all")
@@ -194,6 +212,7 @@ class ReportServerTest(unittest.TestCase):
             "sample_size=0", "minimum_answer_count=5&maximum_answer_count=2",
             "branch_status=active,active", "branch_status=all,pending",
             "branch_phase=evaluating,", "branch_phase=working",
+            "finalization_cursor=sideways:1:2", "finalization_cursor=after:1",
         )
         with running_server(fixture_configuration()) as base_url:
             for query in invalid_queries:

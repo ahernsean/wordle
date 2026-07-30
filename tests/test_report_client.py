@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from threading import Thread
 import unittest
+from urllib.parse import unquote
 
 from report_model import ReportSources
 from report_server import ServerConfiguration, load_fixtures, make_handler
@@ -582,22 +583,68 @@ class ReportClientBrowserTest(unittest.TestCase):
         meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
         self.assertTrue(any("RAISE" in text for text in meta_spans))
 
-    def test_finalization_spines_and_overflow_note_render(self):
-        self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
-          branch.data.finalization_total_count=17;
-          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
-        }""")
-        text = self.page.locator(
-            "section:has-text('Recent finalizations')"
-        ).inner_text()
+    def test_finalization_spines_and_pager_range_render(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        text = section.inner_text()
         # Each finalization discloses the spine that reached this answer set.
         self.assertIn("CRIMP", text)
         self.assertIn("DUCHY", text)
         self.assertIn("WRUNG", text)
-        # 17 total, 3 shown -> 14 more, with the URL knob to widen the view.
-        self.assertIn("14 more", text)
-        self.assertIn("limit=17", text)
+        # 3 shown, fewer than a full (default 10) page -> both Prev and Next
+        # are dead ends; the total is an exact COUNT(*) at query time.
+        self.assertIn("Showing 3 of 3 total", text)
+        self.assertTrue(section.locator("button:has-text('Prev')").is_disabled())
+        self.assertTrue(section.locator("button:has-text('Next')").is_disabled())
+
+    def test_finalization_pager_enables_next_when_a_full_page_is_returned(self):
+        # Next's enabled state is a "did a full page come back" heuristic,
+        # not a comparison against finalization_total_count: that count is
+        # itself a live, moving target (see the cursor-stability queue-layer
+        # tests), so it can't be trusted to say whether more rows exist.
+        self.apply_branch_target("RAISE .....")
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          const base=branch.data.recent_finalizations[0];
+          branch.data.recent_finalizations=Array.from({length:10},(_,i)=>({
+            ...base, finalization_id:100+i, recorded_at:1000-i,
+          }));
+          branch.data.finalization_total_count=17;
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        self.assertIn("Showing 10 of 17 total", section.inner_text())
+        self.assertTrue(section.locator("button:has-text('Prev')").is_disabled())
+        self.assertFalse(section.locator("button:has-text('Next')").is_disabled())
+
+    def test_finalization_pager_next_advances_cursor_and_url(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          const base=branch.data.recent_finalizations[0];
+          branch.data.recent_finalizations=Array.from({length:10},(_,i)=>({
+            ...base, finalization_id:100+i, recorded_at:1000-i,
+          }));
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        section.locator("button:has-text('Next')").click()
+        # The cursor is anchored to the last row actually shown (recorded_at
+        # 991, finalization_id 109), not a row count -- that's what keeps a
+        # page stable while the swarm keeps appending finalizations.
+        self.assertIn("finalization_cursor=after:991:109", unquote(self.page.url))
+        # The click's own state update lands synchronously (asserted above);
+        # the re-render only lands once the follow-up fetch resolves.  The
+        # fixture server ignores query params, so its response reverts the
+        # patched 10 rows back to the 3-row fixture: wait on the whole
+        # post-fetch sentence, not a fragment like "of 3" that the patched
+        # "Showing 10 of 3 total" already satisfies before the fetch lands.
+        self.page.wait_for_function(
+            "() => document.querySelector('#report')"
+            ".innerText.includes('Showing 3 of 3 total')"
+        )
+        self.assertFalse(section.locator("button:has-text('Prev')").is_disabled())
 
     def test_erd_and_bounds_round_in_cache_and_hotspot_views(self):
         result = self.page.evaluate("""async () => {
@@ -625,6 +672,69 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(self.page.locator(".outcome-cut").count(), 2)
         self.assertEqual(self.page.locator(".outcome-loss").count(), 1)
         self.assertIn("Cut-reuse misses", self.page.locator("#report").inner_text())
+
+    def test_cut_reuse_miss_card_shows_the_full_record(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Cut-reuse misses")
+        text = self.page.locator("section:has-text('Cut-reuse misses')").inner_text()
+        # The fixture row has budget 5, wanted_ceiling null (an exact-required
+        # caller), available_bound 2.2 at budget 4, and epoch 4 -- all of it
+        # should render, not just available_bound/available_budget.
+        self.assertIn("budget 5", text)
+        self.assertIn("wanted exact", text)
+        self.assertIn("available 2.200 at budget 4", text)
+        self.assertIn("epoch 4", text)
+
+    def test_focused_page_size_select_survives_a_poll_refresh(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        select = self.page.locator("section:has-text('Recent finalizations') select")
+        select.click()
+        select.evaluate("(el) => el.dataset.testMarker = 'still-here'")
+        # A poll refresh while the select has focus must not tear out and
+        # rebuild the branch section -- there is no DOM state that lets a
+        # native <select>'s open dropdown survive its element being replaced.
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(select.get_attribute("data-test-marker"), "still-here")
+        self.assertTrue(select.evaluate("(el) => el === document.activeElement"))
+
+    def test_focused_tree_summary_survives_a_poll_refresh(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector(".tree details summary")
+        summary = self.page.locator(".tree details summary").first
+        summary.click()
+        self.assertTrue(summary.evaluate("(el) => el === document.activeElement"))
+        summary.evaluate("(el) => el.dataset.testMarker = 'still-here'")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(summary.get_attribute("data-test-marker"), "still-here")
+        self.assertTrue(summary.evaluate("(el) => el === document.activeElement"))
+
+    def test_navigation_rerenders_even_with_a_stale_focused_control(self):
+        # sameView polls skip their visual apply while focus sits on a
+        # select/input/textarea/summary (verified above); a real navigation
+        # must always render regardless, since replacing the old view is the
+        # point.  Drive it through setState directly rather than a Playwright
+        # click, which would itself move focus off the summary and mask the
+        # bug this guards against.
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector(".tree details summary")
+        summary = self.page.locator(".tree details summary").first
+        summary.click()
+        self.assertTrue(summary.evaluate("(el) => el === document.activeElement"))
+        self.page.evaluate(
+            "() => __reportClient.setState({...__reportClient.getState(), kind:'workers', tree:false})"
+        )
+        self.page.wait_for_selector("text=workers report")
+
+    def test_finalization_page_size_selector_changes_limit_and_resets_cursor(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        section.locator("select").select_option("25")
+        self.assertIn("limit=25", self.page.url)
+        self.assertNotIn("finalization_cursor=", self.page.url)
 
     def test_semantic_change_highlights_matching_identity_only(self):
         classes = self.page.evaluate("""async () => {

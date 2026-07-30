@@ -2762,8 +2762,19 @@ class ERDQueue:
             return outcome
         return "cut" if row["ceiling"] is not None else "unknown"
 
-    def report_branch_telemetry(self, branch_key, limit) -> dict:
-        """Return bounded current and historical telemetry for one branch."""
+    def report_branch_telemetry(self, branch_key, limit, after=None, before=None) -> dict:
+        """Return bounded current and historical telemetry for one branch.
+
+        recent_finalizations is newest-first and keyset-paginated: at most one
+        of after/before is a (recorded_at, id) boundary taken from a row
+        already seen (after: strictly older, continuing the same newest-first
+        order; before: strictly newer, fetched ascending and reversed back to
+        newest-first). Unlike an OFFSET, a boundary tied to an actual row
+        stays valid as new rows keep landing on a branch the swarm is still
+        finalizing -- OFFSET counts from the current head, which shifts under
+        it and skips or repeats rows. Neither applies to cut_reuse_misses,
+        which always shows the single most recent window.
+        """
         bundle_row = self._conn.execute("""
             SELECT COUNT(*) AS bundle_count,
                    SUM(nodes) AS node_count,
@@ -2779,11 +2790,31 @@ class ERDQueue:
             "SELECT COUNT(*) FROM telemetry.branch_finalize_log "
             "WHERE branch_key = ?",
             (branch_key,)).fetchone()[0]
-        finalization_rows = self._conn.execute("""
-            SELECT * FROM telemetry.branch_finalize_log
-            WHERE branch_key = ?
-            ORDER BY recorded_at DESC, id DESC LIMIT ?
-        """, (branch_key, limit)).fetchall()
+        if after is not None:
+            after_recorded_at, after_id = after
+            finalization_rows = self._conn.execute("""
+                SELECT * FROM telemetry.branch_finalize_log
+                WHERE branch_key = ?
+                  AND (recorded_at < ? OR (recorded_at = ? AND id < ?))
+                ORDER BY recorded_at DESC, id DESC LIMIT ?
+            """, (branch_key, after_recorded_at, after_recorded_at, after_id,
+                  limit)).fetchall()
+        elif before is not None:
+            before_recorded_at, before_id = before
+            ascending_rows = self._conn.execute("""
+                SELECT * FROM telemetry.branch_finalize_log
+                WHERE branch_key = ?
+                  AND (recorded_at > ? OR (recorded_at = ? AND id > ?))
+                ORDER BY recorded_at ASC, id ASC LIMIT ?
+            """, (branch_key, before_recorded_at, before_recorded_at, before_id,
+                  limit)).fetchall()
+            finalization_rows = list(reversed(ascending_rows))
+        else:
+            finalization_rows = self._conn.execute("""
+                SELECT * FROM telemetry.branch_finalize_log
+                WHERE branch_key = ?
+                ORDER BY recorded_at DESC, id DESC LIMIT ?
+            """, (branch_key, limit)).fetchall()
         finalizations = []
         for row in finalization_rows:
             finalizations.append({

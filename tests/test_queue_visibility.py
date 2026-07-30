@@ -100,6 +100,84 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertIsNone(loss["best_erd"])
         self.assertEqual(len(telemetry["cut_reuse_misses"]), 1)
 
+    def test_branch_report_telemetry_after_cursor_pages_past_the_first_window(self):
+        self.q.create_branch(self.user_key, len(WORDS), 10)
+        for outcome in ("exact", "cut", "loss"):
+            self.q.add_branch_finalize_log(
+                self.user_key, "CRANE -----", 5, 5,
+                10, 20, 100, 7,
+                n_bundles=2, max_bundle_nodes=60,
+                total_bundle_wall_millis=30, censored_units=1,
+                ceiling=2.5 if outcome == "cut" else None,
+                outcome=outcome, bulk_done_candidates=1,
+                best_guess="crane" if outcome == "exact" else None,
+                best_erd=1.5 if outcome == "exact" else None,
+            )
+        first_page = self.q.report_branch_telemetry(self.user_key, limit=2)
+        self.assertEqual(first_page["finalization_total_count"], 3)
+        self.assertEqual(
+            [row["outcome"] for row in first_page["recent_finalizations"]],
+            ["loss", "cut"],
+        )
+        last_row = first_page["recent_finalizations"][-1]
+        second_page = self.q.report_branch_telemetry(
+            self.user_key, limit=2,
+            after=(last_row["recorded_at"], last_row["finalization_id"]),
+        )
+        self.assertEqual(
+            [row["outcome"] for row in second_page["recent_finalizations"]],
+            ["exact"],
+        )
+
+    def test_branch_report_telemetry_after_cursor_is_stable_when_a_new_row_lands(self):
+        # An OFFSET counts rows from the current head, so a row landing
+        # between two page fetches shifts everything under it -- the next
+        # page then repeats a row instead of continuing past it.  A cursor
+        # tied to an actual already-seen row must not be affected by
+        # whatever lands after it, since the branch is still being solved
+        # while the user pages through its history.
+        self.q.create_branch(self.user_key, len(WORDS), 10)
+        for outcome in ("exact", "cut", "loss"):
+            self.q.add_branch_finalize_log(
+                self.user_key, "CRANE -----", 5, 5,
+                10, 20, 100, 7, outcome=outcome, bulk_done_candidates=1,
+            )
+        first_page = self.q.report_branch_telemetry(self.user_key, limit=1)
+        cursor_row = first_page["recent_finalizations"][0]
+        self.assertEqual(cursor_row["outcome"], "loss")
+        # A new finalization lands on the branch while the user is paging.
+        self.q.add_branch_finalize_log(
+            self.user_key, "CRANE -----", 5, 5,
+            10, 20, 100, 7, outcome="exact", bulk_done_candidates=1,
+            best_guess="crane", best_erd=2.0,
+        )
+        second_page = self.q.report_branch_telemetry(
+            self.user_key, limit=1,
+            after=(cursor_row["recorded_at"], cursor_row["finalization_id"]),
+        )
+        self.assertEqual(second_page["recent_finalizations"][0]["outcome"], "cut")
+
+    def test_branch_report_telemetry_before_cursor_reverses_back_to_newest_first(self):
+        self.q.create_branch(self.user_key, len(WORDS), 10)
+        for outcome in ("exact", "cut", "loss"):
+            self.q.add_branch_finalize_log(
+                self.user_key, "CRANE -----", 5, 5,
+                10, 20, 100, 7, outcome=outcome, bulk_done_candidates=1,
+            )
+        first_page = self.q.report_branch_telemetry(self.user_key, limit=1)
+        first_row = first_page["recent_finalizations"][0]
+        second_page = self.q.report_branch_telemetry(
+            self.user_key, limit=1,
+            after=(first_row["recorded_at"], first_row["finalization_id"]),
+        )
+        second_row = second_page["recent_finalizations"][0]
+        self.assertEqual(second_row["outcome"], "cut")
+        back_to_first = self.q.report_branch_telemetry(
+            self.user_key, limit=1,
+            before=(second_row["recorded_at"], second_row["finalization_id"]),
+        )
+        self.assertEqual(back_to_first["recent_finalizations"][0]["outcome"], "loss")
+
     def test_historical_hotspots_are_bounded_and_coordination_is_bucketed(self):
         now = int(time.time())
         for index in range(5):

@@ -9,6 +9,7 @@ import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 import sys
 from urllib.parse import parse_qs, urlsplit
 
@@ -47,9 +48,11 @@ INTEGER_PARAMETERS = {
 }
 SCALAR_PARAMETERS = {
     "branch_target", "sort", "by", "worker", "branch_status", "branch_phase",
+    "finalization_cursor",
     *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
 }
+FINALIZATION_CURSOR_PATTERN = re.compile(r"(after|before):(\d+):(\d+)")
 ALLOWED_PARAMETERS = SCALAR_PARAMETERS
 SORT_FIELDS = {"default", "age", "size", "workers", "priority", "nodes", "slowest"}
 HOTSPOT_FIELDS = {
@@ -156,6 +159,19 @@ def parse_report_request(path, query):
     sample_size = integer_values["sample_size"]
     if limit is not None and limit < 1:
         raise InvalidRequest("limit must be at least 1")
+    finalization_cursor_value = _single_value(parameters, "finalization_cursor")
+    finalization_cursor_direction = None
+    finalization_cursor_recorded_at = None
+    finalization_cursor_id = None
+    if finalization_cursor_value:
+        match = FINALIZATION_CURSOR_PATTERN.fullmatch(finalization_cursor_value)
+        if not match:
+            raise InvalidRequest(
+                "finalization_cursor must be '(after|before):<recorded_at>:<id>'"
+            )
+        finalization_cursor_direction = match.group(1)
+        finalization_cursor_recorded_at = int(match.group(2))
+        finalization_cursor_id = int(match.group(3))
     if since_seconds is not None and since_seconds < 1:
         raise InvalidRequest("since_seconds must be at least 1")
     if sample_size is not None and sample_size < 1:
@@ -212,6 +228,9 @@ def parse_report_request(path, query):
         priority=integer_values["priority"],
         sort=sort,
         limit=limit,
+        finalization_cursor_direction=finalization_cursor_direction,
+        finalization_cursor_recorded_at=finalization_cursor_recorded_at,
+        finalization_cursor_id=finalization_cursor_id,
     )
     request = ReportRequest(
         report_kind=explicit_kind,
