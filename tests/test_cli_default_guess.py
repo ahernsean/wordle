@@ -300,7 +300,11 @@ class TestCmdGuessDefault(CliTestCase):
         self.assertEqual(self.soln().guesses[0][0], "slate")
 
     def test_no_default_without_a_cached_erd(self):
-        out = self.run_cmd(cmd_guess, inputs=[""])
+        # An ANSI escape (e.g. "\x1b[31m") also contains "[", so this
+        # assertion needs plain output pinned, not just whatever the
+        # invoking terminal happens to support.
+        with mock.patch.object(wordle, 'SUPPORTS_COLOR', False):
+            out = self.run_cmd(cmd_guess, inputs=[""])
         self.assertNotIn("[", out.split("Word to guess?")[1])
         self.assertIn("5 letters", out)
         self.assertEqual(self.soln().guesses, [])

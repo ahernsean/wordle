@@ -3154,8 +3154,12 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
             return 1.5
 
         out = io.StringIO()
+        # Pinned plain: the dashes in the branch spine are markup-wrapped
+        # per letter, so a color-capable process would break this literal
+        # "-----" match into interleaved escape codes.
         with mock.patch('wordle.time.time', side_effect=lambda: next(counter) * 31), \
-             mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected):
+             mock.patch('wordle.min_expected_guesses', side_effect=fake_min_expected), \
+             mock.patch('wordle.SUPPORTS_COLOR', False):
             with redirect_stdout(out):
                 solver._scan(score_cache)
 
