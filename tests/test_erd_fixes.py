@@ -7,6 +7,7 @@
 - backfill_max_depth not clobbering a worker's fresh solve_budget,
 - _multistep_stats keying response groups consistently with/without a cache.
 """
+import math
 import os
 import sqlite3
 import tempfile
@@ -14,7 +15,7 @@ import time
 import unittest
 
 from cache_sqlite import ScoreCache, MemoryScoreCache
-from wordle_engine import ResponseCache, ERD_ALL, Solution
+from wordle_engine import ResponseCache, ERD_ALL, Solution, erd_ge, erd_numerator
 from erd_queue import ERDQueue
 import import_cache
 
@@ -385,6 +386,56 @@ class TestERDQueueManagement(_TmpDB, unittest.TestCase):
         q.add_pending_many([(key, len(WORDS[:2]), 1, "crane", 0)])
         row = q.get_pending_branch(key)
         self.assertEqual(row["priority"], 5)
+
+
+class TestErdGe(unittest.TestCase):
+    """erd_numerator/erd_ge compare k/N-grid ERD values at exact rational
+    precision, so two float64 images of the same rational never spuriously
+    compare unequal."""
+
+    def test_same_rational_via_different_arithmetic_compares_equal(self):
+        # (n_answers, k) pairs confirmed to produce two distinct float64
+        # images of k/n_answers via direct division vs. repeated addition.
+        for n_answers, k in [(7, 5), (19, 13), (45, 5), (3209, 3)]:
+            direct = k / n_answers
+            accumulated = 0.0
+            for _ in range(k):
+                accumulated += 1 / n_answers
+            self.assertNotEqual(direct, accumulated)  # float noise is real
+            self.assertTrue(erd_ge(direct, accumulated, n_answers))
+            self.assertTrue(erd_ge(accumulated, direct, n_answers))
+            self.assertEqual(erd_numerator(direct, n_answers), k)
+            self.assertEqual(erd_numerator(accumulated, n_answers), k)
+
+    def test_adjacent_rationals_compare_strictly(self):
+        for n_answers, k in [(7, 3), (19, 49), (45, 61), (3209, 8123)]:
+            lower = k / n_answers
+            higher = (k + 1) / n_answers
+            self.assertTrue(erd_ge(higher, lower, n_answers))
+            self.assertFalse(erd_ge(lower, higher, n_answers))
+
+    def test_ulp_noise_does_not_flip_the_comparison(self):
+        # The exact float64-noise scenario from the swarm: two images of the
+        # same k/N value differing by one ULP must compare as equal (>= both
+        # ways), never as a spurious re-solve trigger.
+        value = 13 / 5
+        nudged = math.nextafter(value, math.inf)
+        self.assertNotEqual(value, nudged)
+        self.assertTrue(erd_ge(value, nudged, 5))
+        self.assertTrue(erd_ge(nudged, value, 5))
+
+    def test_off_grid_value_returns_no_numerator(self):
+        # 2.5 is not on the 5-word k/5 grid (12.5 is not near an integer).
+        self.assertIsNone(erd_numerator(2.5, 5))
+        self.assertEqual(erd_numerator(2.4, 5), 12)
+
+    def test_off_grid_operand_falls_back_to_raw_float_compare(self):
+        # An off-grid operand must never raise: erd_ge degrades to the
+        # pre-fix float compare instead of crashing the caller, since this
+        # comparison only ever gates reuse of already-proven work.
+        self.assertTrue(erd_ge(3.0, 2.5, 5))     # raw: 3.0 >= 2.5
+        self.assertFalse(erd_ge(2.0, 2.5, 5))    # raw: 2.0 >= 2.5
+        self.assertTrue(erd_ge(2.5, 2.5, 5))     # both off-grid, equal raw
 
 
 if __name__ == "__main__":
