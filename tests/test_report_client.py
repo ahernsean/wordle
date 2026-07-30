@@ -854,6 +854,14 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertEqual(count, 0)
 
+    def test_tree_header_names_the_snapshot_and_offers_refresh(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#layout-tree").click()
+        header = self.page.locator(".report-meta")
+        self.assertIn("snapshot", header.inner_text())
+        self.assertEqual(header.get_by_role("button", name="Refresh tree").count(), 1)
+        self.assertNotIn("generated 0s ago", header.inner_text())
+
     def test_sticky_order_survives_reordering_and_finalizing_state(self):
         identities = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view/queue')).json();
