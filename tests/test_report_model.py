@@ -773,8 +773,14 @@ class ReportModelTest(unittest.TestCase):
         self.assertIsNotNone(first_key)
         cache.write(first_key, ERD_ALL, "salet", 2.0)
         cache.write_loss(second_key, ERD_ALL, 3)
+        queue = unittest.mock.Mock()
+        queue.branch_rows_for_reference_prefix.return_value = [{
+            "branch_key": first_key,
+            "spine": "salet -----",
+        }]
+        queue.row_spine_text.return_value = "salet -----"
         with self.assertRaisesRegex(ValueError, "ambiguous.*unknown spine"):
-            resolve_branch_reference(None, branch_reference(first_key)[:4], cache)
+            resolve_branch_reference(queue, branch_reference(first_key)[:4], cache)
         cache.close()
 
 

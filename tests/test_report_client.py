@@ -273,7 +273,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         facts = self.page.locator("ul.tree li:not(.word-group) > details > summary .inline-facts").first
         self.assertEqual(
             [" ".join(text.split()) for text in facts.locator("> span").all_inner_texts()],
-            ["d1", "active / evaluating", "8 answers", "2 workers", "20/50", "@2222"],
+            ["d1", "active / evaluating", "8 answers", "2 workers", "20/50", "@22222222"],
         )
         self.assertTrue(all(
             style == "nowrap" for style in facts.locator("> span").evaluate_all(
@@ -571,6 +571,18 @@ class ReportClientBrowserTest(unittest.TestCase):
             "section:has-text('Reached via') button:has-text('Copy spine')"
         )
         self.assertTrue(copy_button.is_visible())
+        self.page.evaluate("""() => {
+          navigator.clipboard = undefined;
+          window.__copiedSpine = false;
+          document.execCommand = command => {
+            window.__copiedSpine = command === 'copy';
+            return window.__copiedSpine;
+          };
+        }""")
+        copy_button.click()
+        self.page.wait_for_function(
+            "() => window.__copiedSpine === true"
+        )
 
     def test_branch_target_subtitle_returns_in_tree_layout(self):
         self.apply_branch_target("RAISE .....")

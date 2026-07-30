@@ -297,31 +297,29 @@ def resolve_branch_target(
 
 def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
     matches = [] if queue is None else queue.branch_rows_for_reference_prefix(digest_prefix)
-    cache_matches = [] if matches or cache is None else cache.branch_keys_for_reference_prefix(
+    cache_matches = [] if cache is None else cache.branch_keys_for_reference_prefix(
         digest_prefix
     )
-    if not matches:
-        if not cache_matches:
-            raise ValueError(f"No queued @{digest_prefix} branch found")
-        if len(cache_matches) == 1:
-            return {"branch_key": cache_matches[0], "spine": None}
-    if len(matches) > 1:
-        descriptions = []
-        for row in matches:
-            reference = branch_reference(bytes(row["branch_key"]))
-            spine = queue.row_spine_text(row) or "unknown spine"
-            descriptions.append(f"@{reference} {spine}")
+    queue_keys = {bytes(row["branch_key"]) for row in matches}
+    cache_only_keys = [key for key in cache_matches if key not in queue_keys]
+    if not matches and not cache_only_keys:
+        raise ValueError(f"No queued @{digest_prefix} branch found")
+    if len(matches) + len(cache_only_keys) > 1:
+        descriptions = [
+            f"@{branch_reference(bytes(row['branch_key']))} "
+            f"{queue.row_spine_text(row) or 'unknown spine'}"
+            for row in matches
+        ]
+        descriptions.extend(
+            f"@{branch_reference(key)} unknown spine" for key in cache_only_keys
+        )
         raise ValueError(
             f"branch reference @{digest_prefix} is ambiguous: "
             + "; ".join(descriptions)
         )
-    if len(cache_matches) > 1:
-        raise ValueError(
-            f"branch reference @{digest_prefix} is ambiguous: "
-            + "; ".join(f"@{branch_reference(key)} unknown spine"
-                        for key in cache_matches)
-        )
-    return matches[0]
+    if matches:
+        return matches[0]
+    return {"branch_key": cache_only_keys[0], "spine": None}
 
 
 def parse_rich_spine(path: str | None) -> list[RichSpineStep]:

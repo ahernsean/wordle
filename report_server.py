@@ -346,7 +346,10 @@ def make_handler(configuration):
                 else:
                     report = collect_report(configuration.sources, request)
             except ValueError as error:
-                status = 404 if "not found" in str(error).lower() else 400
+                status = 404 if (
+                    "not found" in str(error).lower()
+                    or str(error).startswith("No queued @")
+                ) else 400
                 kind = "not_found" if status == 404 else "invalid_request"
                 self._error(status, kind, str(error))
                 return

@@ -218,6 +218,11 @@
     const label=key=>String(key).replaceAll("_"," ");
     const timeLabel=key=>key.endsWith("_at")?label(String(key).slice(0,-3)):label(key);
     const shortReference=reference=>String(reference).slice(0,8);
+    function copyText(text){
+      const fallback=()=>{const area=document.createElement("textarea");area.value=text;area.setAttribute("readonly","");area.style.cssText="position:fixed;left:-9999px;top:0;opacity:0";document.body.append(area);area.select();area.setSelectionRange(0,area.value.length);const copied=document.execCommand("copy");area.remove();return copied;};
+      if(!navigator.clipboard?.writeText)return Promise.resolve(fallback());
+      return navigator.clipboard.writeText(text).then(()=>true,()=>fallback());
+    }
     const workerName=worker=>{const number=String(worker.worker_number??String(worker.worker_id).split("-").pop());return /^[0-9]+$/.test(number)?"w"+number:String(worker.worker_id);};
     const candidateText=(word,isAnswer)=>word?String(word).toUpperCase()+(isAnswer?"*":""):"—";
     const bool=value=>value==="1"||value==="true";
@@ -497,7 +502,7 @@
       const identityMetrics=element("div","metrics");
       identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
       fragment.append(section("Identity",identityMetrics));
-      if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine");copyButton.addEventListener("click",()=>navigator.clipboard.writeText(branch.spine.flatMap(step=>[step.word,step.pattern]).join(" ")));spineSection.append(copyButton);fragment.append(spineSection);}
+      if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine"),spineText=branch.spine.flatMap(step=>[step.word,step.pattern]).join(" ");copyButton.addEventListener("click",()=>copyText(spineText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));spineSection.append(copyButton);fragment.append(spineSection);}
       fragment.append(section("Queue",data.queue?kv([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
       fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[timeLabel(key),displayTimedValue(key,value,report.generated_at)]))));
