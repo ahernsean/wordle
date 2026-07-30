@@ -547,6 +547,9 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(first_page["data"]["paging"]["total_group_count"], 2)
         self.assertEqual(first_page["data"]["paging"]["next_cursor"], "audio")
 
+        default_page = collect_report(self.sources, ReportRequest(tree=True))
+        self.assertEqual(default_page["data"]["paging"]["page_size"], 10)
+
         second_page = collect_report(self.sources, ReportRequest(
             tree=True, tree_cursor="audio", filters=ReportFilters(limit=1),
         ))

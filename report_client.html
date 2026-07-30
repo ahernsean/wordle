@@ -185,7 +185,8 @@
         <div class="group-head"><span class="gname">View</span><span class="ghint">order &amp; scope what's shown</span></div>
         <div class="field-flow">
           <label class="field" id="sort-field"><span class="fieldlabel">Sort <span class="hinttag">default = natural order</span></span><select id="sort"><option value="">default</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>nodes</option><option>slowest</option></select></label>
-          <label class="field"><span id="limit-label">Branches shown</span><input id="limit" type="number" min="1"></label>
+          <label class="field" id="limit-field"><span id="limit-label">Branches shown</span><input id="limit" type="number" min="1"></label>
+          <label class="field" id="tree-page-size-field"><span>Items per page</span><select id="tree-page-size"><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label>
           <label class="field" id="by-field"><span class="fieldlabel">Hotspot field</span><select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>bulk-completed-candidates</option><option>cut-reuse</option><option>coordination</option></select></label>
           <label class="field" id="epoch-field">Epoch<input id="epoch" class="narrow" type="number"></label>
           <label class="field" id="since-seconds-field"><span class="fieldlabel">Stats window (s)</span><input id="since-seconds" type="number" min="1" title="time window for hotspot aggregation"></label>
@@ -235,6 +236,7 @@
       if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree?["active"]:[];
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
+      if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_phase=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
@@ -291,6 +293,7 @@
       byId("layout-flat").setAttribute("aria-pressed",currentState.tree?"false":"true");
       byId("layout-tree").setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
+      byId("tree-page-size").value=String(currentState.limit||10);
       byId("sort").value=currentState.sort;byId("by").value=currentState.by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
@@ -301,9 +304,11 @@
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
       byId("sort-field").hidden=kind==="cache"||isHotspots;
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
-      byId("limit-label").textContent=currentState.tree?"Child groups per page":kind==="auto"?"Branches shown":"Rows shown";
+      byId("limit-label").textContent=currentState.tree?"Items per page":kind==="auto"?"Branches shown":"Rows shown";
+      byId("limit-field").hidden=currentState.tree;
+      byId("tree-page-size-field").hidden=!currentState.tree;
     }
-    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:currentState.tree?byId("tree-page-size").value:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));

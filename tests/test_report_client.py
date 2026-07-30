@@ -257,6 +257,11 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(report,null,parsePageState({search:'?kind=queue&tree=1&limit=10'}));
         }""")
         group = self.page.locator("ul.tree > li.word-group")
+        self.assertEqual(self.page.locator("#tree-page-size").input_value(), "10")
+        self.assertEqual(
+            self.page.locator("#tree-page-size option").all_text_contents(),
+            ["10", "25", "50", "100"],
+        )
         self.assertIsNone(group.locator("> details").get_attribute("open"))
         group.locator("> details > summary").click()
         rows = group.locator("> details > .tree-pattern-page > ul.patterns > li")

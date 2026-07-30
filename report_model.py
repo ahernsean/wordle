@@ -32,7 +32,7 @@ from wordle_ui import fmt_pattern, parse_pattern
 
 SCHEMA_VERSION = 2
 WORKER_STALE_SECONDS = 20
-DEFAULT_TREE_PAGE_SIZE = 25
+DEFAULT_TREE_PAGE_SIZE = 10
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
