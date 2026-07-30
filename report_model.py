@@ -320,11 +320,15 @@ def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
 
 
 def collect_ambiguous_branch_reference_report(sources, request, error):
-    candidates = [{
-        "branch_reference": candidate["branch_reference"],
-        "spine": candidate["spine"],
-        "answer_count": len(_decode_branch_key(candidate["branch_key"])),
-    } for candidate in error.candidates]
+    candidates = []
+    for candidate in error.candidates:
+        answer_words = sorted(_decode_branch_key(candidate["branch_key"]))
+        candidates.append({
+            "branch_reference": candidate["branch_reference"],
+            "spine": candidate["spine"],
+            "answer_count": len(answer_words),
+            "answer_preview": answer_words[:3],
+        })
     report = _semantic_report("branch_reference_matches", sources,
                               request.branch_target, int(time.time()), {
                                   "branch_reference": request.branch_target.branch_reference,
