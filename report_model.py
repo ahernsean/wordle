@@ -303,7 +303,7 @@ def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
     queue_keys = {bytes(row["branch_key"]) for row in matches}
     cache_only_keys = [key for key in cache_matches if key not in queue_keys]
     if not matches and not cache_only_keys:
-        raise ValueError(f"No queued @{digest_prefix} branch found")
+        raise ValueError(f"No queued or cached @{digest_prefix} branch found")
     if len(matches) + len(cache_only_keys) > 1:
         descriptions = [
             f"@{branch_reference(bytes(row['branch_key']))} "
