@@ -305,21 +305,29 @@ def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
     if not matches and not cache_only_keys:
         raise ValueError(f"No queued or cached @{digest_prefix} branch found")
     if len(matches) + len(cache_only_keys) > 1:
-        descriptions = [
-            f"@{branch_reference(bytes(row['branch_key']))} "
-            f"{queue.row_spine_text(row) or 'unknown spine'}"
-            for row in matches
+        candidates = [
+            {"branch_reference": branch_reference(bytes(row["branch_key"])),
+             "spine": queue.row_spine_text(row)} for row in matches
         ]
-        descriptions.extend(
-            f"@{branch_reference(key)} unknown spine" for key in cache_only_keys
-        )
-        raise ValueError(
-            f"branch reference @{digest_prefix} is ambiguous: "
-            + "; ".join(descriptions)
-        )
+        candidates.extend({"branch_reference": branch_reference(key), "spine": None}
+                          for key in cache_only_keys)
+        error = ValueError(f"branch reference @{digest_prefix} is ambiguous")
+        error.candidates = candidates
+        raise error
     if matches:
         return matches[0]
     return {"branch_key": cache_only_keys[0], "spine": None}
+
+
+def collect_ambiguous_branch_reference_report(sources, request, error):
+    report = _semantic_report("branch_reference_matches", sources,
+                              request.branch_target, int(time.time()), {
+                                  "branch_reference": request.branch_target.branch_reference,
+                                  "candidates": error.candidates,
+                              }, request)
+    report["sources"]["queue"]["ok"] = True
+    report["sources"]["cache"]["ok"] = True
+    return report
 
 
 def parse_rich_spine(path: str | None) -> list[RichSpineStep]:

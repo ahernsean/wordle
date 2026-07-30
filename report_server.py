@@ -20,6 +20,7 @@ from report_model import (
     ReportFilters,
     ReportRequest,
     ReportSources,
+    collect_ambiguous_branch_reference_report,
     collect_report,
     parse_branch_filter,
     parse_report_branch_target,
@@ -346,6 +347,12 @@ def make_handler(configuration):
                 else:
                     report = collect_report(configuration.sources, request)
             except ValueError as error:
+                if hasattr(error, "candidates"):
+                    report = collect_ambiguous_branch_reference_report(
+                        configuration.sources, request, error
+                    )
+                    self._json(200, report)
+                    return
                 status = 404 if (
                     "not found" in str(error).lower()
                     or str(error).startswith("No queued or cached @")

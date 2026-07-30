@@ -779,8 +779,10 @@ class ReportModelTest(unittest.TestCase):
             "spine": "salet -----",
         }]
         queue.row_spine_text.return_value = "salet -----"
-        with self.assertRaisesRegex(ValueError, "ambiguous.*unknown spine"):
+        with self.assertRaisesRegex(ValueError, "ambiguous") as raised:
             resolve_branch_reference(queue, branch_reference(first_key)[:4], cache)
+        self.assertEqual(len(raised.exception.candidates), 2)
+        self.assertIsNone(raised.exception.candidates[1]["spine"])
         cache.close()
 
 

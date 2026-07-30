@@ -184,7 +184,10 @@ class SemanticReportTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "ambiguous") as raised:
             resolve_branch_reference(multiple, "1234")
-        self.assertIn("@" + branch_reference(b"cigarrebut"), str(raised.exception))
+        self.assertEqual(
+            raised.exception.candidates[0]["branch_reference"],
+            branch_reference(b"cigarrebut"),
+        )
 
     def test_queue_prefix_helper_has_bounded_candidate_contract(self):
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
