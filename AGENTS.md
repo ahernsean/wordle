@@ -223,6 +223,11 @@ This is distinct from the comment style rule ("describe what the code is, not
 how it got there"), which applies to inline code comments. A PR description is
 inherently a description of a diff; talking about what changed is the point.
 
+Every PR that fully implements a tracked issue must include a GitHub closing
+keyword such as `Closes #192` in its Summary so the PR is linked to the issue
+and merging it closes the issue automatically. If the PR is only partial work,
+link the issue with `Refs #192` instead.
+
 Always update the PR title and description when pushing new commits. Never
 leave a PR state that describes only a proper subset of the commits. A PR
 should always be left in a reviewable state.
