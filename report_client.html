@@ -547,6 +547,17 @@
         const pageSize=currentState.limit||10,offset=state.finalization_offset||0;
         const pager=element("div","status-line finalization-pager");
         pager.append(element("span","dim",shownCount?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(totalCount):"No finalizations at this offset, of "+numText(totalCount)+" total"));
+        const pageSizeLabel=element("label","dim");
+        const pageSizeSelect=element("select","");
+        for(const size of [...new Set([10,25,50,100,pageSize])].sort((a,b)=>a-b)){
+          const option=element("option","",String(size));
+          option.value=String(size);
+          option.selected=size===pageSize;
+          pageSizeSelect.append(option);
+        }
+        pageSizeSelect.addEventListener("change",()=>setState({...currentState,limit:Number(pageSizeSelect.value),finalization_offset:0}));
+        pageSizeLabel.append("Per page ",pageSizeSelect);
+        pager.append(pageSizeLabel);
         const prevButton=element("button","","Prev");
         prevButton.disabled=offset<=0;
         prevButton.addEventListener("click",()=>setState({...currentState,finalization_offset:Math.max(0,offset-pageSize)}));
@@ -557,7 +568,26 @@
         wrap.append(pager);
         fragment.append(wrap);
       }
-      if(data.cut_reuse_misses?.length){const misses=element("div","grid");for(const row of data.cut_reuse_misses)misses.append(element("article","card outcome-cut","cut reuse · available "+fixed(row.available_bound)+" · budget "+valueOrDash(row.available_budget)));fragment.append(section("Cut-reuse misses",misses));}
+      if(data.cut_reuse_misses?.length){
+        const misses=element("div","grid");
+        for(const row of data.cut_reuse_misses){
+          const card=element("article","card outcome-cut");
+          const title=element("div","card-title");
+          title.append(element("h3","","Cut-reuse miss"));
+          card.append(title);
+          const wanted=row.wanted_ceiling!==null&&row.wanted_ceiling!==undefined?"wanted ceiling "+fixed(row.wanted_ceiling):"wanted exact";
+          card.append(statLine([
+            numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),
+            "budget "+valueOrDash(row.budget),
+            wanted,
+            "available "+fixed(row.available_bound)+" at budget "+valueOrDash(row.available_budget),
+            "epoch "+valueOrDash(row.epoch),
+            relativeAge(row.recorded_at,report.generated_at),
+          ]));
+          misses.append(card);
+        }
+        fragment.append(section("Cut-reuse misses",misses));
+      }
       const bundleLabels={bundle_count:"bundles",node_count:"nodes",wall_millis:"wall ms",censored_unit_count:"censored units",maximum_bundle_node_count:"max bundle nodes"};
       const bundlePairs=Object.entries(data.bundle_summary||{}).map(([key,value])=>[bundleLabels[key]||label(key),value]);
       const republishedList=data.republished_candidates||[];

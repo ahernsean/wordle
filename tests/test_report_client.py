@@ -655,6 +655,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(self.page.locator(".outcome-loss").count(), 1)
         self.assertIn("Cut-reuse misses", self.page.locator("#report").inner_text())
 
+    def test_cut_reuse_miss_card_shows_the_full_record(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Cut-reuse misses")
+        text = self.page.locator("section:has-text('Cut-reuse misses')").inner_text()
+        # The fixture row has budget 5, wanted_ceiling null (an exact-required
+        # caller), available_bound 2.2 at budget 4, and epoch 4 -- all of it
+        # should render, not just available_bound/available_budget.
+        self.assertIn("budget 5", text)
+        self.assertIn("wanted exact", text)
+        self.assertIn("available 2.200 at budget 4", text)
+        self.assertIn("epoch 4", text)
+
+    def test_finalization_page_size_selector_changes_limit_and_resets_offset(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        section = self.page.locator("section:has-text('Recent finalizations')")
+        section.locator("select").select_option("25")
+        self.assertIn("limit=25", self.page.url)
+        self.assertNotIn("finalization_offset=", self.page.url)
+
     def test_semantic_change_highlights_matching_identity_only(self):
         classes = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view/queue')).json();
