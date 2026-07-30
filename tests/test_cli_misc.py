@@ -484,7 +484,10 @@ class SetContextAndGuessesTests(CliTestCase):
         self.assertEqual(wordle._display_max_ent, 0.0)
 
     def test_print_guesses_empty(self):
-        out = self.run_cmd(lambda gs: wordle.print_guesses(self.soln()))
+        # Pinned plain: with SUPPORTS_COLOR on, an empty guess list still
+        # emits a bare reset escape, which would fail this exact-match.
+        with mock.patch.object(wordle, 'SUPPORTS_COLOR', False):
+            out = self.run_cmd(lambda gs: wordle.print_guesses(self.soln()))
         self.assertEqual(out, "")
 
     def test_print_guesses_with_history(self):
