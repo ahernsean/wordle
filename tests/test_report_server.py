@@ -144,6 +144,21 @@ class ReportServerTest(unittest.TestCase):
         self.assertEqual(after_request.filters.finalization_cursor_id, 42)
         self.assertEqual(before_request.filters.finalization_cursor_direction, "before")
 
+    def test_tree_page_parameters_require_tree_and_complete_parent_spine(self):
+        request = parse_report_request(
+            "/api/view", "tree=1&tree_parent=RAISE%20.....&tree_cursor=raise",
+        )
+        self.assertEqual(request.tree_parent, "RAISE -----")
+        self.assertEqual(request.tree_cursor, "raise")
+        for query, message in (
+            ("tree_cursor=raise", "require tree"),
+            ("tree=1&tree_parent=RAISE", "complete spine"),
+            ("tree=1&tree_cursor=not-a-word", "five-letter word"),
+        ):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, message):
+                    parse_report_request("/api/view", query)
+
     def test_root_overview_defaults_to_active_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
         all_request = parse_report_request("/api/view", "branch_status=all")

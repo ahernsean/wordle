@@ -471,7 +471,7 @@ class SemanticReportTest(unittest.TestCase):
         ))
         queue.close()
 
-    def test_root_word_and_branch_trees_use_only_queue_spines(self):
+    def test_tree_page_returns_immediate_queue_children(self):
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.create_branch(
             b"cigarrebut", 2, 4, budget=5, spine="RAISE -----"
@@ -485,24 +485,23 @@ class SemanticReportTest(unittest.TestCase):
         )
         queue.close()
         for branch_target_text, expected_word in (
-            ("", None), ("RAISE", "raise"), ("RAISE -----", "raise"),
+            ("", None), ("RAISE", "raise"), ("RAISE -----", "crane"),
         ):
             with self.subTest(branch_target=branch_target_text):
                 report = collect_report(self.sources, ReportRequest(
                     branch_target=parse_report_branch_target(branch_target_text), tree=True
                 ))
                 self.assertTrue(report["data"]["tree_available"])
-                node_ids = {node["node_id"] for node in report["data"]["nodes"]}
                 for node in report["data"]["nodes"]:
                     if node["parent_node_id"] is None:
                         self.assertEqual(node["guess_depth"], 1)
                     else:
-                        self.assertIn(node["parent_node_id"], node_ids)
+                        self.assertEqual(node["parent_node_id"], "raise:-----")
                     self.assertGreaterEqual(node["guess_depth"], 1)
                     if expected_word and node["step"] is not None:
-                        self.assertEqual(node["node_id"].split(":", 1)[0], expected_word)
+                        self.assertEqual(node["step"]["word"], expected_word)
 
-    def test_tree_keeps_filtered_context_and_drops_other_descendants(self):
+    def test_tree_page_applies_filters_to_immediate_children(self):
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.create_branch(
             b"cigarrebut", 2, 4, budget=5, spine="RAISE -----"
@@ -525,10 +524,34 @@ class SemanticReportTest(unittest.TestCase):
             node for node in report["data"]["nodes"]
             if node["branch_key_hex"] is not None
         ]
-        self.assertEqual(len(branch_nodes), 2)
-        self.assertTrue(any(node["is_context"] for node in branch_nodes))
+        self.assertEqual(len(branch_nodes), 1)
         self.assertTrue(any(node["answer_count"] == 150 for node in branch_nodes))
         self.assertFalse(any(node["answer_count"] == 3 for node in branch_nodes))
+
+    def test_tree_uses_source_step_and_pages_child_word_groups(self):
+        first_key = b"sourcebranch0001"
+        second_key = b"sourcebranch0002"
+        queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        queue.add_pending_many([
+            (first_key, 3, 1, "audio", 1),
+            (second_key, 3, 1, "crane", 1),
+        ])
+        queue.close()
+
+        first_page = collect_report(self.sources, ReportRequest(
+            tree=True, filters=ReportFilters(limit=1),
+        ))
+        self.assertEqual(first_page["data"]["nodes"][0]["step"], {
+            "word": "audio", "pattern": "----y",
+        })
+        self.assertEqual(first_page["data"]["paging"]["total_group_count"], 2)
+        self.assertEqual(first_page["data"]["paging"]["next_cursor"], "audio")
+
+        second_page = collect_report(self.sources, ReportRequest(
+            tree=True, tree_cursor="audio", filters=ReportFilters(limit=1),
+        ))
+        self.assertEqual(second_page["data"]["nodes"][0]["step"]["word"], "crane")
+        self.assertIsNone(second_page["data"]["paging"]["next_cursor"])
 
     def test_cache_only_tree_is_unavailable_and_legacy_spine_is_unknown(self):
         pattern_code, answer_words, branch_key = self._largest_group()
@@ -552,7 +575,7 @@ class SemanticReportTest(unittest.TestCase):
             node for node in legacy_tree["data"]["nodes"]
             if node["node_id"].startswith("unknown:")
         ]
-        self.assertEqual(len(unknown_nodes), 3)
+        self.assertEqual(len(unknown_nodes), 1)
         self.assertTrue(all(node["step"] is None for node in unknown_nodes))
 
     def test_spine_recording_no_complete_guess_is_unknown_not_a_parentless_branch(self):

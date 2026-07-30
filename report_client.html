@@ -137,6 +137,7 @@
        into a branch and never the step from a word to its own patterns. */
     .tree ul.patterns { margin-left:.3rem; padding-left:.5rem; border-left:none; }
     .tree summary { cursor:pointer; min-height:28px; padding:.15rem 0; }
+    .tree-pager { display:flex; flex-wrap:wrap; gap:.4rem; align-items:center; margin:.45rem 0; }
     .clickable { cursor:pointer; }
     .clickable:hover { border-color:var(--green); }
     .badge { background:var(--red); color:white; border-radius:4px; padding:.1rem .35rem; }
@@ -202,7 +203,7 @@
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
-    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), stickyOrders=new Map();
+    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), stickyOrders=new Map(), treePageHistory=new Map();
     let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false;
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
@@ -230,7 +231,7 @@
     const branchValues=(value,allowed)=>value===undefined?undefined:[...(value||[])].filter(item=>allowed.includes(item));
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,finalization_cursor:String(state.finalization_cursor||"")};
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
       if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree?["active"]:[];
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
@@ -240,6 +241,7 @@
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
       if(normalized.tree){normalized.claims=false;normalized.answers=false;}
+      else normalized.tree_cursor=null;
       if(normalized.kind==="queue"||normalized.kind==="workers"){normalized.claims=false;normalized.answers=false;}
       if(normalized.kind==="auto"&&normalized.branch_target===""){normalized.answers=false;normalized.claims=false;}
       const branchTargetTokens=normalized.branch_target.split(/\s+/).filter(Boolean),inferredWord=normalized.kind==="auto"&&branchTargetTokens.length%2===1&&!normalized.branch_target.startsWith("@");
@@ -249,7 +251,7 @@
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),finalization_cursor:query.get("finalization_cursor")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -261,6 +263,7 @@
       addBranchFilter("branch_phase",state.branch_phase,[]);
       for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","limit","by","epoch","since_seconds","sample_size"])if(state[name]!==null&&state[name]!=="")query.set(name,String(state[name]));
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
+      if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
       if(includeClient&&state.poll!==DEFAULT_POLL)query.set("poll",String(state.poll));
       return query;
     }
@@ -298,9 +301,9 @@
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
       byId("sort-field").hidden=kind==="cache"||isHotspots;
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
-      byId("limit-label").textContent=kind==="auto"?"Branches shown":"Rows shown";
+      byId("limit-label").textContent=currentState.tree?"Child groups per page":kind==="auto"?"Branches shown":"Rows shown";
     }
-    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:""};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -627,9 +630,11 @@
     }
     function renderTree(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;if(!data.tree_available){fragment.append(element("p","empty",data.unavailable_reason||"No extant queue topology"));return fragment;}
-      const children=new Map();for(const node of data.nodes||[]){const parent=node.parent_node_id||"__base__";if(!children.has(parent))children.set(parent,[]);children.get(parent).push(node);}
       const previousNodes=previousBy(previous,"nodes","node_id");
-      const build=(node,carriesWord=true)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const details=element("details");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);if(matchMedia("(max-width:479px)").matches&&node.guess_depth>1&&!node.is_context)collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const summary=element("summary","clickable"),labelText=node.step?String(node.step.word).toUpperCase():"?",headGroup=element("span","step-group");if(carriesWord)headGroup.append(element("span","",labelText));if(node.step)headGroup.append(patternTiles(node.step.pattern));summary.append(headGroup);const facts=element("span","dim inline-facts");for(const fact of ["d"+node.guess_depth,valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase),valueOrDash(node.answer_count)+" answers",valueOrDash(node.worker_count)+" workers",valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count),node.branch_reference?"@"+shortReference(node.branch_reference):"structure"])facts.append(element("span","",fact));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});headGroup.append(openButton);}summary.append(facts);details.addEventListener("toggle",()=>details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id));details.append(summary);const childNodes=children.get(node.node_id)||[];if(childNodes.length)details.append(buildGroupedList(childNodes,node.node_id,""));item.append(details);return item;};
+      const treeURL=(parentSpine,cursor)=>{const url=new URL(buildAPIURL({...state,tree:true}),location.origin);if(parentSpine)url.searchParams.set("tree_parent",parentSpine);else url.searchParams.delete("tree_parent");if(cursor)url.searchParams.set("tree_cursor",cursor);else url.searchParams.delete("tree_cursor");return url.pathname+url.search;};
+      const loadPage=async(parentSpine,cursor,host)=>{host.replaceChildren(element("p","dim","Loading branches…"));try{const response=await fetch(treeURL(parentSpine,cursor));if(!response.ok)throw new Error("Tree request failed ("+response.status+")");const childReport=await response.json();host.replaceChildren(buildPage(childReport.data.nodes||[],childReport.data.paging||{},parentSpine));}catch(error){host.replaceChildren(element("p","error",error.message));}};
+      const pageKey=parentSpine=>parentSpine||"__root__";
+      const build=(node,carriesWord=true)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const details=element("details");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);if(matchMedia("(max-width:479px)").matches&&node.guess_depth>1&&!node.is_context)collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const summary=element("summary","clickable"),labelText=node.step?String(node.step.word).toUpperCase():"?",headGroup=element("span","step-group");if(carriesWord)headGroup.append(element("span","",labelText));if(node.step)headGroup.append(patternTiles(node.step.pattern));summary.append(headGroup);const facts=element("span","dim inline-facts");for(const fact of ["d"+node.guess_depth,valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase),valueOrDash(node.answer_count)+" answers",valueOrDash(node.worker_count)+" workers",valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count),node.branch_reference?"@"+shortReference(node.branch_reference):"structure"])facts.append(element("span","",fact));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});headGroup.append(openButton);}summary.append(facts);details.addEventListener("toggle",()=>{details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id);if(details.open&&node.has_children&&!details.dataset.childrenLoaded&&node.spine){details.dataset.childrenLoaded="1";loadPage(node.spine,null,childHost);}});details.append(summary);const childHost=element("div","tree-children");if(node.has_children)details.append(childHost);item.append(details);return item;};
       // Every word is a group at every level, including the one-pattern case:
       // the word is named once and its response patterns are the rows beneath
       // it.  Collapse state is keyed by parent, so the same word appearing
@@ -649,8 +654,8 @@
         }
         return list;
       };
-      const tree=buildGroupedList(children.get("__base__")||[],"","tree");
-      fragment.append(tree);return fragment;
+      const buildPage=(siblings,paging,parentSpine)=>{const holder=element("div","tree-page"),tree=buildGroupedList(siblings,parentSpine||"","tree");holder.append(tree);const pager=element("div","tree-pager dim"),key=pageKey(parentSpine),history=treePageHistory.get(key)||[],returnedGroupCount=paging.returned_group_count??wordGroups(siblings).length,totalGroupCount=paging.total_group_count??returnedGroupCount;pager.append(element("span","","Showing "+returnedGroupCount+" of "+totalGroupCount+" child groups"));if(history.length){const previousButton=element("button","","Previous");previousButton.addEventListener("click",()=>{const prior=history.pop();treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:prior||null},false);else loadPage(parentSpine,prior,holder);});pager.append(previousButton);}if(paging.next_cursor){const nextButton=element("button","","Next");nextButton.addEventListener("click",()=>{history.push(paging.cursor||null);treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:paging.next_cursor},false);else loadPage(parentSpine,paging.next_cursor,holder);});pager.append(nextButton);}if(history.length||paging.next_cursor)holder.append(pager);return holder;};
+      fragment.append(buildPage(data.nodes||[],data.paging||{},data.paging?.parent_spine||""));return fragment;
     }
     function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=element("div","grid"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
     function renderWorkers(report,previous,state){const grid=element("div","grid workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(report.data.rows||[],"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;}

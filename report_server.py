@@ -49,7 +49,7 @@ INTEGER_PARAMETERS = {
 }
 SCALAR_PARAMETERS = {
     "branch_target", "sort", "by", "worker", "branch_status", "branch_phase",
-    "finalization_cursor",
+    "finalization_cursor", "tree_parent", "tree_cursor",
     *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
 }
@@ -129,6 +129,23 @@ def parse_report_request(path, query):
     tree = _boolean_value(parameters, "tree")
     include_claims = _boolean_value(parameters, "claims")
     include_answers = _boolean_value(parameters, "answers")
+    tree_parent = _single_value(parameters, "tree_parent", "")
+    tree_cursor = _single_value(parameters, "tree_cursor")
+    if (tree_parent or tree_cursor) and not tree:
+        raise InvalidRequest("tree_parent and tree_cursor require tree")
+    if tree_parent:
+        try:
+            tree_parent_target = parse_report_branch_target(tree_parent)
+        except ValueError as error:
+            raise InvalidRequest(str(error)) from error
+        if tree_parent_target.kind != "branch":
+            raise InvalidRequest("tree_parent must be a complete spine")
+        tree_parent = " ".join(
+            value for step in tree_parent_target.steps
+            for value in (step.word.upper(), step.pattern)
+        )
+    if tree_cursor is not None and not re.fullmatch(r"[a-z]{5}", tree_cursor):
+        raise InvalidRequest("tree_cursor must be a five-letter word")
     branch_status_value = _single_value(parameters, "branch_status")
     branch_phase_value = _single_value(parameters, "branch_phase")
     try:
@@ -243,6 +260,8 @@ def parse_report_request(path, query):
         worker_id=worker_id,
         hotspot_field=hotspot_field,
         epoch=integer_values["epoch"],
+        tree_parent=tree_parent,
+        tree_cursor=tree_cursor,
         since_seconds=since_seconds or 3600,
         sample_size=min(sample_size or 50_000, 1_000_000),
     )

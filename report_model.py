@@ -32,6 +32,7 @@ from wordle_ui import fmt_pattern, parse_pattern
 
 SCHEMA_VERSION = 2
 WORKER_STALE_SECONDS = 20
+DEFAULT_TREE_PAGE_SIZE = 25
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
@@ -156,6 +157,8 @@ class ReportRequest:
     worker_id: str | None = None
     hotspot_field: str | None = None
     epoch: int | None = None
+    tree_parent: str = ""
+    tree_cursor: str | None = None
     since_seconds: int | None = None
     sample_size: int | None = None
 
@@ -166,6 +169,8 @@ def validate_report_request(request: ReportRequest) -> None:
     branch_target_kind = request.branch_target.kind
     if request.tree and report_kind in ("cache", "hotspots", "leaderboard"):
         raise ValueError(f"--tree cannot be used with --{report_kind}")
+    if (request.tree_parent or request.tree_cursor) and not request.tree:
+        raise ValueError("tree_parent and tree_cursor require tree")
     if request.include_claims and (
         request.tree
         or report_kind != "auto"
@@ -1475,6 +1480,8 @@ def _scoped_queue_rows(queue, request, apply_filters=True):
     scope, prefix = _branch_target_queue_scope(request.branch_target, queue)
     query_filters = _filters_payload(unbounded_filters)
     query_filters.update(scope)
+    if request.tree_parent:
+        query_filters["spine_prefix"] = request.tree_parent
     result = queue.report_queue_rows(query_filters)
     return result["rows"], prefix
 
@@ -1509,22 +1516,6 @@ def _tree_node_id(steps):
 
 
 def _tree_layout(rows, request, prefix, unfiltered_rows):
-    context_rows = [
-        row for row in unfiltered_rows
-        if request.branch_target.kind in ("branch", "branch_reference")
-        and _row_matches_branch_target(row, request.branch_target, prefix)
-        and ((row.get("spine") or "") == prefix
-             or (request.branch_target.kind == "branch_reference"
-                 and branch_reference(bytes(row["branch_key"])).startswith(
-                     request.branch_target.branch_reference)))
-    ]
-    selected_by_key = {row["branch_key_hex"]: row for row in rows}
-    for context_row in context_rows:
-        if context_row["branch_key_hex"] not in selected_by_key:
-            context_copy = dict(context_row)
-            context_copy["is_context"] = True
-            rows.append(context_copy)
-            selected_by_key[context_copy["branch_key_hex"]] = context_copy
     if not rows:
         return {
             "root": _branch_target_payload(request.branch_target),
@@ -1534,11 +1525,11 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
             "nodes": [],
         }
 
-    # A node is a played guess, so the shallowest nodes are the base words the
-    # search starts from; the forest has no node above them.
+    # A node is a played guess.  The response includes one page of immediate
+    # children; their descendants are fetched only when a node is expanded.
     nodes = {}
     for row in rows:
-        steps = _spine_steps(row.get("spine"))
+        steps = _steps_from_queue_row(row)
         if steps:
             parent_id = None
             for guess_depth_value in range(1, len(steps) + 1):
@@ -1558,6 +1549,10 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
                     "completed_candidate_count": None,
                     "candidate_count": None,
                     "is_context": False,
+                    "spine": " ".join(
+                        value for spine_step in steps[:guess_depth_value]
+                        for value in (spine_step.word.upper(), spine_step.pattern)
+                    ),
                 })
                 parent_id = node_id
             final_node = nodes[parent_id]
@@ -1582,6 +1577,7 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
                     "completed_candidate_count": None,
                     "candidate_count": None,
                     "is_context": False,
+                    "spine": None,
                 })
                 parent_id = node_id
             final_node = nodes[parent_id]
@@ -1596,21 +1592,49 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
             "candidate_count": row["candidate_count"],
             "is_context": bool(row.get("is_context")),
         })
-    ordered_nodes = sorted(
-        nodes.values(),
+    parent_node_ids = {
+        candidate["parent_node_id"] for candidate in nodes.values()
+        if candidate["parent_node_id"] is not None
+    }
+    for node in nodes.values():
+        node["has_children"] = node["node_id"] in parent_node_ids
+    parent_spine = request.tree_parent or prefix
+    parent_id = _tree_node_id(_spine_steps(parent_spine)) if parent_spine else None
+    direct_nodes = [
+        node for node in nodes.values() if node["parent_node_id"] == parent_id
+    ]
+    grouped_nodes = {}
+    for node in sorted(
+        direct_nodes,
         key=lambda node: (
-            node["guess_depth"],
             (node["step"] or {}).get("word", ""),
             (node["step"] or {}).get("pattern", ""),
             node["branch_key_hex"] or "",
         ),
-    )
+    ):
+        group_key = (node["step"] or {}).get("word") or node["node_id"]
+        grouped_nodes.setdefault(group_key, []).append(node)
+    group_keys = list(grouped_nodes)
+    if request.tree_cursor is not None:
+        group_keys = [key for key in group_keys if key > request.tree_cursor]
+    page_size = request.filters.limit or DEFAULT_TREE_PAGE_SIZE
+    page_keys = group_keys[:page_size]
+    page_nodes = [node for key in page_keys for node in grouped_nodes[key]]
+    next_cursor = page_keys[-1] if len(group_keys) > page_size else None
     return {
         "root": _branch_target_payload(request.branch_target),
         "topology_source": "queue",
         "tree_available": True,
         "unavailable_reason": None,
-        "nodes": ordered_nodes,
+        "nodes": page_nodes,
+        "paging": {
+            "parent_spine": parent_spine,
+            "cursor": request.tree_cursor,
+            "page_size": page_size,
+            "returned_group_count": len(page_keys),
+            "total_group_count": len(grouped_nodes),
+            "next_cursor": next_cursor,
+        },
     }
 
 
