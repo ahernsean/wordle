@@ -567,6 +567,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         ).inner_text()
         self.assertIn("RAISE", reached)
 
+    def test_branch_target_subtitle_returns_in_tree_layout(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Identity')")
+        # Flat branch view: the Identity section names the branch, so the meta
+        # subtitle omits the spine.
+        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
+        self.assertFalse(any("RAISE" in text for text in meta_spans))
+        # Tree layout routes to renderTree and never renders the Identity /
+        # "Reached via" sections, so the meta subtitle must name the branch
+        # target again — otherwise nothing on the page identifies the branch.
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector("ul.tree > li")
+        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
+        self.assertTrue(any("RAISE" in text for text in meta_spans))
+
     def test_finalization_spines_and_overflow_note_render(self):
         self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
