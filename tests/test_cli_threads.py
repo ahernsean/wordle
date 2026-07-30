@@ -10,6 +10,7 @@ open/close edges.
 """
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -57,10 +58,40 @@ class TestERDSolverEdges(unittest.TestCase):
         s.stop()
         self.assertTrue(s._cancel.is_set())
 
-    def test_run_trivial_position(self):
-        s = self._solver(words=[_w(0), _w(1)])
-        s.run()  # <= 2 words: sentinel, no scan
-        self.assertEqual(s.root_total, -1)
+    def test_run_trivial_position_two_words(self):
+        # <= 2 words: still a real (near-instant) scan restricted to the
+        # branch words themselves, not a skipped/sentinel state.
+        words = [_w(0), _w(1)]
+        s = self._solver(words=words)
+        s.run()
+        self.assertEqual(s.root_total, 2)
+        self.assertEqual(s.root_best, (_w(0), 1.5))
+        self.assertEqual(
+            s._seed_mem_cache.read(ScoreCache.encode_subset(words), ERD_ALL),
+            (_w(0), 1.5))
+
+    def test_run_trivial_position_one_word(self):
+        words = [_w(0)]
+        s = self._solver(words=words)
+        s.run()
+        self.assertEqual(s.root_total, 1)
+        self.assertEqual(s.root_best, (_w(0), 1.0))
+        self.assertEqual(
+            s._seed_mem_cache.read(ScoreCache.encode_subset(words), ERD_ALL),
+            (_w(0), 1.0))
+
+    def test_run_no_candidates_returns_without_hanging(self):
+        # An empty branch (e.g. a contradictory response the fallback
+        # couldn't recover from) must return promptly: _solve_subset has
+        # no n==0 guard, so falling through to _scan's retry loop would
+        # spin forever (min_expected_guesses([], ...) always returns None,
+        # and no loss is ever recorded to trip the budget-floor exit).
+        s = self._solver(words=[])
+        thread = threading.Thread(target=s.run)
+        thread.start()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "ERDSolver.run() hung on n==0")
+        self.assertEqual(s.root_total, 0)
 
     def test_run_persist_opens_and_closes_cache(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
