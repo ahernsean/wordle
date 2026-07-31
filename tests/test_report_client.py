@@ -504,6 +504,44 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("2.793", text)
         self.assertNotIn("2.793103449275866", text)
 
+    def test_branch_erd_values_show_unreduced_lattice_rationals(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.queue.best_erd=17/8;
+          branch.data.queue.ceiling=18/8+1e-9;
+          branch.data.cache.best_erd=17/8;
+          branch.data.recent_finalizations[0]={
+            ...branch.data.recent_finalizations[0],best_guess:'cigar',best_erd:15/8,
+          };
+          branch.data.recent_finalizations[1]={
+            ...branch.data.recent_finalizations[1],ceiling:18/8+1e-9,
+          };
+          branch.data.cut_reuse_misses[0]={
+            ...branch.data.cut_reuse_misses[0],wanted_ceiling:17/8+1e-9,
+            available_bound:18/8+1e-9,
+          };
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("best ERD", text)
+        self.assertIn("2.125 17/8", text)
+        self.assertIn("2.250 18/8", text)
+        self.assertIn("ERD 1.875 15/8", text)
+        self.assertIn("wanted ERD ceiling 2.125 17/8", text)
+        self.assertIn("available ERD bound 2.250 18/8", text)
+        self.assertNotIn("3/2", text)
+
+    def test_branch_erd_ceiling_accepts_its_explicit_padding(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.branch.answer_count=3209;
+          branch.data.queue.ceiling=3/3209+1e-9;
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("ERD ceiling", text)
+        self.assertIn("0.001 3/3209", text)
+
     def test_branch_cache_updated_at_is_human_readable(self):
         self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
@@ -737,7 +775,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # should render, not just available_bound/available_budget.
         self.assertIn("budget 5", text)
         self.assertIn("wanted exact", text)
-        self.assertIn("available 2.200 at budget 4", text)
+        self.assertIn("available ERD bound 2.200 at budget 4", text)
         self.assertIn("epoch 4", text)
 
     def test_focused_page_size_select_survives_a_poll_refresh(self):
