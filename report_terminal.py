@@ -19,6 +19,7 @@ from report_model import (
     collect_report,
     parse_report_branch_target,
 )
+from wordle_engine import erd_display_numerator
 
 
 GREEN = "\033[32m"
@@ -140,6 +141,17 @@ def _format_metric_value(key, value):
     if key in BOUND_FIELDS and isinstance(value, float):
         return f"{value:.3f}"
     return value
+
+
+def _format_branch_erd(value, answer_count, *, ceiling=False):
+    """Render a branch ERD with its unreduced answer-count denominator."""
+    if value is None:
+        return "—"
+    text = f"{value:.3f}"
+    numerator = erd_display_numerator(value, answer_count, ceiling=ceiling)
+    if numerator is not None:
+        text += f" {numerator}/{answer_count}"
+    return text
 
 
 def _display_reference(branch_reference):
@@ -1035,7 +1047,10 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     cache = data["cache"]
     cache_line = f"  {cache['cache_state']}"
     if cache.get("best_guess"):
-        cache_line += f"  best={cache['best_guess'].upper()}/{cache['best_erd']:.3f}"
+        cache_line += (
+            f"  best={cache['best_guess'].upper()}/ERD "
+            f"{_format_branch_erd(cache['best_erd'], branch['answer_count'])}"
+        )
     if cache.get("max_remaining_depth") is not None:
         cache_line += f"  max-d={cache['max_remaining_depth']}"
     cache_lines = ["Cache", _fit(cache_line, width)]
@@ -1130,9 +1145,12 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             width,
         ))
     for miss in data.get("cut_reuse_misses", []):
+        available_bound = _format_branch_erd(
+            miss["available_bound"], miss["answer_count"], ceiling=True
+        )
         telemetry_lines.append(_fit(
             f"  cut reuse miss epoch={miss['epoch']} budget={miss['budget']} "
-            f"available={_format_metric_value('available_bound', miss['available_bound'])}",
+            f"available ERD bound={available_bound}",
             width,
         ))
     if len(telemetry_lines) == 1:

@@ -15,7 +15,10 @@ import time
 import unittest
 
 from cache_sqlite import ScoreCache, MemoryScoreCache
-from wordle_engine import ResponseCache, ERD_ALL, Solution, erd_ge, erd_numerator
+from wordle_engine import (
+    ResponseCache, ERD_ALL, Solution, _CEIL_EPS, erd_display_numerator,
+    erd_ge, erd_numerator,
+)
 from erd_queue import ERDQueue
 import import_cache
 
@@ -436,6 +439,14 @@ class TestErdGe(unittest.TestCase):
         self.assertTrue(erd_ge(3.0, 2.5, 5))     # raw: 3.0 >= 2.5
         self.assertFalse(erd_ge(2.0, 2.5, 5))    # raw: 2.0 >= 2.5
         self.assertTrue(erd_ge(2.5, 2.5, 5))     # both off-grid, equal raw
+
+    def test_ceiling_display_recovers_the_padded_lattice_numerator(self):
+        n_answers = 3209
+        value = 3 / n_answers + _CEIL_EPS
+        self.assertIsNone(erd_display_numerator(value, n_answers))
+        self.assertEqual(
+            erd_display_numerator(value, n_answers, ceiling=True), 3
+        )
 
 
 if __name__ == "__main__":

@@ -131,22 +131,22 @@ _ABORT_STATUSES = frozenset({DEADLINE_EXCEEDED, CANCEL_RECVD})
 _ERD_LATTICE_NOISE_MARGIN = 1e-6
 
 
-def erd_numerator(value, n_answers):
+def erd_numerator(value, n_answers, *, noise_margin=_ERD_LATTICE_NOISE_MARGIN):
     """Return the integer numerator of value, if value is exactly
-    k/n_answers to within _ERD_LATTICE_NOISE_MARGIN; None if it lies off
-    that lattice.
+    k/n_answers to within ``noise_margin`` in scaled numerator units; None if
+    it lies off that lattice.
 
     A branch's ERD at any budget is (sum of integer line lengths) / n_answers,
-    so every achievable ERD — and every alpha-beta ceiling, which lands on
-    the same lattice — is exactly k/n_answers: a one-dimensional lattice of
-    points spaced 1/n_answers apart.  Carried as float64 the value
+    so every achievable ERD is exactly k/n_answers: a one-dimensional lattice
+    of points spaced 1/n_answers apart.  The unpadded alpha-beta threshold
+    lands on that same lattice.  Carried as float64 the value
     accumulates ~1e-9 of representation noise; multiplying by n_answers and
     rounding recovers the exact k.  Distinct lattice points are >= 1 apart
     after that scaling, so the noise margin can only ever collapse two
     encodings of the same value, never merge two different ERDs."""
     numerator = value * n_answers
     rounded = round(numerator)
-    if abs(numerator - rounded) < _ERD_LATTICE_NOISE_MARGIN:
+    if abs(numerator - rounded) < noise_margin:
         return rounded
     return None
 
@@ -274,6 +274,21 @@ ORDER_MIN_N = 8
 # false cutoff would only cost a missed cache write, never correctness, but the
 # margin makes "never wrongly discard a true winner" exact rather than probable.
 _CEIL_EPS = 1e-9
+
+
+def erd_display_numerator(value, n_answers, *, ceiling=False):
+    """Return the unreduced ERD lattice numerator suitable for display.
+
+    Exact ERDs must lie on the branch's ``1 / n_answers`` lattice.  A derived
+    alpha-beta ceiling carries ``_CEIL_EPS`` above its semantic lattice value,
+    so its display check also admits that explicitly bounded offset.
+    """
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    allowed_noise = _ERD_LATTICE_NOISE_MARGIN
+    if ceiling:
+        allowed_noise += n_answers * _CEIL_EPS
+    return erd_numerator(value, n_answers, noise_margin=allowed_noise)
 
 
 # ---------------------------------------------------------------------------

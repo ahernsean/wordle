@@ -211,13 +211,19 @@
     const valueOrDash=value=>{if(value===null||value===undefined||value==="")return "—";if(typeof value==="number"&&Number.isInteger(value))return formatInteger(value);return String(value);};
     const numText=formatInteger;
     const boundFields=new Set(["best_erd","erd","ceiling","bound_erd","available_bound","wanted_ceiling"]);
+    const ERD_LATTICE_NOISE_MARGIN=1e-6, CEILING_EPS=1e-9;
     const fixed=(value,digits=3)=>value===null||value===undefined?null:Number(value).toFixed(digits);
+    const erdValue=(value,answerCount,{ceiling=false}={})=>{
+      const decimal=fixed(value);if(decimal===null||!Number.isFinite(Number(value))||!Number.isInteger(answerCount)||answerCount<=0)return decimal;
+      const scaled=Number(value)*answerCount,numerator=Math.round(scaled),allowance=ERD_LATTICE_NOISE_MARGIN+(ceiling?answerCount*CEILING_EPS:0);
+      return Math.abs(scaled-numerator)<allowance?decimal+" "+numerator+"/"+answerCount:decimal;
+    };
     const displayValue=(key,value)=>key==="best_guess"&&value?String(value).toUpperCase():boundFields.has(key)&&typeof value==="number"?fixed(value):value;
     const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
     const absoluteTime=seconds=>seconds===null||seconds===undefined?"unknown time":new Date(seconds*1000).toLocaleString(undefined,{dateStyle:"medium",timeStyle:"medium"});
     const displayTimedValue=(key,value,now)=>key.endsWith("_at")&&typeof value==="number"?relativeAge(value,now):displayValue(key,value);
     const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts)if(part)node.append(element("span","",part));return node;};
-    const label=key=>String(key).replaceAll("_"," ");
+    const label=key=>String(key).replaceAll("_"," ").replace(/\berd\b/gi,"ERD");
     const timeLabel=key=>key.endsWith("_at")?label(String(key).slice(0,-3)):label(key);
     const shortReference=reference=>String(reference).slice(0,8);
     function copyText(text){
@@ -510,9 +516,9 @@
       identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
       fragment.append(section("Identity",identityMetrics));
       if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine"),spineText=branch.spine.flatMap(step=>[step.word,step.pattern]).join(" ");copyButton.addEventListener("click",()=>copyText(spineText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));spineSection.append(copyButton);fragment.append(spineSection);}
-      fragment.append(section("Queue",data.queue?kv([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["ERD",fixed(data.queue.best_erd)],["ceiling",fixed(data.queue.ceiling)],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
+      fragment.append(section("Queue",data.queue?kv([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best guess",data.queue.best_guess?candidateText(data.queue.best_guess,data.queue.best_guess_is_answer):"none yet"],["best ERD",erdValue(data.queue.best_erd,branch.answer_count)],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
-      fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[timeLabel(key),displayTimedValue(key,value,report.generated_at)]))));
+      fragment.append(section("Cache",kv(Object.entries(data.cache||{}).filter(([key])=>key!=="branch_key_hex").map(([key,value])=>[timeLabel(key),key==="best_erd"?erdValue(value,branch.answer_count):displayTimedValue(key,value,report.generated_at)]))));
       const ownership=data.branch_ownership||{};
       const ownershipSection=element("section","section");
       ownershipSection.append(
@@ -540,13 +546,13 @@
           if(row.outcome==="exact"){
             if(row.best_guess){
               let solved="solved "+candidateText(row.best_guess,false);
-              if(row.best_erd!==null&&row.best_erd!==undefined)solved+=" / ERD "+fixed(row.best_erd);
+              if(row.best_erd!==null&&row.best_erd!==undefined)solved+=" / ERD "+erdValue(row.best_erd,row.answer_count);
               facts.push(solved);
             }else{
               facts.push("solution not recorded");
             }
           }
-          if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ceiling "+fixed(row.ceiling));
+          if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
           facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.bulk_completed_candidate_count)+" bulk proofs",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
           if(row.wall_millis)facts.push(numText(row.wall_millis)+" ms");
@@ -588,12 +594,12 @@
           const title=element("div","card-title");
           title.append(element("h3","","Cut-reuse miss"));
           card.append(title);
-          const wanted=row.wanted_ceiling!==null&&row.wanted_ceiling!==undefined?"wanted ceiling "+fixed(row.wanted_ceiling):"wanted exact";
+          const wanted=row.wanted_ceiling!==null&&row.wanted_ceiling!==undefined?"wanted ERD ceiling "+erdValue(row.wanted_ceiling,row.answer_count,{ceiling:true}):"wanted exact";
           card.append(statLine([
             numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),
             "budget "+valueOrDash(row.budget),
             wanted,
-            "available "+fixed(row.available_bound)+" at budget "+valueOrDash(row.available_budget),
+            "available ERD bound "+erdValue(row.available_bound,row.answer_count,{ceiling:true})+" at budget "+valueOrDash(row.available_budget),
             "epoch "+valueOrDash(row.epoch),
             relativeAge(row.recorded_at,report.generated_at),
           ]));
