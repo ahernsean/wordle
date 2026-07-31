@@ -431,6 +431,16 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("ERD 3.564  max-d=6", output)
         self.assertNotIn("3.564102564102564", output)
 
+    def test_word_report_marks_an_absent_erd_summary_as_not_available(self):
+        report = self._word_report({
+            "state": "pending", "erd": None, "max_remaining_depth": None,
+            "resolved_group_count": 0, "infeasible_group_count": 0,
+            "response_group_count": 0,
+        })
+        report["data"]["erd_summary"] = None
+        output = render_report(report, width=60)
+        self.assertIn("ERD: n/a", output)
+
     def test_word_report_renders_pending_erd(self):
         report = self._word_report({
             "state": "pending", "erd": None, "max_remaining_depth": None,
