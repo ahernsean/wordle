@@ -546,7 +546,7 @@
           if(row.outcome==="exact"){
             if(row.best_guess){
               let solved="solved "+candidateText(row.best_guess,false);
-              if(row.best_erd!==null&&row.best_erd!==undefined)solved+=" / ERD "+erdValue(row.best_erd,row.answer_count);
+              if(row.best_erd!==null&&row.best_erd!==undefined)solved+=" "+erdValue(row.best_erd,row.answer_count);
               facts.push(solved);
             }else{
               facts.push("solution not recorded");
@@ -599,7 +599,8 @@
             numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),
             "budget "+valueOrDash(row.budget),
             wanted,
-            "available ERD bound "+erdValue(row.available_bound,row.answer_count,{ceiling:true})+" at budget "+valueOrDash(row.available_budget),
+            "available ERD bound "+erdValue(row.available_bound,row.answer_count,{ceiling:true}),
+            "at budget "+valueOrDash(row.available_budget),
             "epoch "+valueOrDash(row.epoch),
             relativeAge(row.recorded_at,report.generated_at),
           ]));

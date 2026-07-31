@@ -526,7 +526,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("best ERD", text)
         self.assertIn("2.125 17/8", text)
         self.assertIn("2.250 18/8", text)
-        self.assertIn("ERD 1.875 15/8", text)
+        self.assertIn("solved CIGAR 1.875 15/8", text)
         self.assertIn("wanted ERD ceiling 2.125 17/8", text)
         self.assertIn("available ERD bound 2.250 18/8", text)
         self.assertNotIn("3/2", text)
@@ -541,6 +541,29 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertIn("ERD ceiling", text)
         self.assertIn("0.001 3/3209", text)
+
+    def test_cut_reuse_facts_wrap_between_complete_metrics(self):
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.cut_reuse_misses[0]={
+            ...branch.data.cut_reuse_misses[0],answer_count:19,
+            available_bound:47/19+1e-9,available_budget:5,
+          };
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        card = self.page.locator("section:has-text('Cut-reuse misses') article.card")
+        facts = card.locator(".stat-line > span")
+        self.assertIn("available ERD bound 2.474 47/19", facts.all_inner_texts())
+        self.assertIn("at budget 5", facts.all_inner_texts())
+        self.assertTrue(all(
+            style == "nowrap" for style in facts.evaluate_all(
+                "spans => spans.map(span => getComputedStyle(span).whiteSpace)"
+            )
+        ))
+        self.assertLessEqual(*card.evaluate(
+            "card => [card.scrollWidth, card.clientWidth]"
+        ))
 
     def test_branch_cache_updated_at_is_human_readable(self):
         self.page.evaluate("""async () => {
@@ -591,7 +614,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("solved CIGAR / ERD 1.875", text)
+        self.assertIn("solved CIGAR 1.875", text)
         self.assertNotIn("solution not recorded", text)
 
     def test_old_epoch_finalizations_are_marked_historical(self):
@@ -775,7 +798,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # should render, not just available_bound/available_budget.
         self.assertIn("budget 5", text)
         self.assertIn("wanted exact", text)
-        self.assertIn("available ERD bound 2.200 at budget 4", text)
+        self.assertIn("available ERD bound 2.200", text)
+        self.assertIn("at budget 4", text)
         self.assertIn("epoch 4", text)
 
     def test_focused_page_size_select_survives_a_poll_refresh(self):
