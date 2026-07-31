@@ -595,7 +595,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")
         text = self.page.locator("section:has-text('Recent finalizations')").inner_text()
-        self.assertIn("Cut — best line exceeds the budget", text)
+        self.assertIn("Cut: No candidate under ceiling", text)
         self.assertIn("Exact — solved within budget", text)
         self.assertIn("Loss — unsolvable in the game", text)
         self.assertIn("solution not recorded", text)
