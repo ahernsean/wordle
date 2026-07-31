@@ -857,6 +857,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_tree_header_names_the_snapshot_and_offers_refresh(self):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector("ul.tree")
         header = self.page.locator(".report-meta")
         self.assertIn("snapshot", header.inner_text())
         self.assertEqual(header.get_by_role("button", name="Refresh tree").count(), 1)
