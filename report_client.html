@@ -529,7 +529,7 @@
       fragment.append(ownershipSection);
       if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
       if(data.recent_finalizations?.length||data.finalization_total_count){
-        const outcomeGloss={exact:"Exact — solved within budget",cut:"Cut — best line exceeds the budget",loss:"Loss — unsolvable in the game",unknown:"Finalized"};
+        const outcomeGloss={exact:"Exact — solved within budget",cut:"Cut: No candidate under ceiling",loss:"Loss — unsolvable in the game",unknown:"Finalized"};
         const finalizations=element("div","grid");
         const activeEpoch=report.sources?.queue?.epoch;
         for(const row of data.recent_finalizations){
