@@ -902,7 +902,7 @@ def _semantic_header(report, title, width):
 
 def _word_erd_line(erd_summary):
     if not erd_summary:
-        return "ERD: —"
+        return "ERD: n/a"
     state = erd_summary.get("state")
     if state == "complete":
         return f"ERD {erd_summary['erd']:.3f}  max-d={erd_summary['max_remaining_depth']}"
