@@ -438,7 +438,7 @@ class OverviewRendererTest(unittest.TestCase):
             "response_group_count": 4,
         })
         output = render_report(report, width=100)
-        self.assertIn("ERD pending — 2 of 4 response groups solved", output)
+        self.assertIn("ERD pending: 2 of 4 response groups solved", output)
 
     def test_word_report_renders_infeasible_erd(self):
         report = self._word_report({
@@ -448,7 +448,7 @@ class OverviewRendererTest(unittest.TestCase):
         })
         output = render_report(report, width=100)
         self.assertIn(
-            "ERD ∞ — 1 of 4 response groups unsolvable within budget", output
+            "ERD ∞: 1 of 4 response groups unsolvable within budget", output
         )
 
     @staticmethod

@@ -902,18 +902,18 @@ def _semantic_header(report, title, width):
 
 def _word_erd_line(erd_summary):
     if not erd_summary:
-        return "ERD —"
+        return "ERD: —"
     state = erd_summary.get("state")
     if state == "complete":
         return f"ERD {erd_summary['erd']:.3f}  max-d={erd_summary['max_remaining_depth']}"
     if state == "infeasible":
         return (
-            f"ERD ∞ — {erd_summary['infeasible_group_count']} of "
+            f"ERD ∞: {erd_summary['infeasible_group_count']} of "
             f"{erd_summary['response_group_count']} response groups "
             "unsolvable within budget"
         )
     return (
-        f"ERD pending — {erd_summary['resolved_group_count']} of "
+        f"ERD pending: {erd_summary['resolved_group_count']} of "
         f"{erd_summary['response_group_count']} response groups solved"
     )
 
