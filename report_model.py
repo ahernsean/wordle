@@ -629,6 +629,14 @@ def _queue_overview(sources, generated_at, answer_set, report):
             filters=filters,
             generated_at=generated_at,
         )
+        active_branch_keys = [
+            bytes(row["branch_key"])
+            for row in queue_result["rows"]
+            if row["branch_status"] == "active"
+        ]
+        completed_candidate_indexes = queue.completed_candidate_indexes_by_branch(
+            active_branch_keys
+        )
         normalized_rows = []
         for row in queue_result["rows"]:
             branch_values = {
@@ -666,13 +674,11 @@ def _queue_overview(sources, generated_at, answer_set, report):
                 answer_set,
             )
             # Active branches carry their done claim indexes so overview
-            # displays can draw the candidate sweep; the set is bounded by the
-            # worker count.  Other statuses have no live claim rows.
+            # displays can draw the candidate sweep. Other statuses have no
+            # live claim rows.
             if normalized["branch_status"] == "active":
-                normalized["completed_candidate_indexes"] = sorted(
-                    claim["idx"]
-                    for claim in queue.claims_for_branch(bytes(row["branch_key"]))
-                    if claim["done"]
+                normalized["completed_candidate_indexes"] = (
+                    completed_candidate_indexes[bytes(row["branch_key"])]
                 )
             normalized_rows.append(normalized)
 
@@ -708,26 +714,10 @@ def _queue_overview(sources, generated_at, answer_set, report):
             "stop_fraction": DISK_STOP_FRACTION,
         }
 
+        phase_counts = queue.overview_phase_counts()
         report["data"]["queue_counts"] = {
             "pending_branch_count": counts.get("pending", 0),
-            "evaluating_user_branch_count": sum(
-                not row["is_cooperative"]
-                for row in queue.report_queue_rows(
-                    {"branch_phases": ("evaluating",)},
-                    generated_at=generated_at,
-                )["rows"]
-            ),
-            "evaluating_cooperative_branch_count": sum(
-                row["is_cooperative"]
-                for row in queue.report_queue_rows(
-                    {"branch_phases": ("evaluating",)},
-                    generated_at=generated_at,
-                )["rows"]
-            ),
-            "finalizing_branch_count": queue.report_queue_rows(
-                {"branch_phases": ("finalizing",)},
-                generated_at=generated_at,
-            )["matched_rows"],
+            **phase_counts,
             "done_branch_count": counts.get("done", 0),
         }
         report["data"]["worker_totals"] = worker_totals

@@ -1381,6 +1381,62 @@ class ERDQueue:
             "SELECT status, COUNT(*) c FROM pending_branches GROUP BY status"
         )}
 
+    def overview_phase_counts(self) -> dict:
+        """Return queue-wide evaluating and finalizing branch counts."""
+        row = self._conn.execute("""
+            WITH branch_ids AS (
+                SELECT branch_id FROM pending_branches
+                UNION
+                SELECT branch_id FROM active_branches
+            )
+            SELECT
+                SUM(CASE
+                    WHEN pending.branch_id IS NOT NULL
+                     AND pending.status != 'done'
+                     AND active.status IS NOT 'finalized'
+                     AND (active.status = 'open'
+                          OR pending.status = 'in_progress')
+                    THEN 1 ELSE 0 END) AS evaluating_user_branch_count,
+                SUM(CASE
+                    WHEN pending.branch_id IS NULL AND active.status = 'open'
+                    THEN 1 ELSE 0 END) AS evaluating_cooperative_branch_count,
+                SUM(CASE
+                    WHEN pending.status IS NOT 'done'
+                     AND active.status = 'finalized'
+                    THEN 1 ELSE 0 END) AS finalizing_branch_count
+            FROM branch_ids
+            LEFT JOIN pending_branches AS pending USING (branch_id)
+            LEFT JOIN active_branches AS active USING (branch_id)
+        """).fetchone()
+        return {
+            key: row[key] or 0
+            for key in (
+                "evaluating_user_branch_count",
+                "evaluating_cooperative_branch_count",
+                "finalizing_branch_count",
+            )
+        }
+
+    def completed_candidate_indexes_by_branch(self, branch_keys) -> dict:
+        """Return completed candidate indexes for the requested branches."""
+        branch_ids = self._branch_ids_for_keys(branch_keys)
+        indexes_by_branch = {bytes(branch_key): [] for branch_key in branch_keys}
+        if not branch_ids:
+            return indexes_by_branch
+        placeholders = ",".join("?" for _ in branch_ids)
+        rows = self._conn.execute(
+            f"""SELECT branches.branch_key, candidate_claims.idx
+                FROM candidate_claims
+                JOIN branches USING (branch_id)
+                WHERE candidate_claims.branch_id IN ({placeholders})
+                  AND candidate_claims.done = 1
+                ORDER BY branches.branch_key, candidate_claims.idx""",
+            branch_ids,
+        ).fetchall()
+        for row in rows:
+            indexes_by_branch[bytes(row["branch_key"])].append(row["idx"])
+        return indexes_by_branch
+
     def heartbeats_with_branch(self):
         """Heartbeat rows joined to the branch each worker is contributing to.
 

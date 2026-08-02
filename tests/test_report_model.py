@@ -467,6 +467,49 @@ class ReportModelTest(unittest.TestCase):
             report["data"]["queue_counts"]["evaluating_cooperative_branch_count"], 1
         )
 
+    def test_finalizing_user_branch_is_not_counted_as_evaluating(self):
+        branch_key = b"finalizing-user"
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 3, 5, "SALET", 0)])
+        queue.claim_next("worker-1")
+        queue.create_branch(branch_key, 3, 5)
+        queue.try_finalize_branch(branch_key)
+        queue.close()
+
+        report = collect_overview_report(self.sources)
+        queue_counts = report["data"]["queue_counts"]
+        self.assertEqual(queue_counts["evaluating_user_branch_count"], 0)
+        self.assertEqual(queue_counts["finalizing_branch_count"], 1)
+
+    def test_overview_uses_one_queue_snapshot_and_preserves_worker_ramps(self):
+        now = int(time.time())
+        branch_key = b"ramp-branch"
+        queue = self._open_queue()
+        queue.create_branch(branch_key, 3, 5)
+        branch_id = queue._intern_branch(branch_key)
+        queue._conn.executemany(
+            "INSERT INTO candidate_claims "
+            "(branch_id, idx, claimed_by, claimed_at, done, done_at) "
+            "VALUES (?, ?, 'worker-1', ?, 1, ?)",
+            [(branch_id, index, now, now) for index in (1, 3)],
+        )
+        queue.heartbeat("worker-1", 1, branch_key, 3, now, 2)
+        queue.close()
+
+        with (
+            patch.object(
+                ERDQueue, "report_queue_rows", autospec=True,
+                side_effect=ERDQueue.report_queue_rows,
+            ) as report_queue_rows,
+            patch("report_model.time.time", return_value=now),
+        ):
+            report = collect_overview_report(self.sources)
+
+        self.assertEqual(report_queue_rows.call_count, 1)
+        self.assertEqual(
+            report["data"]["branches"][0]["completed_candidate_indexes"], [1, 3]
+        )
+
     def test_branch_report_lists_live_off_branch_claim_holders(self):
         now = int(time.time())
         parent_key = b"parent-branch"
