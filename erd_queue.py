@@ -2067,6 +2067,48 @@ class ERDQueue:
         """, (branch_id,))
         return cur.rowcount > 0
 
+    def complete_pending_for_loss(self, branch_key, loss_budget, root_budget) -> bool:
+        """Atomically retire only pending work covered by a branch loss.
+
+        A queued branch is reached through its single source-word response, so
+        its remaining budget is root_budget minus one when that spine is known.
+        Returns True when no queued row needs further work, False when a queued
+        request is left pending because the loss budget does not cover it.
+        """
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return True
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute("""
+                SELECT source_word, source_pattern FROM pending_branches
+                WHERE branch_id = ?
+            """, (branch_id,)).fetchone()
+            if row is None:
+                self._conn.execute("COMMIT")
+                return True
+            pending_budget = root_budget - (
+                1 if row["source_word"] and row["source_pattern"] is not None
+                else 0)
+            if loss_budget is not None and loss_budget >= pending_budget:
+                self._conn.execute("""
+                    UPDATE pending_branches
+                    SET status = 'done', completed_at = ?
+                    WHERE branch_id = ?
+                """, (int(time.time()), branch_id))
+                self._conn.execute("COMMIT")
+                return True
+            self._conn.execute("""
+                UPDATE pending_branches
+                SET status = 'pending', claimed_by = NULL, claimed_at = NULL
+                WHERE branch_id = ? AND status != 'done'
+            """, (branch_id,))
+            self._conn.execute("COMMIT")
+            return False
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
     def branch_done_candidates(self, branch_key) -> int:
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:

@@ -1743,7 +1743,6 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
             "nodes_spent": 0, "created_at": 100, "finalized_at": 200,
             "spine": "SALET -g-g-",
         }
-        w.queue.get_pending_branch.return_value = None
         w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
         return w
 
@@ -2010,7 +2009,8 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w.maybe_finalize(key, BRANCH, len(CANDIDATES))
         w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
         w.queue.add_cut_result.assert_not_called()
-        w.queue.mark_done.assert_called_once_with(key)
+        w.queue.complete_pending_for_loss.assert_called_once_with(
+            key, 3, ROOT_BUDGET)
         w.queue.requeue_pending.assert_not_called()
         log_kwargs = w.queue.add_branch_finalize_log.call_args.kwargs
         self.assertEqual(log_kwargs["outcome"], "loss")
@@ -2031,16 +2031,13 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
         w.queue.add_cut_result.assert_not_called()
 
-    def test_ceiling_proven_loss_requeues_a_larger_budget_user_request(self):
+    def test_ceiling_proven_loss_completes_pending_work_by_budget(self):
         key = ScoreCache.encode_subset(BRANCH)
         w = self._worker((None, None, None, False, 3, 3.111111112, True))
-        w.queue.get_pending_branch.return_value = {
-            "source_word": "crane", "source_pattern": 0,
-        }
         w.maybe_finalize(key, BRANCH, len(CANDIDATES))
         w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
-        w.queue.requeue_pending.assert_called_once_with(key)
-        w.queue.mark_done.assert_not_called()
+        w.queue.complete_pending_for_loss.assert_called_once_with(
+            key, 3, ROOT_BUDGET)
 
     def test_loss_path_unchanged_without_cut_flag(self):
         key = ScoreCache.encode_subset(BRANCH)
@@ -2048,26 +2045,24 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w.maybe_finalize(key, BRANCH, len(CANDIDATES))
         w.score_cache.write_loss.assert_called_once()
         w.queue.add_cut_result.assert_not_called()
-        w.queue.mark_done.assert_called_once_with(key)
+        w.queue.complete_pending_for_loss.assert_called_once_with(
+            key, 4, ROOT_BUDGET)
         log_kwargs = w.queue.add_branch_finalize_log.call_args.kwargs
         self.assertEqual(log_kwargs["outcome"], "loss")
         self.assertIsNone(log_kwargs["ceiling"])
 
-    def test_exhaustive_loss_requeues_a_larger_budget_user_request(self):
+    def test_exhaustive_loss_completes_pending_work_by_budget(self):
         key = ScoreCache.encode_subset(BRANCH)
         w = self._worker((None, None, None, False, 3, None, False))
-        w.queue.get_pending_branch.return_value = {
-            "source_word": "crane", "source_pattern": 0,
-        }
         w.maybe_finalize(key, BRANCH, len(CANDIDATES))
         w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
-        w.queue.requeue_pending.assert_called_once_with(key)
-        w.queue.mark_done.assert_not_called()
+        w.queue.complete_pending_for_loss.assert_called_once_with(
+            key, 3, ROOT_BUDGET)
 
-    def test_pending_lookup_failure_still_runs_cleanup(self):
+    def test_pending_completion_failure_still_runs_cleanup(self):
         key = ScoreCache.encode_subset(BRANCH)
         w = self._worker((None, None, None, False, 3, None, False))
-        w.queue.get_pending_branch.side_effect = RuntimeError("boom")
+        w.queue.complete_pending_for_loss.side_effect = RuntimeError("boom")
         w.maybe_finalize(key, BRANCH, len(CANDIDATES))
         w.queue.requeue_pending.assert_called_once_with(key)
         w.queue.delete_branch.assert_called_once_with(key)

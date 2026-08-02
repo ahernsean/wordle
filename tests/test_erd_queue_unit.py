@@ -699,6 +699,20 @@ class TestPendingRowHelpers(_TmpQueue):
     def test_requeue_pending_noop_without_row(self):
         self.assertFalse(self.q.requeue_pending(self.key))
 
+    def test_complete_pending_for_loss_preserves_an_uncovered_request(self):
+        self._queue_pending()
+        self.q.claim_next("worker-0")
+        self.assertFalse(self.q.complete_pending_for_loss(
+            self.key, loss_budget=3, root_budget=6))
+        self.assertEqual(self.q.get_pending_branch(self.key)["status"], "pending")
+
+    def test_complete_pending_for_loss_retires_a_covered_request(self):
+        self._queue_pending()
+        self.q.claim_next("worker-0")
+        self.assertTrue(self.q.complete_pending_for_loss(
+            self.key, loss_budget=5, root_budget=6))
+        self.assertEqual(self.q.get_pending_branch(self.key)["status"], "done")
+
 
 class TestCeilingTelemetry(_TmpQueue):
     """The ceiling/outcome columns on branch_finalize_log, the

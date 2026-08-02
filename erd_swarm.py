@@ -1474,28 +1474,22 @@ class _BranchWorker:
                 'already published; continuing to cleanup', self.name,
                 branch_key[:25])
         loss = best_guess is None and (not cut or ceiling_proves_loss)
-        pending_budget = None
-        pending_lookup_failed = False
-        if best_guess is None:
+        try:
+            if loss:
+                self.queue.complete_pending_for_loss(
+                    branch_key, budget, self.root_budget)
+            elif cut:
+                self.queue.requeue_pending(branch_key)
+            else:
+                self.queue.mark_done(branch_key)
+        except Exception:
+            logger.exception('%s pending completion failed for branch %s; '
+                             'retaining queued work', self.name, branch_key[:25])
             try:
-                pending_row = self.queue.get_pending_branch(branch_key)
-                if pending_row is not None:
-                    pending_spine = self._root_spine(
-                        pending_row['source_word'], pending_row['source_pattern'])
-                    pending_budget = self._spine_budget(pending_spine)
+                self.queue.requeue_pending(branch_key)
             except Exception:
-                pending_lookup_failed = True
-                logger.exception('%s could not read pending budget for branch %s; '
-                                 'retaining queued work', self.name,
+                logger.exception('%s could not requeue branch %s', self.name,
                                  branch_key[:25])
-        if (cut and not ceiling_proves_loss) or (
-                loss and (pending_lookup_failed or pending_budget is not None
-                          and (budget is None or budget < pending_budget))):
-            # A user-queued row needs another solve unless this result is exact
-            # or its loss budget covers the queued request.
-            self.queue.requeue_pending(branch_key)
-        else:
-            self.queue.mark_done(branch_key)    # pending_branches row -> done
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
         return True
