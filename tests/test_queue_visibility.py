@@ -282,6 +282,21 @@ class QueueVisibilityTests(unittest.TestCase):
         telemetry = self.q.report_branch_telemetry(self.user_key, limit=1)
         self.assertEqual(telemetry["recent_finalizations"][0]["outcome"], "unknown")
 
+    def test_report_normalizes_ceiling_above_budget_cut_as_loss(self):
+        now = int(time.time())
+        self.q.add_branch_finalize_log(
+            self.user_key, "CRANE -----", 5, 3, now - 2, now - 1,
+            100, 3, ceiling=3.25, outcome="cut",
+        )
+        row = self.q.report_branch_telemetry(self.user_key, limit=1)[
+            "recent_finalizations"][0]
+        self.assertEqual(row["outcome"], "loss")
+        self.assertEqual(row["loss_proof"], "ceiling_above_budget")
+        stored = self.q._conn.execute(
+            "SELECT outcome FROM telemetry.branch_finalize_log"
+        ).fetchone()["outcome"]
+        self.assertEqual(stored, "cut")
+
     def test_report_queue_filters_accept_dicts_and_cover_each_bound(self):
         self.q.create_branch(
             self.user_key, len(WORDS), 10, priority=7, budget=4,

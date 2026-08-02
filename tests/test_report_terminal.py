@@ -827,6 +827,28 @@ class CandidateSweepBarTest(unittest.TestCase):
             line.strip().startswith("[") for line in unswept_output.splitlines()
         ))
 
+    def test_branch_report_names_ceiling_proven_loss(self):
+        report = overview_report()
+        report.update({"report_kind": "branch", "branch_target": None})
+        branch = deepcopy(report["data"]["branches"][0])
+        queue = deepcopy(branch)
+        report["data"] = {
+            "branch": branch,
+            "queue": queue,
+            "cache": {"cache_state": "missing", "best_guess": None,
+                      "best_erd": None, "max_remaining_depth": None},
+            "workers": [],
+            "republished_candidates": [], "completed_candidate_indexes": [],
+            "claims": None, "provenance_unknown": False,
+            "recent_finalizations": [{
+                "spine": "CRANE -----", "outcome": "loss",
+                "loss_proof": "ceiling_above_budget", "epoch": 11,
+                "search_node_count": 100, "evaluated_candidate_count": 8,
+                "bulk_completed_candidate_count": 0,
+            }],
+        }
+        self.assertIn("loss unsolvable-within-budget", render_report(report, width=100))
+
 
 class CollectionRendererTest(unittest.TestCase):
     def _report(self, report_kind, data, tree=False):
