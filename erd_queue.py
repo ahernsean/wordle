@@ -1092,14 +1092,15 @@ class ERDQueue:
                 """, (row["branch_id"], cur.lastrowid))
 
         self._add_columns("branch_source_work", {"root_pattern": "INTEGER"})
-        self._conn.execute("""
-            UPDATE branch_source_work
-            SET root_pattern = (
-                SELECT source_pattern FROM pending_branches
-                WHERE pending_branches.branch_id = branch_source_work.branch_id
-            )
-            WHERE parent_branch_id IS NULL AND root_pattern IS NULL
-        """)
+        if {"branch_id", "source_pattern"} <= pending_columns:
+            self._conn.execute("""
+                UPDATE branch_source_work
+                SET root_pattern = (
+                    SELECT source_pattern FROM pending_branches
+                    WHERE pending_branches.branch_id = branch_source_work.branch_id
+                )
+                WHERE parent_branch_id IS NULL AND root_pattern IS NULL
+            """)
 
         # Claims bundle index on the (post-normalization) branch_id key.  After
         # the ADD COLUMN and rebuild above, so bundle_id and branch_id both
@@ -1468,6 +1469,12 @@ class ERDQueue:
                     AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
               )
         """)
+
+    def _remove_branch_source_work(self, branch_id: int):
+        """Remove a branch from every source request that owns it."""
+        self._conn.execute(
+            "DELETE FROM branch_source_work WHERE branch_id = ?", (branch_id,))
+        self._complete_finished_source_work()
 
     def reset_stale_in_progress(self) -> int:
         """Reset any 'in_progress' rows back to 'pending'.
@@ -3557,6 +3564,7 @@ class ERDQueue:
                     self._conn.execute(
                         "DELETE FROM pending_branches WHERE branch_id = ?",
                         (branch_id,))
+                    self._remove_branch_source_work(branch_id)
             self._conn.execute("COMMIT")
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
@@ -3641,11 +3649,20 @@ class ERDQueue:
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
             return False
-        self._conn.execute(
-            "DELETE FROM pending_branches "
-            "WHERE branch_id = ? AND status = 'pending'",
-            (branch_id,))
-        return self._conn.execute("SELECT changes()").fetchone()[0] > 0
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "DELETE FROM pending_branches "
+                "WHERE branch_id = ? AND status = 'pending'",
+                (branch_id,))
+            removed = self._conn.execute("SELECT changes()").fetchone()[0] > 0
+            if removed:
+                self._remove_branch_source_work(branch_id)
+            self._conn.execute("COMMIT")
+            return removed
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
 
     # ------------------------------------------------------------------
     # Mid-loop publisher support

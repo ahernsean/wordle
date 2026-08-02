@@ -1790,6 +1790,22 @@ class _BranchWorker:
 
     # -- scheduling: claim one candidate from the best available branch ------
 
+    def _claim_active_branch(self, branches, source_work_id=None):
+        """Claim a candidate bundle from an open branch, if one is available."""
+        for active_branch in branches:
+            branch_key = bytes(active_branch['branch_key'])
+            words = decode_subset(branch_key)
+            claim = self._claim_bundle(branch_key, active_branch['n_candidates'], words)
+            if claim is not None:
+                branch = dict(active_branch)
+                if source_work_id is not None:
+                    branch['source_work_id'] = source_work_id
+                bundle_id, indices, forced = claim
+                return branch, bundle_id, indices, forced
+            if self.queue.branch_done_candidates(branch_key) >= active_branch['n_candidates']:
+                self.maybe_finalize(branch_key, words, active_branch['n_candidates'])
+        return None
+
     def claim_one(self):
         """Return (branch_row_dict, bundle_id, indices, forced) for the next
         bundle of candidates to work, or None if there is nothing to do right
@@ -1803,24 +1819,19 @@ class _BranchWorker:
         no candidate work is needed.
         """
         claimed = None
-        if (not self._source_work_enabled
-                and not self.queue.branches_in_progress()):
+        if not self._source_work_enabled:
+            direct_work = self._claim_active_branch(self.queue.branches_in_progress())
+            if direct_work is not None:
+                return direct_work
             self._source_work_enabled = self.queue.has_source_work()
         source_work_rows = (self.queue.source_work_candidates()
                             if self._source_work_enabled else ())
         for source_work in source_work_rows:
             source_work_id = source_work['source_work_id']
-            for b in self.queue.branches_in_progress(source_work_id):
-                branch_key = bytes(b['branch_key'])
-                words = decode_subset(branch_key)
-                claim = self._claim_bundle(branch_key, b['n_candidates'], words)
-                if claim is not None:
-                    branch = dict(b)
-                    branch['source_work_id'] = source_work_id
-                    bundle_id, indices, forced = claim
-                    return branch, bundle_id, indices, forced
-                if self.queue.branch_done_candidates(branch_key) >= b['n_candidates']:
-                    self.maybe_finalize(branch_key, words, b['n_candidates'])
+            active_work = self._claim_active_branch(
+                self.queue.branches_in_progress(source_work_id), source_work_id)
+            if active_work is not None:
+                return active_work
 
             while True:
                 claimed = self.queue.claim_next(self.name, source_work_id)
@@ -1841,16 +1852,7 @@ class _BranchWorker:
             # A queue upgraded while active work is present can carry branches
             # from before source lineage was recorded.  They remain claimable
             # until finalization; new work always follows source-first order.
-            for b in self.queue.branches_in_progress():
-                branch_key = bytes(b['branch_key'])
-                words = decode_subset(branch_key)
-                claim = self._claim_bundle(branch_key, b['n_candidates'], words)
-                if claim is not None:
-                    bundle_id, indices, forced = claim
-                    return dict(b), bundle_id, indices, forced
-                if self.queue.branch_done_candidates(branch_key) >= b['n_candidates']:
-                    self.maybe_finalize(branch_key, words, b['n_candidates'])
-            return None
+            return self._claim_active_branch(self.queue.branches_in_progress())
 
         n_words = claimed['n_words']
         self.queue.create_branch(

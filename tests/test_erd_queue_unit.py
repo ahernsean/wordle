@@ -13,6 +13,7 @@ set_meta/get_meta, and total_branches.  claim_next/mark_done are also tested
 here for completeness.
 """
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -40,7 +41,8 @@ class _TmpQueue(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.q = ERDQueue(os.path.join(self._tmp.name, "q.sqlite3"))
+        self.queue_path = os.path.join(self._tmp.name, "q.sqlite3")
+        self.q = ERDQueue(self.queue_path)
         self.addCleanup(self.q.close)
         self.key = ScoreCache.encode_subset(WORDS)
 
@@ -61,6 +63,41 @@ class TestBranchLifecycle(_TmpQueue):
     def test_create_branch_returns_false_on_duplicate(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self.assertFalse(self.q.create_branch(self.key, len(WORDS), N_CANDIDATES))
+
+    def test_malformed_pending_schema_reports_schema_drift(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
+        queue_path = self.queue_path
+        self.q.close()
+        conn = sqlite3.connect(queue_path)
+        try:
+            conn.executescript("""
+                CREATE TABLE pending_branches_without_pattern (
+                    branch_id INTEGER PRIMARY KEY,
+                    n_words INTEGER NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    source_word TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    claimed_by TEXT,
+                    claimed_at INTEGER,
+                    completed_at INTEGER
+                );
+                INSERT INTO pending_branches_without_pattern
+                    (branch_id, n_words, priority, source_word, status,
+                     claimed_by, claimed_at, completed_at)
+                    SELECT branch_id, n_words, priority, source_word, status,
+                           claimed_by, claimed_at, completed_at
+                    FROM pending_branches;
+                DROP TABLE pending_branches;
+                ALTER TABLE pending_branches_without_pattern
+                    RENAME TO pending_branches;
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        with self.assertRaisesRegex(RuntimeError,
+                                    "pending_branches is missing column"):
+            ERDQueue(queue_path)
 
     def test_get_branch_returns_row(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
@@ -489,6 +526,38 @@ class TestClaimNext(_TmpQueue):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "penis", 0)])
         claimed = self.q.claim_next("worker-0")
         self.assertEqual(claimed["source_word"], "penis")
+        self.assertEqual(claimed["priority"], 1)
+
+    def test_remove_pending_removes_source_work_membership(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 0)])
+        branch_id = self.q._intern_branch(self.key)
+
+        self.assertTrue(self.q.remove_pending(self.key))
+        self.assertEqual(self.q._conn.execute(
+            "SELECT COUNT(*) FROM branch_source_work WHERE branch_id = ?",
+            (branch_id,)).fetchone()[0], 0)
+
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 42)])
+        claimed = self.q.claim_next("worker-0")
+        self.assertEqual(claimed["source_word"], "slate")
+        self.assertEqual(claimed["priority"], 1)
+
+    def test_forced_active_removal_removes_source_work_membership(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 0)])
+        claimed = self.q.claim_next("worker-0")
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             priority=claimed["priority"],
+                             source_work_id=claimed["source_work_id"])
+        branch_id = self.q._intern_branch(self.key)
+
+        self.q.cancel_active_branch(self.key, remove_from_queue=True)
+        self.assertEqual(self.q._conn.execute(
+            "SELECT COUNT(*) FROM branch_source_work WHERE branch_id = ?",
+            (branch_id,)).fetchone()[0], 0)
+
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 42)])
+        claimed = self.q.claim_next("worker-1")
+        self.assertEqual(claimed["source_word"], "slate")
         self.assertEqual(claimed["priority"], 1)
 
 

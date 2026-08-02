@@ -947,6 +947,33 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], key_b)
         self.assertTrue(indices)
 
+    def test_claim_one_discovers_source_work_after_unclaimable_direct_branch(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        direct_key = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(direct_key, len(BRANCH), n_candidates,
+                        budget=ROOT_BUDGET)
+        q.claim_next_bundle(direct_key, "other-worker", n_candidates,
+                            list(range(n_candidates)), [0.0] * n_candidates,
+                            small_count=n_candidates, count_cap=n_candidates)
+        source_key = ScoreCache.encode_subset(BRANCH[:4])
+        q.add_pending_many([(source_key, 4, 7, "crane", 0)])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            result = w.claim_one()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result)
+        branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch['branch_key'], source_key)
+        self.assertEqual(branch['source_word'], "crane")
+        self.assertTrue(indices)
+
     def test_claim_one_joins_existing_in_progress_branch(self):
         from erd_queue import ERDQueue
         branch_key = ScoreCache.encode_subset(BRANCH)
