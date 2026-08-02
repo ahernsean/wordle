@@ -367,7 +367,7 @@ class _MidLoopPublisher:
             return None
         if not created and getattr(self._worker, '_top_source_work_id', None) is not None:
             self._worker.queue.attach_branch_source_work(
-                branch_key, self._worker._top_source_work_id,
+                branch_key, self._worker._top_source_work_id, budget, ours, n,
                 getattr(self._worker, '_claimed_branch_key', None))
 
         # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
@@ -1733,7 +1733,8 @@ class _BranchWorker:
                         return None
                     if getattr(self, '_top_source_work_id', None) is not None:
                         self.queue.attach_branch_source_work(
-                            branch_key, self._top_source_work_id,
+                            branch_key, self._top_source_work_id, budget, ours,
+                            n_words,
                             getattr(self, '_claimed_branch_key', None))
             # Descents into this branch promote grandchildren relative to its spine.
             self._claimed_branch_spine = child_spine

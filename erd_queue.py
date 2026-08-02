@@ -49,6 +49,16 @@ _COST_MODEL_BUCKET_BASE = 1.3
 _LOG_BUCKET_BASE = math.log(_COST_MODEL_BUCKET_BASE)
 
 
+def _erd_ge(left, right, n_words):
+    """Compare ERD values on the branch's exact rational lattice."""
+    left_numerator = round(left * n_words)
+    right_numerator = round(right * n_words)
+    if (abs(left * n_words - left_numerator) < 1e-6
+            and abs(right * n_words - right_numerator) < 1e-6):
+        return left_numerator >= right_numerator
+    return left >= right
+
+
 def cost_size_bucket(n_words: int) -> int:
     """Map a branch word-count to its geometric cost-model bucket index."""
     if n_words < 1:
@@ -1679,16 +1689,20 @@ class ERDQueue:
             """, (branch_id, source_work_id, parent_branch_id))
         return cur.rowcount == 1
 
-    def attach_branch_source_work(self, branch_key, source_work_id,
-                                  parent_branch_key=None) -> bool:
-        """Attach source ownership to a surviving open branch."""
+    def attach_branch_source_work(self, branch_key, source_work_id, budget,
+                                  ceiling, n_words, parent_branch_key=None) -> bool:
+        """Attach source ownership when the surviving branch is joinable."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             branch_id = self._intern_branch(branch_key)
             active = branch_id is not None and self._conn.execute(
-                "SELECT 1 FROM active_branches WHERE branch_id = ? AND status = 'open'",
+                "SELECT budget, ceiling FROM active_branches "
+                "WHERE branch_id = ? AND status = 'open'",
                 (branch_id,)).fetchone()
-            if not active:
+            if (not active or active["budget"] != budget
+                    or (active["ceiling"] is not None
+                        and (ceiling is None
+                             or not _erd_ge(active["ceiling"], ceiling, n_words)))):
                 self._conn.execute("COMMIT")
                 return False
             parent_branch_id = (self._intern_branch(parent_branch_key)

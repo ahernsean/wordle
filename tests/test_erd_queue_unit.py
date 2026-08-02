@@ -78,6 +78,53 @@ class TestBranchLifecycle(_TmpQueue):
             budget=5, source_work_id=source_b))
         self.assertEqual(self.q.branches_in_progress(source_b), [])
 
+    def test_attach_source_work_rejects_replaced_incompatible_branch(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+
+        self.assertFalse(self.q.attach_branch_source_work(
+            self.key, source_work_id, budget=4, ceiling=None,
+            n_words=len(WORDS)))
+        self.assertEqual(self.q.branches_in_progress(source_work_id), [])
+
+    def test_attach_source_work_accepts_compatible_branch(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+
+        self.assertTrue(self.q.attach_branch_source_work(
+            self.key, source_work_id, budget=5, ceiling=None,
+            n_words=len(WORDS)))
+        self.assertEqual(len(self.q.branches_in_progress(source_work_id)), 1)
+
+    def test_attach_source_work_compares_compatible_lattice_ceilings(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             budget=5, ceiling=2.0)
+
+        self.assertTrue(self.q.attach_branch_source_work(
+            self.key, source_work_id, budget=5, ceiling=1.8,
+            n_words=len(WORDS)))
+
+    def test_require_unowned_claim_rejects_newly_owned_branch(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.assertTrue(self.q.attach_branch_source_work(
+            self.key, source_work_id, budget=5, ceiling=None,
+            n_words=len(WORDS)))
+
+        self.assertIsNone(self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
+            require_unowned=True))
+
     def test_malformed_pending_schema_reports_schema_drift(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
         queue_path = self.queue_path
