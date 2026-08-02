@@ -553,6 +553,10 @@ class _BranchWorker:
         self._top_source_pattern = None
         self._top_source_work_id = None
         self._top_source_priority = 0
+        # Direct cooperative callers can create active branches without a
+        # source-work request.  Keep their tight claim loop free of the
+        # source-admission query used by queued source work.
+        self._source_work_enabled = self.queue.has_source_work()
         # Counts ERD-pruned candidate_accuracy claims for 1-in-N down-sampling.
         self._erd_lower_bound_pruned_accuracy_n = 0
         # Absolute root -> branch spine of the branch the worker is currently
@@ -1799,7 +1803,9 @@ class _BranchWorker:
         no candidate work is needed.
         """
         claimed = None
-        for source_work in self.queue.source_work_candidates():
+        source_work_rows = (self.queue.source_work_candidates()
+                            if self._source_work_enabled else ())
+        for source_work in source_work_rows:
             source_work_id = source_work['source_work_id']
             for b in self.queue.branches_in_progress(source_work_id):
                 branch_key = bytes(b['branch_key'])
@@ -1846,6 +1852,7 @@ class _BranchWorker:
             source_pattern=claimed['source_pattern'], budget=budget,
             spine=root_spine, root_budget=self.root_budget,
             source_work_id=claimed['source_work_id'])
+        self._source_work_enabled = True
         words = decode_subset(claimed['branch_key'])
         claim = self._claim_bundle(claimed['branch_key'], self.n_candidates, words)
         branch = {

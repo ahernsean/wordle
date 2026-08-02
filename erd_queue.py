@@ -1366,6 +1366,11 @@ class ERDQueue:
                      s.source_work_id
         """).fetchall()
 
+    def has_source_work(self) -> bool:
+        """Whether this queue has source-aware scheduling provenance."""
+        return self._conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM source_work)").fetchone()[0] == 1
+
     def claim_next(self, worker_id: str, source_work_id: int = None):
         """Atomically claim the highest-priority / largest pending branch.
 

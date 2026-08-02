@@ -934,7 +934,10 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
-            result = w.claim_one()
+            with mock.patch.object(w.queue, 'source_work_candidates',
+                                   wraps=w.queue.source_work_candidates) as source_rows:
+                result = w.claim_one()
+            self.assertEqual(source_rows.call_count, 0)
         finally:
             w.close()
 
