@@ -1843,6 +1843,8 @@ class _BranchWorker:
                 if claim is not None:
                     bundle_id, indices, forced = claim
                     return dict(b), bundle_id, indices, forced
+                if self.queue.branch_done_candidates(branch_key) >= b['n_candidates']:
+                    self.maybe_finalize(branch_key, words, b['n_candidates'])
             return None
 
         n_words = claimed['n_words']

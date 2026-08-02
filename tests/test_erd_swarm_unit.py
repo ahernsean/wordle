@@ -971,6 +971,34 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], branch_key)
         self.assertTrue(indices)
 
+    def test_claim_one_finalizes_completed_direct_branch(self):
+        from erd_queue import ERDQueue
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        q.create_branch(branch_key, len(BRANCH), n_candidates,
+                        budget=ROOT_BUDGET)
+        order = list(range(n_candidates))
+        q.claim_next_bundle(branch_key, "other-worker", n_candidates, order,
+                            [0.0] * n_candidates, small_count=n_candidates,
+                            count_cap=n_candidates)
+        for index in order:
+            q.complete_candidate(branch_key, index)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        try:
+            self.assertIsNone(q.get_branch(branch_key))
+        finally:
+            q.close()
+
 
 class TestCooperativeSolveFullPath(unittest.TestCase):
     """cooperative_solve evaluates all candidates and returns the correct result
