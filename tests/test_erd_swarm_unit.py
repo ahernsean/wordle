@@ -26,7 +26,7 @@ from unittest import mock
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET, PROMOTE_MIN_SIZE
 from cache_sqlite import ScoreCache
-from wordle_engine import ERD_ALL, SOLVED, OVER_ERD_LIMIT
+from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
 from erd_queue import ERDQueue, guess_depth_from_spine
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
@@ -1987,6 +1987,33 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w.queue.add_cut_result.assert_called_once_with(
             key, 4, 2.5, tainted=True)
 
+    def test_ceiling_above_budget_caches_loss_and_retires_pending_row(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, False, 3, 3.111111112, True))
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
+        w.queue.add_cut_result.assert_not_called()
+        w.queue.mark_done.assert_called_once_with(key)
+        w.queue.requeue_pending.assert_not_called()
+        log_kwargs = w.queue.add_branch_finalize_log.call_args.kwargs
+        self.assertEqual(log_kwargs["outcome"], "loss")
+        self.assertAlmostEqual(log_kwargs["ceiling"], 3.111111112)
+
+    def test_ceiling_equal_to_budget_remains_an_ordinary_cut(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, False, 3, 3.0, True))
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write_loss.assert_not_called()
+        w.queue.add_cut_result.assert_called_once_with(key, 3, 3.0, tainted=False)
+        w.queue.requeue_pending.assert_called_once_with(key)
+
+    def test_tainted_ceiling_above_budget_still_caches_loss(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, True, 3, 3.111111112, True))
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
+        w.queue.add_cut_result.assert_not_called()
+
     def test_loss_path_unchanged_without_cut_flag(self):
         key = ScoreCache.encode_subset(BRANCH)
         w = self._worker((None, None, None, False, 4, None, False))
@@ -2152,9 +2179,9 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         self.key = ScoreCache.encode_subset(BRANCH)
         ScoreCache(self.cache_path, BRANCH).close()
 
-    def _complete_all(self, q, cut):
+    def _complete_all(self, q, cut, budget=4, ceiling=2.5):
         n = len(CANDIDATES)
-        q.create_branch(self.key, len(BRANCH), n, budget=4, ceiling=2.5)
+        q.create_branch(self.key, len(BRANCH), n, budget=budget, ceiling=ceiling)
         order = list(range(n))
         _, indices, _ = q.claim_next_bundle(
             self.key, "other", n, order, [0.0] * n,
@@ -2207,6 +2234,41 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         best = sc.read_with_depth(self.key, ERD_ALL)
         self.assertIsNotNone(best)
         sc.close()
+
+    def test_ceiling_proven_loss_reopens_as_a_durable_loss(self):
+        q = ERDQueue(self.queue_path)
+        self._complete_all(q, cut=True, budget=3, ceiling=3.25)
+        q.close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w.maybe_finalize(self.key, BRANCH, len(CANDIDATES))
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        self.assertEqual(q.read_cut_result(self.key), [])
+        row = q._conn.execute(
+            "SELECT outcome, ceiling, budget FROM telemetry.branch_finalize_log"
+        ).fetchone()
+        self.assertEqual((row["outcome"], row["ceiling"], row["budget"]),
+                         ("loss", 3.25, 3))
+        q.close()
+
+        w = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        try:
+            self.assertEqual(
+                w.cooperative_solve(BRANCH, 3),
+                (OVER_DEPTH_BUDGET, float("inf"), None, True),
+            )
+            self.assertEqual(
+                w.cooperative_solve(BRANCH, 2),
+                (OVER_DEPTH_BUDGET, float("inf"), None, True),
+            )
+        finally:
+            w.close()
+        q = ERDQueue(self.queue_path)
+        self.assertIsNone(q.get_branch(self.key))
+        q.close()
 
 
 if __name__ == "__main__":

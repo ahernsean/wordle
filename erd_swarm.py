@@ -1377,6 +1377,10 @@ class _BranchWorker:
         bulk_done_candidates = self.queue.branch_bulk_done_candidates(branch_key)
         n_claims = completed_candidates - bulk_done_candidates
         cut = best_guess is None and cut_occurred
+        ceiling_proves_loss = (
+            cut and budget is not None and ceiling is not None
+            and math.isfinite(ceiling) and ceiling > budget
+        )
         if best_guess is not None:
             # Exact optimum.  A ceiling (if any) only pruned candidates proven
             # >= a value some candidate beat, so the result is universally
@@ -1399,6 +1403,18 @@ class _BranchWorker:
                         'max_depth=%s budget=%s%s', self.name, len(words),
                         best_guess, best_erd, max_depth, budget,
                         ' TAINTED' if tainted else '')
+        elif ceiling_proves_loss:
+            # A budget-feasible strategy has ERD <= budget.  Pricing every
+            # candidate out at a strictly larger ceiling therefore proves no
+            # budget-feasible strategy exists, including for tainted cuts.
+            self.score_cache.write_loss(branch_key, ERD_ALL, budget)
+            if self._adaptive and nodes_spent > 0:
+                self.queue.add_cost_sample(ERD_ALL, len(words), nodes_spent,
+                                           'cut', budget=budget, censored=1,
+                                           wall_millis=wall_millis)
+            logger.warning('%s finalized branch (%d words) as LOSS: ceiling '
+                           '%.4f exceeds budget=%s nodes=%d', self.name,
+                           len(words), ceiling, budget, nodes_spent)
         elif cut:
             # Every candidate priced out at >= the ceiling and none was proven
             # infeasible: a lower bound only ("true ERD >= ceiling").  That is
@@ -1450,14 +1466,14 @@ class _BranchWorker:
                 censored_units=censored_units, ceiling=ceiling,
                 bulk_done_candidates=bulk_done_candidates,
                 best_guess=best_guess, best_erd=best_erd,
-                outcome='cut' if cut else
-                        ('exact' if best_guess is not None else 'loss'))
+                outcome='loss' if ceiling_proves_loss else ('cut' if cut else
+                        ('exact' if best_guess is not None else 'loss')))
         except Exception:
             logger.exception(
                 '%s finalize telemetry failed for branch %s -- result '
                 'already published; continuing to cleanup', self.name,
                 branch_key[:25])
-        if cut:
+        if cut and not ceiling_proves_loss:
             # A cut satisfies the promoting parent but is not an exact result:
             # a user-queued row for this branch (normally impossible — pending
             # membership suppresses the ceiling at promotion — but reachable if
@@ -1607,8 +1623,8 @@ class _BranchWorker:
         it; the solve then ends either exact (best found below the ceiling —
         cached and returned as SOLVED) or cut (everything priced out at >=
         ceiling — returned as (OVER_ERD_LIMIT, bound, None, tainted) via the
-        cut_results channel, never cached; tainted carries the ceilinged
-        solve's floor taint into the consumer).  A branch that already exists with
+        cut_results channel unless its ceiling exceeds the budget, which proves
+        and caches a loss.  A branch that already exists with
         a TIGHTER ceiling than the caller's cannot serve this caller (its cut
         would prove too little); this method then returns None and the engine
         solves the frame inline under its own ceiling — always correct, just
@@ -1701,13 +1717,19 @@ class _BranchWorker:
                     self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
                 if reuse is not None:
                     return (SOLVED, *reuse)
+                loss_budget = self.score_cache.read_loss(branch_key, ERD_ALL)
+                if loss_budget is not None and budget <= loss_budget:
+                    return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                 cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                 if cut is not None:
                     return cut
                 if self.queue.get_branch(branch_key) is None:
-                    # Finalized + deleted: a cut lands in cut_results just
-                    # before the delete, so re-check once before concluding
-                    # the branch was a loss.
+                    # Finalized + deleted: a cut lands in cut_results and a
+                    # ceiling-proven loss lands in the score cache before the
+                    # delete, so re-check both before concluding a loss.
+                    loss_budget = self.score_cache.read_loss(branch_key, ERD_ALL)
+                    if loss_budget is not None and budget <= loss_budget:
+                        return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                     cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                     if cut is not None:
                         return cut

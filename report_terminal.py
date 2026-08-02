@@ -1129,8 +1129,10 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     finalizations = data.get("recent_finalizations", [])
     for finalization in finalizations:
         spine = finalization.get("spine") or "(spine unknown)"
+        proof = " ceiling-above-budget" if finalization.get("loss_proof") == \
+            "ceiling_above_budget" else ""
         telemetry_lines.append(_fit(
-            f"  {spine}  {finalization['outcome']} "
+            f"  {spine}  {finalization['outcome']}{proof} "
             f"epoch={finalization['epoch']} "
             f"nodes={_abbreviate_number(finalization['search_node_count'])} "
             f"evaluated={finalization['evaluated_candidate_count']} "

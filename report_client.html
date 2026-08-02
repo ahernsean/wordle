@@ -536,7 +536,8 @@
           const historical=row.epoch!==null&&activeEpoch!==null&&row.epoch!==activeEpoch;
           const card=element("article","card outcome-"+row.outcome+(historical?" historical":""));
           const title=element("div","card-title");
-          title.append(element("h3","",outcomeGloss[row.outcome]||row.outcome));
+          const outcomeTitle=row.loss_proof==="ceiling_above_budget"?"Loss: ceiling proves unsolvable within budget":(outcomeGloss[row.outcome]||row.outcome);
+          title.append(element("h3","",outcomeTitle));
           if(historical)title.append(element("span","chip historical","Historical"));
           card.append(title);
           const spineSteps=spineFromText(row.spine);
@@ -552,7 +553,8 @@
               facts.push("solution not recorded");
             }
           }
-          if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
+          if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdValue(row.ceiling,row.answer_count,{ceiling:true})+" exceeds budget "+valueOrDash(row.budget));
+          else if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
           facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.bulk_completed_candidate_count)+" bulk proofs",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
           if(row.wall_millis)facts.push(numText(row.wall_millis)+" ms");
