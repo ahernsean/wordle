@@ -99,6 +99,27 @@ class TestBranchLifecycle(_TmpQueue):
                                     "pending_branches is missing column"):
             ERDQueue(queue_path)
 
+    def test_source_work_migration_preserves_root_pattern_idempotently(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
+        self.q._conn.execute("DELETE FROM branch_source_work")
+        self.q._conn.execute("DELETE FROM source_work")
+        self.q.close()
+
+        migrated = ERDQueue(self.queue_path)
+        try:
+            claimed = migrated.claim_next("worker-0")
+            self.assertEqual(claimed["source_pattern"], 42)
+            self.assertEqual(claimed["source_word"], "crane")
+        finally:
+            migrated.close()
+
+        reopened = ERDQueue(self.queue_path)
+        try:
+            self.assertEqual(len(reopened.source_work_rows()), 1)
+            self.assertEqual(reopened.source_work_rows()[0]["root_count"], 1)
+        finally:
+            reopened.close()
+
     def test_get_branch_returns_row(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
         row = self.q.get_branch(self.key)
