@@ -974,6 +974,32 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['source_word'], "crane")
         self.assertTrue(indices)
 
+    def test_stale_worker_preserves_owner_when_joining_source_active_branch(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        stale_worker = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        q = ERDQueue(self.queue_path)
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        q.add_pending_many([(branch_key, len(BRANCH), 7, "crane", 0)])
+        source_work_id = q.source_work_rows()[0]["source_work_id"]
+        q.close()
+
+        promoting_worker = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNotNone(promoting_worker.claim_one())
+        finally:
+            promoting_worker.close()
+        try:
+            result = stale_worker.claim_one()
+        finally:
+            stale_worker.close()
+
+        self.assertIsNotNone(result)
+        branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch['branch_key'], branch_key)
+        self.assertEqual(branch['source_work_id'], source_work_id)
+        self.assertTrue(indices)
+
     def test_claim_one_joins_existing_in_progress_branch(self):
         from erd_queue import ERDQueue
         branch_key = ScoreCache.encode_subset(BRANCH)

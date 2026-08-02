@@ -120,6 +120,27 @@ class TestBranchLifecycle(_TmpQueue):
         finally:
             reopened.close()
 
+    def test_source_work_migration_marks_terminal_roots_complete(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
+        self.q.mark_done(self.key)
+        self.q._conn.execute("DELETE FROM branch_source_work")
+        self.q._conn.execute("DELETE FROM source_work")
+        self.q.close()
+
+        migrated = ERDQueue(self.queue_path)
+        try:
+            rows = migrated.source_work_rows()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["state"], "complete")
+        finally:
+            migrated.close()
+
+        reopened = ERDQueue(self.queue_path)
+        try:
+            self.assertEqual(reopened.source_work_rows()[0]["state"], "complete")
+        finally:
+            reopened.close()
+
     def test_get_branch_returns_row(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
         row = self.q.get_branch(self.key)

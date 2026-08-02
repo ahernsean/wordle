@@ -1072,19 +1072,22 @@ class ERDQueue:
         pending_columns = {row["name"] for row in self._conn.execute(
             "PRAGMA table_info(pending_branches)")}
         if (self._conn.execute("SELECT COUNT(*) FROM source_work").fetchone()[0] == 0
-                and {"branch_id", "source_word", "priority"} <= pending_columns):
+                and {"branch_id", "source_word", "priority", "status"}
+                <= pending_columns):
             legacy_roots = self._conn.execute("""
-                SELECT branch_id, source_word, priority
+                SELECT branch_id, source_word, priority, status
                 FROM pending_branches
                 ORDER BY branch_id
             """).fetchall()
             now = int(time.time())
             for offset, row in enumerate(legacy_roots):
+                state = ({"done": "complete", "in_progress": "active"}
+                         .get(row["status"], "queued"))
                 cur = self._conn.execute("""
                     INSERT INTO source_work
                         (source_word, requested_priority, requested_at, state)
-                    VALUES (?, ?, ?, 'queued')
-                """, (row["source_word"], row["priority"], now + offset))
+                    VALUES (?, ?, ?, ?)
+                """, (row["source_word"], row["priority"], now + offset, state))
                 self._conn.execute("""
                     INSERT OR IGNORE INTO branch_source_work
                         (branch_id, source_work_id, parent_branch_id)
@@ -2446,6 +2449,19 @@ class ERDQueue:
             parameters.append(source_work_id)
         query += " ORDER BY a.n_words DESC"
         return self._conn.execute(query, parameters).fetchall()
+
+    def direct_branches_in_progress(self):
+        """Open branches that have no source-work ownership."""
+        return self._conn.execute("""
+            SELECT a.*, b.branch_key FROM active_branches a
+            JOIN branches b ON b.branch_id = a.branch_id
+            WHERE a.status = 'open'
+              AND NOT EXISTS (
+                  SELECT 1 FROM branch_source_work m
+                  WHERE m.branch_id = a.branch_id
+              )
+            ORDER BY a.n_words DESC
+        """).fetchall()
 
     def recover_active_branches(self):
         """Free stale in-flight claims after a restart; completed work survives.

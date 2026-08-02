@@ -1820,7 +1820,8 @@ class _BranchWorker:
         """
         claimed = None
         if not self._source_work_enabled:
-            direct_work = self._claim_active_branch(self.queue.branches_in_progress())
+            direct_work = self._claim_active_branch(
+                self.queue.direct_branches_in_progress())
             if direct_work is not None:
                 return direct_work
             self._source_work_enabled = self.queue.has_source_work()
@@ -1852,7 +1853,7 @@ class _BranchWorker:
             # A queue upgraded while active work is present can carry branches
             # from before source lineage was recorded.  They remain claimable
             # until finalization; new work always follows source-first order.
-            return self._claim_active_branch(self.queue.branches_in_progress())
+            return self._claim_active_branch(self.queue.direct_branches_in_progress())
 
         n_words = claimed['n_words']
         self.queue.create_branch(
