@@ -365,6 +365,10 @@ class _MidLoopPublisher:
         if not joinable:
             token[5] = False
             return None
+        if not created and getattr(self._worker, '_top_source_work_id', None) is not None:
+            self._worker.queue.attach_branch_source_work(
+                branch_key, self._worker._top_source_work_id,
+                getattr(self._worker, '_claimed_branch_key', None))
 
         # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
         # tuned offline; the node-proportionate path is the model working as
@@ -1050,7 +1054,8 @@ class _BranchWorker:
         self._packing_stats_cache[branch_key] = result
         return result
 
-    def _claim_bundle(self, branch_key, n_candidates, words):
+    def _claim_bundle(self, branch_key, n_candidates, words,
+                      require_unowned=False):
         """claim_next_bundle for `branch_key`, supplying this worker's
         (cached) packing stats.  Returns (bundle_id, indices, forced) or None
         — see ERDQueue.claim_next_bundle.
@@ -1063,7 +1068,7 @@ class _BranchWorker:
         return self.queue.claim_next_bundle(
             branch_key, self.name, n_candidates, order, cost_lower_bound,
             small_count=self.small_count, count_cap=self.count_cap,
-            republish_limit=self.republish_limit)
+            republish_limit=self.republish_limit, require_unowned=require_unowned)
 
     # -- evaluate one candidate claim ---------------------------------------
 
@@ -1726,6 +1731,10 @@ class _BranchWorker:
                     if row_ceiling is not None and (
                             ours is None or not erd_ge(row_ceiling, ours, n_words)):
                         return None
+                    if getattr(self, '_top_source_work_id', None) is not None:
+                        self.queue.attach_branch_source_work(
+                            branch_key, self._top_source_work_id,
+                            getattr(self, '_claimed_branch_key', None))
             # Descents into this branch promote grandchildren relative to its spine.
             self._claimed_branch_spine = child_spine
 
@@ -1790,12 +1799,15 @@ class _BranchWorker:
 
     # -- scheduling: claim one candidate from the best available branch ------
 
-    def _claim_active_branch(self, branches, source_work_id=None):
+    def _claim_active_branch(self, branches, source_work_id=None,
+                             require_unowned=False):
         """Claim a candidate bundle from an open branch, if one is available."""
         for active_branch in branches:
             branch_key = bytes(active_branch['branch_key'])
             words = decode_subset(branch_key)
-            claim = self._claim_bundle(branch_key, active_branch['n_candidates'], words)
+            claim = self._claim_bundle(
+                branch_key, active_branch['n_candidates'], words,
+                require_unowned=require_unowned)
             if claim is not None:
                 branch = dict(active_branch)
                 if source_work_id is not None:
@@ -1821,7 +1833,7 @@ class _BranchWorker:
         claimed = None
         if not self._source_work_enabled:
             direct_work = self._claim_active_branch(
-                self.queue.direct_branches_in_progress())
+                self.queue.direct_branches_in_progress(), require_unowned=True)
             if direct_work is not None:
                 return direct_work
             self._source_work_enabled = self.queue.has_source_work()
@@ -1853,7 +1865,8 @@ class _BranchWorker:
             # A queue upgraded while active work is present can carry branches
             # from before source lineage was recorded.  They remain claimable
             # until finalization; new work always follows source-first order.
-            return self._claim_active_branch(self.queue.direct_branches_in_progress())
+            return self._claim_active_branch(
+                self.queue.direct_branches_in_progress(), require_unowned=True)
 
         n_words = claimed['n_words']
         self.queue.create_branch(

@@ -64,6 +64,20 @@ class TestBranchLifecycle(_TmpQueue):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self.assertFalse(self.q.create_branch(self.key, len(WORDS), N_CANDIDATES))
 
+    def test_losing_create_does_not_attach_incompatible_source_work(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
+        source_a = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             budget=4, source_work_id=source_a)
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "slate", 42)])
+        source_b = max(row["source_work_id"] for row in self.q.source_work_rows())
+
+        self.assertFalse(self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES,
+            budget=5, source_work_id=source_b))
+        self.assertEqual(self.q.branches_in_progress(source_b), [])
+
     def test_malformed_pending_schema_reports_schema_drift(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
         queue_path = self.queue_path

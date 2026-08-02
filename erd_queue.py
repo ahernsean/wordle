@@ -1669,7 +1669,7 @@ class ERDQueue:
         """, (branch_id, n_words, n_candidates,
               priority, source_word, source_pattern, now, budget, spine,
               ceiling))
-        if source_work_id is not None:
+        if source_work_id is not None and cur.rowcount:
             parent_branch_id = (self._intern_branch(parent_branch_key)
                                 if parent_branch_key is not None else None)
             self._conn.execute("""
@@ -1678,6 +1678,31 @@ class ERDQueue:
                 VALUES (?, ?, ?, NULL)
             """, (branch_id, source_work_id, parent_branch_id))
         return cur.rowcount == 1
+
+    def attach_branch_source_work(self, branch_key, source_work_id,
+                                  parent_branch_key=None) -> bool:
+        """Attach source ownership to a surviving open branch."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            branch_id = self._intern_branch(branch_key)
+            active = branch_id is not None and self._conn.execute(
+                "SELECT 1 FROM active_branches WHERE branch_id = ? AND status = 'open'",
+                (branch_id,)).fetchone()
+            if not active:
+                self._conn.execute("COMMIT")
+                return False
+            parent_branch_id = (self._intern_branch(parent_branch_key)
+                                if parent_branch_key is not None else None)
+            self._conn.execute("""
+                INSERT OR IGNORE INTO branch_source_work
+                    (branch_id, source_work_id, parent_branch_id, root_pattern)
+                VALUES (?, ?, ?, NULL)
+            """, (branch_id, source_work_id, parent_branch_id))
+            self._conn.execute("COMMIT")
+            return True
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
 
     def get_branch(self, branch_key):
         branch_id = self._intern_branch(branch_key)
@@ -1691,7 +1716,8 @@ class ERDQueue:
                           candidate_order, cost_lower_bound,
                           small_count=DEFAULT_SMALL_COUNT,
                           count_cap=DEFAULT_COUNT_CAP,
-                          republish_limit=DEFAULT_REPUBLISH_LIMIT):
+                          republish_limit=DEFAULT_REPUBLISH_LIMIT,
+                          require_unowned=False):
         """Atomically bulk-complete eliminations and claim a survivor bundle.
 
         Runs the exact-elimination classification from
@@ -1773,6 +1799,11 @@ class ERDQueue:
                 "FROM active_branches "
                 "WHERE branch_id = ?", (branch_id,)).fetchone()
             if br is None or br["status"] != "open":
+                self._conn.execute("COMMIT")
+                return None
+            if require_unowned and self._conn.execute(
+                    "SELECT 1 FROM branch_source_work WHERE branch_id = ?",
+                    (branch_id,)).fetchone() is not None:
                 self._conn.execute("COMMIT")
                 return None
             # The branch ceiling is a bound like any achieved best: candidates
