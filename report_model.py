@@ -37,6 +37,15 @@ DEFAULT_TREE_PAGE_SIZE = 10
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
 
+def _open_report_queue(sources):
+    """Open the initialized queue for report reads without schema writes."""
+    return ERDQueue(
+        sources.queue_path,
+        telemetry_path=sources.telemetry_path,
+        initialize_schema=False,
+    )
+
+
 def disk_fill_rate(samples, now):
     """Return the fitted bytes-per-second filesystem fill rate."""
     fresh_samples = [sample for sample in samples if now - sample[0] <= 900]
@@ -620,7 +629,7 @@ def _empty_data():
 def _queue_overview(sources, generated_at, answer_set, report):
     queue = None
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        queue = _open_report_queue(sources)
         report["sources"]["telemetry"]["ok"] = True
         counts = queue.counts_by_status()
         heartbeats = list(queue.heartbeats_with_branch())
@@ -962,7 +971,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     worker_counts = {}
     queue = None
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        queue = _open_report_queue(sources)
         pending_rows = queue.status_by_branch_keys(branch_keys)
         active_rows = queue.active_branches_by_keys(branch_keys)
         worker_counts = queue.worker_counts_by_branch(WORKER_LIVENESS_SECONDS)
@@ -1220,7 +1229,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     except (sqlite3.Error, OSError) as error:
         cache_error = error
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        queue = _open_report_queue(sources)
         if request.branch_target.kind == "branch_reference":
             referenced_row = resolve_branch_reference(
                 queue, request.branch_target.branch_reference, cache
@@ -1484,7 +1493,7 @@ def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict
     )
     queue = None
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        queue = _open_report_queue(sources)
         rows, _prefix = _scoped_queue_rows(queue, request)
         data["summary"] = _collection_summary(rows)
         data["matched_rows"] = len(rows)
@@ -1665,7 +1674,7 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
     )
     queue = None
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        queue = _open_report_queue(sources)
         filtered_rows, prefix = _scoped_queue_rows(queue, request, True)
         unfiltered_rows = filtered_rows
         if request.branch_target.kind in ("branch", "branch_reference"):
@@ -1710,13 +1719,7 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
     )
     queue = None
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
-        scoped_rows, _prefix = _scoped_queue_rows(queue, request)
-        scoped_keys = {row["branch_key_hex"] for row in scoped_rows}
-        workers = [
-            _normalize_worker(row, generated_at, answer_set)
-            for row in queue.heartbeats_with_branch()
-        ]
+        queue = _open_report_queue(sources)
         filters_have_branch_scope = any((
             request.filters.branch_statuses,
             request.filters.branch_phases,
@@ -1725,6 +1728,17 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
             request.filters.budget is not None,
             request.filters.priority is not None,
         ))
+        if request.branch_target.kind == "root" and not filters_have_branch_scope:
+            scoped_rows = queue.report_queue_rows({
+                "branch_statuses": ("active",),
+            })["rows"]
+        else:
+            scoped_rows, _prefix = _scoped_queue_rows(queue, request)
+        scoped_keys = {row["branch_key_hex"] for row in scoped_rows}
+        workers = [
+            _normalize_worker(row, generated_at, answer_set)
+            for row in queue.heartbeats_with_branch()
+        ]
         if request.branch_target.kind != "root" or filters_have_branch_scope:
             workers = [
                 worker for worker in workers
@@ -1914,7 +1928,7 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
     )
     queue = None
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        queue = _open_report_queue(sources)
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
@@ -2019,7 +2033,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     )
     queue = None
     try:
-        queue = ERDQueue(sources.queue_path, telemetry_path=sources.telemetry_path)
+        queue = _open_report_queue(sources)
         epoch = queue.epoch if request.epoch is None else request.epoch
         current_fields = {"nodes", "age", "size", "workers", "priority", "slowest"}
         if field in current_fields:

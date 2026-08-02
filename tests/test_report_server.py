@@ -7,11 +7,13 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from erd_queue import ERDQueue
 from report_model import ReportSources, collect_report
 from report_server import (
     FIXTURE_FILENAMES,
@@ -79,7 +81,22 @@ class ReportServerTest(unittest.TestCase):
             self.guess_list_path,
             os.path.join(directory, "telemetry.sqlite3"),
         )
+        queue = ERDQueue(
+            self.sources.queue_path, telemetry_path=self.sources.telemetry_path
+        )
+        queue.close()
         self.live_configuration = ServerConfiguration(self.sources, CLIENT_PATH)
+
+    def test_everyday_reports_return_within_one_second(self):
+        configuration = ServerConfiguration(
+            self.sources, CLIENT_PATH, None, None
+        )
+        with running_server(configuration) as base_url:
+            for path in ("/api/view", "/api/view/queue", "/api/view/workers"):
+                started_at = time.monotonic()
+                status, _, _ = request(base_url, path)
+                self.assertEqual(status, 200)
+                self.assertLess(time.monotonic() - started_at, 1.0, path)
 
     def test_live_root_contract_matches_direct_collection_shape(self):
         disk = {

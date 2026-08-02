@@ -590,7 +590,7 @@ class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
     def __init__(self, db_path: str, timeout: float = 30.0,
-                 telemetry_path: str = None):
+                 telemetry_path: str = None, initialize_schema: bool = True):
         self.db_path = db_path
         self._timeout = timeout
         self._conn = sqlite3.connect(db_path, timeout=timeout,
@@ -600,11 +600,14 @@ class ERDQueue:
             telemetry_path = derive_telemetry_path(db_path)
         self.telemetry_path = telemetry_path
         self._conn.execute("ATTACH DATABASE ? AS telemetry", (telemetry_path,))
-        self._conn.executescript(_QUEUE_SCHEMA_SQL)
-        self._conn.executescript(_TELEMETRY_SCHEMA_SQL)
-        self._absorb_legacy_telemetry_tables()
-        self._migrate()
-        self._assert_schema()
+        if initialize_schema:
+            self._conn.executescript(_QUEUE_SCHEMA_SQL)
+            self._conn.executescript(_TELEMETRY_SCHEMA_SQL)
+            self._absorb_legacy_telemetry_tables()
+            self._migrate()
+            self._assert_schema()
+        else:
+            self._conn.execute("PRAGMA query_only = ON")
         # Active epoch, read once: workers open the queue after the supervisor has
         # stamped run_meta.epoch, and are restarted across a cutover, so caching
         # here is safe and keeps every telemetry insert off a per-row SELECT.
@@ -2419,21 +2422,34 @@ class ERDQueue:
             WHEN pending_status IS NULL AND active_status IS NULL THEN 'unqueued'
             WHEN worker_count > 0 THEN 'active'
             ELSE 'pending' END"""
+        active_only = branch_statuses == ("active",)
+        completed_query = """
+                SELECT branch_id, COUNT(*) AS completed_candidate_count
+                FROM candidate_claims WHERE done = 1 GROUP BY branch_id
+        """
+        if active_only:
+            completed_query = """
+                SELECT branch_id, COUNT(*) AS completed_candidate_count
+                FROM candidate_claims
+                WHERE done = 1 AND branch_id IN (
+                    SELECT branch_id FROM workers
+                )
+                GROUP BY branch_id
+            """
         base_query = f"""
             WITH branch_ids AS (
                 SELECT branch_id FROM pending_branches
                 UNION
                 SELECT branch_id FROM active_branches
             ),
-            completed AS (
-                SELECT branch_id, COUNT(*) AS completed_candidate_count
-                FROM candidate_claims WHERE done = 1 GROUP BY branch_id
-            ),
             workers AS (
                 SELECT current_branch_id AS branch_id, COUNT(*) AS worker_count
                 FROM worker_heartbeat
                 WHERE current_branch_id IS NOT NULL AND updated_at >= ?
                 GROUP BY current_branch_id
+            ),
+            completed AS (
+                {completed_query}
             ),
             source_rows AS (
                 SELECT registry.branch_key,
