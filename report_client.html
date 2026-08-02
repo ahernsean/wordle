@@ -536,7 +536,7 @@
           const historical=row.epoch!==null&&activeEpoch!==null&&row.epoch!==activeEpoch;
           const card=element("article","card outcome-"+row.outcome+(historical?" historical":""));
           const title=element("div","card-title");
-          const outcomeTitle=row.loss_proof==="ceiling_above_budget"?"Loss: ceiling proves unsolvable within budget":(outcomeGloss[row.outcome]||row.outcome);
+          const outcomeTitle=row.loss_proof==="ceiling_above_budget"?"Loss: unsolvable within budget":(outcomeGloss[row.outcome]||row.outcome);
           title.append(element("h3","",outcomeTitle));
           if(historical)title.append(element("span","chip historical","Historical"));
           card.append(title);

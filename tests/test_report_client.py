@@ -612,7 +612,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("Loss: ceiling proves unsolvable within budget", text)
+        self.assertIn("Loss: unsolvable within budget", text)
         self.assertIn("ERD lower bound 3.250 26/8 exceeds budget 3", text)
 
     def test_exact_finalization_shows_recorded_solution(self):

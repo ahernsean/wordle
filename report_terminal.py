@@ -1129,7 +1129,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     finalizations = data.get("recent_finalizations", [])
     for finalization in finalizations:
         spine = finalization.get("spine") or "(spine unknown)"
-        proof = " ceiling-above-budget" if finalization.get("loss_proof") == \
+        proof = " unsolvable-within-budget" if finalization.get("loss_proof") == \
             "ceiling_above_budget" else ""
         telemetry_lines.append(_fit(
             f"  {spine}  {finalization['outcome']}{proof} "

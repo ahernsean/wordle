@@ -847,7 +847,7 @@ class CandidateSweepBarTest(unittest.TestCase):
                 "bulk_completed_candidate_count": 0,
             }],
         }
-        self.assertIn("loss ceiling-above-budget", render_report(report, width=100))
+        self.assertIn("loss unsolvable-within-budget", render_report(report, width=100))
 
 
 class CollectionRendererTest(unittest.TestCase):
