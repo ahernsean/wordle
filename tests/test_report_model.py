@@ -51,6 +51,7 @@ class ReportModelTest(unittest.TestCase):
             candidate_list_path=self.candidate_list_path,
             telemetry_path=self.telemetry_path,
         )
+        self._open_queue().close()
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -509,6 +510,37 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(
             report["data"]["branches"][0]["completed_candidate_indexes"], [1, 3]
         )
+
+    def test_active_report_rows_ignore_inactive_claim_history(self):
+        now = int(time.time())
+        active_branch_key = b"active-branch"
+        inactive_branch_key = b"inactive-branch"
+        queue = self._open_queue()
+        queue.create_branch(active_branch_key, 3, 5)
+        queue.heartbeat("worker-1", 1, active_branch_key, 3, now, 0)
+        queue.create_branch(inactive_branch_key, 3, 100_000)
+        inactive_branch_id = queue._intern_branch(inactive_branch_key)
+        queue._conn.execute("BEGIN")
+        queue._conn.executemany(
+            "INSERT INTO candidate_claims "
+            "(branch_id, idx, claimed_by, claimed_at, done, done_at) "
+            "VALUES (?, ?, 'worker-2', ?, 1, ?)",
+            (
+                (inactive_branch_id, candidate_index, now, now)
+                for candidate_index in range(100_000)
+            ),
+        )
+        queue._conn.execute("COMMIT")
+
+        started_at = time.monotonic()
+        result = queue.report_queue_rows({"branch_statuses": ("active",)})
+        elapsed_seconds = time.monotonic() - started_at
+        queue.close()
+
+        self.assertEqual(
+            [row["branch_key"] for row in result["rows"]], [active_branch_key]
+        )
+        self.assertLess(elapsed_seconds, 1.0)
 
     def test_branch_report_lists_live_off_branch_claim_holders(self):
         now = int(time.time())

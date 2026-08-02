@@ -52,6 +52,7 @@ class SemanticReportTest(unittest.TestCase):
             self.candidate_list_path,
             self.telemetry_path,
         )
+        ERDQueue(self.queue_path, telemetry_path=self.telemetry_path).close()
 
     def tearDown(self):
         self.temporary_directory.cleanup()
