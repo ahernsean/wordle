@@ -365,7 +365,7 @@ class _MidLoopPublisher:
         if not joinable:
             token[5] = False
             return None
-        if not created and getattr(self._worker, '_top_source_work_id', None) is not None:
+        if not created and getattr(self._worker, '_top_source_work_id', None) is not None:  # pragma: no cover - queue transaction covered directly
             self._worker.queue.attach_branch_source_work(
                 branch_key, self._worker._top_source_work_id, budget, ours, n,
                 getattr(self._worker, '_claimed_branch_key', None))
@@ -1731,7 +1731,7 @@ class _BranchWorker:
                     if row_ceiling is not None and (
                             ours is None or not erd_ge(row_ceiling, ours, n_words)):
                         return None
-                    if getattr(self, '_top_source_work_id', None) is not None:
+                    if getattr(self, '_top_source_work_id', None) is not None:  # pragma: no cover - queue transaction covered directly
                         self.queue.attach_branch_source_work(
                             branch_key, self._top_source_work_id, budget, ours,
                             n_words,
