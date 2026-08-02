@@ -971,6 +971,31 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], branch_key)
         self.assertTrue(indices)
 
+    def test_claim_one_joins_active_source_work_branch(self):
+        from erd_queue import ERDQueue
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(branch_key, len(BRANCH), 3, "crane", 0)])
+        q.close()
+
+        first = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNotNone(first.claim_one())
+        finally:
+            first.close()
+
+        second = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        try:
+            result = second.claim_one()
+        finally:
+            second.close()
+
+        self.assertIsNotNone(result)
+        branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch['branch_key'], branch_key)
+        self.assertTrue(indices)
+
     def test_claim_one_finalizes_completed_direct_branch(self):
         from erd_queue import ERDQueue
         branch_key = ScoreCache.encode_subset(BRANCH)

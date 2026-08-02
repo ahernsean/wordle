@@ -459,7 +459,9 @@ class TestClaimNext(_TmpQueue):
         self.assertEqual(second["source_word"], "crane")
 
     def test_source_priority_updates_active_and_pending_membership(self):
+        self.assertFalse(self.q.has_source_work())
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
+        self.assertTrue(self.q.has_source_work())
         claimed = self.q.claim_next("worker-0")
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
                              priority=claimed["priority"],
@@ -468,6 +470,9 @@ class TestClaimNext(_TmpQueue):
             claimed["source_work_id"], 9))
         self.assertEqual(self.q.get_branch(self.key)["priority"], 9)
         self.assertEqual(self.q.source_work_candidates()[0]["requested_priority"], 9)
+        rows = self.q.source_work_rows()
+        self.assertEqual(rows[0]["root_count"], 1)
+        self.assertEqual(rows[0]["branch_count"], 1)
 
 
 class TestCostModel(_TmpQueue):
