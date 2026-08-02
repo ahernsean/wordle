@@ -197,6 +197,31 @@ CREATE TABLE IF NOT EXISTS pending_branches (
 CREATE INDEX IF NOT EXISTS idx_pending_status_pri_n
     ON pending_branches(status, priority DESC, n_words DESC);
 
+-- A user request to precache the response branches of one source guess.  A
+-- request remains distinct even when it shares roots with an earlier request.
+CREATE TABLE IF NOT EXISTS source_work (
+    source_work_id     INTEGER PRIMARY KEY,
+    source_word        TEXT,
+    requested_priority INTEGER NOT NULL,
+    requested_at       INTEGER NOT NULL,
+    state              TEXT    NOT NULL DEFAULT 'queued'
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_work_priority_order
+    ON source_work(requested_priority DESC, source_work_id);
+
+-- Every source-work request that owns a branch.  parent_branch_id records the
+-- source-local promotion lineage; NULL identifies a requested root.
+CREATE TABLE IF NOT EXISTS branch_source_work (
+    branch_id      INTEGER NOT NULL REFERENCES branches(branch_id),
+    source_work_id INTEGER NOT NULL REFERENCES source_work(source_work_id),
+    parent_branch_id INTEGER REFERENCES branches(branch_id),
+    PRIMARY KEY (branch_id, source_work_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_branch_source_work_source
+    ON branch_source_work(source_work_id, branch_id);
+
 -- One row per worker, overwritten each heartbeat.  In the swarm model a
 -- worker is a fungible contributor: it reports which branch and claim it is
 -- on purely so the operator can see it is alive and moving (health), not as
@@ -1040,6 +1065,31 @@ class ERDQueue:
                 "ALTER TABLE worker_heartbeat "
                 "RENAME COLUMN current_branch_key TO current_branch_id")
 
+        # Pre-source-aware queues recorded only a display label on each root.
+        # Preserve each surviving root as independently schedulable source work;
+        # its original request grouping cannot be recovered from those labels.
+        pending_columns = {row["name"] for row in self._conn.execute(
+            "PRAGMA table_info(pending_branches)")}
+        if (self._conn.execute("SELECT COUNT(*) FROM source_work").fetchone()[0] == 0
+                and {"branch_id", "source_word", "priority"} <= pending_columns):
+            legacy_roots = self._conn.execute("""
+                SELECT branch_id, source_word, priority
+                FROM pending_branches
+                ORDER BY branch_id
+            """).fetchall()
+            now = int(time.time())
+            for offset, row in enumerate(legacy_roots):
+                cur = self._conn.execute("""
+                    INSERT INTO source_work
+                        (source_word, requested_priority, requested_at, state)
+                    VALUES (?, ?, ?, 'queued')
+                """, (row["source_word"], row["priority"], now + offset))
+                self._conn.execute("""
+                    INSERT OR IGNORE INTO branch_source_work
+                        (branch_id, source_work_id, parent_branch_id)
+                    VALUES (?, ?, NULL)
+                """, (row["branch_id"], cur.lastrowid))
+
         # Claims bundle index on the (post-normalization) branch_id key.  After
         # the ADD COLUMN and rebuild above, so bundle_id and branch_id both
         # exist whether the database is fresh, upgraded, or already migrated.
@@ -1261,6 +1311,17 @@ class ERDQueue:
                      r[4]) for r in rows]
         self._conn.execute("BEGIN")
         try:
+            now = int(time.time())
+            source_work_ids = {}
+            for _branch_id, _n_words, priority, source_word, _source_pattern in prepared:
+                key = (source_word, priority)
+                if key not in source_work_ids:
+                    cur = self._conn.execute("""
+                        INSERT INTO source_work
+                            (source_word, requested_priority, requested_at, state)
+                        VALUES (?, ?, ?, 'queued')
+                    """, (source_word, priority, now))
+                    source_work_ids[key] = cur.lastrowid
             self._conn.executemany("""
                 INSERT INTO pending_branches
                     (branch_id, n_words, priority, source_word, source_pattern, status)
@@ -1270,6 +1331,13 @@ class ERDQueue:
                     source_word    = COALESCE(source_word, excluded.source_word),
                     source_pattern = COALESCE(source_pattern, excluded.source_pattern)
             """, prepared)
+            self._conn.executemany("""
+                INSERT OR IGNORE INTO branch_source_work
+                    (branch_id, source_work_id, parent_branch_id)
+                VALUES (?, ?, NULL)
+            """, [(branch_id, source_work_ids[(source_word, priority)])
+                  for branch_id, _n_words, priority, source_word, _source_pattern
+                  in prepared])
             self._conn.execute("COMMIT")
             self._tally_wal_traffic(
                 'pending_branches/add', len(prepared),
@@ -1282,7 +1350,23 @@ class ERDQueue:
     # Worker claim loop
     # ------------------------------------------------------------------
 
-    def claim_next(self, worker_id: str):
+    def source_work_candidates(self):
+        """Return unfinished source work in source-first admission order."""
+        return self._conn.execute("""
+            SELECT s.* FROM source_work s
+            WHERE EXISTS (
+                SELECT 1 FROM branch_source_work m
+                LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
+                LEFT JOIN active_branches a ON a.branch_id = m.branch_id
+                WHERE m.source_work_id = s.source_work_id
+                  AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
+            )
+            ORDER BY s.requested_priority DESC,
+                     CASE s.state WHEN 'active' THEN 0 ELSE 1 END,
+                     s.source_work_id
+        """).fetchall()
+
+    def claim_next(self, worker_id: str, source_work_id: int = None):
         """Atomically claim the highest-priority / largest pending branch.
 
         Returns a dict {branch_key, n_words, priority, source_word,
@@ -1298,15 +1382,26 @@ class ERDQueue:
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            if source_work_id is None:
+                source_rows = self.source_work_candidates()
+                source_work_id = (source_rows[0]["source_work_id"]
+                                  if source_rows else None)
+            if source_work_id is None:
+                self._conn.execute("COMMIT")
+                return None
             row = self._conn.execute("""
-                SELECT b.branch_key, p.branch_id, p.n_words, p.priority,
-                       p.source_word, p.source_pattern
+                SELECT b.branch_key, p.branch_id, p.n_words,
+                       s.requested_priority, p.source_word, p.source_pattern,
+                       s.source_work_id
                 FROM pending_branches p
                 JOIN branches b ON b.branch_id = p.branch_id
+                JOIN branch_source_work m ON m.branch_id = p.branch_id
+                JOIN source_work s ON s.source_work_id = m.source_work_id
                 WHERE p.status = 'pending'
-                ORDER BY p.priority DESC, p.n_words DESC
+                  AND s.source_work_id = ?
+                ORDER BY p.n_words DESC
                 LIMIT 1
-            """).fetchone()
+            """, (source_work_id,)).fetchone()
             if row is None:
                 self._conn.execute("COMMIT")
                 return None
@@ -1316,13 +1411,17 @@ class ERDQueue:
                 SET status = 'in_progress', claimed_by = ?, claimed_at = ?
                 WHERE branch_id = ?
             """, (worker_id, now, row["branch_id"]))
+            self._conn.execute(
+                "UPDATE source_work SET state = 'active' WHERE source_work_id = ?",
+                (source_work_id,))
             self._conn.execute("COMMIT")
             return {
                 'branch_key': bytes(row["branch_key"]),
                 'n_words': row["n_words"],
-                'priority': row["priority"],
+                'priority': row["requested_priority"],
                 'source_word': row["source_word"],
                 'source_pattern': row["source_pattern"],
+                'source_work_id': row["source_work_id"],
             }
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
@@ -1338,6 +1437,21 @@ class ERDQueue:
             SET status = 'done', completed_at = ?
             WHERE branch_id = ?
         """, (now, branch_id))
+        self._complete_finished_source_work()
+
+    def _complete_finished_source_work(self):
+        """Mark source requests terminal once every owned branch is complete."""
+        self._conn.execute("""
+            UPDATE source_work AS s SET state = 'complete'
+            WHERE state != 'complete'
+              AND NOT EXISTS (
+                  SELECT 1 FROM branch_source_work m
+                  LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
+                  LEFT JOIN active_branches a ON a.branch_id = m.branch_id
+                  WHERE m.source_work_id = s.source_work_id
+                    AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
+              )
+        """)
 
     def reset_stale_in_progress(self) -> int:
         """Reset any 'in_progress' rows back to 'pending'.
@@ -1489,7 +1603,8 @@ class ERDQueue:
     def create_branch(self, branch_key, n_words, n_candidates,
                       priority=0, source_word=None, source_pattern=None,
                       budget=None, spine=None, root_budget=None,
-                      ceiling=None) -> bool:
+                      ceiling=None, source_work_id=None,
+                      parent_branch_key=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
         Idempotent via INSERT OR IGNORE: the worker that promoted the branch
@@ -1528,6 +1643,14 @@ class ERDQueue:
         """, (branch_id, n_words, n_candidates,
               priority, source_word, source_pattern, now, budget, spine,
               ceiling))
+        if source_work_id is not None:
+            parent_branch_id = (self._intern_branch(parent_branch_key)
+                                if parent_branch_key is not None else None)
+            self._conn.execute("""
+                INSERT OR IGNORE INTO branch_source_work
+                    (branch_id, source_work_id, parent_branch_id)
+                VALUES (?, ?, ?)
+            """, (branch_id, source_work_id, parent_branch_id))
         return cur.rowcount == 1
 
     def get_branch(self, branch_key):
@@ -2231,6 +2354,7 @@ class ERDQueue:
         if branch_id is not None:
             self._conn.execute(
                 "DELETE FROM active_branches WHERE branch_id = ?", (branch_id,))
+            self._complete_finished_source_work()
 
     def reclaim_stale_claims(self, heartbeat_timeout_seconds: int,
                              min_claim_age_seconds: int = None) -> int:
@@ -2284,14 +2408,21 @@ class ERDQueue:
             'candidate_claims/reclaim-worker', n, n * _CLAIM_ROW_WAL_BYTES)
         return n
 
-    def branches_in_progress(self):
+    def branches_in_progress(self, source_work_id=None):
         """Open branches, highest priority first — for swarm scheduling."""
-        return self._conn.execute("""
+        query = """
             SELECT a.*, b.branch_key FROM active_branches a
             JOIN branches b ON b.branch_id = a.branch_id
-            WHERE a.status = 'open'
-            ORDER BY a.priority DESC, a.n_words DESC
-        """).fetchall()
+        """
+        parameters = []
+        if source_work_id is not None:
+            query += " JOIN branch_source_work m ON m.branch_id = a.branch_id"
+        query += " WHERE a.status = 'open'"
+        if source_work_id is not None:
+            query += " AND m.source_work_id = ?"
+            parameters.append(source_work_id)
+        query += " ORDER BY a.n_words DESC"
+        return self._conn.execute(query, parameters).fetchall()
 
     def recover_active_branches(self):
         """Free stale in-flight claims after a restart; completed work survives.
@@ -3429,6 +3560,58 @@ class ERDQueue:
             "WHERE branch_id = ? AND status = 'pending'",
             (priority, branch_id))
         return self._conn.execute("SELECT changes()").fetchone()[0] > 0
+
+    def set_source_work_priority(self, source_work_id: int, priority: int) -> bool:
+        """Atomically change a source request and every owned branch priority."""
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute("""
+                UPDATE source_work SET requested_priority = ?
+                WHERE source_work_id = ?
+            """, (priority, source_work_id))
+            if cur.rowcount:
+                self._conn.execute("""
+                    UPDATE pending_branches
+                    SET priority = (
+                        SELECT MAX(s.requested_priority)
+                        FROM branch_source_work m
+                        JOIN source_work s ON s.source_work_id = m.source_work_id
+                        WHERE m.branch_id = pending_branches.branch_id
+                    )
+                    WHERE branch_id IN (
+                        SELECT branch_id FROM branch_source_work
+                        WHERE source_work_id = ?
+                    )
+                """, (source_work_id,))
+                self._conn.execute("""
+                    UPDATE active_branches
+                    SET priority = (
+                        SELECT MAX(s.requested_priority)
+                        FROM branch_source_work m
+                        JOIN source_work s ON s.source_work_id = m.source_work_id
+                        WHERE m.branch_id = active_branches.branch_id
+                    )
+                    WHERE branch_id IN (
+                        SELECT branch_id FROM branch_source_work
+                        WHERE source_work_id = ?
+                    )
+                """, (source_work_id,))
+            self._conn.execute("COMMIT")
+            return cur.rowcount == 1
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def source_work_rows(self):
+        """Return source requests with their roots and descendants count."""
+        return self._conn.execute("""
+            SELECT s.*, SUM(m.parent_branch_id IS NULL) AS root_count,
+                   COUNT(m.branch_id) AS branch_count
+            FROM source_work s
+            LEFT JOIN branch_source_work m ON m.source_work_id = s.source_work_id
+            GROUP BY s.source_work_id
+            ORDER BY s.requested_priority DESC, s.source_work_id
+        """).fetchall()
 
     def remove_pending(self, branch_key: bytes) -> bool:
         """Delete a pending (status='pending') branch from the queue.

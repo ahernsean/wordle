@@ -102,9 +102,9 @@ RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
 PROMOTE_MIN_SIZE = 60   # cold-model fallback: sub-branches with >= this many
                         # words are promoted cooperatively when the cost model
                         # has no data for their size bucket.
-PROMOTED_PRIORITY = 1_000_000  # promoted sub-branches outrank fresh top branches
-                               # so freed workers prefer joining in-flight depth.
-
+# Compatibility value for callers that construct cooperative branches directly.
+# Scheduler-created descendants inherit their source-work priority instead.
+PROMOTED_PRIORITY = 0
 OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publication
 # Absolute wall-clock backstop on a single inline frame, independent of the cost
 # model.  When the model is cold (typical(n) is None) the node-proportionate
@@ -334,14 +334,16 @@ class _MidLoopPublisher:
         # (cooperative_solve's later create_branch is a no-op once this row exists).
         created = self._worker.queue.create_branch(
             branch_key, n, self._worker.n_candidates,
-            priority=PROMOTED_PRIORITY,
+            priority=getattr(self._worker, '_top_source_priority', 0),
             source_word=self._worker._top_source_word,
             source_pattern=self._worker._top_source_pattern,
             budget=budget,
             spine=self._worker._promoted_spine(
                 self._worker.root_budget - budget),
             root_budget=self._worker.root_budget,
-            ceiling=branch_ceiling)
+            ceiling=branch_ceiling,
+            source_work_id=getattr(self._worker, '_top_source_work_id', None),
+            parent_branch_key=getattr(self._worker, '_claimed_branch_key', None))
 
         if created:
             row_budget, row_ceiling = budget, branch_ceiling
@@ -549,6 +551,8 @@ class _BranchWorker:
         # tree the worker is currently descending.
         self._top_source_word = None
         self._top_source_pattern = None
+        self._top_source_work_id = None
+        self._top_source_priority = 0
         # Counts ERD-pruned candidate_accuracy claims for 1-in-N down-sampling.
         self._erd_lower_bound_pruned_accuracy_n = 0
         # Absolute root -> branch spine of the branch the worker is currently
@@ -1689,10 +1693,13 @@ class _BranchWorker:
                 branch_ceiling = ceiling
             created = self.queue.create_branch(
                 branch_key, n_words, self.n_candidates,
-                priority=PROMOTED_PRIORITY, source_word=self._top_source_word,
+                priority=getattr(self, '_top_source_priority', 0),
+                source_word=self._top_source_word,
                 source_pattern=self._top_source_pattern, budget=budget,
                 spine=child_spine, root_budget=self.root_budget,
-                ceiling=branch_ceiling)
+                ceiling=branch_ceiling,
+                source_work_id=getattr(self, '_top_source_work_id', None),
+                parent_branch_key=getattr(self, '_claimed_branch_key', None))
             if not created:
                 # Raced or joined an existing branch: its budget and ceiling
                 # decide joinability.  The budget must match exactly — every
@@ -1791,20 +1798,24 @@ class _BranchWorker:
         synced in from elsewhere) is marked done without being promoted —
         no candidate work is needed.
         """
-        for b in self.queue.branches_in_progress():
-            branch_key = bytes(b['branch_key'])
-            words = decode_subset(branch_key)
-            claim = self._claim_bundle(branch_key, b['n_candidates'], words)
-            if claim is not None:
-                bundle_id, indices, forced = claim
-                return dict(b), bundle_id, indices, forced
-            if self.queue.branch_done_candidates(branch_key) >= b['n_candidates']:
-                self.maybe_finalize(branch_key, words, b['n_candidates'])
+        claimed = None
+        for source_work in self.queue.source_work_candidates():
+            source_work_id = source_work['source_work_id']
+            for b in self.queue.branches_in_progress(source_work_id):
+                branch_key = bytes(b['branch_key'])
+                words = decode_subset(branch_key)
+                claim = self._claim_bundle(branch_key, b['n_candidates'], words)
+                if claim is not None:
+                    branch = dict(b)
+                    branch['source_work_id'] = source_work_id
+                    bundle_id, indices, forced = claim
+                    return branch, bundle_id, indices, forced
+                if self.queue.branch_done_candidates(branch_key) >= b['n_candidates']:
+                    self.maybe_finalize(branch_key, words, b['n_candidates'])
 
-        while True:
-            claimed = self.queue.claim_next(self.name)
+            claimed = self.queue.claim_next(self.name, source_work_id)
             if claimed is None:
-                return None
+                continue
             root_spine = self._root_spine(claimed['source_word'],
                                           claimed['source_pattern'])
             budget = self._spine_budget(root_spine)
@@ -1814,13 +1825,27 @@ class _BranchWorker:
             if reuse is None:
                 break
             self.queue.mark_done(claimed['branch_key'])
+            return self.claim_one()
+        if claimed is None:
+            # A queue upgraded while active work is present can carry branches
+            # from before source lineage was recorded.  They remain claimable
+            # until finalization; new work always follows source-first order.
+            for b in self.queue.branches_in_progress():
+                branch_key = bytes(b['branch_key'])
+                words = decode_subset(branch_key)
+                claim = self._claim_bundle(branch_key, b['n_candidates'], words)
+                if claim is not None:
+                    bundle_id, indices, forced = claim
+                    return dict(b), bundle_id, indices, forced
+            return None
 
         n_words = claimed['n_words']
         self.queue.create_branch(
             claimed['branch_key'], n_words, self.n_candidates,
             priority=claimed['priority'], source_word=claimed['source_word'],
             source_pattern=claimed['source_pattern'], budget=budget,
-            spine=root_spine, root_budget=self.root_budget)
+            spine=root_spine, root_budget=self.root_budget,
+            source_work_id=claimed['source_work_id'])
         words = decode_subset(claimed['branch_key'])
         claim = self._claim_bundle(claimed['branch_key'], self.n_candidates, words)
         branch = {
@@ -1828,6 +1853,8 @@ class _BranchWorker:
             'n_candidates': self.n_candidates,
             'source_word': claimed['source_word'],
             'source_pattern': claimed['source_pattern'],
+            'source_work_id': claimed['source_work_id'],
+            'priority': claimed['priority'],
             'spine': root_spine,
             'budget': budget,
         }
@@ -1864,6 +1891,9 @@ class _BranchWorker:
             # descending (best-effort; for status display).
             self._top_source_word = branch.get('source_word')
             self._top_source_pattern = branch.get('source_pattern')
+            self._top_source_work_id = branch.get('source_work_id')
+            self._top_source_priority = branch.get('priority', 0)
+            self._claimed_branch_key = branch_key
             # Base spine for deeper promotions: a joined in-progress branch carries
             # its own stored spine; a freshly promoted top branch falls back to root.
             self._claimed_branch_spine = branch.get('spine') or self._root_spine(

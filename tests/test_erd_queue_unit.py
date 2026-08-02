@@ -444,6 +444,31 @@ class TestClaimNext(_TmpQueue):
         self.q.claim_next("worker-0")       # claims the only pending branch
         self.assertIsNone(self.q.claim_next("worker-1"))  # nothing left
 
+    def test_equal_priority_source_work_keeps_started_source_admitted(self):
+        later_key = ScoreCache.encode_subset(WORDS[:3])
+        earlier_second_key = ScoreCache.encode_subset(WORDS[1:])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 5, "crane", 0),
+            (earlier_second_key, 4, 5, "crane", 1),
+        ])
+        self.q.add_pending_many([(later_key, 3, 5, "slate", 0)])
+
+        first = self.q.claim_next("worker-0")
+        self.assertEqual(first["source_word"], "crane")
+        second = self.q.claim_next("worker-1")
+        self.assertEqual(second["source_word"], "crane")
+
+    def test_source_priority_updates_active_and_pending_membership(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
+        claimed = self.q.claim_next("worker-0")
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             priority=claimed["priority"],
+                             source_work_id=claimed["source_work_id"])
+        self.assertTrue(self.q.set_source_work_priority(
+            claimed["source_work_id"], 9))
+        self.assertEqual(self.q.get_branch(self.key)["priority"], 9)
+        self.assertEqual(self.q.source_work_candidates()[0]["requested_priority"], 9)
+
 
 class TestCostModel(_TmpQueue):
     """Cost model: cold read, warm read, geometric mean, policy isolation,
