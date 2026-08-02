@@ -1803,6 +1803,9 @@ class _BranchWorker:
         no candidate work is needed.
         """
         claimed = None
+        if (not self._source_work_enabled
+                and not self.queue.branches_in_progress()):
+            self._source_work_enabled = self.queue.has_source_work()
         source_work_rows = (self.queue.source_work_candidates()
                             if self._source_work_enabled else ())
         for source_work in source_work_rows:
@@ -1819,19 +1822,21 @@ class _BranchWorker:
                 if self.queue.branch_done_candidates(branch_key) >= b['n_candidates']:
                     self.maybe_finalize(branch_key, words, b['n_candidates'])
 
-            claimed = self.queue.claim_next(self.name, source_work_id)
-            if claimed is None:
-                continue
-            root_spine = self._root_spine(claimed['source_word'],
-                                          claimed['source_pattern'])
-            budget = self._spine_budget(root_spine)
-            reuse = _cache_reuse(
-                self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
-                budget)
-            if reuse is None:
+            while True:
+                claimed = self.queue.claim_next(self.name, source_work_id)
+                if claimed is None:
+                    break
+                root_spine = self._root_spine(claimed['source_word'],
+                                              claimed['source_pattern'])
+                budget = self._spine_budget(root_spine)
+                reuse = _cache_reuse(
+                    self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
+                    budget)
+                if reuse is None:
+                    break
+                self.queue.mark_done(claimed['branch_key'])
+            if claimed is not None:
                 break
-            self.queue.mark_done(claimed['branch_key'])
-            return self.claim_one()
         if claimed is None:
             # A queue upgraded while active work is present can carry branches
             # from before source lineage was recorded.  They remain claimable

@@ -216,6 +216,7 @@ CREATE TABLE IF NOT EXISTS branch_source_work (
     branch_id      INTEGER NOT NULL REFERENCES branches(branch_id),
     source_work_id INTEGER NOT NULL REFERENCES source_work(source_work_id),
     parent_branch_id INTEGER REFERENCES branches(branch_id),
+    root_pattern   INTEGER,
     PRIMARY KEY (branch_id, source_work_id)
 );
 
@@ -1090,6 +1091,16 @@ class ERDQueue:
                     VALUES (?, ?, NULL)
                 """, (row["branch_id"], cur.lastrowid))
 
+        self._add_columns("branch_source_work", {"root_pattern": "INTEGER"})
+        self._conn.execute("""
+            UPDATE branch_source_work
+            SET root_pattern = (
+                SELECT source_pattern FROM pending_branches
+                WHERE pending_branches.branch_id = branch_source_work.branch_id
+            )
+            WHERE parent_branch_id IS NULL AND root_pattern IS NULL
+        """)
+
         # Claims bundle index on the (post-normalization) branch_id key.  After
         # the ADD COLUMN and rebuild above, so bundle_id and branch_id both
         # exist whether the database is fresh, upgraded, or already migrated.
@@ -1333,10 +1344,10 @@ class ERDQueue:
             """, prepared)
             self._conn.executemany("""
                 INSERT OR IGNORE INTO branch_source_work
-                    (branch_id, source_work_id, parent_branch_id)
-                VALUES (?, ?, NULL)
-            """, [(branch_id, source_work_ids[(source_word, priority)])
-                  for branch_id, _n_words, priority, source_word, _source_pattern
+                    (branch_id, source_work_id, parent_branch_id, root_pattern)
+                VALUES (?, ?, NULL, ?)
+            """, [(branch_id, source_work_ids[(source_word, priority)], source_pattern)
+                  for branch_id, _n_words, priority, source_word, source_pattern
                   in prepared])
             self._conn.execute("COMMIT")
             self._tally_wal_traffic(
@@ -1396,7 +1407,7 @@ class ERDQueue:
                 return None
             row = self._conn.execute("""
                 SELECT b.branch_key, p.branch_id, p.n_words,
-                       s.requested_priority, p.source_word, p.source_pattern,
+                       s.requested_priority, s.source_word, m.root_pattern AS source_pattern,
                        s.source_work_id
                 FROM pending_branches p
                 JOIN branches b ON b.branch_id = p.branch_id
@@ -1653,8 +1664,8 @@ class ERDQueue:
                                 if parent_branch_key is not None else None)
             self._conn.execute("""
                 INSERT OR IGNORE INTO branch_source_work
-                    (branch_id, source_work_id, parent_branch_id)
-                VALUES (?, ?, ?)
+                    (branch_id, source_work_id, parent_branch_id, root_pattern)
+                VALUES (?, ?, ?, NULL)
             """, (branch_id, source_work_id, parent_branch_id))
         return cur.rowcount == 1
 
@@ -3428,6 +3439,8 @@ class ERDQueue:
         self._conn.execute("DELETE FROM candidate_claims")
         self._conn.execute("DELETE FROM active_branches")
         self._conn.execute("DELETE FROM pending_branches")
+        self._conn.execute("DELETE FROM branch_source_work")
+        self._conn.execute("DELETE FROM source_work")
         self._conn.execute("DELETE FROM worker_heartbeat")
         self._conn.execute("DELETE FROM run_meta")
 

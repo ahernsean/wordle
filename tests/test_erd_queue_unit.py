@@ -474,6 +474,23 @@ class TestClaimNext(_TmpQueue):
         self.assertEqual(rows[0]["root_count"], 1)
         self.assertEqual(rows[0]["branch_count"], 1)
 
+    def test_shared_root_claim_uses_selected_owner_pattern(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
+        slate = next(row for row in self.q.source_work_rows()
+                     if row["source_word"] == "slate")
+        claimed = self.q.claim_next("worker-0", slate["source_work_id"])
+        self.assertEqual(claimed["source_word"], "slate")
+        self.assertEqual(claimed["source_pattern"], 42)
+
+    def test_clear_removes_source_work_before_readding_shared_root(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 999, "audio", 0)])
+        self.q.clear()
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "penis", 0)])
+        claimed = self.q.claim_next("worker-0")
+        self.assertEqual(claimed["source_word"], "penis")
+        self.assertEqual(claimed["priority"], 1)
+
 
 class TestCostModel(_TmpQueue):
     """Cost model: cold read, warm read, geometric mean, policy isolation,
