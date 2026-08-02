@@ -1473,19 +1473,26 @@ class _BranchWorker:
                 '%s finalize telemetry failed for branch %s -- result '
                 'already published; continuing to cleanup', self.name,
                 branch_key[:25])
-        pending_row = self.queue.get_pending_branch(branch_key)
+        loss = best_guess is None and (not cut or ceiling_proves_loss)
         pending_budget = None
-        if pending_row is not None:
-            pending_spine = self._root_spine(
-                pending_row['source_word'], pending_row['source_pattern'])
-            pending_budget = self._spine_budget(pending_spine)
-        if cut and (not ceiling_proves_loss or
-                    (pending_budget is not None and budget < pending_budget)):
-            # A cut satisfies the promoting parent but is not an exact result:
-            # a user-queued row for this branch (normally impossible — pending
-            # membership suppresses the ceiling at promotion — but reachable if
-            # the row was queued mid-solve) needs another solve unless this
-            # branch's loss budget covers the queued request.
+        pending_lookup_failed = False
+        if best_guess is None:
+            try:
+                pending_row = self.queue.get_pending_branch(branch_key)
+                if pending_row is not None:
+                    pending_spine = self._root_spine(
+                        pending_row['source_word'], pending_row['source_pattern'])
+                    pending_budget = self._spine_budget(pending_spine)
+            except Exception:
+                pending_lookup_failed = True
+                logger.exception('%s could not read pending budget for branch %s; '
+                                 'retaining queued work', self.name,
+                                 branch_key[:25])
+        if (cut and not ceiling_proves_loss) or (
+                loss and (pending_lookup_failed or pending_budget is not None
+                          and (budget is None or budget < pending_budget))):
+            # A user-queued row needs another solve unless this result is exact
+            # or its loss budget covers the queued request.
             self.queue.requeue_pending(branch_key)
         else:
             self.queue.mark_done(branch_key)    # pending_branches row -> done

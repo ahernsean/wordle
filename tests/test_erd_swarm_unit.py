@@ -1743,6 +1743,7 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
             "nodes_spent": 0, "created_at": 100, "finalized_at": 200,
             "spine": "SALET -g-g-",
         }
+        w.queue.get_pending_branch.return_value = None
         w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
         return w
 
@@ -2052,6 +2053,25 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         self.assertEqual(log_kwargs["outcome"], "loss")
         self.assertIsNone(log_kwargs["ceiling"])
 
+    def test_exhaustive_loss_requeues_a_larger_budget_user_request(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, False, 3, None, False))
+        w.queue.get_pending_branch.return_value = {
+            "source_word": "crane", "source_pattern": 0,
+        }
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
+        w.queue.requeue_pending.assert_called_once_with(key)
+        w.queue.mark_done.assert_not_called()
+
+    def test_pending_lookup_failure_still_runs_cleanup(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, False, 3, None, False))
+        w.queue.get_pending_branch.side_effect = RuntimeError("boom")
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.queue.requeue_pending.assert_called_once_with(key)
+        w.queue.delete_branch.assert_called_once_with(key)
+
     def test_exact_below_ceiling_caches_as_usual(self):
         key = ScoreCache.encode_subset(BRANCH)
         w = self._worker(("crane", 1.8, 2, False, 4, 2.5, False))
@@ -2206,9 +2226,12 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         self.key = ScoreCache.encode_subset(BRANCH)
         ScoreCache(self.cache_path, BRANCH).close()
 
-    def _complete_all(self, q, cut, budget=4, ceiling=2.5):
+    def _complete_all(self, q, cut, budget=4, ceiling=2.5,
+                      queue_user_request=False):
         n = len(CANDIDATES)
         q.create_branch(self.key, len(BRANCH), n, budget=budget, ceiling=ceiling)
+        if queue_user_request:
+            q.add_pending_many([(self.key, len(BRANCH), 0, "crane", 0)])
         order = list(range(n))
         _, indices, _ = q.claim_next_bundle(
             self.key, "other", n, order, [0.0] * n,
@@ -2296,6 +2319,25 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         self.assertIsNone(q.get_branch(self.key))
         q.close()
+
+    def test_exhaustive_loss_preserves_a_larger_budget_user_request(self):
+        q = ERDQueue(self.queue_path)
+        self._complete_all(
+            q, cut=False, budget=3, ceiling=None, queue_user_request=True)
+        q.close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w.maybe_finalize(self.key, BRANCH, len(CANDIDATES))
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        self.assertEqual(q.get_pending_branch(self.key)["status"], "pending")
+        self.assertIsNone(q.get_branch(self.key))
+        q.close()
+        sc = ScoreCache(self.cache_path, BRANCH)
+        self.assertEqual(sc.read_loss(self.key, ERD_ALL), 3)
+        sc.close()
 
 
 if __name__ == "__main__":
