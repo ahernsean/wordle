@@ -337,6 +337,28 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertFalse(report["sources"]["cache"]["ok"])
 
+    def test_missing_queue_source_does_not_create_database_files(self):
+        missing_queue_path = os.path.join(
+            self.temporary_directory.name, "missing-queue.sqlite3"
+        )
+        missing_telemetry_path = os.path.join(
+            self.temporary_directory.name, "missing-telemetry.sqlite3"
+        )
+        unavailable_queue = ReportSources(
+            queue_path=missing_queue_path,
+            cache_path=self.cache_path,
+            answer_list_path=self.answer_list_path,
+            candidate_list_path=self.candidate_list_path,
+            telemetry_path=missing_telemetry_path,
+        )
+
+        report = collect_overview_report(unavailable_queue)
+
+        self.assertFalse(report["sources"]["queue"]["ok"])
+        self.assertFalse(report["sources"]["telemetry"]["ok"])
+        self.assertFalse(os.path.exists(missing_queue_path))
+        self.assertFalse(os.path.exists(missing_telemetry_path))
+
     def test_answer_list_failure_skips_queue_and_cache_normalization(self):
         with (
             patch("report_model.load_word_list", side_effect=OSError("missing answers")),
