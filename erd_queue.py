@@ -23,6 +23,7 @@ import math
 import os
 import sqlite3
 import time
+from urllib.parse import quote
 
 from cache_sqlite import ScoreCache
 from wordle_ui import fmt_pattern
@@ -586,6 +587,12 @@ def derive_telemetry_path(db_path: str) -> str:
     return f"{root}_telemetry{ext}"
 
 
+def read_only_database_uri(db_path: str) -> str:
+    """Return a SQLite URI that opens an existing database without writes."""
+    absolute_path = os.path.abspath(db_path)
+    return f"file:{quote(absolute_path, safe='/')}?mode=ro"
+
+
 class ERDQueue:
     """SQLite-backed work queue for the parallel ERD_ALL precache job."""
 
@@ -593,13 +600,22 @@ class ERDQueue:
                  telemetry_path: str = None, initialize_schema: bool = True):
         self.db_path = db_path
         self._timeout = timeout
-        self._conn = sqlite3.connect(db_path, timeout=timeout,
-                                     isolation_level=None)
+        connection_path = (
+            db_path if initialize_schema else read_only_database_uri(db_path)
+        )
+        self._conn = sqlite3.connect(
+            connection_path, timeout=timeout, isolation_level=None,
+            uri=not initialize_schema,
+        )
         self._conn.row_factory = sqlite3.Row
         if telemetry_path is None:
             telemetry_path = derive_telemetry_path(db_path)
         self.telemetry_path = telemetry_path
-        self._conn.execute("ATTACH DATABASE ? AS telemetry", (telemetry_path,))
+        attached_path = (
+            telemetry_path
+            if initialize_schema else read_only_database_uri(telemetry_path)
+        )
+        self._conn.execute("ATTACH DATABASE ? AS telemetry", (attached_path,))
         if initialize_schema:
             self._conn.executescript(_QUEUE_SCHEMA_SQL)
             self._conn.executescript(_TELEMETRY_SCHEMA_SQL)
