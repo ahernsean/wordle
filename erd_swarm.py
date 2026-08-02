@@ -1473,12 +1473,19 @@ class _BranchWorker:
                 '%s finalize telemetry failed for branch %s -- result '
                 'already published; continuing to cleanup', self.name,
                 branch_key[:25])
-        if cut and not ceiling_proves_loss:
+        pending_row = self.queue.get_pending_branch(branch_key)
+        pending_budget = None
+        if pending_row is not None:
+            pending_spine = self._root_spine(
+                pending_row['source_word'], pending_row['source_pattern'])
+            pending_budget = self._spine_budget(pending_spine)
+        if cut and (not ceiling_proves_loss or
+                    (pending_budget is not None and budget < pending_budget)):
             # A cut satisfies the promoting parent but is not an exact result:
             # a user-queued row for this branch (normally impossible — pending
             # membership suppresses the ceiling at promotion — but reachable if
-            # the row was queued mid-solve) must go back to 'pending' rather
-            # than be recorded done without a result.
+            # the row was queued mid-solve) needs another solve unless this
+            # branch's loss budget covers the queued request.
             self.queue.requeue_pending(branch_key)
         else:
             self.queue.mark_done(branch_key)    # pending_branches row -> done
@@ -1717,7 +1724,8 @@ class _BranchWorker:
                     self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
                 if reuse is not None:
                     return (SOLVED, *reuse)
-                loss_budget = self.score_cache.read_loss(branch_key, ERD_ALL)
+                loss_budget = self.score_cache.read_loss(
+                    branch_key, ERD_ALL, refresh=True)
                 if loss_budget is not None and budget <= loss_budget:
                     return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                 cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
@@ -1727,7 +1735,8 @@ class _BranchWorker:
                     # Finalized + deleted: a cut lands in cut_results and a
                     # ceiling-proven loss lands in the score cache before the
                     # delete, so re-check both before concluding a loss.
-                    loss_budget = self.score_cache.read_loss(branch_key, ERD_ALL)
+                    loss_budget = self.score_cache.read_loss(
+                        branch_key, ERD_ALL, refresh=True)
                     if loss_budget is not None and budget <= loss_budget:
                         return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                     cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)

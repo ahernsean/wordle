@@ -1867,6 +1867,22 @@ class TestDepthLimitedERD(unittest.TestCase):
         finally:
             os.unlink(tmp.name)
 
+    def test_read_loss_refreshes_a_peer_published_verdict(self):
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        tmp.close()
+        try:
+            waiter = ScoreCache(tmp.name, self.LINEAR)
+            peer = ScoreCache(tmp.name, self.LINEAR)
+            key = b'aaaaabbbbb'
+            self.assertIsNone(waiter.read_loss(key, ERD_ALL))
+            peer.write_loss(key, ERD_ALL, 3)
+            self.assertIsNone(waiter.read_loss(key, ERD_ALL))
+            self.assertEqual(waiter.read_loss(key, ERD_ALL, refresh=True), 3)
+            waiter.close()
+            peer.close()
+        finally:
+            os.unlink(tmp.name)
+
     def test_proven_loss_is_persisted_and_reused(self):
         tmp = tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False)
         tmp.close()

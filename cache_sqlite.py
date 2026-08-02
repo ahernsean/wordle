@@ -626,17 +626,16 @@ class ScoreCache:
         self._mem_cache[(branch_key, policy)] = (
             best_guess, best_score, max_depth, solve_budget)
 
-    def read_loss(self, branch_key, policy):
+    def read_loss(self, branch_key, policy, refresh=False):
         """Largest budget at which `branch_key` is proven a loss, or None.
 
         A return of b means "no winning strategy within b guesses"; the caller
         treats any query budget q <= b as a loss.  Positive hits are mirrored in
-        a session cache; misses fall through to SQLite (so a loss another worker
-        just proved is seen) — a stale miss only costs a recompute, never a wrong
-        answer.
+        a session cache.  Pass refresh=True while polling a cooperative branch
+        so a peer's newly published loss replaces a cached miss.
         """
         cached = self._loss_mem_cache.get((branch_key, policy))
-        if cached is not None:
+        if cached is not None and not refresh:
             return cached or None        # 0 = "no loss known" sentinel
         row = self._conn.execute("""
             SELECT loss_budget
@@ -1161,7 +1160,7 @@ class MemoryScoreCache:
             best_guess, best_score, max_depth, solve_budget)
         self.write_count += 1
 
-    def read_loss(self, branch_key, policy):
+    def read_loss(self, branch_key, policy, refresh=False):
         return self._losses.get((self._scope, branch_key, policy))
 
     def write_loss(self, branch_key, policy, budget):

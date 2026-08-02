@@ -1938,6 +1938,21 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         self.assertIsNotNone(result)
 
+    def test_waiter_refreshes_a_cached_loss_miss_before_branch_deletion(self):
+        w = self._worker()
+        w._stop_requested = False
+        w.score_cache.read_loss.side_effect = (None, None, 3)
+        w.queue.get_branch.return_value = None
+        result = w.cooperative_solve(BRANCH, 3, ceiling=3.25)
+        self.assertEqual(
+            result, (OVER_DEPTH_BUDGET, float('inf'), None, True))
+        self.assertEqual(
+            w.score_cache.read_loss.call_args_list[1].kwargs,
+            {"refresh": True})
+        self.assertEqual(
+            w.score_cache.read_loss.call_args_list[2].kwargs,
+            {"refresh": True})
+
 
 class TestMaybeFinalizeTriage(unittest.TestCase):
     """maybe_finalize's exact / cut / loss triage from the branch meta."""
@@ -1953,6 +1968,7 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
             "nodes_spent": nodes_spent, "created_at": 100, "finalized_at": 200,
             "spine": "SALET -g-g-",
         }
+        w.queue.get_pending_branch.return_value = None
         w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
         return w
 
@@ -2013,6 +2029,17 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w.maybe_finalize(key, BRANCH, len(CANDIDATES))
         w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
         w.queue.add_cut_result.assert_not_called()
+
+    def test_ceiling_proven_loss_requeues_a_larger_budget_user_request(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker((None, None, None, False, 3, 3.111111112, True))
+        w.queue.get_pending_branch.return_value = {
+            "source_word": "crane", "source_pattern": 0,
+        }
+        w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write_loss.assert_called_once_with(key, ERD_ALL, 3)
+        w.queue.requeue_pending.assert_called_once_with(key)
+        w.queue.mark_done.assert_not_called()
 
     def test_loss_path_unchanged_without_cut_flag(self):
         key = ScoreCache.encode_subset(BRANCH)
