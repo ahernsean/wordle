@@ -234,14 +234,23 @@ coordination" in AGENTS.md) carries a `branch_key`/`spine`, `worker_id`,
 row, so a slow branch's coordination cost can be attributed to it directly
 instead of only to its `n_words`/epoch bucket — query
 `WHERE branch_key = ?` (an index exists for this) or `WHERE spine LIKE ...`
-against the telemetry file.  `coordination_millis` is also broken into
+against the telemetry file.  `coordination_millis` is also partitioned into
 `claim_transaction_millis` (claim-scan and write, inside
 `claim_next_bundle`'s transaction) + `claim_commit_millis` (its `COMMIT`) +
-`busy_wait_millis` (lock-acquisition wait) + `finalize_millis`
-(cache-write time when this claim also won the branch's finalize) +
-`idle_millis` (the remainder). There is no `view`/CLI reader for this table
-yet — it is offline/ad-hoc-SQL only; open the telemetry file directly (or a
-live `ERDQueue`'s `telemetry` attached schema) to inspect it.
+`busy_wait_millis` (lock-acquisition wait) + `idle_millis` (the remainder);
+those four sum to `coordination_millis` exactly.
+
+Every row is one candidate evaluation, so `COUNT(*)` is a claim count. The
+finalize phase is deliberately *not* here: it belongs to a branch rather
+than to any single claim, and is recorded once per branch as
+`branch_finalize_log.cache_write_millis` (the score-cache/loss/cut writes
+and the cost-model fold). Join the two tables on `branch_key` for a
+branch's full coordination picture.
+
+The bucketed rollup of this table is exposed as `erd_search.py view --by
+coordination` (aggregated by `n_words`/`worker_count`); the per-row branch
+attribution above has no CLI reader yet, so query the telemetry file
+directly (or a live `ERDQueue`'s `telemetry` attached schema) for it.
 
 ---
 

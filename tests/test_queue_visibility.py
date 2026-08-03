@@ -205,6 +205,26 @@ class QueueVisibilityTests(unittest.TestCase):
                 spine_prefix="CRANE -----",
             )
 
+    def test_coordination_hotspot_claim_count_counts_only_claims(self):
+        # claim_telemetry is one row per candidate evaluation, so this
+        # report's claim_count is a true claim count.  Branch finalize cost
+        # deliberately lives on branch_finalize_log instead: routing it here
+        # would inflate claim_count and SUM(coordination_millis) with rows
+        # that are not claims at all.
+        now = int(time.time())
+        for idx in range(3):
+            self.q.add_claim_telemetry(
+                10, 20, 100, 2, branch_key=self.user_key, idx=idx,
+                bundle_id="worker-0:1:0")
+        self.q.add_branch_finalize_log(
+            self.user_key, "CRANE -----", 10, 4, now, now, 100, 3,
+            cache_write_millis=500)
+        result = self.q.report_hotspots(
+            "coordination", epoch=0, since=now - 60, sample_size=50, limit=10)
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertEqual(result["rows"][0]["claim_count"], 3)
+        self.assertEqual(result["rows"][0]["coordination_millis"], 60)
+
     def test_current_hotspots_support_queue_and_tree_populations(self):
         self.q.create_branch(
             self.user_key, len(WORDS), 10, priority=7, budget=4,

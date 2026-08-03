@@ -1475,6 +1475,10 @@ class _BranchWorker:
         # below: the branch result is already published to the score cache,
         # and without mark_done/delete_branch the branch's claim rows leak
         # and the pending row is never retired.
+        # Everything above published the branch's result; that span is the
+        # finalize phase of the coordination breakdown, recorded on this
+        # branch's own finalize row.
+        cache_write_millis = int((time.time() - finalize_t0) * 1000)
         try:
             (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
              censored_units) = self.queue.finalize_bundle_stats(branch_key)
@@ -1486,6 +1490,7 @@ class _BranchWorker:
                 censored_units=censored_units, ceiling=ceiling,
                 bulk_done_candidates=bulk_done_candidates,
                 best_guess=best_guess, best_erd=best_erd,
+                cache_write_millis=cache_write_millis,
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
         except Exception:
@@ -1512,19 +1517,12 @@ class _BranchWorker:
                                  branch_key[:25])
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
-        if self._adaptive:
-            # A dedicated row for the finalize itself, attributed directly to
-            # the branch that was finalized (idx/bundle_id NULL — this is not
-            # a candidate evaluation).  Written here rather than folded into
-            # whatever claim_telemetry row comes next: that next claim is
-            # almost always a different, unrelated branch (the worker moves
-            # on after finalizing), so deferring the cost would attribute it
-            # to the wrong branch.
-            finalize_millis = int((time.time() - finalize_t0) * 1000)
-            self.queue.add_claim_telemetry(
-                len(words), finalize_millis, 0, self.n_workers,
-                branch_key=branch_key, spine=spine, worker_id=self.name,
-                finalize_millis=finalize_millis)
+        # Restart the coordination window past this finalize.  evaluate_claim
+        # telescopes coordination_millis from the previous claim's completion,
+        # so without this the finalize span would reappear as idle time on the
+        # first claim of whatever branch this worker picks up next — a
+        # different, unrelated branch.
+        self._last_claim_complete = time.time()
         return True
 
     def _await_rival_finalize(self, branch_key, words, n_words, n_candidates):

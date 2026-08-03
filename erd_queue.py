@@ -459,13 +459,12 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- (bundle_id and both range columns are NULL for a claim taken outside a
 -- bundle).  claim_transaction_millis + claim_commit_millis split
 -- coordination_millis's claim-handout portion into the scan/write phase and
--- the COMMIT itself; finalize_millis is cache-write time a worker spent
--- winning a branch's finalize, on its own row (idx/bundle_id NULL) written
--- at finalize time and attributed to that branch — never folded into a
--- candidate-evaluation row, since the next such row is typically a different,
--- unrelated branch's.  idle_millis is the coordination_millis remainder
--- unaccounted for by claim_transaction_millis + claim_commit_millis +
--- busy_wait_millis + finalize_millis.
+-- the COMMIT itself; idle_millis is the remainder unaccounted for by
+-- claim_transaction_millis + claim_commit_millis + busy_wait_millis, so those
+-- four partition coordination_millis exactly.  Every row here is one
+-- candidate evaluation: finalize cost is NOT recorded here (it belongs to a
+-- branch, not to any claim, and lands on branch_finalize_log.cache_write_millis
+-- instead) so COUNT(*) over this table is a true claim count.
 CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     id                        INTEGER PRIMARY KEY AUTOINCREMENT,
     n_words                   INTEGER NOT NULL,
@@ -483,7 +482,6 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     bundle_end_idx            INTEGER,
     claim_transaction_millis  INTEGER,
     claim_commit_millis       INTEGER,
-    finalize_millis           INTEGER,
     idle_millis               INTEGER,
     epoch                     INTEGER NOT NULL DEFAULT 0,
     recorded_at               INTEGER NOT NULL
@@ -525,6 +523,13 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     -- row predates these columns or when the outcome was not an exact solve.
     best_guess              TEXT,
     best_erd                REAL,
+    -- Wall time this worker spent publishing the branch's result once it won
+    -- the finalize: the score-cache/loss/cut writes and the cost-model fold.
+    -- The finalize phase of the issue-197 coordination breakdown, recorded per
+    -- branch because it belongs to the branch, not to any one claim.  Covers
+    -- the publish work only, since the row carrying it is written immediately
+    -- after (a row cannot time its own insert or the queue cleanup past it).
+    cache_write_millis      INTEGER,
     recorded_at             INTEGER NOT NULL
 );
 
@@ -872,7 +877,9 @@ class ERDQueue:
         # Branch-attributed claim telemetry and coordination phase breakdown
         # (issue #197): additive/nullable, so an existing row simply keeps
         # NULL in every new column — it predates per-branch attribution and
-        # the phase split, not an attribution failure.
+        # the phase split, not an attribution failure.  The finalize phase
+        # lands on branch_finalize_log, since it belongs to a branch rather
+        # than to any single claim.
         self._add_columns("claim_telemetry", {
             "branch_key": "BLOB",
             "spine": "TEXT",
@@ -883,8 +890,10 @@ class ERDQueue:
             "bundle_end_idx": "INTEGER",
             "claim_transaction_millis": "INTEGER",
             "claim_commit_millis": "INTEGER",
-            "finalize_millis": "INTEGER",
             "idle_millis": "INTEGER",
+        }, schema="telemetry")
+        self._add_columns("branch_finalize_log", {
+            "cache_write_millis": "INTEGER",
         }, schema="telemetry")
 
         report_indexes = (
@@ -3694,8 +3703,7 @@ class ERDQueue:
                             branch_key: bytes = None, spine: str = None,
                             worker_id: str = None, bundle_id: str = None,
                             idx: int = None, bundle_start_idx: int = None,
-                            bundle_end_idx: int = None,
-                            finalize_millis: int = 0):
+                            bundle_end_idx: int = None):
         """Append a claim coordination record to claim_telemetry for offline analysis.
 
         claim_retries / busy_wait_millis / claim_transaction_millis /
@@ -3707,12 +3715,13 @@ class ERDQueue:
         to; worker_id/bundle_id/idx/bundle_start_idx/bundle_end_idx identify
         which worker evaluated which candidate of which bundle (all default
         to NULL for a caller with no branch/bundle context).
-        finalize_millis is cache-write time this worker spent winning this
-        branch's finalize; callers writing a candidate-evaluation row leave it
-        0 (finalize time is written on its own dedicated row by maybe_finalize
-        instead — see the claim_telemetry schema comment for why).
         idle_millis is coordination_millis minus every other timed phase: the
         remainder is wait/idle time not captured by a specific phase.
+
+        Every row is one candidate evaluation, so COUNT(*) over the table is a
+        claim count.  Branch finalize cost is deliberately not recorded here —
+        it belongs to a branch rather than to a claim, and goes to
+        branch_finalize_log.cache_write_millis instead.
 
         Consumed values are reset to 0 immediately after this INSERT reads
         them, so they are attributed to exactly the next telemetry row and
@@ -3728,21 +3737,20 @@ class ERDQueue:
         idle_millis = max(0, coordination_millis
                           - self._last_claim_transaction_millis
                           - self._last_claim_commit_millis
-                          - self._last_claim_busy_millis
-                          - finalize_millis)
+                          - self._last_claim_busy_millis)
         self._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, work_nodes, claim_retries,
                  busy_wait_millis, worker_count, branch_key, spine, worker_id,
                  bundle_id, idx, bundle_start_idx, bundle_end_idx,
                  claim_transaction_millis, claim_commit_millis,
-                 finalize_millis, idle_millis, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 idle_millis, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, work_nodes, self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, branch_key, spine,
               worker_id, bundle_id, idx, bundle_start_idx, bundle_end_idx,
               self._last_claim_transaction_millis, self._last_claim_commit_millis,
-              finalize_millis, idle_millis, self.epoch, now))
+              idle_millis, self.epoch, now))
         self._last_claim_retries = 0
         self._last_claim_busy_millis = 0
         self._last_claim_transaction_millis = 0
@@ -3754,7 +3762,7 @@ class ERDQueue:
                                 total_bundle_wall_millis=None, censored_units=None,
                                 ceiling=None, outcome=None,
                                 bulk_done_candidates=None, best_guess=None,
-                                best_erd=None):
+                                best_erd=None, cache_write_millis=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -3769,6 +3777,10 @@ class ERDQueue:
         infer it from mutable cache state.  If a bulk sweep supersedes an
         in-flight claim that later finishes, n_claims excludes that overlap
         even though its per-claim telemetry row still exists.
+        cache_write_millis is the wall time the finalizing worker spent
+        publishing the result (score-cache/loss/cut writes and the cost-model
+        fold) — the finalize phase of the coordination breakdown, kept here
+        rather than on claim_telemetry because it belongs to the branch.
         """
         now = int(time.time())
         self._conn.execute("""
@@ -3777,12 +3789,13 @@ class ERDQueue:
                  finalized_at, nodes_spent, n_claims, n_bundles,
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
                  ceiling, outcome, bulk_done_candidates, best_guess, best_erd,
-                 recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cache_write_millis, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
-              bulk_done_candidates, best_guess, best_erd, now))
+              bulk_done_candidates, best_guess, best_erd, cache_write_millis,
+              now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

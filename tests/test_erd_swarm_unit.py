@@ -950,29 +950,24 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             "ORDER BY id").fetchall()
         q.close()
         self.assertTrue(rows)
+        # Every row is a candidate evaluation -- the finalize does not write
+        # here -- so all of them carry full branch and bundle attribution.
         for row in rows:
             self.assertEqual(row["branch_key"], branch_key)
             self.assertEqual(row["spine"], "CRANE -----")
             self.assertEqual(row["worker_id"], "worker-1")
-        # Candidate-evaluation rows carry bundle/idx attribution.
-        candidate_rows = [r for r in rows if r["idx"] is not None]
-        self.assertTrue(candidate_rows)
-        for row in candidate_rows:
             self.assertIsNotNone(row["bundle_id"])
+            self.assertIsNotNone(row["idx"])
             self.assertLessEqual(row["bundle_start_idx"], row["idx"])
             self.assertLessEqual(row["idx"], row["bundle_end_idx"])
-        # The dedicated finalize row (maybe_finalize) has no candidate/bundle
-        # identity, but still carries this branch's own attribution.
-        finalize_rows = [r for r in rows if r["idx"] is None]
-        self.assertEqual(len(finalize_rows), 1)
-        self.assertIsNone(finalize_rows[0]["bundle_id"])
 
-    def test_finalize_millis_is_attributed_to_the_branch_that_finalized(self):
-        # A worker that finalizes branch1 then moves on to branch2 must not
-        # leak branch1's finalize cost onto branch2's claim_telemetry rows:
-        # the two branches are unrelated, and the finalize always happens
-        # strictly after branch1's own candidates are already done, so a
-        # naive "attribute to whatever claim comes next" scheme mislabels it.
+    def test_finalize_cost_lands_on_its_own_branch_and_not_the_next_one(self):
+        # A worker that finalizes branch1 then moves on to branch2 must record
+        # branch1's finalize cost against branch1, and must not let that span
+        # reappear anywhere in branch2's telemetry: the finalize always runs
+        # strictly after branch1's own candidates are done, so both a "fold it
+        # into the next claim" scheme and a telescoped coordination window
+        # that isn't restarted would silently bill it to branch2.
         branch1_words = BRANCH
         branch2_words = BRANCH[:2]
         branch1_key = ScoreCache.encode_subset(branch1_words)
@@ -987,9 +982,8 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
 
         w = _BranchWorker(1, self.cache_path, self.queue_path, None)
         real_write = w.score_cache.write
-        # Slow only branch1's own finalize write, so a nonzero finalize_millis
-        # anywhere else in the results can only be a leak, never branch2's own
-        # (fast) finalize cost being mistaken for one.
+        # Slow only branch1's own finalize write, so a large span anywhere
+        # else can only be a leak, never branch2's own (fast) finalize cost.
         call_count = {"n": 0}
 
         def slow_once_write(*args, **kwargs):
@@ -1005,27 +999,28 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             w.close()
 
         q = ERDQueue(self.queue_path)
-        rows = q._conn.execute(
-            "SELECT branch_key, idx, bundle_id, finalize_millis "
-            "FROM claim_telemetry ORDER BY id").fetchall()
+        finalize_rows = q._conn.execute(
+            "SELECT branch_key, cache_write_millis FROM branch_finalize_log "
+            "ORDER BY id").fetchall()
+        claim_rows = q._conn.execute(
+            "SELECT branch_key, coordination_millis FROM claim_telemetry "
+            "ORDER BY id").fetchall()
         q.close()
 
-        branch1_finalize_rows = [
-            r for r in rows if bytes(r["branch_key"]) == branch1_key
-            and r["idx"] is None and r["bundle_id"] is None]
-        self.assertEqual(len(branch1_finalize_rows), 1)
-        self.assertGreaterEqual(branch1_finalize_rows[0]["finalize_millis"], 40)
+        # The slowed finalize is billed to branch1's own finalize row.
+        by_branch = {bytes(r["branch_key"]): r["cache_write_millis"]
+                     for r in finalize_rows}
+        self.assertGreaterEqual(by_branch[branch1_key], 40)
+        self.assertLess(by_branch[branch2_key], 40)
 
-        # Every other row -- branch1's own candidate rows, and every one of
-        # branch2's rows including its own (fast) finalize row -- must show no
-        # trace of branch1's slowed-down finalize cost.
-        other_rows = [
-            r for r in rows
-            if not (bytes(r["branch_key"]) == branch1_key
-                    and r["idx"] is None and r["bundle_id"] is None)]
-        self.assertTrue(other_rows)
-        for row in other_rows:
-            self.assertLess(row["finalize_millis"], 20)
+        # And it is nowhere in branch2's claim telemetry: the coordination
+        # window restarts past the finalize, so branch2's first claim does not
+        # inherit branch1's finalize span as idle time.
+        branch2_claims = [r for r in claim_rows
+                          if bytes(r["branch_key"]) == branch2_key]
+        self.assertTrue(branch2_claims)
+        for row in branch2_claims:
+            self.assertLess(row["coordination_millis"], 40)
 
 
 class TestClaimOneJoinsInProgressBranch(unittest.TestCase):

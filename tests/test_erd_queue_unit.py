@@ -546,14 +546,13 @@ class TestCostModel(_TmpQueue):
         self.assertIsNone(row['bundle_end_idx'])
         self.assertEqual(row['claim_transaction_millis'], 0)
         self.assertEqual(row['claim_commit_millis'], 0)
-        self.assertEqual(row['finalize_millis'], 0)
         self.assertEqual(row['idle_millis'], 5000)
 
     def test_add_claim_telemetry_carries_branch_attribution(self):
         self.q.add_claim_telemetry(
             10, 5000, 300, 4, branch_key=self.key, spine='CRANE 12',
             worker_id='worker-3', bundle_id='worker-3:123:0', idx=7,
-            bundle_start_idx=0, bundle_end_idx=9, finalize_millis=40)
+            bundle_start_idx=0, bundle_end_idx=9)
         row = self.q._conn.execute(
             "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -564,8 +563,7 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(row['idx'], 7)
         self.assertEqual(row['bundle_start_idx'], 0)
         self.assertEqual(row['bundle_end_idx'], 9)
-        self.assertEqual(row['finalize_millis'], 40)
-        self.assertEqual(row['idle_millis'], 5000 - 40)
+        self.assertEqual(row['idle_millis'], 5000)
 
     def test_add_backstop_telemetry_inserts_row(self):
         self.q.add_backstop_telemetry(8, 2, 65000, 500, None, 6)
