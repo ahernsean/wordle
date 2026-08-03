@@ -79,6 +79,12 @@ DEFAULT_COUNT_CAP = 500
 # (other bundle members happened to be heavy too) to resolve itself without
 # letting a genuinely pathological candidate thrash the pool indefinitely.
 DEFAULT_REPUBLISH_LIMIT = 3
+# The inclusive range a caller-supplied source-work priority may occupy.  Every
+# writer of source_work.requested_priority enforces it and
+# check_source_work_invariants reports a row outside it as a violation, so a
+# priority a queue can hold is exactly a priority a caller may ask for.
+SOURCE_PRIORITY_MIN = 0
+SOURCE_PRIORITY_MAX = 999
 # Per-attempt busy_timeout (ms) while probing for claim_next_bundle's write
 # lock.  Short enough that each failed attempt is a real, countable retry
 # (claim_telemetry.claim_retries) rather than one long internal SQLite wait
@@ -614,6 +620,14 @@ def derive_telemetry_path(db_path: str) -> str:
         return ":memory:"
     root, ext = os.path.splitext(db_path)
     return f"{root}_telemetry{ext}"
+
+
+def check_source_priority_range(priority: int) -> None:
+    """Raise ValueError unless priority is within the source-work range."""
+    if not SOURCE_PRIORITY_MIN <= priority <= SOURCE_PRIORITY_MAX:
+        raise ValueError(
+            "source-work priority must be between "
+            f"{SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}")
 
 
 def read_only_database_uri(db_path: str) -> str:
@@ -1407,7 +1421,13 @@ class ERDQueue:
           queued later.
         - source_word / source_pattern record the first root word whose branch
           produced this entry (kept for display in `status`).
+
+        Raises ValueError, before writing anything, if any row's priority lies
+        outside the source-work range.
         """
+        rows = list(rows)
+        for row in rows:
+            check_source_priority_range(row[2])
         # Intern before the transaction: the branches registry is append-only,
         # so committing ids up front is safe even if the pending insert fails,
         # and keeps the id cache consistent with the database on a rollback.
@@ -3849,8 +3869,7 @@ class ERDQueue:
 
     def set_source_work_priority(self, source_work_id: int, priority: int) -> bool:
         """Atomically change a source request and every owned branch priority."""
-        if not 0 <= priority <= 999:
-            raise ValueError("source-work priority must be between 0 and 999")
+        check_source_priority_range(priority)
         self._conn.execute("BEGIN")
         try:
             cur = self._conn.execute("""
@@ -3966,6 +3985,12 @@ class ERDQueue:
                 "membership"
             )
 
+        # Catches a membership whose parent branch belongs to a different
+        # request.  A parent flattened to another branch the *same* request
+        # owns — a grandchild recorded against the root instead of its
+        # immediate parent — satisfies this query and is not reported here;
+        # that lineage is covered by
+        # test_nested_cooperative_branch_records_immediate_parent.
         invalid_lineage = self._conn.execute("""
             SELECT child.source_work_id, child.branch_id, child.parent_branch_id
             FROM branch_source_work AS child
@@ -3984,30 +4009,33 @@ class ERDQueue:
                 f"{row['parent_branch_id']} that the same request does not own"
             )
 
+        priority_range = (SOURCE_PRIORITY_MIN, SOURCE_PRIORITY_MAX)
         invalid_requested_priorities = self._conn.execute("""
             SELECT source_work_id, requested_priority
             FROM source_work
-            WHERE requested_priority NOT BETWEEN 0 AND 999
+            WHERE requested_priority NOT BETWEEN ? AND ?
             ORDER BY source_work_id
-        """).fetchall()
+        """, priority_range).fetchall()
         for row in invalid_requested_priorities:
             violations.append(
                 f"source_work_id {row['source_work_id']} has requested priority "
-                f"{row['requested_priority']} outside 0..999"
+                f"{row['requested_priority']} outside "
+                f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}"
             )
 
         invalid_effective_priorities = self._conn.execute("""
             SELECT branch_id, source_work_id, owner_priority
             FROM active_branch_owner_rows
-            WHERE owner_priority NOT BETWEEN 0 AND 999
+            WHERE owner_priority NOT BETWEEN ? AND ?
             ORDER BY branch_id, source_work_id
-        """).fetchall()
+        """, priority_range).fetchall()
         for row in invalid_effective_priorities:
             owner = ("direct" if row["source_work_id"] is None else
                      f"source_work_id {row['source_work_id']}")
             violations.append(
                 f"open branch_id {row['branch_id']} owner {owner} has effective "
-                f"priority {row['owner_priority']} outside 0..999"
+                f"priority {row['owner_priority']} outside "
+                f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}"
             )
 
         return violations

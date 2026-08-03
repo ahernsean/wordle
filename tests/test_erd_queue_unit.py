@@ -835,6 +835,21 @@ class TestClaimNext(_TmpQueue):
         self.assertEqual(
             self.q.source_work_rows()[0]["requested_priority"], 1)
 
+    def test_add_pending_many_rejects_priority_outside_range(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        for priority in (-1, 1000):
+            with self.assertRaisesRegex(ValueError, "between 0 and 999"):
+                self.q.add_pending_many([
+                    (self.key, len(WORDS), 1, "crane", 0),
+                    (other_key, 4, priority, "slate", 0),
+                ])
+        # The whole batch is rejected before any write, so neither the
+        # out-of-range row nor the valid row it travelled with is queued.
+        self.assertEqual(self.q.source_work_rows(), [])
+        self.assertFalse(self.q.has_pending_row(self.key))
+        self.assertFalse(self.q.has_pending_row(other_key))
+        self.assertEqual(self.q.check_source_work_invariants(), [])
+
     def test_owner_row_for_branch_has_canonical_direct_and_source_columns(self):
         direct_key = ScoreCache.encode_subset(WORDS[:3])
         self.q.create_branch(direct_key, 3, N_CANDIDATES, priority=3)
