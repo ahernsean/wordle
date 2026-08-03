@@ -124,25 +124,6 @@ def _branch_phase_filter(value):
 
 
 def cmd_view(args):
-    if args.sources:
-        queue = ERDQueue(args.queue_path, read_only=True)
-        try:
-            rows = [dict(row) for row in queue.source_work_rows()]
-        finally:
-            queue.close()
-        if args.format == 'json':
-            print(json.dumps(rows, indent=2))
-        elif args.format == 'jsonl':
-            for row in rows:
-                print(json.dumps(row))
-        else:
-            for row in rows:
-                print(f"{row['source_work_id']:>5}  "
-                      f"{(row['source_word'] or '-').upper():<5}  "
-                      f"priority {row['requested_priority']:>3}  "
-                      f"{row['state']:<6}  roots {row['root_count'] or 0}  "
-                      f"branches {row['branch_count'] or 0}")
-        return
     from report_terminal import run_view
 
     run_view(args)
@@ -404,19 +385,6 @@ def cmd_queue_priority(args):
         print(f'{word.upper()} {pat}: priority set to {args.priority}.')
     else:
         print(f'{word.upper()} {pat}: not found in pending queue.')
-
-
-def cmd_queue_source_priority(args):
-    """Change a source-work request priority and its active descendants."""
-    queue = ERDQueue(args.queue)
-    try:
-        updated = queue.set_source_work_priority(args.source_work_id, args.priority)
-    finally:
-        queue.close()
-    if updated:
-        print(f'Source work {args.source_work_id}: priority set to {args.priority}.')
-    else:
-        print(f'Source work {args.source_work_id}: not found.')
 
 
 # ---------------------------------------------------------------------------
@@ -1036,8 +1004,6 @@ def main():
     view_kind.add_argument('--cache', dest='view_cache', action='store_true')
     view_kind.add_argument('--hotspots', action='store_true')
     view_kind.add_argument('--leaderboard', action='store_true')
-    view_kind.add_argument('--sources', action='store_true',
-                           help='Show source-work requests and ownership counts')
     p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
         help='Comma-separated active,pending,done,unqueued, or all')
@@ -1127,13 +1093,6 @@ def main():
     p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
-    p_qsp = qsub.add_parser(
-        'source-priority',
-        help='Set a source-work priority, including active descendants')
-    p_qsp.add_argument('source_work_id', type=int, metavar='ID')
-    p_qsp.add_argument('--priority', required=True, type=int, metavar='N')
-    p_qsp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
-
     # -- start --
     p_start = sub.add_parser(
         'start',
@@ -1220,8 +1179,6 @@ def main():
             'hotspots' if args.hotspots else
             'leaderboard' if args.leaderboard else 'auto'
         )
-        if args.sources:
-            args.report_kind = 'sources'
         if args.by is not None and not args.hotspots:
             parser.error('--by requires --hotspots')
         if not args.hotspots and any(
@@ -1257,9 +1214,6 @@ def main():
         args.sample_size = min(args.sample_size or 50_000, 1_000_000)
         args.since_seconds = args.since_seconds or 3600
         try:
-            if args.sources:
-                cmd_view(args)
-                return
             validate_report_request(ReportRequest(
                 report_kind=args.report_kind,
                 branch_target=args.branch_target,
@@ -1284,7 +1238,6 @@ def main():
             'clear': cmd_queue_clear,
             'remove': cmd_queue_remove,
             'priority': cmd_queue_priority,
-            'source-priority': cmd_queue_source_priority,
             'reset-stale': cmd_reset_stale,
             'clear-disk-stop': cmd_queue_clear_disk_stop,
             'set-disk-stop': cmd_queue_set_disk_stop,

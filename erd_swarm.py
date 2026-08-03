@@ -104,9 +104,6 @@ RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
 PROMOTE_MIN_SIZE = 60   # cold-model fallback: sub-branches with >= this many
                         # words are promoted cooperatively when the cost model
                         # has no data for their size bucket.
-# Compatibility value for callers that construct cooperative branches directly.
-# Scheduler-created descendants inherit their source-work priority instead.
-PROMOTED_PRIORITY = 0
 OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publication
 # Absolute wall-clock backstop on a single inline frame, independent of the cost
 # model.  When the model is cold (typical(n) is None) the node-proportionate
@@ -1814,8 +1811,7 @@ class _BranchWorker:
                     break                       # finalized as a loss + deleted
                 claim = self._claim_bundle(
                     branch_key, self.n_candidates, words,
-                    expected_source_work_id=self._work_context.source_work_id,
-                    expected_source_priority=self._work_context.source_priority)
+                    expected_source_work_id=self._work_context.source_work_id)
                 if claim is not None:
                     bundle_id, indices, forced = claim
                     if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
@@ -1997,11 +1993,10 @@ class _BranchWorker:
         """Help solve one already-registered branch to completion: claim and
         evaluate its candidates alongside any sibling workers, finalizing it
         once every candidate is done."""
-        branch = next(
-            (dict(row) for row in self.queue.branches_in_progress()
-             if bytes(row['branch_key']) == bytes(branch_key)), None)
-        if branch is None:
+        branch_row = self.queue.owner_row_for_branch(branch_key)
+        if branch_row is None:
             return
+        branch = dict(branch_row)
         with self._entered(WorkContext.from_branch_row(branch)):
             self._solve_branch_focused_in_context(branch)
 
@@ -2020,8 +2015,7 @@ class _BranchWorker:
                 break
             claim = self._claim_bundle(
                 branch_key, n_candidates, words,
-                expected_source_work_id=self._work_context.source_work_id,
-                expected_source_priority=self._work_context.source_priority)
+                expected_source_work_id=self._work_context.source_work_id)
             if claim is None:
                 # Every candidate is claimed.  If coverage is complete, finalize
                 # and stop.  Otherwise some claims are held by siblings — there is

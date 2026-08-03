@@ -1237,6 +1237,44 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertAlmostEqual(cached[1], cost, places=6)
 
+    def test_cooperative_solve_claims_after_source_reprioritization(self):
+        from erd_queue import ERDQueue
+
+        root_key = ScoreCache.encode_subset(BRANCH[:3])
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(root_key, 3, 1, "crane", 0)])
+        source_work_id = q.source_work_rows()[0]["source_work_id"]
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._work_context = WorkContext(
+            source_work_id, 1, "crane", 0, root_key, None)
+        original_claim_bundle = w._claim_bundle
+        reprioritized = False
+
+        def reprioritize_then_claim(*args, **kwargs):
+            nonlocal reprioritized
+            if not reprioritized:
+                reprioritized = True
+                updated = ERDQueue(self.queue_path)
+                try:
+                    self.assertTrue(updated.set_source_work_priority(
+                        source_work_id, 9))
+                finally:
+                    updated.close()
+            return original_claim_bundle(*args, **kwargs)
+
+        w._claim_bundle = mock.MagicMock(side_effect=reprioritize_then_claim)
+        try:
+            result = w.cooperative_solve(BRANCH, ROOT_BUDGET)
+        finally:
+            w.close()
+
+        self.assertTrue(reprioritized)
+        self.assertEqual(result[0], SOLVED)
+        first_call = w._claim_bundle.call_args_list[0]
+        self.assertNotIn("expected_source_priority", first_call.kwargs)
+
     def test_does_not_finalize_when_evaluate_bundle_reports_cancellation(self):
         words = BRANCH
         branch_key = ScoreCache.encode_subset(words)
@@ -1271,7 +1309,7 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
         q.create_branch(branch_key, len(words), n_candidates,
-                        budget=ROOT_BUDGET, priority=erd_swarm.PROMOTED_PRIORITY)
+                        budget=ROOT_BUDGET, priority=0)
         order = list(range(n_candidates))
         cost_lower_bound = [0.0] * n_candidates
         bundle_id, indices, _forced = q.claim_next_bundle(

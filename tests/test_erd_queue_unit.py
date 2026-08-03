@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue as ProductionERDQueue, cost_size_bucket
@@ -260,6 +261,8 @@ class TestBranchLifecycle(_TmpQueue):
             claimed = migrated.claim_next("worker-0")
             self.assertEqual(claimed["source_pattern"], 42)
             self.assertEqual(claimed["source_word"], "crane")
+            self.assertLessEqual(
+                migrated.source_work_rows()[0]["requested_at"], int(time.time()))
         finally:
             migrated.close()
 
@@ -269,6 +272,58 @@ class TestBranchLifecycle(_TmpQueue):
             self.assertEqual(reopened.source_work_rows()[0]["root_count"], 1)
         finally:
             reopened.close()
+
+    def test_view_migration_rebuilds_drifted_views_without_rewriting_current_views(self):
+        expected_views = {
+            row["name"]: row["sql"]
+            for row in self.q._conn.execute("""
+                SELECT name, sql FROM sqlite_master
+                WHERE type = 'view'
+                  AND name IN ('live_branch_source_rows',
+                               'active_branch_owner_rows')
+            """)
+        }
+        self.q.close()
+        conn = sqlite3.connect(self.queue_path)
+        try:
+            conn.execute("DROP VIEW live_branch_source_rows")
+            conn.execute(
+                "CREATE VIEW live_branch_source_rows AS SELECT 0 AS branch_id")
+            conn.commit()
+        finally:
+            conn.close()
+
+        rebuilt = ERDQueue(self.queue_path)
+        try:
+            actual_views = {
+                row["name"]: row["sql"]
+                for row in rebuilt._conn.execute("""
+                    SELECT name, sql FROM sqlite_master
+                    WHERE type = 'view'
+                      AND name IN ('live_branch_source_rows',
+                                   'active_branch_owner_rows')
+                """)
+            }
+            self.assertEqual(actual_views, expected_views)
+        finally:
+            rebuilt.close()
+
+        statements = []
+        original_connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            conn = original_connect(*args, **kwargs)
+            if args[0] == self.queue_path:
+                conn.set_trace_callback(statements.append)
+            return conn
+
+        with mock.patch("erd_queue.sqlite3.connect", side_effect=traced_connect):
+            reopened = ERDQueue(self.queue_path)
+            reopened.close()
+        self.assertFalse(any(
+            statement.lstrip().upper().startswith(("DROP VIEW", "CREATE VIEW"))
+            for statement in statements
+        ))
 
     def test_source_work_migration_marks_terminal_roots_complete(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
@@ -684,6 +739,12 @@ class TestClaimNext(_TmpQueue):
             "UPDATE source_work SET state = 'complete' "
             "WHERE source_work_id = ?",
             (sources["slate"]["source_work_id"],))
+        self.q._conn.execute(
+            "UPDATE branch_source_work SET parent_branch_id = ? "
+            "WHERE source_work_id = ?",
+            (self.q._intern_branch(direct_key),
+             sources["slate"]["source_work_id"])
+        )
 
         violations = self.q.check_source_work_invariants()
         joined = "\n".join(violations)
@@ -693,6 +754,7 @@ class TestClaimNext(_TmpQueue):
         self.assertIn("source-owned open branch_id", joined)
         self.assertIn("requested priority -1 outside 0..999", joined)
         self.assertIn("effective priority 1000 outside 0..999", joined)
+        self.assertIn("that the same request does not own", joined)
         self.assertNotIn(
             self.key,
             [bytes(row["branch_key"])
@@ -753,6 +815,45 @@ class TestClaimNext(_TmpQueue):
         rows = self.q.source_work_rows()
         self.assertEqual(rows[0]["root_count"], 1)
         self.assertEqual(rows[0]["branch_count"], 1)
+        self.assertIsNotNone(self.q.claim_next_bundle(
+            self.key, "worker-1", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
+            expected_source_work_id=claimed["source_work_id"]))
+
+    def test_source_priority_rejects_invalid_and_completed_requests(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        for priority in (-1, 1000):
+            with self.assertRaisesRegex(ValueError, "between 0 and 999"):
+                self.q.set_source_work_priority(source_work_id, priority)
+        self.assertEqual(
+            self.q.source_work_rows()[0]["requested_priority"], 1)
+
+        self.q.claim_next("worker-0", source_work_id)
+        self.q.mark_done(self.key)
+        self.assertFalse(self.q.set_source_work_priority(source_work_id, 2))
+        self.assertEqual(
+            self.q.source_work_rows()[0]["requested_priority"], 1)
+
+    def test_owner_row_for_branch_has_canonical_direct_and_source_columns(self):
+        direct_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.create_branch(direct_key, 3, N_CANDIDATES, priority=3)
+        direct_row = self.q.owner_row_for_branch(direct_key)
+        direct_list_row = self.q.direct_branches_in_progress()[0]
+        self.assertEqual(set(direct_row.keys()), set(direct_list_row.keys()))
+        self.assertIsNone(direct_row["source_work_id"])
+        self.assertEqual(direct_row["owner_priority"], 3)
+
+        self.q.add_pending_many([(self.key, len(WORDS), 7, "crane", 42)])
+        claimed = self.q.claim_next("worker-0")
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, priority=claimed["priority"],
+            source_work_id=claimed["source_work_id"], source_pattern=42)
+        source_row = self.q.owner_row_for_branch(self.key)
+        source_list_row = self.q.branches_in_progress(
+            claimed["source_work_id"])[0]
+        self.assertEqual(set(source_row.keys()), set(source_list_row.keys()))
+        self.assertEqual(source_row["source_work_id"], claimed["source_work_id"])
 
     def test_shared_root_claim_uses_selected_owner_pattern(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])

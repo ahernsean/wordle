@@ -10,6 +10,7 @@ from collections import defaultdict
 from enum import Enum, auto
 
 from cache_sqlite import ScoreCache
+from erd_lattice import ERD_LATTICE_NOISE_MARGIN, erd_ge, erd_numerator
 
 
 # ---------------------------------------------------------------------------
@@ -123,48 +124,6 @@ OVER_ERD_LIMIT    = 4   # every candidate >= ERD bound — lower bound only, do 
 NO_INFORMATION_GAINED = 5  # a response group is the whole branch: split gained nothing
 
 _ABORT_STATUSES = frozenset({DEADLINE_EXCEEDED, CANCEL_RECVD})
-
-
-# Worst on-lattice residual measured across the full production corpus was
-# 3.6e-7 (issue #186); this keeps a ~3x margin while still routing any
-# genuinely off-lattice value to erd_ge's raw-float fallback below.
-_ERD_LATTICE_NOISE_MARGIN = 1e-6
-
-
-def erd_numerator(value, n_answers, *, noise_margin=_ERD_LATTICE_NOISE_MARGIN):
-    """Return the integer numerator of value, if value is exactly
-    k/n_answers to within ``noise_margin`` in scaled numerator units; None if
-    it lies off that lattice.
-
-    A branch's ERD at any budget is (sum of integer line lengths) / n_answers,
-    so every achievable ERD is exactly k/n_answers: a one-dimensional lattice
-    of points spaced 1/n_answers apart.  The unpadded alpha-beta threshold
-    lands on that same lattice.  Carried as float64 the value
-    accumulates ~1e-9 of representation noise; multiplying by n_answers and
-    rounding recovers the exact k.  Distinct lattice points are >= 1 apart
-    after that scaling, so the noise margin can only ever collapse two
-    encodings of the same value, never merge two different ERDs."""
-    numerator = value * n_answers
-    rounded = round(numerator)
-    if abs(numerator - rounded) < noise_margin:
-        return rounded
-    return None
-
-
-def erd_ge(a, b, n_answers):
-    """True iff ERD value a >= b for two values of an n_answers-word branch.
-
-    When both reconstruct to an exact k/n_answers numerator, compares those
-    integers, so float64 noise on the same rational cannot force a spurious
-    cut re-solve.  Falls back to the raw float compare when either value is
-    off that lattice: this comparison only ever gates reuse of already-proven
-    work, so degrading to the pre-fix behavior is always safe, never wrong,
-    and never fatal — unlike raising, which would turn an off-lattice operand
-    into a worker crash instead of a merely-wasted re-solve."""
-    na, nb = erd_numerator(a, n_answers), erd_numerator(b, n_answers)
-    if na is not None and nb is not None:
-        return na >= nb
-    return a >= b
 
 
 # Admissible ceiling on how many answer words any strategy can guarantee to
@@ -285,7 +244,7 @@ def erd_display_numerator(value, n_answers, *, ceiling=False):
     """
     if not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
-    allowed_noise = _ERD_LATTICE_NOISE_MARGIN
+    allowed_noise = ERD_LATTICE_NOISE_MARGIN
     if ceiling:
         allowed_noise += n_answers * _CEIL_EPS
     return erd_numerator(value, n_answers, noise_margin=allowed_noise)

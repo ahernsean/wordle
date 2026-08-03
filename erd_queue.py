@@ -26,6 +26,7 @@ import time
 from urllib.parse import quote
 
 from cache_sqlite import ScoreCache
+from erd_lattice import erd_ge
 from wordle_ui import fmt_pattern
 
 logger = logging.getLogger(__name__)
@@ -47,16 +48,6 @@ _COST_MODEL_MIN_WEIGHT = 1.0
 # still separating sizes that differ by more than a ~30% step.
 _COST_MODEL_BUCKET_BASE = 1.3
 _LOG_BUCKET_BASE = math.log(_COST_MODEL_BUCKET_BASE)
-
-
-def _erd_ge(left, right, n_words):
-    """Compare ERD values on the branch's exact rational lattice."""
-    left_numerator = round(left * n_words)
-    right_numerator = round(right * n_words)
-    if (abs(left * n_words - left_numerator) < 1e-6
-            and abs(right * n_words - right_numerator) < 1e-6):
-        return left_numerator >= right_numerator
-    return left >= right
 
 
 def cost_size_bucket(n_words: int) -> int:
@@ -1092,14 +1083,14 @@ class ERDQueue:
                 ORDER BY branch_id
             """).fetchall()
             now = int(time.time())
-            for offset, row in enumerate(legacy_roots):
+            for row in legacy_roots:
                 state = ({"done": "complete", "in_progress": "active"}
                          .get(row["status"], "queued"))
                 cur = self._conn.execute("""
                     INSERT INTO source_work
                         (source_word, requested_priority, requested_at, state)
                     VALUES (?, ?, ?, ?)
-                """, (row["source_word"], row["priority"], now + offset, state))
+                """, (row["source_word"], row["priority"], now, state))
                 self._conn.execute("""
                     INSERT OR IGNORE INTO branch_source_work
                         (branch_id, source_work_id, parent_branch_id)
@@ -1140,45 +1131,7 @@ class ERDQueue:
                     AND source.state = 'complete'
               )
         """, (int(time.time()),))
-        self._conn.execute("""
-            CREATE VIEW IF NOT EXISTS live_branch_source_rows AS
-            SELECT membership.branch_id,
-                   source.source_work_id,
-                   source.source_word AS owner_source_word,
-                   membership.root_pattern AS owner_root_pattern,
-                   source.requested_priority AS owner_priority
-            FROM branch_source_work AS membership
-            JOIN source_work AS source
-              ON source.source_work_id = membership.source_work_id
-            WHERE membership.resolved_at IS NULL
-              AND source.state != 'complete'
-        """)
-        self._conn.execute("SAVEPOINT rebuild_active_branch_owner_rows")
-        try:
-            self._conn.execute("DROP VIEW IF EXISTS active_branch_owner_rows")
-            self._conn.execute("""
-                CREATE VIEW active_branch_owner_rows AS
-                SELECT active.*,
-                       branch.branch_key,
-                       owner.source_work_id,
-                       COALESCE(owner.owner_source_word, active.source_word)
-                           AS owner_source_word,
-                       COALESCE(owner.owner_root_pattern, active.source_pattern)
-                           AS owner_root_pattern,
-                       COALESCE(owner.owner_priority, active.priority)
-                           AS owner_priority
-                FROM active_branches AS active
-                JOIN branches AS branch USING (branch_id)
-                LEFT JOIN live_branch_source_rows AS owner USING (branch_id)
-                WHERE active.status = 'open'
-                  AND (owner.source_work_id IS NOT NULL
-                       OR active.requires_source_membership = 0)
-            """)
-            self._conn.execute("RELEASE rebuild_active_branch_owner_rows")
-        except Exception:  # pragma: no cover
-            self._conn.execute("ROLLBACK TO rebuild_active_branch_owner_rows")
-            self._conn.execute("RELEASE rebuild_active_branch_owner_rows")
-            raise
+        self._rebuild_queue_views()
 
         # Claims bundle index on the (post-normalization) branch_id key.  After
         # the ADD COLUMN and rebuild above, so bundle_id and branch_id both
@@ -1243,6 +1196,67 @@ class ERDQueue:
             "VALUES (0, 'single-candidate atom baseline', ?)", (now,))
         self._conn.execute(
             "INSERT OR IGNORE INTO run_meta (key, value) VALUES ('epoch', '0')")
+
+    def _rebuild_queue_views(self):
+        """Restore queue views when their stored definition differs from code."""
+        view_definitions = {
+            "live_branch_source_rows": """
+                CREATE VIEW live_branch_source_rows AS
+                SELECT membership.branch_id,
+                       source.source_work_id,
+                       source.source_word AS owner_source_word,
+                       membership.root_pattern AS owner_root_pattern,
+                       source.requested_priority AS owner_priority
+                FROM branch_source_work AS membership
+                JOIN source_work AS source
+                  ON source.source_work_id = membership.source_work_id
+                WHERE membership.resolved_at IS NULL
+                  AND source.state != 'complete'
+            """,
+            "active_branch_owner_rows": """
+                CREATE VIEW active_branch_owner_rows AS
+                SELECT active.*,
+                       branch.branch_key,
+                       owner.source_work_id,
+                       COALESCE(owner.owner_source_word, active.source_word)
+                           AS owner_source_word,
+                       COALESCE(owner.owner_root_pattern, active.source_pattern)
+                           AS owner_root_pattern,
+                       COALESCE(owner.owner_priority, active.priority)
+                           AS owner_priority
+                FROM active_branches AS active
+                JOIN branches AS branch USING (branch_id)
+                LEFT JOIN live_branch_source_rows AS owner USING (branch_id)
+                WHERE active.status = 'open'
+                  AND (owner.source_work_id IS NOT NULL
+                       OR active.requires_source_membership = 0)
+            """,
+        }
+        stored_definitions = {
+            name: self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?",
+                (name,)).fetchone()
+            for name in view_definitions
+        }
+        changed = any(
+            stored_definitions[name] is None or " ".join(
+                stored_definitions[name]["sql"].split()) != " ".join(
+                    definition.split())
+            for name, definition in view_definitions.items()
+        )
+        if not changed:
+            return
+        self._conn.execute("SAVEPOINT rebuild_queue_views")
+        try:
+            for name in view_definitions:
+                self._conn.execute(f"DROP VIEW IF EXISTS {name}")
+            for definition in view_definitions.values():
+                self._conn.execute(definition)
+            self._conn.execute("RELEASE rebuild_queue_views")
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK TO rebuild_queue_views")
+            self._conn.execute("RELEASE rebuild_queue_views")
+            raise
 
     def _assert_schema(self):
         """Refuse to run against a database whose migrated schema disagrees
@@ -1814,7 +1828,7 @@ class ERDQueue:
             if (not active or not source_is_live or active["budget"] != budget
                     or (active["ceiling"] is not None
                         and (ceiling is None
-                             or not _erd_ge(active["ceiling"], ceiling, n_words)))):
+                             or not erd_ge(active["ceiling"], ceiling, n_words)))):
                 self._conn.execute("COMMIT")
                 return False
             parent_branch_id = (self._intern_branch(parent_branch_key)
@@ -1948,9 +1962,14 @@ class ERDQueue:
                 owner_matches = self._conn.execute("""
                     SELECT 1 FROM live_branch_source_rows
                     WHERE branch_id = ? AND source_work_id = ?
-                      AND owner_priority = ?
-                """, (branch_id, expected_source_work_id,
-                      expected_source_priority)).fetchone() is not None
+                """, (branch_id, expected_source_work_id)).fetchone() is not None
+                if owner_matches and expected_source_priority is not None:
+                    owner_matches = self._conn.execute("""
+                        SELECT 1 FROM live_branch_source_rows
+                        WHERE branch_id = ? AND source_work_id = ?
+                          AND owner_priority = ?
+                    """, (branch_id, expected_source_work_id,
+                          expected_source_priority)).fetchone() is not None
             if not owner_matches:
                 self._conn.execute("COMMIT")
                 return None
@@ -2631,7 +2650,7 @@ class ERDQueue:
         return n
 
     def branches_in_progress(self, source_work_id=None):
-        """Open branches, highest priority first — for swarm scheduling."""
+        """Open branches ordered by effective priority then answer count."""
         if source_work_id is None:
             return self._conn.execute("""
                 SELECT row.* FROM active_branch_owner_rows AS row
@@ -2645,20 +2664,41 @@ class ERDQueue:
                                 selected.source_work_id
                        LIMIT 1
                    )
-                ORDER BY row.n_words DESC
+                ORDER BY row.owner_priority DESC, row.n_words DESC
             """).fetchall()
         return self._conn.execute("""
             SELECT * FROM active_branch_owner_rows
             WHERE source_work_id = ?
-            ORDER BY n_words DESC
+            ORDER BY owner_priority DESC, n_words DESC
         """, (source_work_id,)).fetchall()
+
+    def owner_row_for_branch(self, branch_key):
+        """Return the canonical owner row selected for one open branch."""
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return None
+        return self._conn.execute("""
+            SELECT row.* FROM active_branch_owner_rows AS row
+            WHERE row.branch_id = ?
+              AND (row.source_work_id IS NULL
+                   OR row.source_work_id = (
+                       SELECT selected.source_work_id
+                       FROM active_branch_owner_rows AS selected
+                       WHERE selected.branch_id = row.branch_id
+                         AND selected.source_work_id IS NOT NULL
+                       ORDER BY selected.owner_priority DESC,
+                                selected.source_work_id
+                       LIMIT 1
+                   ))
+            LIMIT 1
+        """, (branch_id,)).fetchone()
 
     def direct_branches_in_progress(self):
         """Open branches that have no source-work ownership."""
         return self._conn.execute("""
             SELECT * FROM active_branch_owner_rows
             WHERE source_work_id IS NULL
-            ORDER BY n_words DESC
+            ORDER BY owner_priority DESC, n_words DESC
         """).fetchall()
 
     def recover_active_branches(self):
@@ -3809,11 +3849,13 @@ class ERDQueue:
 
     def set_source_work_priority(self, source_work_id: int, priority: int) -> bool:
         """Atomically change a source request and every owned branch priority."""
+        if not 0 <= priority <= 999:
+            raise ValueError("source-work priority must be between 0 and 999")
         self._conn.execute("BEGIN")
         try:
             cur = self._conn.execute("""
                 UPDATE source_work SET requested_priority = ?
-                WHERE source_work_id = ?
+                WHERE source_work_id = ? AND state != 'complete'
             """, (priority, source_work_id))
             if cur.rowcount:
                 self._conn.execute("""
@@ -3922,6 +3964,24 @@ class ERDQueue:
             violations.append(
                 f"source-owned open branch_id {row['branch_id']} has no live "
                 "membership"
+            )
+
+        invalid_lineage = self._conn.execute("""
+            SELECT child.source_work_id, child.branch_id, child.parent_branch_id
+            FROM branch_source_work AS child
+            WHERE child.parent_branch_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM branch_source_work AS parent
+                  WHERE parent.source_work_id = child.source_work_id
+                    AND parent.branch_id = child.parent_branch_id
+              )
+            ORDER BY child.source_work_id, child.branch_id
+        """).fetchall()
+        for row in invalid_lineage:
+            violations.append(
+                f"membership source_work_id {row['source_work_id']} branch_id "
+                f"{row['branch_id']} has parent_branch_id "
+                f"{row['parent_branch_id']} that the same request does not own"
             )
 
         invalid_requested_priorities = self._conn.execute("""
