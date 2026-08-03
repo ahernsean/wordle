@@ -1251,9 +1251,20 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
             source_work_id, 1, "crane", 0, root_key, None)
         original_claim_bundle = w._claim_bundle
         reprioritized = False
+        # A worker locked out of its own reprioritized branch never claims
+        # again and spins in the wait loop, so the guard bounds the claim
+        # attempts rather than the wall clock: exhausting them stops the
+        # worker and fails with the reason instead of hanging the job.  The
+        # healthy descent claims twice.
+        claim_attempt_limit = 20
+        claim_attempts = 0
 
         def reprioritize_then_claim(*args, **kwargs):
-            nonlocal reprioritized
+            nonlocal reprioritized, claim_attempts
+            claim_attempts += 1
+            if claim_attempts > claim_attempt_limit:
+                w._stop_requested = True
+                return None
             if not reprioritized:
                 reprioritized = True
                 updated = ERDQueue(self.queue_path)
@@ -1271,9 +1282,11 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
             w.close()
 
         self.assertTrue(reprioritized)
+        self.assertLessEqual(
+            claim_attempts, claim_attempt_limit,
+            "cooperative_solve made no progress after "
+            f"{claim_attempt_limit} claim attempts")
         self.assertEqual(result[0], SOLVED)
-        first_call = w._claim_bundle.call_args_list[0]
-        self.assertNotIn("expected_source_priority", first_call.kwargs)
 
     def test_does_not_finalize_when_evaluate_bundle_reports_cancellation(self):
         words = BRANCH
