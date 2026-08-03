@@ -10,7 +10,7 @@ from collections import defaultdict
 from enum import Enum, auto
 
 from cache_sqlite import ScoreCache
-from erd_lattice import ERD_LATTICE_NOISE_MARGIN, erd_ge, erd_numerator
+from erd_lattice import ERD_LATTICE_NOISE_MARGIN, erd_numerator
 
 
 # ---------------------------------------------------------------------------

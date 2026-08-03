@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, mem_cache_limit
+from erd_lattice import erd_ge
 from wordle_engine import (
     ERD_ALL,
     GAME_GUESSES,
@@ -41,7 +42,6 @@ from wordle_engine import (
     OVER_ERD_LIMIT,
     NO_INFORMATION_GAINED,
     _ABORT_STATUSES,
-    erd_ge,
     cache_all_scores,
     evaluate_candidate,
     estimate_candidate_work,
