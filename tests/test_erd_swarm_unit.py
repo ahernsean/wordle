@@ -23,15 +23,38 @@ import time
 import unittest
 from unittest import mock
 
+import erd_queue
 import erd_swarm
 from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
                        PROMOTE_MIN_SIZE)
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
-from erd_queue import ERDQueue, guess_depth_from_spine
+from erd_queue import guess_depth_from_spine
+from tests.queue_invariants import SourceWorkInvariantCheckMixin
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train"]
+
+
+ProductionERDQueue = erd_queue.ERDQueue
+
+
+class InvariantCheckedERDQueue(SourceWorkInvariantCheckMixin,
+                               ProductionERDQueue):
+    pass
+
+
+ERDQueue = InvariantCheckedERDQueue
+
+
+def setUpModule():
+    erd_queue.ERDQueue = InvariantCheckedERDQueue
+    erd_swarm.ERDQueue = InvariantCheckedERDQueue
+
+
+def tearDownModule():
+    erd_queue.ERDQueue = ProductionERDQueue
+    erd_swarm.ERDQueue = ProductionERDQueue
 
 
 def _bare_worker():

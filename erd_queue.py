@@ -287,6 +287,7 @@ CREATE TABLE IF NOT EXISTS active_branches (
     n_words        INTEGER NOT NULL,
     n_candidates   INTEGER NOT NULL,
     priority       INTEGER NOT NULL DEFAULT 0,
+    requires_source_membership INTEGER NOT NULL DEFAULT 0,
     source_word    TEXT,
     source_pattern INTEGER,
     best_erd       REAL,
@@ -1109,6 +1110,17 @@ class ERDQueue:
             "root_pattern": "INTEGER",
             "resolved_at": "INTEGER",
         })
+        self._add_columns("active_branches", {
+            "requires_source_membership": "INTEGER NOT NULL DEFAULT 0",
+        })
+        self._conn.execute("""
+            UPDATE active_branches
+            SET requires_source_membership = 1
+            WHERE branch_id IN (
+                SELECT branch_id FROM branch_source_work
+                WHERE resolved_at IS NULL
+            )
+        """)
         if {"branch_id", "source_pattern"} <= pending_columns:
             self._conn.execute("""
                 UPDATE branch_source_work
@@ -1141,27 +1153,32 @@ class ERDQueue:
             WHERE membership.resolved_at IS NULL
               AND source.state != 'complete'
         """)
-        self._conn.execute("""
-            CREATE VIEW IF NOT EXISTS active_branch_owner_rows AS
-            SELECT active.*,
-                   branch.branch_key,
-                   owner.source_work_id,
-                   COALESCE(owner.owner_source_word, active.source_word)
-                       AS owner_source_word,
-                   COALESCE(owner.owner_root_pattern, active.source_pattern)
-                       AS owner_root_pattern,
-                   COALESCE(owner.owner_priority, active.priority)
-                       AS owner_priority
-            FROM active_branches AS active
-            JOIN branches AS branch USING (branch_id)
-            LEFT JOIN live_branch_source_rows AS owner USING (branch_id)
-            WHERE active.status = 'open'
-              AND (owner.source_work_id IS NOT NULL OR NOT EXISTS (
-                  SELECT 1 FROM branch_source_work AS membership
-                  WHERE membership.branch_id = active.branch_id
-                    AND membership.resolved_at IS NULL
-              ))
-        """)
+        self._conn.execute("SAVEPOINT rebuild_active_branch_owner_rows")
+        try:
+            self._conn.execute("DROP VIEW IF EXISTS active_branch_owner_rows")
+            self._conn.execute("""
+                CREATE VIEW active_branch_owner_rows AS
+                SELECT active.*,
+                       branch.branch_key,
+                       owner.source_work_id,
+                       COALESCE(owner.owner_source_word, active.source_word)
+                           AS owner_source_word,
+                       COALESCE(owner.owner_root_pattern, active.source_pattern)
+                           AS owner_root_pattern,
+                       COALESCE(owner.owner_priority, active.priority)
+                           AS owner_priority
+                FROM active_branches AS active
+                JOIN branches AS branch USING (branch_id)
+                LEFT JOIN live_branch_source_rows AS owner USING (branch_id)
+                WHERE active.status = 'open'
+                  AND (owner.source_work_id IS NOT NULL
+                       OR active.requires_source_membership = 0)
+            """)
+            self._conn.execute("RELEASE rebuild_active_branch_owner_rows")
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK TO rebuild_active_branch_owner_rows")
+            self._conn.execute("RELEASE rebuild_active_branch_owner_rows")
+            raise
 
         # Claims bundle index on the (post-normalization) branch_id key.  After
         # the ADD COLUMN and rebuild above, so bundle_id and branch_id both
@@ -1522,7 +1539,11 @@ class ERDQueue:
                 SET status = 'done', completed_at = ?
                 WHERE branch_id = ?
             """, (now, branch_id))
-            self._resolve_branch_memberships(branch_id)
+            active = self._conn.execute(
+                "SELECT 1 FROM active_branches WHERE branch_id = ?",
+                (branch_id,)).fetchone()
+            if active is None:
+                self._resolve_branch_memberships(branch_id)
             self._conn.execute("COMMIT")
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
@@ -1748,12 +1769,13 @@ class ERDQueue:
             cur = self._conn.execute("""
                 INSERT OR IGNORE INTO active_branches
                     (branch_id, n_words, n_candidates,
-                     priority, source_word, source_pattern, status, created_at,
+                     priority, requires_source_membership,
+                     source_word, source_pattern, status, created_at,
                      budget, spine, ceiling)
-                VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
             """, (branch_id, n_words, n_candidates,
-                  priority, source_word, source_pattern, now, budget, spine,
-                  ceiling))
+                  priority, int(source_work_id is not None), source_word,
+                  source_pattern, now, budget, spine, ceiling))
             created = cur.rowcount == 1
             if source_work_id is not None and created:
                 parent_branch_id = (self._intern_branch(parent_branch_key)
@@ -1785,7 +1807,11 @@ class ERDQueue:
                 "SELECT budget, ceiling FROM active_branches "
                 "WHERE branch_id = ? AND status = 'open'",
                 (branch_id,)).fetchone()
-            if (not active or active["budget"] != budget
+            source_is_live = self._conn.execute("""
+                SELECT 1 FROM source_work
+                WHERE source_work_id = ? AND state != 'complete'
+            """, (source_work_id,)).fetchone() is not None
+            if (not active or not source_is_live or active["budget"] != budget
                     or (active["ceiling"] is not None
                         and (ceiling is None
                              or not _erd_ge(active["ceiling"], ceiling, n_words)))):
@@ -1802,6 +1828,11 @@ class ERDQueue:
                     root_pattern = excluded.root_pattern,
                     resolved_at = NULL
             """, (branch_id, source_work_id, parent_branch_id, source_pattern))
+            self._conn.execute("""
+                UPDATE active_branches
+                SET requires_source_membership = 1
+                WHERE branch_id = ?
+            """, (branch_id,))
             self._conn.execute("COMMIT")
             return True
         except Exception:  # pragma: no cover
@@ -1900,17 +1931,19 @@ class ERDQueue:
             # is treated the same as a missing one.
             branch_id = self._intern_branch(branch_key)
             br = None if branch_id is None else self._conn.execute(
-                "SELECT status, best_erd, pack_cursor, ceiling, bulk_done_bound "
+                "SELECT status, best_erd, pack_cursor, ceiling, bulk_done_bound, "
+                "requires_source_membership "
                 "FROM active_branches "
                 "WHERE branch_id = ?", (branch_id,)).fetchone()
             if br is None or br["status"] != "open":
                 self._conn.execute("COMMIT")
                 return None
             if expected_source_work_id is None:
-                owner_matches = self._conn.execute("""
+                owner_matches = (not br["requires_source_membership"] and
+                    self._conn.execute("""
                     SELECT 1 FROM branch_source_work
                     WHERE branch_id = ? AND resolved_at IS NULL
-                """, (branch_id,)).fetchone() is None
+                """, (branch_id,)).fetchone() is None)
             else:
                 owner_matches = self._conn.execute("""
                     SELECT 1 FROM live_branch_source_rows
@@ -2391,6 +2424,11 @@ class ERDQueue:
                     SET status = 'done', completed_at = ?
                     WHERE branch_id = ?
                 """, (int(time.time()), branch_id))
+                active = self._conn.execute(
+                    "SELECT 1 FROM active_branches WHERE branch_id = ?",
+                    (branch_id,)).fetchone()
+                if active is None:
+                    self._resolve_branch_memberships(branch_id)
                 self._conn.execute("COMMIT")
                 return True
             self._conn.execute("""
@@ -3818,6 +3856,101 @@ class ERDQueue:
             GROUP BY s.source_work_id
             ORDER BY s.requested_priority DESC, s.source_work_id
         """).fetchall()
+
+    def check_source_work_invariants(self) -> list[str]:
+        """Return human-readable violations of source scheduling invariants."""
+        violations = []
+
+        unresolved_without_work = self._conn.execute("""
+            SELECT membership.branch_id, membership.source_work_id
+            FROM branch_source_work AS membership
+            LEFT JOIN pending_branches AS pending
+              ON pending.branch_id = membership.branch_id
+             AND pending.status IN ('pending', 'in_progress')
+            LEFT JOIN active_branches AS active
+              ON active.branch_id = membership.branch_id
+             AND active.status = 'open'
+            WHERE membership.resolved_at IS NULL
+              AND pending.branch_id IS NULL
+              AND active.branch_id IS NULL
+            ORDER BY membership.source_work_id, membership.branch_id
+        """).fetchall()
+        for row in unresolved_without_work:
+            violations.append(
+                "live membership source_work_id "
+                f"{row['source_work_id']} branch_id {row['branch_id']} "
+                "has neither pending/in-progress work nor an open active branch"
+            )
+
+        source_rows = self._conn.execute("""
+            SELECT source.source_work_id, source.state,
+                   EXISTS (
+                       SELECT 1 FROM branch_source_work AS membership
+                       WHERE membership.source_work_id = source.source_work_id
+                         AND membership.resolved_at IS NULL
+                   ) AS has_live_membership
+            FROM source_work AS source
+            ORDER BY source.source_work_id
+        """).fetchall()
+        for row in source_rows:
+            is_complete = row["state"] == "complete"
+            has_live_membership = bool(row["has_live_membership"])
+            if is_complete and has_live_membership:
+                violations.append(
+                    f"complete source_work_id {row['source_work_id']} has a "
+                    "live membership"
+                )
+            elif not is_complete and not has_live_membership:
+                violations.append(
+                    f"unfinished source_work_id {row['source_work_id']} has no "
+                    "live membership"
+                )
+
+        owners_without_membership = self._conn.execute("""
+            SELECT active.branch_id
+            FROM active_branches AS active
+            WHERE active.status = 'open'
+              AND active.requires_source_membership = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM branch_source_work AS membership
+                  WHERE membership.branch_id = active.branch_id
+                    AND membership.resolved_at IS NULL
+              )
+            ORDER BY active.branch_id
+        """).fetchall()
+        for row in owners_without_membership:
+            violations.append(
+                f"source-owned open branch_id {row['branch_id']} has no live "
+                "membership"
+            )
+
+        invalid_requested_priorities = self._conn.execute("""
+            SELECT source_work_id, requested_priority
+            FROM source_work
+            WHERE requested_priority NOT BETWEEN 0 AND 999
+            ORDER BY source_work_id
+        """).fetchall()
+        for row in invalid_requested_priorities:
+            violations.append(
+                f"source_work_id {row['source_work_id']} has requested priority "
+                f"{row['requested_priority']} outside 0..999"
+            )
+
+        invalid_effective_priorities = self._conn.execute("""
+            SELECT branch_id, source_work_id, owner_priority
+            FROM active_branch_owner_rows
+            WHERE owner_priority NOT BETWEEN 0 AND 999
+            ORDER BY branch_id, source_work_id
+        """).fetchall()
+        for row in invalid_effective_priorities:
+            owner = ("direct" if row["source_work_id"] is None else
+                     f"source_work_id {row['source_work_id']}")
+            violations.append(
+                f"open branch_id {row['branch_id']} owner {owner} has effective "
+                f"priority {row['owner_priority']} outside 0..999"
+            )
+
+        return violations
 
     def remove_pending(self, branch_key: bytes) -> bool:
         """Delete a pending (status='pending') branch from the queue.

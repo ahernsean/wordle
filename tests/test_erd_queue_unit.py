@@ -15,11 +15,13 @@ here for completeness.
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue, cost_size_bucket
+from erd_queue import ERDQueue as ProductionERDQueue, cost_size_bucket
+from tests.queue_invariants import SourceWorkInvariantCheckMixin
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
 N_CANDIDATES = 20
@@ -35,6 +37,14 @@ COST_MODEL_BUDGET = 5
 # were written against.
 _IDENTITY_ORDER = list(range(N_CANDIDATES))
 _ZERO_LOWER_BOUND = [0.0] * N_CANDIDATES
+
+
+class InvariantCheckedERDQueue(SourceWorkInvariantCheckMixin,
+                               ProductionERDQueue):
+    pass
+
+
+ERDQueue = InvariantCheckedERDQueue
 
 
 class _TmpQueue(unittest.TestCase):
@@ -125,6 +135,18 @@ class TestBranchLifecycle(_TmpQueue):
             n_words=len(WORDS), source_pattern=0))
         self.assertEqual(len(self.q.branches_in_progress(source_work_id)), 1)
 
+    def test_attach_source_work_rejects_completed_source(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.assertTrue(self.q.remove_pending(other_key))
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+
+        self.assertFalse(self.q.attach_branch_source_work(
+            self.key, source_work_id, budget=5, ceiling=None,
+            n_words=len(WORDS), source_pattern=0))
+        self.assertEqual(len(self.q.direct_branches_in_progress()), 1)
+
     def test_attach_source_work_compares_compatible_lattice_ceilings(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
@@ -168,6 +190,8 @@ class TestBranchLifecycle(_TmpQueue):
             self.key, len(WORDS), N_CANDIDATES, budget=5,
             source_work_id=source_work_id, source_pattern=7)
         self.q.mark_done(self.key)
+        self.q.delete_branch(self.key)
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
 
         self.assertIsNone(self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
@@ -631,6 +655,53 @@ class TestCheckpoint(_TmpQueue):
 
 
 class TestClaimNext(_TmpQueue):
+    def test_source_work_invariant_checker_reports_each_violation(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        direct_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 1, "crane", 7),
+            (other_key, 4, 2, "slate", 42),
+        ])
+        sources = {row["source_word"]: row for row in self.q.source_work_rows()}
+        claimed = self.q.claim_next(
+            "worker-0", sources["crane"]["source_work_id"])
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES,
+            priority=claimed["priority"], source_work_id=claimed["source_work_id"])
+        self.q.create_branch(
+            direct_key, 3, N_CANDIDATES, priority=1000)
+        self.q._conn.execute(
+            "DELETE FROM branch_source_work WHERE source_work_id = ?",
+            (sources["crane"]["source_work_id"],))
+        self.q._conn.execute(
+            "DELETE FROM pending_branches WHERE branch_id = ?",
+            (self.q._intern_branch(other_key),))
+        self.q._conn.execute(
+            "UPDATE source_work SET requested_priority = -1 "
+            "WHERE source_work_id = ?",
+            (sources["crane"]["source_work_id"],))
+        self.q._conn.execute(
+            "UPDATE source_work SET state = 'complete' "
+            "WHERE source_work_id = ?",
+            (sources["slate"]["source_work_id"],))
+
+        violations = self.q.check_source_work_invariants()
+        joined = "\n".join(violations)
+        self.assertIn("has neither pending/in-progress work", joined)
+        self.assertIn("complete source_work_id", joined)
+        self.assertIn("unfinished source_work_id", joined)
+        self.assertIn("source-owned open branch_id", joined)
+        self.assertIn("requested priority -1 outside 0..999", joined)
+        self.assertIn("effective priority 1000 outside 0..999", joined)
+        self.assertNotIn(
+            self.key,
+            [bytes(row["branch_key"])
+             for row in self.q.direct_branches_in_progress()])
+        self.assertIsNone(self.q.claim_next_bundle(
+            self.key, "worker-1", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1))
+        self.q.clear()
+
     def test_claim_next_returns_none_when_queue_empty(self):
         self.assertIsNone(self.q.claim_next("worker-0"))
 
@@ -800,6 +871,94 @@ class TestClaimNext(_TmpQueue):
         claimed = self.q.claim_next("worker-1")
         self.assertEqual(claimed["source_word"], "slate")
         self.assertEqual(claimed["priority"], 1)
+
+
+class TestSourceWorkConcurrency(_TmpQueue):
+    def test_interleaved_source_lifecycle_preserves_invariants(self):
+        worker_count = 4
+        for batch in range(3):
+            ready_to_help = threading.Barrier(worker_count)
+            helped = threading.Barrier(worker_count)
+            ownership = {}
+            failures = []
+            failures_lock = threading.Lock()
+
+            def run_worker(worker_index):
+                queue = ProductionERDQueue(self.queue_path)
+                try:
+                    source_word = f"s{batch}{worker_index}aa"
+                    branch_key = ScoreCache.encode_subset([source_word])
+                    priority = (batch + worker_index) % 10
+                    queue.add_pending_many([
+                        (branch_key, 1, priority, source_word, worker_index),
+                    ])
+                    source_work_id = next(
+                        row["source_work_id"] for row in queue.source_work_rows()
+                        if row["source_word"] == source_word
+                    )
+                    claimed = queue.claim_next(
+                        f"owner-{batch}-{worker_index}", source_work_id)
+                    self.assertIsNotNone(claimed)
+                    self.assertTrue(queue.create_branch(
+                        branch_key, 1, 1, priority=priority,
+                        source_word=source_word, source_pattern=worker_index,
+                        budget=5, source_work_id=source_work_id))
+                    effective_priority = (priority + 1) % 10
+                    self.assertTrue(queue.set_source_work_priority(
+                        source_work_id, effective_priority))
+                    ownership[worker_index] = (
+                        branch_key, source_work_id, effective_priority)
+                    ready_to_help.wait()
+
+                    helped_index = (worker_index + 1) % worker_count
+                    helped_key, helped_source_work_id, helped_priority = (
+                        ownership[helped_index]
+                    )
+                    active = queue.branches_in_progress(
+                        helped_source_work_id)
+                    self.assertEqual(len(active), 1)
+                    bundle = queue.claim_next_bundle(
+                        helped_key, f"helper-{batch}-{worker_index}", 1,
+                        [0], [0.0], small_count=1, count_cap=1,
+                        expected_source_work_id=helped_source_work_id,
+                        expected_source_priority=helped_priority)
+                    self.assertIsNotNone(bundle)
+                    queue.complete_candidate(helped_key, bundle[1][0])
+                    helped.wait()
+
+                    self.assertTrue(queue.try_finalize_branch(branch_key))
+                    queue.mark_done(branch_key)
+                    queue.delete_branch(branch_key)
+
+                    removable_word = f"r{batch}{worker_index}aa"
+                    removable_key = ScoreCache.encode_subset([removable_word])
+                    queue.add_pending_many([
+                        (removable_key, 1, priority, removable_word,
+                         worker_index),
+                    ])
+                    self.assertTrue(queue.remove_pending(removable_key))
+                except Exception as exc:
+                    with failures_lock:
+                        failures.append(exc)
+                    ready_to_help.abort()
+                    helped.abort()
+                finally:
+                    queue.close()
+
+            threads = [
+                threading.Thread(target=run_worker, args=(worker_index,))
+                for worker_index in range(worker_count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+            self.assertFalse(
+                [thread for thread in threads if thread.is_alive()],
+                "source lifecycle stress threads did not finish")
+            if failures:
+                raise failures[0]
+            self.assertEqual(self.q.check_source_work_invariants(), [])
 
 
 class TestCostModel(_TmpQueue):
