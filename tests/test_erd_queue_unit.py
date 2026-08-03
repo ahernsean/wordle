@@ -46,13 +46,17 @@ class _TmpQueue(unittest.TestCase):
         self.addCleanup(self.q.close)
         self.key = ScoreCache.encode_subset(WORDS)
 
-    def _claim_one_idx(self, branch_key, worker_id="worker-0"):
+    def _claim_one_idx(self, branch_key, worker_id="worker-0",
+                       expected_source_work_id=None,
+                       expected_source_priority=None):
         """claim_next_bundle(small_count=1, count_cap=1) unwrapped to a bare
         idx (or None) — the old claim_candidate single-index contract, for
         tests exercising something other than the packer itself."""
         claim = self.q.claim_next_bundle(
             branch_key, worker_id, N_CANDIDATES, _IDENTITY_ORDER,
-            _ZERO_LOWER_BOUND, small_count=1, count_cap=1)
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
+            expected_source_work_id=expected_source_work_id,
+            expected_source_priority=expected_source_priority)
         return claim[1][0] if claim is not None else None
 
 
@@ -143,7 +147,7 @@ class TestBranchLifecycle(_TmpQueue):
             self.key, source_work_id, budget=5, ceiling=1.99,
             n_words=len(WORDS), source_pattern=0))
 
-    def test_require_unowned_claim_rejects_newly_owned_branch(self):
+    def test_direct_claim_rejects_newly_owned_branch(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
         source_work_id = self.q.source_work_rows()[0]["source_work_id"]
@@ -155,7 +159,36 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertIsNone(self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
-            require_unowned=True))
+            expected_source_work_id=None))
+
+    def test_claim_rejects_resolved_expected_owner(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            source_work_id=source_work_id, source_pattern=7)
+        self.q.mark_done(self.key)
+
+        self.assertIsNone(self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
+            expected_source_work_id=source_work_id,
+            expected_source_priority=1))
+
+    def test_claim_rejects_stale_expected_source_priority(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            source_work_id=source_work_id, source_pattern=7)
+        self.q.set_source_work_priority(source_work_id, 9)
+
+        self.assertIsNone(self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
+            expected_source_work_id=source_work_id,
+            expected_source_priority=1))
+        self.assertEqual(self.q.claims_for_branch(self.key), [])
 
     def test_malformed_pending_schema_reports_schema_drift(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
@@ -407,8 +440,10 @@ class TestStartupRecovery(_TmpQueue):
     def test_recover_active_branches_frees_in_flight_claims_only(self):
         # A user-queued branch is identified by its pending_branches row.
         self.q.add_pending_many([(self.key, len(WORDS), 0, None, None)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
-        self._claim_one_idx(self.key, "worker-0")
+        self._claim_one_idx(
+            self.key, "worker-0", source_work_id, 0)
         n_b, n_c = self.q.recover_active_branches()
         self.assertEqual(n_b, 1)
         self.assertEqual(n_c, 1)
@@ -445,8 +480,10 @@ class TestStartupRecovery(_TmpQueue):
         # User-queued branch: has a pending_branches row.
         d0_key = self.key
         self.q.add_pending_many([(d0_key, len(WORDS), 0, None, None)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
         self.q.create_branch(d0_key, len(WORDS), N_CANDIDATES)
-        idx_done = self._claim_one_idx(d0_key, "worker-0")
+        idx_done = self._claim_one_idx(
+            d0_key, "worker-0", source_work_id, 0)
         self.q.complete_candidate(d0_key, idx_done)
 
         # Cooperative branch: no pending_branches row.
@@ -668,7 +705,7 @@ class TestClaimNext(_TmpQueue):
 
         active = self.q.branches_in_progress(rows["slate"]["source_work_id"])[0]
         self.assertEqual(active["owner_source_word"], "slate")
-        self.assertEqual(active["owner_source_pattern"], 42)
+        self.assertEqual(active["owner_root_pattern"], 42)
         self.assertEqual(active["owner_priority"], 9)
 
     def test_completed_owner_stays_resolved_when_branch_is_reactivated(self):

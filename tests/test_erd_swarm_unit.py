@@ -1384,6 +1384,32 @@ class TestHelpOtherBranch(unittest.TestCase):
         finally:
             w.close()
 
+    def test_help_other_branch_preserves_direct_branch_metadata(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        words_b = BRANCH[:4]
+        key_b = ScoreCache.encode_subset(words_b)
+        q = ERDQueue(self.queue_path)
+        q.create_branch(
+            key_b, len(words_b), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=9, source_word="crane", source_pattern=7)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+
+        def evaluate(*_args, **_kwargs):
+            self.assertIsNone(w._top_source_work_id)
+            self.assertEqual(w._top_source_priority, 9)
+            self.assertEqual(w._top_source_word, "crane")
+            self.assertEqual(w._top_source_pattern, 7)
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
+        try:
+            self.assertTrue(w._help_other_branch(b"excluded"))
+        finally:
+            w.close()
+
     def test_help_other_branch_returns_false_when_no_candidates_available(self):
         """When no other branches have available candidate claims, help_other_branch
         returns False without claiming anything."""
@@ -2476,10 +2502,14 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         q.create_branch(self.key, len(BRANCH), n, budget=budget, ceiling=ceiling)
         if queue_user_request:
             q.add_pending_many([(self.key, len(BRANCH), 0, "crane", 0)])
+        source_work_id = (q.source_work_rows()[0]["source_work_id"]
+                          if queue_user_request else None)
         order = list(range(n))
         _, indices, _ = q.claim_next_bundle(
             self.key, "other", n, order, [0.0] * n,
-            small_count=n, count_cap=n)
+            small_count=n, count_cap=n,
+            expected_source_work_id=source_work_id,
+            expected_source_priority=0 if queue_user_request else None)
         for idx in indices:
             q.complete_candidate(self.key, idx)
         if cut:

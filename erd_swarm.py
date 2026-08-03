@@ -1058,7 +1058,8 @@ class _BranchWorker:
         return result
 
     def _claim_bundle(self, branch_key, n_candidates, words,
-                      require_unowned=False):
+                      expected_source_work_id=None,
+                      expected_source_priority=None):
         """claim_next_bundle for `branch_key`, supplying this worker's
         (cached) packing stats.  Returns (bundle_id, indices, forced) or None
         — see ERDQueue.claim_next_bundle.
@@ -1071,7 +1072,9 @@ class _BranchWorker:
         return self.queue.claim_next_bundle(
             branch_key, self.name, n_candidates, order, cost_lower_bound,
             small_count=self.small_count, count_cap=self.count_cap,
-            republish_limit=self.republish_limit, require_unowned=require_unowned)
+            republish_limit=self.republish_limit,
+            expected_source_work_id=expected_source_work_id,
+            expected_source_priority=expected_source_priority)
 
     # -- evaluate one candidate claim ---------------------------------------
 
@@ -1559,7 +1562,8 @@ class _BranchWorker:
                               if 'source_work_id' in branch.keys() else None)
             claim = self._claim_bundle(
                 other_key, n_candidates, words,
-                require_unowned=source_work_id is None)
+                expected_source_work_id=source_work_id,
+                expected_source_priority=branch['owner_priority'])
             if claim is None:
                 continue
             bundle_id, indices, forced = claim
@@ -1578,7 +1582,7 @@ class _BranchWorker:
             self._top_source_work_id = source_work_id
             self._top_source_priority = branch.get('owner_priority', 0)
             self._top_source_word = branch.get('owner_source_word')
-            self._top_source_pattern = branch.get('owner_source_pattern')
+            self._top_source_pattern = branch.get('owner_root_pattern')
             try:
                 if self.evaluate_bundle(other_key, words, branch['n_words'],
                                         bundle_id, indices, forced, budget=budget):
@@ -1795,7 +1799,12 @@ class _BranchWorker:
                     if cut is not None:
                         return cut
                     break                       # finalized as a loss + deleted
-                claim = self._claim_bundle(branch_key, self.n_candidates, words)
+                claim = self._claim_bundle(
+                    branch_key, self.n_candidates, words,
+                    expected_source_work_id=getattr(
+                        self, '_top_source_work_id', None),
+                    expected_source_priority=getattr(
+                        self, '_top_source_priority', None))
                 if claim is not None:
                     bundle_id, indices, forced = claim
                     if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
@@ -1831,21 +1840,23 @@ class _BranchWorker:
 
     # -- scheduling: claim one candidate from the best available branch ------
 
-    def _claim_active_branch(self, branches, source_work_id=None,
-                             require_unowned=False):
+    def _claim_active_branch(self, branches, source_work_id=None):
         """Claim a candidate bundle from an open branch, if one is available."""
         for active_branch in branches:
             branch_key = bytes(active_branch['branch_key'])
             words = decode_subset(branch_key)
             claim = self._claim_bundle(
                 branch_key, active_branch['n_candidates'], words,
-                require_unowned=require_unowned)
+                expected_source_work_id=source_work_id,
+                expected_source_priority=(
+                    active_branch['owner_priority']
+                    if source_work_id is not None else None))
             if claim is not None:
                 branch = dict(active_branch)
                 if source_work_id is not None:
                     branch['source_work_id'] = source_work_id
                     branch['source_word'] = active_branch['owner_source_word']
-                    branch['source_pattern'] = active_branch['owner_source_pattern']
+                    branch['source_pattern'] = active_branch['owner_root_pattern']
                     branch['priority'] = active_branch['owner_priority']
                 bundle_id, indices, forced = claim
                 return branch, bundle_id, indices, forced
@@ -1868,7 +1879,7 @@ class _BranchWorker:
         claimed = None
         if not self._source_work_enabled:
             direct_work = self._claim_active_branch(
-                self.queue.direct_branches_in_progress(), require_unowned=True)
+                self.queue.direct_branches_in_progress())
             if direct_work is not None:
                 return direct_work
             self._source_work_enabled = self.queue.has_source_work()
@@ -1901,7 +1912,7 @@ class _BranchWorker:
             # from before source lineage was recorded.  They remain claimable
             # until finalization; new work always follows source-first order.
             return self._claim_active_branch(
-                self.queue.direct_branches_in_progress(), require_unowned=True)
+                self.queue.direct_branches_in_progress())
 
         n_words = claimed['n_words']
         self.queue.create_branch(
@@ -1912,7 +1923,10 @@ class _BranchWorker:
             source_work_id=claimed['source_work_id'])
         self._source_work_enabled = True
         words = decode_subset(claimed['branch_key'])
-        claim = self._claim_bundle(claimed['branch_key'], self.n_candidates, words)
+        claim = self._claim_bundle(
+            claimed['branch_key'], self.n_candidates, words,
+            expected_source_work_id=claimed['source_work_id'],
+            expected_source_priority=claimed['priority'])
         branch = {
             'branch_key': claimed['branch_key'], 'n_words': n_words,
             'n_candidates': self.n_candidates,
