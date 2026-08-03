@@ -154,6 +154,24 @@ class TestTelemetryInserts(_TmpQueue):
         self.assertEqual(row["claim_retries"], 0)
         self.assertEqual(row["epoch"], 0)
 
+    def test_claim_telemetry_carries_phase_breakdown(self):
+        self.q._last_claim_busy_millis = 2
+        self.q._last_claim_transaction_millis = 5
+        self.q._last_claim_commit_millis = 3
+        self.q.add_claim_telemetry(40, 21, 1500, 6, finalize_millis=4)
+        row = self.q._conn.execute(
+            "SELECT busy_wait_millis, claim_transaction_millis, "
+            "claim_commit_millis, finalize_millis, idle_millis "
+            "FROM claim_telemetry").fetchone()
+        self.assertEqual(row["busy_wait_millis"], 2)
+        self.assertEqual(row["claim_transaction_millis"], 5)
+        self.assertEqual(row["claim_commit_millis"], 3)
+        self.assertEqual(row["finalize_millis"], 4)
+        self.assertEqual(row["idle_millis"], 21 - 5 - 3 - 2 - 4)
+        # Consumed and reset, same contract as busy_wait_millis/claim_retries.
+        self.assertEqual(self.q._last_claim_transaction_millis, 0)
+        self.assertEqual(self.q._last_claim_commit_millis, 0)
+
     def test_branch_finalize_log_persists_branch_timing(self):
         self.q.add_branch_finalize_log(
             b"key", "SALET --g-- ", 30, 4, created_at=100,

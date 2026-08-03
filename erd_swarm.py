@@ -556,6 +556,11 @@ class _BranchWorker:
         # "GUESS pattern".  Promotion composes a child branch's spine as this base
         # plus the live descent guesses in self._spine.  None until the first claim.
         self._claimed_branch_spine = None
+        # Cache-write time from a finalize this worker won since the last
+        # add_claim_telemetry call, consumed and reset by evaluate_claim so a
+        # finalize triggered by completing a candidate is attributed to that
+        # candidate's own claim_telemetry row (see maybe_finalize).
+        self._pending_finalize_millis = 0.0
         # In-memory cache of cost-model predictions keyed by sub-branch size.
         # Cleared on any cost-model write so new samples take effect.
         self._typical_cache = {}
@@ -1059,7 +1064,9 @@ class _BranchWorker:
 
     # -- evaluate one candidate claim ---------------------------------------
 
-    def evaluate_claim(self, branch_key, words, n_words, idx, budget=None):
+    def evaluate_claim(self, branch_key, words, n_words, idx, budget=None,
+                       bundle_id=None, bundle_start_idx=None,
+                       bundle_end_idx=None):
         """Evaluate the single candidate self.all_words[idx] against branch_key.
 
         Folds the result into the branch's shared best and marks the claim
@@ -1069,6 +1076,10 @@ class _BranchWorker:
         budget is the branch's guess budget (depth-limited ERD): a candidate
         whose strategy can't win within budget is infeasible (and taints the
         branch — see ERDQueue.mark_branch_tainted).
+
+        bundle_id/bundle_start_idx/bundle_end_idx identify the claim_next_bundle
+        bundle this candidate belongs to, for claim_telemetry attribution; all
+        three are None for a claim taken outside the bundle path.
         """
         candidate = self.all_words[idx]
         self._cur_candidate = candidate
@@ -1233,8 +1244,15 @@ class _BranchWorker:
                         metric['erd_lower_bound_pruned'],
                         nodes_delta, group_sizes=metric['group_sizes'],
                         source_word=self._top_source_word)
+            finalize_millis = int(self._pending_finalize_millis)
+            self._pending_finalize_millis = 0.0
             self.queue.add_claim_telemetry(
-                n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
+                n_words, int(full_coord_seconds * 1e3), nodes_delta,
+                self.n_workers, branch_key=branch_key,
+                spine=self._claimed_branch_spine, worker_id=self.name,
+                bundle_id=bundle_id, idx=idx,
+                bundle_start_idx=bundle_start_idx,
+                bundle_end_idx=bundle_end_idx, finalize_millis=finalize_millis)
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.
@@ -1245,7 +1263,8 @@ class _BranchWorker:
     # -- evaluate a packer-issued bundle of candidate claims -----------------
 
     def _evaluate_bundle_member(self, branch_key, words, n_words, idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0):
+                                bundle_id, nodes_at_bundle_start, wall_t0,
+                                bundle_start_idx=None, bundle_end_idx=None):
         """evaluate_claim for one bundle member; on cancellation/abort,
         records the bundle as censored.  Returns True to keep going, False
         for the caller to abort evaluate_bundle immediately."""
@@ -1254,7 +1273,9 @@ class _BranchWorker:
                                 wall_t0, censored=True)
             return False
         if not self.evaluate_claim(branch_key, words, n_words, idx,
-                                   budget=budget):
+                                   budget=budget, bundle_id=bundle_id,
+                                   bundle_start_idx=bundle_start_idx,
+                                   bundle_end_idx=bundle_end_idx):
             self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
                                 wall_t0, censored=True)
             return False
@@ -1298,10 +1319,14 @@ class _BranchWorker:
         """
         nodes_at_bundle_start = self._nodes
         wall_t0 = time.time()
+        bundle_start_idx = min(indices) if indices else None
+        bundle_end_idx = max(indices) if indices else None
         for pos, idx in enumerate(indices):
             if not self._evaluate_bundle_member(
                     branch_key, words, n_words, idx, budget, bundle_id,
-                    nodes_at_bundle_start, wall_t0):
+                    nodes_at_bundle_start, wall_t0,
+                    bundle_start_idx=bundle_start_idx,
+                    bundle_end_idx=bundle_end_idx):
                 return False
             if idx in forced:
                 nodes_at_bundle_start = self._nodes
@@ -1316,7 +1341,9 @@ class _BranchWorker:
                     if later_idx in forced:
                         if not self._evaluate_bundle_member(
                                 branch_key, words, n_words, later_idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0):
+                                bundle_id, nodes_at_bundle_start, wall_t0,
+                                bundle_start_idx=bundle_start_idx,
+                                bundle_end_idx=bundle_end_idx):
                             return False
                     else:
                         remainder.append(later_idx)
@@ -1360,6 +1387,7 @@ class _BranchWorker:
             return False
         if not self.queue.try_finalize_branch(branch_key):  # pragma: no cover
             return False  # another worker won the finalize
+        finalize_t0 = time.time()
         meta = self.queue.read_branch_meta(branch_key)
         (best_guess, best_erd, max_depth, tainted, budget,
          ceiling, cut_occurred) = meta
@@ -1492,6 +1520,7 @@ class _BranchWorker:
                                  branch_key[:25])
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
+        self._pending_finalize_millis += (time.time() - finalize_t0) * 1000
         return True
 
     def _await_rival_finalize(self, branch_key, words, n_words, n_candidates):
@@ -1891,6 +1920,8 @@ class _BranchWorker:
         branch = self.queue.get_branch(branch_key)
         if branch is None or branch['status'] != 'open':
             return
+        self._claimed_branch_spine = (
+            branch['spine'] if 'spine' in branch.keys() else None)
         words = decode_subset(branch_key)
         budget = self._branch_budget(branch)
         n_candidates = branch['n_candidates']

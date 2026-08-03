@@ -39,6 +39,7 @@ class QueueVisibilityTests(unittest.TestCase):
             "idx_cut_reuse_misses_epoch_recorded_id",
             "idx_claim_telemetry_epoch_id",
             "idx_claim_telemetry_epoch_recorded_id",
+            "idx_claim_telemetry_branch_recorded_at",
         }
         indexes = set()
         for table in (

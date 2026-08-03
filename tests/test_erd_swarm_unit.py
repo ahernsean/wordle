@@ -74,6 +74,7 @@ def _bare_worker():
     w._top_source_word = None
     w._top_source_pattern = None
     w._claimed_branch_spine = None
+    w._pending_finalize_millis = 0.0
     w._adaptive = True
     w._typical_cache = {}
     w._cost_model_buffer = {}
@@ -343,7 +344,7 @@ class TestCancelPath(unittest.TestCase):
         w.bundle_wall_cap_seconds = 999
         seen = []
 
-        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None):
+        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None, **kwargs):
             seen.append(idx)
             w._nodes += 5000 if idx == 0 else 1
             return True
@@ -367,7 +368,7 @@ class TestCancelPath(unittest.TestCase):
         w.bundle_wall_cap_seconds = 999
         seen = []
 
-        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None):
+        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None, **kwargs):
             seen.append(idx)
             w._nodes += 5000 if idx == 0 else 1
             return True
@@ -389,7 +390,7 @@ class TestCancelPath(unittest.TestCase):
         w.bundle_wall_cap_seconds = 999
         seen = []
 
-        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None):
+        def fake_evaluate_claim(branch_key, words, n_words, idx, budget=None, **kwargs):
             seen.append(idx)
             if idx == 0:
                 w._nodes += 5000
@@ -872,6 +873,64 @@ class TestSolveBranchFocusedMultiBundleDrain(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         self.assertIsNotNone(q.get_branch(branch_key))   # not finalized
         q.close()
+
+
+class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
+    """solve_branch_focused's claim_telemetry rows carry branch/bundle
+    attribution end to end (issue #197): branch_key, spine, and worker_id are
+    populated, and idx falls within [bundle_start_idx, bundle_end_idx] for a
+    bundle claim.  This is the only path today that exercises the full
+    evaluate_claim -> add_claim_telemetry write path, so it is also the test
+    that catches solve_branch_focused failing to set _claimed_branch_spine."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def test_claim_telemetry_rows_carry_branch_and_bundle_attribution(self):
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, spine="CRANE -----")
+        q.close()
+
+        w = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        try:
+            w.solve_branch_focused(branch_key)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        rows = q._conn.execute(
+            "SELECT branch_key, spine, worker_id, bundle_id, idx, "
+            "bundle_start_idx, bundle_end_idx FROM claim_telemetry "
+            "ORDER BY id").fetchall()
+        q.close()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row["branch_key"], branch_key)
+            self.assertEqual(row["spine"], "CRANE -----")
+            self.assertEqual(row["worker_id"], "worker-1")
+            self.assertIsNotNone(row["bundle_id"])
+            self.assertIsNotNone(row["idx"])
+            self.assertLessEqual(row["bundle_start_idx"], row["idx"])
+            self.assertLessEqual(row["idx"], row["bundle_end_idx"])
 
 
 class TestClaimOneJoinsInProgressBranch(unittest.TestCase):

@@ -226,6 +226,23 @@ workers restart would stamp two regimes during the recycle window. Stop the
 swarm first. `--force` overrides that protection only for an intentional live
 cutover; restart every worker immediately afterward.
 
+### Branch-attributed claim telemetry
+
+`telemetry.claim_telemetry` (in the attached telemetry file, see "Schema
+coordination" in AGENTS.md) carries a `branch_key`/`spine`, `worker_id`,
+`bundle_id`, and `idx` (with `bundle_start_idx`/`bundle_end_idx`) on every
+row, so a slow branch's coordination cost can be attributed to it directly
+instead of only to its `n_words`/epoch bucket — query
+`WHERE branch_key = ?` (an index exists for this) or `WHERE spine LIKE ...`
+against the telemetry file.  `coordination_millis` is also broken into
+`claim_transaction_millis` (claim-scan and write, inside
+`claim_next_bundle`'s transaction) + `claim_commit_millis` (its `COMMIT`) +
+`busy_wait_millis` (lock-acquisition wait) + `finalize_millis`
+(cache-write time when this claim also won the branch's finalize) +
+`idle_millis` (the remainder). There is no `view`/CLI reader for this table
+yet — it is offline/ad-hoc-SQL only; open the telemetry file directly (or a
+live `ERDQueue`'s `telemetry` attached schema) to inspect it.
+
 ---
 
 ## Queue mutations

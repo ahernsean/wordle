@@ -577,13 +577,21 @@ class TestClaimTelemetryContentionAttribution(_TmpQueue):
     def test_contention_values_reset_after_being_logged_once(self):
         self.q._last_claim_busy_millis = 250
         self.q._last_claim_retries = 3
+        self.q._last_claim_transaction_millis = 40
+        self.q._last_claim_commit_millis = 10
         self.q.add_claim_telemetry(10, 5, 1, 4)
         self.q.add_claim_telemetry(10, 1, 1, 4)   # a later, unrelated candidate
         rows = self.q._conn.execute(
-            "SELECT busy_wait_millis, claim_retries FROM claim_telemetry "
-            "ORDER BY id").fetchall()
-        self.assertEqual((rows[0]["busy_wait_millis"], rows[0]["claim_retries"]), (250, 3))
-        self.assertEqual((rows[1]["busy_wait_millis"], rows[1]["claim_retries"]), (0, 0))
+            "SELECT busy_wait_millis, claim_retries, claim_transaction_millis, "
+            "claim_commit_millis FROM claim_telemetry ORDER BY id").fetchall()
+        self.assertEqual(
+            (rows[0]["busy_wait_millis"], rows[0]["claim_retries"],
+             rows[0]["claim_transaction_millis"], rows[0]["claim_commit_millis"]),
+            (250, 3, 40, 10))
+        self.assertEqual(
+            (rows[1]["busy_wait_millis"], rows[1]["claim_retries"],
+             rows[1]["claim_transaction_millis"], rows[1]["claim_commit_millis"]),
+            (0, 0, 0, 0))
 
 
 class TestMultiWorkerNoOverlap(unittest.TestCase):
