@@ -118,6 +118,15 @@ class TestBranchLifecycle(_TmpQueue):
     def test_read_branch_best_returns_none_none_for_missing_key(self):
         self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))
 
+    def test_read_branch_best_returns_none_none_after_delete(self):
+        # delete_branch removes the active_branches row but leaves the
+        # branches registry entry (branch_id stays stable for re-promotion),
+        # so a post-delete read finds a registered branch_id with no
+        # active_branches row -- distinct from a never-registered key.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        self.q.delete_branch(self.key)
+        self.assertEqual(self.q.read_branch_best(self.key), (None, None, None))
+
     def test_mark_branch_tainted_sets_flag(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
         self.q.mark_branch_tainted(self.key)

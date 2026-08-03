@@ -874,6 +874,34 @@ class TestSolveBranchFocusedMultiBundleDrain(unittest.TestCase):
         self.assertIsNotNone(q.get_branch(branch_key))   # not finalized
         q.close()
 
+    def test_waits_and_reclaims_when_siblings_hold_remaining_claims(self):
+        # Every candidate already claimed (done=0) by another worker: claim
+        # is None, but branch_done_candidates is 0 < n_candidates, so this
+        # must take the "wait and reclaim" branch rather than finalizing.
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        q.create_branch(branch_key, len(BRANCH), n_candidates, budget=ROOT_BUDGET)
+        order = list(range(n_candidates))
+        cost_lower_bound = [0.0] * n_candidates
+        q.claim_next_bundle(branch_key, "other", n_candidates, order,
+                            cost_lower_bound, small_count=n_candidates,
+                            count_cap=n_candidates)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w.cancel = mock.MagicMock(side_effect=[False, True])
+        try:
+            w.solve_branch_focused(branch_key)
+        finally:
+            w.close()
+
+        self.assertGreaterEqual(w.cancel.call_count, 2)
+        q = ERDQueue(self.queue_path)
+        self.assertIsNotNone(q.get_branch(branch_key))   # not finalized
+        q.close()
+
 
 class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
     """solve_branch_focused's claim_telemetry rows carry branch/bundle
