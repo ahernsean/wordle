@@ -227,6 +227,7 @@ CREATE TABLE IF NOT EXISTS branch_source_work (
     source_work_id INTEGER NOT NULL REFERENCES source_work(source_work_id),
     parent_branch_id INTEGER REFERENCES branches(branch_id),
     root_pattern   INTEGER,
+    resolved_at    INTEGER,
     PRIMARY KEY (branch_id, source_work_id)
 );
 
@@ -1104,7 +1105,10 @@ class ERDQueue:
                     VALUES (?, ?, NULL)
                 """, (row["branch_id"], cur.lastrowid))
 
-        self._add_columns("branch_source_work", {"root_pattern": "INTEGER"})
+        self._add_columns("branch_source_work", {
+            "root_pattern": "INTEGER",
+            "resolved_at": "INTEGER",
+        })
         if {"branch_id", "source_pattern"} <= pending_columns:
             self._conn.execute("""
                 UPDATE branch_source_work
@@ -1114,6 +1118,16 @@ class ERDQueue:
                 )
                 WHERE parent_branch_id IS NULL AND root_pattern IS NULL
             """)
+        self._conn.execute("""
+            UPDATE branch_source_work AS membership
+            SET resolved_at = ?
+            WHERE resolved_at IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM source_work AS source
+                  WHERE source.source_work_id = membership.source_work_id
+                    AND source.state = 'complete'
+              )
+        """, (int(time.time()),))
 
         # Claims bundle index on the (post-normalization) branch_id key.  After
         # the ADD COLUMN and rebuild above, so bundle_id and branch_id both
@@ -1357,9 +1371,13 @@ class ERDQueue:
                     source_pattern = COALESCE(source_pattern, excluded.source_pattern)
             """, prepared)
             self._conn.executemany("""
-                INSERT OR IGNORE INTO branch_source_work
+                INSERT INTO branch_source_work
                     (branch_id, source_work_id, parent_branch_id, root_pattern)
                 VALUES (?, ?, NULL, ?)
+                ON CONFLICT(branch_id, source_work_id) DO UPDATE SET
+                    parent_branch_id = NULL,
+                    root_pattern = excluded.root_pattern,
+                    resolved_at = NULL
             """, [(branch_id, source_work_ids[(source_word, priority)], source_pattern)
                   for branch_id, _n_words, priority, source_word, source_pattern
                   in prepared])
@@ -1379,11 +1397,13 @@ class ERDQueue:
         """Return unfinished source work in source-first admission order."""
         return self._conn.execute("""
             SELECT s.* FROM source_work s
-            WHERE EXISTS (
+            WHERE s.state != 'complete'
+              AND EXISTS (
                 SELECT 1 FROM branch_source_work m
                 LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
                 LEFT JOIN active_branches a ON a.branch_id = m.branch_id
                 WHERE m.source_work_id = s.source_work_id
+                  AND m.resolved_at IS NULL
                   AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
             )
             ORDER BY s.requested_priority DESC,
@@ -1429,6 +1449,8 @@ class ERDQueue:
                 JOIN source_work s ON s.source_work_id = m.source_work_id
                 WHERE p.status = 'pending'
                   AND s.source_work_id = ?
+                  AND s.state != 'complete'
+                  AND m.resolved_at IS NULL
                 ORDER BY p.n_words DESC
                 LIMIT 1
             """, (source_work_id,)).fetchone()
@@ -1462,12 +1484,18 @@ class ERDQueue:
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
             return
-        self._conn.execute("""
-            UPDATE pending_branches
-            SET status = 'done', completed_at = ?
-            WHERE branch_id = ?
-        """, (now, branch_id))
-        self._complete_finished_source_work()
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute("""
+                UPDATE pending_branches
+                SET status = 'done', completed_at = ?
+                WHERE branch_id = ?
+            """, (now, branch_id))
+            self._resolve_branch_memberships(branch_id)
+            self._conn.execute("COMMIT")
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
 
     def _complete_finished_source_work(self):
         """Mark source requests terminal once every owned branch is complete."""
@@ -1479,14 +1507,28 @@ class ERDQueue:
                   LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
                   LEFT JOIN active_branches a ON a.branch_id = m.branch_id
                   WHERE m.source_work_id = s.source_work_id
+                    AND m.resolved_at IS NULL
                     AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
               )
         """)
 
-    def _remove_branch_source_work(self, branch_id: int):
-        """Remove a branch from every source request that owns it."""
-        self._conn.execute(
-            "DELETE FROM branch_source_work WHERE branch_id = ?", (branch_id,))
+    def _resolve_branch_memberships(self, branch_id: int = None,
+                                    withdraw: bool = False):
+        """Make branch ownership unschedulable and update request lifecycle."""
+        branch_condition = "" if branch_id is None else " AND branch_id = ?"
+        parameters = () if branch_id is None else (branch_id,)
+        if withdraw:
+            if branch_id is None:
+                self._conn.execute("DELETE FROM branch_source_work")
+            else:
+                self._conn.execute(
+                    "DELETE FROM branch_source_work "
+                    "WHERE resolved_at IS NULL AND branch_id = ?", parameters)
+        else:
+            self._conn.execute(
+                "UPDATE branch_source_work SET resolved_at = ? "
+                "WHERE resolved_at IS NULL" + branch_condition,
+                (int(time.time()), *parameters))
         self._complete_finished_source_work()
 
     def reset_stale_in_progress(self) -> int:
@@ -1686,9 +1728,13 @@ class ERDQueue:
                 parent_branch_id = (self._intern_branch(parent_branch_key)
                                     if parent_branch_key is not None else None)
                 self._conn.execute("""
-                    INSERT OR IGNORE INTO branch_source_work
+                    INSERT INTO branch_source_work
                         (branch_id, source_work_id, parent_branch_id, root_pattern)
                     VALUES (?, ?, ?, ?)
+                    ON CONFLICT(branch_id, source_work_id) DO UPDATE SET
+                        parent_branch_id = excluded.parent_branch_id,
+                        root_pattern = excluded.root_pattern,
+                        resolved_at = NULL
                 """, (branch_id, source_work_id, parent_branch_id,
                       source_pattern))
             self._conn.execute("COMMIT")
@@ -1717,9 +1763,13 @@ class ERDQueue:
             parent_branch_id = (self._intern_branch(parent_branch_key)
                                 if parent_branch_key is not None else None)
             self._conn.execute("""
-                INSERT OR IGNORE INTO branch_source_work
+                INSERT INTO branch_source_work
                     (branch_id, source_work_id, parent_branch_id, root_pattern)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(branch_id, source_work_id) DO UPDATE SET
+                    parent_branch_id = excluded.parent_branch_id,
+                    root_pattern = excluded.root_pattern,
+                    resolved_at = NULL
             """, (branch_id, source_work_id, parent_branch_id, source_pattern))
             self._conn.execute("COMMIT")
             return True
@@ -1825,7 +1875,8 @@ class ERDQueue:
                 self._conn.execute("COMMIT")
                 return None
             if require_unowned and self._conn.execute(
-                    "SELECT 1 FROM branch_source_work WHERE branch_id = ?",
+                    "SELECT 1 FROM branch_source_work "
+                    "WHERE branch_id = ? AND resolved_at IS NULL",
                     (branch_id,)).fetchone() is not None:
                 self._conn.execute("COMMIT")
                 return None
@@ -2413,28 +2464,40 @@ class ERDQueue:
         # The branches registry row is intentionally left in place: it is
         # append-only, so branch_id stays stable if this branch is ever
         # re-promoted, and the blob it holds once is negligible.
-        branch_id = self._intern_branch(branch_key)
-        if branch_id is not None:
+        self._conn.execute("BEGIN")
+        try:
+            branch_id = self._intern_branch(branch_key)
+            n_claims = n_republish = 0
+            if branch_id is not None:
+                self._conn.execute(
+                    "DELETE FROM candidate_claims WHERE branch_id = ?", (branch_id,))
+                n_claims = self._conn.execute("SELECT changes()").fetchone()[0]
+                self._conn.execute(
+                    "DELETE FROM candidate_republish WHERE branch_id = ?",
+                    (branch_id,))
+                n_republish = self._conn.execute("SELECT changes()").fetchone()[0]
             self._conn.execute(
-                "DELETE FROM candidate_claims WHERE branch_id = ?", (branch_id,))
-            n_claims = self._conn.execute("SELECT changes()").fetchone()[0]
-            self._conn.execute(
-                "DELETE FROM candidate_republish WHERE branch_id = ?",
-                (branch_id,))
-            n_republish = self._conn.execute("SELECT changes()").fetchone()[0]
+                "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
+                (branch_key,))
+            if branch_id is not None:
+                self._conn.execute(
+                    "DELETE FROM active_branches WHERE branch_id = ?", (branch_id,))
+                unresolved_pending = self._conn.execute("""
+                    SELECT 1 FROM pending_branches
+                    WHERE branch_id = ? AND status IN ('pending', 'in_progress')
+                """, (branch_id,)).fetchone()
+                if unresolved_pending is None:
+                    self._resolve_branch_memberships(branch_id)
+            self._conn.execute("COMMIT")
             self._tally_wal_traffic(
                 'candidate_claims/delete-branch', n_claims,
                 n_claims * _CLAIM_ROW_WAL_BYTES)
             self._tally_wal_traffic(
                 'candidate_republish/delete-branch', n_republish,
                 n_republish * _CLAIM_ROW_WAL_BYTES)
-        self._conn.execute(
-            "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
-            (branch_key,))
-        if branch_id is not None:
-            self._conn.execute(
-                "DELETE FROM active_branches WHERE branch_id = ?", (branch_id,))
-            self._complete_finished_source_work()
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
 
     def reclaim_stale_claims(self, heartbeat_timeout_seconds: int,
                              min_claim_age_seconds: int = None) -> int:
@@ -2510,6 +2573,7 @@ class ERDQueue:
             JOIN branch_source_work m ON m.branch_id = a.branch_id
             JOIN source_work s ON s.source_work_id = m.source_work_id
             WHERE a.status = 'open' AND m.source_work_id = ?
+              AND m.resolved_at IS NULL AND s.state != 'complete'
             ORDER BY a.n_words DESC
         """, (source_work_id,)).fetchall()
 
@@ -2522,6 +2586,7 @@ class ERDQueue:
               AND NOT EXISTS (
                   SELECT 1 FROM branch_source_work m
                   WHERE m.branch_id = a.branch_id
+                    AND m.resolved_at IS NULL
               )
             ORDER BY a.n_words DESC
         """).fetchall()
@@ -3522,13 +3587,19 @@ class ERDQueue:
         The persistent cache (wordle_cache.sqlite3) is not touched — only
         the transient coordination tables in erd_queue.sqlite3.
         """
-        self._conn.execute("DELETE FROM candidate_claims")
-        self._conn.execute("DELETE FROM active_branches")
-        self._conn.execute("DELETE FROM pending_branches")
-        self._conn.execute("DELETE FROM branch_source_work")
-        self._conn.execute("DELETE FROM source_work")
-        self._conn.execute("DELETE FROM worker_heartbeat")
-        self._conn.execute("DELETE FROM run_meta")
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute("DELETE FROM candidate_claims")
+            self._conn.execute("DELETE FROM active_branches")
+            self._conn.execute("DELETE FROM pending_branches")
+            self._resolve_branch_memberships(withdraw=True)
+            self._conn.execute("DELETE FROM source_work")
+            self._conn.execute("DELETE FROM worker_heartbeat")
+            self._conn.execute("DELETE FROM run_meta")
+            self._conn.execute("COMMIT")
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
 
     def total_branches(self) -> int:
         """Total rows in pending_branches (all statuses)."""
@@ -3643,7 +3714,7 @@ class ERDQueue:
                     self._conn.execute(
                         "DELETE FROM pending_branches WHERE branch_id = ?",
                         (branch_id,))
-                    self._remove_branch_source_work(branch_id)
+                    self._resolve_branch_memberships(branch_id, withdraw=True)
             self._conn.execute("COMMIT")
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
@@ -3682,10 +3753,11 @@ class ERDQueue:
                         FROM branch_source_work m
                         JOIN source_work s ON s.source_work_id = m.source_work_id
                         WHERE m.branch_id = pending_branches.branch_id
+                          AND m.resolved_at IS NULL
                     )
                     WHERE branch_id IN (
                         SELECT branch_id FROM branch_source_work
-                        WHERE source_work_id = ?
+                        WHERE source_work_id = ? AND resolved_at IS NULL
                     )
                 """, (source_work_id,))
                 self._conn.execute("""
@@ -3695,10 +3767,11 @@ class ERDQueue:
                         FROM branch_source_work m
                         JOIN source_work s ON s.source_work_id = m.source_work_id
                         WHERE m.branch_id = active_branches.branch_id
+                          AND m.resolved_at IS NULL
                     )
                     WHERE branch_id IN (
                         SELECT branch_id FROM branch_source_work
-                        WHERE source_work_id = ?
+                        WHERE source_work_id = ? AND resolved_at IS NULL
                     )
                 """, (source_work_id,))
             self._conn.execute("COMMIT")
@@ -3736,7 +3809,7 @@ class ERDQueue:
                 (branch_id,))
             removed = self._conn.execute("SELECT changes()").fetchone()[0] > 0
             if removed:
-                self._remove_branch_source_work(branch_id)
+                self._resolve_branch_memberships(branch_id, withdraw=True)
             self._conn.execute("COMMIT")
             return removed
         except Exception:  # pragma: no cover

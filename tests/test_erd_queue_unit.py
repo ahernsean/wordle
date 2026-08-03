@@ -81,8 +81,8 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertLess(transaction.index("BEGIN IMMEDIATE"),
                         transaction.index("INSERT OR IGNORE INTO active_branches"))
         self.assertLess(transaction.index("INSERT OR IGNORE INTO active_branches"),
-                        transaction.index("INSERT OR IGNORE INTO branch_source_work"))
-        self.assertLess(transaction.index("INSERT OR IGNORE INTO branch_source_work"),
+                        transaction.index("INSERT INTO branch_source_work"))
+        self.assertLess(transaction.index("INSERT INTO branch_source_work"),
                         transaction.index("COMMIT"))
 
     def test_losing_create_does_not_attach_incompatible_source_work(self):
@@ -670,6 +670,59 @@ class TestClaimNext(_TmpQueue):
         self.assertEqual(active["owner_source_word"], "slate")
         self.assertEqual(active["owner_source_pattern"], 42)
         self.assertEqual(active["owner_priority"], 9)
+
+    def test_completed_owner_stays_resolved_when_branch_is_reactivated(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 7)])
+        crane = self.q.claim_next("worker-0")
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            priority=crane["priority"], source_word=crane["source_word"],
+            source_pattern=crane["source_pattern"],
+            source_work_id=crane["source_work_id"])
+        self.q.mark_done(self.key)
+        self.q.delete_branch(self.key)
+
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 42)])
+        slate = next(row for row in self.q.source_work_rows()
+                     if row["source_word"] == "slate")
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=4,
+            priority=1, source_word="slate", source_pattern=42,
+            source_work_id=slate["source_work_id"])
+
+        candidates = self.q.source_work_candidates()
+        self.assertEqual([row["source_word"] for row in candidates], ["slate"])
+        provenance = self.q._conn.execute("""
+            SELECT source.source_word, membership.resolved_at
+            FROM branch_source_work AS membership
+            JOIN source_work AS source USING (source_work_id)
+            WHERE membership.branch_id = ?
+            ORDER BY source.source_work_id
+        """, (self.q._intern_branch(self.key),)).fetchall()
+        self.assertEqual(provenance[0]["source_word"], "crane")
+        self.assertIsNotNone(provenance[0]["resolved_at"])
+        self.assertEqual(provenance[1]["source_word"], "slate")
+        self.assertIsNone(provenance[1]["resolved_at"])
+
+    def test_cut_branch_keeps_live_membership_for_pending_exact_work(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 7)])
+        crane = self.q.claim_next("worker-0")
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            priority=crane["priority"], source_word=crane["source_word"],
+            source_pattern=crane["source_pattern"],
+            source_work_id=crane["source_work_id"])
+        self.q.requeue_pending(self.key)
+        self.q.delete_branch(self.key)
+
+        candidates = self.q.source_work_candidates()
+        self.assertEqual([row["source_word"] for row in candidates], ["crane"])
+        membership = self.q._conn.execute("""
+            SELECT resolved_at FROM branch_source_work
+            WHERE branch_id = ? AND source_work_id = ?
+        """, (self.q._intern_branch(self.key),
+              crane["source_work_id"])).fetchone()
+        self.assertIsNone(membership["resolved_at"])
 
     def test_clear_removes_source_work_before_readding_shared_root(self):
         self.q.add_pending_many([(self.key, len(WORDS), 999, "audio", 0)])
