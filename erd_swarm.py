@@ -26,6 +26,8 @@ import random
 import signal
 import sqlite3
 import time
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 
 import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, mem_cache_limit
@@ -128,6 +130,37 @@ ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY = max(
 MIN_PUBLISH_BRANCH_WORDS = 2  # frames with fewer answer words are base cases, never
                               # worth tracking for overrun (the candidate loop on a
                               # 1-word branch never even runs)
+
+
+@dataclass(frozen=True)
+class WorkContext:
+    source_work_id: int | None
+    source_priority: int
+    source_word: str | None
+    source_pattern: int | None
+    branch_key: bytes | None
+    spine: str | None
+
+    @classmethod
+    def empty(cls):
+        return cls(None, 0, None, None, None, None)
+
+    @classmethod
+    def from_branch_row(cls, branch):
+        values = dict(branch)
+        source_word = values["owner_source_word"]
+        source_pattern = values["owner_root_pattern"]
+        spine = values.get("spine")
+        if spine is None and source_word and source_pattern is not None:
+            spine = f"{source_word.upper()} {fmt_pattern(source_pattern)}"
+        return cls(
+            values["source_work_id"], values["owner_priority"], source_word,
+            source_pattern, bytes(values["branch_key"]), spine)
+
+    def descend(self, branch_key, spine):
+        return WorkContext(
+            self.source_work_id, self.source_priority, self.source_word,
+            self.source_pattern, bytes(branch_key), spine)
 
 # Adaptive publish threshold (node-equivalents): SAFETY_FACTOR * coordination_time
 # / node_time.  Publishing pays only when the handed-off work exceeds the cost of
@@ -332,18 +365,19 @@ class _MidLoopPublisher:
         # Create the cooperative branch; idempotent if another worker raced us.
         # First writer for this path, so the composed spine must be supplied here
         # (cooperative_solve's later create_branch is a no-op once this row exists).
+        context = self._worker._work_context
         created = self._worker.queue.create_branch(
             branch_key, n, self._worker.n_candidates,
-            priority=getattr(self._worker, '_top_source_priority', 0),
-            source_word=self._worker._top_source_word,
-            source_pattern=self._worker._top_source_pattern,
+            priority=context.source_priority,
+            source_word=context.source_word,
+            source_pattern=context.source_pattern,
             budget=budget,
             spine=self._worker._promoted_spine(
                 self._worker.root_budget - budget),
             root_budget=self._worker.root_budget,
             ceiling=branch_ceiling,
-            source_work_id=getattr(self._worker, '_top_source_work_id', None),
-            parent_branch_key=getattr(self._worker, '_claimed_branch_key', None))
+            source_work_id=context.source_work_id,
+            parent_branch_key=context.branch_key)
 
         if created:
             row_budget, row_ceiling = budget, branch_ceiling
@@ -367,11 +401,10 @@ class _MidLoopPublisher:
             return None
         # A compatible raced branch adopts the selected source ownership only
         # after the surviving row has passed the joinability checks above.
-        if not created and getattr(self._worker, '_top_source_work_id', None) is not None:
+        if not created and context.source_work_id is not None:
             self._worker.queue.attach_branch_source_work(
-                branch_key, self._worker._top_source_work_id, budget, ours, n,
-                self._worker._top_source_pattern,
-                getattr(self._worker, '_claimed_branch_key', None))
+                branch_key, context.source_work_id, budget, ours, n,
+                context.source_pattern, context.branch_key)
 
         # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
         # tuned offline; the node-proportionate path is the model working as
@@ -554,23 +587,13 @@ class _BranchWorker:
         # (which table is the firehose) rather than an unbounded running total.
         self._last_wal_traffic = self.queue.wal_traffic_snapshot()
         self._last_wal_traffic_log = time.time()
-        # Attribution for promoted sub-branches: which top-level (opener,pattern)
-        # tree the worker is currently descending.
-        self._top_source_word = None
-        self._top_source_pattern = None
-        self._top_source_work_id = None
-        self._top_source_priority = 0
+        self._work_context = WorkContext.empty()
         # Direct cooperative callers can create active branches without a
         # source-work request.  Keep their tight claim loop free of the
         # source-admission query used by queued source work.
         self._source_work_enabled = self.queue.has_source_work()
         # Counts ERD-pruned candidate_accuracy claims for 1-in-N down-sampling.
         self._erd_lower_bound_pruned_accuracy_n = 0
-        # Absolute root -> branch spine of the branch the worker is currently
-        # descending (its claimed branch): the guesses played, space-joined as
-        # "GUESS pattern".  Promotion composes a child branch's spine as this base
-        # plus the live descent guesses in self._spine.  None until the first claim.
-        self._claimed_branch_spine = None
         # In-memory cache of cost-model predictions keyed by sub-branch size.
         # Cleared on any cost-model write so new samples take effect.
         self._typical_cache = {}
@@ -620,6 +643,15 @@ class _BranchWorker:
         (run() returns -> close() clears the heartbeat row) runs instead of the
         process dying mid-evaluation."""
         self._stop_requested = True
+
+    @contextmanager
+    def _entered(self, context):
+        saved_context = self._work_context
+        self._work_context = context
+        try:
+            yield
+        finally:
+            self._work_context = saved_context
 
     def cancel(self):
         return self._stop_requested or (
@@ -671,7 +703,7 @@ class _BranchWorker:
             return f'{guess.upper()}:{pattern}/{size}'
         return str(size)
 
-    def _claimed_branch_guess_depth(self):
+    def _context_branch_guess_depth(self):
         """Guess depth of the current claimed branch.
 
         Entries in _hb_max_spine / _log_max_spine at this depth and shallower
@@ -679,20 +711,20 @@ class _BranchWorker:
         the heartbeat's live-descent string.  _solve_subset fires note_depth
         before calling subbranch_solver, so the entry at the claimed branch
         level is always written by the outer frame and persists into inner
-        cooperative_solve sessions until _claimed_branch_spine is updated.
+        cooperative_solve sessions until the work context is updated.
         """
-        spine = getattr(self, '_claimed_branch_spine', None)
+        spine = self._work_context.spine
         return guess_depth_from_spine(spine) if spine else 0
 
     def _hb_spine_str(self):
-        claimed_guess_depth = self._claimed_branch_guess_depth()
+        claimed_guess_depth = self._context_branch_guess_depth()
         return '→'.join(
             f'{d}:{self._fmt_spine_entry(self._hb_max_spine[d])}'
             for d in sorted(self._hb_max_spine)
             if d > claimed_guess_depth)
 
     def _log_spine_str(self):
-        claimed_guess_depth = self._claimed_branch_guess_depth()
+        claimed_guess_depth = self._context_branch_guess_depth()
         return '→'.join(
             f'{d}:{self._fmt_spine_entry(self._log_max_spine[d])}'
             for d in sorted(self._log_max_spine)
@@ -734,7 +766,7 @@ class _BranchWorker:
         composes a spine longer than its budget allows, which create_branch's
         budget + guess_depth = root_budget invariant rejects.
         """
-        base = getattr(self, '_claimed_branch_spine', None)
+        base = self._work_context.spine
         if not base:
             return None
         # Entries at or shallower than the claimed branch's guess depth are
@@ -1251,7 +1283,7 @@ class _BranchWorker:
                         metric['bound'], metric['candidate_cost_lower_bound'],
                         metric['erd_lower_bound_pruned'],
                         nodes_delta, group_sizes=metric['group_sizes'],
-                        source_word=self._top_source_word)
+                        source_word=self._work_context.source_word)
             self.queue.add_claim_telemetry(
                 n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
         self.claims_done += 1
@@ -1568,29 +1600,11 @@ class _BranchWorker:
                 continue
             bundle_id, indices, forced = claim
             budget = self._branch_budget(branch)
-            # Promotions while helping must base off the helped branch's spine.
-            saved_context = (
-                self._claimed_branch_spine,
-                getattr(self, '_claimed_branch_key', None),
-                getattr(self, '_top_source_work_id', None),
-                getattr(self, '_top_source_priority', 0),
-                getattr(self, '_top_source_word', None),
-                getattr(self, '_top_source_pattern', None))
-            self._claimed_branch_spine = branch['spine'] if 'spine' in branch.keys() \
-                else None
-            self._claimed_branch_key = other_key
-            self._top_source_work_id = source_work_id
-            self._top_source_priority = branch.get('owner_priority', 0)
-            self._top_source_word = branch.get('owner_source_word')
-            self._top_source_pattern = branch.get('owner_root_pattern')
-            try:
+            context = WorkContext.from_branch_row(branch)
+            with self._entered(context):
                 if self.evaluate_bundle(other_key, words, branch['n_words'],
                                         bundle_id, indices, forced, budget=budget):
                     self.maybe_finalize(other_key, words, n_candidates)
-            finally:
-                (self._claimed_branch_spine, self._claimed_branch_key,
-                 self._top_source_work_id, self._top_source_priority,
-                 self._top_source_word, self._top_source_pattern) = saved_context
             self._maybe_checkpoint()
             return True
         return False
@@ -1684,9 +1698,8 @@ class _BranchWorker:
         # Absolute spine of the branch being promoted, composed from the descent
         # that reached it before this frame's own work overwrites self._spine.
         child_spine = self._promoted_spine(self.root_budget - budget)
-        saved_spine = self._claimed_branch_spine
-        saved_branch_key = getattr(self, '_claimed_branch_key', None)
-        try:
+        parent_context = self._work_context
+        with ExitStack() as context_stack:
             branch_key = encode_subset(words)
             n_words = len(words)
             # Already solved by someone? reuse without re-promoting.
@@ -1733,13 +1746,13 @@ class _BranchWorker:
                 branch_ceiling = ceiling
             created = self.queue.create_branch(
                 branch_key, n_words, self.n_candidates,
-                priority=getattr(self, '_top_source_priority', 0),
-                source_word=self._top_source_word,
-                source_pattern=self._top_source_pattern, budget=budget,
+                priority=parent_context.source_priority,
+                source_word=parent_context.source_word,
+                source_pattern=parent_context.source_pattern, budget=budget,
                 spine=child_spine, root_budget=self.root_budget,
                 ceiling=branch_ceiling,
-                source_work_id=getattr(self, '_top_source_work_id', None),
-                parent_branch_key=getattr(self, '_claimed_branch_key', None))
+                source_work_id=parent_context.source_work_id,
+                parent_branch_key=parent_context.branch_key)
             if not created:
                 # Raced or joined an existing branch: its budget and ceiling
                 # decide joinability.  The budget must match exactly — every
@@ -1764,14 +1777,14 @@ class _BranchWorker:
                         return None
                     # A compatible raced branch adopts the selected source
                     # ownership only after this surviving row is joinable.
-                    if getattr(self, '_top_source_work_id', None) is not None:
+                    if parent_context.source_work_id is not None:
                         self.queue.attach_branch_source_work(
-                            branch_key, self._top_source_work_id, budget, ours,
-                            n_words, self._top_source_pattern,
-                            getattr(self, '_claimed_branch_key', None))
+                            branch_key, parent_context.source_work_id, budget,
+                            ours, n_words, parent_context.source_pattern,
+                            parent_context.branch_key)
             # Descents into this branch promote grandchildren relative to its spine.
-            self._claimed_branch_spine = child_spine
-            self._claimed_branch_key = branch_key
+            context_stack.enter_context(self._entered(
+                parent_context.descend(branch_key, child_spine)))
 
             while not self.cancel():
                 # Finished?  Check before claiming so we never touch a branch that
@@ -1801,10 +1814,8 @@ class _BranchWorker:
                     break                       # finalized as a loss + deleted
                 claim = self._claim_bundle(
                     branch_key, self.n_candidates, words,
-                    expected_source_work_id=getattr(
-                        self, '_top_source_work_id', None),
-                    expected_source_priority=getattr(
-                        self, '_top_source_priority', None))
+                    expected_source_work_id=self._work_context.source_work_id,
+                    expected_source_priority=self._work_context.source_priority)
                 if claim is not None:
                     bundle_id, indices, forced = claim
                     if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
@@ -1834,15 +1845,14 @@ class _BranchWorker:
                 return CANCEL_RECVD
             # Finalized as a loss: proven unsolvable within budget (not a cutoff).
             return (OVER_DEPTH_BUDGET, float('inf'), None, True)  # pragma: no cover
-        finally:
-            self._claimed_branch_spine = saved_spine
-            self._claimed_branch_key = saved_branch_key
 
     # -- scheduling: claim one candidate from the best available branch ------
 
     def _claim_active_branch(self, branches, source_work_id=None):
         """Claim a candidate bundle from an open branch, if one is available."""
         for active_branch in branches:
+            branch = dict(active_branch)
+            context = WorkContext.from_branch_row(branch)
             branch_key = bytes(active_branch['branch_key'])
             words = decode_subset(branch_key)
             claim = self._claim_bundle(
@@ -1852,22 +1862,17 @@ class _BranchWorker:
                     active_branch['owner_priority']
                     if source_work_id is not None else None))
             if claim is not None:
-                branch = dict(active_branch)
-                if source_work_id is not None:
-                    branch['source_work_id'] = source_work_id
-                    branch['source_word'] = active_branch['owner_source_word']
-                    branch['source_pattern'] = active_branch['owner_root_pattern']
-                    branch['priority'] = active_branch['owner_priority']
                 bundle_id, indices, forced = claim
-                return branch, bundle_id, indices, forced
+                return context, branch, bundle_id, indices, forced
             if self.queue.branch_done_candidates(branch_key) >= active_branch['n_candidates']:
-                self.maybe_finalize(branch_key, words, active_branch['n_candidates'])
+                with self._entered(context):
+                    self.maybe_finalize(
+                        branch_key, words, active_branch['n_candidates'])
         return None
 
     def claim_one(self):
-        """Return (branch_row_dict, bundle_id, indices, forced) for the next
-        bundle of candidates to work, or None if there is nothing to do right
-        now.
+        """Return (context, branch, bundle_id, indices, forced) for the next
+        bundle of candidates, or None if there is nothing to do right now.
 
         Prefers JOINING an in-progress branch (to finish branches already
         underway, concentrating workers) over PROMOTING a new one from the
@@ -1932,21 +1937,26 @@ class _BranchWorker:
             'n_candidates': self.n_candidates,
             'source_word': claimed['source_word'],
             'source_pattern': claimed['source_pattern'],
-            'source_work_id': claimed['source_work_id'],
             'priority': claimed['priority'],
+            'source_work_id': claimed['source_work_id'],
+            'owner_source_word': claimed['source_word'],
+            'owner_root_pattern': claimed['source_pattern'],
+            'owner_priority': claimed['priority'],
             'spine': root_spine,
             'budget': budget,
         }
+        context = WorkContext.from_branch_row(branch)
         # A bulk-elimination sweep can complete the branch without returning
         # worker work; otherwise another worker grabbed every remaining slot.
         if claim is None:
             if (self.queue.branch_done_candidates(claimed['branch_key'])
                     >= self.n_candidates):
-                self.maybe_finalize(claimed['branch_key'], words,
-                                    self.n_candidates)
+                with self._entered(context):
+                    self.maybe_finalize(claimed['branch_key'], words,
+                                        self.n_candidates)
             return None
         bundle_id, indices, forced = claim
-        return branch, bundle_id, indices, forced
+        return context, branch, bundle_id, indices, forced
 
     # -- main loop ----------------------------------------------------------
 
@@ -1964,28 +1974,18 @@ class _BranchWorker:
                 time.sleep(0.5)
                 continue
             idle_since = None
-            branch, bundle_id, indices, forced = work
+            context, branch, bundle_id, indices, forced = work
             branch_key = branch['branch_key']
-            # Attribute any sub-branches this worker promotes to the tree it is
-            # descending (best-effort; for status display).
-            self._top_source_word = branch.get('source_word')
-            self._top_source_pattern = branch.get('source_pattern')
-            self._top_source_work_id = branch.get('source_work_id')
-            self._top_source_priority = branch.get('priority', 0)
-            self._claimed_branch_key = branch_key
-            # Base spine for deeper promotions: a joined in-progress branch carries
-            # its own stored spine; a freshly promoted top branch falls back to root.
-            self._claimed_branch_spine = branch.get('spine') or self._root_spine(
-                branch.get('source_word'), branch.get('source_pattern'))
             words = decode_subset(branch_key)
             n_candidates = branch['n_candidates']
             if self.cancel():
                 break
-            completed = self.evaluate_bundle(
-                branch_key, words, branch['n_words'], bundle_id, indices, forced,
-                budget=self._branch_budget(branch))
-            if completed:
-                self.maybe_finalize(branch_key, words, n_candidates)
+            with self._entered(context):
+                completed = self.evaluate_bundle(
+                    branch_key, words, branch['n_words'], bundle_id, indices,
+                    forced, budget=self._branch_budget(branch))
+                if completed:
+                    self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
             self._check_ram()
             self._check_disk()
@@ -1997,9 +1997,16 @@ class _BranchWorker:
         """Help solve one already-registered branch to completion: claim and
         evaluate its candidates alongside any sibling workers, finalizing it
         once every candidate is done."""
-        branch = self.queue.get_branch(branch_key)
-        if branch is None or branch['status'] != 'open':
+        branch = next(
+            (dict(row) for row in self.queue.branches_in_progress()
+             if bytes(row['branch_key']) == bytes(branch_key)), None)
+        if branch is None:
             return
+        with self._entered(WorkContext.from_branch_row(branch)):
+            self._solve_branch_focused_in_context(branch)
+
+    def _solve_branch_focused_in_context(self, branch):
+        branch_key = bytes(branch['branch_key'])
         words = decode_subset(branch_key)
         budget = self._branch_budget(branch)
         n_candidates = branch['n_candidates']
@@ -2011,7 +2018,10 @@ class _BranchWorker:
             # branch.
             if self.queue.get_branch(branch_key) is None:
                 break
-            claim = self._claim_bundle(branch_key, n_candidates, words)
+            claim = self._claim_bundle(
+                branch_key, n_candidates, words,
+                expected_source_work_id=self._work_context.source_work_id,
+                expected_source_priority=self._work_context.source_priority)
             if claim is None:
                 # Every candidate is claimed.  If coverage is complete, finalize
                 # and stop.  Otherwise some claims are held by siblings — there is

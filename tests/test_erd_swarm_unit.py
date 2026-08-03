@@ -24,7 +24,8 @@ import unittest
 from unittest import mock
 
 import erd_swarm
-from erd_swarm import _BranchWorker, ROOT_BUDGET, PROMOTE_MIN_SIZE
+from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
+                       PROMOTE_MIN_SIZE)
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
 from erd_queue import ERDQueue, guess_depth_from_spine
@@ -71,9 +72,7 @@ def _bare_worker():
     w._hb_max_spine = {}
     w._log_max_spine = {}
     w.started = 0
-    w._top_source_word = None
-    w._top_source_pattern = None
-    w._claimed_branch_spine = None
+    w._work_context = WorkContext.empty()
     w._adaptive = True
     w._typical_cache = {}
     w._cost_model_buffer = {}
@@ -100,6 +99,13 @@ def _bare_worker():
     w.queue.wal_traffic_snapshot.return_value = ({}, {})
     w.queue.wal_size_bytes.return_value = 0
     return w
+
+
+def _context(branch_key=b"branch", spine=None, source_work_id=None,
+             source_priority=0, source_word=None, source_pattern=None):
+    return WorkContext(
+        source_work_id, source_priority, source_word, source_pattern,
+        branch_key, spine)
 
 
 class TestHeartbeatThrottling(unittest.TestCase):
@@ -159,7 +165,7 @@ class TestPromotedSpine(unittest.TestCase):
     def test_descent_at_or_above_base_depth_is_not_reappended(self):
         w = _bare_worker()
         # Base reaches a guess_depth-2 branch via SALET then ABORT.
-        w._claimed_branch_spine = 'SALET -g-g- ABORT y----'
+        w._work_context = _context(spine='SALET -g-g- ABORT y----')
         # Live descent still carries the reaching guess (depth 2, budget 4) AND
         # a genuine child below it (depth 3, budget 3).
         w._note_depth(4, 12, 'abort', 'y----')   # guess_depth 2 — the base tail
@@ -170,8 +176,8 @@ class TestPromotedSpine(unittest.TestCase):
 
     def test_different_entry_at_base_depth_preserves_budget_invariant(self):
         w = _bare_worker()
-        w._claimed_branch_spine = (
-            'CRANE -yy-y SATED -g-g- DARGS -gy--')
+        w._work_context = _context(
+            spine='CRANE -yy-y SATED -g-g- DARGS -gy--')
         w._note_depth(3, 5, 'gamps', '-g---')
 
         spine = w._promoted_spine()
@@ -181,7 +187,7 @@ class TestPromotedSpine(unittest.TestCase):
 
     def test_stale_entry_at_base_depth_dropped_but_descent_kept(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'ALIBI y---- EARNT yg---'
+        w._work_context = _context(spine='ALIBI y---- EARNT yg---')
         w._note_depth(4, 30, 'story', '-yy-y')
         w._note_depth(3, 12, 'coups', '-----')
 
@@ -200,7 +206,7 @@ class TestPromotedSpine(unittest.TestCase):
         for budget, base_spine, descent_entries in cases:
             with self.subTest(budget=budget):
                 w = _bare_worker()
-                w._claimed_branch_spine = base_spine
+                w._work_context = _context(spine=base_spine)
                 for entry_budget, guess, pattern in descent_entries:
                     w._note_depth(entry_budget, 5, guess, pattern)
                 w.score_cache.read_with_depth.return_value = None
@@ -223,7 +229,7 @@ class TestPromotedSpine(unittest.TestCase):
         inner_words = BRANCH[:4]
         outer_key = ScoreCache.encode_subset(outer_words)
         root_key = b"root-branch"
-        w._claimed_branch_key = root_key
+        w._work_context = _context(branch_key=root_key)
         w.score_cache.read_with_depth.return_value = None
         w.score_cache.read_loss.return_value = None
         w.queue.read_cut_result.return_value = []
@@ -234,9 +240,9 @@ class TestPromotedSpine(unittest.TestCase):
         w._claim_bundle = mock.MagicMock(return_value=(1, [0], False))
 
         def evaluate_outer_branch(*_args, **_kwargs):
-            self.assertEqual(w._claimed_branch_key, outer_key)
+            self.assertEqual(w._work_context.branch_key, outer_key)
             w.cooperative_solve(inner_words, ROOT_BUDGET - 1)
-            self.assertEqual(w._claimed_branch_key, outer_key)
+            self.assertEqual(w._work_context.branch_key, outer_key)
             w._stop_requested = True
             return False
 
@@ -246,17 +252,17 @@ class TestPromotedSpine(unittest.TestCase):
 
         nested_create = w.queue.create_branch.call_args_list[1]
         self.assertEqual(nested_create.kwargs["parent_branch_key"], outer_key)
-        self.assertEqual(w._claimed_branch_key, root_key)
+        self.assertEqual(w._work_context.branch_key, root_key)
 
     def test_pure_descent_below_base_is_appended(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 5, 'dogma', 'y---y')     # guess_depth 2 — below the base
         self.assertEqual(w._promoted_spine(), 'SALET -g-g- DOGMA y---y')
 
     def test_no_base_yields_none(self):
         w = _bare_worker()
-        w._claimed_branch_spine = None
+        w._work_context = WorkContext.empty()
         w._note_depth(4, 5, 'dogma', 'y---y')
         self.assertIsNone(w._promoted_spine())
 
@@ -277,7 +283,8 @@ class TestHeartbeatSpineStrFilter(unittest.TestCase):
         # subbranch_solver, then cooperative_solve advanced _claimed_branch_spine
         # to include PEAZE.  The outer frame's entry should not appear as a live
         # descent step.
-        w._claimed_branch_spine = 'SALET -g-g- ABOVE y---y PEAZE -yy--'
+        w._work_context = _context(
+            spine='SALET -g-g- ABOVE y---y PEAZE -yy--')
         w._note_depth(3, 44, 'peaze', '-yy--')   # outer frame's entry at guess_depth 3
         w._note_depth(2, 16, 'nurdy', '---y-')   # real descent at guess_depth 4
         w._hb_max_spine = dict(w._spine)
@@ -287,7 +294,7 @@ class TestHeartbeatSpineStrFilter(unittest.TestCase):
 
     def test_descent_below_claimed_branch_is_included(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 30, 'crane', '-yg--')   # guess_depth 2
         w._note_depth(3, 8, 'dogma', 'y---y')    # guess_depth 3
         w._hb_max_spine = dict(w._spine)
@@ -297,7 +304,7 @@ class TestHeartbeatSpineStrFilter(unittest.TestCase):
 
     def test_tokens_carry_explicit_guess_depth_prefix(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 30, 'crane', '-yg--')   # guess_depth 2
         w._note_depth(3, 8, 'dogma', 'y---y')    # guess_depth 3
         w._hb_max_spine = dict(w._spine)
@@ -559,7 +566,7 @@ class TestSpineComposition(unittest.TestCase):
 
     def test_promoted_spine_composes_base_and_descent_edges(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'
+        w._work_context = _context(spine='SALET -g-g-')
         # Pattern strings pass through unchanged (only ints are fmt_pattern'd).
         w._note_depth(4, 50, 'crane', 'bb-y-')
         w._note_depth(3, 12, 'pound', 'g--y-')
@@ -568,13 +575,13 @@ class TestSpineComposition(unittest.TestCase):
 
     def test_promoted_spine_none_without_base(self):
         w = _bare_worker()
-        w._claimed_branch_spine = None
+        w._work_context = WorkContext.empty()
         w._note_depth(5, 50, 'crane', 'bb-y-')
         self.assertIsNone(w._promoted_spine())
 
     def test_promoted_spine_skips_sentinel_and_size_only_levels(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 50, 'crane', 'bb-y-')
         w._note_depth(3, 12)            # size-only level: no guess/pattern
         # Promotion sentinel preserves the guess but sets size to '•'; the edge
@@ -985,7 +992,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         # Worker must have skipped branch A (fully claimed) and joined branch B.
         self.assertIsNotNone(result)
-        branch, bundle_id, indices, forced = result
+        _context_value, branch, bundle_id, indices, forced = result
         self.assertEqual(branch['branch_key'], key_b)
         self.assertTrue(indices)
 
@@ -1011,7 +1018,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
             w.close()
 
         self.assertIsNotNone(result)
-        branch, _bundle_id, indices, _forced = result
+        _context_value, branch, _bundle_id, indices, _forced = result
         self.assertEqual(branch['branch_key'], source_key)
         self.assertEqual(branch['source_word'], "crane")
         self.assertTrue(indices)
@@ -1037,9 +1044,9 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
             stale_worker.close()
 
         self.assertIsNotNone(result)
-        branch, _bundle_id, indices, _forced = result
+        context, branch, _bundle_id, indices, _forced = result
         self.assertEqual(branch['branch_key'], branch_key)
-        self.assertEqual(branch['source_work_id'], source_work_id)
+        self.assertEqual(context.source_work_id, source_work_id)
         self.assertTrue(indices)
 
     def test_claim_one_joins_existing_in_progress_branch(self):
@@ -1060,9 +1067,9 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         # claim_one should have joined the in-progress branch via
         # branches_in_progress() → claim_next_bundle() → return
-        # (branch, bundle_id, indices, forced).
+        # (context, branch, bundle_id, indices, forced).
         self.assertIsNotNone(result)
-        branch, bundle_id, indices, forced = result
+        _context_value, branch, bundle_id, indices, forced = result
         self.assertEqual(branch['branch_key'], branch_key)
         self.assertTrue(indices)
 
@@ -1087,7 +1094,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
             second.close()
 
         self.assertIsNotNone(result)
-        branch, _bundle_id, indices, _forced = result
+        _context_value, branch, _bundle_id, indices, _forced = result
         self.assertEqual(branch['branch_key'], branch_key)
         self.assertTrue(indices)
 
@@ -1114,10 +1121,10 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
                 slate_rows, sources["slate"]["source_work_id"])
         finally:
             w.close()
-        branch, _bundle_id, indices, _forced = result
-        self.assertEqual(branch["source_word"], "slate")
-        self.assertEqual(branch["source_pattern"], 42)
-        self.assertEqual(branch["priority"], 9)
+        context, _branch, _bundle_id, indices, _forced = result
+        self.assertEqual(context.source_word, "slate")
+        self.assertEqual(context.source_pattern, 42)
+        self.assertEqual(context.source_priority, 9)
         self.assertTrue(indices)
 
     def test_claim_one_finalizes_completed_direct_branch(self):
@@ -1361,26 +1368,24 @@ class TestHelpOtherBranch(unittest.TestCase):
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
-        w._claimed_branch_key = b"waiting"
-        w._top_source_work_id = 999
-        w._top_source_priority = 1
-        w._top_source_word = "crane"
-        w._top_source_pattern = 7
+        waiting_context = _context(
+            branch_key=b"waiting", source_work_id=999, source_priority=1,
+            source_word="crane", source_pattern=7)
+        w._work_context = waiting_context
 
         def evaluate(*_args, **_kwargs):
-            self.assertEqual(w._claimed_branch_key, key_b)
-            self.assertEqual(w._top_source_work_id, claimed["source_work_id"])
-            self.assertEqual(w._top_source_priority, 9)
-            self.assertEqual(w._top_source_word, "slate")
-            self.assertEqual(w._top_source_pattern, 42)
+            self.assertEqual(w._work_context.branch_key, key_b)
+            self.assertEqual(
+                w._work_context.source_work_id, claimed["source_work_id"])
+            self.assertEqual(w._work_context.source_priority, 9)
+            self.assertEqual(w._work_context.source_word, "slate")
+            self.assertEqual(w._work_context.source_pattern, 42)
             return False
 
         w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
         try:
             self.assertTrue(w._help_other_branch(b"excluded"))
-            self.assertEqual(w._claimed_branch_key, b"waiting")
-            self.assertEqual(w._top_source_work_id, 999)
-            self.assertEqual(w._top_source_word, "crane")
+            self.assertEqual(w._work_context, waiting_context)
         finally:
             w.close()
 
@@ -1398,10 +1403,10 @@ class TestHelpOtherBranch(unittest.TestCase):
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
 
         def evaluate(*_args, **_kwargs):
-            self.assertIsNone(w._top_source_work_id)
-            self.assertEqual(w._top_source_priority, 9)
-            self.assertEqual(w._top_source_word, "crane")
-            self.assertEqual(w._top_source_pattern, 7)
+            self.assertIsNone(w._work_context.source_work_id)
+            self.assertEqual(w._work_context.source_priority, 9)
+            self.assertEqual(w._work_context.source_word, "crane")
+            self.assertEqual(w._work_context.source_pattern, 7)
             return False
 
         w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
@@ -1672,7 +1677,7 @@ class TestPromotedSpineDepthCap(unittest.TestCase):
 
     def _descended_worker(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'ALIBI ----- ELOPE y-y--'
+        w._work_context = _context(spine='ALIBI ----- ELOPE y-y--')
         w._spine = {3: (7, 'rends', '-y-y-'), 4: (3, 'motza', '-g---')}
         return w
 
@@ -2186,9 +2191,9 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
     def test_compatible_raced_branch_adopts_selected_source(self):
         w = self._worker()
         parent_key = b"parent-branch"
-        w._top_source_work_id = 41
-        w._top_source_pattern = 42
-        w._claimed_branch_key = parent_key
+        w._work_context = _context(
+            branch_key=parent_key, source_work_id=41, source_priority=1,
+            source_word="crane", source_pattern=42)
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": None, "budget": 4}
 
@@ -2403,9 +2408,9 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
     def test_compatible_race_adopts_selected_source(self):
         pub, w, token = self._overrunning()
         parent_key = b"parent-branch"
-        w._top_source_work_id = 41
-        w._top_source_pattern = 42
-        w._claimed_branch_key = parent_key
+        w._work_context = _context(
+            branch_key=parent_key, source_work_id=41, source_priority=1,
+            source_word="crane", source_pattern=42)
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
 
