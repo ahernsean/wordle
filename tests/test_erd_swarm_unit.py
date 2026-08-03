@@ -217,6 +217,37 @@ class TestPromotedSpine(unittest.TestCase):
                     budget + guess_depth_from_spine(promoted_spine),
                     ROOT_BUDGET)
 
+    def test_nested_cooperative_branch_records_immediate_parent(self):
+        w = _bare_worker()
+        outer_words = BRANCH
+        inner_words = BRANCH[:4]
+        outer_key = ScoreCache.encode_subset(outer_words)
+        root_key = b"root-branch"
+        w._claimed_branch_key = root_key
+        w.score_cache.read_with_depth.return_value = None
+        w.score_cache.read_loss.return_value = None
+        w.queue.read_cut_result.return_value = []
+        w.queue.has_pending_row.return_value = False
+        w.queue.create_branch.return_value = True
+        w.queue.get_branch.side_effect = (
+            lambda branch_key: {} if branch_key == outer_key else None)
+        w._claim_bundle = mock.MagicMock(return_value=(1, [0], False))
+
+        def evaluate_outer_branch(*_args, **_kwargs):
+            self.assertEqual(w._claimed_branch_key, outer_key)
+            w.cooperative_solve(inner_words, ROOT_BUDGET - 1)
+            self.assertEqual(w._claimed_branch_key, outer_key)
+            w._stop_requested = True
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=evaluate_outer_branch)
+
+        w.cooperative_solve(outer_words, ROOT_BUDGET)
+
+        nested_create = w.queue.create_branch.call_args_list[1]
+        self.assertEqual(nested_create.kwargs["parent_branch_key"], outer_key)
+        self.assertEqual(w._claimed_branch_key, root_key)
+
     def test_pure_descent_below_base_is_appended(self):
         w = _bare_worker()
         w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
@@ -473,6 +504,17 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
         size, guess, pattern = w._spine[2]
         self.assertEqual(size, '•')
         self.assertIn(1, w._spine)  # parent depth untouched
+
+    def test_none_budget_is_ignored(self):
+        w = _bare_worker()
+        original_spine = dict(w._spine)
+
+        w._note_depth(None, 12)
+
+        self.assertEqual(w._spine, original_spine)
+
+    def test_fmt_spine_entry_accepts_non_tuple_sentinel(self):
+        self.assertEqual(_BranchWorker._fmt_spine_entry('•'), '•')
 
     def test_sentinel_updates_hb_and_log_max_spine(self):
         w = _bare_worker()
@@ -1049,6 +1091,35 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], branch_key)
         self.assertTrue(indices)
 
+    def test_claim_active_branch_returns_selected_owner_metadata(self):
+        from erd_queue import ERDQueue
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(branch_key, len(BRANCH), 1, "crane", 7)])
+        q.add_pending_many([(branch_key, len(BRANCH), 9, "slate", 42)])
+        sources = {row["source_word"]: row for row in q.source_work_rows()}
+        crane = q.claim_next("peer", sources["crane"]["source_work_id"])
+        q.create_branch(
+            branch_key, len(BRANCH), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=crane["priority"], source_word=crane["source_word"],
+            source_pattern=crane["source_pattern"],
+            source_work_id=crane["source_work_id"])
+        slate_rows = q.branches_in_progress(sources["slate"]["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            result = w._claim_active_branch(
+                slate_rows, sources["slate"]["source_work_id"])
+        finally:
+            w.close()
+        branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch["source_word"], "slate")
+        self.assertEqual(branch["source_pattern"], 42)
+        self.assertEqual(branch["priority"], 9)
+        self.assertTrue(indices)
+
     def test_claim_one_finalizes_completed_direct_branch(self):
         from erd_queue import ERDQueue
         branch_key = ScoreCache.encode_subset(BRANCH)
@@ -1273,6 +1344,45 @@ class TestHelpOtherBranch(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         self.assertIsNotNone(q.get_branch(key_b))   # not finalized
         q.close()
+
+    def test_help_other_branch_switches_and_restores_source_context(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        words_b = BRANCH[:4]
+        key_b = ScoreCache.encode_subset(words_b)
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(key_b, len(words_b), 9, "slate", 42)])
+        claimed = q.claim_next("peer")
+        q.create_branch(
+            key_b, len(words_b), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=claimed["priority"], source_word=claimed["source_word"],
+            source_pattern=claimed["source_pattern"],
+            source_work_id=claimed["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._claimed_branch_key = b"waiting"
+        w._top_source_work_id = 999
+        w._top_source_priority = 1
+        w._top_source_word = "crane"
+        w._top_source_pattern = 7
+
+        def evaluate(*_args, **_kwargs):
+            self.assertEqual(w._claimed_branch_key, key_b)
+            self.assertEqual(w._top_source_work_id, claimed["source_work_id"])
+            self.assertEqual(w._top_source_priority, 9)
+            self.assertEqual(w._top_source_word, "slate")
+            self.assertEqual(w._top_source_pattern, 42)
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
+        try:
+            self.assertTrue(w._help_other_branch(b"excluded"))
+            self.assertEqual(w._claimed_branch_key, b"waiting")
+            self.assertEqual(w._top_source_work_id, 999)
+            self.assertEqual(w._top_source_word, "crane")
+        finally:
+            w.close()
 
     def test_help_other_branch_returns_false_when_no_candidates_available(self):
         """When no other branches have available candidate claims, help_other_branch
@@ -2047,6 +2157,21 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         self.assertIsNotNone(result)
 
+    def test_compatible_raced_branch_adopts_selected_source(self):
+        w = self._worker()
+        parent_key = b"parent-branch"
+        w._top_source_work_id = 41
+        w._top_source_pattern = 42
+        w._claimed_branch_key = parent_key
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 4}
+
+        w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+
+        w.queue.attach_branch_source_work.assert_called_once_with(
+            ScoreCache.encode_subset(BRANCH), 41, 4, 2.5, len(BRANCH), 42,
+            parent_key)
+
     def test_waiter_refreshes_a_cached_loss_miss_before_branch_deletion(self):
         w = self._worker()
         w._stop_requested = False
@@ -2248,6 +2373,21 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
         pub.check(token, CANDIDATES, 1, None, 2.5, 5)
         w.queue.mark_claims_done.assert_not_called()
+
+    def test_compatible_race_adopts_selected_source(self):
+        pub, w, token = self._overrunning()
+        parent_key = b"parent-branch"
+        w._top_source_work_id = 41
+        w._top_source_pattern = 42
+        w._claimed_branch_key = parent_key
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
+
+        pub.check(token, CANDIDATES, 1, "crane", 1.8, 5)
+
+        w.queue.attach_branch_source_work.assert_called_once_with(
+            ScoreCache.encode_subset(BRANCH[:6]), 41, 5, None,
+            len(BRANCH[:6]), 42, parent_key)
 
     def test_race_to_other_budget_skips_marks_and_seed(self):
         # Everything the prefix proved, it proved at the frame's budget: a

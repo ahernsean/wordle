@@ -365,9 +365,12 @@ class _MidLoopPublisher:
         if not joinable:
             token[5] = False
             return None
-        if not created and getattr(self._worker, '_top_source_work_id', None) is not None:  # pragma: no cover - queue transaction covered directly
+        # A compatible raced branch adopts the selected source ownership only
+        # after the surviving row has passed the joinability checks above.
+        if not created and getattr(self._worker, '_top_source_work_id', None) is not None:
             self._worker.queue.attach_branch_source_work(
                 branch_key, self._worker._top_source_work_id, budget, ours, n,
+                self._worker._top_source_pattern,
                 getattr(self._worker, '_claimed_branch_key', None))
 
         # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
@@ -1540,27 +1543,50 @@ class _BranchWorker:
         worker drains useful work from the queue.  Returns True if a bundle
         was evaluated, False if there was nothing to claim.
         """
-        for branch in self.queue.branches_in_progress():
+        owned_branches = []
+        for source_work in self.queue.source_work_candidates():
+            owned_branches.extend(
+                self.queue.branches_in_progress(source_work['source_work_id']))
+        branches = owned_branches + list(self.queue.direct_branches_in_progress())
+        for branch in branches:
+            branch = dict(branch)
             other_key = bytes(branch['branch_key'])
             if other_key == bytes(exclude_branch_key):
                 continue
             n_candidates = branch['n_candidates']
             words = decode_subset(other_key)
-            claim = self._claim_bundle(other_key, n_candidates, words)
+            source_work_id = (branch['source_work_id']
+                              if 'source_work_id' in branch.keys() else None)
+            claim = self._claim_bundle(
+                other_key, n_candidates, words,
+                require_unowned=source_work_id is None)
             if claim is None:
                 continue
             bundle_id, indices, forced = claim
             budget = self._branch_budget(branch)
             # Promotions while helping must base off the helped branch's spine.
-            saved_spine = self._claimed_branch_spine
+            saved_context = (
+                self._claimed_branch_spine,
+                getattr(self, '_claimed_branch_key', None),
+                getattr(self, '_top_source_work_id', None),
+                getattr(self, '_top_source_priority', 0),
+                getattr(self, '_top_source_word', None),
+                getattr(self, '_top_source_pattern', None))
             self._claimed_branch_spine = branch['spine'] if 'spine' in branch.keys() \
                 else None
+            self._claimed_branch_key = other_key
+            self._top_source_work_id = source_work_id
+            self._top_source_priority = branch.get('owner_priority', 0)
+            self._top_source_word = branch.get('owner_source_word')
+            self._top_source_pattern = branch.get('owner_source_pattern')
             try:
                 if self.evaluate_bundle(other_key, words, branch['n_words'],
                                         bundle_id, indices, forced, budget=budget):
                     self.maybe_finalize(other_key, words, n_candidates)
             finally:
-                self._claimed_branch_spine = saved_spine
+                (self._claimed_branch_spine, self._claimed_branch_key,
+                 self._top_source_work_id, self._top_source_priority,
+                 self._top_source_word, self._top_source_pattern) = saved_context
             self._maybe_checkpoint()
             return True
         return False
@@ -1655,6 +1681,7 @@ class _BranchWorker:
         # that reached it before this frame's own work overwrites self._spine.
         child_spine = self._promoted_spine(self.root_budget - budget)
         saved_spine = self._claimed_branch_spine
+        saved_branch_key = getattr(self, '_claimed_branch_key', None)
         try:
             branch_key = encode_subset(words)
             n_words = len(words)
@@ -1731,13 +1758,16 @@ class _BranchWorker:
                     if row_ceiling is not None and (
                             ours is None or not erd_ge(row_ceiling, ours, n_words)):
                         return None
-                    if getattr(self, '_top_source_work_id', None) is not None:  # pragma: no cover - queue transaction covered directly
+                    # A compatible raced branch adopts the selected source
+                    # ownership only after this surviving row is joinable.
+                    if getattr(self, '_top_source_work_id', None) is not None:
                         self.queue.attach_branch_source_work(
                             branch_key, self._top_source_work_id, budget, ours,
-                            n_words,
+                            n_words, self._top_source_pattern,
                             getattr(self, '_claimed_branch_key', None))
             # Descents into this branch promote grandchildren relative to its spine.
             self._claimed_branch_spine = child_spine
+            self._claimed_branch_key = branch_key
 
             while not self.cancel():
                 # Finished?  Check before claiming so we never touch a branch that
@@ -1797,6 +1827,7 @@ class _BranchWorker:
             return (OVER_DEPTH_BUDGET, float('inf'), None, True)  # pragma: no cover
         finally:
             self._claimed_branch_spine = saved_spine
+            self._claimed_branch_key = saved_branch_key
 
     # -- scheduling: claim one candidate from the best available branch ------
 
@@ -1813,6 +1844,9 @@ class _BranchWorker:
                 branch = dict(active_branch)
                 if source_work_id is not None:
                     branch['source_work_id'] = source_work_id
+                    branch['source_word'] = active_branch['owner_source_word']
+                    branch['source_pattern'] = active_branch['owner_source_pattern']
+                    branch['priority'] = active_branch['owner_priority']
                 bundle_id, indices, forced = claim
                 return branch, bundle_id, indices, forced
             if self.queue.branch_done_candidates(branch_key) >= active_branch['n_candidates']:

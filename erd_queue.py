@@ -1670,27 +1670,36 @@ class ERDQueue:
                     f"!= root_budget {root_budget} for spine {spine!r}")
         now = int(time.time())
         branch_id = self._intern_branch(branch_key, create=True)
-        cur = self._conn.execute("""
-            INSERT OR IGNORE INTO active_branches
-                (branch_id, n_words, n_candidates,
-                 priority, source_word, source_pattern, status, created_at,
-                 budget, spine, ceiling)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
-        """, (branch_id, n_words, n_candidates,
-              priority, source_word, source_pattern, now, budget, spine,
-              ceiling))
-        if source_work_id is not None and cur.rowcount:
-            parent_branch_id = (self._intern_branch(parent_branch_key)
-                                if parent_branch_key is not None else None)
-            self._conn.execute("""
-                INSERT OR IGNORE INTO branch_source_work
-                    (branch_id, source_work_id, parent_branch_id, root_pattern)
-                VALUES (?, ?, ?, NULL)
-            """, (branch_id, source_work_id, parent_branch_id))
-        return cur.rowcount == 1
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute("""
+                INSERT OR IGNORE INTO active_branches
+                    (branch_id, n_words, n_candidates,
+                     priority, source_word, source_pattern, status, created_at,
+                     budget, spine, ceiling)
+                VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+            """, (branch_id, n_words, n_candidates,
+                  priority, source_word, source_pattern, now, budget, spine,
+                  ceiling))
+            created = cur.rowcount == 1
+            if source_work_id is not None and created:
+                parent_branch_id = (self._intern_branch(parent_branch_key)
+                                    if parent_branch_key is not None else None)
+                self._conn.execute("""
+                    INSERT OR IGNORE INTO branch_source_work
+                        (branch_id, source_work_id, parent_branch_id, root_pattern)
+                    VALUES (?, ?, ?, ?)
+                """, (branch_id, source_work_id, parent_branch_id,
+                      source_pattern))
+            self._conn.execute("COMMIT")
+            return created
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
 
     def attach_branch_source_work(self, branch_key, source_work_id, budget,
-                                  ceiling, n_words, parent_branch_key=None) -> bool:
+                                  ceiling, n_words, source_pattern,
+                                  parent_branch_key=None) -> bool:
         """Attach source ownership when the surviving branch is joinable."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1710,8 +1719,8 @@ class ERDQueue:
             self._conn.execute("""
                 INSERT OR IGNORE INTO branch_source_work
                     (branch_id, source_work_id, parent_branch_id, root_pattern)
-                VALUES (?, ?, ?, NULL)
-            """, (branch_id, source_work_id, parent_branch_id))
+                VALUES (?, ?, ?, ?)
+            """, (branch_id, source_work_id, parent_branch_id, source_pattern))
             self._conn.execute("COMMIT")
             return True
         except Exception:  # pragma: no cover
@@ -2481,19 +2490,28 @@ class ERDQueue:
 
     def branches_in_progress(self, source_work_id=None):
         """Open branches, highest priority first — for swarm scheduling."""
-        query = """
-            SELECT a.*, b.branch_key FROM active_branches a
+        if source_work_id is None:
+            return self._conn.execute("""
+                SELECT a.*, b.branch_key
+                FROM active_branches a
+                JOIN branches b ON b.branch_id = a.branch_id
+                WHERE a.status = 'open'
+                ORDER BY a.n_words DESC
+            """).fetchall()
+        return self._conn.execute("""
+            SELECT a.*, b.branch_key,
+                   s.source_word AS owner_source_word,
+                   COALESCE(m.root_pattern, a.source_pattern)
+                       AS owner_source_pattern,
+                   s.requested_priority AS owner_priority,
+                   s.source_work_id AS source_work_id
+            FROM active_branches a
             JOIN branches b ON b.branch_id = a.branch_id
-        """
-        parameters = []
-        if source_work_id is not None:
-            query += " JOIN branch_source_work m ON m.branch_id = a.branch_id"
-        query += " WHERE a.status = 'open'"
-        if source_work_id is not None:
-            query += " AND m.source_work_id = ?"
-            parameters.append(source_work_id)
-        query += " ORDER BY a.n_words DESC"
-        return self._conn.execute(query, parameters).fetchall()
+            JOIN branch_source_work m ON m.branch_id = a.branch_id
+            JOIN source_work s ON s.source_work_id = m.source_work_id
+            WHERE a.status = 'open' AND m.source_work_id = ?
+            ORDER BY a.n_words DESC
+        """, (source_work_id,)).fetchall()
 
     def direct_branches_in_progress(self):
         """Open branches that have no source-work ownership."""

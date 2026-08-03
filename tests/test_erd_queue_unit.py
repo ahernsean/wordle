@@ -64,6 +64,27 @@ class TestBranchLifecycle(_TmpQueue):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self.assertFalse(self.q.create_branch(self.key, len(WORDS), N_CANDIDATES))
 
+    def test_create_branch_commits_active_row_and_ownership_together(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "crane", 42)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            self.assertTrue(self.q.create_branch(
+                self.key, len(WORDS), N_CANDIDATES, budget=5,
+                source_word="crane", source_pattern=42,
+                source_work_id=source_work_id))
+        finally:
+            self.q._conn.set_trace_callback(None)
+        transaction = "\n".join(statements)
+        self.assertLess(transaction.index("BEGIN IMMEDIATE"),
+                        transaction.index("INSERT OR IGNORE INTO active_branches"))
+        self.assertLess(transaction.index("INSERT OR IGNORE INTO active_branches"),
+                        transaction.index("INSERT OR IGNORE INTO branch_source_work"))
+        self.assertLess(transaction.index("INSERT OR IGNORE INTO branch_source_work"),
+                        transaction.index("COMMIT"))
+
     def test_losing_create_does_not_attach_incompatible_source_work(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
         source_a = self.q.source_work_rows()[0]["source_work_id"]
@@ -86,7 +107,7 @@ class TestBranchLifecycle(_TmpQueue):
 
         self.assertFalse(self.q.attach_branch_source_work(
             self.key, source_work_id, budget=4, ceiling=None,
-            n_words=len(WORDS)))
+            n_words=len(WORDS), source_pattern=0))
         self.assertEqual(self.q.branches_in_progress(source_work_id), [])
 
     def test_attach_source_work_accepts_compatible_branch(self):
@@ -97,7 +118,7 @@ class TestBranchLifecycle(_TmpQueue):
 
         self.assertTrue(self.q.attach_branch_source_work(
             self.key, source_work_id, budget=5, ceiling=None,
-            n_words=len(WORDS)))
+            n_words=len(WORDS), source_pattern=0))
         self.assertEqual(len(self.q.branches_in_progress(source_work_id)), 1)
 
     def test_attach_source_work_compares_compatible_lattice_ceilings(self):
@@ -109,7 +130,18 @@ class TestBranchLifecycle(_TmpQueue):
 
         self.assertTrue(self.q.attach_branch_source_work(
             self.key, source_work_id, budget=5, ceiling=1.8,
-            n_words=len(WORDS)))
+            n_words=len(WORDS), source_pattern=0))
+
+    def test_attach_source_work_compares_off_lattice_ceilings(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             budget=5, ceiling=2.01)
+
+        self.assertTrue(self.q.attach_branch_source_work(
+            self.key, source_work_id, budget=5, ceiling=1.99,
+            n_words=len(WORDS), source_pattern=0))
 
     def test_require_unowned_claim_rejects_newly_owned_branch(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
@@ -118,7 +150,7 @@ class TestBranchLifecycle(_TmpQueue):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
         self.assertTrue(self.q.attach_branch_source_work(
             self.key, source_work_id, budget=5, ceiling=None,
-            n_words=len(WORDS)))
+            n_words=len(WORDS), source_pattern=0))
 
         self.assertIsNone(self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
@@ -622,6 +654,22 @@ class TestClaimNext(_TmpQueue):
         claimed = self.q.claim_next("worker-0", slate["source_work_id"])
         self.assertEqual(claimed["source_word"], "slate")
         self.assertEqual(claimed["source_pattern"], 42)
+
+    def test_active_shared_root_uses_selected_owner_metadata(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
+        rows = {row["source_word"]: row for row in self.q.source_work_rows()}
+        crane = self.q.claim_next("worker-0", rows["crane"]["source_work_id"])
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, priority=crane["priority"],
+            source_word=crane["source_word"],
+            source_pattern=crane["source_pattern"],
+            source_work_id=crane["source_work_id"])
+
+        active = self.q.branches_in_progress(rows["slate"]["source_work_id"])[0]
+        self.assertEqual(active["owner_source_word"], "slate")
+        self.assertEqual(active["owner_source_pattern"], 42)
+        self.assertEqual(active["owner_priority"], 9)
 
     def test_clear_removes_source_work_before_readding_shared_root(self):
         self.q.add_pending_many([(self.key, len(WORDS), 999, "audio", 0)])
