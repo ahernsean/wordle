@@ -459,11 +459,13 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- (bundle_id and both range columns are NULL for a claim taken outside a
 -- bundle).  claim_transaction_millis + claim_commit_millis split
 -- coordination_millis's claim-handout portion into the scan/write phase and
--- the COMMIT itself; finalize_millis is cache-write time this worker spent
--- winning this branch's finalize (0 when this claim did not finalize it);
--- idle_millis is the coordination_millis remainder unaccounted for by
--- claim_transaction_millis + claim_commit_millis + busy_wait_millis +
--- finalize_millis.
+-- the COMMIT itself; finalize_millis is cache-write time a worker spent
+-- winning a branch's finalize, on its own row (idx/bundle_id NULL) written
+-- at finalize time and attributed to that branch — never folded into a
+-- candidate-evaluation row, since the next such row is typically a different,
+-- unrelated branch's.  idle_millis is the coordination_millis remainder
+-- unaccounted for by claim_transaction_millis + claim_commit_millis +
+-- busy_wait_millis + finalize_millis.
 CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     id                        INTEGER PRIMARY KEY AUTOINCREMENT,
     n_words                   INTEGER NOT NULL,
@@ -3706,7 +3708,9 @@ class ERDQueue:
         which worker evaluated which candidate of which bundle (all default
         to NULL for a caller with no branch/bundle context).
         finalize_millis is cache-write time this worker spent winning this
-        branch's finalize as part of this claim, 0 when it did not finalize.
+        branch's finalize; callers writing a candidate-evaluation row leave it
+        0 (finalize time is written on its own dedicated row by maybe_finalize
+        instead — see the claim_telemetry schema comment for why).
         idle_millis is coordination_millis minus every other timed phase: the
         remainder is wait/idle time not captured by a specific phase.
 

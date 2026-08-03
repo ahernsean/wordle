@@ -74,7 +74,6 @@ def _bare_worker():
     w._top_source_word = None
     w._top_source_pattern = None
     w._claimed_branch_spine = None
-    w._pending_finalize_millis = 0.0
     w._adaptive = True
     w._typical_cache = {}
     w._cost_model_buffer = {}
@@ -955,10 +954,78 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             self.assertEqual(row["branch_key"], branch_key)
             self.assertEqual(row["spine"], "CRANE -----")
             self.assertEqual(row["worker_id"], "worker-1")
+        # Candidate-evaluation rows carry bundle/idx attribution.
+        candidate_rows = [r for r in rows if r["idx"] is not None]
+        self.assertTrue(candidate_rows)
+        for row in candidate_rows:
             self.assertIsNotNone(row["bundle_id"])
-            self.assertIsNotNone(row["idx"])
             self.assertLessEqual(row["bundle_start_idx"], row["idx"])
             self.assertLessEqual(row["idx"], row["bundle_end_idx"])
+        # The dedicated finalize row (maybe_finalize) has no candidate/bundle
+        # identity, but still carries this branch's own attribution.
+        finalize_rows = [r for r in rows if r["idx"] is None]
+        self.assertEqual(len(finalize_rows), 1)
+        self.assertIsNone(finalize_rows[0]["bundle_id"])
+
+    def test_finalize_millis_is_attributed_to_the_branch_that_finalized(self):
+        # A worker that finalizes branch1 then moves on to branch2 must not
+        # leak branch1's finalize cost onto branch2's claim_telemetry rows:
+        # the two branches are unrelated, and the finalize always happens
+        # strictly after branch1's own candidates are already done, so a
+        # naive "attribute to whatever claim comes next" scheme mislabels it.
+        branch1_words = BRANCH
+        branch2_words = BRANCH[:2]
+        branch1_key = ScoreCache.encode_subset(branch1_words)
+        branch2_key = ScoreCache.encode_subset(branch2_words)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.create_branch(branch1_key, len(branch1_words), len(CANDIDATES),
+                        budget=ROOT_BUDGET)
+        q.create_branch(branch2_key, len(branch2_words), len(CANDIDATES),
+                        budget=ROOT_BUDGET)
+        q.close()
+
+        w = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        real_write = w.score_cache.write
+        # Slow only branch1's own finalize write, so a nonzero finalize_millis
+        # anywhere else in the results can only be a leak, never branch2's own
+        # (fast) finalize cost being mistaken for one.
+        call_count = {"n": 0}
+
+        def slow_once_write(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                time.sleep(0.05)
+            return real_write(*args, **kwargs)
+        w.score_cache.write = slow_once_write
+        try:
+            w.solve_branch_focused(branch1_key)
+            w.solve_branch_focused(branch2_key)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        rows = q._conn.execute(
+            "SELECT branch_key, idx, bundle_id, finalize_millis "
+            "FROM claim_telemetry ORDER BY id").fetchall()
+        q.close()
+
+        branch1_finalize_rows = [
+            r for r in rows if bytes(r["branch_key"]) == branch1_key
+            and r["idx"] is None and r["bundle_id"] is None]
+        self.assertEqual(len(branch1_finalize_rows), 1)
+        self.assertGreaterEqual(branch1_finalize_rows[0]["finalize_millis"], 40)
+
+        # Every other row -- branch1's own candidate rows, and every one of
+        # branch2's rows including its own (fast) finalize row -- must show no
+        # trace of branch1's slowed-down finalize cost.
+        other_rows = [
+            r for r in rows
+            if not (bytes(r["branch_key"]) == branch1_key
+                    and r["idx"] is None and r["bundle_id"] is None)]
+        self.assertTrue(other_rows)
+        for row in other_rows:
+            self.assertLess(row["finalize_millis"], 20)
 
 
 class TestClaimOneJoinsInProgressBranch(unittest.TestCase):

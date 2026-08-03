@@ -556,11 +556,6 @@ class _BranchWorker:
         # "GUESS pattern".  Promotion composes a child branch's spine as this base
         # plus the live descent guesses in self._spine.  None until the first claim.
         self._claimed_branch_spine = None
-        # Cache-write time from a finalize this worker won since the last
-        # add_claim_telemetry call, consumed and reset by evaluate_claim so a
-        # finalize triggered by completing a candidate is attributed to that
-        # candidate's own claim_telemetry row (see maybe_finalize).
-        self._pending_finalize_millis = 0.0
         # In-memory cache of cost-model predictions keyed by sub-branch size.
         # Cleared on any cost-model write so new samples take effect.
         self._typical_cache = {}
@@ -1244,15 +1239,12 @@ class _BranchWorker:
                         metric['erd_lower_bound_pruned'],
                         nodes_delta, group_sizes=metric['group_sizes'],
                         source_word=self._top_source_word)
-            finalize_millis = int(self._pending_finalize_millis)
-            self._pending_finalize_millis = 0.0
             self.queue.add_claim_telemetry(
                 n_words, int(full_coord_seconds * 1e3), nodes_delta,
                 self.n_workers, branch_key=branch_key,
                 spine=self._claimed_branch_spine, worker_id=self.name,
                 bundle_id=bundle_id, idx=idx,
-                bundle_start_idx=bundle_start_idx,
-                bundle_end_idx=bundle_end_idx, finalize_millis=finalize_millis)
+                bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx)
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.
@@ -1520,7 +1512,19 @@ class _BranchWorker:
                                  branch_key[:25])
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
-        self._pending_finalize_millis += (time.time() - finalize_t0) * 1000
+        if self._adaptive:
+            # A dedicated row for the finalize itself, attributed directly to
+            # the branch that was finalized (idx/bundle_id NULL — this is not
+            # a candidate evaluation).  Written here rather than folded into
+            # whatever claim_telemetry row comes next: that next claim is
+            # almost always a different, unrelated branch (the worker moves
+            # on after finalizing), so deferring the cost would attribute it
+            # to the wrong branch.
+            finalize_millis = int((time.time() - finalize_t0) * 1000)
+            self.queue.add_claim_telemetry(
+                len(words), finalize_millis, 0, self.n_workers,
+                branch_key=branch_key, spine=spine, worker_id=self.name,
+                finalize_millis=finalize_millis)
         return True
 
     def _await_rival_finalize(self, branch_key, words, n_words, n_candidates):
@@ -1920,8 +1924,7 @@ class _BranchWorker:
         branch = self.queue.get_branch(branch_key)
         if branch is None or branch['status'] != 'open':
             return
-        self._claimed_branch_spine = (
-            branch['spine'] if 'spine' in branch.keys() else None)
+        self._claimed_branch_spine = branch['spine']
         words = decode_subset(branch_key)
         budget = self._branch_budget(branch)
         n_candidates = branch['n_candidates']
