@@ -26,7 +26,7 @@ from unittest import mock
 import erd_queue
 import erd_swarm
 from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
-                       PROMOTE_MIN_SIZE)
+                       PROMOTE_MIN_SIZE, decode_subset)
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
 from erd_queue import guess_depth_from_spine
@@ -1034,12 +1034,16 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             self.assertLessEqual(row["bundle_start_idx"], row["idx"])
             self.assertLessEqual(row["idx"], row["bundle_end_idx"])
 
-    def test_phases_partition_coordination_millis_on_every_row(self):
-        # The schema promises the five phases sum to coordination_millis
-        # exactly.  Measured end to end rather than arithmetically, so any
-        # future coordination work that lands in the telescoped window
-        # without a phase of its own shows up here instead of silently
-        # inflating idle_millis.
+    def test_phases_never_exceed_coordination_millis(self):
+        # idle_millis is computed as the remainder, so the five phases sum to
+        # coordination_millis by construction -- EXCEPT when the other four
+        # already exceed it, where the max(0, ...) clamp floors idle at 0 and
+        # the identity breaks.  That is the case worth guarding: a phase
+        # counting time from outside the coordination window (queue work done
+        # during a candidate's own evaluation) would land here.  This does NOT
+        # detect coordination work that simply has no phase -- that inflates
+        # idle_millis while keeping the sum exact; see
+        # test_scan_time_is_attributed_to_scheduling_not_idle for that.
         branch_key = ScoreCache.encode_subset(BRANCH)
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
@@ -1066,6 +1070,50 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
                 + row["busy_wait_millis"] + row["scheduling_millis"]
                 + row["idle_millis"],
                 row["coordination_millis"])
+
+    def test_scan_time_is_attributed_to_scheduling_not_idle(self):
+        # The point of the scheduling phase: work-selection time must be
+        # visible as scheduling_millis rather than falling into idle_millis,
+        # where a large value reads as "workers are starved" -- the opposite
+        # of the truth when work selection is what consumed the window.
+        #
+        # Drives claim_one (the only path with a scan) with a known delay
+        # injected into it, then evaluates a candidate so a telemetry row is
+        # written, and asserts where the delay landed.  Deleting the
+        # scheduling computation from claim_one fails this test.
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        q = ERDQueue(self.queue_path)
+        q.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, spine="CRANE -----")
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        real_scan = w.queue.direct_branches_in_progress
+
+        def slow_scan(*args, **kwargs):
+            time.sleep(0.05)          # inside claim_one's scan, no lock held
+            return real_scan(*args, **kwargs)
+        w.queue.direct_branches_in_progress = slow_scan
+        try:
+            work = w.claim_one()
+            self.assertIsNotNone(work)
+            context, branch, _bundle_id, indices, _forced = work
+            with w._entered(context):
+                w.evaluate_claim(branch_key, decode_subset(branch_key),
+                                 branch['n_words'], indices[0],
+                                 budget=ROOT_BUDGET)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        row = q._conn.execute(
+            "SELECT scheduling_millis, idle_millis, coordination_millis "
+            "FROM claim_telemetry ORDER BY id LIMIT 1").fetchone()
+        q.close()
+        self.assertGreaterEqual(row["scheduling_millis"], 40)
+        # The scan is the bulk of the window, so idle must not have absorbed it.
+        self.assertLess(row["idle_millis"], row["scheduling_millis"])
 
     def test_finalize_cost_lands_on_its_own_branch_and_not_the_next_one(self):
         # A worker that finalizes branch1 then moves on to branch2 must record
