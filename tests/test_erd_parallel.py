@@ -21,7 +21,7 @@ from wordle_engine import (
     ResponseCache, min_expected_guesses, ERD_ALL,
 )
 import erd_swarm
-from erd_swarm import _BranchWorker, ROOT_BUDGET
+from erd_swarm import _BranchWorker, WorkContext, ROOT_BUDGET
 from erd_queue import ERDQueue, encode_subset
 
 # A branch of 8 answers and 15 candidate guesses: with single-candidate claiming,
@@ -186,7 +186,7 @@ class TestClaimSkipsCachedBranch(unittest.TestCase):
 
         self.assertIsNotNone(result,
                              "branch should have been promoted for real work")
-        branch, bundle_id, indices, forced = result
+        _context, branch, bundle_id, indices, forced = result
         self.assertEqual(branch["branch_key"], self.branch_key)
         self.assertTrue(indices)
 
@@ -202,6 +202,7 @@ class TestReportingInvariants(unittest.TestCase):
         w._log_max_spine = {}
         w._cand_max_depth = 0
         w._cur_depth = 0
+        w._work_context = WorkContext.empty()
         return w
 
     def test_cand_max_depth_resets_per_candidate(self):
