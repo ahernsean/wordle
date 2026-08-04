@@ -23,14 +23,38 @@ import time
 import unittest
 from unittest import mock
 
+import erd_queue
 import erd_swarm
-from erd_swarm import _BranchWorker, ROOT_BUDGET, PROMOTE_MIN_SIZE
+from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
+                       PROMOTE_MIN_SIZE)
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
-from erd_queue import ERDQueue, guess_depth_from_spine
+from erd_queue import guess_depth_from_spine
+from tests.queue_invariants import SourceWorkInvariantCheckMixin
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train"]
+
+
+ProductionERDQueue = erd_queue.ERDQueue
+
+
+class InvariantCheckedERDQueue(SourceWorkInvariantCheckMixin,
+                               ProductionERDQueue):
+    pass
+
+
+ERDQueue = InvariantCheckedERDQueue
+
+
+def setUpModule():
+    erd_queue.ERDQueue = InvariantCheckedERDQueue
+    erd_swarm.ERDQueue = InvariantCheckedERDQueue
+
+
+def tearDownModule():
+    erd_queue.ERDQueue = ProductionERDQueue
+    erd_swarm.ERDQueue = ProductionERDQueue
 
 
 def _bare_worker():
@@ -71,9 +95,7 @@ def _bare_worker():
     w._hb_max_spine = {}
     w._log_max_spine = {}
     w.started = 0
-    w._top_source_word = None
-    w._top_source_pattern = None
-    w._claimed_branch_spine = None
+    w._work_context = WorkContext.empty()
     w._adaptive = True
     w._typical_cache = {}
     w._cost_model_buffer = {}
@@ -100,6 +122,13 @@ def _bare_worker():
     w.queue.wal_traffic_snapshot.return_value = ({}, {})
     w.queue.wal_size_bytes.return_value = 0
     return w
+
+
+def _context(branch_key=b"branch", spine=None, source_work_id=None,
+             source_priority=0, source_word=None, source_pattern=None):
+    return WorkContext(
+        source_work_id, source_priority, source_word, source_pattern,
+        branch_key, spine)
 
 
 class TestHeartbeatThrottling(unittest.TestCase):
@@ -159,7 +188,7 @@ class TestPromotedSpine(unittest.TestCase):
     def test_descent_at_or_above_base_depth_is_not_reappended(self):
         w = _bare_worker()
         # Base reaches a guess_depth-2 branch via SALET then ABORT.
-        w._claimed_branch_spine = 'SALET -g-g- ABORT y----'
+        w._work_context = _context(spine='SALET -g-g- ABORT y----')
         # Live descent still carries the reaching guess (depth 2, budget 4) AND
         # a genuine child below it (depth 3, budget 3).
         w._note_depth(4, 12, 'abort', 'y----')   # guess_depth 2 — the base tail
@@ -170,8 +199,8 @@ class TestPromotedSpine(unittest.TestCase):
 
     def test_different_entry_at_base_depth_preserves_budget_invariant(self):
         w = _bare_worker()
-        w._claimed_branch_spine = (
-            'CRANE -yy-y SATED -g-g- DARGS -gy--')
+        w._work_context = _context(
+            spine='CRANE -yy-y SATED -g-g- DARGS -gy--')
         w._note_depth(3, 5, 'gamps', '-g---')
 
         spine = w._promoted_spine()
@@ -181,7 +210,7 @@ class TestPromotedSpine(unittest.TestCase):
 
     def test_stale_entry_at_base_depth_dropped_but_descent_kept(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'ALIBI y---- EARNT yg---'
+        w._work_context = _context(spine='ALIBI y---- EARNT yg---')
         w._note_depth(4, 30, 'story', '-yy-y')
         w._note_depth(3, 12, 'coups', '-----')
 
@@ -200,7 +229,7 @@ class TestPromotedSpine(unittest.TestCase):
         for budget, base_spine, descent_entries in cases:
             with self.subTest(budget=budget):
                 w = _bare_worker()
-                w._claimed_branch_spine = base_spine
+                w._work_context = _context(spine=base_spine)
                 for entry_budget, guess, pattern in descent_entries:
                     w._note_depth(entry_budget, 5, guess, pattern)
                 w.score_cache.read_with_depth.return_value = None
@@ -217,15 +246,46 @@ class TestPromotedSpine(unittest.TestCase):
                     budget + guess_depth_from_spine(promoted_spine),
                     ROOT_BUDGET)
 
+    def test_nested_cooperative_branch_records_immediate_parent(self):
+        w = _bare_worker()
+        outer_words = BRANCH
+        inner_words = BRANCH[:4]
+        outer_key = ScoreCache.encode_subset(outer_words)
+        root_key = b"root-branch"
+        w._work_context = _context(branch_key=root_key)
+        w.score_cache.read_with_depth.return_value = None
+        w.score_cache.read_loss.return_value = None
+        w.queue.read_cut_result.return_value = []
+        w.queue.has_pending_row.return_value = False
+        w.queue.create_branch.return_value = True
+        w.queue.get_branch.side_effect = (
+            lambda branch_key: {} if branch_key == outer_key else None)
+        w._claim_bundle = mock.MagicMock(return_value=(1, [0], False))
+
+        def evaluate_outer_branch(*_args, **_kwargs):
+            self.assertEqual(w._work_context.branch_key, outer_key)
+            w.cooperative_solve(inner_words, ROOT_BUDGET - 1)
+            self.assertEqual(w._work_context.branch_key, outer_key)
+            w._stop_requested = True
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=evaluate_outer_branch)
+
+        w.cooperative_solve(outer_words, ROOT_BUDGET)
+
+        nested_create = w.queue.create_branch.call_args_list[1]
+        self.assertEqual(nested_create.kwargs["parent_branch_key"], outer_key)
+        self.assertEqual(w._work_context.branch_key, root_key)
+
     def test_pure_descent_below_base_is_appended(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 5, 'dogma', 'y---y')     # guess_depth 2 — below the base
         self.assertEqual(w._promoted_spine(), 'SALET -g-g- DOGMA y---y')
 
     def test_no_base_yields_none(self):
         w = _bare_worker()
-        w._claimed_branch_spine = None
+        w._work_context = WorkContext.empty()
         w._note_depth(4, 5, 'dogma', 'y---y')
         self.assertIsNone(w._promoted_spine())
 
@@ -246,7 +306,8 @@ class TestHeartbeatSpineStrFilter(unittest.TestCase):
         # subbranch_solver, then cooperative_solve advanced _claimed_branch_spine
         # to include PEAZE.  The outer frame's entry should not appear as a live
         # descent step.
-        w._claimed_branch_spine = 'SALET -g-g- ABOVE y---y PEAZE -yy--'
+        w._work_context = _context(
+            spine='SALET -g-g- ABOVE y---y PEAZE -yy--')
         w._note_depth(3, 44, 'peaze', '-yy--')   # outer frame's entry at guess_depth 3
         w._note_depth(2, 16, 'nurdy', '---y-')   # real descent at guess_depth 4
         w._hb_max_spine = dict(w._spine)
@@ -256,7 +317,7 @@ class TestHeartbeatSpineStrFilter(unittest.TestCase):
 
     def test_descent_below_claimed_branch_is_included(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 30, 'crane', '-yg--')   # guess_depth 2
         w._note_depth(3, 8, 'dogma', 'y---y')    # guess_depth 3
         w._hb_max_spine = dict(w._spine)
@@ -266,7 +327,7 @@ class TestHeartbeatSpineStrFilter(unittest.TestCase):
 
     def test_tokens_carry_explicit_guess_depth_prefix(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'   # guess_depth 1
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 30, 'crane', '-yg--')   # guess_depth 2
         w._note_depth(3, 8, 'dogma', 'y---y')    # guess_depth 3
         w._hb_max_spine = dict(w._spine)
@@ -474,6 +535,17 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
         self.assertEqual(size, '•')
         self.assertIn(1, w._spine)  # parent depth untouched
 
+    def test_none_budget_is_ignored(self):
+        w = _bare_worker()
+        original_spine = dict(w._spine)
+
+        w._note_depth(None, 12)
+
+        self.assertEqual(w._spine, original_spine)
+
+    def test_fmt_spine_entry_accepts_non_tuple_sentinel(self):
+        self.assertEqual(_BranchWorker._fmt_spine_entry('•'), '•')
+
     def test_sentinel_updates_hb_and_log_max_spine(self):
         w = _bare_worker()
         w._note_depth(5, 50)
@@ -517,7 +589,7 @@ class TestSpineComposition(unittest.TestCase):
 
     def test_promoted_spine_composes_base_and_descent_edges(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'
+        w._work_context = _context(spine='SALET -g-g-')
         # Pattern strings pass through unchanged (only ints are fmt_pattern'd).
         w._note_depth(4, 50, 'crane', 'bb-y-')
         w._note_depth(3, 12, 'pound', 'g--y-')
@@ -526,13 +598,13 @@ class TestSpineComposition(unittest.TestCase):
 
     def test_promoted_spine_none_without_base(self):
         w = _bare_worker()
-        w._claimed_branch_spine = None
+        w._work_context = WorkContext.empty()
         w._note_depth(5, 50, 'crane', 'bb-y-')
         self.assertIsNone(w._promoted_spine())
 
     def test_promoted_spine_skips_sentinel_and_size_only_levels(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'SALET -g-g-'
+        w._work_context = _context(spine='SALET -g-g-')
         w._note_depth(4, 50, 'crane', 'bb-y-')
         w._note_depth(3, 12)            # size-only level: no guess/pattern
         # Promotion sentinel preserves the guess but sets size to '•'; the edge
@@ -934,14 +1006,70 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
-            result = w.claim_one()
+            with mock.patch.object(w.queue, 'source_work_candidates',
+                                   wraps=w.queue.source_work_candidates) as source_rows:
+                result = w.claim_one()
+            self.assertEqual(source_rows.call_count, 0)
         finally:
             w.close()
 
         # Worker must have skipped branch A (fully claimed) and joined branch B.
         self.assertIsNotNone(result)
-        branch, bundle_id, indices, forced = result
+        _context_value, branch, bundle_id, indices, forced = result
         self.assertEqual(branch['branch_key'], key_b)
+        self.assertTrue(indices)
+
+    def test_claim_one_discovers_source_work_after_unclaimable_direct_branch(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        direct_key = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(direct_key, len(BRANCH), n_candidates,
+                        budget=ROOT_BUDGET)
+        q.claim_next_bundle(direct_key, "other-worker", n_candidates,
+                            list(range(n_candidates)), [0.0] * n_candidates,
+                            small_count=n_candidates, count_cap=n_candidates)
+        source_key = ScoreCache.encode_subset(BRANCH[:4])
+        q.add_pending_many([(source_key, 4, 7, "crane", 0)])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            result = w.claim_one()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result)
+        _context_value, branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch['branch_key'], source_key)
+        self.assertEqual(branch['source_word'], "crane")
+        self.assertTrue(indices)
+
+    def test_stale_worker_preserves_owner_when_joining_source_active_branch(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        stale_worker = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        q = ERDQueue(self.queue_path)
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        q.add_pending_many([(branch_key, len(BRANCH), 7, "crane", 0)])
+        source_work_id = q.source_work_rows()[0]["source_work_id"]
+        q.close()
+
+        promoting_worker = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNotNone(promoting_worker.claim_one())
+        finally:
+            promoting_worker.close()
+        try:
+            result = stale_worker.claim_one()
+        finally:
+            stale_worker.close()
+
+        self.assertIsNotNone(result)
+        context, branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch['branch_key'], branch_key)
+        self.assertEqual(context.source_work_id, source_work_id)
         self.assertTrue(indices)
 
     def test_claim_one_joins_existing_in_progress_branch(self):
@@ -962,11 +1090,93 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         # claim_one should have joined the in-progress branch via
         # branches_in_progress() → claim_next_bundle() → return
-        # (branch, bundle_id, indices, forced).
+        # (context, branch, bundle_id, indices, forced).
         self.assertIsNotNone(result)
-        branch, bundle_id, indices, forced = result
+        _context_value, branch, bundle_id, indices, forced = result
         self.assertEqual(branch['branch_key'], branch_key)
         self.assertTrue(indices)
+
+    def test_claim_one_joins_active_source_work_branch(self):
+        from erd_queue import ERDQueue
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(branch_key, len(BRANCH), 3, "crane", 0)])
+        q.close()
+
+        first = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNotNone(first.claim_one())
+        finally:
+            first.close()
+
+        second = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        try:
+            result = second.claim_one()
+        finally:
+            second.close()
+
+        self.assertIsNotNone(result)
+        _context_value, branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch['branch_key'], branch_key)
+        self.assertTrue(indices)
+
+    def test_claim_active_branch_returns_selected_owner_metadata(self):
+        from erd_queue import ERDQueue
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(branch_key, len(BRANCH), 1, "crane", 7)])
+        q.add_pending_many([(branch_key, len(BRANCH), 9, "slate", 42)])
+        sources = {row["source_word"]: row for row in q.source_work_rows()}
+        crane = q.claim_next("peer", sources["crane"]["source_work_id"])
+        q.create_branch(
+            branch_key, len(BRANCH), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=crane["priority"], source_word=crane["source_word"],
+            source_pattern=crane["source_pattern"],
+            source_work_id=crane["source_work_id"])
+        slate_rows = q.branches_in_progress(sources["slate"]["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            result = w._claim_active_branch(
+                slate_rows, sources["slate"]["source_work_id"])
+        finally:
+            w.close()
+        context, _branch, _bundle_id, indices, _forced = result
+        self.assertEqual(context.source_word, "slate")
+        self.assertEqual(context.source_pattern, 42)
+        self.assertEqual(context.source_priority, 9)
+        self.assertTrue(indices)
+
+    def test_claim_one_finalizes_completed_direct_branch(self):
+        from erd_queue import ERDQueue
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        q.create_branch(branch_key, len(BRANCH), n_candidates,
+                        budget=ROOT_BUDGET)
+        order = list(range(n_candidates))
+        q.claim_next_bundle(branch_key, "other-worker", n_candidates, order,
+                            [0.0] * n_candidates, small_count=n_candidates,
+                            count_cap=n_candidates)
+        for index in order:
+            q.complete_candidate(branch_key, index)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        try:
+            self.assertIsNone(q.get_branch(branch_key))
+        finally:
+            q.close()
 
 
 class TestCooperativeSolveFullPath(unittest.TestCase):
@@ -1027,6 +1237,57 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertAlmostEqual(cached[1], cost, places=6)
 
+    def test_cooperative_solve_claims_after_source_reprioritization(self):
+        from erd_queue import ERDQueue
+
+        root_key = ScoreCache.encode_subset(BRANCH[:3])
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(root_key, 3, 1, "crane", 0)])
+        source_work_id = q.source_work_rows()[0]["source_work_id"]
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._work_context = WorkContext(
+            source_work_id, 1, "crane", 0, root_key, None)
+        original_claim_bundle = w._claim_bundle
+        reprioritized = False
+        # A worker locked out of its own reprioritized branch never claims
+        # again and spins in the wait loop, so the guard bounds the claim
+        # attempts rather than the wall clock: exhausting them stops the
+        # worker and fails with the reason instead of hanging the job.  The
+        # healthy descent claims twice.
+        claim_attempt_limit = 20
+        claim_attempts = 0
+
+        def reprioritize_then_claim(*args, **kwargs):
+            nonlocal reprioritized, claim_attempts
+            claim_attempts += 1
+            if claim_attempts > claim_attempt_limit:
+                w._stop_requested = True
+                return None
+            if not reprioritized:
+                reprioritized = True
+                updated = ERDQueue(self.queue_path)
+                try:
+                    self.assertTrue(updated.set_source_work_priority(
+                        source_work_id, 9))
+                finally:
+                    updated.close()
+            return original_claim_bundle(*args, **kwargs)
+
+        w._claim_bundle = mock.MagicMock(side_effect=reprioritize_then_claim)
+        try:
+            result = w.cooperative_solve(BRANCH, ROOT_BUDGET)
+        finally:
+            w.close()
+
+        self.assertTrue(reprioritized)
+        self.assertLessEqual(
+            claim_attempts, claim_attempt_limit,
+            "cooperative_solve made no progress after "
+            f"{claim_attempt_limit} claim attempts")
+        self.assertEqual(result[0], SOLVED)
+
     def test_does_not_finalize_when_evaluate_bundle_reports_cancellation(self):
         words = BRANCH
         branch_key = ScoreCache.encode_subset(words)
@@ -1061,7 +1322,7 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
         q.create_branch(branch_key, len(words), n_candidates,
-                        budget=ROOT_BUDGET, priority=erd_swarm.PROMOTED_PRIORITY)
+                        budget=ROOT_BUDGET, priority=0)
         order = list(range(n_candidates))
         cost_lower_bound = [0.0] * n_candidates
         bundle_id, indices, _forced = q.claim_next_bundle(
@@ -1164,6 +1425,69 @@ class TestHelpOtherBranch(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         self.assertIsNotNone(q.get_branch(key_b))   # not finalized
         q.close()
+
+    def test_help_other_branch_switches_and_restores_source_context(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        words_b = BRANCH[:4]
+        key_b = ScoreCache.encode_subset(words_b)
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(key_b, len(words_b), 9, "slate", 42)])
+        claimed = q.claim_next("peer")
+        q.create_branch(
+            key_b, len(words_b), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=claimed["priority"], source_word=claimed["source_word"],
+            source_pattern=claimed["source_pattern"],
+            source_work_id=claimed["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        waiting_context = _context(
+            branch_key=b"waiting", source_work_id=999, source_priority=1,
+            source_word="crane", source_pattern=7)
+        w._work_context = waiting_context
+
+        def evaluate(*_args, **_kwargs):
+            self.assertEqual(w._work_context.branch_key, key_b)
+            self.assertEqual(
+                w._work_context.source_work_id, claimed["source_work_id"])
+            self.assertEqual(w._work_context.source_priority, 9)
+            self.assertEqual(w._work_context.source_word, "slate")
+            self.assertEqual(w._work_context.source_pattern, 42)
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
+        try:
+            self.assertTrue(w._help_other_branch(b"excluded"))
+            self.assertEqual(w._work_context, waiting_context)
+        finally:
+            w.close()
+
+    def test_help_other_branch_preserves_direct_branch_metadata(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        words_b = BRANCH[:4]
+        key_b = ScoreCache.encode_subset(words_b)
+        q = ERDQueue(self.queue_path)
+        q.create_branch(
+            key_b, len(words_b), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=9, source_word="crane", source_pattern=7)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+
+        def evaluate(*_args, **_kwargs):
+            self.assertIsNone(w._work_context.source_work_id)
+            self.assertEqual(w._work_context.source_priority, 9)
+            self.assertEqual(w._work_context.source_word, "crane")
+            self.assertEqual(w._work_context.source_pattern, 7)
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
+        try:
+            self.assertTrue(w._help_other_branch(b"excluded"))
+        finally:
+            w.close()
 
     def test_help_other_branch_returns_false_when_no_candidates_available(self):
         """When no other branches have available candidate claims, help_other_branch
@@ -1427,7 +1751,7 @@ class TestPromotedSpineDepthCap(unittest.TestCase):
 
     def _descended_worker(self):
         w = _bare_worker()
-        w._claimed_branch_spine = 'ALIBI ----- ELOPE y-y--'
+        w._work_context = _context(spine='ALIBI ----- ELOPE y-y--')
         w._spine = {3: (7, 'rends', '-y-y-'), 4: (3, 'motza', '-g---')}
         return w
 
@@ -1938,6 +2262,21 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         self.assertIsNotNone(result)
 
+    def test_compatible_raced_branch_adopts_selected_source(self):
+        w = self._worker()
+        parent_key = b"parent-branch"
+        w._work_context = _context(
+            branch_key=parent_key, source_work_id=41, source_priority=1,
+            source_word="crane", source_pattern=42)
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 4}
+
+        w.cooperative_solve(BRANCH, 4, ceiling=2.5)
+
+        w.queue.attach_branch_source_work.assert_called_once_with(
+            ScoreCache.encode_subset(BRANCH), 41, 4, 2.5, len(BRANCH), 42,
+            parent_key)
+
     def test_waiter_refreshes_a_cached_loss_miss_before_branch_deletion(self):
         w = self._worker()
         w._stop_requested = False
@@ -2140,6 +2479,21 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         pub.check(token, CANDIDATES, 1, None, 2.5, 5)
         w.queue.mark_claims_done.assert_not_called()
 
+    def test_compatible_race_adopts_selected_source(self):
+        pub, w, token = self._overrunning()
+        parent_key = b"parent-branch"
+        w._work_context = _context(
+            branch_key=parent_key, source_work_id=41, source_priority=1,
+            source_word="crane", source_pattern=42)
+        w.queue.create_branch.return_value = False
+        w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
+
+        pub.check(token, CANDIDATES, 1, "crane", 1.8, 5)
+
+        w.queue.attach_branch_source_work.assert_called_once_with(
+            ScoreCache.encode_subset(BRANCH[:6]), 41, 5, None,
+            len(BRANCH[:6]), 42, parent_key)
+
     def test_race_to_other_budget_skips_marks_and_seed(self):
         # Everything the prefix proved, it proved at the frame's budget: a
         # raced row at another budget takes neither the done-marks nor the
@@ -2227,10 +2581,14 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         q.create_branch(self.key, len(BRANCH), n, budget=budget, ceiling=ceiling)
         if queue_user_request:
             q.add_pending_many([(self.key, len(BRANCH), 0, "crane", 0)])
+        source_work_id = (q.source_work_rows()[0]["source_work_id"]
+                          if queue_user_request else None)
         order = list(range(n))
         _, indices, _ = q.claim_next_bundle(
             self.key, "other", n, order, [0.0] * n,
-            small_count=n, count_cap=n)
+            small_count=n, count_cap=n,
+            expected_source_work_id=source_work_id,
+            expected_source_priority=0 if queue_user_request else None)
         for idx in indices:
             q.complete_candidate(self.key, idx)
         if cut:

@@ -15,9 +15,9 @@ import time
 import unittest
 
 from cache_sqlite import ScoreCache, MemoryScoreCache
+from erd_lattice import erd_ge, erd_numerator
 from wordle_engine import (
     ResponseCache, ERD_ALL, Solution, _CEIL_EPS, erd_display_numerator,
-    erd_ge, erd_numerator,
 )
 from erd_queue import ERDQueue
 import import_cache
