@@ -1178,6 +1178,7 @@ class TestCostModel(_TmpQueue):
         self.assertIsNone(row['bundle_end_idx'])
         self.assertEqual(row['claim_transaction_millis'], 0)
         self.assertEqual(row['claim_commit_millis'], 0)
+        self.assertEqual(row['scheduling_millis'], 0)
         self.assertEqual(row['idle_millis'], 5000)
 
     def test_add_claim_telemetry_carries_branch_attribution(self):

@@ -96,6 +96,7 @@ def _bare_worker():
     w._log_max_spine = {}
     w.started = 0
     w._work_context = WorkContext.empty()
+    w._pending_scheduling_millis = 0
     w._adaptive = True
     w._typical_cache = {}
     w._cost_model_buffer = {}
@@ -1033,6 +1034,39 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             self.assertLessEqual(row["bundle_start_idx"], row["idx"])
             self.assertLessEqual(row["idx"], row["bundle_end_idx"])
 
+    def test_phases_partition_coordination_millis_on_every_row(self):
+        # The schema promises the five phases sum to coordination_millis
+        # exactly.  Measured end to end rather than arithmetically, so any
+        # future coordination work that lands in the telescoped window
+        # without a phase of its own shows up here instead of silently
+        # inflating idle_millis.
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        q.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, spine="CRANE -----")
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w.solve_branch_focused(branch_key)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        rows = q._conn.execute(
+            "SELECT coordination_millis, claim_transaction_millis, "
+            "claim_commit_millis, busy_wait_millis, scheduling_millis, "
+            "idle_millis FROM claim_telemetry ORDER BY id").fetchall()
+        q.close()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(
+                row["claim_transaction_millis"] + row["claim_commit_millis"]
+                + row["busy_wait_millis"] + row["scheduling_millis"]
+                + row["idle_millis"],
+                row["coordination_millis"])
+
     def test_finalize_cost_lands_on_its_own_branch_and_not_the_next_one(self):
         # A worker that finalizes branch1 then moves on to branch2 must record
         # branch1's finalize cost against branch1, and must not let that span
@@ -1167,6 +1201,50 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         _context_value, branch, bundle_id, indices, forced = result
         self.assertEqual(branch['branch_key'], key_b)
         self.assertTrue(indices)
+
+    def test_claim_one_records_scan_time_net_of_the_queue_phases(self):
+        # The work-selection scan must be charged to scheduling_millis rather
+        # than falling into idle_millis, and must exclude the lock wait and
+        # claim transaction the queue already accounts for -- otherwise the
+        # phases would double-count and overshoot coordination_millis.
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        key = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(key, len(BRANCH), len(CANDIDATES), budget=ROOT_BUDGET)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        # Sleep inside claim_next_bundle's open transaction, so the delay is
+        # charged to claim_transaction_millis by the queue's own timing.
+        real_commit = w.queue._commit_claim_transaction
+
+        def slow_commit(txn_t0):
+            time.sleep(0.05)
+            return real_commit(txn_t0)
+        w.queue._commit_claim_transaction = slow_commit
+        try:
+            result = w.claim_one()
+            attributed = w._queue_attributed_millis()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result)
+        # The queue booked the 50ms as its own phase ...
+        self.assertGreaterEqual(attributed, 40)
+        # ... so the scan figure must not also contain it.
+        self.assertLess(w._pending_scheduling_millis, 40)
+
+    def test_claim_one_clears_scan_time_when_nothing_is_claimable(self):
+        # A scan that selects no branch must not carry its cost forward onto
+        # whichever unrelated branch this worker claims later.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w._pending_scheduling_millis = 999
+            self.assertIsNone(w.claim_one())      # empty queue
+            self.assertEqual(w._pending_scheduling_millis, 0)
+        finally:
+            w.close()
 
     def test_claim_one_discovers_source_work_after_unclaimable_direct_branch(self):
         from erd_queue import ERDQueue

@@ -237,8 +237,28 @@ instead of only to its `n_words`/epoch bucket — query
 against the telemetry file.  `coordination_millis` is also partitioned into
 `claim_transaction_millis` (claim-scan and write, inside
 `claim_next_bundle`'s transaction) + `claim_commit_millis` (its `COMMIT`) +
-`busy_wait_millis` (lock-acquisition wait) + `idle_millis` (the remainder);
-those four sum to `coordination_millis` exactly.
+`busy_wait_millis` (write-lock wait, across every claim path taken while
+coordinating — both `claim_next_bundle` and `claim_next`) +
+`scheduling_millis` (the work-selection scan that chose this branch:
+source-work ordering, pending promotion, joining an in-progress branch) +
+`idle_millis` (the remainder); those five sum to `coordination_millis`
+exactly.
+
+All five measure time *between* candidate evaluations, which is what
+`coordination_millis` spans. Queue work a candidate does during its own
+evaluation — sub-branch promotion taking the write lock, for instance — is
+inside the evaluation span, which `coordination_millis` excludes, so it is
+deliberately not counted here; folding it in would make the parts exceed
+the whole.
+
+Scheduling is broken out rather than left in the remainder because it is
+real work, and it grows with the number of source-work groups: folded into
+`idle_millis` a large value reads as starved workers, when the true cause
+may be that work selection is eating the window.  `idle_millis` therefore
+means genuinely unaccounted wait.  One exception worth knowing: a scan that
+finds nothing claimable is not billed to any branch — the worker had not
+chosen one yet — so that time stays in the next row's `idle_millis`, which
+is the correct reading for a worker that searched and found no work.
 
 Every row is one candidate evaluation, so `COUNT(*)` is a claim count. The
 finalize phase is deliberately *not* here: it belongs to a branch rather

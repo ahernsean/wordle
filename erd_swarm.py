@@ -585,6 +585,10 @@ class _BranchWorker:
         self._last_wal_traffic = self.queue.wal_traffic_snapshot()
         self._last_wal_traffic_log = time.time()
         self._work_context = WorkContext.empty()
+        # Work-selection scan time for the claim currently in hand, set by
+        # claim_one and consumed by the first candidate's telemetry row (the
+        # scan is paid once per claim, like the claim transaction itself).
+        self._pending_scheduling_millis = 0
         # Direct cooperative callers can create active branches without a
         # source-work request.  Keep their tight claim loop free of the
         # source-admission query used by queued source work.
@@ -1287,12 +1291,15 @@ class _BranchWorker:
                         metric['erd_lower_bound_pruned'],
                         nodes_delta, group_sizes=metric['group_sizes'],
                         source_word=self._work_context.source_word)
+            scheduling_millis = self._pending_scheduling_millis
+            self._pending_scheduling_millis = 0
             self.queue.add_claim_telemetry(
                 n_words, int(full_coord_seconds * 1e3), nodes_delta,
                 self.n_workers, branch_key=branch_key,
                 spine=self._work_context.spine, worker_id=self.name,
                 bundle_id=bundle_id, idx=idx,
-                bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx)
+                bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
+                scheduling_millis=scheduling_millis)
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.
@@ -1901,7 +1908,39 @@ class _BranchWorker:
         """Return (context, branch, bundle_id, indices, forced) for the next
         bundle of candidates, or None if there is nothing to do right now.
 
-        Prefers JOINING an in-progress branch (to finish branches already
+        Times the work-selection scan into _pending_scheduling_millis for the
+        resulting claim's telemetry row, net of the lock wait and claim
+        transaction the queue already accounts for separately, so the phases
+        stay disjoint.  A call that finds nothing clears the figure rather
+        than carrying it forward: that scan chose no branch, so billing it to
+        whichever branch is claimed later would misattribute it (it stays in
+        that row's idle_millis, which is what a fruitless scan is).
+        """
+        scan_t0 = time.perf_counter()
+        attributed_before = self._queue_attributed_millis()
+        work = None
+        try:
+            work = self._claim_one_uninstrumented()
+            return work
+        finally:
+            if work is None:
+                self._pending_scheduling_millis = 0
+            else:
+                elapsed = int((time.perf_counter() - scan_t0) * 1000)
+                self._pending_scheduling_millis = max(
+                    0, elapsed - (self._queue_attributed_millis()
+                                  - attributed_before))
+
+    def _queue_attributed_millis(self):
+        """Coordination time the queue has already attributed to a named phase
+        since the last telemetry row (lock wait + claim transaction + commit)."""
+        return (self.queue._last_claim_busy_millis
+                + self.queue._last_claim_transaction_millis
+                + self.queue._last_claim_commit_millis)
+
+    def _claim_one_uninstrumented(self):
+        """claim_one's work selection.  See claim_one for the contract:
+        prefers JOINING an in-progress branch (to finish branches already
         underway, concentrating workers) over PROMOTING a new one from the
         queue.  Promotion claims a pending branch and registers it so others
         can join.  A claimed branch already solved at this budget (e.g.
