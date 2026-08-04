@@ -399,11 +399,19 @@ def cmd_queue_priority(args):
 def cmd_queue_source_priority(args):
     """Set the requested priority of a source-work request, by word.
 
-    Resolves the word to a source_work_id and defers to
+    Resolves the word to an open (non-complete) source_work_id via
+    ERDQueue.source_work_candidates() and defers to
     ERDQueue.set_source_work_priority(), which applies the change to both the
     request's pending roots and its active/promoted descendants in one
-    transaction.  A word that owns more than one open request is ambiguous;
-    --id picks one.  A completed request cannot be reprioritized.
+    transaction.  A branch owned by more than one live request keeps the
+    higher of their requested priorities (MAX(owner_priority) at the branch
+    level), so lowering one request's priority does not necessarily lower a
+    branch it shares with a higher-priority request.
+
+    A word with more than one open request is ambiguous; --source-work-id
+    picks one.  --source-work-id may also name a completed request directly,
+    which is reported as such rather than as "not found".  A word whose
+    requests are all complete is reported distinctly from a word with none.
     """
     word = args.word.strip().lower()
 
@@ -414,33 +422,52 @@ def cmd_queue_source_priority(args):
         return
 
     queue = ERDQueue(args.queue)
-    rows = [row for row in queue.source_work_rows()
-            if row['source_word'] == word]
-    if args.id is not None:
-        rows = [row for row in rows if row['source_work_id'] == args.id]
+    try:
+        all_rows = {row['source_work_id']: row
+                    for row in queue.source_work_rows()
+                    if row['source_word'] == word}
 
-    if not rows:
-        queue.close()
-        if args.id is not None:
-            print(f'{word.upper()}: no source-work request with id {args.id}.')
+        if args.source_work_id is not None:
+            if args.source_work_id not in all_rows:
+                print(f'{word.upper()}: no source-work request with id '
+                      f'{args.source_work_id}.')
+                return
+            source_work_id = args.source_work_id
         else:
-            print(f'{word.upper()}: no source-work request found.')
-        return
+            open_ids = [row['source_work_id']
+                        for row in queue.source_work_candidates()
+                        if row['source_word'] == word]
+            if not open_ids:
+                if all_rows:
+                    print(f'{word.upper()}: all {len(all_rows)} '
+                          f'source-work request(s) are complete.')
+                else:
+                    print(f'{word.upper()}: no source-work request found.')
+                return
+            if len(open_ids) > 1:
+                print(f'{word.upper()}: ambiguous, {len(open_ids)} open '
+                      f'source-work requests match.  '
+                      f'Use --source-work-id to disambiguate.')
+                for candidate_id in sorted(open_ids):
+                    row = all_rows[candidate_id]
+                    requested_at = datetime.fromtimestamp(
+                        row['requested_at']).strftime('%Y-%m-%d %H:%M')
+                    print(f'  id {candidate_id}  '
+                          f'priority {row["requested_priority"]}  '
+                          f'{row["state"]}  {row["root_count"]} root(s), '
+                          f'{row["branch_count"]} branch(es)  '
+                          f'requested {requested_at}')
+                return
+            source_work_id = open_ids[0]
 
-    if len(rows) > 1:
+        updated = queue.set_source_work_priority(source_work_id, args.priority)
+    finally:
         queue.close()
-        ids = ', '.join(str(row['source_work_id']) for row in rows)
-        print(f'{word.upper()}: ambiguous, {len(rows)} source-work requests '
-              f'match (ids: {ids}).  Use --id to disambiguate.')
-        return
-
-    source_work_id = rows[0]['source_work_id']
-    updated = queue.set_source_work_priority(source_work_id, args.priority)
-    queue.close()
 
     if updated:
-        print(f'{word.upper()} (id {source_work_id}): '
-              f'priority set to {args.priority}.')
+        print(f'{word.upper()} (id {source_work_id}): requested priority '
+              f'set to {args.priority}.  A branch shared with another live '
+              f'request keeps the higher of the two.')
     else:
         print(f'{word.upper()} (id {source_work_id}): '
               f'request is complete, cannot reprioritize.')
@@ -1160,8 +1187,7 @@ def main():
     p_qsp.add_argument('--priority', required=True, type=int, metavar='N',
                        help='New requested priority (higher = worked sooner; '
                             'use values 0–999)')
-    p_qsp.add_argument('--id', type=int, default=None, metavar='N',
-                       dest='id',
+    p_qsp.add_argument('--source-work-id', type=int, default=None, metavar='N',
                        help='source_work_id to disambiguate, when --word '
                             'owns more than one open request')
     p_qsp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')

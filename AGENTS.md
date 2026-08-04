@@ -20,8 +20,8 @@ Use `erd_search.py epoch show` to inspect the active telemetry epoch. See
 SWARM.md for the stopped-swarm procedure required to change it.
 
 Queue mutations remain grouped under `erd_search.py queue`: `add`, `remove`,
-`clear`, `priority`, and `reset-stale`. The `queue` group has no read-only
-dashboard commands.
+`clear`, `priority`, `source-priority`, and `reset-stale`. The `queue` group
+has no read-only dashboard commands.
 
 ---
 

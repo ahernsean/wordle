@@ -1,8 +1,10 @@
 """Unit tests for erd_search.cmd_queue_source_priority (issue #206).
 
 Exercises the CLI surface for ERDQueue.set_source_work_priority(): word ->
-source_work_id resolution, ambiguous-word disambiguation via --id, and the
-distinct out-of-range / unknown-word / ambiguous / complete-request messages.
+source_work_id resolution restricted to open (non-complete) requests, the
+--source-work-id disambiguation and direct-completed-request targeting, the
+MAX(owner_priority) branch-sharing behaviour, and the distinct out-of-range /
+unknown-word / all-complete / ambiguous / complete-request messages.
 """
 import contextlib
 import io
@@ -24,7 +26,7 @@ def _make_args(queue_path, **overrides):
     args = types.SimpleNamespace(
         word="salet",
         priority=1,
-        id=None,
+        source_work_id=None,
         queue=queue_path,
     )
     for key, value in overrides.items():
@@ -44,28 +46,54 @@ class TestQueueSourcePriority(unittest.TestCase):
             erd_search.cmd_queue_source_priority(args)
         return buf.getvalue()
 
-    def test_sets_priority_for_pending_and_active_descendant(self):
+    def test_sets_priority_for_pending_root_active_root_and_descendant(self):
         queue = ERDQueue(self.queue_path)
-        key_a = ScoreCache.encode_subset(WORDS_A)
-        key_b = ScoreCache.encode_subset(WORDS_B)
+        key_root = ScoreCache.encode_subset(WORDS_A)
+        key_child = ScoreCache.encode_subset(WORDS_B)
+        key_other_root = ScoreCache.encode_subset(WORDS_C)
         queue.add_pending_many([
-            (key_a, len(WORDS_A), 0, 'salet', 0),
-            (key_b, len(WORDS_B), 0, 'salet', 1),
+            (key_root, len(WORDS_A), 0, 'salet', 0),
+            (key_other_root, len(WORDS_C), 0, 'salet', 1),
         ])
         claimed = queue.claim_next('worker-0')
-        queue.create_branch(key_a, len(WORDS_A), 20,
+        queue.create_branch(key_root, len(WORDS_A), 20,
                              priority=claimed['priority'],
                              source_work_id=claimed['source_work_id'])
+        # A promoted descendant discovered while solving key_root: created
+        # directly (never queued), owned by the same source-work request.
+        queue.create_branch(key_child, len(WORDS_B), 5,
+                             priority=claimed['priority'],
+                             source_work_id=claimed['source_work_id'],
+                             parent_branch_key=key_root)
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=9))
-        self.assertIn('priority set to 9', output)
+        self.assertIn('requested priority set to 9', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
-        self.assertEqual(queue.get_branch(key_a)['priority'], 9)
+        self.assertEqual(queue.get_branch(key_root)['priority'], 9)
+        self.assertEqual(queue.get_branch(key_child)['priority'], 9)
         self.assertEqual(
-            queue.get_pending_branch(key_b)['priority'], 9)
+            queue.get_pending_branch(key_other_root)['priority'], 9)
+
+    def test_branch_shared_by_two_live_requests_keeps_max_priority(self):
+        queue = ERDQueue(self.queue_path)
+        key = ScoreCache.encode_subset(WORDS_A)
+        queue.add_pending_many([(key, len(WORDS_A), 1, 'salet', 0)])
+        queue.add_pending_many([(key, len(WORDS_A), 50, 'crane', 0)])
+        self.assertEqual(queue.get_pending_branch(key)['priority'], 50)
+        queue.close()
+
+        # Lowering CRANE's priority must not drag the branch below what
+        # SALET (still at 1) requires: MAX(owner_priority) wins.
+        output = self._run(_make_args(self.queue_path, word='crane',
+                                       priority=0))
+        self.assertIn('requested priority set to 0', output)
+
+        queue = ERDQueue(self.queue_path)
+        self.addCleanup(queue.close)
+        self.assertEqual(queue.get_pending_branch(key)['priority'], 1)
 
     def test_out_of_range_priority_rejected_without_traceback(self):
         queue = ERDQueue(self.queue_path)
@@ -87,7 +115,47 @@ class TestQueueSourcePriority(unittest.TestCase):
         output = self._run(_make_args(self.queue_path, word='zzzzz'))
         self.assertIn('no source-work request found', output)
 
-    def test_ambiguous_word_lists_candidate_ids_and_requires_disambiguation(self):
+    def test_all_requests_complete_reported_distinctly_from_unknown_word(self):
+        queue = ERDQueue(self.queue_path)
+        key = ScoreCache.encode_subset(WORDS_C)
+        queue.add_pending_many([(key, len(WORDS_C), 0, 'salet', 0)])
+        source_work_id = queue.source_work_rows()[0]['source_work_id']
+        queue.claim_next('worker-0', source_work_id)
+        queue.mark_done(key)
+        queue.close()
+
+        output = self._run(_make_args(self.queue_path, priority=2))
+        self.assertIn('all 1 source-work request(s) are complete', output)
+        self.assertNotIn('no source-work request found', output)
+
+    def test_completed_request_does_not_make_later_request_ambiguous(self):
+        # Regression for issue #206 review finding 1: a word's first request
+        # completing must not leave the next queue add for that word stuck
+        # behind a permanent "ambiguous" result.
+        queue = ERDQueue(self.queue_path)
+        key_done = ScoreCache.encode_subset(WORDS_C)
+        queue.add_pending_many([(key_done, len(WORDS_C), 0, 'salet', 0)])
+        done_id = queue.source_work_rows()[0]['source_work_id']
+        queue.claim_next('worker-0', done_id)
+        queue.mark_done(key_done)
+
+        key_open = ScoreCache.encode_subset(WORDS_A)
+        queue.add_pending_many([(key_open, len(WORDS_A), 0, 'salet', 0)])
+        rows = queue.source_work_rows()
+        self.assertEqual(len(rows), 2)
+        queue.close()
+
+        output = self._run(_make_args(self.queue_path, priority=5))
+        self.assertNotIn('ambiguous', output)
+        self.assertIn('requested priority set to 5', output)
+
+        queue = ERDQueue(self.queue_path)
+        self.addCleanup(queue.close)
+        by_id = {row['source_work_id']: row['requested_priority']
+                  for row in queue.source_work_rows()}
+        self.assertEqual(by_id[done_id], 0)
+
+    def test_ambiguous_word_lists_candidate_details_and_requires_disambiguation(self):
         queue = ERDQueue(self.queue_path)
         key_a = ScoreCache.encode_subset(WORDS_A)
         key_b = ScoreCache.encode_subset(WORDS_B)
@@ -101,8 +169,12 @@ class TestQueueSourcePriority(unittest.TestCase):
 
         output = self._run(_make_args(self.queue_path, priority=5))
         self.assertIn('ambiguous', output)
+        self.assertIn('--source-work-id', output)
         for source_work_id in ids:
-            self.assertIn(str(source_work_id), output)
+            self.assertIn(f'id {source_work_id}', output)
+        self.assertIn('root(s)', output)
+        self.assertIn('branch(es)', output)
+        self.assertIn('queued', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
@@ -111,10 +183,10 @@ class TestQueueSourcePriority(unittest.TestCase):
         self.assertEqual(priorities, [0, 1])
 
         output = self._run(_make_args(self.queue_path, priority=5,
-                                       id=ids[0]))
-        self.assertIn('priority set to 5', output)
+                                       source_work_id=ids[0]))
+        self.assertIn('requested priority set to 5', output)
 
-    def test_id_disambiguates(self):
+    def test_source_work_id_disambiguates(self):
         queue = ERDQueue(self.queue_path)
         key_a = ScoreCache.encode_subset(WORDS_A)
         key_b = ScoreCache.encode_subset(WORDS_B)
@@ -126,8 +198,8 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=7,
-                                       id=target_id))
-        self.assertIn('priority set to 7', output)
+                                       source_work_id=target_id))
+        self.assertIn('requested priority set to 7', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
@@ -144,10 +216,13 @@ class TestQueueSourcePriority(unittest.TestCase):
         bogus_id = max(row['source_work_id'] for row in rows) + 1000
         queue.close()
 
-        output = self._run(_make_args(self.queue_path, id=bogus_id))
+        output = self._run(_make_args(self.queue_path,
+                                       source_work_id=bogus_id))
         self.assertIn(f'no source-work request with id {bogus_id}', output)
 
-    def test_completed_request_reported_distinctly(self):
+    def test_source_work_id_can_target_completed_request_directly(self):
+        # A completed id named explicitly is resolved (it belongs to the
+        # word) and only then reported as complete -- not "not found".
         queue = ERDQueue(self.queue_path)
         key = ScoreCache.encode_subset(WORDS_C)
         queue.add_pending_many([(key, len(WORDS_C), 0, 'salet', 0)])
@@ -156,8 +231,10 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.mark_done(key)
         queue.close()
 
-        output = self._run(_make_args(self.queue_path, priority=2))
+        output = self._run(_make_args(self.queue_path, priority=2,
+                                       source_work_id=source_work_id))
         self.assertIn('request is complete, cannot reprioritize', output)
+        self.assertNotIn('no source-work request with id', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)

@@ -351,16 +351,22 @@ changing it on an in-progress branch has no effect).
 python3.13 erd_search.py queue source-priority --word salet --priority 1
 
 # Disambiguate when the word owns more than one open request:
-python3.13 erd_search.py queue source-priority --word salet --id 7 --priority 1
+python3.13 erd_search.py queue source-priority --word salet --source-work-id 7 --priority 1
 ```
 
 Unlike `queue priority`, which changes one branch, this changes a
 source-work *request* — the whole `queue add --word salet` request that
-covers all of `salet`'s branches. The new priority takes effect immediately
-for both the request's still-pending roots and its already-active/promoted
-descendants. A word that owns more than one open source-work request is
-ambiguous; the command lists the candidate ids and `--id` picks one. A
-completed request cannot be reprioritized.
+covers all of `salet`'s branches. The new requested priority takes effect
+immediately for both the request's still-pending roots and its
+already-active/promoted descendants. A branch owned by more than one live
+request keeps the higher of their requested priorities, so lowering one
+request's priority does not necessarily lower a branch it shares with a
+higher-priority request. A word that owns more than one open source-work
+request is ambiguous; the command lists the candidate ids with enough detail
+(priority, state, root/branch counts, request time) to choose, and
+`--source-work-id` picks one — it can also name a completed request
+directly, which is reported as such. A completed request cannot be
+reprioritized.
 
 ### Remove a branch
 
