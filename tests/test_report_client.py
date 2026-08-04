@@ -670,17 +670,49 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.assertTrue(copy_button.is_visible())
         self.page.evaluate("""() => {
-          navigator.clipboard = undefined;
-          window.__copiedSpine = false;
+          Object.defineProperty(navigator, 'clipboard', {
+            configurable: true, value: undefined,
+          });
+          if (navigator.clipboard !== undefined)
+            throw new Error('clipboard stub did not take effect');
+          window.__copiedText = null;
           document.execCommand = command => {
-            window.__copiedSpine = command === 'copy';
-            return window.__copiedSpine;
+            if (command !== 'copy') return false;
+            window.__copiedText = document.activeElement.value;
+            return true;
           };
         }""")
         copy_button.click()
-        self.page.wait_for_function(
-            "() => window.__copiedSpine === true"
+        self.page.wait_for_selector(
+            "section:has-text('Reached via') button:has-text('Copied')"
         )
+        copied_text = self.page.evaluate("() => window.__copiedText")
+        self.assertEqual(copied_text, "raise -----")
+
+    def test_copy_spine_falls_back_when_clipboard_rejects(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Reached via')")
+        copy_button = self.page.locator(
+            "section:has-text('Reached via') button:has-text('Copy spine')"
+        )
+        self.page.evaluate("""() => {
+          Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: () => Promise.reject(new Error('denied')) },
+          });
+          window.__copiedText = null;
+          document.execCommand = command => {
+            if (command !== 'copy') return false;
+            window.__copiedText = document.activeElement.value;
+            return true;
+          };
+        }""")
+        copy_button.click()
+        self.page.wait_for_selector(
+            "section:has-text('Reached via') button:has-text('Copied')"
+        )
+        copied_text = self.page.evaluate("() => window.__copiedText")
+        self.assertEqual(copied_text, "raise -----")
 
     def test_branch_reference_matches_hide_filters_and_view(self):
         self.page.evaluate("""async () => {
