@@ -1,14 +1,18 @@
 """Tests for terminal rendering and refresh of shared swarm reports."""
 
+from contextlib import redirect_stdout
 from copy import deepcopy
 import io
 import json
+import os
 import shlex
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import erd_search
+from erd_queue import ERDQueue, encode_subset
 import report_terminal
 from report_model import ReportFilters, parse_report_branch_target
 from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
@@ -1245,6 +1249,73 @@ class ViewSessionTest(unittest.TestCase):
         finalizing["data"]["branches"][0]["branch_phase"] = "finalizing"
         session._update_navigation_targets(finalizing)
         self.assertEqual(session.branch_hotkeys[letter], "010203")
+
+
+class SourcesCommandEndToEndTest(unittest.TestCase):
+    """`view --sources` end to end against a real temp queue.  An earlier
+    `--sources` attempt raised TypeError on every invocation and was backed
+    out during #203 review because no test ever actually ran it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        queue = ERDQueue(self.queue_path)
+        branch_key = encode_subset(["crane", "slate"])
+        queue.add_pending_many([(branch_key, 2, 1, "slate", 0)])
+        queue.close()
+
+    def _run(self, *args):
+        output = io.StringIO()
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "--sources",
+                "--queue-path", self.queue_path,
+                "--cache-path", self.cache_path,
+                *args,
+            ]),
+            redirect_stdout(output),
+        ):
+            erd_search.main()
+        return output.getvalue()
+
+    def test_text_output_lists_the_request_and_its_branch(self):
+        text = self._run()
+        self.assertIn("SLATE", text)
+        self.assertIn("requested=1", text)
+
+    def test_json_output_round_trips_the_summary_and_rows(self):
+        report = json.loads(self._run("--format", "json"))
+        self.assertEqual(report["report_kind"], "sources")
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        self.assertEqual(report["data"]["summary"][0]["source_word"], "slate")
+        self.assertEqual(report["data"]["rows"][0]["requested_priority"], 1)
+
+    def test_jsonl_output_is_one_line(self):
+        text = self._run("--format", "jsonl")
+        lines = text.splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["report_kind"], "sources")
+
+    def test_word_filter_narrows_to_the_matching_request(self):
+        report = json.loads(self._run("slate", "--format", "json"))
+        self.assertEqual(
+            [row["source_word"] for row in report["data"]["rows"]], ["slate"]
+        )
+
+    def test_mutually_exclusive_with_other_view_kinds(self):
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "--sources", "--workers",
+                "--queue-path", self.queue_path,
+                "--cache-path", self.cache_path,
+            ]),
+            patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            erd_search.main()
+        self.assertEqual(raised.exception.code, 2)
 
 
 class ViewParserTest(unittest.TestCase):

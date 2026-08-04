@@ -29,7 +29,7 @@ from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
                        PROMOTE_MIN_SIZE, decode_subset)
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
-from erd_queue import guess_depth_from_spine
+from erd_queue import guess_depth_from_spine, SCHEDULING_ROLE_PREFERRED
 from tests.queue_invariants import SourceWorkInvariantCheckMixin
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
@@ -126,10 +126,11 @@ def _bare_worker():
 
 
 def _context(branch_key=b"branch", spine=None, source_work_id=None,
-             source_priority=0, source_word=None, source_pattern=None):
+             source_priority=0, source_word=None, source_pattern=None,
+             scheduling_role=None):
     return WorkContext(
         source_work_id, source_priority, source_word, source_pattern,
-        branch_key, spine)
+        branch_key, spine, scheduling_role)
 
 
 class TestHeartbeatThrottling(unittest.TestCase):
@@ -1463,6 +1464,97 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         finally:
             q.close()
 
+    def test_claim_one_records_fallback_role_when_preferred_source_is_held(self):
+        from erd_queue import ERDQueue, SCHEDULING_ROLE_FALLBACK
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        # crane (priority 9) is the preferred source, but its only branch is
+        # already fully held by another worker: no claimable bundle.
+        crane_key = ScoreCache.encode_subset(BRANCH[:3])
+        q.add_pending_many([(crane_key, 3, 9, "crane", 0)])
+        crane_id = q.source_work_rows()[0]["source_work_id"]
+        claimed = q.claim_next("other-worker", crane_id)
+        q.create_branch(claimed['branch_key'], claimed['n_words'], n_candidates,
+                        priority=claimed['priority'],
+                        source_word=claimed['source_word'],
+                        source_pattern=claimed['source_pattern'],
+                        source_work_id=claimed['source_work_id'])
+        q.claim_next_bundle(
+            crane_key, "other-worker", n_candidates, list(range(n_candidates)),
+            [0.0] * n_candidates, small_count=n_candidates, count_cap=n_candidates,
+            expected_source_work_id=crane_id, expected_source_priority=9)
+        # slate (priority 1) has claimable work: the only eligible fallback.
+        slate_key = ScoreCache.encode_subset(BRANCH[1:4])
+        q.add_pending_many([(slate_key, 3, 1, "slate", 0)])
+        slate_id = next(row["source_work_id"] for row in q.source_work_rows()
+                        if row["source_word"] == "slate")
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            result = w.claim_one()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result)
+        context, branch, _bundle_id, indices, _forced = result
+        self.assertEqual(branch['branch_key'], slate_key)
+        self.assertEqual(context.source_work_id, slate_id)
+        self.assertEqual(context.scheduling_role, SCHEDULING_ROLE_FALLBACK)
+        self.assertTrue(indices)
+
+    def test_claim_one_returns_to_preferred_role_once_it_is_claimable_again(self):
+        from erd_queue import (ERDQueue, SCHEDULING_ROLE_PREFERRED,
+                               SCHEDULING_ROLE_FALLBACK)
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+        crane_key = ScoreCache.encode_subset(BRANCH[:3])
+        q.add_pending_many([(crane_key, 3, 9, "crane", 0)])
+        crane_id = q.source_work_rows()[0]["source_work_id"]
+        claimed = q.claim_next("other-worker", crane_id)
+        q.create_branch(claimed['branch_key'], claimed['n_words'], n_candidates,
+                        priority=claimed['priority'],
+                        source_word=claimed['source_word'],
+                        source_pattern=claimed['source_pattern'],
+                        source_work_id=claimed['source_work_id'])
+        q.claim_next_bundle(
+            crane_key, "other-worker", n_candidates, list(range(n_candidates)),
+            [0.0] * n_candidates, small_count=n_candidates, count_cap=n_candidates,
+            expected_source_work_id=crane_id, expected_source_priority=9)
+        slate_key = ScoreCache.encode_subset(BRANCH[1:4])
+        q.add_pending_many([(slate_key, 3, 1, "slate", 0)])
+        q.close()
+
+        first = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            first_result = first.claim_one()
+        finally:
+            first.close()
+        self.assertEqual(first_result[0].scheduling_role, SCHEDULING_ROLE_FALLBACK)
+
+        # "other-worker" never heartbeat, so its held crane claims are stale:
+        # once reclaimed, crane is claimable again at the next boundary.
+        q = ERDQueue(self.queue_path)
+        q._conn.execute(
+            "UPDATE candidate_claims SET claimed_at = 0 WHERE claimed_by = ?",
+            ("other-worker",))
+        self.assertEqual(q.reclaim_stale_claims(120), n_candidates)
+        q.close()
+
+        second = _BranchWorker(1, self.cache_path, self.queue_path, None)
+        try:
+            second_result = second.claim_one()
+        finally:
+            second.close()
+
+        self.assertIsNotNone(second_result)
+        context, branch, _bundle_id, indices, _forced = second_result
+        self.assertEqual(branch['branch_key'], crane_key)
+        self.assertEqual(context.scheduling_role, SCHEDULING_ROLE_PREFERRED)
+        self.assertTrue(indices)
+
 
 class TestCooperativeSolveFullPath(unittest.TestCase):
     """cooperative_solve evaluates all candidates and returns the correct result
@@ -1533,7 +1625,8 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         w._work_context = WorkContext(
-            source_work_id, 1, "crane", 0, root_key, None)
+            source_work_id, 1, "crane", 0, root_key, None,
+            SCHEDULING_ROLE_PREFERRED)
         original_claim_bundle = w._claim_bundle
         reprioritized = False
         # A worker locked out of its own reprioritized branch never claims
