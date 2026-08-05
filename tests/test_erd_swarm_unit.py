@@ -1221,6 +1221,61 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         finally:
             w.close()
 
+    def test_solve_branch_focused_records_preferred_role_for_source_owned_branch(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH[:3])
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([(branch_key, 3, 1, "crane", 0)])
+        claimed = q.claim_next("peer")
+        q.create_branch(
+            branch_key, 3, len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=claimed["priority"], source_word=claimed["source_word"],
+            source_pattern=claimed["source_pattern"],
+            source_work_id=claimed["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        recorded = {}
+
+        def capture(*_args, **_kwargs):
+            recorded['source_work_id'] = w._work_context.source_work_id
+            recorded['scheduling_role'] = w._work_context.scheduling_role
+
+        w._solve_branch_focused_in_context = mock.MagicMock(side_effect=capture)
+        try:
+            w.solve_branch_focused(branch_key)
+            self.assertEqual(recorded['source_work_id'], claimed["source_work_id"])
+            # source_work_id is not NULL: must be preferred/fallback, never
+            # direct (check_source_work_invariants rejects that pairing).
+            self.assertEqual(recorded['scheduling_role'], "preferred")
+            self.assertEqual(w.queue.check_source_work_invariants(), [])
+        finally:
+            w.close()
+
+    def test_solve_branch_focused_records_direct_role_for_unowned_branch(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH[:3])
+        q = ERDQueue(self.queue_path)
+        q.create_branch(branch_key, 3, len(CANDIDATES), budget=ROOT_BUDGET)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        recorded = {}
+
+        def capture(*_args, **_kwargs):
+            recorded['source_work_id'] = w._work_context.source_work_id
+            recorded['scheduling_role'] = w._work_context.scheduling_role
+
+        w._solve_branch_focused_in_context = mock.MagicMock(side_effect=capture)
+        try:
+            w.solve_branch_focused(branch_key)
+            self.assertIsNone(recorded['source_work_id'])
+            self.assertEqual(recorded['scheduling_role'], "direct")
+        finally:
+            w.close()
+
     def test_claim_one_skips_fully_claimed_in_progress_branch_and_joins_next(self):
         """If the first in-progress branch has all candidates claimed, claim_one
         must continue iterating and claim a candidate from the next branch."""
@@ -1502,6 +1557,36 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], slate_key)
         self.assertEqual(context.source_work_id, slate_id)
         self.assertEqual(context.scheduling_role, SCHEDULING_ROLE_FALLBACK)
+        self.assertTrue(indices)
+
+    def test_claim_one_records_preferred_role_for_equal_priority_tiebreak_winner(self):
+        """Two sources at the SAME requested priority: source_work_candidates()
+        picks one via its tiebreak (state, then source_work_id), but neither was
+        skipped in favor of a higher-priority peer, so both are 'preferred', not
+        just the admission-order-first one."""
+        from erd_queue import ERDQueue, SCHEDULING_ROLE_PREFERRED
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        crane_key = ScoreCache.encode_subset(BRANCH[:3])
+        slate_key = ScoreCache.encode_subset(BRANCH[1:4])
+        q.add_pending_many([(crane_key, 3, 5, "crane", 0)])
+        q.add_pending_many([(slate_key, 3, 5, "slate", 0)])
+        admission_order = [row["source_word"] for row in q.source_work_candidates()]
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            result = w.claim_one()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result)
+        context, branch, _bundle_id, indices, _forced = result
+        # Whichever of the two equal-priority sources the tiebreak orders
+        # first is the one claim_one() actually claims; either way it must
+        # be reported preferred — nothing higher-priority was skipped.
+        self.assertIn(admission_order[0], ("crane", "slate"))
+        self.assertEqual(context.scheduling_role, SCHEDULING_ROLE_PREFERRED)
         self.assertTrue(indices)
 
     def test_claim_one_returns_to_preferred_role_once_it_is_claimable_again(self):
@@ -1832,6 +1917,9 @@ class TestHelpOtherBranch(unittest.TestCase):
             self.assertEqual(w._work_context.source_priority, 9)
             self.assertEqual(w._work_context.source_word, "slate")
             self.assertEqual(w._work_context.source_pattern, 42)
+            # Source-owned: fallback, regardless of which source owns it —
+            # the worker's own branch is blocked, so this is fallback work.
+            self.assertEqual(w._work_context.scheduling_role, "fallback")
             return False
 
         w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
@@ -1859,11 +1947,19 @@ class TestHelpOtherBranch(unittest.TestCase):
             self.assertEqual(w._work_context.source_priority, 9)
             self.assertEqual(w._work_context.source_word, "crane")
             self.assertEqual(w._work_context.source_pattern, 7)
+            # No live source-work ownership: direct, not fallback — no
+            # source-first admission decision was made for this branch, and
+            # source_work_id IS NULL pairs only with DIRECT
+            # (check_source_work_invariants rejects source_work_id IS NULL
+            # paired with preferred/fallback).
+            self.assertEqual(w._work_context.scheduling_role, "direct")
             return False
 
         w.evaluate_bundle = mock.MagicMock(side_effect=evaluate)
         try:
             self.assertTrue(w._help_other_branch(b"excluded"))
+            self.assertEqual(
+                w.queue.check_source_work_invariants(), [])
         finally:
             w.close()
 

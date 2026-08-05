@@ -220,6 +220,10 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("coordination hotspots cannot use a branch target")
     if request.worker_id is not None and report_kind != "workers":
         raise ValueError("worker requires a workers report")
+    if report_kind == "sources" and branch_target_kind not in ("root", "word"):
+        raise ValueError(
+            "--sources accepts only a trailing word or no branch target"
+        )
 
 
 @dataclass(frozen=True)
@@ -519,6 +523,9 @@ def _normalize_worker(row, generated_at, answer_set):
         "bound_erd": _row_value(row, "bound_erd"),
         "source_work_id": _row_value(row, "source_work_id"),
         "scheduling_role": _row_value(row, "scheduling_role"),
+        "scheduling_role_reason": scheduling_role_reason(
+            _row_value(row, "scheduling_role")
+        ),
     }
 
 

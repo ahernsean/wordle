@@ -1472,6 +1472,8 @@ class ViewParserTest(unittest.TestCase):
             ["erd_search.py", "view", "--epoch", "2"],
             ["erd_search.py", "view", "RAISE -----", "--tree", "--claims"],
             ["erd_search.py", "view", "RAISE", "--sort", "nodes"],
+            ["erd_search.py", "view", "--sources", "RAISE", "-----"],
+            ["erd_search.py", "view", "--sources", "@abcd"],
         ]
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):

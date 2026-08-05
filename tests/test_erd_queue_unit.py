@@ -1022,6 +1022,25 @@ class TestClaimNext(_TmpQueue):
         filtered = self.q.source_membership_rows(source_word="slate")
         self.assertEqual([row["source_word"] for row in filtered], ["slate"])
 
+    def test_source_membership_rows_worker_count_ignores_stale_heartbeat(self):
+        # A heartbeat row survives a crashed worker (only unregister_worker/
+        # clear remove it), so worker_count must be fenced by liveness like
+        # worker_counts_by_branch() and report_queue_rows()'s workers CTE —
+        # otherwise a dead worker's residual row would report this branch as
+        # active forever, disagreeing with the queue report's own count.
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 0)])
+        branch_id = self.q._intern_branch(self.key)
+        stale_at = int(time.time()) - 10 * 30  # far past WORKER_LIVENESS_SECONDS
+        self.q._conn.execute("""
+            INSERT INTO worker_heartbeat
+                (worker_id, pid, current_branch_id, updated_at)
+            VALUES ('dead-worker', 1, ?, ?)
+        """, (branch_id, stale_at))
+
+        self.assertEqual(self.q.source_membership_rows()[0]["worker_count"], 0)
+        self.q._conn.execute(
+            "DELETE FROM worker_heartbeat WHERE worker_id = 'dead-worker'")
+
     def test_source_membership_rows_excludes_resolved_by_default(self):
         # A pending root discovered to already be cache-reusable is marked
         # done without ever being promoted to an active branch (the

@@ -87,12 +87,15 @@ SOURCE_PRIORITY_MIN = 0
 SOURCE_PRIORITY_MAX = 999
 
 # A worker's scheduling role, recorded alongside its heartbeat so a report can
-# explain why the worker is running the branch it is on: PREFERRED is the
-# highest-priority eligible source at the claim boundary that selected it,
-# FALLBACK is a lower-priority eligible source claimed because the preferred
-# source(s) had no claimable bundle, and DIRECT is a branch with no live
-# source-work ownership (legacy provenance, or a branch targeted outside
-# normal source-first admission).
+# explain why the worker is running the branch it is on: PREFERRED is a
+# highest-requested-priority eligible source at the claim boundary that
+# selected it (ties at the top priority all count as preferred — none of them
+# was skipped in favor of another), FALLBACK is a strictly-lower-priority
+# eligible source claimed because every higher-priority source had no
+# claimable bundle, and DIRECT is a branch with no live source-work ownership
+# (legacy provenance).  Role is a function of ownership and admission order
+# alone, never of how a branch was reached — a branch with a live owner is
+# always PREFERRED or FALLBACK, one without is always DIRECT.
 SCHEDULING_ROLE_PREFERRED = "preferred"
 SCHEDULING_ROLE_FALLBACK = "fallback"
 SCHEDULING_ROLE_DIRECT = "direct"
@@ -277,9 +280,9 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     node_rate          REAL,        -- nodes/sec since last heartbeat
     cur_path           TEXT,        -- live recursion spine: subset sizes by depth
     source_work_id     INTEGER,     -- source_work(source_work_id) selected at the
-                                     -- last claim boundary; NULL if none was selected
+                                    -- last claim boundary; NULL if none was selected
     scheduling_role    TEXT         -- one of SCHEDULING_ROLES; NULL if source_work_id
-                                     -- is NULL
+                                    -- is NULL
 );
 
 CREATE TABLE IF NOT EXISTS run_meta (
@@ -4106,6 +4109,7 @@ class ERDQueue:
             clauses.append("source.source_word = ?")
             params.append(source_word)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        live_since = int(time.time()) - WORKER_LIVENESS_SECONDS
         return self._conn.execute(f"""
             SELECT membership.source_work_id,
                    source.source_word,
@@ -4124,8 +4128,14 @@ class ERDQueue:
                          WHERE branch_id = membership.branch_id),
                        active.priority, pending.priority
                    ) AS branch_priority,
+                   -- Fenced by heartbeat liveness like worker_counts_by_branch()
+                   -- and report_queue_rows()'s workers CTE: a heartbeat row
+                   -- survives a crashed worker (only unregister_worker/clear
+                   -- remove it), so an unfenced count would keep reporting a
+                   -- dead worker's branch as active forever.
                    (SELECT COUNT(*) FROM worker_heartbeat h
-                     WHERE h.current_branch_id = membership.branch_id) AS worker_count
+                     WHERE h.current_branch_id = membership.branch_id
+                       AND h.updated_at >= ?) AS worker_count
             FROM branch_source_work AS membership
             JOIN source_work AS source
               ON source.source_work_id = membership.source_work_id
@@ -4139,7 +4149,7 @@ class ERDQueue:
             {where}
             ORDER BY source.requested_priority DESC, membership.source_work_id,
                      membership.branch_id
-        """, params).fetchall()
+        """, [live_since, *params]).fetchall()
 
     def check_source_work_invariants(self) -> list[str]:
         """Return human-readable violations of source scheduling invariants."""

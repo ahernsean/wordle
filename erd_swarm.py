@@ -1652,10 +1652,13 @@ class _BranchWorker:
             bundle_id, indices, forced = claim
             budget = self._branch_budget(branch)
             # Reached only because the worker's own branch is blocked on a
-            # dependency: draining any other claimable branch instead of
-            # idling is fallback work by construction, regardless of which
-            # source owns it.
-            context = WorkContext.from_branch_row(branch, SCHEDULING_ROLE_FALLBACK)
+            # dependency: draining any other claimable source-owned branch
+            # instead of idling is fallback work, regardless of which source
+            # owns it.  A direct branch (no live source-work ownership) stays
+            # direct — no source-first admission decision was made for it.
+            role = (SCHEDULING_ROLE_FALLBACK if source_work_id is not None
+                   else SCHEDULING_ROLE_DIRECT)
+            context = WorkContext.from_branch_row(branch, role)
             with self._entered(context):
                 if self.evaluate_bundle(other_key, words, branch['n_words'],
                                         bundle_id, indices, forced, budget=budget):
@@ -1978,13 +1981,18 @@ class _BranchWorker:
             self._source_work_enabled = self.queue.has_source_work()
         source_work_rows = (self.queue.source_work_candidates()
                             if self._source_work_enabled else ())
-        for source_index, source_work in enumerate(source_work_rows):
+        top_priority = (source_work_rows[0]['requested_priority']
+                        if source_work_rows else None)
+        for source_work in source_work_rows:
             source_work_id = source_work['source_work_id']
-            # source_work_candidates() is source-first admission order, so the
-            # first entry with claimable work is the preferred source; any
-            # later one is reached only because every source ahead of it had
-            # no claimable bundle at this claim boundary.
-            role = (SCHEDULING_ROLE_PREFERRED if source_index == 0
+            # source_work_candidates() is source-first admission order
+            # (requested_priority DESC), so every entry tied with the top
+            # requested priority is preferred — none of them was skipped in
+            # favor of another; an entry strictly below it is reached only
+            # because every higher-priority source had no claimable bundle at
+            # this claim boundary, whether or not IT had claimable work.
+            role = (SCHEDULING_ROLE_PREFERRED
+                   if source_work['requested_priority'] == top_priority
                    else SCHEDULING_ROLE_FALLBACK)
             active_work = self._claim_active_branch(
                 self.queue.branches_in_progress(source_work_id), source_work_id,
@@ -2097,9 +2105,14 @@ class _BranchWorker:
         if branch_row is None:
             return
         branch = dict(branch_row)
-        # Targets a specific branch directly, bypassing source-first admission
-        # entirely, so no preferred/fallback selection was made.
-        context = WorkContext.from_branch_row(branch, SCHEDULING_ROLE_DIRECT)
+        # Bypasses source-first admission entirely — this targets one branch
+        # directly rather than selecting among eligible sources — but role
+        # still tracks live ownership: a source-owned branch is never DIRECT
+        # (that would misreport it as unowned), so treat direct targeting of
+        # already-owned work as preferred.
+        role = (SCHEDULING_ROLE_PREFERRED if branch['source_work_id'] is not None
+               else SCHEDULING_ROLE_DIRECT)
+        context = WorkContext.from_branch_row(branch, role)
         with self._entered(context):
             self._solve_branch_focused_in_context(branch)
 
