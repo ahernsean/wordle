@@ -1169,7 +1169,7 @@ class TestCostModel(_TmpQueue):
         # Branch/bundle attribution and the phase breakdown are all optional
         # keyword arguments: an old-style positional-only call still inserts
         # a row, with every new column defaulting to NULL/0.
-        self.assertIsNone(row['branch_key'])
+        self.assertIsNone(row['branch_id'])
         self.assertIsNone(row['spine'])
         self.assertIsNone(row['worker_id'])
         self.assertIsNone(row['bundle_id'])
@@ -1182,6 +1182,11 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(row['idle_millis'], 5000)
 
     def test_add_claim_telemetry_carries_branch_attribution(self):
+        # A claim's branch has always been through create_branch (registering
+        # it in `branches`) by the time any candidate is evaluated against
+        # it, which is what makes add_claim_telemetry's branch_key -> branch_id
+        # interning a lookup rather than a fresh registration.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
         self.q.add_claim_telemetry(
             10, 5000, 300, 4, branch_key=self.key, spine='CRANE 12',
             worker_id='worker-3', bundle_id='worker-3:123:0', idx=7,
@@ -1189,7 +1194,11 @@ class TestCostModel(_TmpQueue):
         row = self.q._conn.execute(
             "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        self.assertEqual(row['branch_key'], self.key)
+        self.assertIsNotNone(row['branch_id'])
+        resolved = self.q._conn.execute(
+            "SELECT branch_key FROM branches WHERE branch_id = ?",
+            (row['branch_id'],)).fetchone()
+        self.assertEqual(resolved['branch_key'], self.key)
         self.assertEqual(row['spine'], 'CRANE 12')
         self.assertEqual(row['worker_id'], 'worker-3')
         self.assertEqual(row['bundle_id'], 'worker-3:123:0')

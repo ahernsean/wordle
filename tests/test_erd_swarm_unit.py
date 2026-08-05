@@ -977,7 +977,7 @@ class TestSolveBranchFocusedMultiBundleDrain(unittest.TestCase):
 
 class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
     """solve_branch_focused's claim_telemetry rows carry branch/bundle
-    attribution end to end (issue #197): branch_key, spine, and worker_id are
+    attribution end to end (issue #197): branch_id, spine, and worker_id are
     populated, and idx falls within [bundle_start_idx, bundle_end_idx] for a
     bundle claim.  This is the only path today that exercises the full
     evaluate_claim -> add_claim_telemetry write path, so it is what catches a
@@ -1018,15 +1018,21 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
 
         q = ERDQueue(self.queue_path)
         rows = q._conn.execute(
-            "SELECT branch_key, spine, worker_id, bundle_id, idx, "
+            "SELECT branch_id, spine, worker_id, bundle_id, idx, "
             "bundle_start_idx, bundle_end_idx FROM claim_telemetry "
             "ORDER BY id").fetchall()
+        # branch_id is the branches-registry surrogate, not the raw
+        # branch_key: resolve it back to confirm the row actually points at
+        # the branch this worker solved, not just some non-NULL id.
+        expected_branch_id = q._conn.execute(
+            "SELECT branch_id FROM branches WHERE branch_key = ?",
+            (branch_key,)).fetchone()["branch_id"]
         q.close()
         self.assertTrue(rows)
         # Every row is a candidate evaluation -- the finalize does not write
         # here -- so all of them carry full branch and bundle attribution.
         for row in rows:
-            self.assertEqual(row["branch_key"], branch_key)
+            self.assertEqual(row["branch_id"], expected_branch_id)
             self.assertEqual(row["spine"], "CRANE -----")
             self.assertEqual(row["worker_id"], "worker-1")
             self.assertIsNotNone(row["bundle_id"])
@@ -1156,9 +1162,13 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
         finalize_rows = q._conn.execute(
             "SELECT branch_key, cache_write_millis FROM branch_finalize_log "
             "ORDER BY id").fetchall()
+        # claim_telemetry stores branch_id, not branch_key -- resolve it back
+        # through the branches registry so the rest of this test can compare
+        # against branch1_key/branch2_key like the finalize-log rows above.
         claim_rows = q._conn.execute(
-            "SELECT branch_key, coordination_millis FROM claim_telemetry "
-            "ORDER BY id").fetchall()
+            "SELECT b.branch_key AS branch_key, t.coordination_millis "
+            "FROM claim_telemetry t JOIN branches b ON t.branch_id = b.branch_id "
+            "ORDER BY t.id").fetchall()
         q.close()
 
         # The slowed finalize is billed to branch1's own finalize row.

@@ -487,9 +487,17 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- Never read by any runtime control path; freely droppable.  busy_wait_millis is
 -- the wall time spent acquiring the claim's write lock (the direct contention
 -- signal); claim_retries counts application-level BEGIN IMMEDIATE retries.
--- branch_key/spine attribute a row to the branch its claim belonged to (bulk
--- lower-bound proofs and other branch-less callers leave both NULL);
--- worker_id/bundle_id/idx identify which worker evaluated which candidate,
+-- branch_id/spine attribute a row to the branch its claim belonged to (bulk
+-- lower-bound proofs and other branch-less callers leave both NULL).
+-- branch_id is the branches registry surrogate (see _intern_branch), not the
+-- branch_key BLOB itself: the registry is append-only, so a branch_id stays
+-- resolvable to its branch_key/word-list forever, even long after the branch
+-- itself is finalized and deleted from active_branches.  Resolving it back
+-- means joining against branches, which lives in the main queue file, not
+-- this attached one — cross-file for a live ERDQueue (branches is already
+-- attached on the same connection); an explicit ATTACH when querying the
+-- telemetry file standalone.  worker_id/bundle_id/idx identify which worker
+-- evaluated which candidate,
 -- with bundle_start_idx/bundle_end_idx the claiming bundle's full index range
 -- (bundle_id and both range columns are NULL for a claim taken outside a
 -- bundle).  claim_transaction_millis + claim_commit_millis split
@@ -518,7 +526,7 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     claim_retries             INTEGER,
     busy_wait_millis          INTEGER,
     worker_count              INTEGER,
-    branch_key                BLOB,
+    branch_id                 INTEGER,
     spine                     TEXT,
     worker_id                 TEXT,
     bundle_id                 TEXT,
@@ -935,7 +943,7 @@ class ERDQueue:
         # lands on branch_finalize_log, since it belongs to a branch rather
         # than to any single claim.
         self._add_columns("claim_telemetry", {
-            "branch_key": "BLOB",
+            "branch_id": "INTEGER",
             "spine": "TEXT",
             "worker_id": "TEXT",
             "bundle_id": "TEXT",
@@ -969,9 +977,9 @@ class ERDQueue:
             ("claim_telemetry", {"epoch", "recorded_at", "id"},
              "idx_claim_telemetry_epoch_recorded_id",
              "epoch, recorded_at DESC, id DESC"),
-            ("claim_telemetry", {"branch_key", "recorded_at"},
+            ("claim_telemetry", {"branch_id", "recorded_at"},
              "idx_claim_telemetry_branch_recorded_at",
-             "branch_key, recorded_at"),
+             "branch_id, recorded_at"),
         )
         for table, required_columns, index_name, indexed_columns in report_indexes:
             columns = {row["name"] for row in self._conn.execute(
@@ -4367,9 +4375,18 @@ class ERDQueue:
         transaction-phase signal; the row is stamped with the active epoch.
 
         branch_key/spine attribute this row to the branch the claim belonged
-        to; worker_id/bundle_id/idx/bundle_start_idx/bundle_end_idx identify
-        which worker evaluated which candidate of which bundle (all default
-        to NULL for a caller with no branch/bundle context).
+        to.  branch_key is interned to its branches-registry branch_id before
+        storage (see _intern_branch) rather than stored as the raw BLOB: the
+        registry already carries the durable branch_key <-> branch_id mapping
+        for every branch that has ever been created, so duplicating the BLOB
+        onto every one of a branch's candidate rows would be pure size with
+        no independent information — a size difference that matters here,
+        since this is the highest-volume table in the schema.  A caller with
+        no branch context passes branch_key=None, which stores branch_id
+        NULL, not 0 or an interned NULL-key row.  worker_id/bundle_id/idx/
+        bundle_start_idx/bundle_end_idx identify which worker evaluated which
+        candidate of which bundle (all default to NULL for a caller with no
+        branch/bundle context).
         scheduling_millis is the caller's work-selection scan for this claim
         (source-work ordering, pending promotion, joining an in-progress
         branch), already net of any lock wait and claim transaction it
@@ -4394,6 +4411,8 @@ class ERDQueue:
         unrelated bundle member logs telemetry next.
         """
         now = int(time.time())
+        branch_id = (None if branch_key is None
+                    else self._intern_branch(branch_key))
         idle_millis = max(0, coordination_millis
                           - self._last_claim_transaction_millis
                           - self._last_claim_commit_millis
@@ -4402,13 +4421,13 @@ class ERDQueue:
         self._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, work_nodes, claim_retries,
-                 busy_wait_millis, worker_count, branch_key, spine, worker_id,
+                 busy_wait_millis, worker_count, branch_id, spine, worker_id,
                  bundle_id, idx, bundle_start_idx, bundle_end_idx,
                  claim_transaction_millis, claim_commit_millis,
                  scheduling_millis, idle_millis, epoch, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, work_nodes, self._last_claim_retries,
-              self._last_claim_busy_millis, worker_count, branch_key, spine,
+              self._last_claim_busy_millis, worker_count, branch_id, spine,
               worker_id, bundle_id, idx, bundle_start_idx, bundle_end_idx,
               self._last_claim_transaction_millis, self._last_claim_commit_millis,
               scheduling_millis, idle_millis, self.epoch, now))

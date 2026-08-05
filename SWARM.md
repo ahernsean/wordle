@@ -229,12 +229,25 @@ cutover; restart every worker immediately afterward.
 ### Branch-attributed claim telemetry
 
 `telemetry.claim_telemetry` (in the attached telemetry file, see "Schema
-coordination" in AGENTS.md) carries a `branch_key`/`spine`, `worker_id`,
+coordination" in AGENTS.md) carries a `branch_id`/`spine`, `worker_id`,
 `bundle_id`, and `idx` (with `bundle_start_idx`/`bundle_end_idx`) on every
 row, so a slow branch's coordination cost can be attributed to it directly
-instead of only to its `n_words`/epoch bucket — query
-`WHERE branch_key = ?` (an index exists for this) or `WHERE spine LIKE ...`
-against the telemetry file.  `coordination_millis` is also partitioned into
+instead of only to its `n_words`/epoch bucket. `branch_id` is the
+`branches` registry surrogate (`_intern_branch`), not the raw `branch_key`
+BLOB — at this table's row volume the BLOB would roughly double the bytes
+per row, most of it a repeat of what the registry already carries. The
+registry is append-only, so a `branch_id` here resolves back to its
+`branch_key`/word-list indefinitely, including long after the branch
+itself is finalized and its `active_branches` row is gone: `SELECT
+branch_key FROM branches WHERE branch_id = ?`. `branches` lives in the
+*main* queue file, though, not this attached telemetry one — a live
+`ERDQueue` already has both open on one connection, so `WHERE branch_id =
+?` (an index exists for this) or a join against `branches` works directly;
+querying the telemetry file standalone (e.g. the `sqlite3` CLI) needs an
+explicit `ATTACH 'erd_queue.sqlite3' AS q` first, then join against
+`q.branches`. Query `WHERE spine LIKE ...` needs no such join, since
+`spine` is small enough to carry directly on each row.
+`coordination_millis` is also partitioned into
 `claim_transaction_millis` (claim-scan and write, inside
 `claim_next_bundle`'s transaction) + `claim_commit_millis` (its `COMMIT`) +
 `busy_wait_millis` (write-lock wait, across every claim path taken while
@@ -264,8 +277,12 @@ Every row is one candidate evaluation, so `COUNT(*)` is a claim count. The
 finalize phase is deliberately *not* here: it belongs to a branch rather
 than to any single claim, and is recorded once per branch as
 `branch_finalize_log.cache_write_millis` (the score-cache/loss/cut writes
-and the cost-model fold). Join the two tables on `branch_key` for a
-branch's full coordination picture.
+and the cost-model fold). `branch_finalize_log` carries the raw `branch_key`
+directly (one row per branch, not per claim, so the BLOB there costs far
+less) while `claim_telemetry` carries `branch_id`; join the two for a
+branch's full coordination picture through `branches`: `claim_telemetry.
+branch_id = branches.branch_id AND branches.branch_key =
+branch_finalize_log.branch_key`.
 
 The bucketed rollup of this table is exposed as `erd_search.py view --by
 coordination` (aggregated by `n_words`/`worker_count`); the per-row branch
