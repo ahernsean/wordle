@@ -392,6 +392,30 @@ are fenced by the active telemetry epoch (`erd_search.py epoch show`).
 
 ---
 
+## How to interact with GitHub
+
+### Creating a PR
+
+When you create a PR, make sure that the title and body are always up to date
+and reflect all committed changes. Whenever you push additional commits, check
+again that the title and body are reflective of all the work.
+
+If you have the ability to subscribe to GitHub events, do so and monitor the PR
+for comments and activities. If you see CI failures, diagnose and push changes.
+
+### Reviewing a PR
+
+If you are asked to review a PR, post your findings (negative and/or positive)
+as comments on the PR, either to the PR general discussion or (better) inline
+comments anchored to specific files and line numbers. Post your testing methods
+along with your findings. If you have recommendations about how to fix the
+problems you find, provide those as well.
+
+If you have the ability to subscribe to GitHub events, do so and monitor the PR
+for new changes. If you discover new commits, review the PR again, following
+the above instructions about posting your findings.
+
+
 ## Claude token usage
 
 If you are a Claude agent, check remaining token budget and reset time, run:
