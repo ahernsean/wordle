@@ -334,9 +334,7 @@ dashes) for patterns that start with a gray position to avoid the shell/argparse
 leading-dash trap (e.g. `--pattern .....` for all-gray, `--pattern =-y-g-` or
 `--pattern=.y.g.`).
 
-Priority values: 0 = default; 1 = high; use 0–999 for normal work.  The swarm
-internally uses 1,000,000 for promoted sub-branches so they always drain before
-fresh top-level branches.
+Priority values: 0 = default; 1 = high; use 0–999 for normal work.
 
 ### Change priority
 
@@ -346,6 +344,29 @@ python3.13 erd_search.py queue priority --word salet --pattern ..... --priority 
 
 Only affects branches with status `pending` (priority is read at claim time, so
 changing it on an in-progress branch has no effect).
+
+### Change a source-work request's priority
+
+```bash
+python3.13 erd_search.py queue source-priority --word salet --priority 1
+
+# Disambiguate when the word owns more than one open request:
+python3.13 erd_search.py queue source-priority --word salet --source-work-id 7 --priority 1
+```
+
+Unlike `queue priority`, which changes one branch, this changes a
+source-work *request* — the whole `queue add --word salet` request that
+covers all of `salet`'s branches. The new requested priority takes effect
+immediately for both the request's still-pending roots and its
+already-active/promoted descendants. A branch owned by more than one live
+request keeps the higher of their requested priorities, so lowering one
+request's priority does not necessarily lower a branch it shares with a
+higher-priority request. A word that owns more than one open source-work
+request is ambiguous; the command lists the candidate ids with enough detail
+(priority, state, root/branch counts, request time) to choose, and
+`--source-work-id` picks one — it can also name a completed request
+directly, which is reported as such. A completed request cannot be
+reprioritized.
 
 ### Remove a branch
 

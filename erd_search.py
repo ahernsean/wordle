@@ -39,6 +39,11 @@ queue remove    Remove a pending branch from the queue.  Use --force to also
 queue priority  Change the priority of a queued branch.  Higher numbers are
                 worked sooner; 0 is the default.
 
+queue source-priority
+                Change the requested priority of a source-work request by
+                word.  Takes effect immediately for both its pending roots
+                and its active/promoted descendants.
+
 epoch           Show or change the telemetry epoch used to compare swarm
                 telemetry from one claiming regime.
 
@@ -88,6 +93,7 @@ from erd_queue import (
     DISK_STOP_FRACTION,
     ERDQueue,
     QUEUE_WAL_HARD_CEILING_BYTES,
+    check_source_priority_range,
     disk_stats,
     encode_subset,
 )
@@ -354,10 +360,9 @@ def cmd_queue_remove(args):
 def cmd_queue_priority(args):
     """Set the priority of a queued branch.
 
-    Priority is an integer; higher numbers are worked sooner.  The internal
-    swarm uses priority 1,000,000 for cooperative sub-branches so they always
-    drain before fresh top-level branches.  User-settable values in the range
-    0–999 are reserved for normal use: 0 = default, higher = sooner.
+    Priority is an integer; higher numbers are worked sooner.  User-settable
+    values in the range 0–999 are reserved for normal use: 0 = default,
+    higher = sooner.
     """
     from wordle_ui import parse_pattern, fmt_pattern
 
@@ -385,6 +390,86 @@ def cmd_queue_priority(args):
         print(f'{word.upper()} {pat}: priority set to {args.priority}.')
     else:
         print(f'{word.upper()} {pat}: not found in pending queue.')
+
+
+# ---------------------------------------------------------------------------
+# queue source-priority
+# ---------------------------------------------------------------------------
+
+def cmd_queue_source_priority(args):
+    """Set the requested priority of a source-work request, by word.
+
+    Resolves the word to an open (non-complete) source_work_id via
+    ERDQueue.source_work_candidates() and defers to
+    ERDQueue.set_source_work_priority(), which applies the change to both the
+    request's pending roots and its active/promoted descendants in one
+    transaction.  A branch owned by more than one live request keeps the
+    higher of their requested priorities (MAX(owner_priority) at the branch
+    level), so lowering one request's priority does not necessarily lower a
+    branch it shares with a higher-priority request.
+
+    A word with more than one open request is ambiguous; --source-work-id
+    picks one.  --source-work-id may also name a completed request directly,
+    which is reported as such rather than as "not found".  A word whose
+    requests are all complete is reported distinctly from a word with none.
+    """
+    word = args.word.strip().lower()
+
+    try:
+        check_source_priority_range(args.priority)
+    except ValueError as error:
+        print(error)
+        return
+
+    queue = ERDQueue(args.queue)
+    try:
+        all_rows = {row['source_work_id']: row
+                    for row in queue.source_work_rows()
+                    if row['source_word'] == word}
+
+        if args.source_work_id is not None:
+            if args.source_work_id not in all_rows:
+                print(f'{word.upper()}: no source-work request with id '
+                      f'{args.source_work_id}.')
+                return
+            source_work_id = args.source_work_id
+        else:
+            open_ids = [row['source_work_id']
+                        for row in queue.source_work_candidates()
+                        if row['source_word'] == word]
+            if not open_ids:
+                if all_rows:
+                    print(f'{word.upper()}: all {len(all_rows)} '
+                          f'source-work request(s) are complete.')
+                else:
+                    print(f'{word.upper()}: no source-work request found.')
+                return
+            if len(open_ids) > 1:
+                print(f'{word.upper()}: ambiguous, {len(open_ids)} open '
+                      f'source-work requests match.  '
+                      f'Use --source-work-id to disambiguate.')
+                for candidate_id in sorted(open_ids):
+                    row = all_rows[candidate_id]
+                    requested_at = datetime.fromtimestamp(
+                        row['requested_at']).strftime('%Y-%m-%d %H:%M')
+                    print(f'  id {candidate_id}  '
+                          f'priority {row["requested_priority"]}  '
+                          f'{row["state"]}  {row["root_count"]} root(s), '
+                          f'{row["branch_count"]} branch(es)  '
+                          f'requested {requested_at}')
+                return
+            source_work_id = open_ids[0]
+
+        updated = queue.set_source_work_priority(source_work_id, args.priority)
+    finally:
+        queue.close()
+
+    if updated:
+        print(f'{word.upper()} (id {source_work_id}): '
+              f'requested priority set to {args.priority}.')
+    else:
+        print(f'{word.upper()} (id {source_work_id}): '
+              f'request is complete, cannot reprioritize.')
 
 
 # ---------------------------------------------------------------------------
@@ -1093,6 +1178,19 @@ def main():
     p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
+    # -- queue source-priority --
+    p_qsp = qsub.add_parser(
+        'source-priority',
+        help='Set the requested priority of a source-work request')
+    p_qsp.add_argument('--word', required=True, metavar='WORD')
+    p_qsp.add_argument('--priority', required=True, type=int, metavar='N',
+                       help='New requested priority (higher = worked sooner; '
+                            'use values 0–999)')
+    p_qsp.add_argument('--source-work-id', type=int, default=None, metavar='N',
+                       help='source_work_id to disambiguate, when --word '
+                            'owns more than one open request')
+    p_qsp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+
     # -- start --
     p_start = sub.add_parser(
         'start',
@@ -1238,6 +1336,7 @@ def main():
             'clear': cmd_queue_clear,
             'remove': cmd_queue_remove,
             'priority': cmd_queue_priority,
+            'source-priority': cmd_queue_source_priority,
             'reset-stale': cmd_reset_stale,
             'clear-disk-stop': cmd_queue_clear_disk_stop,
             'set-disk-stop': cmd_queue_set_disk_stop,
