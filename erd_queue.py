@@ -487,16 +487,58 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- Never read by any runtime control path; freely droppable.  busy_wait_millis is
 -- the wall time spent acquiring the claim's write lock (the direct contention
 -- signal); claim_retries counts application-level BEGIN IMMEDIATE retries.
+-- branch_id/spine attribute a row to the branch its claim belonged to (bulk
+-- lower-bound proofs and other branch-less callers leave both NULL).
+-- branch_id is the branches registry surrogate (see _intern_branch), not the
+-- branch_key BLOB itself: the registry is append-only, so a branch_id stays
+-- resolvable to its branch_key/word-list forever, even long after the branch
+-- itself is finalized and deleted from active_branches.  Resolving it back
+-- means joining against branches, which lives in the main queue file, not
+-- this attached one — cross-file for a live ERDQueue (branches is already
+-- attached on the same connection); an explicit ATTACH when querying the
+-- telemetry file standalone.  worker_id/bundle_id/idx identify which worker
+-- evaluated which candidate,
+-- with bundle_start_idx/bundle_end_idx the claiming bundle's full index range
+-- (bundle_id and both range columns are NULL for a claim taken outside a
+-- bundle).  claim_transaction_millis + claim_commit_millis split
+-- coordination_millis's claim-handout portion into the scan/write phase and
+-- the COMMIT itself; busy_wait_millis is the write-lock wait across the claim
+-- paths taken while coordinating; scheduling_millis is the work-selection scan
+-- that chose this branch (source-work ordering, pending promotion, joining an
+-- in-progress branch) excluding the phases already counted; idle_millis is
+-- what is left over.  Those five partition coordination_millis exactly, and
+-- idle_millis means genuinely unaccounted wait -- scheduling work is called
+-- out separately so a large idle_millis cannot be misread as starved workers
+-- when it is really scan cost.  All five span time BETWEEN candidate
+-- evaluations, which is what coordination_millis covers: queue work done
+-- during a candidate's own evaluation (sub-branch promotion taking the write
+-- lock) sits inside the evaluation span that coordination_millis excludes and
+-- is deliberately not counted, since counting it would make the parts exceed
+-- the whole.  Every row here is one candidate evaluation:
+-- finalize cost is NOT recorded here (it belongs to a branch, not to any
+-- claim, and lands on branch_finalize_log.cache_write_millis instead) so
+-- COUNT(*) over this table is a true claim count.
 CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    n_words             INTEGER NOT NULL,
-    coordination_millis INTEGER NOT NULL,
-    work_nodes          INTEGER NOT NULL,
-    claim_retries      INTEGER,
-    busy_wait_millis   INTEGER,
-    worker_count       INTEGER,
-    epoch              INTEGER NOT NULL DEFAULT 0,
-    recorded_at        INTEGER NOT NULL
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    n_words                   INTEGER NOT NULL,
+    coordination_millis       INTEGER NOT NULL,
+    work_nodes                INTEGER NOT NULL,
+    claim_retries             INTEGER,
+    busy_wait_millis          INTEGER,
+    worker_count              INTEGER,
+    branch_id                 INTEGER,
+    spine                     TEXT,
+    worker_id                 TEXT,
+    bundle_id                 TEXT,
+    idx                       INTEGER,
+    bundle_start_idx          INTEGER,
+    bundle_end_idx            INTEGER,
+    claim_transaction_millis  INTEGER,
+    claim_commit_millis       INTEGER,
+    scheduling_millis         INTEGER,
+    idle_millis               INTEGER,
+    epoch                     INTEGER NOT NULL DEFAULT 0,
+    recorded_at               INTEGER NOT NULL
 );
 
 -- Durable per-branch timing/cost record, written at finalize BEFORE delete_branch
@@ -535,6 +577,13 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     -- row predates these columns or when the outcome was not an exact solve.
     best_guess              TEXT,
     best_erd                REAL,
+    -- Wall time this worker spent publishing the branch's result once it won
+    -- the finalize: the score-cache/loss/cut writes and the cost-model fold.
+    -- The finalize phase of the issue-197 coordination breakdown, recorded per
+    -- branch because it belongs to the branch, not to any one claim.  Covers
+    -- the publish work only, since the row carrying it is written immediately
+    -- after (a row cannot time its own insert or the queue cleanup past it).
+    cache_write_millis      INTEGER,
     recorded_at             INTEGER NOT NULL
 );
 
@@ -675,6 +724,8 @@ class ERDQueue:
         # the next add_claim_telemetry without changing claim_* return shapes.
         self._last_claim_busy_millis = 0
         self._last_claim_retries = 0
+        self._last_claim_transaction_millis = 0
+        self._last_claim_commit_millis = 0
         # Monotonic per-connection counter for bundle_id generation: paired
         # with worker_id and this process's pid, it is unique without a
         # timestamp-collision risk (two bundles claimed by the same worker
@@ -885,6 +936,29 @@ class ERDQueue:
             "best_erd": "REAL",
         }, schema="telemetry")
 
+        # Branch-attributed claim telemetry and coordination phase breakdown
+        # (issue #197): additive/nullable, so an existing row simply keeps
+        # NULL in every new column — it predates per-branch attribution and
+        # the phase split, not an attribution failure.  The finalize phase
+        # lands on branch_finalize_log, since it belongs to a branch rather
+        # than to any single claim.
+        self._add_columns("claim_telemetry", {
+            "branch_id": "INTEGER",
+            "spine": "TEXT",
+            "worker_id": "TEXT",
+            "bundle_id": "TEXT",
+            "idx": "INTEGER",
+            "bundle_start_idx": "INTEGER",
+            "bundle_end_idx": "INTEGER",
+            "claim_transaction_millis": "INTEGER",
+            "claim_commit_millis": "INTEGER",
+            "scheduling_millis": "INTEGER",
+            "idle_millis": "INTEGER",
+        }, schema="telemetry")
+        self._add_columns("branch_finalize_log", {
+            "cache_write_millis": "INTEGER",
+        }, schema="telemetry")
+
         report_indexes = (
             ("branch_finalize_log", {"branch_key", "recorded_at"},
              "idx_branch_finalize_log_branch_recorded_at",
@@ -903,6 +977,9 @@ class ERDQueue:
             ("claim_telemetry", {"epoch", "recorded_at", "id"},
              "idx_claim_telemetry_epoch_recorded_id",
              "epoch, recorded_at DESC, id DESC"),
+            ("claim_telemetry", {"branch_id", "recorded_at"},
+             "idx_claim_telemetry_branch_recorded_at",
+             "branch_id, recorded_at"),
         )
         for table, required_columns, index_name, indexed_columns in report_indexes:
             columns = {row["name"] for row in self._conn.execute(
@@ -1515,7 +1592,7 @@ class ERDQueue:
         'pending' row before either marks it 'in_progress'.  Under contention
         the loser blocks and retries automatically via sqlite3_busy_timeout.
         """
-        self._conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate_timed()
         try:
             if source_work_id is None:
                 source_rows = self.source_work_candidates()
@@ -1881,6 +1958,45 @@ class ERDQueue:
             "SELECT * FROM active_branches WHERE branch_id = ?",
             (branch_id,)).fetchone()
 
+    def _begin_immediate_timed(self):
+        """BEGIN IMMEDIATE, adding the wait for the write lock to
+        _last_claim_busy_millis.
+
+        For the write paths that let SQLite's own busy_timeout do the waiting
+        rather than running claim_next_bundle's application-level retry probe:
+        the wait is the same contention signal either way, so it belongs in
+        the same accumulator.  Those paths make no application-level retries,
+        so they leave claim_retries alone.
+
+        Only for locks taken while the worker is coordinating between
+        candidates.  A lock taken during candidate evaluation (sub-branch
+        promotion, e.g. attach_branch_source_work) must NOT use this: that
+        time sits inside the evaluation span which evaluate_claim subtracts
+        from coordination_millis, so counting it would push the phase parts
+        above the whole they are supposed to partition.
+        """
+        _acquire_t0 = time.perf_counter()
+        self._conn.execute("BEGIN IMMEDIATE")
+        self._last_claim_busy_millis += int(
+            (time.perf_counter() - _acquire_t0) * 1e3)
+
+    def _commit_claim_transaction(self, txn_t0):
+        """COMMIT a claim_next_bundle transaction, timing scan/write vs COMMIT.
+
+        txn_t0 is a time.perf_counter() reading taken right after the write
+        lock was acquired (BEGIN IMMEDIATE succeeded).  Populates
+        _last_claim_transaction_millis (scan and write statements before this
+        call) and _last_claim_commit_millis (the COMMIT itself), consumed and
+        reset by the next add_claim_telemetry the same way as
+        _last_claim_busy_millis/_last_claim_retries.
+        """
+        self._last_claim_transaction_millis = int(
+            (time.perf_counter() - txn_t0) * 1e3)
+        _commit_t0 = time.perf_counter()
+        self._conn.execute("COMMIT")
+        self._last_claim_commit_millis = int(
+            (time.perf_counter() - _commit_t0) * 1e3)
+
     def claim_next_bundle(self, branch_key, worker_id, n_candidates,
                           candidate_order, cost_lower_bound,
                           small_count=DEFAULT_SMALL_COUNT,
@@ -1955,8 +2071,10 @@ class ERDQueue:
                     retries += 1
         finally:
             self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
-        self._last_claim_busy_millis = int((time.perf_counter() - _acquire_t0) * 1e3)
-        self._last_claim_retries = retries
+        self._last_claim_busy_millis += int(
+            (time.perf_counter() - _acquire_t0) * 1e3)
+        self._last_claim_retries += retries
+        _txn_t0 = time.perf_counter()
         try:
             # Never hand out a claim for a branch that has been finalized and
             # deleted: a worker still looping would otherwise redo it from
@@ -1970,7 +2088,7 @@ class ERDQueue:
                 "FROM active_branches "
                 "WHERE branch_id = ?", (branch_id,)).fetchone()
             if br is None or br["status"] != "open":
-                self._conn.execute("COMMIT")
+                self._commit_claim_transaction(_txn_t0)
                 return None
             if expected_source_work_id is None:
                 owner_matches = (not br["requires_source_membership"] and
@@ -1991,7 +2109,7 @@ class ERDQueue:
                     """, (branch_id, expected_source_work_id,
                           expected_source_priority)).fetchone() is not None
             if not owner_matches:
-                self._conn.execute("COMMIT")
+                self._commit_claim_transaction(_txn_t0)
                 return None
             # The branch ceiling is a bound like any achieved best: candidates
             # whose lower bound reaches it are provably pruned for free, so the
@@ -2098,7 +2216,7 @@ class ERDQueue:
                 bundle = [idx for idx in holes
                           if cost_lower_bound[idx] < bound][:survivor_limit]
             if not bundle:
-                self._conn.execute("COMMIT")
+                self._commit_claim_transaction(_txn_t0)
                 return None
             bundle_id = f"{worker_id}:{self._pid}:{self._bundle_seq}"
             self._bundle_seq += 1
@@ -2132,7 +2250,7 @@ class ERDQueue:
                 # Every packed position already had a row (e.g. mark_claims_
                 # done beat us to the whole prefix): the cursor still
                 # advanced past them, so the caller should just retry.
-                self._conn.execute("COMMIT")
+                self._commit_claim_transaction(_txn_t0)
                 return None
             placeholders = ",".join("?" * len(bundle))
             rows = self._conn.execute(
@@ -2141,7 +2259,7 @@ class ERDQueue:
                 f"AND idx IN ({placeholders})",
                 (branch_id, republish_limit, *bundle)).fetchall()
             forced = frozenset(r["idx"] for r in rows)
-            self._conn.execute("COMMIT")
+            self._commit_claim_transaction(_txn_t0)
             return (bundle_id, bundle, forced)
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
@@ -4243,12 +4361,44 @@ class ERDQueue:
               self.epoch, now))
 
     def add_claim_telemetry(self, n_words: int, coordination_millis: int,
-                            work_nodes: int, worker_count: int):
+                            work_nodes: int, worker_count: int,
+                            branch_key: bytes = None, spine: str = None,
+                            worker_id: str = None, bundle_id: str = None,
+                            idx: int = None, bundle_start_idx: int = None,
+                            bundle_end_idx: int = None,
+                            scheduling_millis: int = 0):
         """Append a claim coordination record to claim_telemetry for offline analysis.
 
-        claim_retries / busy_wait_millis come from the most recent claim path on
-        this connection (set by claim_next_bundle), the direct lock-contention
-        signal; the row is stamped with the active epoch.
+        claim_retries / busy_wait_millis / claim_transaction_millis /
+        claim_commit_millis come from the most recent claim path on this
+        connection (set by claim_next_bundle), the direct lock-contention and
+        transaction-phase signal; the row is stamped with the active epoch.
+
+        branch_key/spine attribute this row to the branch the claim belonged
+        to.  branch_key is interned to its branches-registry branch_id before
+        storage (see _intern_branch) rather than stored as the raw BLOB: the
+        registry already carries the durable branch_key <-> branch_id mapping
+        for every branch that has ever been created, so duplicating the BLOB
+        onto every one of a branch's candidate rows would be pure size with
+        no independent information — a size difference that matters here,
+        since this is the highest-volume table in the schema.  A caller with
+        no branch context passes branch_key=None, which stores branch_id
+        NULL, not 0 or an interned NULL-key row.  worker_id/bundle_id/idx/
+        bundle_start_idx/bundle_end_idx identify which worker evaluated which
+        candidate of which bundle (all default to NULL for a caller with no
+        branch/bundle context).
+        scheduling_millis is the caller's work-selection scan for this claim
+        (source-work ordering, pending promotion, joining an in-progress
+        branch), already net of any lock wait and claim transaction it
+        contained so the phases stay disjoint.  idle_millis is
+        coordination_millis minus every other timed phase, so those five
+        partition it exactly and idle_millis means genuinely unaccounted
+        wait rather than unattributed scan work.
+
+        Every row is one candidate evaluation, so COUNT(*) over the table is a
+        claim count.  Branch finalize cost is deliberately not recorded here —
+        it belongs to a branch rather than to a claim, and goes to
+        branch_finalize_log.cache_write_millis instead.
 
         Consumed values are reset to 0 immediately after this INSERT reads
         them, so they are attributed to exactly the next telemetry row and
@@ -4261,15 +4411,30 @@ class ERDQueue:
         unrelated bundle member logs telemetry next.
         """
         now = int(time.time())
+        branch_id = (None if branch_key is None
+                    else self._intern_branch(branch_key))
+        idle_millis = max(0, coordination_millis
+                          - self._last_claim_transaction_millis
+                          - self._last_claim_commit_millis
+                          - self._last_claim_busy_millis
+                          - scheduling_millis)
         self._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, work_nodes, claim_retries,
-                 busy_wait_millis, worker_count, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 busy_wait_millis, worker_count, branch_id, spine, worker_id,
+                 bundle_id, idx, bundle_start_idx, bundle_end_idx,
+                 claim_transaction_millis, claim_commit_millis,
+                 scheduling_millis, idle_millis, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, work_nodes, self._last_claim_retries,
-              self._last_claim_busy_millis, worker_count, self.epoch, now))
+              self._last_claim_busy_millis, worker_count, branch_id, spine,
+              worker_id, bundle_id, idx, bundle_start_idx, bundle_end_idx,
+              self._last_claim_transaction_millis, self._last_claim_commit_millis,
+              scheduling_millis, idle_millis, self.epoch, now))
         self._last_claim_retries = 0
         self._last_claim_busy_millis = 0
+        self._last_claim_transaction_millis = 0
+        self._last_claim_commit_millis = 0
 
     def add_branch_finalize_log(self, branch_key, spine, n_words, budget,
                                 created_at, finalized_at, nodes_spent, n_claims,
@@ -4277,7 +4442,7 @@ class ERDQueue:
                                 total_bundle_wall_millis=None, censored_units=None,
                                 ceiling=None, outcome=None,
                                 bulk_done_candidates=None, best_guess=None,
-                                best_erd=None):
+                                best_erd=None, cache_write_millis=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -4292,6 +4457,10 @@ class ERDQueue:
         infer it from mutable cache state.  If a bulk sweep supersedes an
         in-flight claim that later finishes, n_claims excludes that overlap
         even though its per-claim telemetry row still exists.
+        cache_write_millis is the wall time the finalizing worker spent
+        publishing the result (score-cache/loss/cut writes and the cost-model
+        fold) — the finalize phase of the coordination breakdown, kept here
+        rather than on claim_telemetry because it belongs to the branch.
         """
         now = int(time.time())
         self._conn.execute("""
@@ -4300,12 +4469,13 @@ class ERDQueue:
                  finalized_at, nodes_spent, n_claims, n_bundles,
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
                  ceiling, outcome, bulk_done_candidates, best_guess, best_erd,
-                 recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cache_write_millis, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
-              bulk_done_candidates, best_guess, best_erd, now))
+              bulk_done_candidates, best_guess, best_erd, cache_write_millis,
+              now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

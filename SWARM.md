@@ -226,6 +226,69 @@ workers restart would stamp two regimes during the recycle window. Stop the
 swarm first. `--force` overrides that protection only for an intentional live
 cutover; restart every worker immediately afterward.
 
+### Branch-attributed claim telemetry
+
+`telemetry.claim_telemetry` (in the attached telemetry file, see "Schema
+coordination" in AGENTS.md) carries a `branch_id`/`spine`, `worker_id`,
+`bundle_id`, and `idx` (with `bundle_start_idx`/`bundle_end_idx`) on every
+row, so a slow branch's coordination cost can be attributed to it directly
+instead of only to its `n_words`/epoch bucket. `branch_id` is the
+`branches` registry surrogate (`_intern_branch`), not the raw `branch_key`
+BLOB — at this table's row volume the BLOB would roughly double the bytes
+per row, most of it a repeat of what the registry already carries. The
+registry is append-only, so a `branch_id` here resolves back to its
+`branch_key`/word-list indefinitely, including long after the branch
+itself is finalized and its `active_branches` row is gone: `SELECT
+branch_key FROM branches WHERE branch_id = ?`. `branches` lives in the
+*main* queue file, though, not this attached telemetry one — a live
+`ERDQueue` already has both open on one connection, so `WHERE branch_id =
+?` (an index exists for this) or a join against `branches` works directly;
+querying the telemetry file standalone (e.g. the `sqlite3` CLI) needs an
+explicit `ATTACH 'erd_queue.sqlite3' AS q` first, then join against
+`q.branches`. Query `WHERE spine LIKE ...` needs no such join, since
+`spine` is small enough to carry directly on each row.
+`coordination_millis` is also partitioned into
+`claim_transaction_millis` (claim-scan and write, inside
+`claim_next_bundle`'s transaction) + `claim_commit_millis` (its `COMMIT`) +
+`busy_wait_millis` (write-lock wait, across every claim path taken while
+coordinating — both `claim_next_bundle` and `claim_next`) +
+`scheduling_millis` (the work-selection scan that chose this branch:
+source-work ordering, pending promotion, joining an in-progress branch) +
+`idle_millis` (the remainder); those five sum to `coordination_millis`
+exactly.
+
+All five measure time *between* candidate evaluations, which is what
+`coordination_millis` spans. Queue work a candidate does during its own
+evaluation — sub-branch promotion taking the write lock, for instance — is
+inside the evaluation span, which `coordination_millis` excludes, so it is
+deliberately not counted here; folding it in would make the parts exceed
+the whole.
+
+Scheduling is broken out rather than left in the remainder because it is
+real work, and it grows with the number of source-work groups: folded into
+`idle_millis` a large value reads as starved workers, when the true cause
+may be that work selection is eating the window.  `idle_millis` therefore
+means genuinely unaccounted wait.  One exception worth knowing: a scan that
+finds nothing claimable is not billed to any branch — the worker had not
+chosen one yet — so that time stays in the next row's `idle_millis`, which
+is the correct reading for a worker that searched and found no work.
+
+Every row is one candidate evaluation, so `COUNT(*)` is a claim count. The
+finalize phase is deliberately *not* here: it belongs to a branch rather
+than to any single claim, and is recorded once per branch as
+`branch_finalize_log.cache_write_millis` (the score-cache/loss/cut writes
+and the cost-model fold). `branch_finalize_log` carries the raw `branch_key`
+directly (one row per branch, not per claim, so the BLOB there costs far
+less) while `claim_telemetry` carries `branch_id`; join the two for a
+branch's full coordination picture through `branches`: `claim_telemetry.
+branch_id = branches.branch_id AND branches.branch_key =
+branch_finalize_log.branch_key`.
+
+The bucketed rollup of this table is exposed as `erd_search.py view --by
+coordination` (aggregated by `n_words`/`worker_count`); the per-row branch
+attribution above has no CLI reader yet, so query the telemetry file
+directly (or a live `ERDQueue`'s `telemetry` attached schema) for it.
+
 ---
 
 ## Queue mutations

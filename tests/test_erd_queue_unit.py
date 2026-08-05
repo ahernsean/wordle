@@ -402,6 +402,15 @@ class TestBranchLifecycle(_TmpQueue):
     def test_read_branch_best_returns_none_none_for_missing_key(self):
         self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))
 
+    def test_read_branch_best_returns_none_none_after_delete(self):
+        # delete_branch removes the active_branches row but leaves the
+        # branches registry entry (branch_id stays stable for re-promotion),
+        # so a post-delete read finds a registered branch_id with no
+        # active_branches row -- distinct from a never-registered key.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        self.q.delete_branch(self.key)
+        self.assertEqual(self.q.read_branch_best(self.key), (None, None, None))
+
     def test_mark_branch_tainted_sets_flag(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
         self.q.mark_branch_tainted(self.key)
@@ -1157,6 +1166,46 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(row['coordination_millis'], 5000)
         self.assertEqual(row['work_nodes'], 300)
         self.assertEqual(row['worker_count'], 4)
+        # Branch/bundle attribution and the phase breakdown are all optional
+        # keyword arguments: an old-style positional-only call still inserts
+        # a row, with every new column defaulting to NULL/0.
+        self.assertIsNone(row['branch_id'])
+        self.assertIsNone(row['spine'])
+        self.assertIsNone(row['worker_id'])
+        self.assertIsNone(row['bundle_id'])
+        self.assertIsNone(row['idx'])
+        self.assertIsNone(row['bundle_start_idx'])
+        self.assertIsNone(row['bundle_end_idx'])
+        self.assertEqual(row['claim_transaction_millis'], 0)
+        self.assertEqual(row['claim_commit_millis'], 0)
+        self.assertEqual(row['scheduling_millis'], 0)
+        self.assertEqual(row['idle_millis'], 5000)
+
+    def test_add_claim_telemetry_carries_branch_attribution(self):
+        # A claim's branch has always been through create_branch (registering
+        # it in `branches`) by the time any candidate is evaluated against
+        # it, which is what makes add_claim_telemetry's branch_key -> branch_id
+        # interning a lookup rather than a fresh registration.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.q.add_claim_telemetry(
+            10, 5000, 300, 4, branch_key=self.key, spine='CRANE 12',
+            worker_id='worker-3', bundle_id='worker-3:123:0', idx=7,
+            bundle_start_idx=0, bundle_end_idx=9)
+        row = self.q._conn.execute(
+            "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row['branch_id'])
+        resolved = self.q._conn.execute(
+            "SELECT branch_key FROM branches WHERE branch_id = ?",
+            (row['branch_id'],)).fetchone()
+        self.assertEqual(resolved['branch_key'], self.key)
+        self.assertEqual(row['spine'], 'CRANE 12')
+        self.assertEqual(row['worker_id'], 'worker-3')
+        self.assertEqual(row['bundle_id'], 'worker-3:123:0')
+        self.assertEqual(row['idx'], 7)
+        self.assertEqual(row['bundle_start_idx'], 0)
+        self.assertEqual(row['bundle_end_idx'], 9)
+        self.assertEqual(row['idle_millis'], 5000)
 
     def test_add_backstop_telemetry_inserts_row(self):
         self.q.add_backstop_telemetry(8, 2, 65000, 500, None, 6)

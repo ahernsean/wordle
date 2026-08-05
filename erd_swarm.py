@@ -585,6 +585,10 @@ class _BranchWorker:
         self._last_wal_traffic = self.queue.wal_traffic_snapshot()
         self._last_wal_traffic_log = time.time()
         self._work_context = WorkContext.empty()
+        # Work-selection scan time for the claim currently in hand, set by
+        # claim_one and consumed by the first candidate's telemetry row (the
+        # scan is paid once per claim, like the claim transaction itself).
+        self._pending_scheduling_millis = 0
         # Direct cooperative callers can create active branches without a
         # source-work request.  Keep their tight claim loop free of the
         # source-admission query used by queued source work.
@@ -1107,7 +1111,9 @@ class _BranchWorker:
 
     # -- evaluate one candidate claim ---------------------------------------
 
-    def evaluate_claim(self, branch_key, words, n_words, idx, budget=None):
+    def evaluate_claim(self, branch_key, words, n_words, idx, budget=None,
+                       bundle_id=None, bundle_start_idx=None,
+                       bundle_end_idx=None):
         """Evaluate the single candidate self.all_words[idx] against branch_key.
 
         Folds the result into the branch's shared best and marks the claim
@@ -1117,6 +1123,10 @@ class _BranchWorker:
         budget is the branch's guess budget (depth-limited ERD): a candidate
         whose strategy can't win within budget is infeasible (and taints the
         branch — see ERDQueue.mark_branch_tainted).
+
+        bundle_id/bundle_start_idx/bundle_end_idx identify the claim_next_bundle
+        bundle this candidate belongs to, for claim_telemetry attribution; all
+        three are None for a claim taken outside the bundle path.
         """
         candidate = self.all_words[idx]
         self._cur_candidate = candidate
@@ -1281,8 +1291,15 @@ class _BranchWorker:
                         metric['erd_lower_bound_pruned'],
                         nodes_delta, group_sizes=metric['group_sizes'],
                         source_word=self._work_context.source_word)
+            scheduling_millis = self._pending_scheduling_millis
+            self._pending_scheduling_millis = 0
             self.queue.add_claim_telemetry(
-                n_words, int(full_coord_seconds * 1e3), nodes_delta, self.n_workers)
+                n_words, int(full_coord_seconds * 1e3), nodes_delta,
+                self.n_workers, branch_key=branch_key,
+                spine=self._work_context.spine, worker_id=self.name,
+                bundle_id=bundle_id, idx=idx,
+                bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
+                scheduling_millis=scheduling_millis)
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.
@@ -1293,7 +1310,8 @@ class _BranchWorker:
     # -- evaluate a packer-issued bundle of candidate claims -----------------
 
     def _evaluate_bundle_member(self, branch_key, words, n_words, idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0):
+                                bundle_id, nodes_at_bundle_start, wall_t0,
+                                bundle_start_idx=None, bundle_end_idx=None):
         """evaluate_claim for one bundle member; on cancellation/abort,
         records the bundle as censored.  Returns True to keep going, False
         for the caller to abort evaluate_bundle immediately."""
@@ -1302,7 +1320,9 @@ class _BranchWorker:
                                 wall_t0, censored=True)
             return False
         if not self.evaluate_claim(branch_key, words, n_words, idx,
-                                   budget=budget):
+                                   budget=budget, bundle_id=bundle_id,
+                                   bundle_start_idx=bundle_start_idx,
+                                   bundle_end_idx=bundle_end_idx):
             self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
                                 wall_t0, censored=True)
             return False
@@ -1346,10 +1366,14 @@ class _BranchWorker:
         """
         nodes_at_bundle_start = self._nodes
         wall_t0 = time.time()
+        bundle_start_idx = min(indices) if indices else None
+        bundle_end_idx = max(indices) if indices else None
         for pos, idx in enumerate(indices):
             if not self._evaluate_bundle_member(
                     branch_key, words, n_words, idx, budget, bundle_id,
-                    nodes_at_bundle_start, wall_t0):
+                    nodes_at_bundle_start, wall_t0,
+                    bundle_start_idx=bundle_start_idx,
+                    bundle_end_idx=bundle_end_idx):
                 return False
             if idx in forced:
                 nodes_at_bundle_start = self._nodes
@@ -1364,7 +1388,9 @@ class _BranchWorker:
                     if later_idx in forced:
                         if not self._evaluate_bundle_member(
                                 branch_key, words, n_words, later_idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0):
+                                bundle_id, nodes_at_bundle_start, wall_t0,
+                                bundle_start_idx=bundle_start_idx,
+                                bundle_end_idx=bundle_end_idx):
                             return False
                     else:
                         remainder.append(later_idx)
@@ -1408,6 +1434,7 @@ class _BranchWorker:
             return False
         if not self.queue.try_finalize_branch(branch_key):  # pragma: no cover
             return False  # another worker won the finalize
+        finalize_t0 = time.time()
         meta = self.queue.read_branch_meta(branch_key)
         (best_guess, best_erd, max_depth, tainted, budget,
          ceiling, cut_occurred) = meta
@@ -1503,6 +1530,10 @@ class _BranchWorker:
         # below: the branch result is already published to the score cache,
         # and without mark_done/delete_branch the branch's claim rows leak
         # and the pending row is never retired.
+        # Everything above published the branch's result; that span is the
+        # finalize phase of the coordination breakdown, recorded on this
+        # branch's own finalize row.
+        cache_write_millis = int((time.time() - finalize_t0) * 1000)
         try:
             (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
              censored_units) = self.queue.finalize_bundle_stats(branch_key)
@@ -1514,6 +1545,7 @@ class _BranchWorker:
                 censored_units=censored_units, ceiling=ceiling,
                 bulk_done_candidates=bulk_done_candidates,
                 best_guess=best_guess, best_erd=best_erd,
+                cache_write_millis=cache_write_millis,
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
         except Exception:
@@ -1540,6 +1572,12 @@ class _BranchWorker:
                                  branch_key[:25])
         self.queue.delete_branch(branch_key)    # drop transient coordination
         self._packing_stats_cache.pop(branch_key, None)
+        # Restart the coordination window past this finalize.  evaluate_claim
+        # telescopes coordination_millis from the previous claim's completion,
+        # so without this the finalize span would reappear as idle time on the
+        # first claim of whatever branch this worker picks up next — a
+        # different, unrelated branch.
+        self._last_claim_complete = time.time()
         return True
 
     def _await_rival_finalize(self, branch_key, words, n_words, n_candidates):
@@ -1870,7 +1908,39 @@ class _BranchWorker:
         """Return (context, branch, bundle_id, indices, forced) for the next
         bundle of candidates, or None if there is nothing to do right now.
 
-        Prefers JOINING an in-progress branch (to finish branches already
+        Times the work-selection scan into _pending_scheduling_millis for the
+        resulting claim's telemetry row, net of the lock wait and claim
+        transaction the queue already accounts for separately, so the phases
+        stay disjoint.  A call that finds nothing clears the figure rather
+        than carrying it forward: that scan chose no branch, so billing it to
+        whichever branch is claimed later would misattribute it (it stays in
+        that row's idle_millis, which is what a fruitless scan is).
+        """
+        scan_t0 = time.perf_counter()
+        attributed_before = self._queue_attributed_millis()
+        work = None
+        try:
+            work = self._claim_one_uninstrumented()
+            return work
+        finally:
+            if work is None:
+                self._pending_scheduling_millis = 0
+            else:
+                elapsed = int((time.perf_counter() - scan_t0) * 1000)
+                self._pending_scheduling_millis = max(
+                    0, elapsed - (self._queue_attributed_millis()
+                                  - attributed_before))
+
+    def _queue_attributed_millis(self):
+        """Coordination time the queue has already attributed to a named phase
+        since the last telemetry row (lock wait + claim transaction + commit)."""
+        return (self.queue._last_claim_busy_millis
+                + self.queue._last_claim_transaction_millis
+                + self.queue._last_claim_commit_millis)
+
+    def _claim_one_uninstrumented(self):
+        """claim_one's work selection.  See claim_one for the contract:
+        prefers JOINING an in-progress branch (to finish branches already
         underway, concentrating workers) over PROMOTING a new one from the
         queue.  Promotion claims a pending branch and registers it so others
         can join.  A claimed branch already solved at this budget (e.g.
