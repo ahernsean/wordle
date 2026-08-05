@@ -465,9 +465,8 @@ def cmd_queue_source_priority(args):
         queue.close()
 
     if updated:
-        print(f'{word.upper()} (id {source_work_id}): requested priority '
-              f'set to {args.priority}.  A branch shared with another live '
-              f'request keeps the higher of the two.')
+        print(f'{word.upper()} (id {source_work_id}): '
+              f'requested priority set to {args.priority}.')
     else:
         print(f'{word.upper()} (id {source_work_id}): '
               f'request is complete, cannot reprioritize.')
