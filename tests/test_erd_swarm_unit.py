@@ -2171,6 +2171,74 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         self.assertIsNone(row)
         w.evaluate_bundle.assert_not_called()
 
+    def test_widens_its_own_source_when_only_active_branch_is_the_one_excluded(self):
+        """The production shape from the issue: a worker blocked on AUDIO's
+        only active branch, with AUDIO also holding a pending branch and a
+        lower-priority source (PENIS) holding an active one.  The worker
+        must widen AUDIO — promote its own pending branch — rather than
+        serve PENIS, and rather than treat AUDIO's active branch (the one
+        excluded, since it's the one being waited on) as already covering
+        the source."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+
+        # AUDIO (priority 9): one active branch (the one this call excludes,
+        # standing in for "already being served") plus one pending branch.
+        words_audio_active = BRANCH[:4]
+        key_audio_active = ScoreCache.encode_subset(words_audio_active)
+        q.add_pending_many([(key_audio_active, len(words_audio_active), 9,
+                            "audio", 10)])
+        claimed_audio = q.claim_next("setup", self._source_work_id(q, "audio"))
+        q.create_branch(
+            key_audio_active, len(words_audio_active), n_candidates,
+            budget=ROOT_BUDGET, priority=claimed_audio["priority"],
+            source_word=claimed_audio["source_word"],
+            source_pattern=claimed_audio["source_pattern"],
+            source_work_id=claimed_audio["source_work_id"])
+        words_audio_pending = BRANCH
+        key_audio_pending = ScoreCache.encode_subset(words_audio_pending)
+        q.add_pending_many([(key_audio_pending, len(words_audio_pending), 9,
+                            "audio", 11)])
+
+        # PENIS (priority 1): one active branch, joinable and lower priority.
+        words_penis = ["brain", "stove", "cloud", "piano"]
+        key_penis = ScoreCache.encode_subset(words_penis)
+        q.add_pending_many([(key_penis, len(words_penis), 1, "penis", 20)])
+        claimed_penis = q.claim_next("setup", self._source_work_id(q, "penis"))
+        q.create_branch(
+            key_penis, len(words_penis), n_candidates, budget=ROOT_BUDGET,
+            priority=claimed_penis["priority"],
+            source_word=claimed_penis["source_word"],
+            source_pattern=claimed_penis["source_pattern"],
+            source_work_id=claimed_penis["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._work_context = _context(
+            branch_key=key_audio_active, source_work_id=claimed_audio["source_work_id"],
+            source_priority=9, source_word="audio",
+            source_pattern=claimed_audio["source_pattern"])
+        served = []
+
+        def fake_evaluate(branch_key, *_args, **_kwargs):
+            served.append(bytes(branch_key))
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate)
+        try:
+            result = w._help_other_branch(key_audio_active)
+            audio_pending_row = w.queue.get_branch(key_audio_pending)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [key_audio_pending])
+        self.assertNotIn(key_penis, served)
+        # AUDIO's pending branch is now promoted (active), not left pending.
+        self.assertIsNotNone(audio_pending_row)
+
 
 class TestHelpOtherBranchRecursionBound(unittest.TestCase):
     """issue #214: _help_other_branch must not let its own recursive

@@ -1674,13 +1674,18 @@ class _BranchWorker:
         would only ever join already-active branches (issue #214).  The
         priority check here compares a candidate source's requested_priority
         against the priority of the branch this call would fall back to
-        helping — either another active branch, or (with none available)
-        the branch already being served, i.e. the one whose dependency this
-        call was invoked to wait out — not merely against iteration order,
-        so a blocked worker widens a genuinely higher-priority source rather
-        than promoting whichever pending source happens to sort first, and
-        never abandons its own higher-priority branch for a lower-priority
-        pending one just because nothing else is active right now.
+        helping — either another joinable active branch, or (with none
+        available) the branch already being served, i.e. the one whose
+        dependency this call was invoked to wait out — not merely against
+        iteration order, so a blocked worker widens a genuinely higher-or-
+        equal-priority source rather than promoting whichever pending source
+        happens to sort first, and never abandons its own higher-priority
+        branch for a strictly lower-priority pending one just because
+        nothing else is active right now.  Equal priority is allowed through
+        deliberately: the source a worker is already serving always ties its
+        own gate, and that is exactly the case the issue asks for — a
+        worker blocked on AUDIO's only active branch must be able to widen
+        AUDIO by promoting more of AUDIO's own pending branches.
 
         Bounded by MAX_HELP_RECURSION_DEPTH: past the cap this returns False
         immediately rather than diving into another branch's evaluate_bundle
@@ -1701,14 +1706,22 @@ class _BranchWorker:
         fallback_priority = self._work_context.source_priority
         if branches and branches[0]['owner_priority'] > fallback_priority:
             fallback_priority = branches[0]['owner_priority']
+        # Sources with a branch surviving the exclude-filter above are
+        # joinable by the loop below; excluding exclude_branch_key here (not
+        # just above) matters when a source's ONLY active branch is the one
+        # this call was invoked to wait out — the join loop cannot touch
+        # that branch, so re-querying branches_in_progress(source_work_id)
+        # directly (unfiltered) would wrongly count it as "covered below"
+        # and block the source from ever widening past that single branch.
+        joinable_source_ids = {b['source_work_id'] for b in branches}
 
         for source_work in source_rows:
             source_work_id = source_work['source_work_id']
             priority = source_work['requested_priority']
-            if priority <= fallback_priority:
+            if priority < fallback_priority:
                 continue
-            if self.queue.branches_in_progress(source_work_id):
-                continue  # already has active branches; the join loop below covers it
+            if source_work_id in joinable_source_ids:
+                continue  # already has a joinable active branch below
             promoted = self._promote_source_work(
                 source_work_id, SCHEDULING_ROLE_PREFERRED)
             if promoted is None:
