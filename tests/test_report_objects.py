@@ -555,7 +555,7 @@ class SemanticReportTest(unittest.TestCase):
             tree=True, filters=ReportFilters(limit=1),
         ))
         self.assertEqual(first_page["data"]["nodes"][0]["step"], {
-            "word": "audio", "pattern": "----y",
+            "word": "audio", "pattern": "----y", "word_is_answer": False,
         })
         self.assertEqual(first_page["data"]["paging"]["total_group_count"], 2)
         self.assertEqual(first_page["data"]["paging"]["next_cursor"], "audio")

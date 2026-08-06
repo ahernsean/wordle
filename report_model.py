@@ -859,16 +859,36 @@ def _semantic_report(
     )
 
 
-def _resolved_branch_payload(resolved):
+def _resolved_branch_payload(resolved, answer_set):
     return {
         "branch_reference": branch_reference(resolved.branch_key),
         "branch_key_hex": resolved.branch_key.hex(),
         "spine": [
-            {"word": step.word, "pattern": step.pattern}
+            {
+                "word": step.word,
+                "pattern": step.pattern,
+                "word_is_answer": step.word in answer_set,
+            }
             for step in resolved.steps
         ],
         "guess_depth": len(resolved.steps),
         "answer_count": len(resolved.answer_words),
+    }
+
+
+def _with_best_guess_is_answer(cache_state, answer_set):
+    """Add best_guess_is_answer to a ScoreCache state dict.
+
+    ScoreCache has no answer-set knowledge of its own, so callers that hold
+    one attach this flag themselves rather than teaching the cache layer
+    about answer sets.
+    """
+    if not cache_state:
+        return cache_state
+    best_guess = cache_state.get("best_guess")
+    return {
+        **cache_state,
+        "best_guess_is_answer": bool(best_guess and best_guess.lower() in answer_set),
     }
 
 
@@ -984,7 +1004,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     data = {
         "word": word,
         "word_is_answer": word in answer_set,
-        "context": _resolved_branch_payload(resolved),
+        "context": _resolved_branch_payload(resolved, answer_set),
         "response_group_counts": {},
         "response_groups": [],
     }
@@ -1293,6 +1313,15 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             branch_key, request.filters.limit or 10,
             after=cursor_after, before=cursor_before,
         )
+        branch_telemetry["recent_finalizations"] = [
+            {
+                **row,
+                "best_guess_is_answer": bool(
+                    row["best_guess"] and row["best_guess"].lower() in answer_set
+                ),
+            }
+            for row in branch_telemetry["recent_finalizations"]
+        ]
     except (sqlite3.Error, OSError) as error:
         queue_error = error
         if request.branch_target.kind == "branch_reference":
@@ -1313,7 +1342,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             queue.close()
 
     budget = _row_value(active_row, "budget", GAME_GUESSES - len(resolved.steps))
-    branch_payload = _resolved_branch_payload(resolved)
+    branch_payload = _resolved_branch_payload(resolved, answer_set)
     branch_payload["budget"] = budget
     if request.include_answers:
         branch_payload["answer_words"] = list(resolved.answer_words)
@@ -1322,8 +1351,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     ]
     workers.sort(key=_worker_sort_key)
     live_worker_count = sum(worker["is_live"] for worker in workers)
-    initial_cache_state = ScoreCache.report_branch_state_without_rows(
-        branch_key, budget
+    initial_cache_state = _with_best_guess_is_answer(
+        ScoreCache.report_branch_state_without_rows(branch_key, budget), answer_set
     )
     branch_status, branch_phase = branch_status_and_phase(
         _row_value(pending_row, "status"),
@@ -1415,7 +1444,9 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
     try:
         if cache is None:
             raise cache_error
-        data["cache"] = cache.report_branch_state(branch_key, ERD_ALL, budget)
+        data["cache"] = _with_best_guess_is_answer(
+            cache.report_branch_state(branch_key, ERD_ALL, budget), answer_set
+        )
         branch_status, branch_phase = branch_status_and_phase(
             _row_value(pending_row, "status"),
             _row_value(active_row, "status"),
@@ -1513,6 +1544,7 @@ def _scoped_queue_rows(queue, request, apply_filters=True):
 
 def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
+    answer_set = set(load_word_list(sources.answer_list_path))
     data = {"summary": {}, "matched_rows": 0, "rows": []}
     report = _semantic_report(
         "queue", sources, request.branch_target, generated_at, data, request
@@ -1527,6 +1559,11 @@ def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict
         data["rows"] = rows[:limit] if limit is not None else rows
         for row in data["rows"]:
             row["branch_reference"] = branch_reference(bytes(row.pop("branch_key")))
+            row["spine"] = _normalized_branch_spine(row, answer_set)
+            best_guess = row.get("best_guess")
+            row["best_guess_is_answer"] = bool(
+                best_guess and best_guess.lower() in answer_set
+            )
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
@@ -1540,7 +1577,7 @@ def _tree_node_id(steps):
     return "/".join(f"{step.word}:{step.pattern}" for step in steps)
 
 
-def _tree_layout(rows, request, prefix, unfiltered_rows):
+def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
     if not rows:
         return {
             "root": _branch_target_payload(request.branch_target),
@@ -1563,7 +1600,11 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
                 nodes.setdefault(node_id, {
                     "node_id": node_id,
                     "parent_node_id": parent_id,
-                    "step": {"word": step.word, "pattern": step.pattern},
+                    "step": {
+                        "word": step.word,
+                        "pattern": step.pattern,
+                        "word_is_answer": step.word in answer_set,
+                    },
                     "branch_key_hex": None,
                     "branch_reference": None,
                     "branch_status": None,
@@ -1683,6 +1724,7 @@ def _tree_layout(rows, request, prefix, unfiltered_rows):
 
 def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
+    answer_set = set(load_word_list(sources.answer_list_path))
     inferred_kind = request.report_kind
     if inferred_kind == "auto":
         inferred_kind = "queue" if request.branch_target.kind == "root" else request.branch_target.kind
@@ -1724,7 +1766,7 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
                 if row["branch_key_hex"] in selected_branch_keys
             ]
         data.update(_tree_layout(
-            list(filtered_rows), request, prefix, unfiltered_rows
+            list(filtered_rows), request, prefix, unfiltered_rows, answer_set
         ))
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
@@ -1948,6 +1990,7 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
 def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
+    answer_set = set(all_answers)
     data = {}
     report = _semantic_report(
         "cache", sources, request.branch_target, generated_at, data, request
@@ -1974,7 +2017,10 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
                 "distributions": cache.report_cache_distributions(ERD_ALL),
                 "recent_rows": [
                     {
-                        **{key: value for key, value in row.items() if key != "branch_key"},
+                        **_with_best_guess_is_answer(
+                            {key: value for key, value in row.items() if key != "branch_key"},
+                            answer_set,
+                        ),
                         "branch_key_hex": row["branch_key"].hex(),
                         "branch_reference": branch_reference(row["branch_key"]),
                     }
@@ -2000,7 +2046,7 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
                     "answer_count": len(words),
                     "branch_key_hex": key.hex(),
                     "branch_reference": branch_reference(key),
-                    **states[key],
+                    **_with_best_guess_is_answer(states[key], answer_set),
                 })
             data.update({"summary": {"response_group_count": len(rows)}, "rows": rows})
         else:
@@ -2023,8 +2069,9 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
             data.update({
                 "branch_key_hex": branch_key.hex(),
                 "branch_reference": branch_reference(branch_key),
-                "cache": cache.report_branch_state(
-                    branch_key, ERD_ALL, budget
+                "cache": _with_best_guess_is_answer(
+                    cache.report_branch_state(branch_key, ERD_ALL, budget),
+                    answer_set,
                 ),
             })
         report["sources"]["cache"]["ok"] = True
@@ -2040,6 +2087,7 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
 
 def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
+    answer_set = set(load_word_list(sources.answer_list_path))
     field = request.hotspot_field or "nodes"
     since_seconds = request.since_seconds or 3600
     sample_size = min(request.sample_size or 50_000, 1_000_000)
@@ -2081,9 +2129,8 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
             scope, prefix = _branch_target_queue_scope(request.branch_target, queue)
             branch_key = scope.get("branch_key")
             if field == "cut-reuse" and request.branch_target.kind == "branch":
-                all_answers = load_word_list(sources.answer_list_path)
                 branch_key = resolve_branch_target(
-                    request.branch_target, all_answers
+                    request.branch_target, load_word_list(sources.answer_list_path)
                 ).branch_key
             result = queue.report_hotspots(
                 field, epoch, generated_at - since_seconds,
@@ -2091,7 +2138,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
             )
         normalized_rows = []
         for row in result["rows"]:
-            normalized = dict(row)
+            normalized = _with_best_guess_is_answer(dict(row), answer_set)
             branch_key = normalized.pop("branch_key", None)
             if branch_key is not None:
                 normalized["branch_key_hex"] = bytes(branch_key).hex()

@@ -399,6 +399,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("worker-0", text)
         self.assertGreater(self.page.locator(".card.dead").count(), 0)
 
+    def test_queue_view_draws_its_spine_as_colored_squares(self):
+        # The queue report's rows carry a spine as flat "WORD pattern WORD
+        # pattern" text (see the queue.json fixture), not the structured
+        # {word,pattern} steps the overview/branch reports use. cardForBranch
+        # must still render tiles for it, not fall back to dim raw text.
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector(".card .tiles")
+        card = self.page.locator(".card", has_text="RAISE").first
+        self.assertGreater(card.locator(".tile").count(), 0)
+        self.assertEqual(card.locator(".dim", has_text="RAISE").count(), 0)
+
+    def test_spine_words_carry_the_answer_asterisk(self):
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.branch.spine=[{word:'raise',pattern:'-----',word_is_answer:true}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        text = self.page.locator("section:has-text('Reached via')").first.inner_text()
+        self.assertIn("RAISE*", text)
+
     def test_worker_on_removed_branch_renders_as_transitioning(self):
         result = self.page.evaluate("""async () => {
           const state=__reportClient.getState();
@@ -523,10 +543,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("best ERD", text)
-        self.assertIn("2.125 17/8", text)
+        self.assertIn("best CRANE*/2.125 17/8", text)
+        self.assertIn("best guess CRANE*/2.125 17/8", text)
         self.assertIn("2.250 18/8", text)
-        self.assertIn("solved CIGAR 1.875 15/8", text)
+        self.assertIn("solved CIGAR/1.875 15/8", text)
         self.assertIn("wanted ERD ceiling 2.125 17/8", text)
         self.assertIn("available ERD bound 2.250 18/8", text)
         self.assertNotIn("3/2", text)
@@ -626,7 +646,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("solved CIGAR 1.875", text)
+        self.assertIn("solved CIGAR/1.875", text)
         self.assertNotIn("solution not recorded", text)
 
     def test_old_epoch_finalizations_are_marked_historical(self):
