@@ -997,6 +997,103 @@ class TestClaimNext(_TmpQueue):
         self.assertEqual(claimed["source_word"], "slate")
         self.assertEqual(claimed["priority"], 1)
 
+    def test_source_membership_rows_reports_multiple_owners_with_effective_priority(self):
+        # Two requests own the same root: one row per (source_work_id,
+        # branch_id) membership, each keeping its own requested priority
+        # while the branch's effective priority is the MAX across both.
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
+
+        rows = self.q.source_membership_rows()
+        self.assertEqual(len(rows), 2)
+        by_word = {row["source_word"]: row for row in rows}
+        self.assertEqual(set(by_word), {"crane", "slate"})
+        self.assertEqual(by_word["crane"]["requested_priority"], 1)
+        self.assertEqual(by_word["slate"]["requested_priority"], 9)
+        # Both rows report the same branch at its effective (MAX) priority,
+        # not each owner's own requested priority — a shared branch is never
+        # presented as though only its own requester set its priority.
+        self.assertEqual(by_word["crane"]["branch_priority"], 9)
+        self.assertEqual(by_word["slate"]["branch_priority"], 9)
+        self.assertEqual(bytes(by_word["crane"]["branch_key"]), self.key)
+        self.assertEqual(by_word["crane"]["pending_status"], "pending")
+        self.assertIsNone(by_word["crane"]["active_status"])
+
+        filtered = self.q.source_membership_rows(source_word="slate")
+        self.assertEqual([row["source_word"] for row in filtered], ["slate"])
+
+    def test_source_membership_rows_worker_count_ignores_stale_heartbeat(self):
+        # A heartbeat row survives a crashed worker (only unregister_worker/
+        # clear remove it), so worker_count must be fenced by liveness like
+        # worker_counts_by_branch() and report_queue_rows()'s workers CTE —
+        # otherwise a dead worker's residual row would report this branch as
+        # active forever, disagreeing with the queue report's own count.
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 0)])
+        branch_id = self.q._intern_branch(self.key)
+        stale_at = int(time.time()) - 10 * 30  # far past WORKER_LIVENESS_SECONDS
+        self.q._conn.execute("""
+            INSERT INTO worker_heartbeat
+                (worker_id, pid, current_branch_id, updated_at)
+            VALUES ('dead-worker', 1, ?, ?)
+        """, (branch_id, stale_at))
+
+        self.assertEqual(self.q.source_membership_rows()[0]["worker_count"], 0)
+        self.q._conn.execute(
+            "DELETE FROM worker_heartbeat WHERE worker_id = 'dead-worker'")
+
+    def test_source_membership_rows_excludes_resolved_by_default(self):
+        # A pending root discovered to already be cache-reusable is marked
+        # done without ever being promoted to an active branch (the
+        # claim_one() cache-reuse path) — mark_done resolves its membership
+        # immediately since there is no active row to defer resolution to.
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 7)])
+        self.q.mark_done(self.key)
+
+        self.assertEqual(self.q.source_membership_rows(), [])
+        resolved_rows = self.q.source_membership_rows(include_resolved=True)
+        self.assertEqual(len(resolved_rows), 1)
+        self.assertIsNotNone(resolved_rows[0]["resolved_at"])
+
+    def test_heartbeat_rejects_unknown_scheduling_role(self):
+        with self.assertRaisesRegex(ValueError, "unknown scheduling_role"):
+            self.q.heartbeat(
+                "worker-0", 1, None, None, 0, 0, scheduling_role="bogus")
+
+    def test_heartbeats_with_branch_prefers_workers_own_selected_owner(self):
+        # A branch shared by two requests (both own the same root): the
+        # worker recorded against the *other* owner must not display this
+        # branch's own source label — heartbeats_with_branch must key off the
+        # worker's own source_work_id, not an arbitrary branch-level column.
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
+        rows = {row["source_word"]: row for row in self.q.source_work_rows()}
+        claimed = self.q.claim_next("worker-0", rows["crane"]["source_work_id"])
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, priority=claimed["priority"],
+            source_word=claimed["source_word"],
+            source_pattern=claimed["source_pattern"],
+            source_work_id=claimed["source_work_id"])
+
+        self.q.heartbeat("worker-0", 1, self.key, len(WORDS), 0, 0,
+                         source_work_id=rows["slate"]["source_work_id"],
+                         scheduling_role="preferred")
+        heartbeat_row = self.q.heartbeats_with_branch()[0]
+        self.assertEqual(heartbeat_row["source_word"], "slate")
+        self.assertEqual(heartbeat_row["source_pattern"], 42)
+        self.assertEqual(heartbeat_row["priority"], 9)
+        self.assertEqual(heartbeat_row["scheduling_role"], "preferred")
+
+    def test_invariant_checker_flags_scheduling_role_source_mismatch(self):
+        self.q.heartbeat("worker-0", 1, None, None, 0, 0)
+        self.q._conn.execute(
+            "UPDATE worker_heartbeat SET source_work_id = 999, "
+            "scheduling_role = NULL WHERE worker_id = 'worker-0'")
+        violations = self.q.check_source_work_invariants()
+        self.assertTrue(any("worker worker-0" in violation
+                            for violation in violations))
+        self.q._conn.execute(
+            "DELETE FROM worker_heartbeat WHERE worker_id = 'worker-0'")
+
 
 class TestSourceWorkConcurrency(_TmpQueue):
     def test_interleaved_source_lifecycle_preserves_invariants(self):

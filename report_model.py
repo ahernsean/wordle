@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import collections
 import os
 import re
 import sqlite3
@@ -176,7 +177,7 @@ def validate_report_request(request: ReportRequest) -> None:
     """Reject report options that have no meaning for the selected report."""
     report_kind = request.report_kind
     branch_target_kind = request.branch_target.kind
-    if request.tree and report_kind in ("cache", "hotspots", "leaderboard"):
+    if request.tree and report_kind in ("cache", "hotspots", "leaderboard", "sources"):
         raise ValueError(f"--tree cannot be used with --{report_kind}")
     if (request.tree_parent or request.tree_cursor) and not request.tree:
         raise ValueError("tree_parent and tree_cursor require tree")
@@ -188,7 +189,7 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("--claims requires a singular branch target")
     if request.include_answers and (
         request.tree
-        or report_kind in ("queue", "workers", "leaderboard")
+        or report_kind in ("queue", "workers", "leaderboard", "sources")
         or (report_kind == "auto" and branch_target_kind == "root")
     ):
         raise ValueError(
@@ -219,6 +220,10 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("coordination hotspots cannot use a branch target")
     if request.worker_id is not None and report_kind != "workers":
         raise ValueError("worker requires a workers report")
+    if report_kind == "sources" and branch_target_kind not in ("root", "word"):
+        raise ValueError(
+            "--sources accepts only a trailing word or no branch target"
+        )
 
 
 @dataclass(frozen=True)
@@ -516,7 +521,27 @@ def _normalize_worker(row, generated_at, answer_set):
         "best_guess": best_guess.lower() if best_guess else None,
         "best_erd": _row_value(row, "best_erd"),
         "bound_erd": _row_value(row, "bound_erd"),
+        "source_work_id": _row_value(row, "source_work_id"),
+        "scheduling_role": _row_value(row, "scheduling_role"),
+        "scheduling_role_reason": scheduling_role_reason(
+            _row_value(row, "scheduling_role")
+        ),
     }
+
+
+def scheduling_role_reason(scheduling_role):
+    """Human-readable explanation of why a worker is running the branch it is
+    on, for the given persisted scheduling role (see erd_queue.SCHEDULING_ROLE_*).
+
+    None (no role recorded, e.g. an idle worker between claims) reports
+    unattributed rather than guessing.
+    """
+    return {
+        "preferred": "serving its preferred source work",
+        "fallback": "serving fallback work: preferred source(s) had no "
+                    "claimable bundle at the last claim boundary",
+        "direct": "direct branch work with no live source-work ownership",
+    }.get(scheduling_role, "unattributed")
 
 
 def worker_state(worker, generated_at, branch_phase):
@@ -2089,6 +2114,111 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
+def _source_summary_payload(row):
+    source_word = _row_value(row, "source_word")
+    return {
+        "source_work_id": row["source_work_id"],
+        "source_word": source_word.lower() if source_word else None,
+        "requested_priority": row["requested_priority"],
+        "state": row["state"],
+        "root_count": row["root_count"] or 0,
+        "branch_count": row["branch_count"] or 0,
+    }
+
+
+def _source_membership_payload(row, owner_count):
+    branch_key = bytes(row["branch_key"])
+    parent_branch_key = _row_value(row, "parent_branch_key")
+    source_word = _row_value(row, "source_word")
+    worker_count = _row_value(row, "worker_count", 0)
+    # cache_state is omitted (unlike the queue/word/branch reports): a shared
+    # branch's cache freshness is answer-set-wide, not per-owner, and adding a
+    # ScoreCache lookup per membership row here would duplicate what the
+    # queue/branch reports already answer more precisely for one branch.
+    branch_status, branch_phase = branch_status_and_phase(
+        _row_value(row, "pending_status"), _row_value(row, "active_status"),
+        worker_count,
+    )
+    return {
+        "source_work_id": row["source_work_id"],
+        "source_word": source_word.lower() if source_word else None,
+        "requested_priority": row["requested_priority"],
+        "source_state": row["source_state"],
+        "branch_reference": branch_reference(branch_key),
+        "branch_key_hex": branch_key.hex(),
+        "root_pattern": _normalized_pattern(_row_value(row, "root_pattern")),
+        "parent_branch_reference": (
+            branch_reference(bytes(parent_branch_key))
+            if parent_branch_key is not None else None
+        ),
+        "branch_status": branch_status,
+        "branch_phase": branch_phase,
+        # The branch's own materialized priority: set_source_work_priority
+        # keeps it at MAX(owner_priority) across every live owner, so it can
+        # exceed this row's own requested_priority on a shared branch — the
+        # two are reported side by side rather than presenting one as if it
+        # were the branch's only claim on scheduling.
+        "branch_effective_priority": _row_value(row, "branch_priority"),
+        "worker_count": worker_count,
+        "owner_count": owner_count,
+        "is_shared": owner_count > 1,
+        "resolved_at": _row_value(row, "resolved_at"),
+    }
+
+
+def collect_source_report(sources: ReportSources, request: ReportRequest) -> dict:
+    """Report every source-work request, its recorded requested priority, and
+    every branch it owns (or shares) — the reporting half of #200's operator
+    surface.  A branch with more than one live owner is never reduced to a
+    single display label: each owning request gets its own row, with the
+    branch's own effective (materialized) priority reported alongside each
+    owner's individually requested priority."""
+    generated_at = int(time.time())
+    data = {"summary": [], "matched_rows": 0, "rows": []}
+    report = _semantic_report(
+        "sources", sources, request.branch_target, generated_at, data, request
+    )
+    queue = None
+    try:
+        queue = _open_report_queue(sources)
+        source_word = (
+            request.branch_target.trailing_word
+            if request.branch_target.kind == "word" else None
+        )
+        summary_rows = queue.source_work_rows()
+        if source_word is not None:
+            summary_rows = [row for row in summary_rows
+                            if (row["source_word"] or "").lower() == source_word]
+        data["summary"] = [_source_summary_payload(row) for row in summary_rows]
+
+        # Owner counts are computed from every live membership so a branch
+        # shared with a request outside the word filter still reports
+        # is_shared correctly, rather than only counting the filtered rows.
+        all_membership_rows = queue.source_membership_rows()
+        owner_counts = collections.Counter(
+            row["branch_id"] for row in all_membership_rows
+        )
+        membership_rows = (
+            [row for row in all_membership_rows
+             if (row["source_word"] or "").lower() == source_word]
+            if source_word is not None else all_membership_rows
+        )
+        payload_rows = [
+            _source_membership_payload(row, owner_counts[row["branch_id"]])
+            for row in membership_rows
+        ]
+        data["matched_rows"] = len(payload_rows)
+        limit = request.filters.limit
+        data["rows"] = payload_rows[:limit] if limit is not None else payload_rows
+        _mark_queue_source_ok(report)
+    except (sqlite3.Error, OSError) as error:
+        _mark_queue_source_error(report, error)
+    finally:
+        if queue is not None:
+            queue.close()
+    return report
+
+
 def collect_overview_report(
     sources: ReportSources,
     request: ReportRequest | None = None,
@@ -2141,4 +2271,6 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
         return collect_hotspot_report(sources, request)
     if report_kind == "leaderboard":
         return collect_leaderboard_report(sources, request)
+    if report_kind == "sources":
+        return collect_source_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")

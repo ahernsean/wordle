@@ -129,7 +129,19 @@ python3.13 erd_search.py view --cache
 python3.13 erd_search.py view --cache CRANE
 python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
+python3.13 erd_search.py view --sources
+python3.13 erd_search.py view --sources CRANE
 ```
+
+`--sources` reports every source-work request: its recorded requested
+priority, the request state, and every branch it owns — including branches
+shared with another request, shown as one row per owning request with both
+that request's own requested priority and the branch's effective (highest
+live owner's) priority side by side, plus its promotion lineage (root
+pattern and immediate parent). A trailing word narrows to that word's
+request(s). Each worker's own report row shows whether it is serving its
+preferred (highest-priority eligible) source or fallback work claimed
+because the preferred source had no claimable bundle.
 
 Use `--answers` for answer-word arrays on word or branch reports and `--claims`
 for sparse candidate detail on one branch. Collection filters include branch

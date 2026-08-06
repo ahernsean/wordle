@@ -20,6 +20,8 @@ from report_model import (
     branch_reference,
     collect_overview_report,
     collect_report,
+    collect_source_report,
+    collect_workers_report,
     normalize_worker_descent,
     parse_rich_spine,
     parse_report_branch_target,
@@ -881,6 +883,85 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(len(raised.exception.candidates), 2)
         self.assertIsNone(raised.exception.candidates[1]["spine"])
         cache.close()
+
+
+class SourceReportTest(unittest.TestCase):
+    setUp = ReportModelTest.setUp
+    tearDown = ReportModelTest.tearDown
+    _open_queue = ReportModelTest._open_queue
+
+    def test_source_report_exposes_multiple_owners_with_requested_and_effective_priority(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        queue.add_pending_many([(branch_key, 2, 9, "crane", 1)])
+        queue.close()
+
+        report = collect_report(
+            self.sources, ReportRequest(report_kind="sources"))
+
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        self.assertEqual(len(report["data"]["summary"]), 2)
+        rows = {row["source_word"]: row for row in report["data"]["rows"]}
+        self.assertEqual(set(rows), {"salet", "crane"})
+        self.assertEqual(rows["salet"]["requested_priority"], 1)
+        self.assertEqual(rows["crane"]["requested_priority"], 9)
+        # Both rows report the branch's own effective (MAX) priority, not
+        # each request's own requested priority — a shared branch is never
+        # reduced to a single owner's claim.
+        self.assertEqual(rows["salet"]["branch_effective_priority"], 9)
+        self.assertEqual(rows["crane"]["branch_effective_priority"], 9)
+        self.assertTrue(rows["salet"]["is_shared"])
+        self.assertEqual(rows["salet"]["owner_count"], 2)
+        self.assertEqual(rows["salet"]["branch_status"], "pending")
+        self.assertEqual(rows["salet"]["branch_phase"], "queued")
+
+    def test_source_report_filters_by_word_but_keeps_global_shared_detection(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        queue.add_pending_many([(branch_key, 2, 9, "crane", 1)])
+        queue.add_pending_many([(solo_key, 2, 1, "salet", 2)])
+        queue.close()
+
+        report = collect_source_report(
+            self.sources,
+            ReportRequest(
+                report_kind="sources",
+                branch_target=parse_report_branch_target(["salet"]),
+            ),
+        )
+
+        rows = report["data"]["rows"]
+        self.assertEqual({row["source_word"] for row in rows}, {"salet"})
+        shared_row = next(r for r in rows
+                          if bytes.fromhex(r["branch_key_hex"]) == branch_key)
+        # The word filter drops crane's own row, but shared detection still
+        # reflects crane's (unfiltered) ownership of the same branch.
+        self.assertTrue(shared_row["is_shared"])
+        self.assertEqual(shared_row["owner_count"], 2)
+        solo_row = next(r for r in rows
+                        if bytes.fromhex(r["branch_key_hex"]) == solo_key)
+        self.assertFalse(solo_row["is_shared"])
+
+    def test_workers_report_exposes_scheduling_role_and_source_work_id(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        source_work_id = queue.source_work_rows()[0]["source_work_id"]
+        now = int(time.time())
+        queue.heartbeat("worker-1", 1, branch_key, 2, now, 0,
+                        source_work_id=source_work_id,
+                        scheduling_role="preferred")
+        queue.close()
+
+        report = collect_report(
+            self.sources, ReportRequest(report_kind="workers"))
+
+        worker = report["data"]["rows"][0]
+        self.assertEqual(worker["source_work_id"], source_work_id)
+        self.assertEqual(worker["scheduling_role"], "preferred")
 
 
 if __name__ == "__main__":

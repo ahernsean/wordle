@@ -842,6 +842,9 @@ def _worker_display_row(worker, generated_at, state):
     row["display_rate"] = (
         f"{_abbreviate_number(rate)}/s" if rate is not None else "—"
     )
+    row["display_role"] = {
+        "preferred": "pref", "fallback": "fbck", "direct": "dir",
+    }.get(worker.get("scheduling_role"), "—")
     return row
 
 
@@ -857,6 +860,7 @@ def _worker_columns():
         TerminalColumn(
             "MaxGD", "display_guess_depth", required=True, alignment="right"
         ),
+        TerminalColumn("Role", "display_role", remove_priority=9),
         TerminalColumn(
             "Rate", "display_rate", remove_priority=10, alignment="right",
             highlight_rule=_rate_stall_rule,
@@ -1377,6 +1381,42 @@ def _render_hotspot_sections(report, width, display_order):
     return [("header", header), ("hotspots", lines)]
 
 
+def _render_source_sections(report, width, display_order):
+    data = report["data"]
+    header = _semantic_header(report, "Source-work report", width)
+    lines = [f"Requests: {len(data.get('summary', []))}   "
+            f"memberships: {data.get('matched_rows', 0)} matched"]
+    for source in data.get("summary", []):
+        lines.append(_fit(
+            f"  #{source['source_work_id']} {(source['source_word'] or '-').upper()}  "
+            f"requested={source['requested_priority']}  {source['state']}  "
+            f"roots={source['root_count']} branches={source['branch_count']}",
+            width,
+        ))
+    if data.get("rows"):
+        lines.append("")
+        lines.append("  Ownership:")
+    for row in data.get("rows", []):
+        hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
+        hotkey_prefix = f"{hotkey} " if hotkey else ""
+        shared = "shared" if row["is_shared"] else "sole"
+        parent = (f" parent=@{_display_reference(row['parent_branch_reference'])}"
+                 if row.get("parent_branch_reference") else "")
+        lines.append(_fit(
+            f"    {hotkey_prefix}#{row['source_work_id']} "
+            f"{(row['source_word'] or '-').upper()} "
+            f"@{_display_reference(row['branch_reference'])} "
+            f"{row['branch_status']}/{row['branch_phase']} "
+            f"requested={row['requested_priority']} "
+            f"effective={row['branch_effective_priority']} "
+            f"({shared}, {row['owner_count']} owner(s)) "
+            f"root={row['root_pattern']}{parent} "
+            f"workers={row['worker_count']}",
+            width,
+        ))
+    return [("header", header), ("source_rows", lines)]
+
+
 def _render_leaderboard_sections(report, width):
     data = report["data"]
     counts = data["counts"]
@@ -1435,6 +1475,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_hotspot_sections(report, width, display_order)
     if report["report_kind"] == "leaderboard":
         return _render_leaderboard_sections(report, width)
+    if report["report_kind"] == "sources":
+        return _render_source_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 
