@@ -379,16 +379,18 @@ class TestClaimNextBundle(_TmpQueue):
         self.assertTrue(set(indices).isdisjoint({0, 1, 2}),
                         "must not re-claim positions mark_claims_done already covered")
 
-    def test_forward_path_returns_none_when_whole_packed_bundle_already_done(self):
+    def test_forward_path_returns_retry_when_whole_packed_bundle_already_done(self):
         # mark_claims_done covers positions 0..N_CANDIDATES-1 entirely (the
         # whole branch was evaluated inline before overrun fired): the
-        # forward path's packed bundle filters down to empty, and the call
-        # must report "nothing claimed" rather than a bundle of size 0.
+        # forward path's packed bundle filters down to empty, but the cursor
+        # still advanced past a real prefix, so the branch remains claimable
+        # — the call must report the CLAIM_RETRY sentinel (issue #214), not a
+        # plain None indistinguishable from "no work anywhere".
         self.q.mark_claims_done(self.key, list(range(N_CANDIDATES)))
         claim = self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
             small_count=5, count_cap=5)
-        self.assertIsNone(claim)
+        self.assertIs(claim, erd_queue.CLAIM_RETRY)
 
     def test_full_drain_with_mark_claims_done_prefix_has_unique_coverage(self):
         self.q.mark_claims_done(self.key, [0, 1, 2])

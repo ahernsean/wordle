@@ -20,6 +20,7 @@ import time
 import unittest
 from unittest import mock
 
+import erd_queue
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue as ProductionERDQueue, cost_size_bucket
 from tests.queue_invariants import SourceWorkInvariantCheckMixin
@@ -510,6 +511,40 @@ class TestCandidateClaiming(_TmpQueue):
         self._claim_one_idx(self.key, "worker-0")
         self.q.delete_branch(self.key)
         self.assertEqual(self.q.claims_for_branch(self.key), [])
+
+    def test_returns_retry_sentinel_when_mark_claims_done_races_the_forward_pack(self):
+        # mark_claims_done (the mid-loop publisher) can insert done=1 rows for
+        # a fresh branch's whole best-first prefix before the packer ever
+        # runs over it (issue #214).  A claim_next_bundle call over that same
+        # prefix finds every packed position already taken; the branch
+        # remains claimable (the cursor advanced past a real prefix, just not
+        # one this call could hand out), so it must report CLAIM_RETRY, not a
+        # plain "no work anywhere" None.
+        self.q.mark_claims_done(self.key, _IDENTITY_ORDER)
+        result = self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=N_CANDIDATES,
+            count_cap=N_CANDIDATES)
+        self.assertIs(result, erd_queue.CLAIM_RETRY)
+
+    def test_retry_sentinel_resolves_to_a_bundle_on_the_next_call(self):
+        small_count = 5
+        self.q.mark_claims_done(self.key, _IDENTITY_ORDER[:small_count])
+        first = self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=small_count,
+            count_cap=small_count)
+        self.assertIs(first, erd_queue.CLAIM_RETRY)
+
+        second = self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=small_count,
+            count_cap=small_count)
+        self.assertIsNotNone(second)
+        self.assertIsNot(second, erd_queue.CLAIM_RETRY)
+        _bundle_id, indices, _forced = second
+        self.assertEqual(indices,
+                         _IDENTITY_ORDER[small_count:small_count * 2])
 
 
 class TestStartupRecovery(_TmpQueue):

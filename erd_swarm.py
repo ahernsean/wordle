@@ -53,7 +53,7 @@ from erd_queue import (ERDQueue, decode_subset, encode_subset,
                        DISK_STOP_FRACTION,
                        QUEUE_WAL_HARD_CEILING_BYTES,
                        DEFAULT_SMALL_COUNT, DEFAULT_COUNT_CAP,
-                       DEFAULT_REPUBLISH_LIMIT,
+                       DEFAULT_REPUBLISH_LIMIT, CLAIM_RETRY,
                        SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
                        SCHEDULING_ROLE_DIRECT)
 from wordle_ui import fmt_pattern
@@ -217,7 +217,31 @@ BUNDLE_SMALL_COUNT = int(
     os.environ.get('BUNDLE_SMALL_COUNT', str(DEFAULT_SMALL_COUNT)))
 BUNDLE_COUNT_CAP = int(os.environ.get('BUNDLE_COUNT_CAP', str(DEFAULT_COUNT_CAP)))
 
+# _claim_bundle's cap on transparent CLAIM_RETRY retries for one call: the
+# race claim_next_bundle reports via CLAIM_RETRY (mark_claims_done beating
+# the packer to a just-advanced prefix) clears on the very next attempt in
+# practice, so this only bounds worst-case spin under adversarial timing.
+CLAIM_RETRY_ATTEMPTS = 10
+
 logger = logging.getLogger('wordle')
+
+# Cap on how many _help_other_branch calls may nest within one worker's call
+# stack (tracked via _help_recursion_depth) before it refuses to dive into
+# another branch's evaluate_bundle and returns False instead.  Each level a
+# blocked cooperative_solve recurses through _help_other_branch can itself
+# block on a wholly different sub-branch and recurse again; without a cap
+# the stack grows without bound under sustained blocking (issue #214).  The
+# cap only stops new recursion — it never cancels or abandons the subtree a
+# worker is already inside.
+MAX_HELP_RECURSION_DEPTH = 4
+
+# _promote_source_work sentinel: a pending branch was promoted (or found
+# already solved and marked done) but no bundle is claimable from it right
+# now — distinct from None, which means the source has no pending branch
+# left to promote at all.  Both _claim_one_uninstrumented and
+# _help_other_branch treat this as "this source is handled for this call",
+# not as "fall through to something else".
+_PROMOTED_NO_BUNDLE = object()
 
 
 class _LogEMA:
@@ -637,6 +661,9 @@ class _BranchWorker:
         # captures claim acquisition and inter-claim overhead — matching the
         # lifetime eval%/coord% split, not just the in-evaluate_claim window.
         self._last_claim_complete = time.time()
+        # Nesting depth of _help_other_branch calls on this worker's stack —
+        # see MAX_HELP_RECURSION_DEPTH.
+        self._help_recursion_depth = 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -1018,6 +1045,7 @@ class _BranchWorker:
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._hb_spine_str(),
+            cur_help_depth=self._help_recursion_depth,
             source_work_id=self._work_context.source_work_id,
             scheduling_role=self._work_context.scheduling_role)
         self._hb_max_spine = {}
@@ -1115,15 +1143,23 @@ class _BranchWorker:
 
         Every claim path (top-level loop, helping, deep solving, focused)
         funnels through here, so this is where a quiescing supervisor's pause
-        flag is honoured before touching the queue."""
+        flag is honoured before touching the queue.  It is also the one place
+        that resolves the CLAIM_RETRY sentinel: a retry-shaped miss means
+        `branch_key` itself remains claimable, so this retries the SAME
+        branch rather than reporting no work and letting a caller fall
+        through to a lower-priority one (issue #214)."""
         self._respect_checkpoint_pause()
         order, cost_lower_bound = self._packing_stats(branch_key, words)
-        return self.queue.claim_next_bundle(
-            branch_key, self.name, n_candidates, order, cost_lower_bound,
-            small_count=self.small_count, count_cap=self.count_cap,
-            republish_limit=self.republish_limit,
-            expected_source_work_id=expected_source_work_id,
-            expected_source_priority=expected_source_priority)
+        for _ in range(CLAIM_RETRY_ATTEMPTS):
+            result = self.queue.claim_next_bundle(
+                branch_key, self.name, n_candidates, order, cost_lower_bound,
+                small_count=self.small_count, count_cap=self.count_cap,
+                republish_limit=self.republish_limit,
+                expected_source_work_id=expected_source_work_id,
+                expected_source_priority=expected_source_priority)
+            if result is not CLAIM_RETRY:
+                return result
+        return None
 
     # -- evaluate one candidate claim ---------------------------------------
 
@@ -1622,23 +1658,94 @@ class _BranchWorker:
 
     def _help_other_branch(self, exclude_branch_key: bytes) -> bool:
         """Evaluate one bundle of candidate claims from any open branch other
-        than exclude_branch_key.
+        than exclude_branch_key — promoting a higher-priority pending-only
+        source first if one outranks the branch this call would otherwise
+        join.
 
         Called when the worker is waiting on a dependency branch whose remaining
         candidates are all held by other workers.  Instead of sleeping, the
-        worker drains useful work from the queue.  Returns True if a bundle
-        was evaluated, False if there was nothing to claim.
+        worker drains useful work from the queue.  Returns True if work was
+        done (a bundle evaluated, or a branch promoted/finalized without one
+        being available yet), False if there was nothing to claim.
+
+        Without the promotion below, a source word with only pending
+        branches can never start while any other source has active branches
+        to help with, regardless of its requested priority: this method
+        would only ever join already-active branches (issue #214).  The
+        priority check here compares a candidate source's requested_priority
+        against the priority of the branch this call would fall back to
+        helping — either another joinable active branch, or (with none
+        available) the branch already being served, i.e. the one whose
+        dependency this call was invoked to wait out — not merely against
+        iteration order, so a blocked worker widens a genuinely higher-or-
+        equal-priority source rather than promoting whichever pending source
+        happens to sort first, and never abandons its own higher-priority
+        branch for a strictly lower-priority pending one just because
+        nothing else is active right now.  Equal priority is allowed through
+        deliberately: the source a worker is already serving always ties its
+        own gate, and that is exactly the case the issue asks for — a
+        worker blocked on AUDIO's only active branch must be able to widen
+        AUDIO by promoting more of AUDIO's own pending branches.
+
+        Bounded by MAX_HELP_RECURSION_DEPTH: past the cap this returns False
+        immediately rather than diving into another branch's evaluate_bundle
+        (which could itself block and recurse again), so the caller's own
+        wait loop polls at that depth instead of growing the stack further.
         """
+        if self._help_recursion_depth >= MAX_HELP_RECURSION_DEPTH:
+            return False
+        exclude_branch_key = bytes(exclude_branch_key)
+        source_rows = self.queue.source_work_candidates()  # priority DESC
         owned_branches = []
-        for source_work in self.queue.source_work_candidates():
+        for source_work in source_rows:
             owned_branches.extend(
                 self.queue.branches_in_progress(source_work['source_work_id']))
-        branches = owned_branches + list(self.queue.direct_branches_in_progress())
+        branches = [
+            b for b in owned_branches + list(self.queue.direct_branches_in_progress())
+            if bytes(b['branch_key']) != exclude_branch_key]
+        fallback_priority = self._work_context.source_priority
+        if branches and branches[0]['owner_priority'] > fallback_priority:
+            fallback_priority = branches[0]['owner_priority']
+        # Sources with a branch surviving the exclude-filter above are
+        # joinable by the loop below; excluding exclude_branch_key here (not
+        # just above) matters when a source's ONLY active branch is the one
+        # this call was invoked to wait out — the join loop cannot touch
+        # that branch, so re-querying branches_in_progress(source_work_id)
+        # directly (unfiltered) would wrongly count it as "covered below"
+        # and block the source from ever widening past that single branch.
+        joinable_source_ids = {b['source_work_id'] for b in branches}
+
+        for source_work in source_rows:
+            source_work_id = source_work['source_work_id']
+            priority = source_work['requested_priority']
+            if priority < fallback_priority:
+                continue
+            if source_work_id in joinable_source_ids:
+                continue  # already has a joinable active branch below
+            promoted = self._promote_source_work(
+                source_work_id, SCHEDULING_ROLE_PREFERRED)
+            if promoted is None:
+                continue
+            if promoted is _PROMOTED_NO_BUNDLE:
+                return True
+            context, branch, bundle_id, indices, forced = promoted
+            branch_key = bytes(branch['branch_key'])
+            words = decode_subset(branch_key)
+            self._help_recursion_depth += 1
+            try:
+                with self._entered(context):
+                    if self.evaluate_bundle(branch_key, words, branch['n_words'],
+                                            bundle_id, indices, forced,
+                                            budget=self._branch_budget(branch)):
+                        self.maybe_finalize(branch_key, words, branch['n_candidates'])
+            finally:
+                self._help_recursion_depth -= 1
+            self._maybe_checkpoint()
+            return True
+
         for branch in branches:
             branch = dict(branch)
             other_key = bytes(branch['branch_key'])
-            if other_key == bytes(exclude_branch_key):
-                continue
             n_candidates = branch['n_candidates']
             words = decode_subset(other_key)
             source_work_id = (branch['source_work_id']
@@ -1659,10 +1766,14 @@ class _BranchWorker:
             role = (SCHEDULING_ROLE_FALLBACK if source_work_id is not None
                    else SCHEDULING_ROLE_DIRECT)
             context = WorkContext.from_branch_row(branch, role)
-            with self._entered(context):
-                if self.evaluate_bundle(other_key, words, branch['n_words'],
-                                        bundle_id, indices, forced, budget=budget):
-                    self.maybe_finalize(other_key, words, n_candidates)
+            self._help_recursion_depth += 1
+            try:
+                with self._entered(context):
+                    if self.evaluate_bundle(other_key, words, branch['n_words'],
+                                            bundle_id, indices, forced, budget=budget):
+                        self.maybe_finalize(other_key, words, n_candidates)
+            finally:
+                self._help_recursion_depth -= 1
             self._maybe_checkpoint()
             return True
         return False
@@ -1962,66 +2073,41 @@ class _BranchWorker:
                 + self.queue._last_claim_transaction_millis
                 + self.queue._last_claim_commit_millis)
 
-    def _claim_one_uninstrumented(self):
-        """claim_one's work selection.  See claim_one for the contract:
-        prefers JOINING an in-progress branch (to finish branches already
-        underway, concentrating workers) over PROMOTING a new one from the
-        queue.  Promotion claims a pending branch and registers it so others
-        can join.  A claimed branch already solved at this budget (e.g.
-        synced in from elsewhere) is marked done without being promoted —
-        no candidate work is needed.
-        """
-        claimed = None
-        selected_role = SCHEDULING_ROLE_DIRECT
-        if not self._source_work_enabled:
-            direct_work = self._claim_active_branch(
-                self.queue.direct_branches_in_progress())
-            if direct_work is not None:
-                return direct_work
-            self._source_work_enabled = self.queue.has_source_work()
-        source_work_rows = (self.queue.source_work_candidates()
-                            if self._source_work_enabled else ())
-        top_priority = (source_work_rows[0]['requested_priority']
-                        if source_work_rows else None)
-        for source_work in source_work_rows:
-            source_work_id = source_work['source_work_id']
-            # source_work_candidates() is source-first admission order
-            # (requested_priority DESC), so every entry tied with the top
-            # requested priority is preferred — none of them was skipped in
-            # favor of another; an entry strictly below it is reached only
-            # because every higher-priority source had no claimable bundle at
-            # this claim boundary, whether or not IT had claimable work.
-            role = (SCHEDULING_ROLE_PREFERRED
-                   if source_work['requested_priority'] == top_priority
-                   else SCHEDULING_ROLE_FALLBACK)
-            active_work = self._claim_active_branch(
-                self.queue.branches_in_progress(source_work_id), source_work_id,
-                role)
-            if active_work is not None:
-                return active_work
+    def _promote_source_work(self, source_work_id, scheduling_role):
+        """Promote one pending branch of source_work_id into active_branches.
 
-            while True:
-                claimed = self.queue.claim_next(self.name, source_work_id)
-                if claimed is None:
-                    break
-                root_spine = self._root_spine(claimed['source_word'],
-                                              claimed['source_pattern'])
-                budget = self._spine_budget(root_spine)
-                reuse = _cache_reuse(
-                    self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
-                    budget)
-                if reuse is None:
-                    break
-                self.queue.mark_done(claimed['branch_key'])
-            if claimed is not None:
-                selected_role = role
+        Mirrors claim_next's cache-reuse skip: a claimed branch already
+        solved at its budget (e.g. synced in from elsewhere) is marked done
+        without being promoted — no candidate work is needed — and the loop
+        keeps pulling pending branches for this source until it finds one
+        genuinely worth promoting or the source is exhausted.
+
+        scheduling_role labels the resulting WorkContext (SCHEDULING_ROLE_
+        PREFERRED/FALLBACK — see erd_queue.py): the caller states, at the
+        point of selection, whether this source was the highest-priority
+        eligible one or a fallback reached because a higher-priority source
+        had no claimable bundle.
+
+        Returns:
+        - (context, branch, bundle_id, indices, forced) if a bundle was
+          claimed off the newly promoted branch;
+        - _PROMOTED_NO_BUNDLE if a branch was created (or fully resolved via
+          bulk-elimination/finalize) but no bundle is claimable right now;
+        - None if source_work_id has no pending branch left to promote.
+        """
+        while True:
+            claimed = self.queue.claim_next(self.name, source_work_id)
+            if claimed is None:
+                return None
+            root_spine = self._root_spine(claimed['source_word'],
+                                          claimed['source_pattern'])
+            budget = self._spine_budget(root_spine)
+            reuse = _cache_reuse(
+                self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
+                budget)
+            if reuse is None:
                 break
-        if claimed is None:
-            # A queue upgraded while active work is present can carry branches
-            # from before source lineage was recorded.  They remain claimable
-            # until finalization; new work always follows source-first order.
-            return self._claim_active_branch(
-                self.queue.direct_branches_in_progress())
+            self.queue.mark_done(claimed['branch_key'])
 
         n_words = claimed['n_words']
         self.queue.create_branch(
@@ -2049,7 +2135,7 @@ class _BranchWorker:
             'spine': root_spine,
             'budget': budget,
         }
-        context = WorkContext.from_branch_row(branch, selected_role)
+        context = WorkContext.from_branch_row(branch, scheduling_role)
         # A bulk-elimination sweep can complete the branch without returning
         # worker work; otherwise another worker grabbed every remaining slot.
         if claim is None:
@@ -2058,9 +2144,51 @@ class _BranchWorker:
                 with self._entered(context):
                     self.maybe_finalize(claimed['branch_key'], words,
                                         self.n_candidates)
-            return None
+            return _PROMOTED_NO_BUNDLE
         bundle_id, indices, forced = claim
         return context, branch, bundle_id, indices, forced
+
+    def _claim_one_uninstrumented(self):
+        """claim_one's work selection.  See claim_one for the contract:
+        prefers JOINING an in-progress branch (to finish branches already
+        underway, concentrating workers) over PROMOTING a new one from the
+        queue.  Promotion claims a pending branch and registers it so others
+        can join.
+        """
+        if not self._source_work_enabled:
+            direct_work = self._claim_active_branch(
+                self.queue.direct_branches_in_progress())
+            if direct_work is not None:
+                return direct_work
+            self._source_work_enabled = self.queue.has_source_work()
+        source_work_rows = (self.queue.source_work_candidates()
+                            if self._source_work_enabled else ())
+        top_priority = (source_work_rows[0]['requested_priority']
+                        if source_work_rows else None)
+        for source_work in source_work_rows:
+            source_work_id = source_work['source_work_id']
+            # source_work_candidates() is source-first admission order
+            # (requested_priority DESC), so every entry tied with the top
+            # requested priority is preferred — none of them was skipped in
+            # favor of another; an entry strictly below it is reached only
+            # because every higher-priority source had no claimable bundle at
+            # this claim boundary, whether or not IT had claimable work.
+            role = (SCHEDULING_ROLE_PREFERRED
+                   if source_work['requested_priority'] == top_priority
+                   else SCHEDULING_ROLE_FALLBACK)
+            active_work = self._claim_active_branch(
+                self.queue.branches_in_progress(source_work_id), source_work_id,
+                role)
+            if active_work is not None:
+                return active_work
+
+            promoted = self._promote_source_work(source_work_id, role)
+            if promoted is not None:
+                return None if promoted is _PROMOTED_NO_BUNDLE else promoted
+        # A queue upgraded while active work is present can carry branches
+        # from before source lineage was recorded.  They remain claimable
+        # until finalization; new work always follows source-first order.
+        return self._claim_active_branch(self.queue.direct_branches_in_progress())
 
     # -- main loop ----------------------------------------------------------
 

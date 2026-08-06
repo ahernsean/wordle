@@ -509,6 +509,7 @@ def _normalize_worker(row, generated_at, answer_set):
         ),
         "current_max_guess_depth": _row_value(row, "cur_max_depth"),
         "current_node_count": _row_value(row, "cur_nodes"),
+        "help_recursion_depth": _row_value(row, "cur_help_depth", 0),
         "nodes_per_second": _row_value(row, "node_rate"),
         "descent": normalize_worker_descent(
             parse_rich_spine(_row_value(row, "cur_path")), answer_set

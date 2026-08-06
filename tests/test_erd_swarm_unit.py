@@ -96,6 +96,7 @@ def _bare_worker():
     w._log_max_spine = {}
     w.started = 0
     w._work_context = WorkContext.empty()
+    w._help_recursion_depth = 0
     w._pending_scheduling_millis = 0
     w._adaptive = True
     w._typical_cache = {}
@@ -2016,6 +2017,438 @@ class TestHelpOtherBranch(unittest.TestCase):
 
         # Should return False (the only available branch was excluded).
         self.assertFalse(result)
+
+
+class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
+    """issue #214: a source with only pending branches must be able to start
+    while a lower-priority source has active branches available to help
+    with — and the reverse must not happen (a lower-priority pending source
+    must not preempt a higher-priority branch already in progress)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def _source_work_id(self, q, source_word):
+        return next(
+            row["source_work_id"] for row in q.source_work_candidates()
+            if row["source_word"] == source_word)
+
+    def test_promotes_pending_higher_priority_source_over_active_lower_priority_one(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+
+        # Source "low" (priority 1) has an active branch with free candidates —
+        # the branch this call would otherwise fall back to joining.
+        words_low = BRANCH[:4]
+        key_low = ScoreCache.encode_subset(words_low)
+        q.add_pending_many([(key_low, len(words_low), 1, "low", 10)])
+        claimed_low = q.claim_next("setup", self._source_work_id(q, "low"))
+        q.create_branch(
+            key_low, len(words_low), n_candidates, budget=ROOT_BUDGET,
+            priority=claimed_low["priority"],
+            source_word=claimed_low["source_word"],
+            source_pattern=claimed_low["source_pattern"],
+            source_work_id=claimed_low["source_work_id"])
+
+        # Source "high" (priority 9) has only a pending branch: 74-pending/
+        # 0-active AUDIO from the issue.  It must start without being promoted
+        # by a setup helper first.
+        words_high = BRANCH
+        key_high = ScoreCache.encode_subset(words_high)
+        q.add_pending_many([(key_high, len(words_high), 9, "high", 20)])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        served = []
+
+        def fake_evaluate(branch_key, *_args, **_kwargs):
+            served.append(bytes(branch_key))
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate)
+        try:
+            result = w._help_other_branch(b"unrelated-exclude")
+            row = w.queue.get_branch(key_high)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [key_high])
+        self.assertNotIn(key_low, served)
+        # "high" is now promoted into an active branch.
+        self.assertIsNotNone(row)
+
+    def test_does_not_promote_lower_priority_pending_source_over_active_higher_priority_one(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+
+        # Source "high" (priority 9) already has an active branch.
+        words_high = BRANCH[:4]
+        key_high = ScoreCache.encode_subset(words_high)
+        q.add_pending_many([(key_high, len(words_high), 9, "high", 10)])
+        claimed_high = q.claim_next("setup", self._source_work_id(q, "high"))
+        q.create_branch(
+            key_high, len(words_high), n_candidates, budget=ROOT_BUDGET,
+            priority=claimed_high["priority"],
+            source_word=claimed_high["source_word"],
+            source_pattern=claimed_high["source_pattern"],
+            source_work_id=claimed_high["source_work_id"])
+
+        # Source "low" (priority 1) has only a pending branch: lower priority
+        # than the branch already in progress, so it must not be promoted.
+        words_low = BRANCH
+        key_low = ScoreCache.encode_subset(words_low)
+        q.add_pending_many([(key_low, len(words_low), 1, "low", 20)])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        served = []
+
+        def fake_evaluate(branch_key, *_args, **_kwargs):
+            served.append(bytes(branch_key))
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate)
+        try:
+            result = w._help_other_branch(b"unrelated-exclude")
+            row = w.queue.get_branch(key_low)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [key_high])
+        # "low" was never promoted: it stays pending, not active.
+        self.assertIsNone(row)
+
+    def test_does_not_promote_lower_priority_pending_source_over_branch_already_being_served(self):
+        """A worker blocked deep inside a higher-priority branch's dependency
+        (no OTHER active branches exist at all) must not abandon it for a
+        lower-priority pending source just because nothing else is active."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+
+        words_low = BRANCH
+        key_low = ScoreCache.encode_subset(words_low)
+        q.add_pending_many([(key_low, len(words_low), 1, "low", 20)])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        # Simulate being blocked inside a priority-9 branch: no other active
+        # branch exists, but the context this call is nested under outranks
+        # "low".
+        w._work_context = _context(
+            branch_key=b"served-branch", source_priority=9,
+            source_word="served", source_pattern=1)
+        w.evaluate_bundle = mock.MagicMock(return_value=False)
+        try:
+            result = w._help_other_branch(b"served-branch")
+            row = w.queue.get_branch(key_low)
+        finally:
+            w.close()
+
+        self.assertFalse(result)
+        self.assertIsNone(row)
+        w.evaluate_bundle.assert_not_called()
+
+    def test_widens_its_own_source_when_only_active_branch_is_the_one_excluded(self):
+        """The production shape from the issue: a worker blocked on AUDIO's
+        only active branch, with AUDIO also holding a pending branch under
+        the SAME source_work_id and a lower-priority source (PENIS) holding
+        an active one.  The worker must widen AUDIO — promote its own
+        pending branch — rather than serve PENIS, and rather than treat
+        AUDIO's active branch (the one excluded, since it's the one being
+        waited on) as already covering the source.
+
+        Both AUDIO branches are added in a single add_pending_many call so
+        they share one source_work_id (add_pending_many creates a fresh
+        source_work row per call, even for a repeated source_word/priority
+        pair) — otherwise the pending branch would land under a second,
+        merely coincidentally-tied source_work_id whose own
+        branches_in_progress() is trivially empty, which would exercise the
+        equal-priority fix but not the joinable_source_ids fix.
+        """
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+
+        # AUDIO (priority 9): one active branch (the one this call excludes,
+        # standing in for "already being served") plus one pending branch,
+        # both under the same source_work_id.  n_words picks which pending
+        # row claim_next promotes first (largest n_words wins), so the
+        # larger branch becomes "active" and the smaller stays pending.
+        words_audio_active = BRANCH
+        key_audio_active = ScoreCache.encode_subset(words_audio_active)
+        words_audio_pending = BRANCH[:3]
+        key_audio_pending = ScoreCache.encode_subset(words_audio_pending)
+        q.add_pending_many([
+            (key_audio_active, len(words_audio_active), 9, "audio", 10),
+            (key_audio_pending, len(words_audio_pending), 9, "audio", 10),
+        ])
+        audio_source_work_id = self._source_work_id(q, "audio")
+        claimed_audio = q.claim_next("setup", audio_source_work_id)
+        self.assertEqual(claimed_audio["branch_key"], key_audio_active)
+        q.create_branch(
+            key_audio_active, len(words_audio_active), n_candidates,
+            budget=ROOT_BUDGET, priority=claimed_audio["priority"],
+            source_word=claimed_audio["source_word"],
+            source_pattern=claimed_audio["source_pattern"],
+            source_work_id=claimed_audio["source_work_id"])
+
+        # PENIS (priority 1): one active branch, joinable and lower priority.
+        # A BRANCH subset (not CANDIDATES-only words like "brain"): branch
+        # words must be valid answers, and the fixture's answer file is
+        # BRANCH alone — the join loop below does try to claim this branch
+        # pre-fix (promotion is wrongly skipped), so an out-of-answer word
+        # here would fail on pattern_matrix.answer_indices regardless of the
+        # fix under test.
+        words_penis = BRANCH[-2:]
+        key_penis = ScoreCache.encode_subset(words_penis)
+        q.add_pending_many([(key_penis, len(words_penis), 1, "penis", 20)])
+        claimed_penis = q.claim_next("setup", self._source_work_id(q, "penis"))
+        q.create_branch(
+            key_penis, len(words_penis), n_candidates, budget=ROOT_BUDGET,
+            priority=claimed_penis["priority"],
+            source_word=claimed_penis["source_word"],
+            source_pattern=claimed_penis["source_pattern"],
+            source_work_id=claimed_penis["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._work_context = _context(
+            branch_key=key_audio_active, source_work_id=audio_source_work_id,
+            source_priority=9, source_word="audio",
+            source_pattern=claimed_audio["source_pattern"])
+        served = []
+
+        def fake_evaluate(branch_key, *_args, **_kwargs):
+            served.append(bytes(branch_key))
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate)
+        try:
+            result = w._help_other_branch(key_audio_active)
+            audio_pending_row = w.queue.get_branch(key_audio_pending)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [key_audio_pending])
+        self.assertNotIn(key_penis, served)
+        # AUDIO's pending branch is now promoted (active), not left pending.
+        self.assertIsNotNone(audio_pending_row)
+
+    def test_prefers_joining_own_sources_other_active_branch_over_promoting(self):
+        """When the worker's own source already has ANOTHER joinable active
+        branch (distinct from the one excluded), the promotion loop must
+        skip it — 'prefer joining over promoting' — and leave its pending
+        branch alone; the join loop below picks up the other active branch
+        instead."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+
+        # AUDIO (priority 9): the excluded active branch (being served),
+        # a SECOND active branch with free candidates (joinable), and a
+        # pending branch that must stay pending while the second active
+        # branch remains available to join.
+        words_excluded = BRANCH
+        key_excluded = ScoreCache.encode_subset(words_excluded)
+        words_joinable = BRANCH[:3]
+        key_joinable = ScoreCache.encode_subset(words_joinable)
+        words_pending = BRANCH[:2]
+        key_pending = ScoreCache.encode_subset(words_pending)
+        q.add_pending_many([
+            (key_excluded, len(words_excluded), 9, "audio", 10),
+            (key_joinable, len(words_joinable), 9, "audio", 10),
+            (key_pending, len(words_pending), 9, "audio", 10),
+        ])
+        audio_source_work_id = self._source_work_id(q, "audio")
+        claimed_excluded = q.claim_next("setup", audio_source_work_id)
+        self.assertEqual(claimed_excluded["branch_key"], key_excluded)
+        q.create_branch(
+            key_excluded, len(words_excluded), n_candidates,
+            budget=ROOT_BUDGET, priority=claimed_excluded["priority"],
+            source_word=claimed_excluded["source_word"],
+            source_pattern=claimed_excluded["source_pattern"],
+            source_work_id=claimed_excluded["source_work_id"])
+        claimed_joinable = q.claim_next("setup", audio_source_work_id)
+        self.assertEqual(claimed_joinable["branch_key"], key_joinable)
+        q.create_branch(
+            key_joinable, len(words_joinable), n_candidates,
+            budget=ROOT_BUDGET, priority=claimed_joinable["priority"],
+            source_word=claimed_joinable["source_word"],
+            source_pattern=claimed_joinable["source_pattern"],
+            source_work_id=claimed_joinable["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._work_context = _context(
+            branch_key=key_excluded, source_work_id=audio_source_work_id,
+            source_priority=9, source_word="audio",
+            source_pattern=claimed_excluded["source_pattern"])
+        served = []
+
+        def fake_evaluate(branch_key, *_args, **_kwargs):
+            served.append(bytes(branch_key))
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate)
+        try:
+            result = w._help_other_branch(key_excluded)
+            pending_row = w.queue.get_branch(key_pending)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [key_joinable])
+        # The still-pending branch was never promoted: joining took priority.
+        self.assertIsNone(pending_row)
+
+
+class TestHelpOtherBranchRecursionBound(unittest.TestCase):
+    """issue #214: _help_other_branch must not let its own recursive
+    evaluate_bundle chain grow the worker's stack without bound."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def test_short_circuits_at_the_cap_without_scanning_the_queue(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        key_a = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(key_a, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, priority=0)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._help_recursion_depth = erd_swarm.MAX_HELP_RECURSION_DEPTH
+        w.queue.source_work_candidates = mock.MagicMock(
+            wraps=w.queue.source_work_candidates)
+        try:
+            result = w._help_other_branch(b"excluded")
+        finally:
+            w.close()
+
+        self.assertFalse(result)
+        w.queue.source_work_candidates.assert_not_called()
+
+    def test_recursion_never_exceeds_the_configured_cap(self):
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        key_a = ScoreCache.encode_subset(BRANCH)
+        q.create_branch(key_a, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, priority=0)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        # Every claim attempt "succeeds" against a fixed dummy bundle, so
+        # sustained recursion is driven purely by the fake evaluate_bundle
+        # below rather than by how many real candidates remain claimable.
+        w._claim_bundle = mock.MagicMock(
+            return_value=("bundle-x", [0], frozenset()))
+        depths_seen = []
+
+        def fake_evaluate_bundle(*_args, **_kwargs):
+            depths_seen.append(w._help_recursion_depth)
+            w._help_other_branch(b"nested-exclude")
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate_bundle)
+        try:
+            w._help_other_branch(b"excluded")
+        finally:
+            w.close()
+
+        self.assertEqual(depths_seen,
+                         list(range(1, erd_swarm.MAX_HELP_RECURSION_DEPTH + 1)))
+        # Fully unwound: no leaked recursion count on the worker.
+        self.assertEqual(w._help_recursion_depth, 0)
+
+
+class TestClaimBundleRetry(unittest.TestCase):
+    """issue #214: claim_next_bundle's CLAIM_RETRY sentinel means the SAME
+    branch remains claimable, so _claim_bundle — the single funnel every
+    claim path goes through — must retry it transparently rather than
+    reporting no work, which would divert a caller to a different branch."""
+
+    def test_retries_transparently_and_returns_the_eventual_bundle(self):
+        w = _bare_worker()
+        w._packing_stats = mock.MagicMock(
+            return_value=([0, 1, 2], [0.0, 0.0, 0.0]))
+        real_bundle = ("bundle-1", [0, 1], frozenset())
+        w.queue.claim_next_bundle = mock.MagicMock(
+            side_effect=[erd_queue.CLAIM_RETRY, erd_queue.CLAIM_RETRY,
+                        real_bundle])
+
+        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"])
+
+        self.assertEqual(result, real_bundle)
+        self.assertEqual(w.queue.claim_next_bundle.call_count, 3)
+
+    def test_gives_up_after_the_retry_cap_and_reports_no_work(self):
+        w = _bare_worker()
+        w._packing_stats = mock.MagicMock(
+            return_value=([0, 1, 2], [0.0, 0.0, 0.0]))
+        w.queue.claim_next_bundle = mock.MagicMock(
+            return_value=erd_queue.CLAIM_RETRY)
+
+        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"])
+
+        self.assertIsNone(result)
+        self.assertEqual(w.queue.claim_next_bundle.call_count,
+                         erd_swarm.CLAIM_RETRY_ATTEMPTS)
+
+    def test_plain_none_is_not_retried(self):
+        w = _bare_worker()
+        w._packing_stats = mock.MagicMock(
+            return_value=([0, 1, 2], [0.0, 0.0, 0.0]))
+        w.queue.claim_next_bundle = mock.MagicMock(return_value=None)
+
+        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"])
+
+        self.assertIsNone(result)
+        self.assertEqual(w.queue.claim_next_bundle.call_count, 1)
 
 
 class TestMidLoopPublisher(unittest.TestCase):

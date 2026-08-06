@@ -148,6 +148,25 @@ DISK_STOP_FRACTION = 0.90
 encode_subset = ScoreCache.encode_subset
 
 
+class _ClaimRetry:
+    """claim_next_bundle sentinel: this call's transaction advanced the
+    branch's claim state (the pack cursor moved past a prefix another
+    caller's mark_claims_done had already claimed) but yielded no bundle for
+    THIS caller.  A fresh call against the same branch_key may succeed
+    immediately, unlike a plain None — which means the branch is absent,
+    not open, foreign to the caller's expected owner, or (rarest) genuinely
+    has no claimable candidate left at all.  Callers must not treat this the
+    same as None: retrying the same branch is the correct response, not
+    falling through to a different one."""
+    __slots__ = ()
+
+    def __repr__(self):
+        return 'CLAIM_RETRY'
+
+
+CLAIM_RETRY = _ClaimRetry()
+
+
 def disk_stats(path: str) -> dict:
     """Fullness of the filesystem holding `path`, in df's terms.
 
@@ -279,6 +298,7 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     cur_nodes          INTEGER,     -- monotonic node counter (forward-progress)
     node_rate          REAL,        -- nodes/sec since last heartbeat
     cur_path           TEXT,        -- live recursion spine: subset sizes by depth
+    cur_help_depth     INTEGER NOT NULL DEFAULT 0,  -- _help_other_branch nesting depth
     source_work_id     INTEGER,     -- source_work(source_work_id) selected at the
                                     -- last claim boundary; NULL if none was selected
     scheduling_role    TEXT         -- one of SCHEDULING_ROLES; NULL if source_work_id
@@ -1306,6 +1326,15 @@ class ERDQueue:
                     "post-normalization VACUUM skipped (%s); database is "
                     "correct but not yet compacted", exc)
 
+        # worker_heartbeat.cur_help_depth: nesting depth of _help_other_branch
+        # calls on this worker's stack (see erd_swarm.MAX_HELP_RECURSION_DEPTH),
+        # so `view worker` can show when a worker is deep in a rescue chain
+        # instead of at its normal claim boundary.  Additive on transient
+        # liveness state — see the current_branch_key rename above.
+        self._add_columns("worker_heartbeat", {
+            "cur_help_depth": "INTEGER NOT NULL DEFAULT 0",
+        })
+
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
         now = int(time.time())
@@ -1746,7 +1775,8 @@ class ERDQueue:
                   best_guess=None, best_erd=None, bound_erd=None,
                   cur_candidate=None, cand_n_seen=None, claim_total=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
-                  cur_path=None, source_work_id=None, scheduling_role=None):
+                  cur_path=None, cur_help_depth=0, source_work_id=None,
+                  scheduling_role=None):
         if scheduling_role is not None and scheduling_role not in SCHEDULING_ROLES:
             raise ValueError(f"unknown scheduling_role {scheduling_role!r}: "
                              f"expected one of {SCHEDULING_ROLES}")
@@ -1759,14 +1789,14 @@ class ERDQueue:
                  updated_at, claims_done, claim_idx, claim_started_at,
                  cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
                  best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
-                 cur_max_depth, cur_nodes, node_rate, cur_path,
+                 cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
                  source_work_id, scheduling_role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_id, n_words, started_at,
               now, claims_done, claim_idx, claim_started_at,
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
               best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
-              cur_max_depth, cur_nodes, node_rate, cur_path,
+              cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
               source_work_id, scheduling_role))
         # Attributed so a heartbeat write storm is visible in the WAL report: an
         # unthrottled per-candidate heartbeat is a full-page WAL frame each and
@@ -2069,8 +2099,12 @@ class ERDQueue:
         would spend engine work to establish the same fact.  Aggregate counts
         are retained on the branch instead of emitting per-candidate telemetry.
 
-        Returns (bundle_id, indices, forced), or None if nothing is claimable
-        (branch not open or missing, or every slot already has a row).
+        Returns (bundle_id, indices, forced); None if nothing is claimable
+        (branch not open or missing, wrong owner, or every slot already has
+        a row); or the CLAIM_RETRY sentinel if this call's own claim attempt
+        was entirely superseded by a race — the branch remains claimable and
+        the caller should call again for the same branch_key rather than
+        moving on to a different one (see CLAIM_RETRY).
         indices is the claimed idx list in best-first (evaluation) order.
         forced is the frozenset of indices whose candidate_republish count has
         already reached republish_limit: the caller must evaluate those
@@ -2288,7 +2322,7 @@ class ERDQueue:
                 # done beat us to the whole prefix): the cursor still
                 # advanced past them, so the caller should just retry.
                 self._commit_claim_transaction(_txn_t0)
-                return None
+                return CLAIM_RETRY
             placeholders = ",".join("?" * len(bundle))
             rows = self._conn.execute(
                 f"SELECT idx FROM candidate_republish "
