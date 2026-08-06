@@ -53,7 +53,9 @@ from erd_queue import (ERDQueue, decode_subset, encode_subset,
                        DISK_STOP_FRACTION,
                        QUEUE_WAL_HARD_CEILING_BYTES,
                        DEFAULT_SMALL_COUNT, DEFAULT_COUNT_CAP,
-                       DEFAULT_REPUBLISH_LIMIT, CLAIM_RETRY)
+                       DEFAULT_REPUBLISH_LIMIT, CLAIM_RETRY,
+                       SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
+                       SCHEDULING_ROLE_DIRECT)
 from wordle_ui import fmt_pattern
 
 from runtime_paths import (
@@ -137,13 +139,22 @@ class WorkContext:
     source_pattern: int | None
     branch_key: bytes | None
     spine: str | None
+    scheduling_role: str | None
 
     @classmethod
     def empty(cls):
-        return cls(None, 0, None, None, None, None)
+        return cls(None, 0, None, None, None, None, None)
 
     @classmethod
-    def from_branch_row(cls, branch):
+    def from_branch_row(cls, branch, scheduling_role):
+        """Build a context for a branch selected under the given scheduling
+        role (SCHEDULING_ROLE_PREFERRED/FALLBACK/DIRECT — see erd_queue.py):
+        the caller states, at the point of selection, whether this branch was
+        the highest-priority eligible source, a lower-priority source claimed
+        because the preferred one had no claimable bundle, or a branch with no
+        live source-work ownership.  That decision cannot be reconstructed
+        later from membership rows alone, so it is threaded in rather than
+        derived here."""
         values = dict(branch)
         source_word = values["owner_source_word"]
         source_pattern = values["owner_root_pattern"]
@@ -152,12 +163,15 @@ class WorkContext:
             spine = f"{source_word.upper()} {fmt_pattern(source_pattern)}"
         return cls(
             values["source_work_id"], values["owner_priority"], source_word,
-            source_pattern, bytes(values["branch_key"]), spine)
+            source_pattern, bytes(values["branch_key"]), spine, scheduling_role)
 
     def descend(self, branch_key, spine):
+        # A promoted descendant keeps the parent's scheduling role: recursive
+        # promotion helps the owning source tree without becoming a new,
+        # independently-ranked scheduling decision.
         return WorkContext(
             self.source_work_id, self.source_priority, self.source_word,
-            self.source_pattern, bytes(branch_key), spine)
+            self.source_pattern, bytes(branch_key), spine, self.scheduling_role)
 
 # Adaptive publish threshold (node-equivalents): SAFETY_FACTOR * coordination_time
 # / node_time.  Publishing pays only when the handed-off work exceeds the cost of
@@ -1031,7 +1045,9 @@ class _BranchWorker:
             cur_max_depth=self._cand_max_depth,
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._hb_spine_str(),
-            cur_help_depth=self._help_recursion_depth)
+            cur_help_depth=self._help_recursion_depth,
+            source_work_id=self._work_context.source_work_id,
+            scheduling_role=self._work_context.scheduling_role)
         self._hb_max_spine = {}
         if self._cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
             self._last_progress_log = now
@@ -1693,7 +1709,8 @@ class _BranchWorker:
                 continue
             if self.queue.branches_in_progress(source_work_id):
                 continue  # already has active branches; the join loop below covers it
-            promoted = self._promote_source_work(source_work_id)
+            promoted = self._promote_source_work(
+                source_work_id, SCHEDULING_ROLE_PREFERRED)
             if promoted is None:
                 continue
             if promoted is _PROMOTED_NO_BUNDLE:
@@ -1728,7 +1745,14 @@ class _BranchWorker:
                 continue
             bundle_id, indices, forced = claim
             budget = self._branch_budget(branch)
-            context = WorkContext.from_branch_row(branch)
+            # Reached only because the worker's own branch is blocked on a
+            # dependency: draining any other claimable source-owned branch
+            # instead of idling is fallback work, regardless of which source
+            # owns it.  A direct branch (no live source-work ownership) stays
+            # direct — no source-first admission decision was made for it.
+            role = (SCHEDULING_ROLE_FALLBACK if source_work_id is not None
+                   else SCHEDULING_ROLE_DIRECT)
+            context = WorkContext.from_branch_row(branch, role)
             self._help_recursion_depth += 1
             try:
                 with self._entered(context):
@@ -1979,11 +2003,12 @@ class _BranchWorker:
 
     # -- scheduling: claim one candidate from the best available branch ------
 
-    def _claim_active_branch(self, branches, source_work_id=None):
+    def _claim_active_branch(self, branches, source_work_id=None,
+                             scheduling_role=SCHEDULING_ROLE_DIRECT):
         """Claim a candidate bundle from an open branch, if one is available."""
         for active_branch in branches:
             branch = dict(active_branch)
-            context = WorkContext.from_branch_row(branch)
+            context = WorkContext.from_branch_row(branch, scheduling_role)
             branch_key = bytes(active_branch['branch_key'])
             words = decode_subset(branch_key)
             claim = self._claim_bundle(
@@ -2035,7 +2060,7 @@ class _BranchWorker:
                 + self.queue._last_claim_transaction_millis
                 + self.queue._last_claim_commit_millis)
 
-    def _promote_source_work(self, source_work_id):
+    def _promote_source_work(self, source_work_id, scheduling_role):
         """Promote one pending branch of source_work_id into active_branches.
 
         Mirrors claim_next's cache-reuse skip: a claimed branch already
@@ -2043,6 +2068,12 @@ class _BranchWorker:
         without being promoted — no candidate work is needed — and the loop
         keeps pulling pending branches for this source until it finds one
         genuinely worth promoting or the source is exhausted.
+
+        scheduling_role labels the resulting WorkContext (SCHEDULING_ROLE_
+        PREFERRED/FALLBACK — see erd_queue.py): the caller states, at the
+        point of selection, whether this source was the highest-priority
+        eligible one or a fallback reached because a higher-priority source
+        had no claimable bundle.
 
         Returns:
         - (context, branch, bundle_id, indices, forced) if a bundle was
@@ -2091,7 +2122,7 @@ class _BranchWorker:
             'spine': root_spine,
             'budget': budget,
         }
-        context = WorkContext.from_branch_row(branch)
+        context = WorkContext.from_branch_row(branch, scheduling_role)
         # A bulk-elimination sweep can complete the branch without returning
         # worker work; otherwise another worker grabbed every remaining slot.
         if claim is None:
@@ -2119,14 +2150,26 @@ class _BranchWorker:
             self._source_work_enabled = self.queue.has_source_work()
         source_work_rows = (self.queue.source_work_candidates()
                             if self._source_work_enabled else ())
+        top_priority = (source_work_rows[0]['requested_priority']
+                        if source_work_rows else None)
         for source_work in source_work_rows:
             source_work_id = source_work['source_work_id']
+            # source_work_candidates() is source-first admission order
+            # (requested_priority DESC), so every entry tied with the top
+            # requested priority is preferred — none of them was skipped in
+            # favor of another; an entry strictly below it is reached only
+            # because every higher-priority source had no claimable bundle at
+            # this claim boundary, whether or not IT had claimable work.
+            role = (SCHEDULING_ROLE_PREFERRED
+                   if source_work['requested_priority'] == top_priority
+                   else SCHEDULING_ROLE_FALLBACK)
             active_work = self._claim_active_branch(
-                self.queue.branches_in_progress(source_work_id), source_work_id)
+                self.queue.branches_in_progress(source_work_id), source_work_id,
+                role)
             if active_work is not None:
                 return active_work
 
-            promoted = self._promote_source_work(source_work_id)
+            promoted = self._promote_source_work(source_work_id, role)
             if promoted is not None:
                 return None if promoted is _PROMOTED_NO_BUNDLE else promoted
         # A queue upgraded while active work is present can carry branches
@@ -2177,7 +2220,15 @@ class _BranchWorker:
         if branch_row is None:
             return
         branch = dict(branch_row)
-        with self._entered(WorkContext.from_branch_row(branch)):
+        # Bypasses source-first admission entirely — this targets one branch
+        # directly rather than selecting among eligible sources — but role
+        # still tracks live ownership: a source-owned branch is never DIRECT
+        # (that would misreport it as unowned), so treat direct targeting of
+        # already-owned work as preferred.
+        role = (SCHEDULING_ROLE_PREFERRED if branch['source_work_id'] is not None
+               else SCHEDULING_ROLE_DIRECT)
+        context = WorkContext.from_branch_row(branch, role)
+        with self._entered(context):
             self._solve_branch_focused_in_context(branch)
 
     def _solve_branch_focused_in_context(self, branch):

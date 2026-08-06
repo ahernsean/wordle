@@ -85,6 +85,22 @@ DEFAULT_REPUBLISH_LIMIT = 3
 # priority a queue can hold is exactly a priority a caller may ask for.
 SOURCE_PRIORITY_MIN = 0
 SOURCE_PRIORITY_MAX = 999
+
+# A worker's scheduling role, recorded alongside its heartbeat so a report can
+# explain why the worker is running the branch it is on: PREFERRED is a
+# highest-requested-priority eligible source at the claim boundary that
+# selected it (ties at the top priority all count as preferred — none of them
+# was skipped in favor of another), FALLBACK is a strictly-lower-priority
+# eligible source claimed because every higher-priority source had no
+# claimable bundle, and DIRECT is a branch with no live source-work ownership
+# (legacy provenance).  Role is a function of ownership and admission order
+# alone, never of how a branch was reached — a branch with a live owner is
+# always PREFERRED or FALLBACK, one without is always DIRECT.
+SCHEDULING_ROLE_PREFERRED = "preferred"
+SCHEDULING_ROLE_FALLBACK = "fallback"
+SCHEDULING_ROLE_DIRECT = "direct"
+SCHEDULING_ROLES = (SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
+                    SCHEDULING_ROLE_DIRECT)
 # Per-attempt busy_timeout (ms) while probing for claim_next_bundle's write
 # lock.  Short enough that each failed attempt is a real, countable retry
 # (claim_telemetry.claim_retries) rather than one long internal SQLite wait
@@ -282,7 +298,11 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     cur_nodes          INTEGER,     -- monotonic node counter (forward-progress)
     node_rate          REAL,        -- nodes/sec since last heartbeat
     cur_path           TEXT,        -- live recursion spine: subset sizes by depth
-    cur_help_depth     INTEGER NOT NULL DEFAULT 0  -- _help_other_branch nesting depth
+    cur_help_depth     INTEGER NOT NULL DEFAULT 0,  -- _help_other_branch nesting depth
+    source_work_id     INTEGER,     -- source_work(source_work_id) selected at the
+                                    -- last claim boundary; NULL if none was selected
+    scheduling_role    TEXT         -- one of SCHEDULING_ROLES; NULL if source_work_id
+                                    -- is NULL
 );
 
 CREATE TABLE IF NOT EXISTS run_meta (
@@ -1215,6 +1235,13 @@ class ERDQueue:
         self._add_columns("active_branches", {
             "requires_source_membership": "INTEGER NOT NULL DEFAULT 0",
         })
+        # worker_heartbeat is transient liveness state (see its table comment): no
+        # backfill for existing rows is needed, they are overwritten on the next
+        # heartbeat.
+        self._add_columns("worker_heartbeat", {
+            "source_work_id": "INTEGER",
+            "scheduling_role": "TEXT",
+        })
         self._conn.execute("""
             UPDATE active_branches
             SET requires_source_membership = 1
@@ -1748,7 +1775,11 @@ class ERDQueue:
                   best_guess=None, best_erd=None, bound_erd=None,
                   cur_candidate=None, cand_n_seen=None, claim_total=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
-                  cur_path=None, cur_help_depth=0):
+                  cur_path=None, cur_help_depth=0, source_work_id=None,
+                  scheduling_role=None):
+        if scheduling_role is not None and scheduling_role not in SCHEDULING_ROLES:
+            raise ValueError(f"unknown scheduling_role {scheduling_role!r}: "
+                             f"expected one of {SCHEDULING_ROLES}")
         now = int(time.time())
         current_branch_id = (self._intern_branch(current_branch_key, create=True)
                              if current_branch_key is not None else None)
@@ -1758,13 +1789,15 @@ class ERDQueue:
                  updated_at, claims_done, claim_idx, claim_started_at,
                  cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
                  best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
-                 cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
+                 source_work_id, scheduling_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_id, n_words, started_at,
               now, claims_done, claim_idx, claim_started_at,
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
               best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
-              cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth))
+              cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
+              source_work_id, scheduling_role))
         # Attributed so a heartbeat write storm is visible in the WAL report: an
         # unthrottled per-candidate heartbeat is a full-page WAL frame each and
         # otherwise hides here, uncategorised.
@@ -1843,26 +1876,31 @@ class ERDQueue:
     def heartbeats_with_branch(self):
         """Heartbeat rows joined to the branch each worker is contributing to.
 
-        source_word/pattern/priority come from active_branches (the branch the
-        worker is on), so the health display can label a worker by the branch
-        it's helping rather than by an opaque key.  on_active_branch is 1 when
-        that branch still has an active row and 0 once it has been finalized
-        and removed, so a display can tell a working worker apart from one
-        between branches.
+        source_word/pattern/priority prefer the OWNER the worker itself selected
+        at its last claim boundary (h.source_work_id, via live_branch_source_rows)
+        and fall back to active_branches' own fields for a direct branch with no
+        live source-work ownership — so a shared branch's display reflects each
+        worker's actual selected owner rather than one arbitrary label for every
+        worker on the branch.  on_active_branch is 1 when that branch still has
+        an active row and 0 once it has been finalized and removed, so a display
+        can tell a working worker apart from one between branches.
         """
         return self._conn.execute("""
             SELECT h.*,
                    bk.branch_key AS current_branch_key,
-                   b.priority,
+                   COALESCE(owner.owner_priority, b.priority) AS priority,
                    b.spine,
-                   b.source_word,
-                   b.source_pattern,
+                   COALESCE(owner.owner_source_word, b.source_word) AS source_word,
+                   COALESCE(owner.owner_root_pattern, b.source_pattern) AS source_pattern,
                    b.branch_id IS NOT NULL AS on_active_branch
             FROM worker_heartbeat h
             LEFT JOIN active_branches b
                    ON h.current_branch_id = b.branch_id
             LEFT JOIN branches bk
                    ON h.current_branch_id = bk.branch_id
+            LEFT JOIN live_branch_source_rows owner
+                   ON owner.branch_id = h.current_branch_id
+                  AND owner.source_work_id = h.source_work_id
             ORDER BY h.worker_id
         """).fetchall()
 
@@ -4069,6 +4107,84 @@ class ERDQueue:
             ORDER BY s.requested_priority DESC, s.source_work_id
         """).fetchall()
 
+    def source_membership_rows(self, source_work_id=None, source_word=None,
+                               include_resolved=False):
+        """Return one row per (source_work_id, branch_id) membership.
+
+        This is the canonical detail query behind `view --sources`: every
+        request that owns a branch, its recorded requested priority, the
+        branch's effective priority (MAX(owner_priority) across every live
+        owner, computed the same way set_source_work_priority materializes it
+        onto active_branches/pending_branches — computed directly here rather
+        than trusted from that materialization, so a shared branch never
+        reports one owner's request as though it were exclusive even when a
+        second owner attached without a priority change to re-materialize
+        it), and the promotion lineage (root_pattern traces back to the root
+        (word, pattern) this membership descends from; parent_branch_key is
+        the immediate parent).
+
+        resolved_at is NULL for a live (currently schedulable) membership and
+        set once its request is complete; include_resolved=True also returns
+        resolved memberships, so a completed request's ownership history
+        remains queryable even though it is no longer schedulable.
+
+        source_work_id/source_word filter to one request or one word's
+        requests (a word may have more than one request; see
+        set_source_work_priority's word-to-request ambiguity).
+        """
+        clauses = []
+        params = []
+        if not include_resolved:
+            clauses.append("membership.resolved_at IS NULL")
+        if source_work_id is not None:
+            clauses.append("membership.source_work_id = ?")
+            params.append(source_work_id)
+        if source_word is not None:
+            clauses.append("source.source_word = ?")
+            params.append(source_word)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        live_since = int(time.time()) - WORKER_LIVENESS_SECONDS
+        return self._conn.execute(f"""
+            SELECT membership.source_work_id,
+                   source.source_word,
+                   source.requested_priority,
+                   source.state AS source_state,
+                   membership.branch_id,
+                   branch.branch_key,
+                   membership.root_pattern,
+                   membership.parent_branch_id,
+                   parent_branch.branch_key AS parent_branch_key,
+                   membership.resolved_at,
+                   pending.status AS pending_status,
+                   active.status AS active_status,
+                   COALESCE(
+                       (SELECT MAX(owner_priority) FROM live_branch_source_rows
+                         WHERE branch_id = membership.branch_id),
+                       active.priority, pending.priority
+                   ) AS branch_priority,
+                   -- Fenced by heartbeat liveness like worker_counts_by_branch()
+                   -- and report_queue_rows()'s workers CTE: a heartbeat row
+                   -- survives a crashed worker (only unregister_worker/clear
+                   -- remove it), so an unfenced count would keep reporting a
+                   -- dead worker's branch as active forever.
+                   (SELECT COUNT(*) FROM worker_heartbeat h
+                     WHERE h.current_branch_id = membership.branch_id
+                       AND h.updated_at >= ?) AS worker_count
+            FROM branch_source_work AS membership
+            JOIN source_work AS source
+              ON source.source_work_id = membership.source_work_id
+            JOIN branches AS branch ON branch.branch_id = membership.branch_id
+            LEFT JOIN branches AS parent_branch
+                   ON parent_branch.branch_id = membership.parent_branch_id
+            LEFT JOIN pending_branches AS pending
+                   ON pending.branch_id = membership.branch_id
+            LEFT JOIN active_branches AS active
+                   ON active.branch_id = membership.branch_id
+            {where}
+            ORDER BY source.requested_priority DESC, membership.source_work_id,
+                     membership.branch_id
+        """, [live_since, *params]).fetchall()
+
     def check_source_work_invariants(self) -> list[str]:
         """Return human-readable violations of source scheduling invariants."""
         violations = []
@@ -4187,6 +4303,27 @@ class ERDQueue:
                 f"open branch_id {row['branch_id']} owner {owner} has effective "
                 f"priority {row['owner_priority']} outside "
                 f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}"
+            )
+
+        role_placeholders = ",".join("?" for _ in SCHEDULING_ROLES)
+        invalid_scheduling_roles = self._conn.execute(f"""
+            SELECT worker_id, source_work_id, scheduling_role
+            FROM worker_heartbeat
+            WHERE (scheduling_role IS NOT NULL
+                   AND scheduling_role NOT IN ({role_placeholders}))
+               OR (source_work_id IS NOT NULL
+                   AND (scheduling_role IS NULL
+                        OR scheduling_role NOT IN (?, ?)))
+               OR (source_work_id IS NULL AND scheduling_role IN (?, ?))
+            ORDER BY worker_id
+        """, (*SCHEDULING_ROLES,
+              SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
+              SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK)).fetchall()
+        for row in invalid_scheduling_roles:
+            violations.append(
+                f"worker {row['worker_id']} has source_work_id "
+                f"{row['source_work_id']} with scheduling_role "
+                f"{row['scheduling_role']!r}"
             )
 
         return violations
