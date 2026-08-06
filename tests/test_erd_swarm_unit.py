@@ -2173,37 +2173,57 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
 
     def test_widens_its_own_source_when_only_active_branch_is_the_one_excluded(self):
         """The production shape from the issue: a worker blocked on AUDIO's
-        only active branch, with AUDIO also holding a pending branch and a
-        lower-priority source (PENIS) holding an active one.  The worker
-        must widen AUDIO — promote its own pending branch — rather than
-        serve PENIS, and rather than treat AUDIO's active branch (the one
-        excluded, since it's the one being waited on) as already covering
-        the source."""
+        only active branch, with AUDIO also holding a pending branch under
+        the SAME source_work_id and a lower-priority source (PENIS) holding
+        an active one.  The worker must widen AUDIO — promote its own
+        pending branch — rather than serve PENIS, and rather than treat
+        AUDIO's active branch (the one excluded, since it's the one being
+        waited on) as already covering the source.
+
+        Both AUDIO branches are added in a single add_pending_many call so
+        they share one source_work_id (add_pending_many creates a fresh
+        source_work row per call, even for a repeated source_word/priority
+        pair) — otherwise the pending branch would land under a second,
+        merely coincidentally-tied source_work_id whose own
+        branches_in_progress() is trivially empty, which would exercise the
+        equal-priority fix but not the joinable_source_ids fix.
+        """
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
 
         # AUDIO (priority 9): one active branch (the one this call excludes,
-        # standing in for "already being served") plus one pending branch.
-        words_audio_active = BRANCH[:4]
+        # standing in for "already being served") plus one pending branch,
+        # both under the same source_work_id.  n_words picks which pending
+        # row claim_next promotes first (largest n_words wins), so the
+        # larger branch becomes "active" and the smaller stays pending.
+        words_audio_active = BRANCH
         key_audio_active = ScoreCache.encode_subset(words_audio_active)
-        q.add_pending_many([(key_audio_active, len(words_audio_active), 9,
-                            "audio", 10)])
-        claimed_audio = q.claim_next("setup", self._source_work_id(q, "audio"))
+        words_audio_pending = BRANCH[:3]
+        key_audio_pending = ScoreCache.encode_subset(words_audio_pending)
+        q.add_pending_many([
+            (key_audio_active, len(words_audio_active), 9, "audio", 10),
+            (key_audio_pending, len(words_audio_pending), 9, "audio", 10),
+        ])
+        audio_source_work_id = self._source_work_id(q, "audio")
+        claimed_audio = q.claim_next("setup", audio_source_work_id)
+        self.assertEqual(claimed_audio["branch_key"], key_audio_active)
         q.create_branch(
             key_audio_active, len(words_audio_active), n_candidates,
             budget=ROOT_BUDGET, priority=claimed_audio["priority"],
             source_word=claimed_audio["source_word"],
             source_pattern=claimed_audio["source_pattern"],
             source_work_id=claimed_audio["source_work_id"])
-        words_audio_pending = BRANCH
-        key_audio_pending = ScoreCache.encode_subset(words_audio_pending)
-        q.add_pending_many([(key_audio_pending, len(words_audio_pending), 9,
-                            "audio", 11)])
 
         # PENIS (priority 1): one active branch, joinable and lower priority.
-        words_penis = ["brain", "stove", "cloud", "piano"]
+        # A BRANCH subset (not CANDIDATES-only words like "brain"): branch
+        # words must be valid answers, and the fixture's answer file is
+        # BRANCH alone — the join loop below does try to claim this branch
+        # pre-fix (promotion is wrongly skipped), so an out-of-answer word
+        # here would fail on pattern_matrix.answer_indices regardless of the
+        # fix under test.
+        words_penis = BRANCH[-2:]
         key_penis = ScoreCache.encode_subset(words_penis)
         q.add_pending_many([(key_penis, len(words_penis), 1, "penis", 20)])
         claimed_penis = q.claim_next("setup", self._source_work_id(q, "penis"))
@@ -2217,7 +2237,7 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         w._work_context = _context(
-            branch_key=key_audio_active, source_work_id=claimed_audio["source_work_id"],
+            branch_key=key_audio_active, source_work_id=audio_source_work_id,
             source_priority=9, source_word="audio",
             source_pattern=claimed_audio["source_pattern"])
         served = []
@@ -2238,6 +2258,74 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         self.assertNotIn(key_penis, served)
         # AUDIO's pending branch is now promoted (active), not left pending.
         self.assertIsNotNone(audio_pending_row)
+
+    def test_prefers_joining_own_sources_other_active_branch_over_promoting(self):
+        """When the worker's own source already has ANOTHER joinable active
+        branch (distinct from the one excluded), the promotion loop must
+        skip it — 'prefer joining over promoting' — and leave its pending
+        branch alone; the join loop below picks up the other active branch
+        instead."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        n_candidates = len(CANDIDATES)
+
+        # AUDIO (priority 9): the excluded active branch (being served),
+        # a SECOND active branch with free candidates (joinable), and a
+        # pending branch that must stay pending while the second active
+        # branch remains available to join.
+        words_excluded = BRANCH
+        key_excluded = ScoreCache.encode_subset(words_excluded)
+        words_joinable = BRANCH[:3]
+        key_joinable = ScoreCache.encode_subset(words_joinable)
+        words_pending = BRANCH[:2]
+        key_pending = ScoreCache.encode_subset(words_pending)
+        q.add_pending_many([
+            (key_excluded, len(words_excluded), 9, "audio", 10),
+            (key_joinable, len(words_joinable), 9, "audio", 10),
+            (key_pending, len(words_pending), 9, "audio", 10),
+        ])
+        audio_source_work_id = self._source_work_id(q, "audio")
+        claimed_excluded = q.claim_next("setup", audio_source_work_id)
+        self.assertEqual(claimed_excluded["branch_key"], key_excluded)
+        q.create_branch(
+            key_excluded, len(words_excluded), n_candidates,
+            budget=ROOT_BUDGET, priority=claimed_excluded["priority"],
+            source_word=claimed_excluded["source_word"],
+            source_pattern=claimed_excluded["source_pattern"],
+            source_work_id=claimed_excluded["source_work_id"])
+        claimed_joinable = q.claim_next("setup", audio_source_work_id)
+        self.assertEqual(claimed_joinable["branch_key"], key_joinable)
+        q.create_branch(
+            key_joinable, len(words_joinable), n_candidates,
+            budget=ROOT_BUDGET, priority=claimed_joinable["priority"],
+            source_word=claimed_joinable["source_word"],
+            source_pattern=claimed_joinable["source_pattern"],
+            source_work_id=claimed_joinable["source_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._work_context = _context(
+            branch_key=key_excluded, source_work_id=audio_source_work_id,
+            source_priority=9, source_word="audio",
+            source_pattern=claimed_excluded["source_pattern"])
+        served = []
+
+        def fake_evaluate(branch_key, *_args, **_kwargs):
+            served.append(bytes(branch_key))
+            return False
+
+        w.evaluate_bundle = mock.MagicMock(side_effect=fake_evaluate)
+        try:
+            result = w._help_other_branch(key_excluded)
+            pending_row = w.queue.get_branch(key_pending)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [key_joinable])
+        # The still-pending branch was never promoted: joining took priority.
+        self.assertIsNone(pending_row)
 
 
 class TestHelpOtherBranchRecursionBound(unittest.TestCase):
