@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ERD swarm reports</title>
   <style>
-    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --red:#d14b4b; --amber:#b59f3b; }
+    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#6f8d6c; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --red:#d14b4b; --amber:#b59f3b; }
     * { box-sizing:border-box; }
     html, body { margin:0; min-width:0; background:var(--bg); color:var(--text); font:13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
     body { overflow-x:hidden; }
@@ -113,6 +113,9 @@
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
     .progress-line .sweep { height:1rem; margin:0 0 .3rem; }
     .sweep-cell { flex:1 1 0; min-width:2px; border-radius:1px; background:linear-gradient(to top,var(--green) var(--fill,0%),var(--border) var(--fill,0%)); }
+    /* A fully-done cell is drawn desaturated so "completely full" reads as a
+       distinct state from a nearly-full cell rather than blending with it. */
+    .sweep-cell.complete { background:var(--green-complete); }
     /* The digit is an SVG background image, not laid-out text: SVG
        rasterization places the glyph geometrically, so the digit stays
        centered at any sub-pixel cell position where HTML text layout would
@@ -452,8 +455,10 @@
         // A 100% fill is reserved for a cell whose every candidate is done;
         // partial completion is capped below full (and lifted off zero) so a
         // nearly-done cell never reads as finished.
-        const fill=doneCount>=end-start?100:doneCount>0?Math.max(15,Math.min(85,Math.round(100*doneCount/(end-start)))):0;
+        const complete=doneCount>=end-start;
+        const fill=complete?100:doneCount>0?Math.max(15,Math.min(85,Math.round(100*doneCount/(end-start)))):0;
         cellNode.style.setProperty("--fill",fill+"%");
+        if(complete)cellNode.classList.add("complete");
         strip.append(cellNode);
       }
       const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));

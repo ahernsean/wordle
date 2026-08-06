@@ -1259,6 +1259,22 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["markers"], ["3"])
         self.assertFalse(any(85 < fill < 100 for fill in result["fills"]))
 
+    def test_completed_sweep_cells_are_marked_for_desaturated_color(self):
+        result = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.completed_candidate_indexes=[...Array(branch.data.queue.candidate_count).keys()];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          const cells=[...document.querySelectorAll('.sweep-cell')];
+          return {
+            completeCount:cells.filter(cell=>cell.classList.contains('complete')).length,
+            completeColor:getComputedStyle(cells[0]).backgroundColor,
+          };
+        }""")
+        self.assertEqual(result["completeCount"], 50)
+        # A completed cell's flat fill is the desaturated --green-complete
+        # shade, distinct from the bright #6aaa64 --green used while filling.
+        self.assertEqual(result["completeColor"], "rgb(111, 141, 108)")
+
     def test_overview_branch_cards_render_sweep_with_worker_markers(self):
         result = self.page.evaluate("""() => {
           const cards=[...document.querySelectorAll('#report .grid article.card.clickable')];
