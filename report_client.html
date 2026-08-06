@@ -717,7 +717,12 @@
           const after=node.getBoundingClientRect(),dx=prior.rect.left-after.left,dy=prior.rect.top-after.top;
           if(dx||dy)node.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:"none"}],{duration:350,easing:"ease",fill:"forwards"});
         }else{
-          node.animate([{opacity:0,transform:"scale(.96)"},{opacity:1,transform:"none"}],{duration:300,easing:"ease",fill:"forwards"});
+          // A brand-new card grows in from the right while fading up to full
+          // size, rather than just barely swelling in place -- the same
+          // leftward-exit/rightward-entry language as the departure below, so
+          // a card being replaced by an unrelated one reads as a clear
+          // handoff even though the two never share a slot.
+          node.animate([{opacity:0,transform:"translateX(50px) scale(.7)"},{opacity:1,transform:"none"}],{duration:380,easing:"ease-out",fill:"forwards"});
         }
       }
       const leaving=[...before].filter(([identity])=>!present.has(identity));
@@ -732,9 +737,9 @@
         // the animation's effect the instant it ends and the clone reverts to
         // its un-animated style (fully opaque), flashing back into view for
         // the remaining time before removal.
-        clone.animate([{opacity:1,transform:"none"},{opacity:0,transform:"scale(.96)"}],{duration:300,easing:"ease",fill:"forwards"});
+        clone.animate([{opacity:1,transform:"none"},{opacity:0,transform:"translateX(-50px) scale(.7)"}],{duration:380,easing:"ease-in",fill:"forwards"});
       }
-      setTimeout(()=>layer.remove(),350);
+      setTimeout(()=>layer.remove(),400);
     }
     function reportHasFocusedControl(){
       const active=document.activeElement;
