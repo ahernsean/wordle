@@ -375,6 +375,22 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["data"]["branches"], [])
         self.assertEqual(report["data"]["workers"], [])
 
+    def test_answer_list_failure_degrades_queue_tree_and_hotspot_reports(self):
+        # Each of these collectors reads the answer list itself (to flag
+        # candidate words as answers) inside the same try/except that already
+        # turns a bad queue read into a degraded report -- a missing answer
+        # list must degrade the same way, not raise past the caller.
+        with patch("report_model.load_word_list", side_effect=OSError("missing answers")):
+            queue_report = collect_report(self.sources, ReportRequest(report_kind="queue"))
+            tree_report = collect_report(self.sources, ReportRequest(tree=True))
+            hotspot_report = collect_report(self.sources, ReportRequest(report_kind="hotspots"))
+        for report in (queue_report, tree_report, hotspot_report):
+            self.assertFalse(report["sources"]["queue"]["ok"])
+            self.assertIn("missing answers", report["sources"]["queue"]["error"])
+        self.assertEqual(queue_report["data"]["rows"], [])
+        self.assertEqual(hotspot_report["data"]["rows"], [])
+        self.assertFalse(tree_report["data"]["tree_available"])
+
     def test_queue_collection_error_does_not_relabel_attached_telemetry(self):
         with patch.object(
             ERDQueue, "counts_by_status",

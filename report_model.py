@@ -877,13 +877,15 @@ def _resolved_branch_payload(resolved, answer_set):
 
 
 def _with_best_guess_is_answer(cache_state, answer_set):
-    """Add best_guess_is_answer to a ScoreCache state dict.
+    """Add best_guess_is_answer to a row that carries a best_guess field.
 
-    ScoreCache has no answer-set knowledge of its own, so callers that hold
-    one attach this flag themselves rather than teaching the cache layer
-    about answer sets.
+    ScoreCache and the queue's hotspot rows have no answer-set knowledge of
+    their own, so callers that hold one attach this flag themselves rather
+    than teaching those layers about answer sets. Rows with no best_guess
+    field (most hotspot populations) are returned unchanged rather than
+    gaining an always-False flag that never meant anything for them.
     """
-    if not cache_state:
+    if not cache_state or "best_guess" not in cache_state:
         return cache_state
     best_guess = cache_state.get("best_guess")
     return {
@@ -1544,13 +1546,13 @@ def _scoped_queue_rows(queue, request, apply_filters=True):
 
 def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
-    answer_set = set(load_word_list(sources.answer_list_path))
     data = {"summary": {}, "matched_rows": 0, "rows": []}
     report = _semantic_report(
         "queue", sources, request.branch_target, generated_at, data, request
     )
     queue = None
     try:
+        answer_set = set(load_word_list(sources.answer_list_path))
         queue = _open_report_queue(sources)
         rows, _prefix = _scoped_queue_rows(queue, request)
         data["summary"] = _collection_summary(rows)
@@ -1724,7 +1726,6 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
 
 def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
-    answer_set = set(load_word_list(sources.answer_list_path))
     inferred_kind = request.report_kind
     if inferred_kind == "auto":
         inferred_kind = "queue" if request.branch_target.kind == "root" else request.branch_target.kind
@@ -1742,6 +1743,7 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
     )
     queue = None
     try:
+        answer_set = set(load_word_list(sources.answer_list_path))
         queue = _open_report_queue(sources)
         filtered_rows, prefix = _scoped_queue_rows(queue, request, True)
         unfiltered_rows = filtered_rows
@@ -2087,7 +2089,6 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
 
 def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
-    answer_set = set(load_word_list(sources.answer_list_path))
     field = request.hotspot_field or "nodes"
     since_seconds = request.since_seconds or 3600
     sample_size = min(request.sample_size or 50_000, 1_000_000)
@@ -2107,6 +2108,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     )
     queue = None
     try:
+        answer_set = set(load_word_list(sources.answer_list_path))
         queue = _open_report_queue(sources)
         epoch = queue.epoch if request.epoch is None else request.epoch
         current_fields = {"nodes", "age", "size", "workers", "priority", "slowest"}
@@ -2130,7 +2132,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
             branch_key = scope.get("branch_key")
             if field == "cut-reuse" and request.branch_target.kind == "branch":
                 branch_key = resolve_branch_target(
-                    request.branch_target, load_word_list(sources.answer_list_path)
+                    request.branch_target, sorted(answer_set)
                 ).branch_key
             result = queue.report_hotspots(
                 field, epoch, generated_at - since_seconds,

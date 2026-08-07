@@ -1270,7 +1270,7 @@ def _render_queue_collection_sections(report, width, display_order):
             f"  {hotkey_prefix}@{_display_reference(row['branch_reference'])} "
             f"{row['branch_status']}/{row['branch_phase']} "
             f"n={row['answer_count']} "
-            f"guess_depth={len((row.get('spine') or '').split()) // 2} "
+            f"guess_depth={len(row.get('spine') or [])} "
             f"priority={row['priority']} workers={row['worker_count']}",
             width,
         ))

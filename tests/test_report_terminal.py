@@ -950,7 +950,10 @@ class CollectionRendererTest(unittest.TestCase):
                 "branch_status": "active",
                 "branch_phase": "evaluating",
                 "answer_count": 2,
-                "spine": "RAISE ----- CRANE y----",
+                "spine": [
+                    {"word": "raise", "pattern": "-----", "word_is_answer": False},
+                    {"word": "crane", "pattern": "y----", "word_is_answer": True},
+                ],
                 "priority": 7,
                 "worker_count": 1,
             }],
