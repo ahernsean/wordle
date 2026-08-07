@@ -464,7 +464,7 @@ def _normalize_branch(
         "source_word": source_word.lower() if source_word else None,
         "source_pattern": _normalized_pattern(_row_value(row, "source_pattern")),
         "best_guess": best_guess.lower() if best_guess else None,
-        "best_guess_is_answer": bool(best_guess and best_guess.lower() in answer_set),
+        "best_guess_is_answer": _is_answer(best_guess, answer_set),
         "best_erd": _row_value(row, "best_erd"),
         "best_max_remaining_depth": _row_value(row, "best_max_depth"),
         "budget": _row_value(row, "budget"),
@@ -859,18 +859,23 @@ def _semantic_report(
     )
 
 
+def _is_answer(word, answer_set):
+    return bool(word and word.lower() in answer_set)
+
+
+def _step_payload(step, answer_set):
+    return {
+        "word": step.word,
+        "pattern": step.pattern,
+        "word_is_answer": _is_answer(step.word, answer_set),
+    }
+
+
 def _resolved_branch_payload(resolved, answer_set):
     return {
         "branch_reference": branch_reference(resolved.branch_key),
         "branch_key_hex": resolved.branch_key.hex(),
-        "spine": [
-            {
-                "word": step.word,
-                "pattern": step.pattern,
-                "word_is_answer": step.word in answer_set,
-            }
-            for step in resolved.steps
-        ],
+        "spine": [_step_payload(step, answer_set) for step in resolved.steps],
         "guess_depth": len(resolved.steps),
         "answer_count": len(resolved.answer_words),
     }
@@ -887,10 +892,9 @@ def _with_best_guess_is_answer(cache_state, answer_set):
     """
     if not cache_state or "best_guess" not in cache_state:
         return cache_state
-    best_guess = cache_state.get("best_guess")
     return {
         **cache_state,
-        "best_guess_is_answer": bool(best_guess and best_guess.lower() in answer_set),
+        "best_guess_is_answer": _is_answer(cache_state.get("best_guess"), answer_set),
     }
 
 
@@ -1318,9 +1322,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         branch_telemetry["recent_finalizations"] = [
             {
                 **row,
-                "best_guess_is_answer": bool(
-                    row["best_guess"] and row["best_guess"].lower() in answer_set
-                ),
+                "best_guess_is_answer": _is_answer(row["best_guess"], answer_set),
             }
             for row in branch_telemetry["recent_finalizations"]
         ]
@@ -1562,10 +1564,7 @@ def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict
         for row in data["rows"]:
             row["branch_reference"] = branch_reference(bytes(row.pop("branch_key")))
             row["spine"] = _normalized_branch_spine(row, answer_set)
-            best_guess = row.get("best_guess")
-            row["best_guess_is_answer"] = bool(
-                best_guess and best_guess.lower() in answer_set
-            )
+            row["best_guess_is_answer"] = _is_answer(row.get("best_guess"), answer_set)
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
@@ -1602,11 +1601,7 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
                 nodes.setdefault(node_id, {
                     "node_id": node_id,
                     "parent_node_id": parent_id,
-                    "step": {
-                        "word": step.word,
-                        "pattern": step.pattern,
-                        "word_is_answer": step.word in answer_set,
-                    },
+                    "step": _step_payload(step, answer_set),
                     "branch_key_hex": None,
                     "branch_reference": None,
                     "branch_status": None,
