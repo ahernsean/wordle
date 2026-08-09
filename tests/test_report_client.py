@@ -399,6 +399,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("worker-0", text)
         self.assertGreater(self.page.locator(".card.dead").count(), 0)
 
+    def test_queue_view_draws_its_spine_as_colored_squares(self):
+        # The queue report's rows carry a spine as flat "WORD pattern WORD
+        # pattern" text (see the queue.json fixture), not the structured
+        # {word,pattern} steps the overview/branch reports use. cardForBranch
+        # must still render tiles for it, not fall back to dim raw text.
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector(".card .tiles")
+        card = self.page.locator(".card", has_text="RAISE").first
+        self.assertGreater(card.locator(".tile").count(), 0)
+        self.assertEqual(card.locator(".dim", has_text="RAISE").count(), 0)
+
+    def test_spine_words_carry_the_answer_asterisk(self):
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.branch.spine=[{word:'raise',pattern:'-----',word_is_answer:true}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        text = self.page.locator("section:has-text('Reached via')").first.inner_text()
+        self.assertIn("RAISE*", text)
+
     def test_worker_on_removed_branch_renders_as_transitioning(self):
         result = self.page.evaluate("""async () => {
           const state=__reportClient.getState();
@@ -523,10 +543,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("best ERD", text)
-        self.assertIn("2.125 17/8", text)
+        self.assertIn("best CRANE*/2.125 17/8", text)
+        self.assertIn("best guess CRANE*/2.125 17/8", text)
         self.assertIn("2.250 18/8", text)
-        self.assertIn("solved CIGAR 1.875 15/8", text)
+        self.assertIn("solved CIGAR/1.875 15/8", text)
         self.assertIn("wanted ERD ceiling 2.125 17/8", text)
         self.assertIn("available ERD bound 2.250 18/8", text)
         self.assertNotIn("3/2", text)
@@ -626,8 +646,45 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("solved CIGAR 1.875", text)
+        self.assertIn("solved CIGAR/1.875", text)
         self.assertNotIn("solution not recorded", text)
+
+    def test_finalization_spine_and_solved_text_agree_on_the_asterisk(self):
+        # A structured spine (what collect_branch_report now emits) must star
+        # the same word the "solved" line stars -- not one starred and the
+        # other bare, which is the inconsistency a flat-string spine caused.
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.recent_finalizations[0]={
+            ...branch.data.recent_finalizations[0],
+            spine:[{word:'slate',pattern:'g----',word_is_answer:false},
+                   {word:'crane',pattern:'-----',word_is_answer:true}],
+            best_guess:'crane',
+            best_guess_is_answer:true,
+            best_erd:1.875,
+          };
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+        card = self.page.locator(
+            "section:has-text('Recent finalizations') .card"
+        ).first.inner_text()
+        self.assertIn("SLATE", card)
+        self.assertIn("solved CRANE*/1.875", card)
+        # Every occurrence of the word carries the star -- none bare.
+        self.assertEqual(card.count("CRANE"), card.count("CRANE*"))
+
+    def test_queue_card_omits_the_spine_block_for_a_root_branch(self):
+        # A root-level branch (no source word/pattern, no stored spine) now
+        # gets spine: [] from the backend instead of spine: null -- an empty
+        # array is truthy, so the card must check length, not presence, or
+        # it appends a childless, still-margined .tiles div.
+        tiles_count = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/queue')).json();
+          report.data.rows=[{...report.data.rows[0],spine:[]}];
+          applyReport(report,null,{...__reportClient.getState(),kind:'queue'});
+          return document.querySelectorAll('.card .tiles').length;
+        }""")
+        self.assertEqual(tiles_count, 0)
 
     def test_old_epoch_finalizations_are_marked_historical(self):
         self.page.evaluate("""async () => {

@@ -375,6 +375,49 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["data"]["branches"], [])
         self.assertEqual(report["data"]["workers"], [])
 
+    def test_answer_list_failure_only_degrades_the_answer_asterisk(self):
+        # Queue/tree/hotspot reports use the answer list purely to decorate
+        # words with word_is_answer/best_guess_is_answer -- they are fully
+        # meaningful without it. A missing or unreadable answer list must
+        # cost only that decoration, not the report, and must never be
+        # blamed on the (perfectly healthy) queue database.
+        branch_key = ScoreCache.encode_subset(ANSWERS[:3])
+        queue = self._open_queue()
+        queue.create_branch(
+            branch_key, 3, 5, source_word="salet", source_pattern=0,
+            budget=4, spine="salet ----- crane y----",
+        )
+        queue._conn.execute(
+            "UPDATE active_branches SET best_guess = 'crane', best_erd = 2.25 "
+            "WHERE branch_id = ?",
+            (queue._intern_branch(branch_key),),
+        )
+        queue.close()
+
+        with patch("report_model.load_word_list", side_effect=OSError("missing answers")):
+            queue_report = collect_report(self.sources, ReportRequest(report_kind="queue"))
+            tree_report = collect_report(self.sources, ReportRequest(tree=True))
+            hotspot_report = collect_report(self.sources, ReportRequest(report_kind="hotspots"))
+
+        for report in (queue_report, tree_report, hotspot_report):
+            self.assertTrue(report["sources"]["queue"]["ok"])
+            self.assertIsNone(report["sources"]["queue"]["error"])
+
+        # crane is a real answer word, but with the answer list unreadable
+        # neither the spine step nor the best guess can be starred.
+        row = queue_report["data"]["rows"][0]
+        self.assertEqual(row["spine"][1]["word"], "crane")
+        self.assertFalse(row["spine"][1]["word_is_answer"])
+        self.assertEqual(row["best_guess"], "crane")
+        self.assertFalse(row["best_guess_is_answer"])
+
+        root_step = tree_report["data"]["nodes"][0]["step"]
+        self.assertEqual(root_step["word"], "salet")
+        self.assertFalse(root_step["word_is_answer"])
+
+        self.assertEqual(hotspot_report["data"]["rows"][0]["best_guess"], "crane")
+        self.assertFalse(hotspot_report["data"]["rows"][0]["best_guess_is_answer"])
+
     def test_queue_collection_error_does_not_relabel_attached_telemetry(self):
         with patch.object(
             ERDQueue, "counts_by_status",
