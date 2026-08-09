@@ -281,6 +281,26 @@ class TestBestERDGuess(CliTestCase):
             wordle.print_status(self.gs)
         self.assertIn("3.142 TRACE", out.getvalue())
 
+    def test_status_line_stars_a_best_guess_that_is_an_answer(self):
+        # trace is in ANSWERS -- the status line must star it even though
+        # nothing else (e.g. cmd_grid) has run yet to prime the display
+        # context print_status relies on.
+        self._cache_erd("trace")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            wordle.print_status(self.gs)
+        self.assertIn("3.142 TRACE*", out.getvalue())
+
+    def test_status_line_does_not_star_a_guess_only_best_guess(self):
+        # brain is in GUESSES but not ANSWERS.
+        self._cache_erd("brain")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            wordle.print_status(self.gs)
+        text = out.getvalue()
+        self.assertIn("3.142 BRAIN", text)
+        self.assertNotIn("BRAIN*", text)
+
 
 class TestCmdGuessDefault(CliTestCase):
     def _cache_erd(self, word, score=3.142):
