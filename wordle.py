@@ -2632,6 +2632,7 @@ def print_status(gs, solver=None):
     print(f'\n{"=" * get_display_width()}')
     if gs.single:
         soln = gs.solutions[0]
+        set_display_context(soln)
         if soln.answer_word:
             with colored_text("yellow"):
                 print(f"Sim: {soln.answer_word.upper()}")
@@ -2658,7 +2659,7 @@ def print_status(gs, solver=None):
             scan_lines = []
             hit = _best_erd_guess(gs, soln)
             if hit is not None:
-                line += f' | {hit[1]:.3f} {hit[0].upper()}'
+                line += f' | {hit[1]:.3f} {hit[0].upper()}{_mark(hit[0])}'
             elif solver is not None and set(solver._words) == set(words):
                 if solver.root_total == 0:
                     scan_lines = ['ERD: ordering candidates...']
