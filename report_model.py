@@ -339,12 +339,16 @@ def resolve_branch_reference(queue, digest_prefix, cache=None) -> dict:
 
 
 def collect_ambiguous_branch_reference_report(sources, request, error):
+    answer_set = _decorative_answer_set(sources)
     candidates = []
     for candidate in error.candidates:
         answer_words = sorted(_decode_branch_key(candidate["branch_key"]))
         candidates.append({
             "branch_reference": candidate["branch_reference"],
-            "spine": candidate["spine"],
+            "spine": [
+                _step_payload(step, answer_set)
+                for step in _spine_steps(candidate["spine"])
+            ],
             "answer_count": len(answer_words),
             "answer_preview": answer_words[:3],
         })
@@ -863,6 +867,20 @@ def _is_answer(word, answer_set):
     return bool(word and word.lower() in answer_set)
 
 
+def _decorative_answer_set(sources):
+    """Answer set for word_is_answer decoration, empty if unreadable.
+
+    Queue/tree/hotspot reports are fully meaningful without an answer list --
+    it only decorates words with '*'. A missing or unreadable answer list
+    here must cost the decoration, not the report: it is not a queue or
+    cache failure and must never be attributed to either source.
+    """
+    try:
+        return set(load_word_list(sources.answer_list_path))
+    except OSError:
+        return frozenset()
+
+
 def _step_payload(step, answer_set):
     return {
         "word": step.word,
@@ -1322,6 +1340,10 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         branch_telemetry["recent_finalizations"] = [
             {
                 **row,
+                "spine": [
+                    _step_payload(step, answer_set)
+                    for step in _spine_steps(row["spine"])
+                ],
                 "best_guess_is_answer": _is_answer(row["best_guess"], answer_set),
             }
             for row in branch_telemetry["recent_finalizations"]
@@ -1548,13 +1570,13 @@ def _scoped_queue_rows(queue, request, apply_filters=True):
 
 def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
+    answer_set = _decorative_answer_set(sources)
     data = {"summary": {}, "matched_rows": 0, "rows": []}
     report = _semantic_report(
         "queue", sources, request.branch_target, generated_at, data, request
     )
     queue = None
     try:
-        answer_set = set(load_word_list(sources.answer_list_path))
         queue = _open_report_queue(sources)
         rows, _prefix = _scoped_queue_rows(queue, request)
         data["summary"] = _collection_summary(rows)
@@ -1721,6 +1743,7 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
 
 def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
+    answer_set = _decorative_answer_set(sources)
     inferred_kind = request.report_kind
     if inferred_kind == "auto":
         inferred_kind = "queue" if request.branch_target.kind == "root" else request.branch_target.kind
@@ -1738,7 +1761,6 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
     )
     queue = None
     try:
-        answer_set = set(load_word_list(sources.answer_list_path))
         queue = _open_report_queue(sources)
         filtered_rows, prefix = _scoped_queue_rows(queue, request, True)
         unfiltered_rows = filtered_rows
@@ -2084,6 +2106,7 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
 
 def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
+    answer_set = _decorative_answer_set(sources)
     field = request.hotspot_field or "nodes"
     since_seconds = request.since_seconds or 3600
     sample_size = min(request.sample_size or 50_000, 1_000_000)
@@ -2103,7 +2126,6 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     )
     queue = None
     try:
-        answer_set = set(load_word_list(sources.answer_list_path))
         queue = _open_report_queue(sources)
         epoch = queue.epoch if request.epoch is None else request.epoch
         current_fields = {"nodes", "age", "size", "workers", "priority", "slowest"}

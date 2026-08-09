@@ -1374,7 +1374,8 @@ def _render_hotspot_sections(report, width, display_order):
         metrics = ", ".join(
             f"{key}={_format_metric_value(key, value)}" for key, value in row.items()
             if key not in (
-                "row_id", "branch_key_hex", "branch_reference", "spine"
+                "row_id", "branch_key_hex", "branch_reference", "spine",
+                "best_guess_is_answer",
             )
         )
         lines.append(_fit(f"  {hotkey_prefix}{identity}  {metrics}", width))

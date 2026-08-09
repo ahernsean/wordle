@@ -416,7 +416,7 @@
       const title=element("div","card-title");
       title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));
       card.append(title);
-      if(row.spine)card.append(renderSpine(Array.isArray(row.spine)?row.spine:spineFromText(row.spine)));
+      if(row.spine?.length)card.append(renderSpine(Array.isArray(row.spine)?row.spine:spineFromText(row.spine)));
       const parts=[];
       if(row.candidate_count){const line=element("div","progress-line");const fill=Array.isArray(row.completed_candidate_indexes)?sweepStrip(row.candidate_count,row.completed_candidate_indexes,branchWorkers,previousWorkersById):progress(row.completed_candidate_count,row.candidate_count);line.append(fill);card.append(line);parts.push(numText(row.completed_candidate_count)+"/"+numText(row.candidate_count)+" cands");}
       parts.push(numText(row.answer_count)+(row.answer_count===1?" answer":" answers"));
@@ -552,7 +552,7 @@
           title.append(element("h3","",outcomeTitle));
           if(historical)title.append(element("span","chip historical","Historical"));
           card.append(title);
-          const spineSteps=spineFromText(row.spine);
+          const spineSteps=Array.isArray(row.spine)?row.spine:spineFromText(row.spine);
           card.append(spineSteps.length?renderSpine(spineSteps):element("div","dim","spine unknown"));
           card.append(statLine(["budget "+valueOrDash(row.budget),"epoch "+valueOrDash(row.epoch),relativeAge(row.recorded_at,report.generated_at)]));
           const facts=[];
@@ -637,7 +637,7 @@
       }
       return fragment;
     }
-    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=element("div","grid");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine)card.append(renderSpine(spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
+    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=element("div","grid");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
     /* Sibling nodes in payload order, gathered under the word that was played.
        A node with no recorded guess has no word to gather under and stands
        alone under a null key. */
