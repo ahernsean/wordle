@@ -1569,6 +1569,27 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.evaluate("() => window.__copiedText"), selected["text"])
 
+    def test_rendered_views_mark_answers_on_colored_and_heading_tiles(self):
+        # Guards the coverage hole the fixtures used to have: every answer flag
+        # sat on a small unplayed tile, so a notch that failed on a response
+        # color or at heading size would have gone unseen.
+        self.page.goto(self.base_url + "?branch_target=CACHE")
+        self.page.wait_for_selector("h2 .word")
+        heading = self.page.locator("h2 .word").first
+        self.assertTrue(self.answer_notch(heading))
+        self.assertIn("word-lg", heading.get_attribute("class"))
+        group = self.page.locator(".grid .card .word").first
+        self.assertTrue(self.answer_notch(group))
+        self.assertGreater(
+            group.locator(".letter.g, .letter.y, .letter:not(.blank)").count(), 0)
+
+        self.page.goto(self.base_url)
+        self.page.wait_for_selector(".card .tiles .word")
+        colored = self.page.locator(
+            ".card .tiles .word:has(.letter.y), .card .tiles .word:has(.letter.g)"
+        ).first
+        self.assertTrue(self.answer_notch(colored))
+
     def test_no_horizontal_scroll_at_required_widths(self):
         # Every view, not just whichever one setUp left loaded: the tree view
         # reached phone widths overflowing because it was never measured here.
