@@ -90,11 +90,50 @@
     .chip.loss, .outcome-loss { border-color:var(--red); color:#a32c2c; }
     .chip.historical { border-color:var(--dim); color:var(--dim); background:#ffffff; }
     .card.historical { border-style:dashed; background:#f3f4f6; }
-    .tiles { display:flex; flex-wrap:wrap; gap:.15rem .5rem; align-items:center; margin:.2rem 0; }
+    /* A spine is one row of guesses or a column of them, never a ragged mix:
+       it lays out on a single row, and layoutSpines drops the whole spine to a
+       column when that row will not fit.  Guesses are separated by well more
+       than the gap between letters, so a row reads as distinct words. */
+    .tiles { display:flex; flex-wrap:nowrap; overflow:hidden; gap:.3rem 1rem; align-items:center; margin:.2rem 0; }
+    .tiles.stacked { flex-direction:column; align-items:flex-start; overflow:visible; }
     .step-group { display:inline-flex; gap:.3rem; align-items:center; white-space:nowrap; }
     .step { display:inline-flex; gap:.1rem; white-space:nowrap; }
-    .tile { display:inline-grid; place-items:center; width:1.15rem; height:1.15rem; font-size:.75rem; font-weight:bold; color:white; background:var(--gray); }
-    .tile.g { background:var(--green); } .tile.y { background:var(--yellow); }
+    /* A guess is drawn as its five letters over the colors of its response:
+       one square tile per letter, no corner radius, gap and letter size both
+       proportional to the tile.  Sizes are held on whole pixels -- a fractional
+       tile height puts the centered line box on a fraction and the glyph then
+       snaps up to a pixel off center. */
+    :root { --tile-base:15px; --tile-gap-ratio:.07; --tile-font-ratio:.62; --tile-outline-ratio:.023; --tile-notch-ratio:.38; --tile-notch-inset:max(1px,calc(var(--tile-base) * .07)); }
+    .word-sm { --tile:var(--tile-base); }
+    .word-md { --tile:round(calc(var(--tile-base) * 1.3),1px); }
+    .word-lg { --tile:round(calc(var(--tile-base) * 1.8),1px); }
+    /* Nothing inside a word is a flex or grid item: those are blockified, and a
+       block serializes with a line break, which would make a copied word arrive
+       as one letter per line.  font-size:0 on the row keeps any whitespace
+       between tiles from opening a gap of its own. */
+    .word { display:inline-block; white-space:nowrap; font-size:0; }
+    /* No vertical-align: the tile's single line box fills its height, so the
+       letters carry a real text baseline and the row inherits it.  Default
+       baseline alignment then seats the tile letters on the baseline of the
+       text beside them at every scale.  padding-top carries the centering
+       correction measured in centerLetters -- it moves the glyph without
+       moving the tile behind it. */
+    .word > .letter { position:relative; display:inline-block; text-align:center; width:var(--tile); height:var(--tile); line-height:var(--tile); padding-top:var(--letter-shift,0px); margin-right:calc(var(--tile) * var(--tile-gap-ratio)); font-family:"Helvetica Neue",Helvetica,Arial,sans-serif; font-size:calc(var(--tile) * var(--tile-font-ratio)); font-weight:700; color:#ffffff; background:var(--gray); text-transform:uppercase; }
+    .word > .letter:nth-child(5) { margin-right:0; }
+    .word > .letter.g { background:var(--green); } .word > .letter.y { background:var(--yellow); }
+    /* A guess with no response is the unplayed tile: white, gray outline, dark
+       letters.  The outline is inset so the tile keeps the same outer box as a
+       colored one and rows of both sit on a shared grid. */
+    .word > .letter.blank { background:#ffffff; color:var(--text); box-shadow:inset 0 0 0 max(1px,calc(var(--tile) * var(--tile-outline-ratio))) #878a8c; }
+    /* A guess that is itself a possible answer is notched at the corner of its
+       last tile.  currentColor is already the tile's letter color, so one rule
+       covers every tone.  The notch is held off the corner: flush to the edge,
+       a white notch on a colored tile merges with the page behind it and reads
+       as a bite out of the tile rather than a mark on it. */
+    .word.is-answer > .letter:nth-child(5)::after { content:""; position:absolute; top:var(--tile-notch-inset); right:var(--tile-notch-inset); border-top:calc(var(--tile) * var(--tile-notch-ratio)) solid currentColor; border-left:calc(var(--tile) * var(--tile-notch-ratio)) solid transparent; }
+    /* A word and the ERD it earned are one unit: the tiles butt against the
+       slash, and the pair never breaks across a line. */
+    .word-erd { white-space:nowrap; }
     .progress-line { margin:.25rem 0; }
     .progress { height:.3rem; border-radius:999px; background:var(--border); overflow:hidden; }
     .progress > span { display:block; height:100%; background:var(--green); }
@@ -235,16 +274,6 @@
       return navigator.clipboard.writeText(text).then(()=>true,()=>fallback());
     }
     const workerName=worker=>{const number=String(worker.worker_number??String(worker.worker_id).split("-").pop());return /^[0-9]+$/.test(number)?"w"+number:String(worker.worker_id);};
-    const candidateText=(word,isAnswer)=>word?String(word).toUpperCase()+(isAnswer?"*":""):"—";
-    // The canonical word/ERD pairing: WORD*/2.809, never a word and its ERD
-    // shown as two separately labeled facts.
-    const candidateErdText=(word,isAnswer,erdVal,answerCount,options)=>{
-      if(!word)return null;
-      let text=candidateText(word,isAnswer);
-      if(erdVal!==null&&erdVal!==undefined)text+="/"+erdValue(erdVal,answerCount,options);
-      return text;
-    };
-    const bestGuessEntry=(row,answerCount=row.answer_count)=>candidateErdText(row.best_guess,row.best_guess_is_answer,row.best_erd,answerCount);
     const bool=value=>value==="1"||value==="true";
     const intOrNull=value=>{if(value===null||value===""||value===undefined)return null;const parsed=Number.parseInt(value,10);return Number.isFinite(parsed)?parsed:null;};
     const branchValues=(value,allowed)=>value===undefined?undefined:[...(value||[])].filter(item=>allowed.includes(item));
@@ -362,8 +391,100 @@
     // a rendered object rather than only text.
     function labeledFacts(values){const node=element("div","labeled-facts");for(const [key,value] of values){if(value===null||value===undefined||value==="")continue;const fact=element("span","fact"),cell=element("span","");if(value instanceof Node)cell.append(value);else cell.textContent=valueOrDash(value);fact.append(element("span","fact-label",key)," ",cell);node.append(fact);}return node;}
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
-    function patternTiles(pattern){const step=element("span","step");for(const character of pattern||"?????")step.append(element("span","tile "+(character==="g"?"g":character==="y"?"y":""),character));return step;}
-    function renderSpine(spine){const node=element("div","tiles");for(const step of spine||[]){const group=element("span","step-group");group.append(element("span","",step.word?candidateText(step.word,step.word_is_answer):"?"),patternTiles(step.pattern));node.append(group);}return node;}
+    // The canonical spine language, the same one the branch target box parses:
+    // a word, then its response, alternating, space separated.  A word with no
+    // response contributes only itself, which is a legal trailing token.
+    const spineToken=(word,pattern)=>String(word||"").toUpperCase()+(pattern?" "+String(pattern).toLowerCase():"");
+    const spineText=steps=>(steps||[]).map(step=>spineToken(step.word,step.pattern)).join(" ");
+    // A guess and its response drawn as one object: the letters of the word
+    // over the colors of the pattern.  With no pattern the tiles are blank --
+    // a word that was named but never played.  data-spine carries the text the
+    // word copies as, so a selection can be pasted straight back into the
+    // branch target box.
+    function wordTiles(word,pattern,isAnswer,sizeClass="word-sm"){
+      const node=element("span","word "+sizeClass+(isAnswer?" is-answer":""));
+      node.dataset.spine=spineToken(word,pattern);
+      if(isAnswer)node.title=String(word).toUpperCase()+" is in the answer set";
+      const letters=String(word||"?????").toUpperCase().padEnd(5," ").slice(0,5);
+      const responses=pattern?String(pattern):null;
+      for(let index=0;index<letters.length;index++){
+        const character=responses?responses[index]:null;
+        const tone=character==="g"?"g":character==="y"?"y":responses?"":"blank";
+        node.append(element("span","letter "+tone,letters[index]===" "?"":letters[index]));
+      }
+      return node;
+    }
+    // The word/ERD pairing as one node: tiles for the word, text for the ERD it
+    // earned, never split across a line.
+    function bestGuessCell(row,answerCount=row.answer_count,prefix=""){
+      if(!row.best_guess)return null;
+      const cell=element("span","word-erd");
+      if(prefix)cell.append(prefix);
+      cell.append(wordTiles(row.best_guess,null,row.best_guess_is_answer));
+      if(row.best_erd!==null&&row.best_erd!==undefined)cell.append("/"+erdValue(row.best_erd,answerCount));
+      return cell;
+    }
+    // The browser rounds a font's ascent and descent to whole pixels and snaps
+    // the baseline it derives from them to a whole pixel, which can leave a
+    // capital up to a pixel off center in its tile -- worst at the smallest
+    // size.  Rasterizing a few flat capitals large and scanning for their ink
+    // gives the baseline the tile actually wants; canvas reports its own text
+    // metrics rounded to whole pixels, which is far too coarse to center on.
+    function capitalInkRatio(fontWeight,fontFamily){
+      const size=600,box=1200,canvas=document.createElement("canvas");
+      canvas.width=canvas.height=box;
+      const context=canvas.getContext("2d",{willReadFrequently:true});
+      if(!context)return null;
+      context.fillStyle="#ffffff";context.fillRect(0,0,box,box);
+      context.fillStyle="#000000";
+      context.font=fontWeight+" "+size+"px "+fontFamily;
+      context.textBaseline="alphabetic";
+      const baseline=900;
+      context.fillText("HETIL",40,baseline);
+      const pixels=context.getImageData(0,0,box,box).data;
+      let top=null,bottom=null;
+      for(let y=0;y<box;y++){
+        let inked=false;
+        for(let x=0;x<box;x++)if(pixels[(y*box+x)*4]<128){inked=true;break;}
+        if(inked){if(top===null)top=y;bottom=y;}
+      }
+      if(top===null)return null;
+      return {ascent:(baseline-top)/size,descent:(bottom+1-baseline)/size};
+    }
+    let letterShiftApplied=false;
+    function centerLetters(){
+      if(letterShiftApplied)return;
+      const rules=[];
+      for(const name of ["word-sm","word-md","word-lg"]){
+        const sample=element("span","word "+name);sample.append(element("span","letter","H"));
+        sample.style.cssText="position:absolute;visibility:hidden";
+        document.body.append(sample);
+        const cell=sample.firstChild,style=getComputedStyle(cell);
+        const ink=capitalInkRatio(style.fontWeight,style.fontFamily);
+        if(!ink){sample.remove();return;}
+        const tile=parseFloat(style.height),fontSize=parseFloat(style.fontSize);
+        const marker=element("span","");marker.style.cssText="display:inline-block;width:0;height:0";
+        cell.append(marker);
+        const currentBaseline=marker.getBoundingClientRect().top-cell.getBoundingClientRect().top;
+        sample.remove();
+        const wanted=(tile+(ink.ascent-ink.descent)*fontSize)/2;
+        rules.push("."+name+"{--letter-shift:"+(wanted-currentBaseline).toFixed(2)+"px}");
+      }
+      letterShiftApplied=true;
+      const sheet=document.createElement("style");sheet.textContent=rules.join("");
+      document.head.append(sheet);
+    }
+    // A spine is a single row of guesses when that row fits and a column of them
+    // when it does not, never some across and the rest wrapped onto a second
+    // row.  Measured after insertion, so it re-decides on every repaint and
+    // whenever the viewport changes.
+    function layoutSpines(root){
+      for(const spine of root.querySelectorAll(".tiles")){
+        spine.classList.remove("stacked");
+        if(spine.scrollWidth>spine.clientWidth)spine.classList.add("stacked");
+      }
+    }
+    function renderSpine(spine,sizeClass="word-md"){const node=element("div","tiles");for(const step of spine||[]){node.append(wordTiles(step.word,step.pattern,step.word_is_answer,sizeClass));}return node;}
     function spineFromText(text){const parts=String(text||"").trim().split(/\s+/).filter(Boolean);const steps=[];for(let i=0;i+1<parts.length;i+=2)steps.push({word:parts[i],pattern:parts[i+1]});return steps;}
     function branchContextSummary(worker){
       if(Array.isArray(worker.branch_context)&&worker.branch_context.length){
@@ -410,10 +531,7 @@
       if(report.tree){meta.append(element("span","dim","snapshot "+absoluteTime(report.generated_at)));const refreshButton=element("button","","Refresh tree");refreshButton.addEventListener("click",refreshTreeSnapshot);meta.append(refreshButton);}
       if(!(report.tree&&report.report_kind==="queue")){const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.open=sourcePathsOpen;details.addEventListener("toggle",()=>{sourcePathsOpen=details.open;});details.append(summary);for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);}return meta;
     }
-    function bestText(row){
-      const pair=bestGuessEntry(row);
-      return pair?"best "+pair:null;
-    }
+    function bestText(row,answerCount=row.answer_count){return bestGuessCell(row,answerCount,"best ");}
     function cardForBranch(row,previous,branchWorkers=[],previousWorkersById=null){
       const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previous));card.dataset.identity=row.branch_key_hex;
       const title=element("div","card-title");
@@ -444,7 +562,7 @@
       const stateClass=["dead","transitioning","finalizing","stale"].includes(workerState)?workerState:"";
       const card=element("article",("card worker "+stateClass+" "+workerChangeClass(worker,previous)).trim());card.dataset.identity=worker.worker_id;
       const title=element("div","card-title");
-      title.append(element("strong","",workerName(worker)),element("span","chip",workerState),element("span","",candidateText(worker.current_candidate,worker.current_candidate_is_answer)));
+      title.append(element("strong","",workerName(worker)),element("span","chip",workerState),worker.current_candidate?wordTiles(worker.current_candidate,null,worker.current_candidate_is_answer):element("span","dim","\u2014"));
       card.append(title);
       const parts=[];
       if(worker.current_max_guess_depth!==null&&worker.current_max_guess_depth!==undefined)parts.push("d"+worker.current_max_guess_depth);
@@ -517,12 +635,12 @@
       const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at));fragment.append(workers);return fragment;
     }
     function renderWord(report,previous,state){
-      const fragment=document.createDocumentFragment(),data=report.data;fragment.append(element("h2","",candidateText(data.word,data.word_is_answer)),renderSpine(data.context?.spine));
+      const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading,renderSpine(data.context?.spine));
       const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+erd.infeasible_group_count+" of "+erd.response_group_count+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+erd.resolved_group_count+" of "+erd.response_group_count+" response groups solved"));}}
       const groupCountLabels={response_group_count:"response groups",trivial_response_group_count:"trivial",queued_response_group_count:"queued",active_response_group_count:"active",exact_response_group_count:"exact",loss_response_group_count:"loss",missing_response_group_count:"missing"};
       const summary=element("div","metrics");for(const [key,value] of Object.entries(data.response_group_counts||{}))summary.append(metric(groupCountLabels[key]||label(key),value));fragment.append(summary);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??data.response_group_counts?.response_group_count??matchedRows;fragment.append(element("p","dim","Shown "+shownRows.length+" of "+matchedRows+" matched · "+totalRows+" total response groups"));
-      const grid=element("div","grid"),previousRows=previousBy(previous,"response_groups","branch_key_hex");for(const row of ordered(shownRows,"branch_key_hex","response-groups",state)){const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;const title=element("div","card-title");title.append(patternTiles(row.pattern),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));card.append(title);const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+valueOrDash(row.cache_state)];const best=bestText(row);if(best)parts.push(best);if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)parts.push("max remaining depth "+row.max_remaining_depth);if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));parts.push("@"+shortReference(valueOrDash(row.branch_reference)));card.append(statLine(parts));card.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:(state.branch_target+" "+row.pattern).trim(),tree:false,finalization_cursor:""}));grid.append(card);}fragment.append(grid);return fragment;
+      const grid=element("div","grid"),previousRows=previousBy(previous,"response_groups","branch_key_hex");for(const row of ordered(shownRows,"branch_key_hex","response-groups",state)){const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;const title=element("div","card-title");title.append(wordTiles(data.word,row.pattern,data.word_is_answer,"word-md"),element("span","chip",valueOrDash(row.branch_status)),element("span","chip",valueOrDash(row.branch_phase)));card.append(title);const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+valueOrDash(row.cache_state)];const best=bestText(row);if(best)parts.push(best);if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)parts.push("max remaining depth "+row.max_remaining_depth);if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));parts.push("@"+shortReference(valueOrDash(row.branch_reference)));card.append(statLine(parts));card.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:(state.branch_target+" "+row.pattern).trim(),tree:false,finalization_cursor:""}));grid.append(card);}fragment.append(grid);return fragment;
     }
     function section(title,content,className=""){const node=element("section","section "+className);node.append(element("h2","",title));if(content)node.append(content);return node;}
     function renderBranch(report,previous,state){
@@ -530,8 +648,8 @@
       const identityMetrics=element("div","metrics");
       identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
       fragment.append(section("Identity",identityMetrics));
-      if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine"),spineText=branch.spine.flatMap(step=>[step.word,step.pattern]).join(" ");copyButton.addEventListener("click",()=>copyText(spineText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));spineSection.append(copyButton);fragment.append(spineSection);}
-      fragment.append(section("Queue",data.queue?labeledFacts([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",bestGuessEntry(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
+      if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine"),spineTargetText=spineText(branch.spine);copyButton.addEventListener("click",()=>copyText(spineTargetText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));spineSection.append(copyButton);fragment.append(spineSection);}
+      fragment.append(section("Queue",data.queue?labeledFacts([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
       fragment.append(section("Cache",labeledFacts(candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at))));
       const ownership=data.branch_ownership||{};
@@ -561,7 +679,7 @@
           const facts=[];
           if(row.outcome==="exact"){
             if(row.best_guess){
-              facts.push("solved "+bestGuessEntry(row));
+              facts.push(bestGuessCell(row,row.answer_count,"solved "));
             }else{
               facts.push("solution not recorded");
             }
@@ -662,7 +780,7 @@
       const pageKey=parentSpine=>parentSpine||"__root__";
       const pageSize=()=>state.limit||10;
       const buildPager=({summary,previous,next})=>{const pager=element("div","tree-pager dim");pager.append(element("span","",summary));const pageSizeLabel=element("label","dim","Items per page "),pageSizeSelect=element("select","tree-page-size");for(const size of [10,25,50,100]){const option=element("option","",String(size));option.value=String(size);option.selected=size===pageSize();pageSizeSelect.append(option);}pageSizeSelect.addEventListener("change",()=>{pageSizeSelect.blur();treeGroupPages.clear();treePageHistory.clear();initializedNodes.clear();collapsedNodes.clear();initializedWordGroups.clear();collapsedWordGroups.clear();setState({...currentState,limit:Number(pageSizeSelect.value),tree_cursor:null},false);});pageSizeLabel.append(pageSizeSelect);pager.append(pageSizeLabel);if(previous){const previousButton=element("button","","Previous");previousButton.addEventListener("click",previous);pager.append(previousButton);}if(next){const nextButton=element("button","","Next");nextButton.addEventListener("click",next);pager.append(nextButton);}return pager;};
-      const build=(node,carriesWord=true)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const summary=element(node.has_children?"summary":"div","clickable"),labelText=node.step?candidateText(node.step.word,node.step.word_is_answer):"?",headGroup=element("span","step-group");if(carriesWord)headGroup.append(element("span","",labelText));if(node.step)headGroup.append(patternTiles(node.step.pattern));summary.append(headGroup);const facts=element("span","dim inline-facts"),factValues=["d"+node.guess_depth,valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase),valueOrDash(node.answer_count)+" answers",valueOrDash(node.worker_count)+" workers",valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count)];if(node.has_children)factValues.push(node.child_count+" child branches",node.subtree_worker_count+" workers in subtree");if(node.priority!==null&&node.priority!==undefined)factValues.push("priority "+numText(node.priority));factValues.push(node.branch_reference?"@"+shortReference(node.branch_reference):"structure");for(const fact of factValues)facts.append(element("span","",fact));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});headGroup.append(openButton);}summary.append(facts);if(!node.has_children){item.append(summary);return item;}const details=element("details","tree-branch");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const childHost=element("div","tree-children");details.addEventListener("toggle",()=>{details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id);if(details.open&&!details.dataset.childrenLoaded&&node.spine){details.dataset.childrenLoaded="1";loadPage(node.spine,null,childHost);}});details.append(summary,childHost);item.append(details);return item;};
+      const build=(node,carriesWord=true)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const summary=element(node.has_children?"summary":"div","clickable"),headGroup=element("span","step-group");headGroup.append(node.step?wordTiles(node.step.word,node.step.pattern,node.step.word_is_answer):element("span","dim","?"));summary.append(headGroup);const facts=element("span","dim inline-facts"),factValues=["d"+node.guess_depth,valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase),valueOrDash(node.answer_count)+" answers",valueOrDash(node.worker_count)+" workers",valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count)];if(node.has_children)factValues.push(node.child_count+" child branches",node.subtree_worker_count+" workers in subtree");if(node.priority!==null&&node.priority!==undefined)factValues.push("priority "+numText(node.priority));factValues.push(node.branch_reference?"@"+shortReference(node.branch_reference):"structure");for(const fact of factValues)facts.append(element("span","",fact));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});headGroup.append(openButton);}summary.append(facts);if(!node.has_children){item.append(summary);return item;}const details=element("details","tree-branch");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const childHost=element("div","tree-children");details.addEventListener("toggle",()=>{details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id);if(details.open&&!details.dataset.childrenLoaded&&node.spine){details.dataset.childrenLoaded="1";loadPage(node.spine,null,childHost);}});details.append(summary,childHost);item.append(details);return item;};
       // Every word is a group at every level, including the one-pattern case:
       // the word is named once and its response patterns are the rows beneath
       // it.  Collapse state is keyed by parent, so the same word appearing
@@ -682,7 +800,7 @@
           item.dataset.identity="word-group:"+groupKey;
           const details=element("details");if(!initializedWordGroups.has(groupKey)){initializedWordGroups.add(groupKey);collapsedWordGroups.add(groupKey);}details.open=!collapsedWordGroups.has(groupKey);
           const summary=element("summary","clickable");
-          const subtreeWorkerCount=groupNodes.reduce((total,node)=>total+(node.subtree_worker_count||0),0);summary.append(element("span","",candidateText(word,groupNodes[0].step&&groupNodes[0].step.word_is_answer)),element("span","dim"," "+numText(groupNodes.length)+(groupNodes.length===1?" branch":" branches")+" · "+numText(subtreeWorkerCount)+(subtreeWorkerCount===1?" worker":" workers")));
+          const subtreeWorkerCount=groupNodes.reduce((total,node)=>total+(node.subtree_worker_count||0),0);summary.append(wordTiles(word,null,groupNodes[0].step&&groupNodes[0].step.word_is_answer,"word-md"),element("span","dim"," "+numText(groupNodes.length)+(groupNodes.length===1?" branch":" branches")+" · "+numText(subtreeWorkerCount)+(subtreeWorkerCount===1?" worker":" workers")));
           details.addEventListener("toggle",()=>details.open?collapsedWordGroups.delete(groupKey):collapsedWordGroups.add(groupKey));
           details.append(summary,buildPatternPage(groupNodes,groupKey));item.append(details);list.append(item);
         }
@@ -704,7 +822,7 @@
       for(const [key,value] of Object.entries(row||{})){
         if(skip.has(key))continue;
         if(key==="best_erd"&&row.best_guess)continue;
-        if(key==="best_guess"){const pair=bestGuessEntry(row,answerCount);if(pair)entries.push([timeLabel(key),pair]);continue;}
+        if(key==="best_guess"){const pair=bestGuessCell(row,answerCount);if(pair)entries.push([timeLabel(key),pair]);continue;}
         entries.push([timeLabel(key),key==="best_erd"?erdValue(value,answerCount):displayTimedValue(key,value,generatedAt)]);
       }
       return entries;
@@ -718,7 +836,7 @@
       fragment.append(element("p","dim","Ranked by ERD · showing "+rows.length+" of "+(data.total_rows??rows.length)+" complete"));
       if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
       const grid=element("div","grid"),previousRows=previousBy(previous,"rows","word");
-      for(const row of rows){const card=element("article","card "+changeClass(row,previousRows.get(String(row.word))));card.dataset.identity=row.word;const title=element("div","card-title");title.append(element("span","chip","#"+row.rank),element("span","",candidateErdText(row.word,row.word_is_answer,row.erd,null)));card.append(title,statLine(["max remaining depth "+row.max_remaining_depth]));grid.append(card);}
+      for(const row of rows){const card=element("article","card "+changeClass(row,previousRows.get(String(row.word))));card.dataset.identity=row.word;const title=element("div","card-title");const entry=element("span","word-erd");entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","chip","#"+row.rank),entry);card.append(title,statLine(["max remaining depth "+row.max_remaining_depth]));grid.append(card);}
       fragment.append(grid);return fragment;
     }
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
@@ -775,7 +893,7 @@
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;
-      root.replaceChildren(content);animateSweepMarkers(root);animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
@@ -869,6 +987,7 @@
       document.addEventListener("click",event=>{if(!connWrap.contains(event.target))setRefreshOpen(false);});
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
+      addEventListener("resize",()=>layoutSpines(byId("report")));
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.applyReport=applyReport;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
