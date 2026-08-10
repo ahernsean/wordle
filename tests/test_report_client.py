@@ -488,6 +488,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view/workers?worker=worker-0')).json();
           report.data.rows[0].answer_count=8;
+          report.data.rows[0].current_candidate_is_answer=true;
+          report.data.rows[0].best_guess_is_answer=true;
           applyReport(report,null,{...__reportClient.getState(),kind:'workers',worker_id:'worker-0'});
         }""")
 
@@ -495,7 +497,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         for expected in (
             "Current work", "current-claim nodes 900", "nodes/s 46",
             "candidate index 7", "claim started", "Search state",
-            "best CRANE/2.250 18/8", "cache hits 50", "cache misses 10",
+            "candidate NURDY*", "best CRANE*/2.250 18/8", "cache hits 50",
+            "cache misses 10",
             "Open branch",
         ):
             self.assertIn(expected, text)

@@ -525,6 +525,9 @@ def _normalize_worker(row, generated_at, answer_set):
         "erd_cutoff_evaluation_count": _row_value(row, "n_cutoff", 0),
         "remaining_depth_pruned_evaluation_count": _row_value(row, "n_pruned", 0),
         "best_guess": best_guess.lower() if best_guess else None,
+        "best_guess_is_answer": bool(
+            best_guess and best_guess.lower() in answer_set
+        ),
         "best_erd": _row_value(row, "best_erd"),
         "bound_erd": _row_value(row, "bound_erd"),
         "source_work_id": _row_value(row, "source_work_id"),
