@@ -485,12 +485,18 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=Worker w0")
         self.assertIn("kind=workers", self.page.url)
         self.assertIn("worker=worker-0", self.page.url)
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/workers?worker=worker-0')).json();
+          report.data.rows[0].answer_count=8;
+          applyReport(report,null,{...__reportClient.getState(),kind:'workers',worker_id:'worker-0'});
+        }""")
 
         text = self.page.locator("#report").inner_text()
         for expected in (
             "Current work", "current-claim nodes 900", "nodes/s 46",
             "candidate index 7", "claim started", "Search state",
-            "cache hits 50", "cache misses 10", "Open branch",
+            "best CRANE/2.250 18/8", "cache hits 50", "cache misses 10",
+            "Open branch",
         ):
             self.assertIn(expected, text)
         self.assertEqual(

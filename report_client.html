@@ -707,7 +707,7 @@
       const work=section("Current work",kv(currentWork));
       if(worker.descent?.length)work.append(renderSpine(worker.descent));
       fragment.append(work);
-      const best=worker.best_guess?worker.best_guess.toUpperCase()+(worker.best_erd===null||worker.best_erd===undefined?"":" / "+fixed(worker.best_erd)):null;
+      const best=worker.best_guess?worker.best_guess.toUpperCase()+(worker.best_erd===null||worker.best_erd===undefined?"":"/"+erdValue(worker.best_erd,worker.answer_count)):null;
       const search=[["best",best],["effective bound",worker.bound_erd===null||worker.bound_erd===undefined?null:fixed(worker.bound_erd)],["solved",worker.solved_evaluation_count],["ERD cutoffs",worker.erd_cutoff_evaluation_count],["depth prunes",worker.remaining_depth_pruned_evaluation_count]];
       fragment.append(section("Search state",kv(search)));
       const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["source work",worker.source_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];

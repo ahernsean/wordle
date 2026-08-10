@@ -1003,6 +1003,7 @@ class SourceReportTest(unittest.TestCase):
             self.sources, ReportRequest(report_kind="workers"))
 
         worker = report["data"]["rows"][0]
+        self.assertEqual(worker["answer_count"], 2)
         self.assertEqual(worker["source_work_id"], source_work_id)
         self.assertEqual(worker["scheduling_role"], "preferred")
 

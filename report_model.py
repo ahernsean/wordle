@@ -495,6 +495,7 @@ def _normalize_worker(row, generated_at, answer_set):
         "worker_id": worker_id,
         "worker_number": _worker_number(worker_id),
         "pid": row["pid"],
+        "answer_count": _row_value(row, "n_words"),
         "updated_at": row["updated_at"],
         "is_live": generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS,
         "branch_reference": branch_reference(branch_key) if branch_key else None,
