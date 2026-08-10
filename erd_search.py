@@ -50,6 +50,15 @@ epoch           Show or change the telemetry epoch used to compare swarm
 queue set-disk-stop
                 Keep the swarm down across reboots and systemd restarts.
 
+queue reconcile-orphaned-ownership
+                Demote open owned branches whose source-work membership was
+                lost while they were still open (see check_source_work_
+                invariants' "source-owned open branch_id ... has no live
+                membership"), making them claimable again.  The run loop
+                self-heals this on every membership resolution; this command
+                is for branches stranded before that (e.g. accumulated while
+                the swarm was down).
+
 For exporting a trimmed cache snapshot to sync to the iPhone, or importing
 one from another machine, see export_cache.py and import_cache.py — the
 cache is shared with interactive play (wordle.py), not swarm-specific.
@@ -612,6 +621,12 @@ def _checkpoint_cache_on_start(cache_path):
 
 
 DISK_SAMPLE_SECONDS = 30
+# Cadence for the supervisor's check_source_work_invariants() sweep.  The
+# reconciliation in _resolve_branch_memberships already demotes routine
+# pruning residue on every membership resolution, so a violation surviving
+# to this sweep is a genuine anomaly worth logging rather than the expected
+# output of alpha-beta pruning.
+INVARIANT_CHECK_SECONDS = 300
 QUEUE_WAL_QUIESCE_BYTES = 2 * 1024 ** 3
 TRUNCATE_RETRY_SECONDS = 15
 # Hard ceiling on the queue WAL (QUEUE_WAL_HARD_CEILING_BYTES, shared with
@@ -651,6 +666,16 @@ def _disk_guard(queue, queue_path) -> bool:
 def _supervisor_checkpoint(queue):
     """Backfill the queue WAL without taking the writer lock."""
     queue.checkpoint('PASSIVE')
+
+
+def _check_source_work_invariants(queue):
+    """Log any check_source_work_invariants() violations found right now."""
+    violations = queue.check_source_work_invariants()
+    if violations:
+        logger.warning('Source-work invariant check found %d violation(s):',
+                       len(violations))
+        for violation in violations:
+            logger.warning('  %s', violation)
 
 
 def _maybe_quiesce_truncate(queue):
@@ -802,6 +827,7 @@ def cmd_run(args):
     q = ERDQueue(args.queue)
     last_checkpoint = time.time()
     last_disk_sample = 0.0
+    last_invariant_check = time.time()
     while not stop_event.is_set():
         time.sleep(5)
         if stop_event.is_set():
@@ -820,6 +846,17 @@ def cmd_run(args):
             if now - last_checkpoint > erd_swarm.CHECKPOINT_SECONDS:
                 _supervisor_checkpoint(q)
                 last_checkpoint = time.time()
+            if now - last_invariant_check > INVARIANT_CHECK_SECONDS:
+                # Purely diagnostic (six read queries, one log line): a
+                # transient OperationalError here must not escalate to the
+                # fail-stop handler below, which is for the load-bearing
+                # writes elsewhere in this loop.
+                try:
+                    _check_source_work_invariants(q)
+                except sqlite3.OperationalError as exc:
+                    logger.warning('Source-work invariant check skipped: %s',
+                                   exc)
+                last_invariant_check = time.time()
             _maybe_quiesce_truncate(q)
             if _enforce_wal_hard_ceiling(q, procs):
                 stop_event.set()
@@ -932,6 +969,22 @@ def cmd_reset_stale(args):
     n = queue.reset_stale_in_progress()
     queue.close()
     print(f'Reset {n} in_progress row(s) to pending.')
+
+
+# ---------------------------------------------------------------------------
+# queue reconcile-orphaned-ownership
+# ---------------------------------------------------------------------------
+
+def cmd_queue_reconcile_orphaned_ownership(args):
+    queue = ERDQueue(args.queue)
+    branch_ids = queue.reconcile_orphaned_branch_ownership()
+    queue.close()
+    if not branch_ids:
+        print('No orphaned owned branches found.')
+        return
+    print(f'Demoted {len(branch_ids)} orphaned owned branch(es) to direct '
+          f'(claimable without a live source-work membership): '
+          f'{", ".join(str(b) for b in branch_ids)}')
 
 
 def _normalize_queue_cli_args(args):
@@ -1220,6 +1273,13 @@ def main():
                              help='Reset in_progress rows to pending')
     p_rst.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
+    # -- queue reconcile-orphaned-ownership --
+    p_qro = qsub.add_parser(
+        'reconcile-orphaned-ownership',
+        help='Demote open owned branches whose source-work membership was '
+             'lost while they were still open, making them claimable again')
+    p_qro.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
+
     p_cds = qsub.add_parser(
         'clear-disk-stop', help='Release the disk-stop latch so run can start'
     )
@@ -1342,6 +1402,7 @@ def main():
             'priority': cmd_queue_priority,
             'source-priority': cmd_queue_source_priority,
             'reset-stale': cmd_reset_stale,
+            'reconcile-orphaned-ownership': cmd_queue_reconcile_orphaned_ownership,
             'clear-disk-stop': cmd_queue_clear_disk_stop,
             'set-disk-stop': cmd_queue_set_disk_stop,
         }

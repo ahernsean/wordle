@@ -1749,6 +1749,89 @@ class ERDQueue:
                 "WHERE resolved_at IS NULL" + branch_condition,
                 (int(time.time()), *parameters))
         self._complete_finished_source_work()
+        self._demote_orphaned_owned_branches()
+
+    def _demote_orphaned_owned_branches(self) -> list[int]:
+        """Demote open branches whose only source ownership has been lost.
+
+        A branch promoted under a source-work request (requires_source_
+        membership = 1) can outlive every membership that justified the
+        requirement, in either of two shapes:
+
+        - claim_next_bundle's bulk elimination retroactively retracts the
+          in-flight candidate that promoted it once the shared best_erd
+          bound tightens past it, and the branch's own membership resolves
+          along with the rest of the (now-finished) request while the
+          branch itself stays open;
+        - create_branch attaches a source_work_id without checking the
+          request is still live (unlike attach_branch_source_work, which
+          gates on source.state != 'complete'), so a worker's in-flight
+          create_branch call can land an unresolved membership against a
+          request that finished moments earlier.
+
+        Neither is an error -- both are routine consequences of alpha-beta
+        pruning racing a shared bound -- so the branch is never cancelled
+        here (its answer set may still be reachable from another spine).
+        Instead it is demoted to requires_source_membership = 0, the state a
+        directly dispatched branch already has, so active_branch_owner_rows
+        admits it without a live membership and any worker can pick it up
+        again.
+
+        The query mirrors active_branch_owner_rows' own visibility test
+        (via live_branch_source_rows) exactly, rather than only the
+        resolved_at half of it, so both shapes above are caught. Any
+        leftover unresolved membership rows for a demoted branch are also
+        resolved here: claim_next_bundle's direct-claim guard requires both
+        requires_source_membership = 0 and the absence of any resolved_at
+        IS NULL row, so flipping the flag alone would leave the branch
+        visible but still unclaimable.
+
+        Must run inside the caller's transaction (see _resolve_branch_
+        memberships): the condition it looks for is only ever created by a
+        membership resolution, a source-work completion, or a create_branch
+        call, all of which already hold the write lock here. Returns the
+        demoted branch_ids.
+        """
+        rows = self._conn.execute("""
+            SELECT active.branch_id
+            FROM active_branches AS active
+            WHERE active.status = 'open'
+              AND active.requires_source_membership = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM live_branch_source_rows AS owner
+                  WHERE owner.branch_id = active.branch_id
+              )
+        """).fetchall()
+        branch_ids = [row["branch_id"] for row in rows]
+        if branch_ids:
+            now = int(time.time())
+            placeholders = ",".join("?" for _ in branch_ids)
+            self._conn.execute(
+                "UPDATE branch_source_work SET resolved_at = ? "
+                f"WHERE resolved_at IS NULL AND branch_id IN ({placeholders})",
+                (now, *branch_ids))
+            self._conn.executemany(
+                "UPDATE active_branches SET requires_source_membership = 0 "
+                "WHERE branch_id = ?",
+                [(branch_id,) for branch_id in branch_ids])
+        return branch_ids
+
+    def reconcile_orphaned_branch_ownership(self) -> list[int]:
+        """Demote every currently-orphaned open owned branch, standalone.
+
+        For one-off cleanup of branches stranded before this reconciliation
+        existed (or accumulated while it could not run, e.g. the swarm was
+        down) -- the CLI's `queue reconcile-orphaned-ownership` command.
+        Normal operation self-heals through _resolve_branch_memberships and
+        never needs this called directly."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            branch_ids = self._demote_orphaned_owned_branches()
+            self._conn.execute("COMMIT")
+            return branch_ids
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def reset_stale_in_progress(self) -> int:
         """Reset any 'in_progress' rows back to 'pending'.
