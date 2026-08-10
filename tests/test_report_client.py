@@ -491,6 +491,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("transitioning", result["className"])
         self.assertIn("transitioning", result["text"])
 
+    def test_worker_card_opens_detail_route_with_live_heartbeat_fields(self):
+        card = self.page.locator('[data-identity="worker-0"]')
+        self.assertIn("900 nodes", card.inner_text())
+
+        card.click()
+        self.page.wait_for_selector("text=Worker w0")
+        self.assertIn("kind=workers", self.page.url)
+        self.assertIn("worker=worker-0", self.page.url)
+
+        text = self.page.locator("#report").inner_text()
+        for expected in (
+            "Current work", "current-claim nodes 900", "nodes/s 46",
+            "candidate index 7", "claim started", "Search state",
+            "cache hits 50", "cache misses 10", "Open branch",
+        ):
+            self.assertIn(expected, text)
+        self.page.get_by_role("button", name="Open branch").click()
+        self.assertIn("branch_target=", self.page.url)
+
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
