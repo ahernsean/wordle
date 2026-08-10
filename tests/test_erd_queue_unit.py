@@ -848,6 +848,12 @@ class TestClaimNext(_TmpQueue):
             [bytes(row["branch_key"])
              for row in self.q.direct_branches_in_progress()],
             [self.key])
+        # Visible is not the same as claimable: claim_next_bundle's
+        # direct-claim guard also requires no unresolved membership row, so
+        # demotion must restore both, not just flip the flag.
+        self.assertIsNotNone(self.q.claim_next_bundle(
+            self.key, "worker-1", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1))
 
     def test_reconcile_orphaned_branch_ownership_is_noop_when_healthy(self):
         self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 7)])
@@ -902,6 +908,9 @@ class TestClaimNext(_TmpQueue):
             [bytes(row["branch_key"])
              for row in self.q.direct_branches_in_progress()],
             [other_key])
+        self.assertIsNotNone(self.q.claim_next_bundle(
+            other_key, "worker-1", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1))
 
     def test_claim_next_returns_none_when_queue_empty(self):
         self.assertIsNone(self.q.claim_next("worker-0"))

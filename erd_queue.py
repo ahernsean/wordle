@@ -1756,21 +1756,41 @@ class ERDQueue:
 
         A branch promoted under a source-work request (requires_source_
         membership = 1) can outlive every membership that justified the
-        requirement: claim_next_bundle's bulk elimination retroactively
-        retracts the in-flight candidate that promoted it once the shared
-        best_erd bound tightens past it, or its owning request finishes
-        before this branch does. Neither is an error -- both are routine
-        consequences of alpha-beta pruning racing a shared bound -- so the
-        branch is never cancelled here (its answer set may still be
-        reachable from another spine). Instead it is demoted to requires_
-        source_membership = 0, the state a directly dispatched branch
-        already has, so active_branch_owner_rows admits it without a live
-        membership and any worker can pick it up again.
+        requirement, in either of two shapes:
+
+        - claim_next_bundle's bulk elimination retroactively retracts the
+          in-flight candidate that promoted it once the shared best_erd
+          bound tightens past it, and the branch's own membership resolves
+          along with the rest of the (now-finished) request while the
+          branch itself stays open;
+        - create_branch attaches a source_work_id without checking the
+          request is still live (unlike attach_branch_source_work, which
+          gates on source.state != 'complete'), so a worker's in-flight
+          create_branch call can land an unresolved membership against a
+          request that finished moments earlier.
+
+        Neither is an error -- both are routine consequences of alpha-beta
+        pruning racing a shared bound -- so the branch is never cancelled
+        here (its answer set may still be reachable from another spine).
+        Instead it is demoted to requires_source_membership = 0, the state a
+        directly dispatched branch already has, so active_branch_owner_rows
+        admits it without a live membership and any worker can pick it up
+        again.
+
+        The query mirrors active_branch_owner_rows' own visibility test
+        (via live_branch_source_rows) exactly, rather than only the
+        resolved_at half of it, so both shapes above are caught. Any
+        leftover unresolved membership rows for a demoted branch are also
+        resolved here: claim_next_bundle's direct-claim guard requires both
+        requires_source_membership = 0 and the absence of any resolved_at
+        IS NULL row, so flipping the flag alone would leave the branch
+        visible but still unclaimable.
 
         Must run inside the caller's transaction (see _resolve_branch_
         memberships): the condition it looks for is only ever created by a
-        membership resolution or a source-work completion, both of which
-        already hold the write lock here. Returns the demoted branch_ids.
+        membership resolution, a source-work completion, or a create_branch
+        call, all of which already hold the write lock here. Returns the
+        demoted branch_ids.
         """
         rows = self._conn.execute("""
             SELECT active.branch_id
@@ -1778,13 +1798,18 @@ class ERDQueue:
             WHERE active.status = 'open'
               AND active.requires_source_membership = 1
               AND NOT EXISTS (
-                  SELECT 1 FROM branch_source_work AS membership
-                  WHERE membership.branch_id = active.branch_id
-                    AND membership.resolved_at IS NULL
+                  SELECT 1 FROM live_branch_source_rows AS owner
+                  WHERE owner.branch_id = active.branch_id
               )
         """).fetchall()
         branch_ids = [row["branch_id"] for row in rows]
         if branch_ids:
+            now = int(time.time())
+            placeholders = ",".join("?" for _ in branch_ids)
+            self._conn.execute(
+                "UPDATE branch_source_work SET resolved_at = ? "
+                f"WHERE resolved_at IS NULL AND branch_id IN ({placeholders})",
+                (now, *branch_ids))
             self._conn.executemany(
                 "UPDATE active_branches SET requires_source_membership = 0 "
                 "WHERE branch_id = ?",
@@ -1796,9 +1821,9 @@ class ERDQueue:
 
         For one-off cleanup of branches stranded before this reconciliation
         existed (or accumulated while it could not run, e.g. the swarm was
-        down) -- the CLI's `queue reconcile-stale-ownership` command. Normal
-        operation self-heals through _resolve_branch_memberships and never
-        needs this called directly."""
+        down) -- the CLI's `queue reconcile-orphaned-ownership` command.
+        Normal operation self-heals through _resolve_branch_memberships and
+        never needs this called directly."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             branch_ids = self._demote_orphaned_owned_branches()

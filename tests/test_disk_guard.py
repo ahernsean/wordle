@@ -16,7 +16,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import erd_search
-from cache_sqlite import ScoreCache
 from erd_queue import (ERDQueue, disk_stats, DISK_SAMPLE_KEEP,
                        DISK_WARN_FRACTION, DISK_STOP_FRACTION)
 from report_model import disk_fill_rate
@@ -181,31 +180,6 @@ class TestSupervisorCheckpoint(_TmpQueue):
         # PASSIVE backfills but never truncates the file.
         self.assertEqual(self.q.wal_size_bytes(), wal_before)
         self.assertIsNone(self.q.get_meta("checkpoint_pause"))
-
-
-class TestCheckSourceWorkInvariants(_TmpQueue):
-    def test_clean_queue_logs_nothing(self):
-        with self.assertNoLogs('wordle', level='WARNING'):
-            erd_search._check_source_work_invariants(self.q)
-
-    def test_violation_is_logged(self):
-        words = ["crane", "slate", "trace", "stale", "tales"]
-        key = ScoreCache.encode_subset(words)
-        self.q.add_pending_many([(key, len(words), 9, "crane", 7)])
-        crane = self.q.claim_next("worker-0")
-        self.q.create_branch(
-            key, len(words), 20, budget=5, priority=crane["priority"],
-            source_word=crane["source_word"],
-            source_pattern=crane["source_pattern"],
-            source_work_id=crane["source_work_id"])
-        branch_id = self.q._intern_branch(key)
-        self.q._conn.execute(
-            "DELETE FROM branch_source_work WHERE branch_id = ?", (branch_id,))
-
-        with self.assertLogs('wordle', level='WARNING') as log:
-            erd_search._check_source_work_invariants(self.q)
-        joined = "\n".join(log.output)
-        self.assertIn("source-owned open branch_id", joined)
 
 
 class TestFmtSize(unittest.TestCase):

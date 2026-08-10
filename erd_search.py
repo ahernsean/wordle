@@ -50,7 +50,7 @@ epoch           Show or change the telemetry epoch used to compare swarm
 queue set-disk-stop
                 Keep the swarm down across reboots and systemd restarts.
 
-queue reconcile-stale-ownership
+queue reconcile-orphaned-ownership
                 Demote open owned branches whose source-work membership was
                 lost while they were still open (see check_source_work_
                 invariants' "source-owned open branch_id ... has no live
@@ -847,7 +847,15 @@ def cmd_run(args):
                 _supervisor_checkpoint(q)
                 last_checkpoint = time.time()
             if now - last_invariant_check > INVARIANT_CHECK_SECONDS:
-                _check_source_work_invariants(q)
+                # Purely diagnostic (six read queries, one log line): a
+                # transient OperationalError here must not escalate to the
+                # fail-stop handler below, which is for the load-bearing
+                # writes elsewhere in this loop.
+                try:
+                    _check_source_work_invariants(q)
+                except sqlite3.OperationalError as exc:
+                    logger.warning('Source-work invariant check skipped: %s',
+                                   exc)
                 last_invariant_check = time.time()
             _maybe_quiesce_truncate(q)
             if _enforce_wal_hard_ceiling(q, procs):
@@ -964,10 +972,10 @@ def cmd_reset_stale(args):
 
 
 # ---------------------------------------------------------------------------
-# queue reconcile-stale-ownership
+# queue reconcile-orphaned-ownership
 # ---------------------------------------------------------------------------
 
-def cmd_queue_reconcile_stale_ownership(args):
+def cmd_queue_reconcile_orphaned_ownership(args):
     queue = ERDQueue(args.queue)
     branch_ids = queue.reconcile_orphaned_branch_ownership()
     queue.close()
@@ -1265,9 +1273,9 @@ def main():
                              help='Reset in_progress rows to pending')
     p_rst.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
-    # -- queue reconcile-stale-ownership --
+    # -- queue reconcile-orphaned-ownership --
     p_qro = qsub.add_parser(
-        'reconcile-stale-ownership',
+        'reconcile-orphaned-ownership',
         help='Demote open owned branches whose source-work membership was '
              'lost while they were still open, making them claimable again')
     p_qro.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
@@ -1394,7 +1402,7 @@ def main():
             'priority': cmd_queue_priority,
             'source-priority': cmd_queue_source_priority,
             'reset-stale': cmd_reset_stale,
-            'reconcile-stale-ownership': cmd_queue_reconcile_stale_ownership,
+            'reconcile-orphaned-ownership': cmd_queue_reconcile_orphaned_ownership,
             'clear-disk-stop': cmd_queue_clear_disk_stop,
             'set-disk-stop': cmd_queue_set_disk_stop,
         }

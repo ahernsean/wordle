@@ -411,6 +411,23 @@ resets them to `pending` so they are re-queued on the next run.  The supervisor
 does this automatically on startup; use it manually only when the supervisor is
 stopped and you want to inspect or requeue before restarting.
 
+### Reconcile orphaned branch ownership
+
+```bash
+python3.13 erd_search.py queue reconcile-orphaned-ownership
+```
+
+A branch promoted under a source-work request can lose every membership that
+justified `requires_source_membership`, while itself staying `open`: bulk
+elimination retracts the in-flight candidate that promoted it, or the request
+completes moments before a racing `create_branch` call attaches it.  Either
+way the branch becomes invisible to every claim path and is flagged by
+`check_source_work_invariants()` as a "source-owned open branch ... has no
+live membership" violation.  The supervisor self-heals this automatically on
+every membership resolution (see `_resolve_branch_memberships` in
+`erd_queue.py`); use this command only to reconcile branches stranded before
+that existed, or accumulated while the swarm was down.
+
 ---
 
 ## Cache operations
