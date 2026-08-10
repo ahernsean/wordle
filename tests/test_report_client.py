@@ -512,6 +512,22 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.get_by_role("button", name="Open branch").click()
         self.assertIn("branch_target=", self.page.url)
 
+    def test_worker_card_title_keeps_answer_marker_on_its_line(self):
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/workers')).json();
+          report.data.rows=report.data.rows.slice(0,2).map((worker,index)=>({
+            ...worker, worker_id:'worker-'+index, worker_number:String(index),
+            state:'working', current_candidate:'enols',
+            current_candidate_is_answer:index===1,
+          }));
+          applyReport(report,null,{...__reportClient.getState(),kind:'workers'});
+          return [...document.querySelectorAll('.worker .card-title')].map(title=>[
+            title.children[0].offsetTop, title.children[2].offsetTop
+          ]);
+        }""")
+        self.assertTrue(all(len(set(tops)) == 1 for tops in result), result)
+
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
