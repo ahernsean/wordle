@@ -99,21 +99,20 @@
     .tiles { display:flex; flex-wrap:nowrap; overflow:hidden; gap:.3rem 1rem; align-items:center; margin:.2rem 0; }
     .tiles.stacked { flex-direction:column; align-items:flex-start; overflow:visible; }
     .step-group { display:inline-flex; gap:.3rem; align-items:center; white-space:nowrap; }
-    .step { display:inline-flex; gap:.1rem; white-space:nowrap; }
     /* A guess is drawn as its five letters over the colors of its response:
        one square tile per letter, no corner radius, gap and letter size both
        proportional to the tile.  Sizes are held on whole pixels -- a fractional
        tile height puts the centered line box on a fraction and the glyph then
        snaps up to a pixel off center. */
-    :root { --tile-base:15px; --tile-gap-ratio:.07; --tile-font-ratio:.62; --tile-outline-ratio:.023; --tile-notch-ratio:.38; --tile-notch-inset:max(1px,calc(var(--tile-base) * .07)); }
+    :root { --tile-base:15px; --tile-gap-ratio:.07; --tile-font-ratio:.62; --tile-outline-ratio:.023; --tile-notch-ratio:.38; }
     .word-sm { --tile:var(--tile-base); }
-    .word-md { --tile:round(calc(var(--tile-base) * 1.3),1px); }
-    .word-lg { --tile:round(calc(var(--tile-base) * 1.8),1px); }
+    .word-md { --tile:20px; --tile:round(calc(var(--tile-base) * 1.3),1px); }
+    .word-lg { --tile:27px; --tile:round(calc(var(--tile-base) * 1.8),1px); }
     /* Nothing inside a word is a flex or grid item: those are blockified, and a
        block serializes with a line break, which would make a copied word arrive
        as one letter per line.  font-size:0 on the row keeps any whitespace
        between tiles from opening a gap of its own. */
-    .word { display:inline-block; white-space:nowrap; font-size:0; }
+    .word { display:inline-block; white-space:nowrap; font-size:0; --tile-notch-inset:max(1px,calc(var(--tile) * .07)); }
     /* No vertical-align: the tile's single line box fills its height, so the
        letters carry a real text baseline and the row inherits it.  Default
        baseline alignment then seats the tile letters on the baseline of the
@@ -289,6 +288,12 @@
       // Whether two words abut is decided before any replacement: replacing a
       // word turns it into a text node, which would hide it from the next
       // word's sibling check and run the two tokens together.
+      // Anything selected besides the words themselves is prose, and prose has
+      // structure -- line breaks from block layout, middots from generated
+      // content -- that textContent cannot carry.  Leave those to the browser.
+      const probe=fragment.cloneNode(true);
+      for(const word of probe.querySelectorAll("[data-spine]"))word.remove();
+      if(probe.textContent.trim()!=="")return null;
       const plans=words.map(word=>{
         const previous=word.previousSibling;
         return [word,!!previous&&previous.nodeType===1&&previous.hasAttribute("data-spine")];
@@ -445,7 +450,7 @@
     function wordTiles(word,pattern,isAnswer,sizeClass="word-sm"){
       const node=element("span","word "+sizeClass+(isAnswer?" is-answer":""));
       node.dataset.spine=spineToken(word,pattern);
-      if(isAnswer)node.title=String(word).toUpperCase()+" is in the answer set";
+      node.title=spineToken(word,pattern)+(isAnswer?" \u00b7 in the answer set":"");
       const letters=String(word||"?????").toUpperCase().padEnd(5," ").slice(0,5);
       const responses=pattern?String(pattern):null;
       for(let index=0;index<letters.length;index++){
@@ -502,7 +507,10 @@
         document.body.append(sample);
         const cell=sample.firstChild,style=getComputedStyle(cell);
         const ink=capitalInkRatio(style.fontWeight,style.fontFamily);
-        if(!ink){sample.remove();return;}
+        // A canvas that reads back blank (privacy hardening) never becomes
+        // measurable, so the give-up latches rather than repeating the scan on
+        // every repaint.
+        if(!ink){sample.remove();letterShiftApplied=true;return;}
         const tile=parseFloat(style.height),fontSize=parseFloat(style.fontSize);
         const marker=element("span","");marker.style.cssText="display:inline-block;width:0;height:0";
         cell.append(marker);
@@ -825,14 +833,15 @@
       const pageKey=parentSpine=>parentSpine||"__root__";
       const pageSize=()=>state.limit||10;
       const buildPager=({summary,previous,next})=>{const pager=element("div","tree-pager dim");pager.append(element("span","",summary));const pageSizeLabel=element("label","dim","Items per page "),pageSizeSelect=element("select","tree-page-size");for(const size of [10,25,50,100]){const option=element("option","",String(size));option.value=String(size);option.selected=size===pageSize();pageSizeSelect.append(option);}pageSizeSelect.addEventListener("change",()=>{pageSizeSelect.blur();treeGroupPages.clear();treePageHistory.clear();initializedNodes.clear();collapsedNodes.clear();initializedWordGroups.clear();collapsedWordGroups.clear();setState({...currentState,limit:Number(pageSizeSelect.value),tree_cursor:null},false);});pageSizeLabel.append(pageSizeSelect);pager.append(pageSizeLabel);if(previous){const previousButton=element("button","","Previous");previousButton.addEventListener("click",previous);pager.append(previousButton);}if(next){const nextButton=element("button","","Next");nextButton.addEventListener("click",next);pager.append(nextButton);}return pager;};
-      const build=(node,carriesWord=true)=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const summary=element(node.has_children?"summary":"div","clickable"),headGroup=element("span","step-group");headGroup.append(node.step?wordTiles(node.step.word,node.step.pattern,node.step.word_is_answer):element("span","dim","?"));summary.append(headGroup);const facts=element("span","dim inline-facts"),factValues=["d"+node.guess_depth,valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase),valueOrDash(node.answer_count)+" answers",valueOrDash(node.worker_count)+" workers",valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count)];if(node.has_children)factValues.push(node.child_count+" child branches",node.subtree_worker_count+" workers in subtree");if(node.priority!==null&&node.priority!==undefined)factValues.push("priority "+numText(node.priority));factValues.push(node.branch_reference?"@"+shortReference(node.branch_reference):"structure");for(const fact of factValues)facts.append(element("span","",fact));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});headGroup.append(openButton);}summary.append(facts);if(!node.has_children){item.append(summary);return item;}const details=element("details","tree-branch");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const childHost=element("div","tree-children");details.addEventListener("toggle",()=>{details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id);if(details.open&&!details.dataset.childrenLoaded&&node.spine){details.dataset.childrenLoaded="1";loadPage(node.spine,null,childHost);}});details.append(summary,childHost);item.append(details);return item;};
+      const build=node=>{const item=element("li",changeClass(node,previousNodes.get(String(node.node_id))));item.dataset.identity=node.node_id;const summary=element(node.has_children?"summary":"div","clickable"),headGroup=element("span","step-group");headGroup.append(node.step?wordTiles(node.step.word,node.step.pattern,node.step.word_is_answer):element("span","dim","?"));summary.append(headGroup);const facts=element("span","dim inline-facts"),factValues=["d"+node.guess_depth,valueOrDash(node.branch_status)+" / "+valueOrDash(node.branch_phase),valueOrDash(node.answer_count)+" answers",valueOrDash(node.worker_count)+" workers",valueOrDash(node.completed_candidate_count)+"/"+valueOrDash(node.candidate_count)];if(node.has_children)factValues.push(node.child_count+" child branches",node.subtree_worker_count+" workers in subtree");if(node.priority!==null&&node.priority!==undefined)factValues.push("priority "+numText(node.priority));factValues.push(node.branch_reference?"@"+shortReference(node.branch_reference):"structure");for(const fact of factValues)facts.append(element("span","",fact));if(node.branch_reference){const openButton=element("button","","Open");openButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();navigateBranch(node);});headGroup.append(openButton);}summary.append(facts);if(!node.has_children){item.append(summary);return item;}const details=element("details","tree-branch");if(!initializedNodes.has(node.node_id)){initializedNodes.add(node.node_id);collapsedNodes.add(node.node_id);}details.open=!collapsedNodes.has(node.node_id);const childHost=element("div","tree-children");details.addEventListener("toggle",()=>{details.open?collapsedNodes.delete(node.node_id):collapsedNodes.add(node.node_id);if(details.open&&!details.dataset.childrenLoaded&&node.spine){details.dataset.childrenLoaded="1";loadPage(node.spine,null,childHost);}});details.append(summary,childHost);item.append(details);return item;};
       // Every word is a group at every level, including the one-pattern case:
-      // the word is named once and its response patterns are the rows beneath
-      // it.  Collapse state is keyed by parent, so the same word appearing
+      // the group heads the word unplayed and each row beneath draws that same
+      // word wearing its own response, so the two read as one object in two
+      // states.  Collapse state is keyed by parent, so the same word appearing
       // under two parents collapses independently.
       const buildPatternPage=(groupNodes,groupKey)=>{
         const size=pageSize(),holder=element("div","tree-pattern-page"),pageIndex=treeGroupPages.get(groupKey)||0,start=pageIndex*size,patterns=element("ul","patterns");
-        for(const node of groupNodes.slice(start,start+size))patterns.append(build(node,false));
+        for(const node of groupNodes.slice(start,start+size))patterns.append(build(node));
         holder.append(patterns);
         if(groupNodes.length>size)holder.append(buildPager({summary:"Showing "+(start+1)+"–"+Math.min(start+size,groupNodes.length)+" of "+groupNodes.length+" branches",previous:pageIndex?()=>{treeGroupPages.set(groupKey,pageIndex-1);holder.replaceWith(buildPatternPage(groupNodes,groupKey));}:null,next:start+size<groupNodes.length?()=>{treeGroupPages.set(groupKey,pageIndex+1);holder.replaceWith(buildPatternPage(groupNodes,groupKey));}:null}));
         return holder;

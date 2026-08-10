@@ -1640,6 +1640,37 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.page.locator("section:has-text('Identity') .metrics").first)
         self.assertFalse(copied["handled"])
 
+    def test_copying_prose_that_contains_a_word_is_left_to_the_browser(self):
+        # The case with teeth: a fact row holds both prose and a word.  Rewriting
+        # it would flatten the row, because textContent carries neither the line
+        # breaks block layout makes nor the middots generated content draws.
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Queue') .labeled-facts")
+        facts = self.page.locator("section:has-text('Queue') .labeled-facts").first
+        self.assertGreater(facts.locator(".word").count(), 0)
+        copied = self.copy_selection(facts)
+        self.assertFalse(copied["handled"], copied["text"])
+
+    def test_copying_a_whole_report_keeps_its_line_structure(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Queue')")
+        result = self.page.evaluate("""() => {
+          const range = document.createRange();
+          range.selectNodeContents(document.getElementById('report'));
+          const selection = getSelection();
+          selection.removeAllRanges(); selection.addRange(range);
+          const native = selection.toString();
+          const data = new DataTransfer();
+          const event = new ClipboardEvent(
+            'copy', {clipboardData: data, bubbles: true, cancelable: true});
+          document.dispatchEvent(event);
+          selection.removeAllRanges();
+          return {handled: event.defaultPrevented,
+                  nativeLines: native.split(String.fromCharCode(10)).length};
+        }""")
+        self.assertFalse(result["handled"])
+        self.assertGreater(result["nativeLines"], 20)
+
     def test_copy_spine_button_and_a_copied_selection_agree(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("section:has-text('Reached via') .word")
@@ -1682,6 +1713,68 @@ class ReportClientBrowserTest(unittest.TestCase):
             ".card .tiles .word:has(.letter.y), .card .tiles .word:has(.letter.g)"
         ).first
         self.assertTrue(self.answer_notch(colored))
+
+    def test_unmeasurable_font_gives_up_centring_once_not_every_repaint(self):
+        # centerLetters runs from applyReport, so a failure that does not latch
+        # rasterises a 1200x1200 canvas on every poll forever.  A browser whose
+        # canvas reads back blank (privacy hardening) is the reachable case.
+        page = self.browser.new_page(viewport={"width": 1200, "height": 800})
+        try:
+            page.add_init_script("""
+              window.__readbacks = 0;
+              const original = CanvasRenderingContext2D.prototype.getImageData;
+              CanvasRenderingContext2D.prototype.getImageData = function (...args) {
+                window.__readbacks++;
+                const data = original.apply(this, args);
+                data.data.fill(255);
+                return data;
+              };
+            """)
+            page.goto(self.base_url)
+            page.wait_for_selector(".card")
+            at_load = page.evaluate("() => window.__readbacks")
+            self.assertGreater(at_load, 0)
+            page.evaluate("""async () => {
+              const report = await (await fetch('/api/view')).json();
+              for (let index = 0; index < 5; index++)
+                applyReport(report, null, __reportClient.getState());
+            }""")
+            self.assertEqual(page.evaluate("() => window.__readbacks"), at_load)
+        finally:
+            page.close()
+
+    def test_notch_geometry_scales_with_the_tile(self):
+        # Both the notch and the gap holding it off the corner are tile ratios.
+        # The inset is derived from --tile, which only exists on the word, so a
+        # declaration in the wrong place computes invalid and silently falls
+        # back to auto -- visible only by measuring.
+        geometry = self.page.evaluate("""() => {
+          const result = {};
+          for (const size of ['word-sm', 'word-md', 'word-lg']) {
+            const word = document.createElement('span');
+            word.className = 'word ' + size + ' is-answer';
+            for (let index = 0; index < 5; index++) {
+              const letter = document.createElement('span');
+              letter.className = 'letter'; letter.textContent = 'A';
+              word.append(letter);
+            }
+            document.body.append(word);
+            const last = word.querySelector('.letter:nth-child(5)');
+            const after = getComputedStyle(last, '::after');
+            const tile = parseFloat(getComputedStyle(last).height);
+            result[size] = {
+              notch: parseFloat(after.borderTopWidth) / tile,
+              inset: parseFloat(after.top) / tile,
+            };
+            word.remove();
+          }
+          return result;
+        }""")
+        ratios = {size: value["inset"] for size, value in geometry.items()}
+        self.assertEqual(len(set(round(ratio, 4) for ratio in ratios.values())), 1, ratios)
+        for size, value in geometry.items():
+            self.assertAlmostEqual(value["inset"], 0.07, places=3, msg=size)
+            self.assertAlmostEqual(value["notch"], 0.38, places=1, msg=size)
 
     def test_no_horizontal_scroll_at_required_widths(self):
         # Every view, not just whichever one setUp left loaded: the tree view
@@ -1809,14 +1902,24 @@ class ReportClientBrowserTest(unittest.TestCase):
                 self.page.goto(self.base_url + path)
                 self.page.wait_for_selector(".tiles")
                 spines = self.page.evaluate("""() => [...document.querySelectorAll('.tiles')]
-                  .map(node => ({stacked: node.classList.contains('stacked'),
-                                 clipped: node.scrollWidth > node.clientWidth,
-                                 words: node.querySelectorAll('.word').length}))""")
+                  .map(node => {
+                    const words = [...node.querySelectorAll('.word')];
+                    const tops = new Set(words.map(
+                      word => Math.round(word.getBoundingClientRect().top)));
+                    return {stacked: node.classList.contains('stacked'),
+                            clipped: node.scrollWidth > node.clientWidth,
+                            words: words.length, rows: tops.size};
+                  })""")
                 self.assertTrue(spines, f"no spine at {width} on {path!r}")
                 for spine in spines:
-                    self.assertFalse(
-                        spine["clipped"],
-                        f"spine clipped at {width} on {path!r}: {spine}")
+                    where = f"at {width} on {path!r}: {spine}"
+                    self.assertFalse(spine["clipped"], f"spine clipped {where}")
+                    # One row carrying every guess, or one guess per row.  Any
+                    # count between the two is the ragged mix this forbids.
+                    self.assertEqual(
+                        spine["rows"],
+                        spine["words"] if spine["stacked"] else 1,
+                        f"ragged spine {where}")
 
     def test_integers_use_comma_separators(self):
         self.apply_branch_target("RAISE .....")
