@@ -161,6 +161,18 @@ class ReportClientBrowserTest(unittest.TestCase):
         cls.playwright.stop()
         cls.server_context.__exit__(None, None, None)
 
+    def answer_notch(self, word):
+        """Whether a word carries the answer-set notch.
+
+        Reads only whether the marker is drawn, never what color it is: a
+        change to the palette must not fail a test about answer-set membership.
+        """
+        return word.evaluate("""(node) => {
+          const last = node.querySelector('.letter:nth-child(5)');
+          const after = getComputedStyle(last, '::after');
+          return after.content !== 'none' && parseFloat(after.borderTopWidth) > 0;
+        }""")
+
     def setUp(self):
         self.page = self.browser.new_page(viewport={"width": 1200, "height": 800})
         self.page.goto(self.base_url)
@@ -242,10 +254,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         rows = group.locator("> details > .tree-pattern-page > ul.patterns > li")
         self.assertEqual(rows.count(), 1)
-        # The group names the word, so its rows carry only the response pattern.
+        # The group heads the word unplayed; each row beneath draws that same
+        # word wearing its own response, so the two read as one object in two
+        # states rather than a word and a detached pattern.
         row_summary = rows.locator("> .clickable")
-        self.assertNotIn("RAISE", row_summary.inner_text())
-        self.assertEqual(row_summary.locator(".step").count(), 1)
+        self.assertEqual(row_summary.locator(".word").count(), 1)
+        self.assertEqual(
+            row_summary.locator(".word").get_attribute("data-spine"), "RAISE -----")
 
     def test_tree_pages_response_patterns_inside_a_word_group(self):
         self.page.evaluate("""async () => {
@@ -362,7 +377,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("SALET", text)
         self.assertIn("3.564", text)
         self.assertNotIn("3.5643502648", text)
-        self.assertIn("CRANE*", text)  # word_is_answer renders the asterisk
+        self.assertIn("CRANE", text)
+        self.assertTrue(self.answer_notch(
+            self.page.locator(".card", has_text="CRANE").first.locator(".word")))
 
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request
@@ -407,17 +424,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("[data-kind=queue]").click()
         self.page.wait_for_selector(".card .tiles")
         card = self.page.locator(".card", has_text="RAISE").first
-        self.assertGreater(card.locator(".tile").count(), 0)
-        self.assertEqual(card.locator(".dim", has_text="RAISE").count(), 0)
+        counts = card.evaluate("""(node) => ({
+          words: node.querySelectorAll('.word').length,
+          letters: node.querySelectorAll('.word > .letter').length,
+          dimmed: [...node.querySelectorAll('.dim')]
+            .filter(item => item.textContent.includes('RAISE')).length,
+        })""")
+        self.assertGreater(counts["words"], 0)
+        # Every guess on the flat spine became five tiles, none left as text.
+        self.assertEqual(counts["letters"], 5 * counts["words"], counts)
+        self.assertEqual(counts["dimmed"], 0, counts)
 
-    def test_spine_words_carry_the_answer_asterisk(self):
+    def test_spine_words_carry_the_answer_notch(self):
         self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.branch.spine=[{word:'raise',pattern:'-----',word_is_answer:true}];
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
         }""")
-        text = self.page.locator("section:has-text('Reached via')").first.inner_text()
-        self.assertIn("RAISE*", text)
+        reached = self.page.locator("section:has-text('Reached via')").first
+        self.assertIn("RAISE", reached.inner_text())
+        self.assertTrue(self.answer_notch(reached.locator(".word").first))
 
     def test_worker_on_removed_branch_renders_as_transitioning(self):
         result = self.page.evaluate("""async () => {
@@ -497,7 +523,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         for expected in (
             "Current work", "current-claim nodes 900", "nodes/s 46",
             "candidate index 7", "claim started", "Search state",
-            "candidate NURDY*", "best CRANE*/2.250 18/8", "cache hits 50",
+            "candidate NURDY", "best CRANE/2.250 18/8", "cache hits 50",
             "cache misses 10",
             "Open branch",
         ):
@@ -509,6 +535,14 @@ class ReportClientBrowserTest(unittest.TestCase):
                 "Search state", "Cumulative worker counters",
             ],
         )
+        # The marker moved from the text into the tile, so it is asserted as
+        # drawn rather than spelled.
+        for word in ("NURDY", "CRANE"):
+            self.assertTrue(
+                self.answer_notch(
+                    self.page.locator(f'.word[data-spine="{word}"]').first),
+                word,
+            )
         self.page.get_by_role("button", name="Open branch").click()
         self.assertIn("branch_target=", self.page.url)
 
@@ -523,13 +557,20 @@ class ReportClientBrowserTest(unittest.TestCase):
           }));
           applyReport(report,null,{...__reportClient.getState(),kind:'workers'});
           return [...document.querySelectorAll('.worker .card-title')].map(title=>({
-            titleOffsets:[title.children[0].offsetTop,title.children[2].offsetTop],
+            titleHeight:title.getBoundingClientRect().height,
             childHeights:[...title.children].map(child=>child.getBoundingClientRect().height),
             childWhiteSpace:[...title.children].map(child=>getComputedStyle(child).whiteSpace),
           }));
         }""")
+        # One line: the title is no taller than its tallest child.  Its
+        # children have different heights now, so their tops legitimately
+        # differ while still sharing the line.
         self.assertTrue(
-            all(len(set(card["titleOffsets"])) == 1 for card in result), result
+            all(
+                card["titleHeight"] <= max(card["childHeights"]) + 1
+                for card in result
+            ),
+            result,
         )
         self.assertTrue(
             all(height < 30 for card in result for height in card["childHeights"]),
@@ -575,15 +616,20 @@ class ReportClientBrowserTest(unittest.TestCase):
             }],
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
-          return document.querySelector('#report').innerText;
+          const context=document.querySelector('.status-line .word');
+          return {text:document.querySelector('#report').innerText,
+                  contextIsAWord:!!context,
+                  contextSpine:context&&context.dataset.spine};
         }""")
+        self.assertEqual(text["contextIsAWord"], True)
+        self.assertEqual(text["contextSpine"], "SALET ---g-")
+        text = text["text"]
         self.assertIn("Branch ownership", text)
         self.assertIn("Live workers", text)
         self.assertIn("None", text)
         self.assertIn("Claim holders off-branch", text)
         self.assertIn("w5", text)
         self.assertIn("SALET", text)
-        self.assertIn("\ng\n", text)
 
     def test_branch_surfaces_missing_best_and_rounds_bounds(self):
         text = self.page.evaluate("""async () => {
@@ -616,8 +662,8 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("best CRANE*/2.125 17/8", text)
-        self.assertIn("best guess CRANE*/2.125 17/8", text)
+        self.assertIn("best CRANE/2.125 17/8", text)
+        self.assertIn("best guess CRANE/2.125 17/8", text)
         self.assertIn("2.250 18/8", text)
         self.assertIn("solved CIGAR/1.875 15/8", text)
         self.assertIn("wanted ERD ceiling 2.125 17/8", text)
@@ -722,10 +768,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("solved CIGAR/1.875", text)
         self.assertNotIn("solution not recorded", text)
 
-    def test_finalization_spine_and_solved_text_agree_on_the_asterisk(self):
-        # A structured spine (what collect_branch_report now emits) must star
-        # the same word the "solved" line stars -- not one starred and the
-        # other bare, which is the inconsistency a flat-string spine caused.
+    def test_finalization_spine_and_solved_word_agree_on_the_answer_notch(self):
+        # A structured spine (what collect_branch_report now emits) must mark
+        # the same word the "solved" line marks -- not one marked and the other
+        # bare, which is the inconsistency a flat-string spine caused.
         self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.recent_finalizations[0]={
@@ -740,11 +786,16 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         card = self.page.locator(
             "section:has-text('Recent finalizations') .card"
-        ).first.inner_text()
-        self.assertIn("SLATE", card)
-        self.assertIn("solved CRANE*/1.875", card)
-        # Every occurrence of the word carries the star -- none bare.
-        self.assertEqual(card.count("CRANE"), card.count("CRANE*"))
+        ).first
+        self.assertIn("SLATE", card.inner_text())
+        self.assertIn("solved CRANE/1.875", card.inner_text())
+        # The spine's CRANE and the solved CRANE are both marked; SLATE, which
+        # is not in the answer set, is not.
+        words = card.locator(".word")
+        self.assertEqual(
+            [self.answer_notch(words.nth(index)) for index in range(words.count())],
+            [False, True, True],
+        )
 
     def test_queue_card_omits_the_spine_block_for_a_root_branch(self):
         # A root-level branch (no source word/pattern, no stored spine) now
@@ -817,7 +868,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             "section:has-text('Reached via') button:has-text('Copied')"
         )
         copied_text = self.page.evaluate("() => window.__copiedText")
-        self.assertEqual(copied_text, "raise -----")
+        self.assertEqual(copied_text, "RAISE -----")
 
     def test_copy_spine_falls_back_when_clipboard_rejects(self):
         self.apply_branch_target("RAISE .....")
@@ -842,7 +893,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             "section:has-text('Reached via') button:has-text('Copied')"
         )
         copied_text = self.page.evaluate("() => window.__copiedText")
-        self.assertEqual(copied_text, "raise -----")
+        self.assertEqual(copied_text, "RAISE -----")
 
     def test_branch_reference_matches_hide_filters_and_view(self):
         self.page.evaluate("""async () => {
@@ -1343,10 +1394,14 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_tile_colors_match_wordle_palette(self):
         self.apply_branch_target("CACHE")
-        self.page.wait_for_selector(".tile")
+        self.page.wait_for_selector(".word > .letter")
         colors = self.page.evaluate("""() => {
           const result={};
-          for(const name of ['g','y','']){const node=document.createElement('span');node.className='tile '+name;document.body.append(node);result[name||'gray']=getComputedStyle(node).backgroundColor;node.remove();}
+          for(const name of ['g','y','']){
+            const word=document.createElement('span');word.className='word word-sm';
+            const node=document.createElement('span');node.className='letter '+name;
+            word.append(node);document.body.append(word);
+            result[name||'gray']=getComputedStyle(node).backgroundColor;word.remove();}
           return result;
         }""")
         declared = self.page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--green').trim()")
@@ -1354,6 +1409,159 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(colors["g"], "rgb(106, 170, 100)")
         self.assertEqual(colors["y"], "rgb(201, 180, 88)")
         self.assertEqual(colors["gray"], "rgb(120, 124, 126)")
+
+    def test_notch_is_drawn_in_the_letter_colour(self):
+        # The one test with an opinion about notch colour: it must equal the
+        # letter colour of the tile it sits on, which is what currentColor buys
+        # -- white over a response colour, dark over the unplayed tile.
+        tones = self.page.evaluate("""() => {
+          const result = {};
+          for (const tone of ['g', 'y', '', 'blank']) {
+            const word = document.createElement('span');
+            word.className = 'word word-sm is-answer';
+            for (let index = 0; index < 5; index++) {
+              const letter = document.createElement('span');
+              letter.className = 'letter ' + tone;
+              letter.textContent = 'A';
+              word.append(letter);
+            }
+            document.body.append(word);
+            const last = word.querySelector('.letter:nth-child(5)');
+            result[tone || 'gray'] = {
+              notch: getComputedStyle(last, '::after').borderTopColor,
+              letter: getComputedStyle(last).color,
+            };
+            word.remove();
+          }
+          return result;
+        }""")
+        for tone, colors in tones.items():
+            self.assertEqual(colors["notch"], colors["letter"], tone)
+
+    def test_notch_renders_on_every_tone_and_size(self):
+        drawn = self.page.evaluate("""() => {
+          const result = {};
+          for (const size of ['word-sm', 'word-md', 'word-lg']) {
+            for (const tone of ['g', 'y', '', 'blank']) {
+              const word = document.createElement('span');
+              word.className = 'word ' + size + ' is-answer';
+              for (let index = 0; index < 5; index++) {
+                const letter = document.createElement('span');
+                letter.className = 'letter ' + tone;
+                letter.textContent = 'A';
+                word.append(letter);
+              }
+              document.body.append(word);
+              const after = getComputedStyle(
+                word.querySelector('.letter:nth-child(5)'), '::after');
+              result[size + '/' + (tone || 'gray')] =
+                after.content !== 'none' && parseFloat(after.borderTopWidth) > 0;
+              word.remove();
+            }
+          }
+          return result;
+        }""")
+        self.assertEqual(len(drawn), 12)
+        for combination, present in drawn.items():
+            self.assertTrue(present, combination)
+
+    def test_a_word_that_is_not_an_answer_carries_no_notch(self):
+        absent = self.page.evaluate("""() => {
+          const word = document.createElement('span');
+          word.className = 'word word-sm';
+          for (let index = 0; index < 5; index++) {
+            const letter = document.createElement('span');
+            letter.className = 'letter';
+            letter.textContent = 'A';
+            word.append(letter);
+          }
+          document.body.append(word);
+          const after = getComputedStyle(
+            word.querySelector('.letter:nth-child(5)'), '::after');
+          const result = after.content === 'none'
+            || parseFloat(after.borderTopWidth) === 0;
+          word.remove();
+          return result;
+        }""")
+        self.assertTrue(absent)
+
+    def test_letters_sit_centred_in_their_tiles_at_every_size(self):
+        # The browser rounds font ascent and descent to whole pixels and snaps
+        # the baseline it derives from them, which left a capital up to a pixel
+        # high in its tile.  Compare the baseline the tile actually uses against
+        # the one cap-centring wants, computed from the font's real ink.
+        offsets = self.page.evaluate("""() => {
+          const inkExtents = (weight, family) => {
+            const size = 600, box = 1200;
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = box;
+            const context = canvas.getContext('2d', {willReadFrequently: true});
+            context.fillStyle = '#fff'; context.fillRect(0, 0, box, box);
+            context.fillStyle = '#000';
+            context.font = weight + ' ' + size + 'px ' + family;
+            context.textBaseline = 'alphabetic';
+            context.fillText('HETIL', 40, 900);
+            const pixels = context.getImageData(0, 0, box, box).data;
+            let top = null, bottom = null;
+            for (let y = 0; y < box; y++) {
+              let inked = false;
+              for (let x = 0; x < box; x++)
+                if (pixels[(y * box + x) * 4] < 128) { inked = true; break; }
+              if (inked) { if (top === null) top = y; bottom = y; }
+            }
+            return {ascent: (900 - top) / size, descent: (bottom + 1 - 900) / size};
+          };
+          const result = {};
+          for (const size of ['word-sm', 'word-md', 'word-lg']) {
+            const word = document.createElement('span');
+            word.className = 'word ' + size;
+            const letter = document.createElement('span');
+            letter.className = 'letter'; letter.textContent = 'H';
+            word.append(letter); document.body.append(word);
+            const style = getComputedStyle(letter);
+            const ink = inkExtents(style.fontWeight, style.fontFamily);
+            const tile = parseFloat(style.height);
+            const fontSize = parseFloat(style.fontSize);
+            const marker = document.createElement('span');
+            marker.style.cssText = 'display:inline-block;width:0;height:0';
+            letter.append(marker);
+            const actual = marker.getBoundingClientRect().top
+              - letter.getBoundingClientRect().top;
+            const wanted = (tile + (ink.ascent - ink.descent) * fontSize) / 2;
+            word.remove();
+            result[size] = actual - wanted;
+          }
+          return result;
+        }""")
+        # A baseline can only land on a whole pixel, so half a pixel is the
+        # floor; before the correction the smallest tile was a full pixel out.
+        for size, offset in offsets.items():
+            self.assertLessEqual(abs(offset), 0.5 + 1e-9, f"{size} off by {offset}")
+
+    def test_tile_letters_share_the_baseline_of_adjacent_text(self):
+        delta = self.page.evaluate("""() => {
+          const line = document.createElement('div');
+          line.style.cssText = 'font:13px/1.4 monospace';
+          const before = document.createElement('span');
+          before.style.cssText = 'display:inline-block;width:0;height:0';
+          const word = document.createElement('span');
+          word.className = 'word word-sm';
+          for (const character of 'CRANE') {
+            const letter = document.createElement('span');
+            letter.className = 'letter blank'; letter.textContent = character;
+            word.append(letter);
+          }
+          line.append('best ', before, word);
+          document.body.append(line);
+          const inside = document.createElement('span');
+          inside.style.cssText = 'display:inline-block;width:0;height:0';
+          word.querySelector('.letter').append(inside);
+          const result = inside.getBoundingClientRect().top
+            - before.getBoundingClientRect().top;
+          line.remove();
+          return result;
+        }""")
+        self.assertLessEqual(abs(delta), 1.0, f"tile baseline off by {delta}px")
 
     def test_no_horizontal_scroll_at_required_widths(self):
         # Every view, not just whichever one setUp left loaded: the tree view
@@ -1470,23 +1678,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(self.page.locator("#report .sweep").count(), 0)
         self.assertGreater(self.page.locator("#report .progress").count(), 0)
 
-    def test_spine_words_never_separate_from_their_patterns(self):
-        result = self.page.evaluate("""async () => {
-          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
-          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
-          const groups=[...document.querySelectorAll('.tiles .step-group')];
-          const spineGroups=groups.map(group=>({text:group.textContent,hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
-          const tree=await (await fetch('/api/view?tree=1')).json();
-          applyReport(tree,null,{...__reportClient.getState(),branch_target:'',tree:true});
-          const treeGroups=[...document.querySelectorAll('.tree .step-group')].map(group=>({hasTiles:!!group.querySelector('.step'),noWrap:getComputedStyle(group).whiteSpace==='nowrap'}));
-          return {spineGroups,treeGroupCount:treeGroups.length,treeAllNoWrap:treeGroups.every(group=>group.noWrap)};
-        }""")
-        self.assertTrue(result["spineGroups"])
-        for group in result["spineGroups"]:
-            self.assertTrue(group["hasTiles"])
-            self.assertTrue(group["noWrap"])
-        self.assertGreater(result["treeGroupCount"], 0)
-        self.assertTrue(result["treeAllNoWrap"])
+    def test_a_spine_is_one_row_or_one_column_never_a_ragged_mix(self):
+        # A guess and its response are one object now, so the old hazard (a word
+        # wrapping away from its pattern) cannot arise.  What can is a spine
+        # laying some guesses across and wrapping the rest onto a second row;
+        # the whole spine drops to a column instead, and never clips.
+        for width in (320, 375, 390, 600, 1200):
+            self.page.set_viewport_size({"width": width, "height": 900})
+            for path in ("", "?branch_target=RAISE+.....", "?kind=queue"):
+                self.page.goto(self.base_url + path)
+                self.page.wait_for_selector(".tiles")
+                spines = self.page.evaluate("""() => [...document.querySelectorAll('.tiles')]
+                  .map(node => ({stacked: node.classList.contains('stacked'),
+                                 clipped: node.scrollWidth > node.clientWidth,
+                                 words: node.querySelectorAll('.word').length}))""")
+                self.assertTrue(spines, f"no spine at {width} on {path!r}")
+                for spine in spines:
+                    self.assertFalse(
+                        spine["clipped"],
+                        f"spine clipped at {width} on {path!r}: {spine}")
 
     def test_integers_use_comma_separators(self):
         self.apply_branch_target("RAISE .....")
@@ -1495,15 +1705,17 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("12,000", text)
         self.assertNotIn("12000", text)
 
-    def test_candidates_are_uppercase_with_answer_asterisk(self):
+    def test_candidates_are_uppercase_and_answers_are_notched(self):
         text = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',current_candidate:'crane',current_candidate_is_answer:true,current_max_guess_depth:2,nodes_per_second:10}];
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("CRANE*", text)
+        self.assertIn("CRANE", text)
         self.assertNotIn("crane", text)
+        self.assertTrue(self.answer_notch(
+            self.page.locator(".card.worker .word").first))
 
     def test_hotspot_population_is_humanized_and_hex_is_hidden(self):
         self.page.locator("[data-kind=hotspots]").click()
