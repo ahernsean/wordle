@@ -522,11 +522,26 @@ class ReportClientBrowserTest(unittest.TestCase):
             current_candidate_is_answer:index===1,
           }));
           applyReport(report,null,{...__reportClient.getState(),kind:'workers'});
-          return [...document.querySelectorAll('.worker .card-title')].map(title=>[
-            title.children[0].offsetTop, title.children[2].offsetTop
-          ]);
+          return [...document.querySelectorAll('.worker .card-title')].map(title=>({
+            titleOffsets:[title.children[0].offsetTop,title.children[2].offsetTop],
+            childHeights:[...title.children].map(child=>child.getBoundingClientRect().height),
+            childWhiteSpace:[...title.children].map(child=>getComputedStyle(child).whiteSpace),
+          }));
         }""")
-        self.assertTrue(all(len(set(tops)) == 1 for tops in result), result)
+        self.assertTrue(
+            all(len(set(card["titleOffsets"])) == 1 for card in result), result
+        )
+        self.assertTrue(
+            all(height < 30 for card in result for height in card["childHeights"]),
+            result,
+        )
+        self.assertTrue(
+            all(
+                white_space == "nowrap"
+                for card in result for white_space in card["childWhiteSpace"]
+            ),
+            result,
+        )
 
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
