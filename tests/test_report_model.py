@@ -508,6 +508,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(worker["current_max_guess_depth"], 5)
         self.assertNotIn("cur_max_depth", worker)
         self.assertTrue(worker["current_candidate_is_answer"])
+        self.assertTrue(worker["best_guess_is_answer"])
         self.assertTrue(worker["descent"][0]["word_is_answer"])
         self.assertEqual(report["data"]["worker_totals"]["cache_hit_count"], 5)
         self.assertGreater(report["data"]["disk"]["total_bytes"], 0)
@@ -1003,6 +1004,7 @@ class SourceReportTest(unittest.TestCase):
             self.sources, ReportRequest(report_kind="workers"))
 
         worker = report["data"]["rows"][0]
+        self.assertEqual(worker["answer_count"], 2)
         self.assertEqual(worker["source_work_id"], source_work_id)
         self.assertEqual(worker["scheduling_role"], "preferred")
 

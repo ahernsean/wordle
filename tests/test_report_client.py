@@ -470,6 +470,79 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("transitioning", result["className"])
         self.assertIn("transitioning", result["text"])
 
+    def test_worker_card_opens_detail_route_with_live_heartbeat_fields(self):
+        card = self.page.locator('[data-identity="worker-0"]')
+        self.assertIn("900 nodes", card.inner_text())
+
+        with self.page.expect_response(
+            lambda response: (
+                "/api/view/workers" in response.url
+                and "worker=worker-0" in response.url
+            )
+        ) as worker_response:
+            card.click()
+        self.assertTrue(worker_response.value.ok)
+        self.page.wait_for_selector("text=Worker w0")
+        self.assertIn("kind=workers", self.page.url)
+        self.assertIn("worker=worker-0", self.page.url)
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/workers?worker=worker-0')).json();
+          report.data.rows[0].answer_count=8;
+          report.data.rows[0].current_candidate_is_answer=true;
+          report.data.rows[0].best_guess_is_answer=true;
+          applyReport(report,null,{...__reportClient.getState(),kind:'workers',worker_id:'worker-0'});
+        }""")
+
+        text = self.page.locator("#report").inner_text()
+        for expected in (
+            "Current work", "current-claim nodes 900", "nodes/s 46",
+            "candidate index 7", "claim started", "Search state",
+            "candidate NURDY*", "best CRANE*/2.250 18/8", "cache hits 50",
+            "cache misses 10",
+            "Open branch",
+        ):
+            self.assertIn(expected, text)
+        self.assertEqual(
+            self.page.locator("#report > .section > h2").all_inner_texts(),
+            [
+                "Identity", "Current branch", "Current work",
+                "Search state", "Cumulative worker counters",
+            ],
+        )
+        self.page.get_by_role("button", name="Open branch").click()
+        self.assertIn("branch_target=", self.page.url)
+
+    def test_worker_card_title_keeps_answer_marker_on_its_line(self):
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/workers')).json();
+          report.data.rows=report.data.rows.slice(0,2).map((worker,index)=>({
+            ...worker, worker_id:'worker-'+index, worker_number:String(index),
+            state:'working', current_candidate:'enols',
+            current_candidate_is_answer:index===1,
+          }));
+          applyReport(report,null,{...__reportClient.getState(),kind:'workers'});
+          return [...document.querySelectorAll('.worker .card-title')].map(title=>({
+            titleOffsets:[title.children[0].offsetTop,title.children[2].offsetTop],
+            childHeights:[...title.children].map(child=>child.getBoundingClientRect().height),
+            childWhiteSpace:[...title.children].map(child=>getComputedStyle(child).whiteSpace),
+          }));
+        }""")
+        self.assertTrue(
+            all(len(set(card["titleOffsets"])) == 1 for card in result), result
+        )
+        self.assertTrue(
+            all(height < 30 for card in result for height in card["childHeights"]),
+            result,
+        )
+        self.assertTrue(
+            all(
+                white_space == "nowrap"
+                for card in result for white_space in card["childWhiteSpace"]
+            ),
+            result,
+        )
+
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
