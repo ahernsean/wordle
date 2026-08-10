@@ -474,7 +474,14 @@ class ReportClientBrowserTest(unittest.TestCase):
         card = self.page.locator('[data-identity="worker-0"]')
         self.assertIn("900 nodes", card.inner_text())
 
-        card.click()
+        with self.page.expect_response(
+            lambda response: (
+                "/api/view/workers" in response.url
+                and "worker=worker-0" in response.url
+            )
+        ) as worker_response:
+            card.click()
+        self.assertTrue(worker_response.value.ok)
         self.page.wait_for_selector("text=Worker w0")
         self.assertIn("kind=workers", self.page.url)
         self.assertIn("worker=worker-0", self.page.url)
