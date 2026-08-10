@@ -699,6 +699,9 @@
       const fragment=document.createDocumentFragment();
       const identity=[["worker",workerName(worker)],["PID",worker.pid],["state",worker.state],["last heartbeat",relativeAge(worker.updated_at,generatedAt)]];
       fragment.append(section("Identity",kv(identity)));
+      const branch=section("Current branch",branchContextSummary(worker));
+      if(worker.branch_reference){const openBranch=element("button","","Open branch");openBranch.addEventListener("click",()=>navigateBranch(worker));branch.append(openBranch);}
+      fragment.append(branch);
       const candidate=worker.current_candidate?worker.current_candidate.toUpperCase():"—";
       const currentWork=[["candidate",candidate],["candidate index",worker.candidate_index],["current-claim nodes",worker.current_node_count],["nodes/s",worker.nodes_per_second===null||worker.nodes_per_second===undefined?null:formatInteger(Math.round(worker.nodes_per_second))],["claim started",relativeAge(worker.claim_started_at,generatedAt)],["max guess depth",worker.current_max_guess_depth],["help recursion depth",worker.help_recursion_depth]];
       const work=section("Current work",kv(currentWork));
@@ -709,9 +712,6 @@
       fragment.append(section("Search state",kv(search)));
       const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["source work",worker.source_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];
       fragment.append(section("Cumulative worker counters",kv(cumulative)));
-      const branch=section("Current branch",branchContextSummary(worker));
-      if(worker.branch_reference){const openBranch=element("button","","Open branch");openBranch.addEventListener("click",()=>navigateBranch(worker));branch.append(openBranch);}
-      fragment.append(branch);
       return fragment;
     }
     function renderWorkers(report,previous,state){

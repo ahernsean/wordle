@@ -493,6 +493,13 @@ class ReportClientBrowserTest(unittest.TestCase):
             "cache hits 50", "cache misses 10", "Open branch",
         ):
             self.assertIn(expected, text)
+        self.assertEqual(
+            self.page.locator("#report > .section > h2").all_inner_texts(),
+            [
+                "Identity", "Current branch", "Current work",
+                "Search state", "Cumulative worker counters",
+            ],
+        )
         self.page.get_by_role("button", name="Open branch").click()
         self.assertIn("branch_target=", self.page.url)
 
