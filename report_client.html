@@ -270,6 +270,43 @@
     const label=key=>String(key).replaceAll("_"," ").replace(/\berd\b/gi,"ERD");
     const timeLabel=key=>key.endsWith("_at")?label(String(key).slice(0,-3)):label(key);
     const shortReference=reference=>String(reference).slice(0,8);
+    // Copying a selection that touches a word yields the spine language the
+    // branch target box parses, so a word or a run of them can be pasted
+    // straight back in.  Without this the tiles copy as their bare letters --
+    // the response is carried by color, which no selection can reach -- and a
+    // spine arrives one guess per line, since each guess is a block.
+    function spineTextFromSelection(range){
+      const fragment=range.cloneContents();
+      const words=[...fragment.querySelectorAll("[data-spine]")];
+      if(!words.length){
+        // A selection inside one word still yields that whole word: the spine
+        // language cannot express half a guess.
+        const container=range.commonAncestorContainer;
+        const host=container.nodeType===1?container:container.parentElement;
+        const enclosing=host&&host.closest("[data-spine]");
+        return enclosing?enclosing.dataset.spine:null;
+      }
+      // Whether two words abut is decided before any replacement: replacing a
+      // word turns it into a text node, which would hide it from the next
+      // word's sibling check and run the two tokens together.
+      const plans=words.map(word=>{
+        const previous=word.previousSibling;
+        return [word,!!previous&&previous.nodeType===1&&previous.hasAttribute("data-spine")];
+      });
+      for(const [word,abuts] of plans)word.replaceWith(document.createTextNode((abuts?" ":"")+word.dataset.spine));
+      return fragment.textContent.replace(/\s+/g," ").trim();
+    }
+    function installSpineCopy(){
+      document.addEventListener("copy",event=>{
+        const selection=getSelection();
+        if(!selection||!selection.rangeCount||selection.isCollapsed)return;
+        const text=spineTextFromSelection(selection.getRangeAt(0));
+        // A selection touching no word copies natively, untouched.
+        if(text===null||!event.clipboardData)return;
+        event.clipboardData.setData("text/plain",text);
+        event.preventDefault();
+      });
+    }
     function copyText(text){
       const fallback=()=>{const area=document.createElement("textarea");area.value=text;area.setAttribute("readonly","");area.style.cssText="position:fixed;left:-9999px;top:0;opacity:0";document.body.append(area);area.select();area.setSelectionRange(0,area.value.length);const copied=document.execCommand("copy");area.remove();return copied;};
       if(!navigator.clipboard?.writeText)return Promise.resolve(fallback());
@@ -1018,10 +1055,11 @@
       document.addEventListener("click",event=>{if(!connWrap.contains(event.target))setRefreshOpen(false);});
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
+      installSpineCopy();
       addEventListener("resize",()=>layoutSpines(byId("report")));
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.applyReport=applyReport;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>

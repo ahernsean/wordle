@@ -1563,6 +1563,105 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertLessEqual(abs(delta), 1.0, f"tile baseline off by {delta}px")
 
+    def copy_selection(self, locator):
+        """Text the clipboard would receive for a selection of `locator`."""
+        return locator.evaluate("""(host) => {
+          const range = document.createRange();
+          range.selectNodeContents(host);
+          const selection = getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          const data = new DataTransfer();
+          const event = new ClipboardEvent(
+            'copy', {clipboardData: data, bubbles: true, cancelable: true});
+          document.dispatchEvent(event);
+          selection.removeAllRanges();
+          return {text: data.getData('text/plain'), handled: event.defaultPrevented};
+        }""")
+
+    def test_copying_a_word_yields_text_the_branch_target_box_parses(self):
+        # The response lives in the tile colors, which no selection can reach,
+        # so a copied word carries its pattern as spine text instead.
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Reached via') .word")
+        copied = self.copy_selection(
+            self.page.locator("section:has-text('Reached via') .tiles").first)
+        self.assertTrue(copied["handled"])
+        self.assertEqual(copied["text"], "RAISE -----")
+        self.assertNotIn("\n", copied["text"])
+        # Round trip: paste it back and the same branch comes up.
+        self.page.fill("#branch-target-input", copied["text"])
+        self.page.click("#apply")
+        self.page.wait_for_selector("section:has-text('Identity')")
+        self.assertIn("@1111", self.page.locator(
+            "section:has-text('Identity')").first.inner_text())
+
+    def test_copying_a_multi_guess_spine_stays_on_one_line(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector(".card .tiles .word")
+        copied = self.page.evaluate("""() => {
+          const spine = [...document.querySelectorAll('.card .tiles')]
+            .find(node => node.querySelectorAll('.word').length > 1);
+          const range = document.createRange();
+          range.selectNodeContents(spine);
+          const selection = getSelection();
+          selection.removeAllRanges(); selection.addRange(range);
+          const data = new DataTransfer();
+          document.dispatchEvent(new ClipboardEvent(
+            'copy', {clipboardData: data, bubbles: true, cancelable: true}));
+          selection.removeAllRanges();
+          return data.getData('text/plain');
+        }""")
+        self.assertNotIn("\n", copied)
+        self.assertEqual(copied, "RAISE ----- ALIBI y----")
+
+    def test_copying_part_of_a_word_still_yields_the_whole_guess(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Reached via') .word")
+        copied = self.page.evaluate("""() => {
+          const word = document.querySelector("section .tiles .word");
+          const range = document.createRange();
+          range.setStart(word.children[1].firstChild, 0);
+          range.setEnd(word.children[3].firstChild, 1);
+          const selection = getSelection();
+          selection.removeAllRanges(); selection.addRange(range);
+          const data = new DataTransfer();
+          document.dispatchEvent(new ClipboardEvent(
+            'copy', {clipboardData: data, bubbles: true, cancelable: true}));
+          selection.removeAllRanges();
+          return data.getData('text/plain');
+        }""")
+        self.assertEqual(copied, "RAISE -----")
+
+    def test_copying_prose_is_left_to_the_browser(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Identity')")
+        copied = self.copy_selection(
+            self.page.locator("section:has-text('Identity') .metrics").first)
+        self.assertFalse(copied["handled"])
+
+    def test_copy_spine_button_and_a_copied_selection_agree(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Reached via') .word")
+        selected = self.copy_selection(
+            self.page.locator("section:has-text('Reached via') .tiles").first)
+        self.page.evaluate("""() => {
+          Object.defineProperty(navigator, 'clipboard', {
+            configurable: true, value: undefined,
+          });
+          window.__copiedText = null;
+          document.execCommand = command => {
+            if (command !== 'copy') return false;
+            window.__copiedText = document.activeElement.value;
+            return true;
+          };
+        }""")
+        self.page.click("section:has-text('Reached via') button:has-text('Copy spine')")
+        self.page.wait_for_selector(
+            "section:has-text('Reached via') button:has-text('Copied')")
+        self.assertEqual(
+            self.page.evaluate("() => window.__copiedText"), selected["text"])
+
     def test_no_horizontal_scroll_at_required_widths(self):
         # Every view, not just whichever one setUp left loaded: the tree view
         # reached phone widths overflowing because it was never measured here.
