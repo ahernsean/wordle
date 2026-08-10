@@ -808,6 +808,101 @@ class TestClaimNext(_TmpQueue):
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1))
         self.q.clear()
 
+    def test_reconcile_orphaned_branch_ownership_demotes_stranded_branch(self):
+        # Mirrors claim_next_bundle's bulk-elimination retracting the
+        # in-flight candidate whose promoted sub-branch stays open (issue
+        # #215): the branch's only membership row is gone but the branch
+        # itself is untouched and still status='open'.
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 7)])
+        crane = self.q.claim_next("worker-0")
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            priority=crane["priority"], source_word=crane["source_word"],
+            source_pattern=crane["source_pattern"],
+            source_work_id=crane["source_work_id"])
+        branch_id = self.q._intern_branch(self.key)
+        # This is the branch's only membership, so retracting it must also
+        # retire the request itself -- exactly what _complete_finished_
+        # source_work does once nothing live references it -- to keep the
+        # rest of the database internally consistent while isolating the
+        # one violation under test.
+        self.q._conn.execute(
+            "DELETE FROM branch_source_work WHERE branch_id = ?", (branch_id,))
+        self.q._conn.execute(
+            "UPDATE source_work SET state = 'complete' "
+            "WHERE source_work_id = ?", (crane["source_work_id"],))
+
+        violations = self.q.check_source_work_invariants()
+        self.assertEqual(violations,
+                         [f"source-owned open branch_id {branch_id} has no "
+                          "live membership"])
+        self.assertEqual(self.q.direct_branches_in_progress(), [])
+
+        demoted = self.q.reconcile_orphaned_branch_ownership()
+
+        self.assertEqual(demoted, [branch_id])
+        self.assertEqual(
+            self.q.get_active_branch(self.key)["requires_source_membership"], 0)
+        self.assertEqual(self.q.check_source_work_invariants(), [])
+        self.assertEqual(
+            [bytes(row["branch_key"])
+             for row in self.q.direct_branches_in_progress()],
+            [self.key])
+
+    def test_reconcile_orphaned_branch_ownership_is_noop_when_healthy(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 7)])
+        crane = self.q.claim_next("worker-0")
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            priority=crane["priority"], source_word=crane["source_word"],
+            source_pattern=crane["source_pattern"],
+            source_work_id=crane["source_work_id"])
+
+        self.assertEqual(self.q.reconcile_orphaned_branch_ownership(), [])
+        self.assertEqual(
+            self.q.get_active_branch(self.key)["requires_source_membership"], 1)
+
+    def test_resolve_branch_memberships_self_heals_orphaned_sibling(self):
+        # Two branches promoted under the same source-work request: the root
+        # (self.key) finalizes normally while its sibling (other_key) was
+        # already orphaned by a bulk-elimination race and never touched
+        # again.  Finalizing the root must not silently strand the sibling
+        # forever -- resolving any membership sweeps for this routine
+        # pruning residue and demotes it so it stays claimable.
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 9, "crane", 7),
+            (other_key, 4, 9, "crane", 8),
+        ])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        root = self.q.claim_next("worker-0", source_work_id)
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            priority=root["priority"], source_word=root["source_word"],
+            source_pattern=root["source_pattern"],
+            source_work_id=root["source_work_id"])
+        sibling = self.q.claim_next("worker-0", source_work_id)
+        self.q.create_branch(
+            other_key, 4, N_CANDIDATES, budget=5,
+            priority=sibling["priority"], source_word=sibling["source_word"],
+            source_pattern=sibling["source_pattern"],
+            source_work_id=sibling["source_work_id"])
+        other_branch_id = self.q._intern_branch(other_key)
+        self.q._conn.execute(
+            "DELETE FROM branch_source_work WHERE branch_id = ?",
+            (other_branch_id,))
+
+        self.q.mark_done(self.key)
+        self.q.delete_branch(self.key)
+
+        self.assertEqual(
+            self.q.get_active_branch(other_key)["requires_source_membership"], 0)
+        self.assertEqual(self.q.check_source_work_invariants(), [])
+        self.assertEqual(
+            [bytes(row["branch_key"])
+             for row in self.q.direct_branches_in_progress()],
+            [other_key])
+
     def test_claim_next_returns_none_when_queue_empty(self):
         self.assertIsNone(self.q.claim_next("worker-0"))
 
