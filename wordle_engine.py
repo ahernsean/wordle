@@ -61,7 +61,7 @@ class GuessUniverse(Enum):
     (e.g. a recognizable answer-shaped word that the clues have already
     eliminated is still a legal — if unwise — guess in normal play).
     """
-    ALL_WORDS = 'words'      # every guessable word
+    ALL_WORDS = 'words'      # every word the puzzle accepts
     ALL_ANSWERS = 'answers'  # words that can ever be a Wordle answer
 
 

@@ -183,9 +183,9 @@ The cache namespace identifies which universe+compliance combination was used:
 
 | Policy constant | Meaning |
 |---|---|
-| `ERD_ALL` | the full guess list, no clue filter — the main precache target |
+| `ERD_ALL` | every accepted word is a candidate, no clue filter — the main precache target |
 | `ERD_ANSWERS` | answer words only, compliant with revealed clues |
-| `ERD_CONSTRAINED` | the full guess list, must satisfy all clues (Wordle hard mode; transient, never persisted) |
+| `ERD_CONSTRAINED` | every accepted word is a candidate, must satisfy all clues (Wordle hard mode; transient, never persisted) |
 | `ERD_ANSWERS_UNFILTERED` | answer words only, no clue filter |
 
 ---
@@ -330,8 +330,8 @@ displays a warning.
 ## Parallel ERD Precache (Swarm)
 
 The precache fills `branch_best_by_policy` for `ERD_ALL` across all branches
-reachable from the opener (typically SALET). Because evaluating the whole guess
-list against a branch is slow, multiple workers cooperate:
+reachable from the opener (typically SALET). Because evaluating every candidate
+against a branch is slow, multiple workers cooperate:
 
 ### Architecture
 
@@ -419,7 +419,7 @@ Groups of size 1 are already solved; groups of size 2 contribute exactly 1.0 bit
 
 ```python
 class GuessUniverse(Enum):
-    ALL_WORDS    = 'words'    # every guessable word
+    ALL_WORDS    = 'words'    # every word the puzzle accepts
     ALL_ANSWERS  = 'answers'  # words that can ever be a Wordle answer
 
 class ComplianceFilter(Enum):
