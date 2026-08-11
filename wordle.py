@@ -2480,8 +2480,8 @@ def cmd_wordcount(gs):
 
 def cmd_candidates(gs):
     universe_options = [
-        (GuessUniverse.ALL_WORDS,   "all words (~12,972)"),
-        (GuessUniverse.ALL_ANSWERS, "possible answers (~3,200)"),
+        (GuessUniverse.ALL_WORDS,   f"all words ({len(gs.all_words):,})"),
+        (GuessUniverse.ALL_ANSWERS, f"possible answers ({len(gs.all_answers):,})"),
     ]
     compliance_options = [
         (ComplianceFilter.UNFILTERED, "unfiltered"),
@@ -2489,7 +2489,7 @@ def cmd_candidates(gs):
     ]
     print(f"\nCandidates mode (current: {_candidate_label(gs.universe, gs.compliance)}):")
 
-    print("Draw guesses from:")
+    print("Draw candidates from:")
     for i, (_, label) in enumerate(universe_options, 1):
         print(f"  {i}. {label}")
     print("Choose (1-2)? ", end="")

@@ -61,8 +61,8 @@ class GuessUniverse(Enum):
     (e.g. a recognizable answer-shaped word that the clues have already
     eliminated is still a legal — if unwise — guess in normal play).
     """
-    ALL_WORDS = 'words'      # ~12,972 — every guessable word
-    ALL_ANSWERS = 'answers'  # ~3,200 — words that can ever be a Wordle answer
+    ALL_WORDS = 'words'      # every word the puzzle accepts
+    ALL_ANSWERS = 'answers'  # words that can ever be a Wordle answer
 
 
 class ComplianceFilter(Enum):
