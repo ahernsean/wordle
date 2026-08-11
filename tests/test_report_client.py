@@ -1776,6 +1776,44 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.assertAlmostEqual(value["inset"], 0.07, places=3, msg=size)
             self.assertAlmostEqual(value["notch"], 0.38, places=1, msg=size)
 
+    def test_a_lattice_rational_wraps_instead_of_leaving_the_card(self):
+        # An ERD on the lattice trails a rational whose width grows with the
+        # answer count, so "best CLART/3.131 1572/502" is wider than a branch
+        # card.  Held rigid it left the card; it may wrap after the decimal,
+        # but the word must never split from the decimal it earned.
+        for width in (390, 480, 700, 1200):
+            self.page.set_viewport_size({"width": width, "height": 900})
+            self.page.goto(self.base_url)
+            self.page.wait_for_selector(".card")
+            measured = self.page.evaluate("""async () => {
+              const report = await (await fetch('/api/view')).json();
+              report.data.branches = [{...report.data.branches[0],
+                answer_count: 502, candidate_count: 14855,
+                completed_candidate_count: 6363, best_guess: 'clart',
+                best_guess_is_answer: false, best_erd: 1572 / 502,
+                worker_count: 1, completed_candidate_indexes: [],
+                spine: [{word: 'raise', pattern: '-----'}]}];
+              applyReport(report, null, {...__reportClient.getState()});
+              const card = document.querySelector('.card');
+              const fact = [...document.querySelectorAll('.stat-line > span')]
+                .find(item => item.textContent.includes('best'));
+              const pair = fact.querySelector('.word-erd-pair');
+              return {
+                text: fact.textContent,
+                overflow: fact.getBoundingClientRect().right
+                          - card.getBoundingClientRect().right,
+                pairLines: pair.getClientRects().length,
+                pairText: pair.textContent,
+              };
+            }""")
+            self.assertIn("1572/502", measured["text"])
+            self.assertLessEqual(
+                measured["overflow"], 0.5,
+                f"the ERD left the card at {width}px: {measured}")
+            # The pair is one unbroken run: CLART and /3.131 together.
+            self.assertEqual(measured["pairLines"], 1, measured)
+            self.assertEqual(measured["pairText"], "CLART/3.131", measured)
+
     def test_no_horizontal_scroll_at_required_widths(self):
         # Every view, not just whichever one setUp left loaded: the tree view
         # reached phone widths overflowing because it was never measured here.

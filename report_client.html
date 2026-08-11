@@ -134,7 +134,8 @@
     .word.is-answer > .letter:nth-child(5)::after { content:""; position:absolute; top:var(--tile-notch-inset); right:var(--tile-notch-inset); border-top:calc(var(--tile) * var(--tile-notch-ratio)) solid currentColor; border-left:calc(var(--tile) * var(--tile-notch-ratio)) solid transparent; }
     /* A word and the ERD it earned are one unit: the tiles butt against the
        slash, and the pair never breaks across a line. */
-    .word-erd { white-space:nowrap; }
+    .word-erd { white-space:normal; }
+    .word-erd > .word-erd-pair { white-space:nowrap; }
     .progress-line { margin:.25rem 0; }
     .progress { height:.3rem; border-radius:999px; background:var(--border); overflow:hidden; }
     .progress > span { display:block; height:100%; background:var(--green); }
@@ -461,13 +462,24 @@
       return node;
     }
     // The word/ERD pairing as one node: tiles for the word, text for the ERD it
-    // earned, never split across a line.
+    // earned.  The word never splits from the decimal it earned, but an ERD on
+    // the lattice trails a rational whose width grows with the answer count --
+    // "/3.131 1572/502" is wider than a card -- so that rational is allowed to
+    // wrap away from the pair rather than carry it off the edge.
     function bestGuessCell(row,answerCount=row.answer_count,prefix=""){
       if(!row.best_guess)return null;
       const cell=element("span","word-erd");
       if(prefix)cell.append(prefix);
-      cell.append(wordTiles(row.best_guess,null,row.best_guess_is_answer));
-      if(row.best_erd!==null&&row.best_erd!==undefined)cell.append("/"+erdValue(row.best_erd,answerCount));
+      const pair=element("span","word-erd-pair");
+      pair.append(wordTiles(row.best_guess,null,row.best_guess_is_answer));
+      let rational=null;
+      if(row.best_erd!==null&&row.best_erd!==undefined){
+        const [decimal,...lattice]=String(erdValue(row.best_erd,answerCount)).split(" ");
+        pair.append("/"+decimal);
+        if(lattice.length)rational=lattice.join(" ");
+      }
+      cell.append(pair);
+      if(rational)cell.append(" "+rational);
       return cell;
     }
     // The browser rounds a font's ascent and descent to whole pixels and snaps
