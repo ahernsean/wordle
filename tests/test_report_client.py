@@ -1070,6 +1070,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.page.wait_for_selector("text=workers report")
 
+    def test_active_text_selection_survives_a_poll_refresh(self):
+        # A poll refresh must not collapse a selection in progress: on
+        # iPhone, a long-press selection has to survive until the Copy tap
+        # lands, and replaceChildren silently drops it if the report
+        # re-renders underneath the user's finger.
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Reached via') .word")
+        section = self.page.locator("section:has-text('Reached via')").first
+        section.evaluate("(el) => el.dataset.testMarker = 'still-here'")
+        self.page.evaluate("""() => {
+          const word = document.querySelector("section .tiles .word");
+          const range = document.createRange();
+          range.selectNodeContents(word);
+          const selection = getSelection();
+          selection.removeAllRanges(); selection.addRange(range);
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(section.get_attribute("data-test-marker"), "still-here")
+        self.assertFalse(self.page.evaluate("() => getSelection().isCollapsed"))
+
     def test_finalization_page_size_selector_changes_limit_and_resets_cursor(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Recent finalizations")

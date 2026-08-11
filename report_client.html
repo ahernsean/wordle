@@ -975,6 +975,11 @@
       const active=document.activeElement;
       return (!!active&&["SELECT","INPUT","TEXTAREA","SUMMARY"].includes(active.tagName)&&byId("report").contains(active))||!!byId("report").querySelector("details.tree-branch[open]");
     }
+    function reportHasActiveSelection(){
+      const selection=getSelection();
+      if(!selection||selection.isCollapsed||!selection.rangeCount)return false;
+      return byId("report").contains(selection.getRangeAt(0).commonAncestorContainer);
+    }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
       const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;document.querySelector("details.filters").hidden=report.report_kind==="branch_reference_matches";if(report.report_kind!=="branch_reference_matches")content.append(reportHeader(report,state));
@@ -1012,15 +1017,18 @@
         // A quiet poll of the view already on screen must never yank a
         // control out from under an in-progress interaction: a native
         // <select>'s open dropdown has no DOM state to restore once its
-        // element is destroyed, and a rebuilt <summary>/<input>/<textarea>
-        // silently drops the focus or in-progress text the user had.  Skip
-        // the visual apply in that case only -- lastReport/lastContext still
-        // advance, so the next poll (once focus moves on) renders current
-        // data rather than replaying this skipped one.  A real navigation
-        // (sameView is false: Go, Back/Forward, clicking a card) always
-        // renders regardless of focus, since replacing the old view is the
-        // point of navigating.
-        if(!sameView||!reportHasFocusedControl())applyReport(report,previous,state);
+        // element is destroyed, a rebuilt <summary>/<input>/<textarea>
+        // silently drops the focus or in-progress text the user had, and
+        // replaceChildren collapses any text selection the user is mid-way
+        // through making -- fatal on iPhone, where a long-press selection has
+        // to survive until the Copy tap lands.  Skip the visual apply in
+        // that case only -- lastReport/lastContext still advance, so the
+        // next poll (once focus moves on or the selection collapses) renders
+        // current data rather than replaying this skipped one.  A real
+        // navigation (sameView is false: Go, Back/Forward, clicking a card)
+        // always renders regardless of focus or selection, since replacing
+        // the old view is the point of navigating.
+        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection()))applyReport(report,previous,state);
         lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }
