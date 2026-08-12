@@ -17,6 +17,9 @@ from report_model import (
     ReportSources,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
+    _grouped_response_groups,
+    _response_group_key,
+    _response_group_rollup,
     branch_reference,
     collect_overview_report,
     collect_report,
@@ -177,6 +180,163 @@ class ReportModelTest(unittest.TestCase):
             summary["response_group_count"],
             report["data"]["response_group_counts"]["response_group_count"],
         )
+
+    def test_response_group_key_orders_status_by_lifecycle(self):
+        order = [
+            _response_group_key({"branch_status": status}, "status")[0]
+            for status in ("active", "pending", "done", "unqueued")
+        ]
+        self.assertEqual(order, sorted(order))
+
+    def test_response_group_key_buckets_answer_count(self):
+        labels = {
+            answer_count: _response_group_key(
+                {"answer_count": answer_count}, "answer_count"
+            )[1]
+            for answer_count in (1, 2, 9, 10, 29, 30, 99, 100, 500)
+        }
+        self.assertEqual(labels, {
+            1: "1", 2: "2–9", 9: "2–9", 10: "10–29", 29: "10–29",
+            30: "30–99", 99: "30–99", 100: "100+", 500: "100+",
+        })
+
+    def test_response_group_key_orders_cache_state_by_urgency(self):
+        order = [
+            _response_group_key({"cache_state": cache_state}, "cache_state")[0]
+            for cache_state in ("missing", "loss", "exact", "not_applicable")
+        ]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(
+            _response_group_key({"cache_state": "not_applicable"}, "cache_state")[1],
+            "trivial",
+        )
+
+    def test_response_group_key_splits_by_worker_presence(self):
+        self.assertEqual(
+            _response_group_key({"worker_count": 2}, "worker_presence"),
+            (0, "has worker"),
+        )
+        self.assertEqual(
+            _response_group_key({"worker_count": 0}, "worker_presence"),
+            (1, "no worker"),
+        )
+
+    def test_response_group_key_orders_priority_high_first_with_unset_last(self):
+        order = [
+            _response_group_key({"priority": priority}, "priority")[0]
+            for priority in (1, 0, None)
+        ]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(
+            _response_group_key({"priority": 1}, "priority")[1], "priority 1"
+        )
+        self.assertEqual(
+            _response_group_key({"priority": None}, "priority")[1], "no priority"
+        )
+
+    def test_response_group_rollup_partitions_by_cache_state(self):
+        rows = [
+            {"answer_count": 1, "cache_state": "not_applicable"},
+            {"answer_count": 1, "cache_state": "not_applicable"},
+            {"answer_count": 5, "cache_state": "exact"},
+            {"answer_count": 8, "cache_state": "loss"},
+            {"answer_count": 12, "cache_state": "missing"},
+        ]
+        rollup = _response_group_rollup(rows)
+        self.assertEqual(rollup, {
+            "answer_count": 27, "branch_count": 5, "trivial_count": 2,
+            "exact_count": 1, "loss_count": 1, "missing_count": 1,
+        })
+        # trivial/exact/loss/missing partition cache_state exhaustively.
+        self.assertEqual(
+            rollup["trivial_count"] + rollup["exact_count"]
+            + rollup["loss_count"] + rollup["missing_count"],
+            rollup["branch_count"],
+        )
+
+    def test_grouped_response_groups_orders_groups_and_sums_rollups(self):
+        rows = [
+            {"branch_status": "done", "answer_count": 3, "cache_state": "exact"},
+            {"branch_status": "unqueued", "answer_count": 10, "cache_state": "missing"},
+            {"branch_status": "active", "answer_count": 1, "cache_state": "not_applicable"},
+        ]
+        groups = _grouped_response_groups(rows, "status")
+        self.assertEqual(
+            [group["label"] for group in groups], ["active", "done", "unqueued"]
+        )
+        self.assertEqual(
+            sum(group["rollup"]["answer_count"] for group in groups),
+            sum(row["answer_count"] for row in rows),
+        )
+
+    def test_collect_word_report_computes_group_by_status(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+            filters=ReportFilters(group_by="status"),
+        )
+        data = collect_report(self.sources, request)["data"]
+        summary = data["response_group_summary"]
+        self.assertEqual(
+            summary["trivial_count"] + summary["exact_count"]
+            + summary["loss_count"] + summary["missing_count"],
+            summary["branch_count"],
+        )
+        groups = data["response_group_groups"]
+        self.assertEqual(
+            sum(group["rollup"]["branch_count"] for group in groups),
+            summary["branch_count"],
+        )
+        self.assertEqual(
+            sum(group["rollup"]["answer_count"] for group in groups),
+            summary["answer_count"],
+        )
+
+    def test_collect_word_report_omits_groups_when_ungrouped(self):
+        request = ReportRequest(branch_target=parse_report_branch_target("salet"))
+        data = collect_report(self.sources, request)["data"]
+        self.assertNotIn("response_group_groups", data)
+        self.assertIn("response_group_summary", data)
+
+    def test_response_group_summary_reflects_active_filters_not_all_groups(self):
+        # The grand summary describes what's currently filtered to, like the
+        # response_groups list itself — not every response group regardless of
+        # filter (that invariant belongs to erd_summary, which must fold every
+        # group to compute one true word ERD).
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+            filters=ReportFilters(minimum_answer_count=0),
+        )
+        data = collect_report(self.sources, request)["data"]
+        self.assertEqual(
+            data["response_group_summary"]["branch_count"], data["matched_rows"]
+        )
+
+    def test_response_group_summary_ignores_display_limit(self):
+        # A limit truncates what's shown, not what's summarized.
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+            filters=ReportFilters(limit=1),
+        )
+        data = collect_report(self.sources, request)["data"]
+        self.assertGreaterEqual(
+            data["response_group_summary"]["branch_count"],
+            len(data["response_groups"]),
+        )
+
+    def test_response_group_groups_respect_display_limit(self):
+        # response_group_groups must be built from the same limited set as
+        # the flat response_groups list — otherwise the card grid renders
+        # more rows than "Shown N of M matched" claims (PR #231 review).
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+            filters=ReportFilters(group_by="status", limit=1),
+        )
+        data = collect_report(self.sources, request)["data"]
+        total_grouped_rows = sum(
+            len(group["rows"]) for group in data["response_group_groups"]
+        )
+        self.assertEqual(total_grouped_rows, len(data["response_groups"]))
+        self.assertLessEqual(total_grouped_rows, 1)
 
     def _leaderboard_sources(self, answers, candidates):
         directory = self.temporary_directory.name
