@@ -1266,6 +1266,24 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertNotEqual(data["work_started_at"],
                             data["totals"]["requested_at"])
 
+    def test_request_time_stamped_after_the_work_it_asked_for_is_dropped(self):
+        # A queue rebuild restamps every source_work row with its own clock
+        # while the branches keep their true creation times, which leaves the
+        # request looking later than the work.  Reporting that stamp would
+        # claim the swarm started before the word was asked for.
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        requested_at = queue.source_work_rows()[0]["requested_at"]
+        self._finalize(queue, "SALET -y---", 1, 100, 10,
+                       requested_at - 86_400, requested_at - 80_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["work_started_at"], requested_at - 86_400)
+        self.assertIsNone(data["totals"]["requested_at"])
+
     def test_estimate_excludes_stalled_branches_from_both_rate_and_remainder(self):
         estimate = _root_progress_estimate([
             # Progressing: 400 of 1,000 candidates left, 100/day observed.

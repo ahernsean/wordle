@@ -27,10 +27,15 @@
     #branch-target-input { flex:1 1 8rem; min-width:6rem; }
     details.root-progress-panel { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin:.5rem 0; }
     details.root-progress-panel > summary { cursor:pointer; font-weight:bold; }
-    /* The table is wider than a phone; it scrolls inside this box so the page body never does. */
-    .root-progress-scroll { overflow-x:auto; margin-top:.4rem; }
+    /* The table is wider than a phone and longer than a screen; it scrolls
+       inside this box on both axes so the page body never does. */
+    .root-progress-scroll { overflow:auto; max-height:60vh; overscroll-behavior:contain; margin-top:.4rem; }
     table.root-progress { border-collapse:collapse; white-space:nowrap; }
-    table.root-progress th, table.root-progress td { border-bottom:1px solid var(--border); padding:.15rem .5rem; text-align:right; }
+    table.root-progress th, table.root-progress td { padding:.15rem .5rem; text-align:right; }
+    table.root-progress td { border-bottom:1px solid var(--border); }
+    /* A collapsed border does not travel with a sticky header, so the rule
+       under the header row is drawn as an inset shadow. */
+    table.root-progress thead th { position:sticky; top:0; z-index:1; background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
     table.root-progress th:first-child, table.root-progress td:first-child { text-align:left; }
     table.root-progress tr.dim td { color:var(--dim); }
     details.filters { margin-top:.35rem; color:var(--dim); }
@@ -270,7 +275,7 @@
     let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
-    const rootProgressCache=new Map(), rootProgressPending=new Set();
+    const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -762,33 +767,50 @@
       if(state.epoch!==null&&state.epoch!=="")query.set("epoch",String(state.epoch));
       return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
     }
-    function renderRootProgressPanel(data){
+    // The headline sits outside the collapsible panel so the numbers worth a
+    // glance -- how much is left and how much has been reached -- are readable
+    // with the table closed.
+    function renderRootProgressHeadline(data){
+      const totals=data.totals||{},estimate=data.estimate,parts=[];
+      if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining");
+      if(totals.answer_count)parts.push((100*totals.started_answer_count/totals.answer_count).toFixed(1)+"% of answers reached");
+      parts.push("began "+absoluteTime(data.work_started_at));
+      return statLine(parts);
+    }
+    function renderRootProgressPanel(data,url){
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
       const metrics=element("div","metrics");
       metrics.append(
-        metric("groups started",totals.started_response_group_count+" / "+totals.response_group_count),
-        metric("answers reached",totals.started_answer_count+" / "+totals.answer_count),
-        metric("branches",totals.branch_count),
+        metric("groups started",numText(totals.started_response_group_count)+" / "+numText(totals.response_group_count)),
+        metric("answers reached",numText(totals.started_answer_count)+" / "+numText(totals.answer_count)),
+        metric("done",totals.branch_count),
+        metric("evaluating",totals.open_branch_count),
         metric("nodes",formatNodeCount(totals.search_node_count)),
         metric("worker-time",formatDuration((totals.wall_millis||0)/1000)));
       fragment.append(metrics);
-      fragment.append(statLine([
-        "requested "+absoluteTime(totals.requested_at),
-        "work began "+absoluteTime(data.work_started_at),
-        "latest "+absoluteTime(data.work_latest_at)]));
+      // A request time is only shown when the queue still holds a real one; a
+      // stamp from a queue rebuild is dropped upstream rather than displayed
+      // as though the work had started before it was asked for.
+      const times=[];
+      if(totals.requested_at!==null&&totals.requested_at!==undefined)times.push("requested "+absoluteTime(totals.requested_at));
+      times.push("work began "+absoluteTime(data.work_started_at),
+                 "latest "+absoluteTime(data.work_latest_at),
+                 "epoch "+data.epoch);
+      fragment.append(statLine(times));
       const estimate=data.estimate;
       if(estimate){
         fragment.append(statLine([
-          "estimated "+formatDuration(estimate.estimated_seconds)+" remaining",
-          numText(estimate.remaining_candidate_count)+" candidates at "+numText(Math.round(estimate.candidates_per_day))+"/day",
-          "excludes "+(totals.response_group_count-totals.started_response_group_count)+" unstarted groups and "+estimate.stalled_branch_count+" stalled branches"]));
+          "~"+formatDuration(estimate.estimated_seconds)+" remaining",
+          numText(estimate.remaining_candidate_count)+" candidates at ~"+numText(Math.round(estimate.candidates_per_day))+"/day",
+          "excludes "+numText(totals.response_group_count-totals.started_response_group_count)+" unstarted groups and "+numText(estimate.stalled_branch_count)+" stalled branches"]));
       }else{
         fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
       }
-      const table=element("table","root-progress");
-      const head=element("tr","");
-      for(const columnName of ["Pattern","Answers","Branches","Open","Nodes","Share","Elapsed","Worker-time"])head.append(element("th","",columnName));
+      const table=element("table","root-progress"),head=element("thead",""),headRow=element("tr","");
+      for(const columnName of ["Pattern","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
+      head.append(headRow);
       table.append(head);
+      const body=element("tbody","");
       for(const row of data.response_groups||[]){
         const line=element("tr",row.started?"":"dim");
         line.append(
@@ -800,33 +822,47 @@
           element("td","",row.started?(100*row.search_node_share).toFixed(1)+"%":"—"),
           element("td","",row.elapsed_millis===null?"—":formatDuration(row.elapsed_millis/1000)),
           element("td","",row.started&&row.branch_count?formatDuration(row.wall_millis/1000):"—"));
-        table.append(line);
+        body.append(line);
       }
+      table.append(body);
       const scroller=element("div","root-progress-scroll");
       scroller.append(table);
+      // Every poll rebuilds the word report, so the scroller is a new element
+      // each time; without carrying its offsets the view snaps back to the
+      // top-left mid-read.
+      scroller.addEventListener("scroll",()=>rootProgressScroll.set(url,{left:scroller.scrollLeft,top:scroller.scrollTop}));
       fragment.append(scroller);
+      fragment.append(element("p","dim","Done and Evaluating count branches at every depth under the pattern. Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock; Worker-time sums across workers. Counts cover epoch "+data.epoch+" only."));
       return fragment;
     }
-    function renderRootProgressInto(host,url,data){
+    function renderRootProgressInto(headlineHost,host,url,data){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);attachRootProgress(host,url);});
-      host.replaceChildren(renderRootProgressPanel(data),refresh);
+      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);attachRootProgress(headlineHost,host,url);});
+      headlineHost.replaceChildren(renderRootProgressHeadline(data));
+      host.replaceChildren(renderRootProgressPanel(data,url),refresh);
+      // The panel is built before the report is mounted, and scroll offsets do
+      // not apply to a detached element.  A microtask runs after the mount and
+      // before the paint, so the restored position is never seen scrolling.
+      queueMicrotask(()=>{
+        const scroller=host.querySelector(".root-progress-scroll"),saved=rootProgressScroll.get(url);
+        if(scroller&&saved){scroller.scrollLeft=saved.left;scroller.scrollTop=saved.top;}
+      });
     }
-    function attachRootProgress(host,url){
+    function attachRootProgress(headlineHost,host,url){
       const cached=rootProgressCache.get(url);
-      if(cached){renderRootProgressInto(host,url,cached);return;}
+      if(cached){renderRootProgressInto(headlineHost,host,url,cached);return;}
       host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
       if(rootProgressPending.has(url))return;
       rootProgressPending.add(url);
       fetch(url,{headers:{Accept:"application/json"}})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
-        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(host,url,progress.data);})
+        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data);})
         .catch(error=>{if(host.isConnected)host.replaceChildren(element("p","error",error.message));})
         .finally(()=>rootProgressPending.delete(url));
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading,renderSpine(data.context?.spine));
-      const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+erd.infeasible_group_count+" of "+erd.response_group_count+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+erd.resolved_group_count+" of "+erd.response_group_count+" response groups solved"));}}
+      const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+numText(erd.infeasible_group_count)+" of "+numText(erd.response_group_count)+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+numText(erd.resolved_group_count)+" of "+numText(erd.response_group_count)+" response groups solved"));}}
       const responseSummary=data.response_group_summary;
       if(responseSummary){
         const summary=element("div","metrics");
@@ -835,12 +871,14 @@
       }
       const progressURL=rootProgressURL(state),progressDetails=element("details","root-progress-panel");
       progressDetails.open=rootProgressOpen;
-      const progressHost=element("div","root-progress-host");
+      const progressHeadline=element("div","root-progress-headline"),progressHost=element("div","root-progress-host");
       progressDetails.append(element("summary","clickable","Root progress"),progressHost);
-      progressDetails.addEventListener("toggle",()=>{rootProgressOpen=progressDetails.open;if(progressDetails.open)attachRootProgress(progressHost,progressURL);});
-      if(progressDetails.open)attachRootProgress(progressHost,progressURL);
-      fragment.append(progressDetails);
-      const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+shownRows.length+" of "+matchedRows+" matched · "+totalRows+" total response groups"));
+      progressDetails.addEventListener("toggle",()=>{rootProgressOpen=progressDetails.open;});
+      // Fetched whether or not the panel is open: the headline outside it
+      // carries the same result, and the result is cached per target.
+      attachRootProgress(progressHeadline,progressHost,progressURL);
+      fragment.append(progressHeadline,progressDetails);
+      const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched · "+numText(totalRows)+" total response groups"));
       const previousRows=previousBy(previous,"response_groups","branch_key_hex");
       const responseGroupCard=row=>{
         const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;
@@ -1025,7 +1063,7 @@
         const size=pageSize(),holder=element("div","tree-pattern-page"),pageIndex=treeGroupPages.get(groupKey)||0,start=pageIndex*size,patterns=element("ul","patterns");
         for(const node of groupNodes.slice(start,start+size))patterns.append(build(node));
         holder.append(patterns);
-        if(groupNodes.length>size)holder.append(buildPager({summary:"Showing "+(start+1)+"–"+Math.min(start+size,groupNodes.length)+" of "+groupNodes.length+" branches",previous:pageIndex?()=>{treeGroupPages.set(groupKey,pageIndex-1);holder.replaceWith(buildPatternPage(groupNodes,groupKey));}:null,next:start+size<groupNodes.length?()=>{treeGroupPages.set(groupKey,pageIndex+1);holder.replaceWith(buildPatternPage(groupNodes,groupKey));}:null}));
+        if(groupNodes.length>size)holder.append(buildPager({summary:"Showing "+numText(start+1)+"–"+numText(Math.min(start+size,groupNodes.length))+" of "+numText(groupNodes.length)+" branches",previous:pageIndex?()=>{treeGroupPages.set(groupKey,pageIndex-1);holder.replaceWith(buildPatternPage(groupNodes,groupKey));}:null,next:start+size<groupNodes.length?()=>{treeGroupPages.set(groupKey,pageIndex+1);holder.replaceWith(buildPatternPage(groupNodes,groupKey));}:null}));
         return holder;
       };
       const buildGroupedList=(siblings,parentKey,className)=>{
@@ -1042,7 +1080,7 @@
         }
         return list;
       };
-      const buildPage=(siblings,paging,parentSpine)=>{const holder=element("div","tree-page"),tree=buildGroupedList(siblings,parentSpine||"","tree");holder.append(tree);const key=pageKey(parentSpine),history=treePageHistory.get(key)||[],returnedGroupCount=paging.returned_group_count??wordGroups(siblings).length,totalGroupCount=paging.total_group_count??returnedGroupCount;if(history.length||paging.next_cursor)holder.append(buildPager({summary:"Showing "+returnedGroupCount+" of "+totalGroupCount+" child groups",previous:history.length?()=>{const prior=history.pop();treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:prior||null},false);else loadPage(parentSpine,prior,holder);}:null,next:paging.next_cursor?()=>{history.push(paging.cursor||null);treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:paging.next_cursor},false);else loadPage(parentSpine,paging.next_cursor,holder);}:null}));return holder;};
+      const buildPage=(siblings,paging,parentSpine)=>{const holder=element("div","tree-page"),tree=buildGroupedList(siblings,parentSpine||"","tree");holder.append(tree);const key=pageKey(parentSpine),history=treePageHistory.get(key)||[],returnedGroupCount=paging.returned_group_count??wordGroups(siblings).length,totalGroupCount=paging.total_group_count??returnedGroupCount;if(history.length||paging.next_cursor)holder.append(buildPager({summary:"Showing "+numText(returnedGroupCount)+" of "+numText(totalGroupCount)+" child groups",previous:history.length?()=>{const prior=history.pop();treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:prior||null},false);else loadPage(parentSpine,prior,holder);}:null,next:paging.next_cursor?()=>{history.push(paging.cursor||null);treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:paging.next_cursor},false);else loadPage(parentSpine,paging.next_cursor,holder);}:null}));return holder;};
       fragment.append(buildPage(data.nodes||[],data.paging||{},data.paging?.parent_spine||""));return fragment;
     }
     function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=element("div","grid"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
@@ -1092,7 +1130,7 @@
       metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("infeasible",counts.infeasible),metric("candidates",data.candidate_count));
       fragment.append(element("h2","","Opener leaderboard"),metrics);
       const rows=data.rows||[];
-      fragment.append(element("p","dim","Ranked by ERD · showing "+rows.length+" of "+(data.total_rows??rows.length)+" complete"));
+      fragment.append(element("p","dim","Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete"));
       if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
       const grid=element("div","grid"),previousRows=previousBy(previous,"rows","word");
       for(const row of rows){const card=element("article","card "+changeClass(row,previousRows.get(String(row.word))));card.dataset.identity=row.word;const title=element("div","card-title");const entry=element("span","word-erd");entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","chip","#"+row.rank),entry);card.append(title,statLine(["max remaining depth "+row.max_remaining_depth]));grid.append(card);}

@@ -401,10 +401,89 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("table.root-progress")
         headers = self.page.eval_on_selector_all(
             "table.root-progress th", "cells => cells.map(c => c.textContent)")
+        # The branch columns are named for the lifecycle phases the report
+        # already shows elsewhere: queued -> evaluating -> finalizing -> done.
         self.assertEqual(
             headers,
-            ["Pattern", "Answers", "Branches", "Open", "Nodes", "Share",
+            ["Pattern", "Answers", "Done", "Evaluating", "Nodes", "Share",
              "Elapsed", "Worker-time"])
+
+    def test_root_progress_table_keeps_its_scroll_position_across_polls(self):
+        # Every poll rebuilds the word report, so the scroller is a fresh
+        # element each cycle.  Without carrying its offsets the table snaps
+        # back to the top-left every couple of seconds while being read.
+        # Phone width, where the table overflows on both axes: a wide viewport
+        # exercises only the vertical one.
+        self.page.set_viewport_size({"width": 390, "height": 800})
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        scrolled = self.page.evaluate("""() => {
+          const box = document.querySelector('.root-progress-scroll');
+          box.scrollLeft = box.scrollWidth - box.clientWidth;
+          box.scrollTop = box.scrollHeight - box.clientHeight;
+          box.dispatchEvent(new Event('scroll'));
+          return [box.scrollLeft, box.scrollTop];
+        }""")
+        self.assertGreater(scrolled[0], 0, "table must overflow horizontally")
+        self.assertGreater(scrolled[1], 0, "table must overflow vertically")
+        self.page.wait_for_timeout(2 * CLIENT_POLL_MILLIS)
+        after = self.page.evaluate("""() => {
+          const box = document.querySelector('.root-progress-scroll');
+          return [box.scrollLeft, box.scrollTop];
+        }""")
+        self.assertEqual(after, scrolled)
+
+    def test_root_progress_table_header_stays_visible_while_scrolling(self):
+        # The table is longer than a phone screen; a header that scrolls away
+        # leaves the columns unidentifiable exactly where the reading happens.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        overlap = self.page.evaluate("""() => {
+          const box = document.querySelector('.root-progress-scroll');
+          box.scrollTop = box.scrollHeight - box.clientHeight;
+          const header = box.querySelector('thead th').getBoundingClientRect();
+          const frame = box.getBoundingClientRect();
+          return {scrolled: box.scrollTop, headerTop: header.top,
+                  frameTop: frame.top, frameBottom: frame.bottom};
+        }""")
+        self.assertGreater(overlap["scrolled"], 0,
+                           "fixture table must overflow vertically")
+        self.assertLess(overlap["headerTop"], overlap["frameBottom"])
+        self.assertAlmostEqual(overlap["headerTop"], overlap["frameTop"],
+                               delta=2)
+
+    def test_root_progress_headline_shows_with_the_panel_collapsed(self):
+        # The remaining-time estimate is the number worth a glance; burying it
+        # behind a disclosure puts it out of reach on a phone.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        self.page.evaluate(
+            "() => document.querySelector('details.root-progress-panel')"
+            ".open = false")
+        headline = self.page.locator(".root-progress-headline").inner_text()
+        self.assertIn("remaining", headline)
+        self.assertIn("% of answers reached", headline)
+        self.assertIn("began", headline)
+        self.assertEqual(
+            self.page.locator("table.root-progress").count(), 1)
+
+    def test_root_progress_counts_carry_thousands_separators(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        text = self.page.locator("details.root-progress-panel").inner_text()
+        self.assertIn("3,209", text)
+        self.assertNotIn("3209", text)
+
+    def test_root_progress_omits_a_request_time_the_queue_cannot_vouch_for(self):
+        # The fixture carries no request time: the queue rebuild that restamped
+        # source_work destroyed it.  Rendering a placeholder would read as a
+        # measurement.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        text = self.page.locator("details.root-progress-panel").inner_text()
+        self.assertNotIn("requested", text)
+        self.assertIn("work began", text)
+        self.assertIn("epoch", text)
 
     def test_root_progress_url_carries_only_parameters_the_report_accepts(self):
         # The word view's own display state — group_by, sort, limit, branch
@@ -429,8 +508,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.root-progress")
         started_without_finalizations = self.page.eval_on_selector_all(
-            "table.root-progress tr:not(.dim)",
-            """rows => rows.slice(1)
+            "table.root-progress tbody tr:not(.dim)",
+            """rows => rows
                  .map(r => [...r.cells].map(c => c.textContent))
                  .filter(cells => cells[2] === '0')""")
         self.assertTrue(started_without_finalizations)
@@ -444,7 +523,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.root-progress")
         dimmed = self.page.eval_on_selector_all(
-            "table.root-progress tr.dim td",
+            "table.root-progress tbody tr.dim td",
             "cells => cells.map(c => c.textContent)")
         self.assertIn("—", dimmed)
         self.assertNotIn("0.0%", dimmed)

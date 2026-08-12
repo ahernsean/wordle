@@ -1410,8 +1410,18 @@ def collect_root_progress_report(sources: ReportSources,
         progress["active_branches"],
         progress["recent_window_seconds"])
     data["active_branches"] = progress["active_branches"]
+    # A request time later than the work it asked for is not a request time.
+    # Rebuilding the queue's source_work rows stamps every one of them with the
+    # rebuild's own clock, discarding whatever the original request time was,
+    # while the branches themselves keep their true creation times.  Reporting
+    # the stamp would place the request after the work it requested, so it is
+    # dropped and the report shows only when work began.
     earliest_request = min((entry["requested_at"] for entry in requests),
                            default=None)
+    if (earliest_request is not None
+            and progress["work_started_at"] is not None
+            and earliest_request > progress["work_started_at"]):
+        earliest_request = None
     data["totals"] = {
         "response_group_count": len(rows),
         "started_response_group_count": sum(row["started"] for row in rows),

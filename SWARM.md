@@ -137,18 +137,32 @@ python3.13 erd_search.py view --root-progress CRANE --epoch 10
 
 `--root-progress` reports one root word's work: every response group with the
 branches, search nodes, and node share spent under it, which groups have not
-been opened at all, when the word was requested versus when work actually
-began on it, and a completion estimate. It is the report that answers "why is
+been opened at all, when work actually began on it, and a completion estimate.
+It is the report that answers "why is
 this root taking so long" — cost concentrates hard, and the node-share column
 names the group holding it. It takes a bare word; a word nested in a spine is
 rejected, since the rollup keys on the root's own response pattern.
 
 A group counts as started once any branch has opened on it, finalized or not,
-so a group being worked right now never reads as untouched. The `Open` column
-carries its in-flight branch count. A started group that has finalized nothing
-shows measured zeros for branches and nodes but `—` for elapsed and
-worker-time, which exist only at finalize; an unopened group shows `—`
-throughout.
+so a group being worked right now never reads as untouched. The two branch
+columns are named for the lifecycle phases the rest of the report uses:
+`Evaluating` counts branches in flight, `Done` counts branches that have
+finalized. Both span every depth under the group, so promoted sub-branches are
+included — unlike the word report's own response-group count, which sees only
+the root's direct groups. A started group that has finalized nothing shows
+measured zeros for those columns but `—` for elapsed and worker-time, which
+exist only at finalize; an unopened group shows `—` throughout.
+
+Node, share, elapsed and worker-time figures are fenced to one telemetry epoch,
+which the report names. Work that finalized under an earlier epoch is not
+counted, so a root whose work began before the current epoch shows a start time
+older than any of its costs.
+
+A request time appears only when the queue holds one that precedes the work it
+asked for. Rebuilding the queue's `source_work` rows restamps every one of them
+with the rebuild's clock while the branches keep their true creation times,
+which leaves the recorded request later than the work; that stamp is dropped
+rather than displayed.
 
 Two time bases appear per group and they answer different questions. `Elapsed`
 is wall-clock from the group's first branch to its last, which the swarm's

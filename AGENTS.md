@@ -136,6 +136,31 @@ produce the same response pattern to a given guess). Do not call them
 
 ---
 
+## Displayed integers carry comma separators
+
+Unless separators would mislead, every integer shown to a user is rendered with
+thousands separators: `571,359`, not `571359`. This holds in the web client, the
+terminal renderer, and CLI output alike.
+
+Separators mislead when the number is an identifier rather than a quantity —
+epoch numbers, branch ids, worker ids, ports, years. Those stay bare.
+
+The web client already formats correctly wherever a number reaches `metric()`
+or `labeledFacts()`, because `valueOrDash` routes integers through
+`formatInteger`. The gap is string concatenation, where a raw number is glued
+into a sentence:
+
+```javascript
+// Wrong: renders "Shown 1170 of 14855 matched"
+"Shown "+shownRows.length+" of "+matchedRows+" matched"
+// Right
+"Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched"
+```
+
+In Python, use the `:,` format spec (`f"{count:,}"`).
+
+---
+
 ## Comment style
 
 **Describe what the code is, not how it got there.**

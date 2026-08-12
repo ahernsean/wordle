@@ -1558,7 +1558,7 @@ class ViewParserTest(unittest.TestCase):
         self.assertTrue(request.include_answers)
 
 
-def root_progress_report(estimate=None):
+def root_progress_report(estimate=None, requested_at=1_798_000_000):
     return {
         "report_kind": "root_progress",
         "schema_version": 2,
@@ -1612,7 +1612,7 @@ def root_progress_report(estimate=None):
                 "wall_millis": 3_471_277_846,
                 "open_branch_count": 8632,
                 "counted_branch_count": 10,
-                "requested_at": 1_798_000_000,
+                "requested_at": requested_at,
                 "recent_window_seconds": 86400,
             },
         },
@@ -1656,7 +1656,10 @@ class RootProgressRendererTest(unittest.TestCase):
 
     def test_open_branch_count_is_its_own_column(self):
         output = render_report(root_progress_report(), width=120)
-        self.assertIn("Open", output.splitlines()[7])
+        # Named for the lifecycle phase the branches are in, so the column
+        # beside it can be named for the phase they reach.
+        self.assertIn("Evaluating", output.splitlines()[7])
+        self.assertIn("Done", output.splitlines()[7])
         hot = next(line for line in output.splitlines()
                    if line.startswith("-y---"))
         self.assertIn("8,584", hot)
@@ -1670,13 +1673,28 @@ class RootProgressRendererTest(unittest.TestCase):
             "stalled_branch_count": 9,
             "stalled_remaining_candidate_count": 4256,
         }), width=120)
-        self.assertIn("estimate 12.4d", output)
+        self.assertIn("estimate ~12.4d", output)
         self.assertIn("79 unstarted groups", output)
         self.assertIn("9 stalled branches", output)
 
     def test_absent_estimate_is_stated_rather_than_guessed(self):
         output = render_report(root_progress_report(), width=120)
         self.assertIn("estimate unavailable", output)
+
+    def test_absent_request_time_is_omitted_rather_than_shown_as_unknown(self):
+        # The queue has no trustworthy request time for this root, so the line
+        # reports only what is known instead of printing a placeholder that
+        # would read as a measurement.
+        output = render_report(root_progress_report(requested_at=None),
+                               width=120)
+        self.assertNotIn("Requested", output)
+        self.assertIn("work began", output)
+
+    def test_counts_are_rendered_with_thousands_separators(self):
+        output = render_report(root_progress_report(), width=120)
+        self.assertIn("answers 2,895/3,209", output)
+        self.assertIn("done 550,292", output)
+        self.assertIn("evaluating 8,632", output)
 
 
 if __name__ == "__main__":

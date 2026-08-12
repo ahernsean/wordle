@@ -1475,23 +1475,28 @@ def _render_root_progress_sections(report, width, display_order):
     )
     requested_at = totals["requested_at"]
     started_at = data["work_started_at"]
+    # A request time stamped by a queue rebuild is dropped upstream rather than
+    # printed as though the work had started before it was asked for.
+    request_text = (f"Requested {_timestamp_text(requested_at)}   "
+                    if requested_at is not None else "")
     summary = [
         _fit(
-            f"Requested {_timestamp_text(requested_at)}   "
+            f"{request_text}"
             f"work began {_timestamp_text(started_at)}   "
             f"latest {_timestamp_text(data['work_latest_at'])}",
             width,
         ),
         _fit(
-            f"  response groups {totals['started_response_group_count']}"
-            f"/{totals['response_group_count']} started"
-            f"   answers {totals['started_answer_count']}"
-            f"/{totals['answer_count']}"
+            f"  response groups {totals['started_response_group_count']:,}"
+            f"/{totals['response_group_count']:,} started"
+            f"   answers {totals['started_answer_count']:,}"
+            f"/{totals['answer_count']:,}"
             f" ({_percentage(totals['started_answer_count'], totals['answer_count'])})",
             width,
         ),
         _fit(
-            f"  branches {totals['branch_count']:,}"
+            f"  done {totals['branch_count']:,}"
+            f"   evaluating {totals['open_branch_count']:,}"
             f"   nodes {_format_node_count(totals['search_node_count'])}"
             f"   worker-time {_abbreviate_duration(totals['wall_millis'] / 1000)}",
             width,
@@ -1505,21 +1510,21 @@ def _render_root_progress_sections(report, width, display_order):
         ))
     else:
         summary.append(_fit(
-            f"  estimate {_abbreviate_duration(estimate['estimated_seconds'])}"
+            f"  estimate ~{_abbreviate_duration(estimate['estimated_seconds'])}"
             f" for {estimate['remaining_candidate_count']:,} candidates"
-            f" at {estimate['candidates_per_day']:,.0f}/day",
+            f" at ~{estimate['candidates_per_day']:,.0f}/day",
             width,
         ))
         summary.append(_fit(
             f"    excludes "
-            f"{totals['response_group_count'] - totals['started_response_group_count']}"
-            f" unstarted groups and {estimate['stalled_branch_count']}"
+            f"{totals['response_group_count'] - totals['started_response_group_count']:,}"
+            f" unstarted groups and {estimate['stalled_branch_count']:,}"
             f" stalled branches"
             f" ({estimate['stalled_remaining_candidate_count']:,} candidates)",
             width,
         ))
-    rows = ["Pattern  Answers  Branches  Open      Nodes  Share   Elapsed  "
-            "WorkerTime"]
+    rows = ["Pattern  Answers      Done  Evaluating      Nodes  Share   "
+            "Elapsed  WorkerTime"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
         # zeros would read as a measurement rather than an absence.  A group
@@ -1540,7 +1545,7 @@ def _render_root_progress_sections(report, width, display_order):
             elapsed_text = worker_text = "—"
         rows.append(_fit(
             f"{row['pattern']:<7}  {row['answer_count']:>7}  "
-            f"{branch_text:>8}  {open_text:>4}  {node_text:>9}  "
+            f"{branch_text:>8}  {open_text:>10}  {node_text:>9}  "
             f"{share_text:>5}  {elapsed_text:>8}  {worker_text:>10}",
             width,
         ))
