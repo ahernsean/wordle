@@ -217,11 +217,7 @@
         <div class="group-head"><span class="gname">Filters:</span><span class="ghint">narrow the branches — applied as you change them</span></div>
         <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
         <div class="status-line"><span class="label">Branch phase</span><span class="statuses" id="branch-phases"></span></div>
-        <div class="dim lifecycle-legend">
-          Status is the branch's relationship to current work — <strong>active</strong> has a worker on it now, <strong>pending</strong> is unfinished with no worker right now, <strong>done</strong> means the result is persisted and no work remains, <strong>unqueued</strong> means no work has been scheduled or persisted yet.
-          Phase is the durable search milestone, reached in order: <strong>queued → evaluating → finalizing → complete</strong>; unqueued branches have no phase yet.
-          Normal combinations: unqueued/— · pending/queued · active/evaluating · pending/evaluating · active/finalizing · pending/finalizing · done/complete.
-        </div>
+        <div class="dim lifecycle-legend">Phase tracks queued → evaluating → finalizing → complete; status tracks whether a worker is on it right now. Unqueued branches have no phase yet.</div>
         <div class="field-flow">
           <label class="field">Min answers<input id="minimum-answer-count" type="number"></label>
           <label class="field">Max answers<input id="maximum-answer-count" type="number"></label>
