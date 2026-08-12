@@ -1326,25 +1326,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertTrue(self.page.locator("#filters-group").is_hidden())
         self.assertTrue(self.page.locator("#sort-field").is_hidden())
 
-    def test_word_report_sort_hides_options_the_server_would_reject(self):
-        # A word report's sort is restricted server-side to default/size/
-        # workers/priority (validate_report_request); age/nodes/slowest would
-        # silently bounce back to "default" with no explanation if offered.
+    def test_word_report_sort_only_offers_options_the_server_accepts(self):
+        # A word report's sort is restricted server-side to size/workers/
+        # priority (validate_report_request); age/nodes/slowest would
+        # silently bounce back to "default" with no explanation if offered,
+        # and iOS Safari's native picker ignores "hidden" on <option> — so
+        # the invalid ones, and the meaningless blank "default", must be
+        # absent from the DOM entirely, not just hidden.
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("text=word report")
-        hidden_by_value = dict(self.page.eval_on_selector_all(
-            "#sort option", "options => options.map(o => [o.value, o.hidden])"
-        ))
-        self.assertEqual(hidden_by_value,
-            {"": False, "age": True, "size": False, "workers": False,
-             "priority": False, "nodes": True, "slowest": True})
+        values = self.page.eval_on_selector_all(
+            "#sort option", "options => options.map(o => o.value)"
+        )
+        self.assertEqual(values, ["size", "workers", "priority"])
+        self.assertEqual(self.page.evaluate("__reportClient.getState().sort"), "size")
         self.page.locator("[data-kind=queue]").click()
         self.page.wait_for_function("() => __reportClient.getState().kind === 'queue'")
-        self.assertTrue(all(
-            hidden is False for _, hidden in self.page.eval_on_selector_all(
-                "#sort option", "options => options.map(o => [o.value, o.hidden])"
-            )
-        ))
+        self.assertEqual(
+            self.page.eval_on_selector_all("#sort option", "options => options.map(o => o.value)"),
+            ["", "age", "size", "workers", "priority", "nodes", "slowest"],
+        )
 
     def test_refresh_popover_toggles_open_and_closed(self):
         self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
@@ -1429,7 +1430,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(states["historical"]["branch_phase"], [])
         self.assertFalse(states["tree"]["claims"])
         self.assertFalse(states["tree"]["answers"])
-        self.assertEqual(states["word"]["sort"], "")
+        self.assertEqual(states["word"]["sort"], "size")
 
     def test_word_summary_keeps_unfiltered_totals(self):
         text = self.page.evaluate("""async () => {

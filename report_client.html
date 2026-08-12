@@ -228,7 +228,7 @@
       <div class="control-group" id="view-group">
         <div class="group-head"><span class="gname">View</span><span class="ghint">order &amp; scope what's shown</span></div>
         <div class="field-flow">
-          <label class="field" id="sort-field"><span class="fieldlabel">Sort</span><select id="sort"><option value="">default</option><option data-word-report-invalid>age</option><option>size</option><option>workers</option><option>priority</option><option data-word-report-invalid>nodes</option><option data-word-report-invalid>slowest</option></select></label>
+          <label class="field" id="sort-field"><span class="fieldlabel">Sort</span><select id="sort"></select></label>
           <label class="field" id="group-by-field"><span class="fieldlabel">Group by</span><select id="group-by"><option value="">none</option><option value="status">status</option><option value="answer_count">answer count</option><option value="cache_state">cache state</option><option value="worker_presence">worker</option><option value="priority">priority</option></select></label>
           <label class="field" id="limit-field"><span id="limit-label">Branches shown</span><input id="limit" type="number" min="1"></label>
           <label class="field" id="by-field"><span class="fieldlabel">Hotspot field</span><select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>bulk-completed-candidates</option><option>cut-reuse</option><option>coordination</option></select></label>
@@ -245,6 +245,11 @@
     const SCHEMA_VERSION=2, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
+    // iOS Safari's native <select> picker ignores the "hidden" attribute on
+    // <option> elements, so context-dependent choices are rebuilt into the
+    // DOM rather than toggled — an absent option can't appear in any picker.
+    const SORT_OPTIONS_DEFAULT=[["","default"],["age","age"],["size","size"],["workers","workers"],["priority","priority"],["nodes","nodes"],["slowest","slowest"]];
+    const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
@@ -342,7 +347,7 @@
       if(normalized.kind!=="workers")normalized.worker_id=null;
       if(normalized.kind==="auto"&&normalized.branch_target===""){normalized.answers=false;normalized.claims=false;}
       const inferredWord=isInferredWordState(normalized.kind,normalized.branch_target);
-      if(inferredWord&&!['','default','size','workers','priority'].includes(normalized.sort))normalized.sort="";
+      if(inferredWord&&!['size','workers','priority'].includes(normalized.sort))normalized.sort="size";
       if(!inferredWord)normalized.group_by="";
       return normalized;
     }
@@ -392,17 +397,21 @@
       byId("layout-flat").setAttribute("aria-pressed",currentState.tree?"false":"true");
       byId("layout-tree").setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
-      byId("sort").value=currentState.sort;byId("by").value=currentState.by;byId("group-by").value=currentState.group_by;
+      const kind=currentState.kind, isHotspots=kind==="hotspots";
+      const wordReport=isInferredWordState(kind,currentState.branch_target);
+      const sortSelect=byId("sort"),sortMode=wordReport?"word":"default";
+      if(sortSelect.dataset.mode!==sortMode){
+        sortSelect.replaceChildren(...(wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT).map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
+        sortSelect.dataset.mode=sortMode;
+      }
+      sortSelect.value=currentState.sort;byId("by").value=currentState.by;byId("group-by").value=currentState.group_by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
-      const kind=currentState.kind, isHotspots=kind==="hotspots";
       const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(currentState.by);
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
       byId("sort-field").hidden=kind==="cache"||isHotspots;
-      const wordReport=isInferredWordState(kind,currentState.branch_target);
-      for(const option of byId("sort").options)option.hidden="wordReportInvalid" in option.dataset&&wordReport;
       byId("group-by-field").hidden=!wordReport;
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
       byId("limit-label").textContent=currentState.tree?"Items per page":kind==="auto"?"Branches shown":"Rows shown";
