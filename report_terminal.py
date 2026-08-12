@@ -1518,25 +1518,30 @@ def _render_root_progress_sections(report, width, display_order):
             f" ({estimate['stalled_remaining_candidate_count']:,} candidates)",
             width,
         ))
-    rows = ["Pattern  Answers  Branches      Nodes  Share   Elapsed  WorkerTime"]
+    rows = ["Pattern  Answers  Branches  Open      Nodes  Share   Elapsed  "
+            "WorkerTime"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
-        # zeros would read as a measurement rather than an absence.
+        # zeros would read as a measurement rather than an absence.  A group
+        # that is open but has finalized nothing is the opposite case: its
+        # zeros are measured, and only the finalize-only figures stay unknown.
         if row["started"]:
             branch_text = f"{row['branch_count']:,}"
+            open_text = f"{row['open_branch_count']:,}"
             node_text = _format_node_count(row["search_node_count"])
             share_text = f"{100.0 * row['search_node_share']:.1f}%"
             elapsed_text = _abbreviate_duration(
                 row["elapsed_millis"] / 1000
                 if row["elapsed_millis"] is not None else None)
-            worker_text = _abbreviate_duration(row["wall_millis"] / 1000)
+            worker_text = (_abbreviate_duration(row["wall_millis"] / 1000)
+                           if row["branch_count"] else "—")
         else:
-            branch_text = node_text = share_text = "—"
+            branch_text = open_text = node_text = share_text = "—"
             elapsed_text = worker_text = "—"
         rows.append(_fit(
             f"{row['pattern']:<7}  {row['answer_count']:>7}  "
-            f"{branch_text:>8}  {node_text:>9}  {share_text:>5}  "
-            f"{elapsed_text:>8}  {worker_text:>10}",
+            f"{branch_text:>8}  {open_text:>4}  {node_text:>9}  "
+            f"{share_text:>5}  {elapsed_text:>8}  {worker_text:>10}",
             width,
         ))
     return [("header", header), ("summary", summary),

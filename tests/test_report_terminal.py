@@ -1583,12 +1583,21 @@ def root_progress_report(estimate=None):
             "estimate": estimate,
             "response_groups": [
                 {"pattern": "-y---", "answer_count": 502, "started": True,
-                 "branch_count": 524_184, "search_node_count": 129_900_000_000,
+                 "branch_count": 524_184, "open_branch_count": 8_584,
+                 "search_node_count": 129_900_000_000,
                  "search_node_share": 0.989, "wall_millis": 3_400_000_000,
                  "elapsed_millis": 968_000_000,
                  "first_created_at": 1, "last_finalized_at": 2},
+                # Open, nothing finalized: started, with no cost yet.
+                {"pattern": "-gg--", "answer_count": 16, "started": True,
+                 "branch_count": 0, "open_branch_count": 1,
+                 "search_node_count": 0,
+                 "search_node_share": 0.0, "wall_millis": 0,
+                 "elapsed_millis": None,
+                 "first_created_at": 3, "last_finalized_at": None},
                 {"pattern": "--y--", "answer_count": 126, "started": False,
-                 "branch_count": 0, "search_node_count": 0,
+                 "branch_count": 0, "open_branch_count": 0,
+                 "search_node_count": 0,
                  "search_node_share": 0.0, "wall_millis": 0,
                  "elapsed_millis": None,
                  "first_created_at": None, "last_finalized_at": None},
@@ -1634,6 +1643,23 @@ class RootProgressRendererTest(unittest.TestCase):
                          if line.startswith("--y--"))
         self.assertIn("—", unstarted)
         self.assertNotIn("0.0%", unstarted)
+
+    def test_open_group_with_nothing_finalized_reads_as_started(self):
+        # Distinct from unstarted: its zeros are measured, and only the
+        # figures that exist solely at finalize stay unknown.
+        output = render_report(root_progress_report(), width=120)
+        fresh = next(line for line in output.splitlines()
+                     if line.startswith("-gg--"))
+        self.assertIn("0.0%", fresh)
+        # One open branch, no finalized ones, and no worker-time yet.
+        self.assertRegex(fresh, r"-gg--\s+16\s+0\s+1\s+0\s+0\.0%\s+—\s+—")
+
+    def test_open_branch_count_is_its_own_column(self):
+        output = render_report(root_progress_report(), width=120)
+        self.assertIn("Open", output.splitlines()[7])
+        hot = next(line for line in output.splitlines()
+                   if line.startswith("-y---"))
+        self.assertIn("8,584", hot)
 
     def test_estimate_states_what_it_excludes(self):
         output = render_report(root_progress_report(estimate={

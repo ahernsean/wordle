@@ -403,8 +403,23 @@ class ReportClientBrowserTest(unittest.TestCase):
             "table.root-progress th", "cells => cells.map(c => c.textContent)")
         self.assertEqual(
             headers,
-            ["Pattern", "Answers", "Branches", "Nodes", "Share", "Elapsed",
-             "Worker-time"])
+            ["Pattern", "Answers", "Branches", "Open", "Nodes", "Share",
+             "Elapsed", "Worker-time"])
+
+    def test_root_progress_panel_shows_open_groups_as_started(self):
+        # A group whose first branch is still open is being worked right now.
+        # Dimming it as unstarted would hide the live state.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        started_without_finalizations = self.page.eval_on_selector_all(
+            "table.root-progress tr:not(.dim)",
+            """rows => rows.slice(1)
+                 .map(r => [...r.cells].map(c => c.textContent))
+                 .filter(cells => cells[2] === '0')""")
+        self.assertTrue(started_without_finalizations)
+        cells = started_without_finalizations[0]
+        self.assertNotEqual(cells[3], "—")   # open count is known
+        self.assertEqual(cells[7], "—")      # worker-time only exists at finalize
 
     def test_root_progress_panel_marks_unstarted_groups_without_zero_costs(self):
         # An unstarted group has no cost to report; showing 0 would read as

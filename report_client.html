@@ -780,7 +780,7 @@
       }
       const table=element("table","root-progress");
       const head=element("tr","");
-      for(const columnName of ["Pattern","Answers","Branches","Nodes","Share","Elapsed","Worker-time"])head.append(element("th","",columnName));
+      for(const columnName of ["Pattern","Answers","Branches","Open","Nodes","Share","Elapsed","Worker-time"])head.append(element("th","",columnName));
       table.append(head);
       for(const row of data.response_groups||[]){
         const line=element("tr",row.started?"":"dim");
@@ -788,10 +788,11 @@
           element("td","",row.pattern),
           element("td","",numText(row.answer_count)),
           element("td","",row.started?numText(row.branch_count):"—"),
+          element("td","",row.started?numText(row.open_branch_count):"—"),
           element("td","",row.started?formatNodeCount(row.search_node_count):"—"),
           element("td","",row.started?(100*row.search_node_share).toFixed(1)+"%":"—"),
           element("td","",row.elapsed_millis===null?"—":formatDuration(row.elapsed_millis/1000)),
-          element("td","",row.started?formatDuration(row.wall_millis/1000):"—"));
+          element("td","",row.started&&row.branch_count?formatDuration(row.wall_millis/1000):"—"));
         table.append(line);
       }
       const scroller=element("div","root-progress-scroll");

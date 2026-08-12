@@ -3713,12 +3713,21 @@ class ERDQueue:
         over the epoch's rows (branch_finalize_log carries no spine index), so
         callers should treat it as a seconds-scale query.
 
-        `work_started_at` is the earliest branch *creation* among the rows
-        counted, which is when the swarm first opened work on the root -- a
-        different question from when the root was requested, which can precede
-        it by days while higher-priority roots hold the queue.  A branch
-        created before the current epoch keeps its original creation time, so
-        this can predate the epoch whose finalizations are being counted.
+        A group is `started` once work has opened on it, which is not the same
+        as having finalized anything: its first branch can still be open, with
+        workers on it right now.  Open branches are therefore rolled up
+        alongside finalized ones, by the same spine prefix, so a group being
+        worked never reads as untouched.  They contribute a branch count and a
+        creation time but no cost -- nodes and worker-time are only known at
+        finalize -- so a freshly opened group shows as started with zero
+        measured cost, which is the true state.
+
+        `work_started_at` is the earliest branch *creation* across both, which
+        is when the swarm first opened work on the root -- a different question
+        from when the root was requested, which can precede it by days while
+        higher-priority roots hold the queue.  A branch created before the
+        current epoch keeps its original creation time, so this can predate the
+        epoch whose finalizations are being counted.
 
         Two distinct time bases are reported per group, and they answer
         different questions:
@@ -3760,6 +3769,7 @@ class ERDQueue:
             first, last = row["first_created_at"], row["last_finalized_at"]
             groups[row["pattern"]] = {
                 "branch_count": row["branch_count"],
+                "open_branch_count": 0,
                 "search_node_count": row["search_node_count"] or 0,
                 "wall_millis": row["wall_millis"] or 0,
                 "first_created_at": first,
@@ -3772,10 +3782,39 @@ class ERDQueue:
                 work_started_at = min(work_started_at or first, first)
             if last is not None:
                 work_latest_at = max(work_latest_at or last, last)
-        open_branch_count = self._conn.execute(
-            "SELECT COUNT(*) FROM active_branches "
-            "WHERE source_word = ? AND status = 'open'",
-            (word.lower(),)).fetchone()[0]
+        open_group_rows = self._conn.execute("""
+            SELECT SUBSTR(spine, ?, 5) AS pattern,
+                   COUNT(*) AS open_branch_count,
+                   MIN(created_at) AS first_created_at
+            FROM active_branches
+            WHERE source_word = ? AND status = 'open' AND spine LIKE ?
+            GROUP BY pattern
+        """, (pattern_start, word.lower(), prefix + " %")).fetchall()
+        open_branch_count = 0
+        for row in open_group_rows:
+            open_branch_count += row["open_branch_count"]
+            first = row["first_created_at"]
+            group = groups.get(row["pattern"])
+            if group is None:
+                # Opened but nothing finalized yet: real work with no cost to
+                # report.  Zeroes here are measured, not assumed absent.
+                group = groups[row["pattern"]] = {
+                    "branch_count": 0,
+                    "open_branch_count": 0,
+                    "search_node_count": 0,
+                    "wall_millis": 0,
+                    "first_created_at": first,
+                    "last_finalized_at": None,
+                    "elapsed_millis": None,
+                }
+            group["open_branch_count"] = row["open_branch_count"]
+            if first is not None:
+                if group["first_created_at"] is None:
+                    group["first_created_at"] = first
+                else:
+                    group["first_created_at"] = min(group["first_created_at"],
+                                                    first)
+                work_started_at = min(work_started_at or first, first)
         active_rows = self._conn.execute("""
             SELECT branch_id, n_words, n_candidates, created_at
             FROM active_branches

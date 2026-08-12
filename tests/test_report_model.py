@@ -1188,6 +1188,15 @@ class RootProgressReportTest(unittest.TestCase):
             "UPDATE telemetry.branch_finalize_log SET epoch = ? "
             "WHERE spine = ?", (epoch, spine))
 
+    def _open_branch(self, queue, spine, n_words, created_at,
+                     answer_slice=slice(0, 2)):
+        queue.create_branch(
+            ScoreCache.encode_subset(ANSWERS[answer_slice]), n_words, 5,
+            source_word="salet", spine=spine)
+        queue._conn.execute(
+            "UPDATE active_branches SET created_at = ? WHERE spine = ?",
+            (created_at, spine))
+
     def _request(self, epoch=None):
         return ReportRequest(
             report_kind="root_progress",
@@ -1286,6 +1295,72 @@ class RootProgressReportTest(unittest.TestCase):
             validate_report_request(ReportRequest(
                 report_kind="root_progress",
                 branch_target=parse_report_branch_target(None)))
+
+    def test_root_progress_rejects_a_word_nested_in_a_spine(self):
+        # The rollup scopes telemetry by "SALET %" and keys on the root's own
+        # response pattern, so a nested target would report SALET's
+        # independent root work against groups computed inside the CRANE
+        # branch.
+        with self.assertRaises(ValueError):
+            validate_report_request(ReportRequest(
+                report_kind="root_progress",
+                branch_target=parse_report_branch_target(
+                    ["crane", "-----", "salet"])))
+
+    def test_group_with_only_open_branches_counts_as_started(self):
+        # The group is being worked right now and has finalized nothing.
+        # Reading it as untouched would hide exactly the state this report
+        # exists to show.
+        queue = self._open_queue()
+        self._open_branch(queue, "SALET -y---", 1, 5_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        row = next(row for row in data["response_groups"]
+                   if row["pattern"] == "-y---")
+        self.assertTrue(row["started"])
+        self.assertEqual(row["open_branch_count"], 1)
+        # Nothing has finalized, so cost is genuinely zero-so-far and the
+        # finalize-derived span is unknown, not zero.
+        self.assertEqual(row["branch_count"], 0)
+        self.assertEqual(row["search_node_count"], 0)
+        self.assertIsNone(row["elapsed_millis"])
+        self.assertEqual(data["totals"]["started_response_group_count"], 1)
+
+    def test_open_branches_can_start_the_clock_before_any_finalization(self):
+        queue = self._open_queue()
+        self._open_branch(queue, "SALET -y---", 1, 5_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["work_started_at"], 5_000)
+
+    def test_open_branch_predating_a_finalization_moves_work_start_earlier(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -----", 1, 100, 10, 9_000, 9_500)
+        self._open_branch(queue, "SALET -y---", 1, 5_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["work_started_at"], 5_000)
+
+    def test_open_and_finalized_branches_fold_into_one_group(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 400, 40, 6_000, 6_500)
+        self._open_branch(queue, "SALET -y--- CRANE -----", 1, 7_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        row = next(row for row in data["response_groups"]
+                   if row["pattern"] == "-y---")
+        self.assertEqual(row["branch_count"], 1)
+        self.assertEqual(row["open_branch_count"], 1)
+        self.assertEqual(row["search_node_count"], 400)
+        self.assertEqual(data["totals"]["started_response_group_count"], 1)
 
 
 if __name__ == "__main__":

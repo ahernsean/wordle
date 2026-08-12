@@ -244,6 +244,14 @@ def validate_report_request(request: ReportRequest) -> None:
             raise ValueError("--tree cannot be used with --root-progress")
         if branch_target_kind != "word":
             raise ValueError("--root-progress requires a word target")
+        # The rollup keys on the root's own response pattern and scopes
+        # telemetry by "WORD %", so a nested target such as
+        # "RAISE ----- SALET" would report SALET's independent root work
+        # against groups computed inside the RAISE branch.
+        if request.branch_target.steps:
+            raise ValueError(
+                "--root-progress requires a bare word, not a word inside a "
+                "spine")
     if report_kind == "sources" and branch_target_kind not in ("root", "word"):
         raise ValueError(
             "--sources accepts only a trailing word or no branch target"
@@ -1374,11 +1382,14 @@ def collect_root_progress_report(sources: ReportSources,
     rows = []
     for pattern, answer_count in sorted(answer_counts.items()):
         totals = worked.get(pattern)
+        # A group is started once any branch has opened on it, finalized or
+        # not; the rollup carries open branches for exactly this reason.
         rows.append({
             "pattern": pattern,
             "answer_count": answer_count,
             "started": totals is not None,
             "branch_count": totals["branch_count"] if totals else 0,
+            "open_branch_count": totals["open_branch_count"] if totals else 0,
             "search_node_count": totals["search_node_count"] if totals else 0,
             "wall_millis": totals["wall_millis"] if totals else 0,
             "elapsed_millis": totals["elapsed_millis"] if totals else None,

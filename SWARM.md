@@ -140,7 +140,15 @@ branches, search nodes, and node share spent under it, which groups have not
 been opened at all, when the word was requested versus when work actually
 began on it, and a completion estimate. It is the report that answers "why is
 this root taking so long" — cost concentrates hard, and the node-share column
-names the group holding it.
+names the group holding it. It takes a bare word; a word nested in a spine is
+rejected, since the rollup keys on the root's own response pattern.
+
+A group counts as started once any branch has opened on it, finalized or not,
+so a group being worked right now never reads as untouched. The `Open` column
+carries its in-flight branch count. A started group that has finalized nothing
+shows measured zeros for branches and nodes but `—` for elapsed and
+worker-time, which exist only at finalize; an unopened group shows `—`
+throughout.
 
 Two time bases appear per group and they answer different questions. `Elapsed`
 is wall-clock from the group's first branch to its last, which the swarm's
