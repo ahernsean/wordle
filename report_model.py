@@ -1224,9 +1224,13 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         response_groups.sort(key=lambda row: (-(row["priority"] or 0), row["pattern"]))
     matched_response_groups = list(response_groups)
     data["response_group_summary"] = _response_group_rollup(matched_response_groups)
+    displayed_response_groups = (
+        matched_response_groups[:filters.limit]
+        if filters.limit is not None else matched_response_groups
+    )
     if filters.group_by and filters.group_by != "none":
         data["response_group_groups"] = _grouped_response_groups(
-            matched_response_groups, filters.group_by
+            displayed_response_groups, filters.group_by
         )
     data["response_group_counts"] = {
         "response_group_count": len(all_response_groups),
@@ -1253,10 +1257,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     data["erd_summary"] = _candidate_erd_summary(all_response_groups, group_budget)
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
-    data["response_groups"] = (
-        matched_response_groups[:filters.limit]
-        if filters.limit is not None else matched_response_groups
-    )
+    data["response_groups"] = displayed_response_groups
     return report
 
 

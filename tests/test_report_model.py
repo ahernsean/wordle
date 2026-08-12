@@ -323,6 +323,21 @@ class ReportModelTest(unittest.TestCase):
             len(data["response_groups"]),
         )
 
+    def test_response_group_groups_respect_display_limit(self):
+        # response_group_groups must be built from the same limited set as
+        # the flat response_groups list — otherwise the card grid renders
+        # more rows than "Shown N of M matched" claims (PR #231 review).
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+            filters=ReportFilters(group_by="status", limit=1),
+        )
+        data = collect_report(self.sources, request)["data"]
+        total_grouped_rows = sum(
+            len(group["rows"]) for group in data["response_group_groups"]
+        )
+        self.assertEqual(total_grouped_rows, len(data["response_groups"]))
+        self.assertLessEqual(total_grouped_rows, 1)
+
     def _leaderboard_sources(self, answers, candidates):
         directory = self.temporary_directory.name
         answer_path = os.path.join(directory, "lb_answers.txt")
