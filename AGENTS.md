@@ -13,8 +13,14 @@ A Wordle solver with five layers:
 
 All read-only swarm inspection uses `erd_search.py view`. It provides text,
 JSON, JSON Lines, optional watch, semantic word/branch selection, queue,
-worker, cache, tree, and hotspot reports. Check `view --help` and use
-`SWARM.md` for examples.
+worker, cache, tree, hotspot, and root-progress reports. Check `view --help`
+and use `SWARM.md` for examples.
+
+`view --root-progress WORD` answers "how far along is this root, and what is
+holding it up": per-response-group branch/node/time totals, which groups are
+untouched, request time versus work-start time, and a completion estimate
+drawn from observed claim throughput. It deliberately does not estimate
+unstarted groups — see SWARM.md for why the cost model cannot rank them.
 
 Use `erd_search.py epoch show` to inspect the active telemetry epoch. See
 SWARM.md for the stopped-swarm procedure required to change it.

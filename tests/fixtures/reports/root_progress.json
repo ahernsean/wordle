@@ -1,0 +1,163 @@
+{
+  "branch_target": {
+    "branch_reference": null,
+    "input_text": "PENIS",
+    "kind": "word",
+    "steps": [],
+    "trailing_word": "penis"
+  },
+  "data": {
+    "active_branches": [
+      {
+        "answer_count": 502,
+        "branch_id": 1589207,
+        "candidate_count": 14855,
+        "created_at": 1785575213,
+        "done_candidate_count": 7699,
+        "recent_done_candidate_count": 582
+      },
+      {
+        "answer_count": 197,
+        "branch_id": 2799543,
+        "candidate_count": 14855,
+        "created_at": 1786341888,
+        "done_candidate_count": 14763,
+        "recent_done_candidate_count": 0
+      }
+    ],
+    "epoch": 11,
+    "estimate": {
+      "candidates_per_day": 582.0,
+      "estimated_seconds": 1062334.0206185568,
+      "recent_candidate_count": 582,
+      "remaining_candidate_count": 7156,
+      "stalled_branch_count": 9,
+      "stalled_remaining_candidate_count": 4256
+    },
+    "response_groups": [
+      {
+        "answer_count": 502,
+        "branch_count": 525567,
+        "elapsed_millis": 964865000,
+        "first_created_at": 1785575493,
+        "last_finalized_at": 1786540358,
+        "pattern": "-y---",
+        "search_node_count": 131432485071,
+        "search_node_share": 0.9892120224773154,
+        "started": true,
+        "wall_millis": 3443585232
+      },
+      {
+        "answer_count": 186,
+        "branch_count": 1335,
+        "elapsed_millis": 16904000,
+        "first_created_at": 1786284634,
+        "last_finalized_at": 1786301538,
+        "pattern": "----y",
+        "search_node_count": 1229995556,
+        "search_node_share": 0.009257425140608068,
+        "started": true,
+        "wall_millis": 26582427
+      },
+      {
+        "answer_count": 467,
+        "branch_count": 21340,
+        "elapsed_millis": 8879000,
+        "first_created_at": 1786283911,
+        "last_finalized_at": 1786292790,
+        "pattern": "-----",
+        "search_node_count": 202771697,
+        "search_node_share": 0.0015261386892454444,
+        "started": true,
+        "wall_millis": 32310895
+      },
+      {
+        "answer_count": 147,
+        "branch_count": 2627,
+        "elapsed_millis": 9036000,
+        "first_created_at": 1786284088,
+        "last_finalized_at": 1786293124,
+        "pattern": "-y--y",
+        "search_node_count": 554851,
+        "search_node_share": 4.176024516215023e-06,
+        "started": true,
+        "wall_millis": 2675742
+      },
+      {
+        "answer_count": 16,
+        "branch_count": 0,
+        "elapsed_millis": null,
+        "first_created_at": null,
+        "last_finalized_at": null,
+        "pattern": "-gg--",
+        "search_node_count": 0,
+        "search_node_share": 0.0,
+        "started": false,
+        "wall_millis": 0
+      },
+      {
+        "answer_count": 15,
+        "branch_count": 0,
+        "elapsed_millis": null,
+        "first_created_at": null,
+        "last_finalized_at": null,
+        "pattern": "g--y-",
+        "search_node_count": 0,
+        "search_node_share": 0.0,
+        "started": false,
+        "wall_millis": 0
+      }
+    ],
+    "totals": {
+      "answer_count": 3209,
+      "branch_count": 551362,
+      "counted_branch_count": 10,
+      "open_branch_count": 8627,
+      "recent_window_seconds": 86400,
+      "requested_at": 1785894382,
+      "response_group_count": 117,
+      "search_node_count": 132865838753,
+      "started_answer_count": 2895,
+      "started_response_group_count": 38,
+      "wall_millis": 3505199126
+    },
+    "word": "penis",
+    "word_is_answer": false,
+    "work_latest_at": 1786540358,
+    "work_started_at": 1785575493
+  },
+  "filters": {
+    "branch_phases": [],
+    "branch_statuses": [],
+    "budget": null,
+    "limit": null,
+    "maximum_answer_count": null,
+    "minimum_answer_count": null,
+    "priority": null,
+    "sort": null
+  },
+  "generated_at": 1786540358,
+  "report_kind": "root_progress",
+  "schema_version": 2,
+  "sources": {
+    "cache": {
+      "error": null,
+      "ok": false,
+      "path": "runtime/wordle_cache.sqlite3"
+    },
+    "queue": {
+      "epoch": null,
+      "error": null,
+      "git_sha": null,
+      "label": null,
+      "ok": true,
+      "path": "runtime/erd_queue.sqlite3"
+    },
+    "telemetry": {
+      "error": null,
+      "ok": true,
+      "path": "runtime/erd_queue_telemetry.sqlite3"
+    }
+  },
+  "tree": false
+}

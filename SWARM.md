@@ -131,7 +131,31 @@ python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
 python3.13 erd_search.py view --sources
 python3.13 erd_search.py view --sources CRANE
+python3.13 erd_search.py view --root-progress CRANE
+python3.13 erd_search.py view --root-progress CRANE --epoch 10
 ```
+
+`--root-progress` reports one root word's work: every response group with the
+branches, search nodes, and node share spent under it, which groups have not
+been opened at all, when the word was requested versus when work actually
+began on it, and a completion estimate. It is the report that answers "why is
+this root taking so long" — cost concentrates hard, and the node-share column
+names the group holding it.
+
+Two time bases appear per group and they answer different questions. `Elapsed`
+is wall-clock from the group's first branch to its last, which the swarm's
+other work shares; `WorkerTime` is summed across bundles, so six workers for
+an hour reads as six hours. Their ratio is a coarse read on parallelism drawn.
+
+The estimate covers only branches with observed throughput, and says how many
+unstarted groups and stalled branches it excludes. Unstarted groups are not
+estimated: the cost model is keyed on `(size, budget)` and branches of
+near-identical size differ in cost by orders of magnitude, so it cannot rank
+them. Groups the swarm has not opened show `—`, never `0`.
+
+The rollup scans the epoch's `branch_finalize_log` rows, which carry no spine
+index, so it takes seconds. The web client fetches it after the word report
+renders and caches it per target; the terminal report pays it on each run.
 
 `--sources` reports every source-work request: its recorded requested
 priority, the request state, and every branch it owns — including branches

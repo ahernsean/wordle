@@ -25,6 +25,14 @@
     .nav, .branch-target, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
     .branch-target { margin-top:.35rem; flex-wrap:nowrap; }
     #branch-target-input { flex:1 1 8rem; min-width:6rem; }
+    details.root-progress-panel { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin:.5rem 0; }
+    details.root-progress-panel > summary { cursor:pointer; font-weight:bold; }
+    /* The table is wider than a phone; it scrolls inside this box so the page body never does. */
+    .root-progress-scroll { overflow-x:auto; margin-top:.4rem; }
+    table.root-progress { border-collapse:collapse; white-space:nowrap; }
+    table.root-progress th, table.root-progress td { border-bottom:1px solid var(--border); padding:.15rem .5rem; text-align:right; }
+    table.root-progress th:first-child, table.root-progress td:first-child { text-align:left; }
+    table.root-progress tr.dim td { color:var(--dim); }
     details.filters { margin-top:.35rem; color:var(--dim); }
     details.filters > summary { cursor:pointer; padding:.1rem 0; }
     .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
@@ -259,7 +267,10 @@
     const treelessKinds=new Set(["cache","hotspots","leaderboard"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
+    // The root-progress scan takes seconds, so a result is held per target and
+    // reused across the poll cycle's re-renders; refreshing is explicit.
+    const rootProgressCache=new Map(), rootProgressPending=new Set();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -728,6 +739,83 @@
       const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex)),liveWorkersByBranch.get(String(row.branch_key_hex))||[],previousWorkersById));fragment.append(branches,element("h2","","Workers"));
       const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at));fragment.append(workers);return fragment;
     }
+    const formatDuration=seconds=>{
+      if(seconds===null||seconds===undefined||seconds<0)return "—";
+      if(seconds<60)return Math.round(seconds)+"s";
+      if(seconds<3600)return Math.round(seconds/60)+"m";
+      if(seconds<86400)return (seconds/3600).toFixed(1)+"h";
+      return (seconds/86400).toFixed(1)+"d";
+    };
+    const formatNodeCount=value=>{
+      if(value===null||value===undefined)return "—";
+      for(const [size,suffix] of [[1e9,"G"],[1e6,"M"],[1e3,"K"]])if(value>=size)return (value/size).toFixed(1)+suffix;
+      return String(value);
+    };
+    function rootProgressURL(state){
+      const query=stateQuery(state,false);query.delete("kind");query.delete("tree");
+      return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
+    }
+    function renderRootProgressPanel(data){
+      const fragment=document.createDocumentFragment(),totals=data.totals||{};
+      const metrics=element("div","metrics");
+      metrics.append(
+        metric("groups started",totals.started_response_group_count+" / "+totals.response_group_count),
+        metric("answers reached",totals.started_answer_count+" / "+totals.answer_count),
+        metric("branches",totals.branch_count),
+        metric("nodes",formatNodeCount(totals.search_node_count)),
+        metric("worker-time",formatDuration((totals.wall_millis||0)/1000)));
+      fragment.append(metrics);
+      fragment.append(statLine([
+        "requested "+absoluteTime(totals.requested_at),
+        "work began "+absoluteTime(data.work_started_at),
+        "latest "+absoluteTime(data.work_latest_at)]));
+      const estimate=data.estimate;
+      if(estimate){
+        fragment.append(statLine([
+          "estimated "+formatDuration(estimate.estimated_seconds)+" remaining",
+          numText(estimate.remaining_candidate_count)+" candidates at "+numText(Math.round(estimate.candidates_per_day))+"/day",
+          "excludes "+(totals.response_group_count-totals.started_response_group_count)+" unstarted groups and "+estimate.stalled_branch_count+" stalled branches"]));
+      }else{
+        fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
+      }
+      const table=element("table","root-progress");
+      const head=element("tr","");
+      for(const columnName of ["Pattern","Answers","Branches","Nodes","Share","Elapsed","Worker-time"])head.append(element("th","",columnName));
+      table.append(head);
+      for(const row of data.response_groups||[]){
+        const line=element("tr",row.started?"":"dim");
+        line.append(
+          element("td","",row.pattern),
+          element("td","",numText(row.answer_count)),
+          element("td","",row.started?numText(row.branch_count):"—"),
+          element("td","",row.started?formatNodeCount(row.search_node_count):"—"),
+          element("td","",row.started?(100*row.search_node_share).toFixed(1)+"%":"—"),
+          element("td","",row.elapsed_millis===null?"—":formatDuration(row.elapsed_millis/1000)),
+          element("td","",row.started?formatDuration(row.wall_millis/1000):"—"));
+        table.append(line);
+      }
+      const scroller=element("div","root-progress-scroll");
+      scroller.append(table);
+      fragment.append(scroller);
+      return fragment;
+    }
+    function renderRootProgressInto(host,url,data){
+      const refresh=element("button","refresh","Refresh");
+      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);attachRootProgress(host,url);});
+      host.replaceChildren(renderRootProgressPanel(data),refresh);
+    }
+    function attachRootProgress(host,url){
+      const cached=rootProgressCache.get(url);
+      if(cached){renderRootProgressInto(host,url,cached);return;}
+      host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
+      if(rootProgressPending.has(url))return;
+      rootProgressPending.add(url);
+      fetch(url,{headers:{Accept:"application/json"}})
+        .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
+        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(host,url,progress.data);})
+        .catch(error=>{if(host.isConnected)host.replaceChildren(element("p","error",error.message));})
+        .finally(()=>rootProgressPending.delete(url));
+    }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading,renderSpine(data.context?.spine));
       const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+erd.infeasible_group_count+" of "+erd.response_group_count+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+erd.resolved_group_count+" of "+erd.response_group_count+" response groups solved"));}}
@@ -737,6 +825,13 @@
         summary.append(metric("branches",responseSummary.branch_count),metric("answers",responseSummary.answer_count),metric("trivial",responseSummary.trivial_count),metric("exact",responseSummary.exact_count),metric("loss",responseSummary.loss_count),metric("missing",responseSummary.missing_count));
         fragment.append(summary);
       }
+      const progressURL=rootProgressURL(state),progressDetails=element("details","root-progress-panel");
+      progressDetails.open=rootProgressOpen;
+      const progressHost=element("div","root-progress-host");
+      progressDetails.append(element("summary","clickable","Root progress"),progressHost);
+      progressDetails.addEventListener("toggle",()=>{rootProgressOpen=progressDetails.open;if(progressDetails.open)attachRootProgress(progressHost,progressURL);});
+      if(progressDetails.open)attachRootProgress(progressHost,progressURL);
+      fragment.append(progressDetails);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+shownRows.length+" of "+matchedRows+" matched · "+totalRows+" total response groups"));
       const previousRows=previousBy(previous,"response_groups","branch_key_hex");
       const responseGroupCard=row=>{

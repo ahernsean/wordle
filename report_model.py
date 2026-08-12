@@ -239,6 +239,11 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("coordination hotspots cannot use a branch target")
     if request.worker_id is not None and report_kind != "workers":
         raise ValueError("worker requires a workers report")
+    if report_kind == "root_progress":
+        if request.tree:
+            raise ValueError("--tree cannot be used with --root-progress")
+        if branch_target_kind != "word":
+            raise ValueError("--root-progress requires a word target")
     if report_kind == "sources" and branch_target_kind not in ("root", "word"):
         raise ValueError(
             "--sources accepts only a trailing word or no branch target"
@@ -1258,6 +1263,158 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = displayed_response_groups
+    return report
+
+
+ROOT_PROGRESS_RECENT_WINDOW_SECONDS = 86400
+
+
+def _root_progress_estimate(active_branches, recent_window_seconds):
+    """A completion estimate for the branches currently carrying the work.
+
+    Only in-flight branches can be estimated: their candidate lists have a
+    known width and an observed completion rate.  Response groups the swarm
+    has not opened yet have neither, and the cost model cannot supply one --
+    it is keyed on (size, budget), and branches of near-identical size differ
+    in cost by orders of magnitude -- so they are excluded and counted
+    separately rather than guessed at.
+
+    Only branches that completed a candidate inside the window contribute.  A
+    branch sitting at 99% with no recent completions is not slow, it is
+    waiting on sub-branches it already published; counting its remainder
+    against a rate it is not producing inflates the estimate without bound.
+    Those branches are reported as stalled instead, so excluding them hides
+    nothing.
+
+    Returns None when nothing has completed inside the window, which is the
+    honest answer for an idle or just-restarted root.
+    """
+    remaining = 0
+    recent = 0
+    stalled_remaining = 0
+    stalled_count = 0
+    for branch in active_branches:
+        branch_remaining = max(0, branch["candidate_count"]
+                                  - branch["done_candidate_count"])
+        if branch["recent_done_candidate_count"]:
+            remaining += branch_remaining
+            recent += branch["recent_done_candidate_count"]
+        elif branch_remaining:
+            stalled_remaining += branch_remaining
+            stalled_count += 1
+    if not recent or not remaining:
+        return None
+    rate_per_second = recent / recent_window_seconds
+    return {
+        "remaining_candidate_count": remaining,
+        "recent_candidate_count": recent,
+        "candidates_per_day": rate_per_second * 86400,
+        "estimated_seconds": remaining / rate_per_second,
+        "stalled_branch_count": stalled_count,
+        "stalled_remaining_candidate_count": stalled_remaining,
+    }
+
+
+def collect_root_progress_report(sources: ReportSources,
+                                 request: ReportRequest) -> dict:
+    """Work totals and a completion estimate for one root word.
+
+    Separate from the word report because the telemetry rollup behind it is a
+    seconds-scale scan: the word report stays instant and a client fetches
+    this alongside it.
+    """
+    generated_at = int(time.time())
+    all_answers = load_word_list(sources.answer_list_path)
+    answer_set = set(all_answers)
+    resolved = resolve_branch_target(request.branch_target, all_answers)
+    word = resolved.trailing_word
+    if word is None:
+        raise ValueError(
+            "root progress report requires a branch target ending in a word")
+    response_cache = ResponseCache(all_answers, score_cache=None)
+    groups = response_cache.group_words(word, list(resolved.answer_words))
+    answer_counts = {fmt_pattern(pattern_code): len(answer_words)
+                     for pattern_code, answer_words in groups.items()
+                     if answer_words}
+    # No branch context here: a root target's branch_key_hex encodes the whole
+    # answer subset, which is tens of kilobytes the panel never reads.  Request
+    # detail likewise stays in the sources report; only the earliest request
+    # time is carried, in totals.
+    data = {
+        "word": word,
+        "word_is_answer": word in answer_set,
+        "response_groups": [],
+        "totals": {},
+        "estimate": None,
+        "work_started_at": None,
+        "work_latest_at": None,
+        "epoch": request.epoch,
+    }
+    report = _semantic_report(
+        "root_progress", sources, request.branch_target, generated_at, data,
+        request
+    )
+    queue = None
+    try:
+        queue = _open_report_queue(sources)
+        epoch = queue.epoch if request.epoch is None else request.epoch
+        progress = queue.report_root_progress(
+            word, epoch, ROOT_PROGRESS_RECENT_WINDOW_SECONDS,
+            now=generated_at)
+        requests = queue.source_work_requests_for_word(word)
+        _mark_queue_source_ok(report)
+    except (sqlite3.Error, OSError) as error:
+        _mark_queue_source_error(report, error)
+        return report
+    finally:
+        if queue is not None:
+            queue.close()
+
+    worked = progress["groups"]
+    rows = []
+    for pattern, answer_count in sorted(answer_counts.items()):
+        totals = worked.get(pattern)
+        rows.append({
+            "pattern": pattern,
+            "answer_count": answer_count,
+            "started": totals is not None,
+            "branch_count": totals["branch_count"] if totals else 0,
+            "search_node_count": totals["search_node_count"] if totals else 0,
+            "wall_millis": totals["wall_millis"] if totals else 0,
+            "elapsed_millis": totals["elapsed_millis"] if totals else None,
+            "first_created_at": totals["first_created_at"] if totals else None,
+            "last_finalized_at": (totals["last_finalized_at"]
+                                  if totals else None),
+        })
+    rows.sort(key=lambda row: (-row["search_node_count"], -row["answer_count"]))
+    node_total = sum(row["search_node_count"] for row in rows)
+    for row in rows:
+        row["search_node_share"] = (row["search_node_count"] / node_total
+                                    if node_total else 0.0)
+    data["response_groups"] = rows
+    data["epoch"] = progress["epoch"]
+    data["work_started_at"] = progress["work_started_at"]
+    data["work_latest_at"] = progress["work_latest_at"]
+    data["estimate"] = _root_progress_estimate(
+        progress["active_branches"],
+        progress["recent_window_seconds"])
+    data["active_branches"] = progress["active_branches"]
+    earliest_request = min((entry["requested_at"] for entry in requests),
+                           default=None)
+    data["totals"] = {
+        "response_group_count": len(rows),
+        "started_response_group_count": sum(row["started"] for row in rows),
+        "answer_count": sum(row["answer_count"] for row in rows),
+        "started_answer_count": sum(row["answer_count"] for row in rows
+                                    if row["started"]),
+        "branch_count": sum(row["branch_count"] for row in rows),
+        "search_node_count": node_total,
+        "wall_millis": sum(row["wall_millis"] for row in rows),
+        "open_branch_count": progress["open_branch_count"],
+        "counted_branch_count": progress["counted_branch_count"],
+        "requested_at": earliest_request,
+        "recent_window_seconds": progress["recent_window_seconds"],
+    }
     return report
 
 
@@ -2427,4 +2584,6 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
         return collect_leaderboard_report(sources, request)
     if report_kind == "sources":
         return collect_source_report(sources, request)
+    if report_kind == "root_progress":
+        return collect_root_progress_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")

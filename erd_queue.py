@@ -3703,6 +3703,126 @@ class ERDQueue:
             "cut_reuse_misses": cut_reuse_misses,
         }
 
+    def report_root_progress(self, word, epoch, recent_window_seconds,
+                             active_branch_limit=10, now=None) -> dict:
+        """Per-response-group work totals for one root word, plus live rates.
+
+        Rolls up telemetry.branch_finalize_log by the root's own response
+        pattern -- the spine's second step -- so every descendant's cost is
+        attributed to the top-level group it sits under.  The rollup is a scan
+        over the epoch's rows (branch_finalize_log carries no spine index), so
+        callers should treat it as a seconds-scale query.
+
+        `work_started_at` is the earliest branch *creation* among the rows
+        counted, which is when the swarm first opened work on the root -- a
+        different question from when the root was requested, which can precede
+        it by days while higher-priority roots hold the queue.  A branch
+        created before the current epoch keeps its original creation time, so
+        this can predate the epoch whose finalizations are being counted.
+
+        Two distinct time bases are reported per group, and they answer
+        different questions:
+          elapsed_millis  wall-clock span from first work to last, which the
+                          swarm's other branches share
+          wall_millis     summed worker-time across bundles, which counts a
+                          six-worker hour as six hours
+        Their ratio is a coarse read on how much parallelism the group drew.
+
+        Progress on still-running branches comes from candidate_claims: a
+        branch is `n_candidates` claims wide, and `recent_done_count` over
+        `recent_window_seconds` gives the rate that turns the remainder into an
+        estimate.  Claim rows carry no epoch, so the window is the only fence.
+        Counting claims costs a scan per branch and a root can hold thousands
+        of open branches at once, so only the `active_branch_limit` widest are
+        counted -- claims are handed out widest-branch-first, so those are the
+        ones carrying the work an estimate depends on.
+        """
+        now = int(time.time()) if now is None else now
+        since = now - recent_window_seconds
+        prefix = word.upper()
+        # The spine's second step starts one space past the root word.
+        pattern_start = len(prefix) + 2
+        group_rows = self._conn.execute("""
+            SELECT SUBSTR(spine, ?, 5) AS pattern,
+                   COUNT(*) AS branch_count,
+                   SUM(nodes_spent) AS search_node_count,
+                   SUM(total_bundle_wall_millis) AS wall_millis,
+                   MIN(created_at) AS first_created_at,
+                   MAX(finalized_at) AS last_finalized_at
+            FROM telemetry.branch_finalize_log
+            WHERE epoch = ? AND spine LIKE ?
+            GROUP BY pattern
+        """, (pattern_start, epoch, prefix + " %")).fetchall()
+        groups = {}
+        work_started_at = None
+        work_latest_at = None
+        for row in group_rows:
+            first, last = row["first_created_at"], row["last_finalized_at"]
+            groups[row["pattern"]] = {
+                "branch_count": row["branch_count"],
+                "search_node_count": row["search_node_count"] or 0,
+                "wall_millis": row["wall_millis"] or 0,
+                "first_created_at": first,
+                "last_finalized_at": last,
+                "elapsed_millis": (last - first) * 1000
+                                  if first is not None and last is not None
+                                  else None,
+            }
+            if first is not None:
+                work_started_at = min(work_started_at or first, first)
+            if last is not None:
+                work_latest_at = max(work_latest_at or last, last)
+        open_branch_count = self._conn.execute(
+            "SELECT COUNT(*) FROM active_branches "
+            "WHERE source_word = ? AND status = 'open'",
+            (word.lower(),)).fetchone()[0]
+        active_rows = self._conn.execute("""
+            SELECT branch_id, n_words, n_candidates, created_at
+            FROM active_branches
+            WHERE source_word = ? AND status = 'open'
+            ORDER BY n_words DESC LIMIT ?
+        """, (word.lower(), active_branch_limit)).fetchall()
+        active = []
+        for row in active_rows:
+            branch_id = row["branch_id"]
+            claim_row = self._conn.execute("""
+                SELECT COUNT(*) AS done_count,
+                       COUNT(*) FILTER (WHERE done_at >= ?) AS recent_count
+                FROM candidate_claims WHERE branch_id = ? AND done = 1
+            """, (since, branch_id)).fetchone()
+            active.append({
+                "branch_id": branch_id,
+                "answer_count": row["n_words"],
+                "candidate_count": row["n_candidates"],
+                "done_candidate_count": claim_row["done_count"],
+                "recent_done_candidate_count": claim_row["recent_count"],
+                "created_at": row["created_at"],
+            })
+        return {
+            "groups": groups,
+            "active_branches": active,
+            "open_branch_count": open_branch_count,
+            "counted_branch_count": len(active),
+            "work_started_at": work_started_at,
+            "work_latest_at": work_latest_at,
+            "recent_window_seconds": recent_window_seconds,
+            "epoch": epoch,
+        }
+
+    def source_work_requests_for_word(self, word) -> list:
+        """Every source-work request naming `word`, oldest request first.
+
+        The request time is when the word was *asked for*, which is not when
+        the swarm began working it: a request sits behind higher-priority
+        roots until workers reach it.
+        """
+        rows = self._conn.execute("""
+            SELECT source_work_id, requested_priority, requested_at, state
+            FROM source_work WHERE source_word = ?
+            ORDER BY requested_at, source_work_id
+        """, (word.lower(),)).fetchall()
+        return [dict(row) for row in rows]
+
     def _bounded_sample_metadata(self, table, epoch, since, sample_size,
                                  spine_prefix=None, branch_key=None):
         spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""

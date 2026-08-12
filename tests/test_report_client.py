@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from threading import Thread
+from threading import Event, Thread
 import unittest
 from urllib.parse import unquote
 
@@ -24,6 +24,8 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
+# The client's DEFAULT_POLL; a re-render lands on every one of these.
+CLIENT_POLL_MILLIS = 2000
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
 REQUIRE_PLAYWRIGHT_BROWSER = os.environ.get("REQUIRE_PLAYWRIGHT_BROWSER") == "1"
 
@@ -370,6 +372,67 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("3.564", text)
         self.assertNotIn("3.564102564102564", text)
         self.assertIn("max remaining depth", text)
+
+    def test_root_progress_panel_loads_after_the_word_report_renders(self):
+        # The rollup behind the panel is a seconds-scale scan, so the word
+        # report must render without waiting on it: hold the panel's response
+        # open and assert the groups are already on screen behind a
+        # progress notice.
+        released = Event()
+
+        def hold(route):
+            released.wait(timeout=10)
+            route.continue_()
+
+        self.page.route("**/api/view/root-progress**", hold)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("text=word report")
+            self.page.wait_for_selector("article.card.clickable")
+            self.assertIn("Computing root progress",
+                          self.page.locator("#report").inner_text())
+        finally:
+            released.set()
+        self.page.wait_for_selector("table.root-progress")
+        self.page.unroute("**/api/view/root-progress**")
+
+    def test_root_progress_panel_separates_elapsed_from_worker_time(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        headers = self.page.eval_on_selector_all(
+            "table.root-progress th", "cells => cells.map(c => c.textContent)")
+        self.assertEqual(
+            headers,
+            ["Pattern", "Answers", "Branches", "Nodes", "Share", "Elapsed",
+             "Worker-time"])
+
+    def test_root_progress_panel_marks_unstarted_groups_without_zero_costs(self):
+        # An unstarted group has no cost to report; showing 0 would read as
+        # "measured zero" rather than "not begun".
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        dimmed = self.page.eval_on_selector_all(
+            "table.root-progress tr.dim td",
+            "cells => cells.map(c => c.textContent)")
+        self.assertIn("—", dimmed)
+        self.assertNotIn("0.0%", dimmed)
+
+    def test_root_progress_scan_runs_once_across_poll_cycles(self):
+        # The word report polls every couple of seconds; re-running a
+        # multi-second telemetry scan on each cycle would pin a worker's
+        # database.  One fetch per target, refreshed only on request.
+        self.page.evaluate("window.__rootProgressCalls = 0;")
+        self.page.route("**/api/view/root-progress**", lambda route: (
+            self.page.evaluate("window.__rootProgressCalls++;"),
+            route.continue_())[-1])
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.root-progress")
+            self.page.wait_for_timeout(2 * CLIENT_POLL_MILLIS)
+            self.assertEqual(
+                self.page.evaluate("window.__rootProgressCalls"), 1)
+        finally:
+            self.page.unroute("**/api/view/root-progress**")
 
     def test_word_report_card_omits_redundant_and_empty_phase_chips(self):
         # The fixture's four groups are branch_status done/done/done/unqueued
@@ -1961,9 +2024,14 @@ class ReportClientBrowserTest(unittest.TestCase):
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
             "?kind=leaderboard", "?kind=queue&tree=1", "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
+            # The word view carries the root-progress table, which is wider
+            # than a phone and must scroll inside its own box.
+            "?branch_target=SALET",
         ):
             self.page.goto(self.base_url + path)
             self.page.wait_for_selector("h1")
+            if "branch_target=SALET" in path:
+                self.page.wait_for_selector("table.root-progress")
             for width in (375, 390, 480, 800, 1200):
                 with self.subTest(path=path or "overview", width=width):
                     self.page.set_viewport_size({"width": width, "height": 800})

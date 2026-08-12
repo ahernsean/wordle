@@ -1145,6 +1145,10 @@ def main():
     view_kind.add_argument(
         '--sources', action='store_true',
         help='Show source-work requests and branch ownership/lineage')
+    view_kind.add_argument(
+        '--root-progress', dest='root_progress', action='store_true',
+        help='Show per-response-group work totals and a completion estimate '
+             'for one root word')
     p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
         help='Comma-separated active,pending,done,unqueued, or all')
@@ -1339,14 +1343,17 @@ def main():
             'cache' if args.view_cache else
             'hotspots' if args.hotspots else
             'leaderboard' if args.leaderboard else
-            'sources' if args.sources else 'auto'
+            'sources' if args.sources else
+            'root_progress' if args.root_progress else 'auto'
         )
         if args.by is not None and not args.hotspots:
             parser.error('--by requires --hotspots')
         if not args.hotspots and any(
                 value is not None
-                for value in (args.epoch, args.since_seconds, args.sample_size)):
-            parser.error('--epoch, --since-seconds, and --sample-size require --hotspots')
+                for value in (args.since_seconds, args.sample_size)):
+            parser.error('--since-seconds and --sample-size require --hotspots')
+        if args.epoch is not None and not (args.hotspots or args.root_progress):
+            parser.error('--epoch requires --hotspots or --root-progress')
         if args.since_seconds is not None and args.since_seconds < 1:
             parser.error('--since-seconds must be at least 1')
         if args.sample_size is not None and args.sample_size < 1:

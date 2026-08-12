@@ -1449,6 +1449,100 @@ def _render_leaderboard_sections(report, width):
     return [("header", header), ("summary", summary), ("leaderboard", rows)]
 
 
+def _timestamp_text(epoch_seconds):
+    if epoch_seconds is None:
+        return "—"
+    return datetime.fromtimestamp(epoch_seconds).strftime("%Y-%m-%d %H:%M")
+
+
+def _format_node_count(node_count):
+    """Node counts span single digits to hundreds of billions in one table."""
+    if node_count >= 1_000_000_000:
+        return f"{node_count / 1_000_000_000:.1f}G"
+    if node_count >= 1_000_000:
+        return f"{node_count / 1_000_000:.1f}M"
+    if node_count >= 1_000:
+        return f"{node_count / 1_000:.1f}K"
+    return str(node_count)
+
+
+def _render_root_progress_sections(report, width, display_order):
+    data = report["data"]
+    totals = data["totals"]
+    word = data["word"].upper() + ("*" if data["word_is_answer"] else "")
+    header = _semantic_header(
+        report, f"Root progress {word}  epoch={data['epoch']}", width
+    )
+    requested_at = totals["requested_at"]
+    started_at = data["work_started_at"]
+    summary = [
+        _fit(
+            f"Requested {_timestamp_text(requested_at)}   "
+            f"work began {_timestamp_text(started_at)}   "
+            f"latest {_timestamp_text(data['work_latest_at'])}",
+            width,
+        ),
+        _fit(
+            f"  response groups {totals['started_response_group_count']}"
+            f"/{totals['response_group_count']} started"
+            f"   answers {totals['started_answer_count']}"
+            f"/{totals['answer_count']}"
+            f" ({_percentage(totals['started_answer_count'], totals['answer_count'])})",
+            width,
+        ),
+        _fit(
+            f"  branches {totals['branch_count']:,}"
+            f"   nodes {_format_node_count(totals['search_node_count'])}"
+            f"   worker-time {_abbreviate_duration(totals['wall_millis'] / 1000)}",
+            width,
+        ),
+    ]
+    estimate = data["estimate"]
+    if estimate is None:
+        summary.append(_fit(
+            "  estimate unavailable: no candidates completed in the window",
+            width,
+        ))
+    else:
+        summary.append(_fit(
+            f"  estimate {_abbreviate_duration(estimate['estimated_seconds'])}"
+            f" for {estimate['remaining_candidate_count']:,} candidates"
+            f" at {estimate['candidates_per_day']:,.0f}/day",
+            width,
+        ))
+        summary.append(_fit(
+            f"    excludes "
+            f"{totals['response_group_count'] - totals['started_response_group_count']}"
+            f" unstarted groups and {estimate['stalled_branch_count']}"
+            f" stalled branches"
+            f" ({estimate['stalled_remaining_candidate_count']:,} candidates)",
+            width,
+        ))
+    rows = ["Pattern  Answers  Branches      Nodes  Share   Elapsed  WorkerTime"]
+    for row in data["response_groups"]:
+        # A group the swarm has not opened has no cost to report.  Printing
+        # zeros would read as a measurement rather than an absence.
+        if row["started"]:
+            branch_text = f"{row['branch_count']:,}"
+            node_text = _format_node_count(row["search_node_count"])
+            share_text = f"{100.0 * row['search_node_share']:.1f}%"
+            elapsed_text = _abbreviate_duration(
+                row["elapsed_millis"] / 1000
+                if row["elapsed_millis"] is not None else None)
+            worker_text = _abbreviate_duration(row["wall_millis"] / 1000)
+        else:
+            branch_text = node_text = share_text = "—"
+            elapsed_text = worker_text = "—"
+        rows.append(_fit(
+            f"{row['pattern']:<7}  {row['answer_count']:>7}  "
+            f"{branch_text:>8}  {node_text:>9}  {share_text:>5}  "
+            f"{elapsed_text:>8}  {worker_text:>10}",
+            width,
+        ))
+    return [("header", header), ("summary", summary),
+            ("root_progress", rows)]
+
+
 def _report_sections(report, previous_report, color, width, display_order):
     if report.get("tree"):
         return _render_tree_sections(report, width, display_order)
@@ -1478,6 +1572,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_leaderboard_sections(report, width)
     if report["report_kind"] == "sources":
         return _render_source_sections(report, width, display_order)
+    if report["report_kind"] == "root_progress":
+        return _render_root_progress_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 

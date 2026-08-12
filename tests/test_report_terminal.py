@@ -1558,5 +1558,100 @@ class ViewParserTest(unittest.TestCase):
         self.assertTrue(request.include_answers)
 
 
+def root_progress_report(estimate=None):
+    return {
+        "report_kind": "root_progress",
+        "schema_version": 2,
+        "generated_at": 1_800_000_000,
+        "tree": False,
+        "sources": {
+            "queue": {"path": "queue.sqlite3", "ok": True, "error": None,
+                      "epoch": 11, "label": "packed", "git_sha": "abcdef12"},
+            "telemetry": {"path": "telemetry.sqlite3", "ok": True,
+                          "error": None},
+            "cache": {"path": "cache.sqlite3", "ok": True, "error": None},
+        },
+        "filters": {},
+        "branch_target": {"kind": "word", "word": "penis"},
+        "data": {
+            "word": "penis",
+            "word_is_answer": False,
+            "context": {"spine": []},
+            "epoch": 11,
+            "work_started_at": 1_799_000_000,
+            "work_latest_at": 1_799_900_000,
+            "estimate": estimate,
+            "response_groups": [
+                {"pattern": "-y---", "answer_count": 502, "started": True,
+                 "branch_count": 524_184, "search_node_count": 129_900_000_000,
+                 "search_node_share": 0.989, "wall_millis": 3_400_000_000,
+                 "elapsed_millis": 968_000_000,
+                 "first_created_at": 1, "last_finalized_at": 2},
+                {"pattern": "--y--", "answer_count": 126, "started": False,
+                 "branch_count": 0, "search_node_count": 0,
+                 "search_node_share": 0.0, "wall_millis": 0,
+                 "elapsed_millis": None,
+                 "first_created_at": None, "last_finalized_at": None},
+            ],
+            "totals": {
+                "response_group_count": 117,
+                "started_response_group_count": 38,
+                "answer_count": 3209,
+                "started_answer_count": 2895,
+                "branch_count": 550_292,
+                "search_node_count": 131_367_632_458,
+                "wall_millis": 3_471_277_846,
+                "open_branch_count": 8632,
+                "counted_branch_count": 10,
+                "requested_at": 1_798_000_000,
+                "recent_window_seconds": 86400,
+            },
+        },
+    }
+
+
+class RootProgressRendererTest(unittest.TestCase):
+    def test_reports_request_time_and_work_start_as_separate_facts(self):
+        output = render_report(root_progress_report(), width=120)
+        self.assertIn("Requested", output)
+        self.assertIn("work began", output)
+        # The two differ by ~11 days here; collapsing them would report the
+        # queue wait as though it were search time.
+        self.assertIn("2026-", output)
+
+    def test_shows_worst_group_share_and_both_time_bases(self):
+        output = render_report(root_progress_report(), width=120)
+        self.assertIn("-y---", output)
+        self.assertIn("129.9G", output)
+        self.assertIn("98.9%", output)
+        # elapsed 11.2d of clock against 39.4d of summed worker-time.
+        self.assertIn("11.2d", output)
+        self.assertIn("39.4d", output)
+
+    def test_unstarted_group_shows_no_measured_cost(self):
+        output = render_report(root_progress_report(), width=120)
+        unstarted = next(line for line in output.splitlines()
+                         if line.startswith("--y--"))
+        self.assertIn("—", unstarted)
+        self.assertNotIn("0.0%", unstarted)
+
+    def test_estimate_states_what_it_excludes(self):
+        output = render_report(root_progress_report(estimate={
+            "remaining_candidate_count": 7171,
+            "recent_candidate_count": 576,
+            "candidates_per_day": 576.0,
+            "estimated_seconds": 1_075_650.0,
+            "stalled_branch_count": 9,
+            "stalled_remaining_candidate_count": 4256,
+        }), width=120)
+        self.assertIn("estimate 12.4d", output)
+        self.assertIn("79 unstarted groups", output)
+        self.assertIn("9 stalled branches", output)
+
+    def test_absent_estimate_is_stated_rather_than_guessed(self):
+        output = render_report(root_progress_report(), width=120)
+        self.assertIn("estimate unavailable", output)
+
+
 if __name__ == "__main__":
     unittest.main()
