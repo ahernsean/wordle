@@ -140,8 +140,23 @@ branches, search nodes, and node share spent under it, which groups have not
 been opened at all, when work actually began on it, and a completion estimate.
 It is the report that answers "why is
 this root taking so long" — cost concentrates hard, and the node-share column
-names the group holding it. It takes a bare word; a word nested in a spine is
-rejected, since the rollup keys on the root's own response pattern.
+names the group holding it. It takes any spine ending in a word: a bare root,
+or a deeper spine such as `PENIS -y--- LUBES`, which asks the same question at
+a greater guess_depth. The rollup scopes telemetry by spine prefix, so a longer
+spine is simply a longer prefix.
+
+The `State` column says where each response group sits: `waiting` (no work
+opened), `working`, `solved` (a proven line), or `loss` (proven unsolvable
+within budget). `solved` and `loss` both mean there is no more work to do here,
+for opposite reasons, so they stay apart. State comes from the cache, not the
+queue, because a group can be solved with no branch open and nothing finalized
+in this epoch — a group of one answer needs no search at all.
+
+This matters for reading the estimate. The estimate excludes groups still
+`waiting`, not groups the queue never opened: PENIS has 34 groups it never
+opened, and every one of them is already solved (29 hold a single answer). They
+are not a backlog, and counting them as one would invent work that does not
+exist.
 
 A group counts as started once any branch has opened on it, finalized or not,
 so a group being worked right now never reads as untouched. The two branch
@@ -170,7 +185,7 @@ other work shares; `WorkerTime` is summed across bundles, so six workers for
 an hour reads as six hours. Their ratio is a coarse read on parallelism drawn.
 
 The estimate covers only branches with observed throughput, and says how many
-unstarted groups and stalled branches it excludes. Unstarted groups are not
+waiting groups and stalled branches it excludes. Waiting groups are not
 estimated: the cost model is keyed on `(size, budget)` and branches of
 near-identical size differ in cost by orders of magnitude, so it cannot rank
 them. Groups the swarm has not opened show `—`, never `0`.

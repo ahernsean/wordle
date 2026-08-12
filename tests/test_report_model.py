@@ -1197,10 +1197,10 @@ class RootProgressReportTest(unittest.TestCase):
             "UPDATE active_branches SET created_at = ? WHERE spine = ?",
             (created_at, spine))
 
-    def _request(self, epoch=None):
+    def _request(self, epoch=None, branch_target=("salet",)):
         return ReportRequest(
             report_kind="root_progress",
-            branch_target=parse_report_branch_target(["salet"]),
+            branch_target=parse_report_branch_target(list(branch_target)),
             epoch=epoch)
 
     def test_rollup_attributes_descendant_cost_to_its_top_level_group(self):
@@ -1314,16 +1314,32 @@ class RootProgressReportTest(unittest.TestCase):
                 report_kind="root_progress",
                 branch_target=parse_report_branch_target(None)))
 
-    def test_root_progress_rejects_a_word_nested_in_a_spine(self):
-        # The rollup scopes telemetry by "SALET %" and keys on the root's own
-        # response pattern, so a nested target would report SALET's
-        # independent root work against groups computed inside the CRANE
-        # branch.
-        with self.assertRaises(ValueError):
-            validate_report_request(ReportRequest(
-                report_kind="root_progress",
-                branch_target=parse_report_branch_target(
-                    ["crane", "-----", "salet"])))
+    def test_root_progress_accepts_a_spine_of_more_than_one_guess(self):
+        # The rollup scopes telemetry by spine prefix and a longer spine is
+        # simply a longer prefix, so "why is CRANE --g-- SALET taking so long"
+        # is the same question at a greater guess_depth.
+        validate_report_request(ReportRequest(
+            report_kind="root_progress",
+            branch_target=parse_report_branch_target(
+                ["crane", "--g--", "salet"])))
+
+    def test_deeper_spine_scopes_the_rollup_to_its_own_subtree(self):
+        # SALET played as a root and SALET played after CRANE reach different
+        # branches.  Sharing a trailing word must not merge their work.
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "crane", 0)])
+        self._finalize(queue, "CRANE --g-- SALET -y---", 1, 700, 70, 10, 20)
+        self._finalize(queue, "SALET -y---", 1, 100, 10, 10, 20)
+        queue.close()
+
+        deeper = collect_report(self.sources, self._request(
+            branch_target=["crane", "--g--", "salet"]))["data"]
+        root = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(deeper["spine_prefix"], "CRANE --g-- SALET")
+        self.assertEqual(deeper["totals"]["search_node_count"], 700)
+        self.assertEqual(root["totals"]["search_node_count"], 100)
 
     def test_group_with_only_open_branches_counts_as_started(self):
         # The group is being worked right now and has finalized nothing.

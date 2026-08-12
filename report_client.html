@@ -38,6 +38,9 @@
     table.root-progress thead th { position:sticky; top:0; z-index:1; background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
     table.root-progress th:first-child, table.root-progress td:first-child { text-align:left; }
     table.root-progress tr.dim td { color:var(--dim); }
+    table.root-progress td.state-solved { color:var(--green); }
+    table.root-progress td.state-loss { color:var(--red); }
+    table.root-progress td.state-waiting { color:var(--dim); }
     details.filters { margin-top:.35rem; color:var(--dim); }
     details.filters > summary { cursor:pointer; padding:.1rem 0; }
     .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
@@ -275,7 +278,7 @@
     let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
-    const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map();
+    const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -767,6 +770,15 @@
       if(state.epoch!==null&&state.epoch!=="")query.set("epoch",String(state.epoch));
       return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
     }
+    const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","loss"];
+    // Only groups still waiting hold work the estimate cannot see.  A group the
+    // swarm never opened because it needed no search is not missing work.
+    function excludedText(totals,estimate){
+      const waiting=(totals.state_counts||{}).waiting||0,parts=[];
+      if(waiting)parts.push(numText(waiting)+" waiting groups");
+      if(estimate.stalled_branch_count)parts.push(numText(estimate.stalled_branch_count)+" stalled branches");
+      return parts.length?"excludes "+parts.join(" and "):"";
+    }
     // The headline sits outside the collapsible panel so the numbers worth a
     // glance are readable with the table closed.  It carries no coverage
     // percentage: cost concentrates so hard that breadth of coverage reads as
@@ -777,12 +789,10 @@
     // reporting the remainder here leaves neither line restating the other.
     function renderRootProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
-      const started=totals.started_response_group_count,total=totals.response_group_count;
+      const counts=totals.state_counts||{};
       if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining");
-      const inProgress=Number.isInteger(solvedGroupCount)?started-solvedGroupCount:null;
-      if(inProgress!==null&&inProgress>=0)parts.push(numText(inProgress)+" groups in progress");
-      else if(Number.isInteger(started))parts.push(numText(started)+" of "+numText(total)+" groups started");
-      if(Number.isInteger(started)&&Number.isInteger(total))parts.push(numText(total-started)+" not started");
+      if(counts.working)parts.push(numText(counts.working)+" groups working");
+      if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");
       parts.push("began "+absoluteTime(data.work_started_at));
       return statLine(parts);
     }
@@ -790,7 +800,8 @@
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
       const metrics=element("div","metrics");
       metrics.append(
-        metric("answers in started groups",numText(totals.started_answer_count)+" / "+numText(totals.answer_count)),
+        ...ROOT_PROGRESS_GROUP_STATES.filter(state=>(totals.state_counts||{})[state])
+            .map(state=>metric(state,(totals.state_counts||{})[state])),
         metric("branches evaluating",totals.open_branch_count),
         metric("nodes",formatNodeCount(totals.search_node_count)),
         metric("worker-time",formatDuration((totals.wall_millis||0)/1000)));
@@ -809,12 +820,12 @@
         fragment.append(statLine([
           "~"+formatDuration(estimate.estimated_seconds)+" remaining",
           numText(estimate.remaining_candidate_count)+" candidates at ~"+numText(Math.round(estimate.candidates_per_day))+"/day",
-          "excludes "+numText(totals.response_group_count-totals.started_response_group_count)+" unstarted groups and "+numText(estimate.stalled_branch_count)+" stalled branches"]));
+          excludedText(totals,estimate)]));
       }else{
         fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
       }
       const table=element("table","root-progress"),head=element("thead",""),headRow=element("tr","");
-      for(const columnName of ["Pattern","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
+      for(const columnName of ["Pattern","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
       head.append(headRow);
       table.append(head);
       const body=element("tbody","");
@@ -822,6 +833,7 @@
         const line=element("tr",row.started?"":"dim");
         line.append(
           element("td","",row.pattern),
+          element("td","state-"+row.state.replace(/ /g,"-"),row.state),
           element("td","",numText(row.answer_count)),
           element("td","",row.started?numText(row.branch_count):"—"),
           element("td","",row.started?numText(row.open_branch_count):"—"),
@@ -844,7 +856,7 @@
     }
     function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount);});
+      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount);});
       headlineHost.replaceChildren(renderRootProgressHeadline(data,solvedGroupCount));
       host.replaceChildren(renderRootProgressPanel(data,url),refresh);
       // The panel is built before the report is mounted, and scroll offsets do
@@ -855,7 +867,19 @@
         if(scroller&&saved){scroller.scrollLeft=saved.left;scroller.scrollTop=saved.top;}
       });
     }
+    // A failure is held like a result.  Retrying on every poll would re-render
+    // the computing notice, re-fire the request and re-render the error every
+    // couple of seconds -- and those two messages wrap to different heights, so
+    // the whole page below the panel would shift each time.  Refresh retries.
+    function renderRootProgressFailure(headlineHost,host,url,message,solvedGroupCount){
+      const refresh=element("button","refresh","Refresh");
+      refresh.addEventListener("click",()=>{rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount);});
+      headlineHost.replaceChildren();
+      host.replaceChildren(element("p","error",message),refresh);
+    }
     function attachRootProgress(headlineHost,host,url,solvedGroupCount){
+      const failure=rootProgressFailure.get(url);
+      if(failure!==undefined){renderRootProgressFailure(headlineHost,host,url,failure,solvedGroupCount);return;}
       const cached=rootProgressCache.get(url);
       if(cached){renderRootProgressInto(headlineHost,host,url,cached,solvedGroupCount);return;}
       host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
@@ -864,7 +888,7 @@
       fetch(url,{headers:{Accept:"application/json"}})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
         .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount);})
-        .catch(error=>{if(host.isConnected)host.replaceChildren(element("p","error",error.message));})
+        .catch(error=>{rootProgressFailure.set(url,error.message);if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount);})
         .finally(()=>rootProgressPending.delete(url));
     }
     function renderWord(report,previous,state){

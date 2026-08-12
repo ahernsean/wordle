@@ -13,6 +13,7 @@ import termios
 import time
 
 from report_model import (
+    ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
     ReportSources,
     WORKER_STALE_SECONDS,
@@ -1466,12 +1467,26 @@ def _format_node_count(node_count):
     return str(node_count)
 
 
+def _state_counts(totals):
+    """Response-group state counts in lifecycle order, zeros omitted.
+
+    A zero count is noise on a line that has to fit a terminal, and its absence
+    already says the state is empty.
+    """
+    counts = totals.get("state_counts") or {}
+    return {state: counts[state] for state in ROOT_PROGRESS_GROUP_STATES
+            if counts.get(state)}
+
+
 def _render_root_progress_sections(report, width, display_order):
     data = report["data"]
     totals = data["totals"]
     word = data["word"].upper() + ("*" if data["word_is_answer"] else "")
+    spine_prefix = data.get("spine_prefix")
+    subject = (spine_prefix + ("*" if data["word_is_answer"] else "")
+               if spine_prefix else word)
     header = _semantic_header(
-        report, f"Root progress {word}  epoch={data['epoch']}", width
+        report, f"Root progress {subject}  epoch={data['epoch']}", width
     )
     requested_at = totals["requested_at"]
     started_at = data["work_started_at"]
@@ -1487,12 +1502,10 @@ def _render_root_progress_sections(report, width, display_order):
             width,
         ),
         _fit(
-            f"  response groups {totals['started_response_group_count']:,}"
-            f"/{totals['response_group_count']:,} started"
-            f"   answers in started groups"
-            f" {totals['started_answer_count']:,}"
-            f"/{totals['answer_count']:,}"
-            f" ({_percentage(totals['started_answer_count'], totals['answer_count'])})",
+            "  " + "   ".join(
+                f"{state} {count:,}"
+                for state, count in _state_counts(totals).items()
+            ) + f"   of {totals['response_group_count']:,} response groups",
             width,
         ),
         _fit(
@@ -1515,16 +1528,24 @@ def _render_root_progress_sections(report, width, display_order):
             f" at ~{estimate['candidates_per_day']:,.0f}/day",
             width,
         ))
-        summary.append(_fit(
-            f"    excludes "
-            f"{totals['response_group_count'] - totals['started_response_group_count']:,}"
-            f" unstarted groups and {estimate['stalled_branch_count']:,}"
-            f" stalled branches"
-            f" ({estimate['stalled_remaining_candidate_count']:,} candidates)",
-            width,
-        ))
-    rows = ["Pattern  Answers      Done  Evaluating      Nodes  Share   "
-            "Elapsed  WorkerTime"]
+        # Only groups still waiting hold work the estimate cannot see.  A
+        # group the swarm never opened because it needed no search is not
+        # missing work, and counting it here would invent a backlog.
+        excluded = []
+        waiting = _state_counts(totals).get("waiting", 0)
+        if waiting:
+            excluded.append(f"{waiting:,} waiting groups")
+        if estimate["stalled_branch_count"]:
+            excluded.append(
+                f"{estimate['stalled_branch_count']:,} stalled branches"
+                f" ({estimate['stalled_remaining_candidate_count']:,}"
+                f" candidates)")
+        if excluded:
+            summary.append(_fit("    excludes " + " and ".join(excluded),
+                                width))
+    rows = [f"{'Pattern':<7} {'State':>7} {'Answers':>7} {'Done':>8}"
+            f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
+            f" {'WorkerTime':>10}"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
         # zeros would read as a measurement rather than an absence.  A group
@@ -1544,9 +1565,9 @@ def _render_root_progress_sections(report, width, display_order):
             branch_text = open_text = node_text = share_text = "—"
             elapsed_text = worker_text = "—"
         rows.append(_fit(
-            f"{row['pattern']:<7}  {row['answer_count']:>7}  "
-            f"{branch_text:>8}  {open_text:>10}  {node_text:>9}  "
-            f"{share_text:>5}  {elapsed_text:>8}  {worker_text:>10}",
+            f"{row['pattern']:<7} {row['state']:>7} {row['answer_count']:>7}"
+            f" {branch_text:>8} {open_text:>10} {node_text:>9}"
+            f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}",
             width,
         ))
     return [("header", header), ("summary", summary),

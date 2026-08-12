@@ -399,11 +399,22 @@ class RootProgressRequestTest(unittest.TestCase):
         self.assertEqual(request.branch_target.trailing_word, "penis")
         self.assertEqual(request.branch_target.steps, ())
 
-    def test_word_nested_in_a_spine_is_rejected(self):
-        with self.assertRaisesRegex(InvalidRequest, "bare word"):
+    def test_spine_with_more_than_one_guess_is_accepted(self):
+        # "Why is RAISE ----- SALET taking so long" is the same question the
+        # report answers for a root, at a greater guess_depth.
+        request = parse_report_request(
+            "/api/view/root-progress",
+            "branch_target=RAISE+-----+SALET")
+        self.assertEqual(request.report_kind, "root_progress")
+        self.assertEqual(request.branch_target.trailing_word, "salet")
+
+    def test_target_without_a_trailing_word_is_rejected(self):
+        # A spine ending in a pattern names a branch, which has no response
+        # groups of its own to report.
+        with self.assertRaisesRegex(InvalidRequest, "ending in a word"):
             parse_report_request(
                 "/api/view/root-progress",
-                "branch_target=RAISE+-----+SALET")
+                "branch_target=RAISE+-----")
 
     def test_word_view_display_state_is_rejected_not_ignored(self):
         # Each of these is carried by the word view's state query. The client

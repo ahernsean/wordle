@@ -3703,15 +3703,23 @@ class ERDQueue:
             "cut_reuse_misses": cut_reuse_misses,
         }
 
-    def report_root_progress(self, word, epoch, recent_window_seconds,
+    def report_root_progress(self, spine_prefix, epoch, recent_window_seconds,
                              active_branch_limit=10, now=None) -> dict:
-        """Per-response-group work totals for one root word, plus live rates.
+        """Per-response-group work totals for one spine, plus live rates.
 
-        Rolls up telemetry.branch_finalize_log by the root's own response
-        pattern -- the spine's second step -- so every descendant's cost is
-        attributed to the top-level group it sits under.  The rollup is a scan
-        over the epoch's rows (branch_finalize_log carries no spine index), so
-        callers should treat it as a seconds-scale query.
+        `spine_prefix` is any spine ending in a word: a bare root word such as
+        `PENIS`, or a deeper one such as `PENIS -y--- LUBES`.  Rolls up
+        telemetry.branch_finalize_log by the response pattern that follows the
+        prefix, so every descendant's cost is attributed to the group it sits
+        under.  The rollup is a scan over the epoch's rows
+        (branch_finalize_log carries no spine index), so callers should treat
+        it as a seconds-scale query.
+
+        Branches are selected by spine prefix alone rather than by source word.
+        A source word identifies the root a branch was requested under, which
+        for a deeper spine is still the root -- selecting on it would scope the
+        open branches to the wrong subtree.  active_branches holds thousands of
+        rows, not millions, so scanning it costs single-digit milliseconds.
 
         A group is `started` once work has opened on it, which is not the same
         as having finalized anything: its first branch can still be open, with
@@ -3723,9 +3731,9 @@ class ERDQueue:
         measured cost, which is the true state.
 
         `work_started_at` is the earliest branch *creation* across both, which
-        is when the swarm first opened work on the root -- a different question
-        from when the root was requested, which can precede it by days while
-        higher-priority roots hold the queue.  A branch created before the
+        is when the swarm first opened work under the prefix -- a different
+        question from when the root was requested, which can precede it by days
+        while higher-priority roots hold the queue.  A branch created before the
         current epoch keeps its original creation time, so this can predate the
         epoch whose finalizations are being counted.
 
@@ -3748,9 +3756,9 @@ class ERDQueue:
         """
         now = int(time.time()) if now is None else now
         since = now - recent_window_seconds
-        prefix = word.upper()
-        # The spine's second step starts one space past the root word.
-        pattern_start = len(prefix) + 2
+        # The response pattern follows one space past the prefix.
+        pattern_start = len(spine_prefix) + 2
+        descendants = spine_prefix + " %"
         group_rows = self._conn.execute("""
             SELECT SUBSTR(spine, ?, 5) AS pattern,
                    COUNT(*) AS branch_count,
@@ -3761,7 +3769,7 @@ class ERDQueue:
             FROM telemetry.branch_finalize_log
             WHERE epoch = ? AND spine LIKE ?
             GROUP BY pattern
-        """, (pattern_start, epoch, prefix + " %")).fetchall()
+        """, (pattern_start, epoch, descendants)).fetchall()
         groups = {}
         work_started_at = None
         work_latest_at = None
@@ -3787,9 +3795,9 @@ class ERDQueue:
                    COUNT(*) AS open_branch_count,
                    MIN(created_at) AS first_created_at
             FROM active_branches
-            WHERE source_word = ? AND status = 'open' AND spine LIKE ?
+            WHERE status = 'open' AND spine LIKE ?
             GROUP BY pattern
-        """, (pattern_start, word.lower(), prefix + " %")).fetchall()
+        """, (pattern_start, descendants)).fetchall()
         open_branch_count = 0
         for row in open_group_rows:
             open_branch_count += row["open_branch_count"]
@@ -3818,9 +3826,9 @@ class ERDQueue:
         active_rows = self._conn.execute("""
             SELECT branch_id, n_words, n_candidates, created_at
             FROM active_branches
-            WHERE source_word = ? AND status = 'open'
+            WHERE status = 'open' AND spine LIKE ?
             ORDER BY n_words DESC LIMIT ?
-        """, (word.lower(), active_branch_limit)).fetchall()
+        """, (descendants, active_branch_limit)).fetchall()
         active = []
         for row in active_rows:
             branch_id = row["branch_id"]

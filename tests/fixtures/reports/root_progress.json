@@ -46,6 +46,7 @@
     "search_node_count": 134766155966,
     "search_node_share": 0.9894760731099221,
     "started": true,
+    "state": "working",
     "wall_millis": 3530969062
    },
    {
@@ -59,6 +60,7 @@
     "search_node_count": 1229995556,
     "search_node_share": 0.009030836889052351,
     "started": true,
+    "state": "solved",
     "wall_millis": 26582427
    },
    {
@@ -72,6 +74,7 @@
     "search_node_count": 202771697,
     "search_node_share": 0.0014887843394154067,
     "started": true,
+    "state": "solved",
     "wall_millis": 32310895
    },
    {
@@ -85,6 +88,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": true,
+    "state": "working",
     "wall_millis": 0
    },
    {
@@ -98,6 +102,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "loss",
     "wall_millis": 0
    },
    {
@@ -111,6 +116,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -124,6 +130,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -137,6 +144,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -150,6 +158,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -163,6 +172,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -176,6 +186,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -189,6 +200,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -202,6 +214,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -215,6 +228,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -228,6 +242,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -241,6 +256,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -254,6 +270,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -267,6 +284,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -280,6 +298,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -293,6 +312,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -306,6 +326,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -319,6 +340,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -332,6 +354,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -345,6 +368,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -358,6 +382,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -371,6 +396,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -384,6 +410,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -397,6 +424,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "waiting",
     "wall_millis": 0
    },
    {
@@ -410,6 +438,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "solved",
     "wall_millis": 0
    },
    {
@@ -423,6 +452,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "solved",
     "wall_millis": 0
    },
    {
@@ -436,6 +466,7 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "solved",
     "wall_millis": 0
    },
    {
@@ -449,9 +480,11 @@
     "search_node_count": 0,
     "search_node_share": 0.0,
     "started": false,
+    "state": "solved",
     "wall_millis": 0
    }
   ],
+  "spine_prefix": "PENIS",
   "totals": {
    "answer_count": 3209,
    "branch_count": 564186,
@@ -461,8 +494,13 @@
    "requested_at": null,
    "response_group_count": 117,
    "search_node_count": 136199509648,
-   "started_answer_count": 3169,
    "started_response_group_count": 83,
+   "state_counts": {
+    "loss": 1,
+    "solved": 6,
+    "waiting": 23,
+    "working": 2
+   },
    "wall_millis": 3592582956
   },
   "word": "penis",

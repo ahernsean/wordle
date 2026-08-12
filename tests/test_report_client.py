@@ -409,8 +409,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # already shows elsewhere: queued -> evaluating -> finalizing -> done.
         self.assertEqual(
             headers,
-            ["Pattern", "Answers", "Done", "Evaluating", "Nodes", "Share",
-             "Elapsed", "Worker-time"])
+            ["Pattern", "State", "Answers", "Done", "Evaluating", "Nodes",
+             "Share", "Elapsed", "Worker-time"])
 
     def test_root_progress_table_keeps_its_scroll_position_across_polls(self):
         # Every poll rebuilds the word report, so the scroller is a fresh
@@ -466,7 +466,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             ".open = false")
         headline = self.page.locator(".root-progress-headline").inner_text()
         self.assertIn("remaining", headline)
-        self.assertIn("not started", headline)
+        self.assertIn("groups working", headline)
         self.assertIn("began", headline)
         self.assertEqual(
             self.page.locator("table.root-progress").count(), 1)
@@ -480,42 +480,61 @@ class ReportClientBrowserTest(unittest.TestCase):
         headline = self.page.locator(".root-progress-headline").inner_text()
         self.assertNotIn("%", headline)
 
-    def test_root_progress_headline_partitions_groups_against_the_erd_line(self):
-        # The ERD line above reports groups solved; the headline reports the
-        # rest of the same total, so neither line restates the other's numbers.
-        # 117 groups, 38 of them solved and 83 opened: 45 are in progress and
-        # 34 were never started.
+    def test_root_progress_headline_counts_groups_by_state(self):
+        # The State column says where each pattern sits; the headline says how
+        # many are in each live state, and nothing the ERD line already shows.
         text = self.page.evaluate("""() => renderRootProgressHeadline({
-          totals:{started_response_group_count:83, response_group_count:117},
-          work_started_at:1785575213, estimate:null,
-        }, 38).innerText""")
-        self.assertIn("45 groups in progress", text)
-        self.assertIn("34 not started", text)
-        self.assertNotIn("117", text)
-        self.assertNotIn("38", text)
-
-    def test_root_progress_headline_falls_back_when_no_solved_count_is_shown(self):
-        # An ERD summary that is complete or infeasible does not put a solved
-        # count on screen, so there is nothing to partition against and the
-        # headline reports the started count outright rather than subtracting
-        # from a number the reader cannot see.
-        text = self.page.evaluate("""() => renderRootProgressHeadline({
-          totals:{started_response_group_count:83, response_group_count:117},
+          totals:{state_counts:{waiting:34, working:45, solved:38}},
           work_started_at:1785575213, estimate:null,
         }, null).innerText""")
-        self.assertIn("83 of 117 groups started", text)
-        self.assertIn("34 not started", text)
+        self.assertIn("45 groups working", text)
+        self.assertIn("34 waiting", text)
+        self.assertNotIn("38", text)
 
-    def test_root_progress_headline_survives_a_solved_count_above_started(self):
-        # A group solved under an earlier epoch but untouched under this one is
-        # solved without being started, which would make the remainder
-        # negative.  The fallback covers it rather than printing "-2 groups".
+    def test_root_progress_headline_omits_states_with_no_groups(self):
+        # A zero is noise on a phone, and its absence already says the state is
+        # empty.  PENIS currently has nothing waiting.
         text = self.page.evaluate("""() => renderRootProgressHeadline({
-          totals:{started_response_group_count:36, response_group_count:117},
+          totals:{state_counts:{working:79, solved:38}},
           work_started_at:1785575213, estimate:null,
-        }, 38).innerText""")
-        self.assertNotIn("-", text.split("began")[0])
-        self.assertIn("36 of 117 groups started", text)
+        }, null).innerText""")
+        self.assertIn("79 groups working", text)
+        self.assertNotIn("waiting", text)
+
+    def test_root_progress_table_states_which_patterns_are_finished(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        states = self.page.eval_on_selector_all(
+            "table.root-progress tbody tr td:nth-child(2)",
+            "cells => cells.map(c => c.textContent)")
+        self.assertEqual(set(states), {"waiting", "working", "solved", "loss"})
+
+    def test_root_progress_failure_renders_once_and_stops_refiring(self):
+        # A failed scan that is not held gets re-requested every poll, and the
+        # computing notice and the error wrap to different heights -- so the
+        # whole page below the panel shifts on every cycle.
+        calls = []
+        self.page.route(
+            "**/api/view/root-progress**",
+            lambda route: (calls.append(1), route.fulfill(
+                status=400, content_type="application/json",
+                body='{"error": {"message": "bad target"}}'))[-1])
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector(".root-progress-host p.error")
+            self.page.wait_for_timeout(3 * CLIENT_POLL_MILLIS)
+            # One request for the life of the panel.  Re-firing is what makes
+            # the panel alternate between the computing notice and the error,
+            # and those wrap to different heights on a phone, so every poll
+            # shifts the whole page below it.  The height cannot be asserted
+            # here -- this fixture answers in milliseconds, so the notice is
+            # never on screen when a sample is taken -- but the re-fire that
+            # causes it is deterministic.
+            self.assertEqual(len(calls), 1, "a held failure must not re-fire")
+            self.assertEqual(
+                self.page.locator(".root-progress-host p.error").count(), 1)
+        finally:
+            self.page.unroute("**/api/view/root-progress**")
 
     def test_root_progress_dates_are_day_month_year(self):
         self.apply_branch_target("SALET")
@@ -535,7 +554,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             "details.root-progress-panel .metrics").inner_text()
         self.assertNotIn("564,186", metrics)
         cells = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr td:nth-child(3)",
+            "table.root-progress tbody tr td:nth-child(4)",
             "cells => cells.map(c => c.textContent)")
         self.assertIn("538,391", cells)
 
@@ -543,9 +562,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.root-progress")
         text = self.page.locator("details.root-progress-panel").inner_text()
-        self.assertIn("3,209", text)
-        self.assertNotIn("3209", text)
         self.assertIn("538,391", text)
+        self.assertNotIn("538391", text)
+        self.assertIn("8,671", text)
 
     def test_root_progress_omits_a_request_time_the_queue_cannot_vouch_for(self):
         # The fixture carries no request time: the queue rebuild that restamped
@@ -584,11 +603,11 @@ class ReportClientBrowserTest(unittest.TestCase):
             "table.root-progress tbody tr:not(.dim)",
             """rows => rows
                  .map(r => [...r.cells].map(c => c.textContent))
-                 .filter(cells => cells[2] === '0')""")
+                 .filter(cells => cells[3] === '0')""")
         self.assertTrue(started_without_finalizations)
         cells = started_without_finalizations[0]
-        self.assertNotEqual(cells[3], "—")   # open count is known
-        self.assertEqual(cells[7], "—")      # worker-time only exists at finalize
+        self.assertNotEqual(cells[4], "—")   # open count is known
+        self.assertEqual(cells[8], "—")      # worker-time only exists at finalize
 
     def test_root_progress_panel_marks_unstarted_groups_without_zero_costs(self):
         # An unstarted group has no cost to report; showing 0 would read as

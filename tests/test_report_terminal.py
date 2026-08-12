@@ -1576,26 +1576,30 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000):
         "data": {
             "word": "penis",
             "word_is_answer": False,
+            "spine_prefix": "PENIS",
             "context": {"spine": []},
             "epoch": 11,
             "work_started_at": 1_799_000_000,
             "work_latest_at": 1_799_900_000,
             "estimate": estimate,
             "response_groups": [
-                {"pattern": "-y---", "answer_count": 502, "started": True,
+                {"pattern": "-y---", "state": "working",
+                 "answer_count": 502, "started": True,
                  "branch_count": 524_184, "open_branch_count": 8_584,
                  "search_node_count": 129_900_000_000,
                  "search_node_share": 0.989, "wall_millis": 3_400_000_000,
                  "elapsed_millis": 968_000_000,
                  "first_created_at": 1, "last_finalized_at": 2},
                 # Open, nothing finalized: started, with no cost yet.
-                {"pattern": "-gg--", "answer_count": 16, "started": True,
+                {"pattern": "-gg--", "state": "working",
+                 "answer_count": 16, "started": True,
                  "branch_count": 0, "open_branch_count": 1,
                  "search_node_count": 0,
                  "search_node_share": 0.0, "wall_millis": 0,
                  "elapsed_millis": None,
                  "first_created_at": 3, "last_finalized_at": None},
-                {"pattern": "--y--", "answer_count": 126, "started": False,
+                {"pattern": "--y--", "state": "waiting",
+                 "answer_count": 126, "started": False,
                  "branch_count": 0, "open_branch_count": 0,
                  "search_node_count": 0,
                  "search_node_share": 0.0, "wall_millis": 0,
@@ -1606,7 +1610,8 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000):
                 "response_group_count": 117,
                 "started_response_group_count": 38,
                 "answer_count": 3209,
-                "started_answer_count": 2895,
+                "state_counts": {"waiting": 79, "working": 34, "solved": 3,
+                                 "loss": 1},
                 "branch_count": 550_292,
                 "search_node_count": 131_367_632_458,
                 "wall_millis": 3_471_277_846,
@@ -1652,7 +1657,8 @@ class RootProgressRendererTest(unittest.TestCase):
                      if line.startswith("-gg--"))
         self.assertIn("0.0%", fresh)
         # One open branch, no finalized ones, and no worker-time yet.
-        self.assertRegex(fresh, r"-gg--\s+16\s+0\s+1\s+0\s+0\.0%\s+—\s+—")
+        self.assertRegex(
+            fresh, r"-gg--\s+working\s+16\s+0\s+1\s+0\s+0\.0%\s+—\s+—")
 
     def test_cumulative_branch_total_is_left_out_of_the_summary(self):
         # Carving work into a sub-branch raises the count without any answer
@@ -1684,7 +1690,8 @@ class RootProgressRendererTest(unittest.TestCase):
             "stalled_remaining_candidate_count": 4256,
         }), width=120)
         self.assertIn("estimate ~12.4d", output)
-        self.assertIn("79 unstarted groups", output)
+        # Only groups still waiting hold work the estimate cannot see.
+        self.assertIn("79 waiting groups", output)
         self.assertIn("9 stalled branches", output)
 
     def test_absent_estimate_is_stated_rather_than_guessed(self):
@@ -1702,7 +1709,7 @@ class RootProgressRendererTest(unittest.TestCase):
 
     def test_counts_are_rendered_with_thousands_separators(self):
         output = render_report(root_progress_report(), width=120)
-        self.assertIn("answers in started groups 2,895/3,209", output)
+        self.assertIn("of 117 response groups", output)
         self.assertIn("branches evaluating 8,632", output)
         # Per-pattern branch counts stay: comparing patterns is what they are
         # for, unlike the cumulative total, which grows with every promotion.

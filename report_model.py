@@ -242,16 +242,11 @@ def validate_report_request(request: ReportRequest) -> None:
     if report_kind == "root_progress":
         if request.tree:
             raise ValueError("--tree cannot be used with --root-progress")
+        # Any spine ending in a word works: the rollup scopes telemetry by
+        # spine prefix, and a deeper spine is simply a longer prefix.  A target
+        # that does not end in a word has no response groups to report.
         if branch_target_kind != "word":
-            raise ValueError("--root-progress requires a word target")
-        # The rollup keys on the root's own response pattern and scopes
-        # telemetry by "WORD %", so a nested target such as
-        # "RAISE ----- SALET" would report SALET's independent root work
-        # against groups computed inside the RAISE branch.
-        if request.branch_target.steps:
-            raise ValueError(
-                "--root-progress requires a bare word, not a word inside a "
-                "spine")
+            raise ValueError("--root-progress requires a target ending in a word")
     if report_kind == "sources" and branch_target_kind not in ("root", "word"):
         raise ValueError(
             "--sources accepts only a trailing word or no branch target"
@@ -1323,6 +1318,39 @@ def _root_progress_estimate(active_branches, recent_window_seconds):
     }
 
 
+# Lifecycle order: a group waits, is worked, and ends solved or proven lost.
+ROOT_PROGRESS_GROUP_STATES = ("waiting", "working", "solved", "loss")
+
+
+def _root_progress_group_state(row, cache_state, group_budget):
+    """Where a response group sits in the work, from the cache's view.
+
+    `solved` and `loss` both mean there is no more work to do here -- one
+    because the group has a proven line, the other because it is proven
+    unsolvable within the remaining budget.  Collapsing them would report a
+    dead end as progress, so they stay apart.
+
+    A group of fewer than two answers needs no search: the guess either was the
+    answer, or one more guess plays the survivor -- and that guess needs a
+    budget to spend, so with none left the survivor is a proven loss.  This
+    mirrors `_candidate_erd_summary`, which the ERD line above the table reads.
+
+    Queue state decides only the two remaining cases.  The cache is the
+    authority on whether work is finished, because a group can be solved with
+    no branch open and no finalization in this epoch.
+    """
+    if cache_state is not None:
+        if (cache_state["best_erd"] is not None
+                and cache_state["max_remaining_depth"] is not None):
+            return "solved"
+        if cache_state["cache_state"] == "loss":
+            return "loss"
+    if row["answer_count"] < 2:
+        solved_by_guess = row["pattern"] == _ALL_GREEN_PATTERN_TEXT
+        return "solved" if solved_by_guess or group_budget >= 1 else "loss"
+    return "working" if row["started"] else "waiting"
+
+
 def collect_root_progress_report(sources: ReportSources,
                                  request: ReportRequest) -> dict:
     """Work totals and a completion estimate for one root word.
@@ -1339,11 +1367,22 @@ def collect_root_progress_report(sources: ReportSources,
     if word is None:
         raise ValueError(
             "root progress report requires a branch target ending in a word")
+    # Spines record words uppercase and patterns as written, so the prefix is
+    # built rather than upper-cased whole: upper-casing would corrupt the y in
+    # a pattern.
+    spine_prefix = " ".join(
+        [part for step in resolved.steps
+         for part in (step.word.upper(), _normalized_pattern(step.pattern))]
+        + [word.upper()]
+    )
+    group_budget = GAME_GUESSES - len(resolved.steps) - 1
     response_cache = ResponseCache(all_answers, score_cache=None)
     groups = response_cache.group_words(word, list(resolved.answer_words))
-    answer_counts = {fmt_pattern(pattern_code): len(answer_words)
-                     for pattern_code, answer_words in groups.items()
-                     if answer_words}
+    group_answer_words = {fmt_pattern(pattern_code): answer_words
+                          for pattern_code, answer_words in groups.items()
+                          if answer_words}
+    answer_counts = {pattern: len(answer_words)
+                     for pattern, answer_words in group_answer_words.items()}
     # No branch context here: a root target's branch_key_hex encodes the whole
     # answer subset, which is tens of kilobytes the panel never reads.  Request
     # detail likewise stays in the sources report; only the earliest request
@@ -1351,6 +1390,7 @@ def collect_root_progress_report(sources: ReportSources,
     data = {
         "word": word,
         "word_is_answer": word in answer_set,
+        "spine_prefix": spine_prefix,
         "response_groups": [],
         "totals": {},
         "estimate": None,
@@ -1367,9 +1407,12 @@ def collect_root_progress_report(sources: ReportSources,
         queue = _open_report_queue(sources)
         epoch = queue.epoch if request.epoch is None else request.epoch
         progress = queue.report_root_progress(
-            word, epoch, ROOT_PROGRESS_RECENT_WINDOW_SECONDS,
+            spine_prefix, epoch, ROOT_PROGRESS_RECENT_WINDOW_SECONDS,
             now=generated_at)
-        requests = queue.source_work_requests_for_word(word)
+        # Work under a deeper spine is still requested under its root, so the
+        # request time is the root's however deep the target sits.
+        requests = queue.source_work_requests_for_word(
+            resolved.steps[0].word if resolved.steps else word)
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
@@ -1378,13 +1421,32 @@ def collect_root_progress_report(sources: ReportSources,
         if queue is not None:
             queue.close()
 
+    branch_keys_by_pattern = {
+        pattern: ScoreCache.encode_subset(answer_words)
+        for pattern, answer_words in group_answer_words.items()
+    }
+    cache = None
+    cache_states = {}
+    try:
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+        cache_states = cache.report_branch_states(
+            list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
+        report["sources"]["cache"]["ok"] = True
+    except (sqlite3.Error, OSError) as error:
+        report["sources"]["cache"]["error"] = str(error)
+    finally:
+        if cache is not None:
+            cache.close()
+
     worked = progress["groups"]
     rows = []
     for pattern, answer_count in sorted(answer_counts.items()):
         totals = worked.get(pattern)
         # A group is started once any branch has opened on it, finalized or
         # not; the rollup carries open branches for exactly this reason.
-        rows.append({
+        row = {
             "pattern": pattern,
             "answer_count": answer_count,
             "started": totals is not None,
@@ -1396,7 +1458,11 @@ def collect_root_progress_report(sources: ReportSources,
             "first_created_at": totals["first_created_at"] if totals else None,
             "last_finalized_at": (totals["last_finalized_at"]
                                   if totals else None),
-        })
+        }
+        row["state"] = _root_progress_group_state(
+            row, cache_states.get(branch_keys_by_pattern[pattern]),
+            group_budget)
+        rows.append(row)
     rows.sort(key=lambda row: (-row["search_node_count"], -row["answer_count"]))
     node_total = sum(row["search_node_count"] for row in rows)
     for row in rows:
@@ -1426,8 +1492,7 @@ def collect_root_progress_report(sources: ReportSources,
         "response_group_count": len(rows),
         "started_response_group_count": sum(row["started"] for row in rows),
         "answer_count": sum(row["answer_count"] for row in rows),
-        "started_answer_count": sum(row["answer_count"] for row in rows
-                                    if row["started"]),
+        "state_counts": collections.Counter(row["state"] for row in rows),
         "branch_count": sum(row["branch_count"] for row in rows),
         "search_node_count": node_total,
         "wall_millis": sum(row["wall_millis"] for row in rows),
