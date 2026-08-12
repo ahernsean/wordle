@@ -40,7 +40,6 @@
     .field { display:grid; gap:.1rem; color:var(--dim); }
     .field[hidden] { display:none; }
     .fieldlabel { display:flex; align-items:baseline; gap:.3rem; }
-    .hinttag { font-size:.68rem; color:var(--amber); border:1px solid #e6dcae; background:#fbf6e2; border-radius:3px; padding:0 .3rem; white-space:nowrap; }
     .status-line { display:flex; flex-wrap:wrap; gap:.4rem; align-items:baseline; padding:.15rem 0; }
     .status-line > .label { color:var(--dim); }
     .statuses { display:flex; flex-wrap:wrap; gap:.5rem; align-items:baseline; }
@@ -66,6 +65,7 @@
     .report-meta { display:flex; flex-wrap:wrap; gap:.2rem .6rem; align-items:baseline; margin:.2rem 0 .35rem; }
     details.source-paths { display:inline-block; }
     details.source-paths[open] { display:block; flex-basis:100%; }
+    details.source-paths > summary { cursor:pointer; font-size:1em; font-weight:normal; }
     h1,h2,h3 { margin:.4rem 0 .25rem; }
     h1 { font-size:1rem; display:inline; }
     h2 { font-size:.95rem; }
@@ -217,7 +217,7 @@
         <div class="group-head"><span class="gname">Filters:</span><span class="ghint">narrow the branches — applied as you change them</span></div>
         <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
         <div class="status-line"><span class="label">Branch phase</span><span class="statuses" id="branch-phases"></span></div>
-        <div class="dim lifecycle-legend">Phase tracks queued → evaluating → finalizing → complete; status tracks whether a worker is on it right now. Unqueued branches have no phase yet.</div>
+        <div class="dim lifecycle-legend">Phase: queued → evaluating → finalizing → complete. Status: worker active or not.</div>
         <div class="field-flow">
           <label class="field">Min answers<input id="minimum-answer-count" type="number"></label>
           <label class="field">Max answers<input id="maximum-answer-count" type="number"></label>
@@ -228,8 +228,8 @@
       <div class="control-group" id="view-group">
         <div class="group-head"><span class="gname">View</span><span class="ghint">order &amp; scope what's shown</span></div>
         <div class="field-flow">
-          <label class="field" id="sort-field"><span class="fieldlabel">Sort <span class="hinttag">default = natural order</span></span><select id="sort"><option value="">default</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>nodes</option><option>slowest</option></select></label>
-          <label class="field" id="group-by-field"><span class="fieldlabel">Group by</span><select id="group-by"><option value="">none</option><option value="status">status</option><option value="answer_count">answer count</option></select></label>
+          <label class="field" id="sort-field"><span class="fieldlabel">Sort</span><select id="sort"><option value="">default</option><option data-word-report-invalid>age</option><option>size</option><option>workers</option><option>priority</option><option data-word-report-invalid>nodes</option><option data-word-report-invalid>slowest</option></select></label>
+          <label class="field" id="group-by-field"><span class="fieldlabel">Group by</span><select id="group-by"><option value="">none</option><option value="status">status</option><option value="answer_count">answer count</option><option value="cache_state">cache state</option><option value="worker_presence">worker</option><option value="priority">priority</option></select></label>
           <label class="field" id="limit-field"><span id="limit-label">Branches shown</span><input id="limit" type="number" min="1"></label>
           <label class="field" id="by-field"><span class="fieldlabel">Hotspot field</span><select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>bulk-completed-candidates</option><option>cut-reuse</option><option>coordination</option></select></label>
           <label class="field" id="epoch-field">Epoch<input id="epoch" class="narrow" type="number"></label>
@@ -401,7 +401,9 @@
       const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(currentState.by);
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
       byId("sort-field").hidden=kind==="cache"||isHotspots;
-      byId("group-by-field").hidden=!isInferredWordState(kind,currentState.branch_target);
+      const wordReport=isInferredWordState(kind,currentState.branch_target);
+      for(const option of byId("sort").options)option.hidden="wordReportInvalid" in option.dataset&&wordReport;
+      byId("group-by-field").hidden=!wordReport;
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
       byId("limit-label").textContent=currentState.tree?"Items per page":kind==="auto"?"Branches shown":"Rows shown";
       byId("limit-field").hidden=currentState.tree;

@@ -1326,6 +1326,26 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertTrue(self.page.locator("#filters-group").is_hidden())
         self.assertTrue(self.page.locator("#sort-field").is_hidden())
 
+    def test_word_report_sort_hides_options_the_server_would_reject(self):
+        # A word report's sort is restricted server-side to default/size/
+        # workers/priority (validate_report_request); age/nodes/slowest would
+        # silently bounce back to "default" with no explanation if offered.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        hidden_by_value = dict(self.page.eval_on_selector_all(
+            "#sort option", "options => options.map(o => [o.value, o.hidden])"
+        ))
+        self.assertEqual(hidden_by_value,
+            {"": False, "age": True, "size": False, "workers": False,
+             "priority": False, "nodes": True, "slowest": True})
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_function("() => __reportClient.getState().kind === 'queue'")
+        self.assertTrue(all(
+            hidden is False for _, hidden in self.page.eval_on_selector_all(
+                "#sort option", "options => options.map(o => [o.value, o.hidden])"
+            )
+        ))
+
     def test_refresh_popover_toggles_open_and_closed(self):
         self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
         self.page.locator("#connection").click()

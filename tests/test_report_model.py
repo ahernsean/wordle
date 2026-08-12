@@ -200,6 +200,40 @@ class ReportModelTest(unittest.TestCase):
             30: "30–99", 99: "30–99", 100: "100+", 500: "100+",
         })
 
+    def test_response_group_key_orders_cache_state_by_urgency(self):
+        order = [
+            _response_group_key({"cache_state": cache_state}, "cache_state")[0]
+            for cache_state in ("missing", "loss", "exact", "not_applicable")
+        ]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(
+            _response_group_key({"cache_state": "not_applicable"}, "cache_state")[1],
+            "trivial",
+        )
+
+    def test_response_group_key_splits_by_worker_presence(self):
+        self.assertEqual(
+            _response_group_key({"worker_count": 2}, "worker_presence"),
+            (0, "has worker"),
+        )
+        self.assertEqual(
+            _response_group_key({"worker_count": 0}, "worker_presence"),
+            (1, "no worker"),
+        )
+
+    def test_response_group_key_orders_priority_high_first_with_unset_last(self):
+        order = [
+            _response_group_key({"priority": priority}, "priority")[0]
+            for priority in (1, 0, None)
+        ]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(
+            _response_group_key({"priority": 1}, "priority")[1], "priority 1"
+        )
+        self.assertEqual(
+            _response_group_key({"priority": None}, "priority")[1], "no priority"
+        )
+
     def test_response_group_rollup_partitions_by_cache_state(self):
         rows = [
             {"answer_count": 1, "cache_state": "not_applicable"},

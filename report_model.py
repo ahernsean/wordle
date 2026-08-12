@@ -115,9 +115,15 @@ class ReportFilters:
 
 BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
 BRANCH_PHASES = ("queued", "evaluating", "finalizing", "complete")
-GROUP_BY_STRATEGIES = ("none", "status", "answer_count")
+GROUP_BY_STRATEGIES = (
+    "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
+)
 _STATUS_GROUP_ORDER = {"active": 0, "pending": 1, "done": 2, "unqueued": 3}
 _ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
+_CACHE_STATE_GROUP_ORDER = {"missing": 0, "loss": 1, "exact": 2, "not_applicable": 3}
+_CACHE_STATE_GROUP_LABEL = {
+    "missing": "missing", "loss": "loss", "exact": "exact", "not_applicable": "trivial",
+}
 
 
 def parse_branch_filter(value, filter_name, allowed_values):
@@ -1027,6 +1033,20 @@ def _response_group_key(row: dict, group_by: str) -> tuple:
             if row["answer_count"] <= upper:
                 return (upper, label)
         return (float("inf"), "100+")
+    if group_by == "cache_state":
+        cache_state = row["cache_state"]
+        return (
+            _CACHE_STATE_GROUP_ORDER[cache_state],
+            _CACHE_STATE_GROUP_LABEL[cache_state],
+        )
+    if group_by == "worker_presence":
+        has_worker = bool(row["worker_count"])
+        return (0 if has_worker else 1, "has worker" if has_worker else "no worker")
+    if group_by == "priority":
+        priority = row["priority"]
+        if priority is None:
+            return (float("inf"), "no priority")
+        return (-priority, f"priority {priority}")
     return (0, "all")
 
 
