@@ -1654,6 +1654,16 @@ class RootProgressRendererTest(unittest.TestCase):
         # One open branch, no finalized ones, and no worker-time yet.
         self.assertRegex(fresh, r"-gg--\s+16\s+0\s+1\s+0\s+0\.0%\s+—\s+—")
 
+    def test_cumulative_branch_total_is_left_out_of_the_summary(self):
+        # Carving work into a sub-branch raises the count without any answer
+        # being closer to solved, so the absolute total tracks scheduling as
+        # much as progress.
+        output = render_report(root_progress_report(), width=120)
+        summary = output.split("Pattern")[0]
+        self.assertNotIn("550,292", summary)
+        self.assertIn("nodes", summary)
+        self.assertIn("worker-time", summary)
+
     def test_open_branch_count_is_its_own_column(self):
         output = render_report(root_progress_report(), width=120)
         # Named for the lifecycle phase the branches are in, so the column
@@ -1692,9 +1702,11 @@ class RootProgressRendererTest(unittest.TestCase):
 
     def test_counts_are_rendered_with_thousands_separators(self):
         output = render_report(root_progress_report(), width=120)
-        self.assertIn("answers 2,895/3,209", output)
-        self.assertIn("done 550,292", output)
-        self.assertIn("evaluating 8,632", output)
+        self.assertIn("answers in started groups 2,895/3,209", output)
+        self.assertIn("branches evaluating 8,632", output)
+        # Per-pattern branch counts stay: comparing patterns is what they are
+        # for, unlike the cumulative total, which grows with every promotion.
+        self.assertIn("524,184", output)
 
 
 if __name__ == "__main__":

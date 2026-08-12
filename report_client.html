@@ -291,7 +291,7 @@
     };
     const displayValue=(key,value)=>boundFields.has(key)&&typeof value==="number"?fixed(value):value;
     const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
-    const absoluteTime=seconds=>seconds===null||seconds===undefined?"unknown time":new Date(seconds*1000).toLocaleString(undefined,{dateStyle:"medium",timeStyle:"medium"});
+    const absoluteTime=seconds=>seconds===null||seconds===undefined?"unknown time":new Date(seconds*1000).toLocaleString("en-GB",{dateStyle:"medium",timeStyle:"medium"});
     const displayTimedValue=(key,value,now)=>key.endsWith("_at")&&typeof value==="number"?relativeAge(value,now):displayValue(key,value);
     const statLine=parts=>{const node=element("div","dim stat-line");for(const part of parts){if(!part)continue;const cell=element("span","");if(part instanceof Node)cell.append(part);else cell.textContent=String(part);node.append(cell);}return node;};
     const label=key=>String(key).replaceAll("_"," ").replace(/\berd\b/gi,"ERD");
@@ -768,12 +768,21 @@
       return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
     }
     // The headline sits outside the collapsible panel so the numbers worth a
-    // glance -- how much is left and how much has been reached -- are readable
-    // with the table closed.
-    function renderRootProgressHeadline(data){
+    // glance are readable with the table closed.  It carries no coverage
+    // percentage: cost concentrates so hard that breadth of coverage reads as
+    // percent-complete while saying nothing about the time left.
+    //
+    // solvedGroupCount is the count the ERD line above already shows.  Solved,
+    // in progress, and not started partition the same response groups, so
+    // reporting the remainder here leaves neither line restating the other.
+    function renderRootProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
+      const started=totals.started_response_group_count,total=totals.response_group_count;
       if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining");
-      if(totals.answer_count)parts.push((100*totals.started_answer_count/totals.answer_count).toFixed(1)+"% of answers reached");
+      const inProgress=Number.isInteger(solvedGroupCount)?started-solvedGroupCount:null;
+      if(inProgress!==null&&inProgress>=0)parts.push(numText(inProgress)+" groups in progress");
+      else if(Number.isInteger(started))parts.push(numText(started)+" of "+numText(total)+" groups started");
+      if(Number.isInteger(started)&&Number.isInteger(total))parts.push(numText(total-started)+" not started");
       parts.push("began "+absoluteTime(data.work_started_at));
       return statLine(parts);
     }
@@ -781,10 +790,8 @@
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
       const metrics=element("div","metrics");
       metrics.append(
-        metric("groups started",numText(totals.started_response_group_count)+" / "+numText(totals.response_group_count)),
-        metric("answers reached",numText(totals.started_answer_count)+" / "+numText(totals.answer_count)),
-        metric("done",totals.branch_count),
-        metric("evaluating",totals.open_branch_count),
+        metric("answers in started groups",numText(totals.started_answer_count)+" / "+numText(totals.answer_count)),
+        metric("branches evaluating",totals.open_branch_count),
         metric("nodes",formatNodeCount(totals.search_node_count)),
         metric("worker-time",formatDuration((totals.wall_millis||0)/1000)));
       fragment.append(metrics);
@@ -832,13 +839,13 @@
       // top-left mid-read.
       scroller.addEventListener("scroll",()=>rootProgressScroll.set(url,{left:scroller.scrollLeft,top:scroller.scrollTop}));
       fragment.append(scroller);
-      fragment.append(element("p","dim","Done and Evaluating count branches at every depth under the pattern. Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock; Worker-time sums across workers. Counts cover epoch "+data.epoch+" only."));
+      fragment.append(element("p","dim","Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock. Counts cover epoch "+data.epoch+"."));
       return fragment;
     }
-    function renderRootProgressInto(headlineHost,host,url,data){
+    function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);attachRootProgress(headlineHost,host,url);});
-      headlineHost.replaceChildren(renderRootProgressHeadline(data));
+      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount);});
+      headlineHost.replaceChildren(renderRootProgressHeadline(data,solvedGroupCount));
       host.replaceChildren(renderRootProgressPanel(data,url),refresh);
       // The panel is built before the report is mounted, and scroll offsets do
       // not apply to a detached element.  A microtask runs after the mount and
@@ -848,15 +855,15 @@
         if(scroller&&saved){scroller.scrollLeft=saved.left;scroller.scrollTop=saved.top;}
       });
     }
-    function attachRootProgress(headlineHost,host,url){
+    function attachRootProgress(headlineHost,host,url,solvedGroupCount){
       const cached=rootProgressCache.get(url);
-      if(cached){renderRootProgressInto(headlineHost,host,url,cached);return;}
+      if(cached){renderRootProgressInto(headlineHost,host,url,cached,solvedGroupCount);return;}
       host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
       if(rootProgressPending.has(url))return;
       rootProgressPending.add(url);
       fetch(url,{headers:{Accept:"application/json"}})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
-        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data);})
+        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount);})
         .catch(error=>{if(host.isConnected)host.replaceChildren(element("p","error",error.message));})
         .finally(()=>rootProgressPending.delete(url));
     }
@@ -875,8 +882,11 @@
       progressDetails.append(element("summary","clickable","Root progress"),progressHost);
       progressDetails.addEventListener("toggle",()=>{rootProgressOpen=progressDetails.open;});
       // Fetched whether or not the panel is open: the headline outside it
-      // carries the same result, and the result is cached per target.
-      attachRootProgress(progressHeadline,progressHost,progressURL);
+      // carries the same result, and the result is cached per target.  The
+      // solved-group count is only passed on when the ERD line above is the
+      // one that shows it, so the headline reports the same partition.
+      attachRootProgress(progressHeadline,progressHost,progressURL,
+        erd&&erd.state!=="complete"&&erd.state!=="infeasible"?erd.resolved_group_count:null);
       fragment.append(progressHeadline,progressDetails);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched · "+numText(totalRows)+" total response groups"));
       const previousRows=previousBy(previous,"response_groups","branch_key_hex");
@@ -1296,7 +1306,7 @@
       addEventListener("resize",()=>layoutSpines(byId("report")));
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>

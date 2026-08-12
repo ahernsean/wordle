@@ -136,7 +136,9 @@ produce the same response pattern to a given guess). Do not call them
 
 ---
 
-## Displayed integers carry comma separators
+## Display conventions
+
+### Integers carry comma separators
 
 Unless separators would mislead, every integer shown to a user is rendered with
 thousands separators: `571,359`, not `571359`. This holds in the web client, the
@@ -158,6 +160,23 @@ into a sentence:
 ```
 
 In Python, use the `:,` format spec (`f"{count:,}"`).
+
+### Dates run day, month, year
+
+`1 Aug 2026`, never `Aug 1, 2026`. The American form orders the fields
+little-endian then big-endian within one date, which reads as neither. Times go
+with it on a 24-hour clock: `1 Aug 2026, 05:06:53`.
+
+In the web client this is the `en-GB` locale — never the viewer's default,
+which is American on the machines this runs on:
+
+```javascript
+new Date(seconds*1000).toLocaleString("en-GB",{dateStyle:"medium",timeStyle:"medium"})
+```
+
+A fully big-endian format is also fine where one already reads well, which is
+why the terminal renderer's `%Y-%m-%d %H:%M` stays as it is. Only the mixed
+ordering is ruled out.
 
 ---
 

@@ -381,7 +381,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         released = Event()
 
         def hold(route):
-            released.wait(timeout=10)
+            # Long enough that only the release below can end the hold.  A
+            # timeout short enough to expire while the page is still loading
+            # lets the response through before the assertion runs, which reads
+            # as "the notice was never shown" on a loaded machine.
+            released.wait(timeout=120)
             route.continue_()
 
         self.page.route("**/api/view/root-progress**", hold)
@@ -462,10 +466,78 @@ class ReportClientBrowserTest(unittest.TestCase):
             ".open = false")
         headline = self.page.locator(".root-progress-headline").inner_text()
         self.assertIn("remaining", headline)
-        self.assertIn("% of answers reached", headline)
+        self.assertIn("not started", headline)
         self.assertIn("began", headline)
         self.assertEqual(
             self.page.locator("table.root-progress").count(), 1)
+
+    def test_root_progress_headline_states_no_coverage_percentage(self):
+        # Cost concentrates so hard that breadth of coverage reads as
+        # percent-complete: 98.8% of answers reached beside ~12d remaining
+        # after 11 days of work invites exactly the wrong conclusion.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        headline = self.page.locator(".root-progress-headline").inner_text()
+        self.assertNotIn("%", headline)
+
+    def test_root_progress_headline_partitions_groups_against_the_erd_line(self):
+        # The ERD line above reports groups solved; the headline reports the
+        # rest of the same total, so neither line restates the other's numbers.
+        # 117 groups, 38 of them solved and 83 opened: 45 are in progress and
+        # 34 were never started.
+        text = self.page.evaluate("""() => renderRootProgressHeadline({
+          totals:{started_response_group_count:83, response_group_count:117},
+          work_started_at:1785575213, estimate:null,
+        }, 38).innerText""")
+        self.assertIn("45 groups in progress", text)
+        self.assertIn("34 not started", text)
+        self.assertNotIn("117", text)
+        self.assertNotIn("38", text)
+
+    def test_root_progress_headline_falls_back_when_no_solved_count_is_shown(self):
+        # An ERD summary that is complete or infeasible does not put a solved
+        # count on screen, so there is nothing to partition against and the
+        # headline reports the started count outright rather than subtracting
+        # from a number the reader cannot see.
+        text = self.page.evaluate("""() => renderRootProgressHeadline({
+          totals:{started_response_group_count:83, response_group_count:117},
+          work_started_at:1785575213, estimate:null,
+        }, null).innerText""")
+        self.assertIn("83 of 117 groups started", text)
+        self.assertIn("34 not started", text)
+
+    def test_root_progress_headline_survives_a_solved_count_above_started(self):
+        # A group solved under an earlier epoch but untouched under this one is
+        # solved without being started, which would make the remainder
+        # negative.  The fallback covers it rather than printing "-2 groups".
+        text = self.page.evaluate("""() => renderRootProgressHeadline({
+          totals:{started_response_group_count:36, response_group_count:117},
+          work_started_at:1785575213, estimate:null,
+        }, 38).innerText""")
+        self.assertNotIn("-", text.split("began")[0])
+        self.assertIn("36 of 117 groups started", text)
+
+    def test_root_progress_dates_are_day_month_year(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        headline = self.page.locator(".root-progress-headline").inner_text()
+        self.assertRegex(headline, r"began \d{1,2} [A-Z][a-z]{2} \d{4}")
+        self.assertNotRegex(headline, r"[A-Z][a-z]{2} \d{1,2}, \d{4}")
+
+    def test_root_progress_omits_the_cumulative_branch_total(self):
+        # Carving work into a sub-branch raises the count without any answer
+        # being closer to solved, so the absolute total tracks scheduling as
+        # much as progress.  Per-pattern values stay, where the comparison
+        # between patterns is the point.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        metrics = self.page.locator(
+            "details.root-progress-panel .metrics").inner_text()
+        self.assertNotIn("564,186", metrics)
+        cells = self.page.eval_on_selector_all(
+            "table.root-progress tbody tr td:nth-child(3)",
+            "cells => cells.map(c => c.textContent)")
+        self.assertIn("538,391", cells)
 
     def test_root_progress_counts_carry_thousands_separators(self):
         self.apply_branch_target("SALET")
@@ -473,6 +545,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = self.page.locator("details.root-progress-panel").inner_text()
         self.assertIn("3,209", text)
         self.assertNotIn("3209", text)
+        self.assertIn("538,391", text)
 
     def test_root_progress_omits_a_request_time_the_queue_cannot_vouch_for(self):
         # The fixture carries no request time: the queue rebuild that restamped

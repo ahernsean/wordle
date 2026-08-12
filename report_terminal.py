@@ -1489,14 +1489,14 @@ def _render_root_progress_sections(report, width, display_order):
         _fit(
             f"  response groups {totals['started_response_group_count']:,}"
             f"/{totals['response_group_count']:,} started"
-            f"   answers {totals['started_answer_count']:,}"
+            f"   answers in started groups"
+            f" {totals['started_answer_count']:,}"
             f"/{totals['answer_count']:,}"
             f" ({_percentage(totals['started_answer_count'], totals['answer_count'])})",
             width,
         ),
         _fit(
-            f"  done {totals['branch_count']:,}"
-            f"   evaluating {totals['open_branch_count']:,}"
+            f"  branches evaluating {totals['open_branch_count']:,}"
             f"   nodes {_format_node_count(totals['search_node_count'])}"
             f"   worker-time {_abbreviate_duration(totals['wall_millis'] / 1000)}",
             width,
