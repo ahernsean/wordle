@@ -110,10 +110,14 @@ class ReportFilters:
     finalization_cursor_direction: str | None = None
     finalization_cursor_recorded_at: int | None = None
     finalization_cursor_id: int | None = None
+    group_by: str | None = None
 
 
 BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
 BRANCH_PHASES = ("queued", "evaluating", "finalizing", "complete")
+GROUP_BY_STRATEGIES = ("none", "status", "answer_count")
+_STATUS_GROUP_ORDER = {"active": 0, "pending": 1, "done": 2, "unqueued": 3}
+_ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
 
 
 def parse_branch_filter(value, filter_name, allowed_values):
@@ -203,6 +207,15 @@ def validate_report_request(request: ReportRequest) -> None:
     ):
         raise ValueError(
             "--sort for word reports must be default, size, workers, or priority"
+        )
+    if request.filters.group_by is not None and (
+        report_kind != "auto"
+        or branch_target_kind != "word"
+        or request.filters.group_by not in GROUP_BY_STRATEGIES
+    ):
+        raise ValueError(
+            "group_by requires a word report and must be one of "
+            + ", ".join(GROUP_BY_STRATEGIES)
         )
     historical_hotspot = request.hotspot_field in (
         "evaluated-candidates", "bulk-completed-candidates",
@@ -1004,6 +1017,50 @@ def _candidate_erd_summary(response_groups, group_budget):
     }
 
 
+def _response_group_key(row: dict, group_by: str) -> tuple:
+    """Map a response-group row to (sort_key, label) for the given strategy."""
+    if group_by == "status":
+        status = row["branch_status"]
+        return (_STATUS_GROUP_ORDER[status], status)
+    if group_by == "answer_count":
+        for upper, label in _ANSWER_COUNT_GROUP_BOUNDARIES:
+            if row["answer_count"] <= upper:
+                return (upper, label)
+        return (float("inf"), "100+")
+    return (0, "all")
+
+
+def _response_group_rollup(rows: list) -> dict:
+    """Fold response-group rows into the same breakdown used for one group
+    or the grand total, so the two are always consistent with each other."""
+    return {
+        "answer_count": sum(row["answer_count"] for row in rows),
+        "branch_count": len(rows),
+        "trivial_count": sum(row["cache_state"] == "not_applicable" for row in rows),
+        "exact_count": sum(row["cache_state"] == "exact" for row in rows),
+        "loss_count": sum(row["cache_state"] == "loss" for row in rows),
+        "missing_count": sum(row["cache_state"] == "missing" for row in rows),
+    }
+
+
+def _grouped_response_groups(rows: list, group_by: str) -> list:
+    """Bucket rows by `group_by`, each with its own rollup, ordered by strategy."""
+    grouped: dict[tuple, dict] = {}
+    for row in rows:
+        key, label = _response_group_key(row, group_by)
+        group = grouped.setdefault(key, {"label": label, "rows": []})
+        group["rows"].append(row)
+    groups = []
+    for key in sorted(grouped):
+        group = grouped[key]
+        groups.append({
+            "label": group["label"],
+            "rollup": _response_group_rollup(group["rows"]),
+            "rows": group["rows"],
+        })
+    return groups
+
+
 def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -1146,6 +1203,11 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     elif filters.sort == "priority":
         response_groups.sort(key=lambda row: (-(row["priority"] or 0), row["pattern"]))
     matched_response_groups = list(response_groups)
+    data["response_group_summary"] = _response_group_rollup(matched_response_groups)
+    if filters.group_by and filters.group_by != "none":
+        data["response_group_groups"] = _grouped_response_groups(
+            matched_response_groups, filters.group_by
+        )
     data["response_group_counts"] = {
         "response_group_count": len(all_response_groups),
         "trivial_response_group_count": sum(

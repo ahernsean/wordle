@@ -1,6 +1,7 @@
 """Browser contract tests for the self-contained report client."""
 
 from contextlib import contextmanager
+import copy
 from http.server import ThreadingHTTPServer
 from html.parser import HTMLParser
 import os
@@ -369,6 +370,73 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("3.564", text)
         self.assertNotIn("3.564102564102564", text)
         self.assertIn("max remaining depth", text)
+
+    def test_word_report_card_omits_redundant_and_empty_phase_chips(self):
+        # The fixture's four groups are branch_status done/done/done/unqueued
+        # with phase complete/complete/complete/None — phase never adds
+        # information beyond status here, so no card should show a second chip.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        chip_counts = self.page.eval_on_selector_all(
+            "article.card.clickable",
+            "cards => cards.map(c => c.querySelectorAll('.chip').length)",
+        )
+        self.assertEqual(chip_counts, [1, 1, 1, 1])
+        self.assertNotIn("complete", self.page.locator("#report").inner_text())
+
+    def _apply_grouped_salet_report(self):
+        # A live background poll re-renders the root overview it's still
+        # tracking (this helper injects report state directly, bypassing
+        # __reportClient.setState, so currentState never points at SALET) and
+        # would wipe the injected DOM mid-test — block it, and load the
+        # fixture directly rather than fetching, so nothing here depends on
+        # the poll being blocked before an in-page fetch resolves.
+        self.page.route("**/api/view**", lambda route: route.abort())
+        report = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["word.json"])
+        response_groups = report["data"]["response_groups"]
+        report["data"]["response_group_summary"] = {"branch_count": 4,
+            "answer_count": 17, "trivial_count": 1, "exact_count": 1,
+            "loss_count": 1, "missing_count": 1}
+        report["data"]["response_group_groups"] = [
+            {"label": "done", "rollup": {"branch_count": 3, "answer_count": 14,
+                "trivial_count": 1, "exact_count": 1, "loss_count": 1, "missing_count": 0},
+                "rows": [row for row in response_groups if row["branch_status"] == "done"]},
+            {"label": "unqueued", "rollup": {"branch_count": 1, "answer_count": 3,
+                "trivial_count": 0, "exact_count": 0, "loss_count": 0, "missing_count": 1},
+                "rows": [row for row in response_groups if row["branch_status"] == "unqueued"]},
+        ]
+        return self.page.evaluate("""(report) => {
+          window.__groupedTestReport = report;
+          applyReport(report, null,
+            {...__reportClient.getState(), branch_target:'SALET', group_by:'status'});
+          return document.querySelectorAll('details.response-group').length;
+        }""", report)
+
+    def test_word_report_renders_groups_with_rollup(self):
+        group_count = self._apply_grouped_salet_report()
+        self.assertEqual(group_count, 2)
+        text = self.page.locator("#report").inner_text()
+        # 14 of 17 answers is 82%, rounded from 82.35...
+        self.assertIn("3 branches", text)
+        self.assertIn("(82%)", text)
+
+    def test_word_report_group_collapse_survives_poll(self):
+        self._apply_grouped_salet_report()
+        details = self.page.locator("details.response-group").first
+        details.locator("summary").click()
+        # <details> dispatches "toggle" as a queued task, not synchronously
+        # with the click, so the listener that records the collapse hasn't
+        # necessarily run yet the instant the click returns — the tree-view
+        # collapse test waits for the same reason.
+        self.page.wait_for_timeout(100)
+        self.assertIsNone(details.get_attribute("open"))
+        self.page.evaluate("""() => {
+          applyReport(window.__groupedTestReport, window.__groupedTestReport,
+            {...__reportClient.getState(), branch_target:'SALET', group_by:'status'});
+        }""")
+        self.assertIsNone(
+            self.page.locator("details.response-group").first.get_attribute("open")
+        )
 
     def test_leaderboard_tab_ranks_openers_and_rounds_erd(self):
         self.page.locator("[data-kind=leaderboard]").click()

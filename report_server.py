@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from report_model import (
     BRANCH_PHASES,
     BRANCH_STATUSES,
+    GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
     ReportFilters,
     ReportRequest,
@@ -48,8 +49,8 @@ INTEGER_PARAMETERS = {
     "limit", "epoch", "since_seconds", "sample_size",
 }
 SCALAR_PARAMETERS = {
-    "branch_target", "sort", "by", "worker", "branch_status", "branch_phase",
-    "finalization_cursor", "tree_parent", "tree_cursor",
+    "branch_target", "sort", "group_by", "by", "worker", "branch_status",
+    "branch_phase", "finalization_cursor", "tree_parent", "tree_cursor",
     *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
 }
@@ -205,6 +206,9 @@ def parse_report_request(path, query):
     sort = _single_value(parameters, "sort")
     if sort is not None and sort not in SORT_FIELDS:
         raise InvalidRequest(f"invalid sort field {sort!r}")
+    group_by = _single_value(parameters, "group_by")
+    if group_by is not None and group_by not in GROUP_BY_STRATEGIES:
+        raise InvalidRequest(f"invalid group_by field {group_by!r}")
 
     hotspot_field = _single_value(parameters, "by")
     historical_options_present = any(
@@ -245,6 +249,7 @@ def parse_report_request(path, query):
         budget=integer_values["budget"],
         priority=integer_values["priority"],
         sort=sort,
+        group_by=group_by,
         limit=limit,
         finalization_cursor_direction=finalization_cursor_direction,
         finalization_cursor_recorded_at=finalization_cursor_recorded_at,
