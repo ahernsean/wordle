@@ -84,8 +84,13 @@
     .card.transitioning { border-color:var(--dim); }
     .dead { border-color:var(--red); }
     .card-title { display:flex; flex-wrap:wrap; gap:.35rem; align-items:baseline; }
-    .worker .card-title { flex-wrap:nowrap; gap:.2rem; min-width:0; overflow:hidden; }
-    .worker .card-title > * { flex:0 0 auto; white-space:nowrap; }
+    .worker .card-title { gap:.2rem; }
+    /* Each item (name, state chip, candidate tiles) wraps to its own line as a
+       whole when the row doesn't fit -- never clipped, never split.  overflow-wrap
+       normally lets a nowrap span break mid-word to avoid overflow; .card sets it
+       to "anywhere" for long unrelated content, so it must be countered here or
+       that inherited rule breaks these items internally instead of wrapping the row. */
+    .worker .card-title > * { flex:0 0 auto; white-space:nowrap; overflow-wrap:normal; }
     .chip { display:inline-block; border:1px solid var(--border); border-radius:999px; padding:.05rem .4rem; color:var(--dim); font-size:.85em; }
     .chip.exact, .outcome-exact { border-color:var(--green); color:#3e7c3a; }
     .chip.cut, .outcome-cut { border-color:var(--amber); color:#7d6812; }
