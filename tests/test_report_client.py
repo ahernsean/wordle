@@ -406,6 +406,23 @@ class ReportClientBrowserTest(unittest.TestCase):
             ["Pattern", "Answers", "Branches", "Open", "Nodes", "Share",
              "Elapsed", "Worker-time"])
 
+    def test_root_progress_url_carries_only_parameters_the_report_accepts(self):
+        # The word view's own display state — group_by, sort, limit, branch
+        # filters — is rejected outright by the root-progress report, not
+        # ignored, so copying the whole state query 400s the panel. The
+        # fixture server ignores query parameters, so this asserts on the URL
+        # the client builds; test_report_server pins the server side.
+        url = self.page.evaluate("""() => rootProgressURL({
+          branch_target:'PENIS', kind:'auto', tree:false,
+          group_by:'worker_presence', sort:'size', limit:25,
+          branch_status:['active'], branch_phase:['evaluating'],
+          minimum_answer_count:5, maximum_answer_count:500, budget:5,
+          priority:998, by:'nodes', since_seconds:900, sample_size:100,
+          worker_id:'worker-1', finalization_cursor:'abc', tree_cursor:'def',
+          answers:true, claims:true, epoch:null,
+        })""")
+        self.assertEqual(url, "/api/view/root-progress?branch_target=PENIS")
+
     def test_root_progress_panel_shows_open_groups_as_started(self):
         # A group whose first branch is still open is being worked right now.
         # Dimming it as unstarted would hide the live state.

@@ -391,5 +391,34 @@ class ReportServerMainTest(unittest.TestCase):
             self.assertIn("already in use", stderr.getvalue())
 
 
+class RootProgressRequestTest(unittest.TestCase):
+    def test_bare_word_target_is_accepted(self):
+        request = parse_report_request(
+            "/api/view/root-progress", "branch_target=PENIS")
+        self.assertEqual(request.report_kind, "root_progress")
+        self.assertEqual(request.branch_target.trailing_word, "penis")
+        self.assertEqual(request.branch_target.steps, ())
+
+    def test_word_nested_in_a_spine_is_rejected(self):
+        with self.assertRaisesRegex(InvalidRequest, "bare word"):
+            parse_report_request(
+                "/api/view/root-progress",
+                "branch_target=RAISE+-----+SALET")
+
+    def test_word_view_display_state_is_rejected_not_ignored(self):
+        # Each of these is carried by the word view's state query. The client
+        # must not forward them, and this pins why: the report rejects them,
+        # so a forwarded parameter fails the whole panel rather than being
+        # dropped.
+        for query in (
+            "branch_target=PENIS&group_by=worker_presence",
+            "branch_target=PENIS&by=nodes",
+            "branch_target=PENIS&worker=worker-1",
+        ):
+            with self.subTest(query=query):
+                with self.assertRaises(InvalidRequest):
+                    parse_report_request("/api/view/root-progress", query)
+
+
 if __name__ == "__main__":
     unittest.main()

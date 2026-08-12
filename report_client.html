@@ -751,8 +751,15 @@
       for(const [size,suffix] of [[1e9,"G"],[1e6,"M"],[1e3,"K"]])if(value>=size)return (value/size).toFixed(1)+suffix;
       return String(value);
     };
+    // The panel reads only which root and which epoch; every other key in
+    // stateQuery is word-view display state that this report rejects rather
+    // than ignores, so it is built from a whitelist, not by subtraction.
+    // Keeping it minimal also means changing sort or grouping reuses the
+    // cached result instead of re-running the scan.
     function rootProgressURL(state){
-      const query=stateQuery(state,false);query.delete("kind");query.delete("tree");
+      const query=new URLSearchParams();
+      if(state.branch_target)query.set("branch_target",state.branch_target);
+      if(state.epoch!==null&&state.epoch!=="")query.set("epoch",String(state.epoch));
       return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
     }
     function renderRootProgressPanel(data){
@@ -1251,7 +1258,7 @@
       addEventListener("resize",()=>layoutSpines(byId("report")));
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>
