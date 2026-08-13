@@ -348,6 +348,22 @@ def _fit(line, width):
     return line[:width - 1] + "…"
 
 
+def _display_spine(row):
+    """Return the recorded spine, or the source guess when it is all that remains."""
+    spine = row.get("spine")
+    if isinstance(spine, list):
+        return " ".join(
+            f"{step['word'].upper()} {step['pattern']}" for step in spine
+        )
+    if spine:
+        return spine
+    source_word = row.get("source_word")
+    source_pattern = row.get("source_pattern") or row.get("source_pattern_text")
+    if source_word and source_pattern:
+        return f"{source_word.upper()} {source_pattern}"
+    return ""
+
+
 def _truncate_cell(value, width, mode):
     if len(value) <= width:
         return value
@@ -1267,14 +1283,22 @@ def _render_queue_collection_sections(report, width, display_order):
     for row in data.get("rows", []):
         hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
         hotkey_prefix = f"{hotkey} " if hotkey else ""
+        spine = row.get("spine")
+        spine_text = _display_spine(row)
+        guess_depth = (
+            len(spine) if isinstance(spine, list)
+            else row.get("guess_depth", 1 if spine_text else 0)
+        )
         lines.append(_fit(
             f"  {hotkey_prefix}@{_display_reference(row['branch_reference'])} "
             f"{row['branch_status']}/{row['branch_phase']} "
             f"n={row['answer_count']} "
-            f"guess_depth={len(row.get('spine') or [])} "
+            f"guess_depth={guess_depth} "
             f"priority={row['priority']} workers={row['worker_count']}",
             width,
         ))
+        if spine_text:
+            lines.append(_fit(f"    spine={spine_text}", width))
     return [("header", header), ("queue_rows", lines)]
 
 
@@ -1380,6 +1404,9 @@ def _render_hotspot_sections(report, width, display_order):
             )
         )
         lines.append(_fit(f"  {hotkey_prefix}{identity}  {metrics}", width))
+        spine_text = _display_spine(row)
+        if spine_text:
+            lines.append(_fit(f"    spine={spine_text}", width))
     return [("header", header), ("hotspots", lines)]
 
 
