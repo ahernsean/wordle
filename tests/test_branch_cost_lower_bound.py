@@ -322,6 +322,45 @@ class TestASuppliedTableMustBeTheSearchesPool(_VocabularyMixin, unittest.TestCas
     def test_table_is_rejected_when_the_search_has_no_pool(self):
         self._reject(self._table(), None)
 
+    def test_a_reused_pool_object_short_circuits_the_set_rebuild(self):
+        table = self._table()
+        equal_pool = list(self.guess_words)
+        self.assertTrue(table.matches_pool(equal_pool))
+        self.assertTrue(table.matches_pool(equal_pool))
+
+    def test_reference_floor_of_a_trivial_branch_is_its_size(self):
+        cache = self._response_cache()
+        self.assertEqual(cache.branch_cost_lower_bound([], self.guess_words), 0.0)
+        self.assertEqual(
+            cache.branch_cost_lower_bound([self.answer_words[0]],
+                                          self.guess_words), 1.0)
+
+    def test_min_expected_guesses_rejects_a_foreign_table(self):
+        narrow = BranchFloorTable(self.guess_words[:40],
+                                  cache=self._response_cache())
+        with self.assertRaises(ValueError):
+            min_expected_guesses(
+                self._branch(10, seed=71), self._response_cache(), None,
+                guesses=self.guess_words, policy=ERD_ALL,
+                pattern_matrix=self.pattern_matrix, branch_floor_table=narrow)
+
+    def test_table_without_a_kernel_falls_back_to_all_singletons(self):
+        """No matrix and no response cache leaves nothing to compute a floor
+        with, so the all-singletons floor stands."""
+        table = BranchFloorTable(self.guess_words)
+        words = self._branch(20, seed=72)
+        self.assertEqual(table.branch_cost_lower_bound(words),
+                         all_singletons_floor(len(words)))
+
+    def test_words_outside_the_matrix_use_the_reference_path(self):
+        table = self._table()
+        outside = [w for w in _ALL_ANSWER_WORDS
+                   if w not in set(self.answer_words)][:20]
+        self.assertEqual(
+            table.branch_cost_lower_bound(outside),
+            ResponseCache(self.answer_words).branch_cost_lower_bound(
+                outside, self.guess_words))
+
     def test_matching_pool_is_accepted_by_word_set_not_by_object(self):
         table = self._table()
         self.assertTrue(table.matches_pool(list(self.guess_words)))

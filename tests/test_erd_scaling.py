@@ -43,6 +43,9 @@ from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET
 from erd_queue import ERDQueue, encode_subset
+from wordle_engine import (BranchFloorTable, ResponseCache,
+                           sub_branch_cost_lower_bound,
+                           _BRANCH_FLOOR_MINIMUM_SIZE)
 from tests.trap_workloads import (build_trap_branches, build_candidates,
                                   seed_cost_model)
 
@@ -501,8 +504,13 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
     # serialized workers pass there and fail here.
     # -------------------------------------------------------------------------
 
-    _N_BRANCHES = 6
-    _BRANCH_SIZE = 20
+    # Branch size is load-bearing, not arbitrary.  A sub-branch only gets a
+    # computed ERD floor once it reaches _BRANCH_FLOOR_MINIMUM_SIZE, so a
+    # workload of small branches leaves that machinery almost unexercised and
+    # this guard would keep passing while floor construction wrecked scaling.
+    # test_workload_exercises_the_branch_floor pins that precondition.
+    _N_BRANCHES = 3
+    _BRANCH_SIZE = 60
     _BASE_CANDIDATES = 150
     _BUDGET = 4
     # Required t1/tN speedup by worker count.  These sit far above the ~1.25x
@@ -601,6 +609,29 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
                     f"1-worker: {result['t1_drain']:.3f}s | "
                     f"{result['workers']}-worker: {result['tN_drain']:.3f}s | "
                     f"cpu_count: {result['cpu_count']}\n")
+
+    def test_workload_exercises_the_branch_floor(self):
+        """Fixture precondition for the scaling guard below.
+
+        The floor is skipped for sub-branches under _BRANCH_FLOOR_MINIMUM_SIZE,
+        so a workload of small branches would run almost none of the code whose
+        per-process cost this guard exists to catch.  Without this check the
+        speedup assertion can pass because the machinery is inert rather than
+        because it scales.
+        """
+        table = BranchFloorTable(self._candidates,
+                                 cache=ResponseCache(self._pool))
+        reached = 0
+        for branch in self._branches:
+            for candidate in self._candidates[:40]:
+                for group in table._cache.group_words(candidate, branch).values():
+                    if len(group) >= _BRANCH_FLOOR_MINIMUM_SIZE:
+                        sub_branch_cost_lower_bound(group, candidate, table)
+                        reached += 1
+        self.assertGreater(reached, 0,
+                           "no sub-branch reaches the floor: this workload "
+                           "cannot detect a floor-construction regression")
+        self.assertGreater(table.misses, 0, "no floor was actually built")
 
     def test_workers_scale_when_solving_dominates_coordination(self):
         n = min(4, os.cpu_count() or 1)
