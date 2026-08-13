@@ -17,7 +17,7 @@ from pattern_matrix import PatternMatrix
 from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from wordle_engine import (
     ERD_ALL, BranchFloorTable, ResponseCache, all_singletons_floor,
-    evaluate_candidate, _BRANCH_FLOOR_MINIMUM_SIZE,
+    evaluate_candidate,
     _candidate_cost_lower_bound, min_expected_guesses,
     sub_branch_cost_lower_bound,
 )
@@ -368,23 +368,45 @@ class TestASuppliedTableMustBeTheSearchesPool(_VocabularyMixin, unittest.TestCas
         self.assertFalse(table.matches_pool(None))
 
 
-class TestMinimumSizeThreshold(_VocabularyMixin, unittest.TestCase):
+class TestEverySubBranchIsPriced(_VocabularyMixin, unittest.TestCase):
+    """No size is too small for the computed floor.
 
-    def test_below_the_threshold_the_all_singletons_floor_stands(self):
-        words = self._branch(_BRANCH_FLOOR_MINIMUM_SIZE - 1, seed=21)
-        table = self._table()
-        self.assertEqual(
-            sub_branch_cost_lower_bound(words, self.guess_words[0], table),
-            all_singletons_floor(len(words)))
-        self.assertEqual(table.misses, 0, "no floor should have been built")
+    A size cutoff is the obvious economy — a floor costs one pass over the
+    pool however few words it prices.  It is also a false one: a sub-branch of
+    k words moves its parent's bound with weight k/n, so the cutoff that keeps
+    the tightening at one parent size discards it at another, and the small
+    sub-branches are the numerous ones.  These pin that no cutoff is present.
+    """
 
-    def test_at_the_threshold_the_computed_floor_applies(self):
-        words = self._branch(_BRANCH_FLOOR_MINIMUM_SIZE, seed=22)
+    def test_the_smallest_multi_word_sub_branch_gets_a_computed_floor(self):
+        words = self._branch(2, seed=21)
         table = self._table()
         self.assertEqual(
             sub_branch_cost_lower_bound(words, self.guess_words[0], table),
             max(all_singletons_floor(len(words)),
                 table.branch_cost_lower_bound(words)))
+        self.assertGreater(table.misses, 0, "no floor was built")
+
+    def test_every_size_up_to_a_dozen_words_gets_a_computed_floor(self):
+        for size in range(2, 13):
+            table = self._table()
+            words = self._branch(size, seed=30 + size)
+            with self.subTest(size=size):
+                self.assertEqual(
+                    sub_branch_cost_lower_bound(
+                        words, self.guess_words[0], table),
+                    max(all_singletons_floor(size),
+                        table.branch_cost_lower_bound(words)))
+
+    def test_a_singleton_costs_one_guess_or_none(self):
+        table = self._table()
+        word = self.answer_words[0]
+        self.assertEqual(sub_branch_cost_lower_bound([word], word, table), 0.0)
+        self.assertEqual(
+            sub_branch_cost_lower_bound([word], self.guess_words[-1], table),
+            1.0)
+        self.assertEqual(table.misses, 0,
+                         "a singleton needs no pass over the pool")
 
 
 class TestGatesAreObservedOnce(_VocabularyMixin, unittest.TestCase):

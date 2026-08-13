@@ -392,17 +392,6 @@ _GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD = 250
 # bound is worth computing for.
 _BRANCH_FLOOR_CAPACITY = 200_000
 
-# Smallest sub-branch given a computed floor; below this the all-singletons
-# floor stands. A floor costs one pass over the candidate pool whatever the
-# sub-branch's size, while its effect on the parent's bound carries weight k/n
-# — so the small sub-branches, which are also by far the most numerous, buy the
-# least tightening per pass. Skipping them keeps nearly all of the pruning —
-# on a 502-word first-guess branch whose ERD exceeds 3.0, 99.3% of a candidate
-# sample against 100.0% — for roughly half the floors. Each worker builds its
-# own floors, so this is also what keeps the per-process cost from flattening
-# multi-worker scaling.
-_BRANCH_FLOOR_MINIMUM_SIZE = 8
-
 
 class ResponseCache:
     """Lazily caches word-to-pattern mappings for each guess word.
@@ -1186,9 +1175,8 @@ class BranchFloorTable:
         """Admissible floor on what `sub_branch` costs the parent that reached it.
 
         A singleton is one guess, or none at all when it is the candidate just
-        played.  Otherwise the floor is `all_singletons_floor`, raised to the
-        sub-branch's own floor once it is large enough to be worth one pass
-        over the pool.
+        played.  Otherwise the floor is `all_singletons_floor` raised to the
+        sub-branch's own floor.
 
         `all_singletons_floor` assumes some guess shatters the sub-branch into
         singletons and is itself a member — true only for small, well-separated
@@ -1196,14 +1184,21 @@ class BranchFloorTable:
         actually do to these words, and is the larger of the two on every
         branch the split does not genuinely shatter.  Both are admissible, so
         the maximum is too.
+
+        Every sub-branch gets the computed floor.  A size threshold looks
+        attractive — a floor costs one pass over the pool whatever the
+        sub-branch's size, and a sub-branch of k words moves its parent's bound
+        with weight k/n — but that weight argument is a function of the parent
+        size, so no single cutoff holds across the range of parents the search
+        walks.  The small sub-branches are also the numerous ones, so skipping
+        them forfeits most of the tightening; measured on the strong-scaling
+        workload, a cutoff of 8 doubled the drain time it was meant to protect.
         """
         size = len(sub_branch)
         if size == 1:
             return 0.0 if sub_branch[0] == candidate else 1.0
-        floor = all_singletons_floor(size)
-        if size < _BRANCH_FLOOR_MINIMUM_SIZE:
-            return floor
-        return max(floor, self.branch_cost_lower_bound(sub_branch))
+        return max(all_singletons_floor(size),
+                   self.branch_cost_lower_bound(sub_branch))
 
 
 def sub_branch_cost_lower_bound(sub_branch, candidate, branch_floor_table=None):

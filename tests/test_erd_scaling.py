@@ -44,8 +44,7 @@ import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET
 from erd_queue import ERDQueue, encode_subset
 from wordle_engine import (BranchFloorTable, ResponseCache,
-                           sub_branch_cost_lower_bound,
-                           _BRANCH_FLOOR_MINIMUM_SIZE)
+                           sub_branch_cost_lower_bound)
 from tests.trap_workloads import (build_trap_branches, build_candidates,
                                   seed_cost_model)
 
@@ -233,16 +232,21 @@ class TestProcessScalingSmoke(_Base):
 @unittest.skipUnless(SCALING_SMOKE_REQS_MET, SCALING_SMOKE_SKIP_REASON)
 class TestCooperativeDrainSmoke(unittest.TestCase):
     # -------------------------------------------------------------------------
-    # PURPOSE: coordination-floor smoke — verify that N cooperative swarm
-    # workers drain a queue of near-zero-solve-work branches at least somewhat
-    # faster than 1 worker.  Because the branches are tiny, wall time here is
-    # dominated by per-claim coordination, so the measured "speedup" is the
-    # coordination fabric's parallelism floor (~1.25x on an idle 8-core box),
-    # NOT the swarm's strong scaling.  This guards against total serialization
-    # (a global lock, a serialized queue); it cannot certify that parallelism
-    # is worth running.  Strong scaling on a solve-dominated workload is
-    # TestSolveDominatedStrongScaling; overhead vs the plain serial engine is
-    # tests/test_swarm_vs_engine_overhead.py.
+    # PURPOSE: drain smoke — verify that N cooperative swarm workers drain a
+    # queue of MANY SMALL branches faster than 1 worker.  This guards against
+    # total serialization (a global lock, a serialized queue); it cannot
+    # certify that parallelism is worth running.  Strong scaling on a
+    # solve-dominated workload is TestSolveDominatedStrongScaling; overhead vs
+    # the plain serial engine is tests/test_swarm_vs_engine_overhead.py.
+    #
+    # The branch COUNT is what this test contributes: 80 claims against the
+    # strong-scaling guard's 4, so a queue that serializes claim handout fails
+    # here and passes there.  What it cannot isolate is coordination cost on
+    # its own.  That would need the per-claim cost — ~1.5ms, so ~0.12s across
+    # the whole queue — to stand clear of the ~1.9s of process spawn and
+    # worker startup, and no fixture the answer list can build gets near that.
+    # Branches therefore carry enough solve work to be measurable at all, and
+    # the number below is a drain speedup, not a coordination floor.
     #
     # DO NOT replace the timing assertion with a pure correctness check.
     # Correctness is covered by TestProcessScalingSmoke (multi-process ERD
@@ -254,16 +258,30 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
     # runs 4 workers vs 1.  The 90% threshold is achievable on any of these.
     # -------------------------------------------------------------------------
 
-    _BRANCH_SIZE = 12
-    _N_BRANCHES = 80         # 80 × 12 = 960 unique answer words
+    # Branch size sets how much work there is to share out.  Wall time here
+    # splits into a fixed cost that no worker count changes — process spawn
+    # and worker startup, measured at ~1.9s — and the drain itself, which is
+    # the only part a second worker can help with.  The ratio below is
+    # therefore a measurement of the drain against that fixed cost, and it
+    # goes UNMEASURABLE as the drain shrinks: at 12 words the engine solves a
+    # branch so fast that 0.25s of drain sits under 1.9s of startup and no
+    # worker count can move the total by 10%.  Solve cost climbs steeply with
+    # branch size (20 words: 4.7s at one worker; 24 words: 16.6s), so 24 puts
+    # the drain well clear of startup — measured 0.53, against a 0.90 bar.
+    #
+    # A future speedup will erode this the same way.  The response is to
+    # restore the margin by giving the fixture more to do, never to relax
+    # _SPEEDUP_RATIO: the bar is what distinguishes a working queue from a
+    # serialized one, and a fixture too small to clear it is the thing that
+    # is wrong.
+    _BRANCH_SIZE = 24
+    _N_BRANCHES = 80         # 80 × 24 = 1,920 unique answer words
     _N_CANDIDATES = 100
-    # N workers must complete in < 90% of 1-worker time.  This is a smoke
-    # test over a tiny queue whose wall time is dominated by per-claim
-    # coordination, not solving — measured 4-worker speedup on an idle
-    # 8-core box sits at ~1.25x, right on a 0.80 ratio, so 0.80 flaked on
-    # sub-1% margins.  0.90 still fails on genuine serialization (~1.0x)
-    # while leaving the coordination floor room to breathe; the swarm's
-    # real parallelism is telemetry's ~3x on production expansion.
+    # N workers must complete in < 90% of 1-worker time.  A serialized queue
+    # measures ~1.0 and fails; the fixture above measures ~0.53 on an idle
+    # 8-core box.  The bar stays at 0.90 rather than tightening toward what
+    # the fixture achieves, because it is calibrated against the failure it
+    # names — serialization — and not against the current fixture's margin.
     _SPEEDUP_RATIO = 0.90
 
     def setUp(self):
@@ -504,13 +522,27 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
     # serialized workers pass there and fail here.
     # -------------------------------------------------------------------------
 
-    # Branch size is load-bearing, not arbitrary.  A sub-branch only gets a
-    # computed ERD floor once it reaches _BRANCH_FLOOR_MINIMUM_SIZE, so a
-    # workload of small branches leaves that machinery almost unexercised and
-    # this guard would keep passing while floor construction wrecked scaling.
-    # test_workload_exercises_the_branch_floor pins that precondition.
-    _N_BRANCHES = 3
-    _BRANCH_SIZE = 60
+    # Workload shape is load-bearing, not arbitrary.
+    #
+    # Branch COUNT is the balance lever: with fewer branches than workers, a
+    # worker has nothing to claim until decomposition publishes a sub-claim,
+    # so the fixture caps its own parallelism before any engine behaviour is
+    # measured.  One branch per worker is the floor, hence 4.
+    #
+    # Branch SIZE is the work lever, and it is what keeps solving dominant.
+    # Every worker pays a fixed startup — pattern matrix, cache and queue open
+    # — that does not shrink with worker count, so a short drain measures
+    # startup rather than scaling.  At this size the 1-worker leg runs ~90s
+    # against a startup of ~14s.  Do not shrink the workload to speed the
+    # suite up: it lowers the measured ratio without any regression behind it.
+    #
+    # Work is neither linear nor monotone in either lever, because the
+    # candidate vocabulary is built from the branches (build_candidates): more
+    # or wider branches mean more guess words, which find a strong guess
+    # sooner and prune harder.  Re-measure after changing either number rather
+    # than extrapolating.
+    _N_BRANCHES = 4
+    _BRANCH_SIZE = 80
     _BASE_CANDIDATES = 150
     _BUDGET = 4
     # Required t1/tN speedup by worker count.  These sit far above the ~1.25x
@@ -613,24 +645,23 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
     def test_workload_exercises_the_branch_floor(self):
         """Fixture precondition for the scaling guard below.
 
-        The floor is skipped for sub-branches under _BRANCH_FLOOR_MINIMUM_SIZE,
-        so a workload of small branches would run almost none of the code whose
-        per-process cost this guard exists to catch.  Without this check the
-        speedup assertion can pass because the machinery is inert rather than
-        because it scales.
+        Floor construction is per-process work, so it is a place a change
+        could quietly flatten multi-worker scaling.  This pins that the
+        workload actually builds floors, rather than the speedup assertion
+        passing because the machinery never ran.
         """
         table = BranchFloorTable(self._candidates,
                                  cache=ResponseCache(self._pool))
-        reached = 0
+        multi_word_groups = 0
         for branch in self._branches:
             for candidate in self._candidates[:40]:
                 for group in table._cache.group_words(candidate, branch).values():
-                    if len(group) >= _BRANCH_FLOOR_MINIMUM_SIZE:
+                    if len(group) > 1:
                         sub_branch_cost_lower_bound(group, candidate, table)
-                        reached += 1
-        self.assertGreater(reached, 0,
-                           "no sub-branch reaches the floor: this workload "
-                           "cannot detect a floor-construction regression")
+                        multi_word_groups += 1
+        self.assertGreater(multi_word_groups, 0,
+                           "every response group is a singleton: this "
+                           "workload cannot exercise the branch floor")
         self.assertGreater(table.misses, 0, "no floor was actually built")
 
     def test_workers_scale_when_solving_dominates_coordination(self):
