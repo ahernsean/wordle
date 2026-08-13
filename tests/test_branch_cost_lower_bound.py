@@ -81,6 +81,25 @@ class TestImplementationsAgree(_VocabularyMixin, unittest.TestCase):
                         vectorized.branch_cost_lower_bound(words),
                         reference.branch_cost_lower_bound(words))
 
+    def test_an_empty_guess_pool_agrees_across_kernels(self):
+        """Nothing playable is a real state, not an error.
+
+        A pool with no words splits nothing, so the widest split is zero and
+        the floor is 3.0 — reachable by the reference kernel, which simply
+        finds no guess to improve on.  The vectorized kernel must not instead
+        reduce over an empty axis, whose maximum has no identity.
+        """
+        empty_matrix = PatternMatrix.build([], self.answer_words)
+        vectorized = BranchFloorTable((), cache=self._response_cache(),
+                                      pattern_matrix=empty_matrix)
+        reference = BranchFloorTable((), cache=self._response_cache())
+        for size in (2, 5, 17):
+            words = self._branch(size, seed=size + 900)
+            with self.subTest(size=size):
+                self.assertEqual(vectorized.branch_cost_lower_bound(words),
+                                 reference.branch_cost_lower_bound(words))
+                self.assertEqual(reference.branch_cost_lower_bound(words), 3.0)
+
     def test_memo_hit_returns_the_computed_value(self):
         table = self._table()
         words = self._branch(30, seed=7)
@@ -399,11 +418,14 @@ class TestThePoolCannotDrift(_VocabularyMixin, unittest.TestCase):
                          "the table's construction order replaced the "
                          "search's tie breaker")
 
-    def test_the_search_adopts_the_tables_pool(self):
-        """Validation happens once; what the search then plays is the tuple.
+    def test_a_supplied_table_is_the_one_consulted(self):
+        """A table the caller supplies is the table the search prices with.
 
-        Adopting it is what leaves no second object to drift — the caller's
-        list is never consulted again.
+        This says nothing about whose pool ordering survives — the caller's
+        does, which `test_a_supplied_table_does_not_impose_its_own_candidate_order`
+        pins.  All that is claimed here is that supplying a table reaches the
+        floor path at all, so a change that quietly stopped consulting it
+        would not pass as a speedup.
         """
         pool = list(self.guess_words)
         table = BranchFloorTable(pool, cache=self._response_cache(),

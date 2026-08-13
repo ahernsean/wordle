@@ -290,12 +290,19 @@ class PatternMatrix:
         if branch_size <= 1:
             return float(branch_size)
         all_singletons_floor = 2.0 - 1.0 / branch_size
-        counts = self.counts_for_all_candidates(branch_indices)
-        group_count = (counts > 0).sum(axis=1)
-        has_self = counts[:, 242] > 0
-        # Largest (group_count + has_self) gives the smallest per-candidate
-        # bound, so it is the branch-wide floor.
-        widest_split = int((group_count + has_self).max())
+        if self.n_guesses == 0:
+            # No word can be played, so nothing splits the branch and the
+            # widest split is zero — the same value the reference kernel
+            # reaches by finding no guess to improve on.  Taking it here
+            # rather than reducing over an empty axis, which has no identity.
+            widest_split = 0
+        else:
+            counts = self.counts_for_all_candidates(branch_indices)
+            group_count = (counts > 0).sum(axis=1)
+            has_self = counts[:, 242] > 0
+            # Largest (group_count + has_self) gives the smallest per-candidate
+            # bound, so it is the branch-wide floor.
+            widest_split = int((group_count + has_self).max())
         return max(all_singletons_floor, 3.0 - widest_split / branch_size)
 
     def patterns_for_candidates(self, candidate_indices, branch_indices):
