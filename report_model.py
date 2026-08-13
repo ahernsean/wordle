@@ -239,6 +239,14 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("coordination hotspots cannot use a branch target")
     if request.worker_id is not None and report_kind != "workers":
         raise ValueError("worker requires a workers report")
+    if report_kind == "root_progress":
+        if request.tree:
+            raise ValueError("--tree cannot be used with --root-progress")
+        # Any spine ending in a word works: the rollup scopes telemetry by
+        # spine prefix, and a deeper spine is simply a longer prefix.  A target
+        # that does not end in a word has no response groups to report.
+        if branch_target_kind != "word":
+            raise ValueError("--root-progress requires a target ending in a word")
     if report_kind == "sources" and branch_target_kind not in ("root", "word"):
         raise ValueError(
             "--sources accepts only a trailing word or no branch target"
@@ -1258,6 +1266,241 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = displayed_response_groups
+    return report
+
+
+ROOT_PROGRESS_RECENT_WINDOW_SECONDS = 86400
+
+
+def _root_progress_estimate(active_branches, recent_window_seconds):
+    """A completion estimate for the branches currently carrying the work.
+
+    Only in-flight branches can be estimated: their candidate lists have a
+    known width and an observed completion rate.  Response groups the swarm
+    has not opened yet have neither, and the cost model cannot supply one --
+    it is keyed on (size, budget), and branches of near-identical size differ
+    in cost by orders of magnitude -- so they are excluded and counted
+    separately rather than guessed at.
+
+    Only branches that completed a candidate inside the window contribute.  A
+    branch sitting at 99% with no recent completions is not slow, it is
+    waiting on sub-branches it already published; counting its remainder
+    against a rate it is not producing inflates the estimate without bound.
+    Those branches are reported as stalled instead, so excluding them hides
+    nothing.
+
+    Returns None when nothing has completed inside the window, which is the
+    honest answer for an idle or just-restarted root.
+    """
+    remaining = 0
+    recent = 0
+    stalled_remaining = 0
+    stalled_count = 0
+    for branch in active_branches:
+        branch_remaining = max(0, branch["candidate_count"]
+                                  - branch["done_candidate_count"])
+        if branch["recent_done_candidate_count"]:
+            remaining += branch_remaining
+            recent += branch["recent_done_candidate_count"]
+        elif branch_remaining:
+            stalled_remaining += branch_remaining
+            stalled_count += 1
+    if not recent or not remaining:
+        return None
+    rate_per_second = recent / recent_window_seconds
+    return {
+        "remaining_candidate_count": remaining,
+        "recent_candidate_count": recent,
+        "candidates_per_day": rate_per_second * 86400,
+        "estimated_seconds": remaining / rate_per_second,
+        "stalled_branch_count": stalled_count,
+        "stalled_remaining_candidate_count": stalled_remaining,
+    }
+
+
+# Lifecycle order: a group waits, is worked, and ends solved or proven lost.
+ROOT_PROGRESS_GROUP_STATES = ("waiting", "working", "solved", "loss")
+
+
+def _root_progress_group_state(row, cache_state, group_budget):
+    """Where a response group sits in the work, from the cache's view.
+
+    `solved` and `loss` both mean there is no more work to do here -- one
+    because the group has a proven line, the other because it is proven
+    unsolvable within the remaining budget.  Collapsing them would report a
+    dead end as progress, so they stay apart.
+
+    A group of fewer than two answers needs no search: the guess either was the
+    answer, or one more guess plays the survivor -- and that guess needs a
+    budget to spend, so with none left the survivor is a proven loss.  This
+    mirrors `_candidate_erd_summary`, which the ERD line above the table reads.
+
+    Queue state decides only the two remaining cases.  The cache is the
+    authority on whether work is finished, because a group can be solved with
+    no branch open and no finalization in this epoch.
+    """
+    if cache_state is not None:
+        if (cache_state["best_erd"] is not None
+                and cache_state["max_remaining_depth"] is not None):
+            return "solved"
+        if cache_state["cache_state"] == "loss":
+            return "loss"
+    if row["answer_count"] < 2:
+        solved_by_guess = row["pattern"] == _ALL_GREEN_PATTERN_TEXT
+        return "solved" if solved_by_guess or group_budget >= 1 else "loss"
+    return "working" if row["started"] else "waiting"
+
+
+def collect_root_progress_report(sources: ReportSources,
+                                 request: ReportRequest) -> dict:
+    """Work totals and a completion estimate for one root word.
+
+    Separate from the word report because the telemetry rollup behind it is a
+    seconds-scale scan: the word report stays instant and a client fetches
+    this alongside it.
+    """
+    generated_at = int(time.time())
+    all_answers = load_word_list(sources.answer_list_path)
+    answer_set = set(all_answers)
+    resolved = resolve_branch_target(request.branch_target, all_answers)
+    word = resolved.trailing_word
+    if word is None:
+        raise ValueError(
+            "root progress report requires a branch target ending in a word")
+    # Spines record words uppercase and patterns as written, so the prefix is
+    # built rather than upper-cased whole: upper-casing would corrupt the y in
+    # a pattern.
+    spine_prefix = " ".join(
+        [part for step in resolved.steps
+         for part in (step.word.upper(), _normalized_pattern(step.pattern))]
+        + [word.upper()]
+    )
+    group_budget = GAME_GUESSES - len(resolved.steps) - 1
+    response_cache = ResponseCache(all_answers, score_cache=None)
+    groups = response_cache.group_words(word, list(resolved.answer_words))
+    group_answer_words = {fmt_pattern(pattern_code): answer_words
+                          for pattern_code, answer_words in groups.items()
+                          if answer_words}
+    answer_counts = {pattern: len(answer_words)
+                     for pattern, answer_words in group_answer_words.items()}
+    # No branch context here: a root target's branch_key_hex encodes the whole
+    # answer subset, which is tens of kilobytes the panel never reads.  Request
+    # detail likewise stays in the sources report; only the earliest request
+    # time is carried, in totals.
+    data = {
+        "word": word,
+        "word_is_answer": word in answer_set,
+        "spine_prefix": spine_prefix,
+        "response_groups": [],
+        "totals": {},
+        "estimate": None,
+        "work_started_at": None,
+        "work_latest_at": None,
+        "epoch": request.epoch,
+    }
+    report = _semantic_report(
+        "root_progress", sources, request.branch_target, generated_at, data,
+        request
+    )
+    queue = None
+    try:
+        queue = _open_report_queue(sources)
+        epoch = queue.epoch if request.epoch is None else request.epoch
+        progress = queue.report_root_progress(
+            spine_prefix, epoch, ROOT_PROGRESS_RECENT_WINDOW_SECONDS,
+            now=generated_at)
+        # Work under a deeper spine is still requested under its root, so the
+        # request time is the root's however deep the target sits.
+        requests = queue.source_work_requests_for_word(
+            resolved.steps[0].word if resolved.steps else word)
+        _mark_queue_source_ok(report)
+    except (sqlite3.Error, OSError) as error:
+        _mark_queue_source_error(report, error)
+        return report
+    finally:
+        if queue is not None:
+            queue.close()
+
+    branch_keys_by_pattern = {
+        pattern: ScoreCache.encode_subset(answer_words)
+        for pattern, answer_words in group_answer_words.items()
+    }
+    cache = None
+    cache_states = {}
+    try:
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+        cache_states = cache.report_branch_states(
+            list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
+        report["sources"]["cache"]["ok"] = True
+    except (sqlite3.Error, OSError) as error:
+        report["sources"]["cache"]["error"] = str(error)
+    finally:
+        if cache is not None:
+            cache.close()
+
+    worked = progress["groups"]
+    rows = []
+    for pattern, answer_count in sorted(answer_counts.items()):
+        totals = worked.get(pattern)
+        # A group is started once any branch has opened on it, finalized or
+        # not; the rollup carries open branches for exactly this reason.
+        row = {
+            "pattern": pattern,
+            "answer_count": answer_count,
+            "started": totals is not None,
+            "branch_count": totals["branch_count"] if totals else 0,
+            "open_branch_count": totals["open_branch_count"] if totals else 0,
+            "search_node_count": totals["search_node_count"] if totals else 0,
+            "wall_millis": totals["wall_millis"] if totals else 0,
+            "elapsed_millis": totals["elapsed_millis"] if totals else None,
+            "first_created_at": totals["first_created_at"] if totals else None,
+            "last_finalized_at": (totals["last_finalized_at"]
+                                  if totals else None),
+        }
+        row["state"] = _root_progress_group_state(
+            row, cache_states.get(branch_keys_by_pattern[pattern]),
+            group_budget)
+        rows.append(row)
+    rows.sort(key=lambda row: (-row["search_node_count"], -row["answer_count"]))
+    node_total = sum(row["search_node_count"] for row in rows)
+    for row in rows:
+        row["search_node_share"] = (row["search_node_count"] / node_total
+                                    if node_total else 0.0)
+    data["response_groups"] = rows
+    data["epoch"] = progress["epoch"]
+    data["work_started_at"] = progress["work_started_at"]
+    data["work_latest_at"] = progress["work_latest_at"]
+    data["estimate"] = _root_progress_estimate(
+        progress["active_branches"],
+        progress["recent_window_seconds"])
+    data["active_branches"] = progress["active_branches"]
+    # A request time later than the work it asked for is not a request time.
+    # Rebuilding the queue's source_work rows stamps every one of them with the
+    # rebuild's own clock, discarding whatever the original request time was,
+    # while the branches themselves keep their true creation times.  Reporting
+    # the stamp would place the request after the work it requested, so it is
+    # dropped and the report shows only when work began.
+    earliest_request = min((entry["requested_at"] for entry in requests),
+                           default=None)
+    if (earliest_request is not None
+            and progress["work_started_at"] is not None
+            and earliest_request > progress["work_started_at"]):
+        earliest_request = None
+    data["totals"] = {
+        "response_group_count": len(rows),
+        "started_response_group_count": sum(row["started"] for row in rows),
+        "answer_count": sum(row["answer_count"] for row in rows),
+        "state_counts": collections.Counter(row["state"] for row in rows),
+        "branch_count": sum(row["branch_count"] for row in rows),
+        "search_node_count": node_total,
+        "wall_millis": sum(row["wall_millis"] for row in rows),
+        "open_branch_count": progress["open_branch_count"],
+        "counted_branch_count": progress["counted_branch_count"],
+        "requested_at": earliest_request,
+        "recent_window_seconds": progress["recent_window_seconds"],
+    }
     return report
 
 
@@ -2427,4 +2670,6 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
         return collect_leaderboard_report(sources, request)
     if report_kind == "sources":
         return collect_source_report(sources, request)
+    if report_kind == "root_progress":
+        return collect_root_progress_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")

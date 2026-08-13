@@ -131,7 +131,68 @@ python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
 python3.13 erd_search.py view --sources
 python3.13 erd_search.py view --sources CRANE
+python3.13 erd_search.py view --root-progress CRANE
+python3.13 erd_search.py view --root-progress CRANE --epoch 10
 ```
+
+`--root-progress` reports one root word's work: every response group with the
+branches, search nodes, and node share spent under it, which groups have not
+been opened at all, when work actually began on it, and a completion estimate.
+It is the report that answers "why is
+this root taking so long" — cost concentrates hard, and the node-share column
+names the group holding it. It takes any spine ending in a word: a bare root,
+or a deeper spine such as `PENIS -y--- LUBES`, which asks the same question at
+a greater guess_depth. The rollup scopes telemetry by spine prefix, so a longer
+spine is simply a longer prefix.
+
+The `State` column says where each response group sits: `waiting` (no work
+opened), `working`, `solved` (a proven line), or `loss` (proven unsolvable
+within budget). `solved` and `loss` both mean there is no more work to do here,
+for opposite reasons, so they stay apart. State comes from the cache, not the
+queue, because a group can be solved with no branch open and nothing finalized
+in this epoch — a group of one answer needs no search at all.
+
+This matters for reading the estimate. The estimate excludes groups still
+`waiting`, not groups the queue never opened: PENIS has 34 groups it never
+opened, and every one of them is already solved (29 hold a single answer). They
+are not a backlog, and counting them as one would invent work that does not
+exist.
+
+A group counts as started once any branch has opened on it, finalized or not,
+so a group being worked right now never reads as untouched. The two branch
+columns are named for the lifecycle phases the rest of the report uses:
+`Evaluating` counts branches in flight, `Done` counts branches that have
+finalized. Both span every depth under the group, so promoted sub-branches are
+included — unlike the word report's own response-group count, which sees only
+the root's direct groups. A started group that has finalized nothing shows
+measured zeros for those columns but `—` for elapsed and worker-time, which
+exist only at finalize; an unopened group shows `—` throughout.
+
+Node, share, elapsed and worker-time figures are fenced to one telemetry epoch,
+which the report names. Work that finalized under an earlier epoch is not
+counted, so a root whose work began before the current epoch shows a start time
+older than any of its costs.
+
+A request time appears only when the queue holds one that precedes the work it
+asked for. Rebuilding the queue's `source_work` rows restamps every one of them
+with the rebuild's clock while the branches keep their true creation times,
+which leaves the recorded request later than the work; that stamp is dropped
+rather than displayed.
+
+Two time bases appear per group and they answer different questions. `Elapsed`
+is wall-clock from the group's first branch to its last, which the swarm's
+other work shares; `WorkerTime` is summed across bundles, so six workers for
+an hour reads as six hours. Their ratio is a coarse read on parallelism drawn.
+
+The estimate covers only branches with observed throughput, and says how many
+waiting groups and stalled branches it excludes. Waiting groups are not
+estimated: the cost model is keyed on `(size, budget)` and branches of
+near-identical size differ in cost by orders of magnitude, so it cannot rank
+them. Groups the swarm has not opened show `—`, never `0`.
+
+The rollup scans the epoch's `branch_finalize_log` rows, which carry no spine
+index, so it takes seconds. The web client fetches it after the word report
+renders and caches it per target; the terminal report pays it on each run.
 
 `--sources` reports every source-work request: its recorded requested
 priority, the request state, and every branch it owns — including branches

@@ -20,6 +20,8 @@ from report_model import (
     _grouped_response_groups,
     _response_group_key,
     _response_group_rollup,
+    _root_progress_estimate,
+    validate_report_request,
     branch_reference,
     collect_overview_report,
     collect_report,
@@ -1167,6 +1169,232 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(worker["answer_count"], 2)
         self.assertEqual(worker["source_work_id"], source_work_id)
         self.assertEqual(worker["scheduling_role"], "preferred")
+
+
+class RootProgressReportTest(unittest.TestCase):
+    setUp = ReportModelTest.setUp
+    tearDown = ReportModelTest.tearDown
+    _open_queue = ReportModelTest._open_queue
+
+    NOW = 1_800_000_000
+
+    def _finalize(self, queue, spine, n_words, nodes, wall_millis,
+                  created_at, finalized_at, epoch=0):
+        queue.add_branch_finalize_log(
+            ScoreCache.encode_subset(ANSWERS[:1]), spine, n_words, 3,
+            created_at, finalized_at, nodes, 1,
+            total_bundle_wall_millis=wall_millis)
+        queue._conn.execute(
+            "UPDATE telemetry.branch_finalize_log SET epoch = ? "
+            "WHERE spine = ?", (epoch, spine))
+
+    def _open_branch(self, queue, spine, n_words, created_at,
+                     answer_slice=slice(0, 2)):
+        queue.create_branch(
+            ScoreCache.encode_subset(ANSWERS[answer_slice]), n_words, 5,
+            source_word="salet", spine=spine)
+        queue._conn.execute(
+            "UPDATE active_branches SET created_at = ? WHERE spine = ?",
+            (created_at, spine))
+
+    def _request(self, epoch=None, branch_target=("salet",)):
+        return ReportRequest(
+            report_kind="root_progress",
+            branch_target=parse_report_branch_target(list(branch_target)),
+            epoch=epoch)
+
+    def test_rollup_attributes_descendant_cost_to_its_top_level_group(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 100, 1000, 10, 20)
+        self._finalize(queue, "SALET -y--- CRANE -----", 1, 900, 9000, 12, 30)
+        self._finalize(queue, "SALET ----- NURDY -----", 1, 7, 70, 15, 25)
+        queue.close()
+
+        report = collect_report(self.sources, self._request())
+
+        rows = {row["pattern"]: row for row in report["data"]["response_groups"]}
+        # Both SALET -y--- rows fold into the one group, deepest included.
+        self.assertEqual(rows["-y---"]["search_node_count"], 1000)
+        self.assertEqual(rows["-y---"]["branch_count"], 2)
+        self.assertEqual(rows["-----"]["search_node_count"], 7)
+        # Every response group appears, including ones never worked.
+        self.assertEqual(len(rows), 4)
+        self.assertFalse(rows["-y-y-"]["started"])
+        self.assertEqual(rows["-y-y-"]["search_node_count"], 0)
+        self.assertIsNone(rows["-y-y-"]["elapsed_millis"])
+
+    def test_rollup_reports_elapsed_and_worker_time_separately(self):
+        queue = self._open_queue()
+        # One branch spanning 100s of wall clock that consumed 400s of
+        # worker-time: four workers on it, not a 400s stretch of the clock.
+        self._finalize(queue, "SALET -y---", 1, 5, 400_000, 1_000, 1_100)
+        queue.close()
+
+        report = collect_report(self.sources, self._request())
+
+        row = next(row for row in report["data"]["response_groups"]
+                   if row["pattern"] == "-y---")
+        self.assertEqual(row["elapsed_millis"], 100_000)
+        self.assertEqual(row["wall_millis"], 400_000)
+
+    def test_rollup_is_fenced_by_epoch(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 100, 10, 10, 20, epoch=0)
+        self._finalize(queue, "SALET -----", 1, 500, 10, 10, 20, epoch=1)
+        queue.close()
+
+        rows = {row["pattern"]: row for row
+                in collect_report(self.sources,
+                                  self._request(epoch=1))["data"]["response_groups"]}
+        self.assertTrue(rows["-----"]["started"])
+        self.assertFalse(rows["-y---"]["started"])
+
+    def test_work_started_is_distinct_from_when_the_word_was_requested(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        requested_at = queue.source_work_rows()[0]["requested_at"]
+        # Work opens well after the request: the root waits behind others.
+        self._finalize(queue, "SALET -y---", 1, 100, 10,
+                       requested_at + 86_400, requested_at + 90_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["totals"]["requested_at"], requested_at)
+        self.assertEqual(data["work_started_at"], requested_at + 86_400)
+        self.assertNotEqual(data["work_started_at"],
+                            data["totals"]["requested_at"])
+
+    def test_request_time_stamped_after_the_work_it_asked_for_is_dropped(self):
+        # A queue rebuild restamps every source_work row with its own clock
+        # while the branches keep their true creation times, which leaves the
+        # request looking later than the work.  Reporting that stamp would
+        # claim the swarm started before the word was asked for.
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        requested_at = queue.source_work_rows()[0]["requested_at"]
+        self._finalize(queue, "SALET -y---", 1, 100, 10,
+                       requested_at - 86_400, requested_at - 80_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["work_started_at"], requested_at - 86_400)
+        self.assertIsNone(data["totals"]["requested_at"])
+
+    def test_estimate_excludes_stalled_branches_from_both_rate_and_remainder(self):
+        estimate = _root_progress_estimate([
+            # Progressing: 400 of 1,000 candidates left, 100/day observed.
+            {"candidate_count": 1000, "done_candidate_count": 600,
+             "recent_done_candidate_count": 100},
+            # Stalled at 99%: waiting on published sub-branches, not on its
+            # own candidates.  Its remainder must not be charged to the
+            # rate above, which it is not producing.
+            {"candidate_count": 1000, "done_candidate_count": 990,
+             "recent_done_candidate_count": 0},
+        ], 86400)
+
+        self.assertEqual(estimate["remaining_candidate_count"], 400)
+        self.assertEqual(estimate["candidates_per_day"], 100)
+        self.assertEqual(estimate["estimated_seconds"], 4 * 86400)
+        self.assertEqual(estimate["stalled_branch_count"], 1)
+        self.assertEqual(estimate["stalled_remaining_candidate_count"], 10)
+
+    def test_estimate_is_absent_when_nothing_completed_in_the_window(self):
+        self.assertIsNone(_root_progress_estimate([
+            {"candidate_count": 1000, "done_candidate_count": 10,
+             "recent_done_candidate_count": 0},
+        ], 86400))
+
+    def test_root_progress_requires_a_word_target(self):
+        with self.assertRaises(ValueError):
+            validate_report_request(ReportRequest(
+                report_kind="root_progress",
+                branch_target=parse_report_branch_target(None)))
+
+    def test_root_progress_accepts_a_spine_of_more_than_one_guess(self):
+        # The rollup scopes telemetry by spine prefix and a longer spine is
+        # simply a longer prefix, so "why is CRANE --g-- SALET taking so long"
+        # is the same question at a greater guess_depth.
+        validate_report_request(ReportRequest(
+            report_kind="root_progress",
+            branch_target=parse_report_branch_target(
+                ["crane", "--g--", "salet"])))
+
+    def test_deeper_spine_scopes_the_rollup_to_its_own_subtree(self):
+        # SALET played as a root and SALET played after CRANE reach different
+        # branches.  Sharing a trailing word must not merge their work.
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "crane", 0)])
+        self._finalize(queue, "CRANE --g-- SALET -y---", 1, 700, 70, 10, 20)
+        self._finalize(queue, "SALET -y---", 1, 100, 10, 10, 20)
+        queue.close()
+
+        deeper = collect_report(self.sources, self._request(
+            branch_target=["crane", "--g--", "salet"]))["data"]
+        root = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(deeper["spine_prefix"], "CRANE --g-- SALET")
+        self.assertEqual(deeper["totals"]["search_node_count"], 700)
+        self.assertEqual(root["totals"]["search_node_count"], 100)
+
+    def test_group_with_only_open_branches_counts_as_started(self):
+        # The group is being worked right now and has finalized nothing.
+        # Reading it as untouched would hide exactly the state this report
+        # exists to show.
+        queue = self._open_queue()
+        self._open_branch(queue, "SALET -y---", 1, 5_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        row = next(row for row in data["response_groups"]
+                   if row["pattern"] == "-y---")
+        self.assertTrue(row["started"])
+        self.assertEqual(row["open_branch_count"], 1)
+        # Nothing has finalized, so cost is genuinely zero-so-far and the
+        # finalize-derived span is unknown, not zero.
+        self.assertEqual(row["branch_count"], 0)
+        self.assertEqual(row["search_node_count"], 0)
+        self.assertIsNone(row["elapsed_millis"])
+        self.assertEqual(data["totals"]["started_response_group_count"], 1)
+
+    def test_open_branches_can_start_the_clock_before_any_finalization(self):
+        queue = self._open_queue()
+        self._open_branch(queue, "SALET -y---", 1, 5_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["work_started_at"], 5_000)
+
+    def test_open_branch_predating_a_finalization_moves_work_start_earlier(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -----", 1, 100, 10, 9_000, 9_500)
+        self._open_branch(queue, "SALET -y---", 1, 5_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["work_started_at"], 5_000)
+
+    def test_open_and_finalized_branches_fold_into_one_group(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 400, 40, 6_000, 6_500)
+        self._open_branch(queue, "SALET -y--- CRANE -----", 1, 7_000)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        row = next(row for row in data["response_groups"]
+                   if row["pattern"] == "-y---")
+        self.assertEqual(row["branch_count"], 1)
+        self.assertEqual(row["open_branch_count"], 1)
+        self.assertEqual(row["search_node_count"], 400)
+        self.assertEqual(data["totals"]["started_response_group_count"], 1)
 
 
 if __name__ == "__main__":

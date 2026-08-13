@@ -13,6 +13,7 @@ import termios
 import time
 
 from report_model import (
+    ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
     ReportSources,
     WORKER_STALE_SECONDS,
@@ -1449,6 +1450,130 @@ def _render_leaderboard_sections(report, width):
     return [("header", header), ("summary", summary), ("leaderboard", rows)]
 
 
+def _timestamp_text(epoch_seconds):
+    if epoch_seconds is None:
+        return "—"
+    return datetime.fromtimestamp(epoch_seconds).strftime("%Y-%m-%d %H:%M")
+
+
+def _format_node_count(node_count):
+    """Node counts span single digits to hundreds of billions in one table."""
+    if node_count >= 1_000_000_000:
+        return f"{node_count / 1_000_000_000:.1f}G"
+    if node_count >= 1_000_000:
+        return f"{node_count / 1_000_000:.1f}M"
+    if node_count >= 1_000:
+        return f"{node_count / 1_000:.1f}K"
+    return str(node_count)
+
+
+def _state_counts(totals):
+    """Response-group state counts in lifecycle order, zeros omitted.
+
+    A zero count is noise on a line that has to fit a terminal, and its absence
+    already says the state is empty.
+    """
+    counts = totals.get("state_counts") or {}
+    return {state: counts[state] for state in ROOT_PROGRESS_GROUP_STATES
+            if counts.get(state)}
+
+
+def _render_root_progress_sections(report, width, display_order):
+    data = report["data"]
+    totals = data["totals"]
+    word = data["word"].upper() + ("*" if data["word_is_answer"] else "")
+    spine_prefix = data.get("spine_prefix")
+    subject = (spine_prefix + ("*" if data["word_is_answer"] else "")
+               if spine_prefix else word)
+    header = _semantic_header(
+        report, f"Root progress {subject}  epoch={data['epoch']}", width
+    )
+    requested_at = totals["requested_at"]
+    started_at = data["work_started_at"]
+    # A request time stamped by a queue rebuild is dropped upstream rather than
+    # printed as though the work had started before it was asked for.
+    request_text = (f"Requested {_timestamp_text(requested_at)}   "
+                    if requested_at is not None else "")
+    summary = [
+        _fit(
+            f"{request_text}"
+            f"work began {_timestamp_text(started_at)}   "
+            f"latest {_timestamp_text(data['work_latest_at'])}",
+            width,
+        ),
+        _fit(
+            "  " + "   ".join(
+                f"{state} {count:,}"
+                for state, count in _state_counts(totals).items()
+            ) + f"   of {totals['response_group_count']:,} response groups",
+            width,
+        ),
+        _fit(
+            f"  branches evaluating {totals['open_branch_count']:,}"
+            f"   nodes {_format_node_count(totals['search_node_count'])}"
+            f"   worker-time {_abbreviate_duration(totals['wall_millis'] / 1000)}",
+            width,
+        ),
+    ]
+    estimate = data["estimate"]
+    if estimate is None:
+        summary.append(_fit(
+            "  estimate unavailable: no candidates completed in the window",
+            width,
+        ))
+    else:
+        summary.append(_fit(
+            f"  estimate ~{_abbreviate_duration(estimate['estimated_seconds'])}"
+            f" for {estimate['remaining_candidate_count']:,} candidates"
+            f" at ~{estimate['candidates_per_day']:,.0f}/day",
+            width,
+        ))
+        # Only groups still waiting hold work the estimate cannot see.  A
+        # group the swarm never opened because it needed no search is not
+        # missing work, and counting it here would invent a backlog.
+        excluded = []
+        waiting = _state_counts(totals).get("waiting", 0)
+        if waiting:
+            excluded.append(f"{waiting:,} waiting groups")
+        if estimate["stalled_branch_count"]:
+            excluded.append(
+                f"{estimate['stalled_branch_count']:,} stalled branches"
+                f" ({estimate['stalled_remaining_candidate_count']:,}"
+                f" candidates)")
+        if excluded:
+            summary.append(_fit("    excludes " + " and ".join(excluded),
+                                width))
+    rows = [f"{'Pattern':<7} {'State':>7} {'Answers':>7} {'Done':>8}"
+            f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
+            f" {'WorkerTime':>10}"]
+    for row in data["response_groups"]:
+        # A group the swarm has not opened has no cost to report.  Printing
+        # zeros would read as a measurement rather than an absence.  A group
+        # that is open but has finalized nothing is the opposite case: its
+        # zeros are measured, and only the finalize-only figures stay unknown.
+        if row["started"]:
+            branch_text = f"{row['branch_count']:,}"
+            open_text = f"{row['open_branch_count']:,}"
+            node_text = _format_node_count(row["search_node_count"])
+            share_text = f"{100.0 * row['search_node_share']:.1f}%"
+            elapsed_text = _abbreviate_duration(
+                row["elapsed_millis"] / 1000
+                if row["elapsed_millis"] is not None else None)
+            worker_text = (_abbreviate_duration(row["wall_millis"] / 1000)
+                           if row["branch_count"] else "—")
+        else:
+            branch_text = open_text = node_text = share_text = "—"
+            elapsed_text = worker_text = "—"
+        rows.append(_fit(
+            f"{row['pattern']:<7} {row['state']:>7} {row['answer_count']:>7}"
+            f" {branch_text:>8} {open_text:>10} {node_text:>9}"
+            f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}",
+            width,
+        ))
+    return [("header", header), ("summary", summary),
+            ("root_progress", rows)]
+
+
 def _report_sections(report, previous_report, color, width, display_order):
     if report.get("tree"):
         return _render_tree_sections(report, width, display_order)
@@ -1478,6 +1603,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_leaderboard_sections(report, width)
     if report["report_kind"] == "sources":
         return _render_source_sections(report, width, display_order)
+    if report["report_kind"] == "root_progress":
+        return _render_root_progress_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 

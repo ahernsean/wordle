@@ -3703,6 +3703,173 @@ class ERDQueue:
             "cut_reuse_misses": cut_reuse_misses,
         }
 
+    def report_root_progress(self, spine_prefix, epoch, recent_window_seconds,
+                             active_branch_limit=10, now=None) -> dict:
+        """Per-response-group work totals for one spine, plus live rates.
+
+        `spine_prefix` is any spine ending in a word: a bare root word such as
+        `PENIS`, or a deeper one such as `PENIS -y--- LUBES`.  Rolls up
+        telemetry.branch_finalize_log by the response pattern that follows the
+        prefix, so every descendant's cost is attributed to the group it sits
+        under.  The rollup is a scan over the epoch's rows
+        (branch_finalize_log carries no spine index), so callers should treat
+        it as a seconds-scale query.
+
+        Branches are selected by spine prefix alone rather than by source word.
+        A source word identifies the root a branch was requested under, which
+        for a deeper spine is still the root -- selecting on it would scope the
+        open branches to the wrong subtree.  active_branches holds thousands of
+        rows, not millions, so scanning it costs single-digit milliseconds.
+
+        A group is `started` once work has opened on it, which is not the same
+        as having finalized anything: its first branch can still be open, with
+        workers on it right now.  Open branches are therefore rolled up
+        alongside finalized ones, by the same spine prefix, so a group being
+        worked never reads as untouched.  They contribute a branch count and a
+        creation time but no cost -- nodes and worker-time are only known at
+        finalize -- so a freshly opened group shows as started with zero
+        measured cost, which is the true state.
+
+        `work_started_at` is the earliest branch *creation* across both, which
+        is when the swarm first opened work under the prefix -- a different
+        question from when the root was requested, which can precede it by days
+        while higher-priority roots hold the queue.  A branch created before the
+        current epoch keeps its original creation time, so this can predate the
+        epoch whose finalizations are being counted.
+
+        Two distinct time bases are reported per group, and they answer
+        different questions:
+          elapsed_millis  wall-clock span from first work to last, which the
+                          swarm's other branches share
+          wall_millis     summed worker-time across bundles, which counts a
+                          six-worker hour as six hours
+        Their ratio is a coarse read on how much parallelism the group drew.
+
+        Progress on still-running branches comes from candidate_claims: a
+        branch is `n_candidates` claims wide, and `recent_done_count` over
+        `recent_window_seconds` gives the rate that turns the remainder into an
+        estimate.  Claim rows carry no epoch, so the window is the only fence.
+        Counting claims costs a scan per branch and a root can hold thousands
+        of open branches at once, so only the `active_branch_limit` widest are
+        counted -- claims are handed out widest-branch-first, so those are the
+        ones carrying the work an estimate depends on.
+        """
+        now = int(time.time()) if now is None else now
+        since = now - recent_window_seconds
+        # The response pattern follows one space past the prefix.
+        pattern_start = len(spine_prefix) + 2
+        descendants = spine_prefix + " %"
+        group_rows = self._conn.execute("""
+            SELECT SUBSTR(spine, ?, 5) AS pattern,
+                   COUNT(*) AS branch_count,
+                   SUM(nodes_spent) AS search_node_count,
+                   SUM(total_bundle_wall_millis) AS wall_millis,
+                   MIN(created_at) AS first_created_at,
+                   MAX(finalized_at) AS last_finalized_at
+            FROM telemetry.branch_finalize_log
+            WHERE epoch = ? AND spine LIKE ?
+            GROUP BY pattern
+        """, (pattern_start, epoch, descendants)).fetchall()
+        groups = {}
+        work_started_at = None
+        work_latest_at = None
+        for row in group_rows:
+            first, last = row["first_created_at"], row["last_finalized_at"]
+            groups[row["pattern"]] = {
+                "branch_count": row["branch_count"],
+                "open_branch_count": 0,
+                "search_node_count": row["search_node_count"] or 0,
+                "wall_millis": row["wall_millis"] or 0,
+                "first_created_at": first,
+                "last_finalized_at": last,
+                "elapsed_millis": (last - first) * 1000
+                                  if first is not None and last is not None
+                                  else None,
+            }
+            if first is not None:
+                work_started_at = min(work_started_at or first, first)
+            if last is not None:
+                work_latest_at = max(work_latest_at or last, last)
+        open_group_rows = self._conn.execute("""
+            SELECT SUBSTR(spine, ?, 5) AS pattern,
+                   COUNT(*) AS open_branch_count,
+                   MIN(created_at) AS first_created_at
+            FROM active_branches
+            WHERE status = 'open' AND spine LIKE ?
+            GROUP BY pattern
+        """, (pattern_start, descendants)).fetchall()
+        open_branch_count = 0
+        for row in open_group_rows:
+            open_branch_count += row["open_branch_count"]
+            first = row["first_created_at"]
+            group = groups.get(row["pattern"])
+            if group is None:
+                # Opened but nothing finalized yet: real work with no cost to
+                # report.  Zeroes here are measured, not assumed absent.
+                group = groups[row["pattern"]] = {
+                    "branch_count": 0,
+                    "open_branch_count": 0,
+                    "search_node_count": 0,
+                    "wall_millis": 0,
+                    "first_created_at": first,
+                    "last_finalized_at": None,
+                    "elapsed_millis": None,
+                }
+            group["open_branch_count"] = row["open_branch_count"]
+            if first is not None:
+                if group["first_created_at"] is None:
+                    group["first_created_at"] = first
+                else:
+                    group["first_created_at"] = min(group["first_created_at"],
+                                                    first)
+                work_started_at = min(work_started_at or first, first)
+        active_rows = self._conn.execute("""
+            SELECT branch_id, n_words, n_candidates, created_at
+            FROM active_branches
+            WHERE status = 'open' AND spine LIKE ?
+            ORDER BY n_words DESC LIMIT ?
+        """, (descendants, active_branch_limit)).fetchall()
+        active = []
+        for row in active_rows:
+            branch_id = row["branch_id"]
+            claim_row = self._conn.execute("""
+                SELECT COUNT(*) AS done_count,
+                       COUNT(*) FILTER (WHERE done_at >= ?) AS recent_count
+                FROM candidate_claims WHERE branch_id = ? AND done = 1
+            """, (since, branch_id)).fetchone()
+            active.append({
+                "branch_id": branch_id,
+                "answer_count": row["n_words"],
+                "candidate_count": row["n_candidates"],
+                "done_candidate_count": claim_row["done_count"],
+                "recent_done_candidate_count": claim_row["recent_count"],
+                "created_at": row["created_at"],
+            })
+        return {
+            "groups": groups,
+            "active_branches": active,
+            "open_branch_count": open_branch_count,
+            "counted_branch_count": len(active),
+            "work_started_at": work_started_at,
+            "work_latest_at": work_latest_at,
+            "recent_window_seconds": recent_window_seconds,
+            "epoch": epoch,
+        }
+
+    def source_work_requests_for_word(self, word) -> list:
+        """Every source-work request naming `word`, oldest request first.
+
+        The request time is when the word was *asked for*, which is not when
+        the swarm began working it: a request sits behind higher-priority
+        roots until workers reach it.
+        """
+        rows = self._conn.execute("""
+            SELECT source_work_id, requested_priority, requested_at, state
+            FROM source_work WHERE source_word = ?
+            ORDER BY requested_at, source_work_id
+        """, (word.lower(),)).fetchall()
+        return [dict(row) for row in rows]
+
     def _bounded_sample_metadata(self, table, epoch, since, sample_size,
                                  spine_prefix=None, branch_key=None):
         spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""

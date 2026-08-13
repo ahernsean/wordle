@@ -42,6 +42,7 @@ FIXTURE_FILENAMES = (
     "cache.json",
     "hotspots.json",
     "leaderboard.json",
+    "root_progress.json",
 )
 BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
 INTEGER_PARAMETERS = {
@@ -113,6 +114,7 @@ def parse_report_request(path, query):
         "/api/view/cache": "cache",
         "/api/view/hotspots": "hotspots",
         "/api/view/leaderboard": "leaderboard",
+        "/api/view/root-progress": "root_progress",
     }.get(path)
     if explicit_kind is None:
         raise KeyError(path)

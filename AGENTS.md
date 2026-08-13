@@ -13,8 +13,14 @@ A Wordle solver with five layers:
 
 All read-only swarm inspection uses `erd_search.py view`. It provides text,
 JSON, JSON Lines, optional watch, semantic word/branch selection, queue,
-worker, cache, tree, and hotspot reports. Check `view --help` and use
-`SWARM.md` for examples.
+worker, cache, tree, hotspot, and root-progress reports. Check `view --help`
+and use `SWARM.md` for examples.
+
+`view --root-progress WORD` answers "how far along is this root, and what is
+holding it up": per-response-group branch/node/time totals, which groups are
+untouched, request time versus work-start time, and a completion estimate
+drawn from observed claim throughput. It deliberately does not estimate
+unstarted groups — see SWARM.md for why the cost model cannot rank them.
 
 Use `erd_search.py epoch show` to inspect the active telemetry epoch. See
 SWARM.md for the stopped-swarm procedure required to change it.
@@ -127,6 +133,56 @@ identity.
 **Response partitions** are "response groups" (the sets of answer words that
 produce the same response pattern to a given guess). Do not call them
 "subgroups" — that was old vocabulary for what is now "branch."
+
+**A longer spine is not a "nested" one.** A spine is a sequence of (guess,
+pattern) pairs; how many it holds is its `guess_depth`. `PENIS -y--- LUBES` is
+a spine at guess_depth 2, not a word nested inside a spine — nothing is
+contained in anything. Say "a spine of more than one guess", "a deeper spine",
+or name the `guess_depth` outright.
+
+---
+
+## Display conventions
+
+### Integers carry comma separators
+
+Unless separators would mislead, every integer shown to a user is rendered with
+thousands separators: `571,359`, not `571359`. This holds in the web client, the
+terminal renderer, and CLI output alike.
+
+Separators mislead when the number is an identifier rather than a quantity —
+epoch numbers, branch ids, worker ids, ports, years. Those stay bare.
+
+The web client already formats correctly wherever a number reaches `metric()`
+or `labeledFacts()`, because `valueOrDash` routes integers through
+`formatInteger`. The gap is string concatenation, where a raw number is glued
+into a sentence:
+
+```javascript
+// Wrong: renders "Shown 1170 of 14855 matched"
+"Shown "+shownRows.length+" of "+matchedRows+" matched"
+// Right
+"Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched"
+```
+
+In Python, use the `:,` format spec (`f"{count:,}"`).
+
+### Dates run day, month, year
+
+`1 Aug 2026`, never `Aug 1, 2026`. The American form orders the fields
+little-endian then big-endian within one date, which reads as neither. Times go
+with it on a 24-hour clock: `1 Aug 2026, 05:06:53`.
+
+In the web client this is the `en-GB` locale — never the viewer's default,
+which is American on the machines this runs on:
+
+```javascript
+new Date(seconds*1000).toLocaleString("en-GB",{dateStyle:"medium",timeStyle:"medium"})
+```
+
+A fully big-endian format is also fine where one already reads well, which is
+why the terminal renderer's `%Y-%m-%d %H:%M` stays as it is. Only the mixed
+ordering is ruled out.
 
 ---
 
