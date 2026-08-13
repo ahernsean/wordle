@@ -1179,7 +1179,10 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         group_row.update({
             "branch_status": branch_status,
             "branch_phase": branch_phase,
-            "priority": _row_value(active_row, "priority", _row_value(pending_row, "priority")),
+            "priority": _row_value(
+                active_row, "effective_priority",
+                _row_value(pending_row, "priority"),
+            ),
             "worker_count": worker_count,
             "cache_state": cache_state["cache_state"],
             "best_guess": cache_state["best_guess"],
@@ -1735,7 +1738,10 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             "branch_phase": branch_phase,
             "pending_status": _row_value(pending_row, "status"),
             "active_status": _row_value(active_row, "status"),
-            "priority": _row_value(active_row, "priority", _row_value(pending_row, "priority")),
+            "priority": _row_value(
+                active_row, "effective_priority",
+                _row_value(pending_row, "priority"),
+            ),
             "candidate_count": _row_value(active_row, "n_candidates"),
             "completed_candidate_count": progress["completed_candidate_count"],
             "bulk_completed_candidate_count": progress["bulk_completed_candidate_count"],

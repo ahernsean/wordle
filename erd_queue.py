@@ -3103,7 +3103,8 @@ class ERDQueue:
             "kind": "user" if p is not None else "coop",
             "status": (p["status"] if p is not None
                        else (a["status"] if a is not None else "unknown")),
-            "priority": (a["priority"] if a is not None else p["priority"]),
+            "priority": (a["effective_priority"] if a is not None
+                         else p["priority"]),
             "n_words": (a["n_words"] if a is not None else p["n_words"]),
             "budget": a["budget"] if a is not None else None,
             "done_candidates": claims_done,
@@ -3146,8 +3147,16 @@ class ERDQueue:
         active = {
             bytes(r["branch_key"]): r
             for r in self._conn.execute(
-                "SELECT a.*, b.branch_key FROM active_branches a "
-                "JOIN branches b ON b.branch_id = a.branch_id")
+                f"""SELECT a.*, b.branch_key,
+                           CASE WHEN a.status = 'open' THEN COALESCE(
+                               (SELECT MAX(owner_priority)
+                                FROM live_branch_source_rows
+                                WHERE branch_id = a.branch_id),
+                               CASE WHEN a.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
+                                    THEN 0 ELSE a.priority END
+                           ) ELSE a.priority END AS effective_priority
+                    FROM active_branches a
+                    JOIN branches b ON b.branch_id = a.branch_id""")
         }
         keys = set(pending) | set(active)
         rows = [self._branch_row_dict(pending.get(k), active.get(k))
@@ -3253,7 +3262,13 @@ class ERDQueue:
                        pending.status AS pending_status,
                        active.status AS active_status,
                        pending.priority AS pending_priority,
-                       active.priority AS active_priority,
+                       CASE WHEN active.status = 'open' THEN COALESCE(
+                           (SELECT MAX(owner_priority)
+                            FROM live_branch_source_rows
+                            WHERE branch_id = active.branch_id),
+                           CASE WHEN active.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
+                                THEN 0 ELSE active.priority END
+                       ) ELSE active.priority END AS active_priority,
                        pending.n_words AS pending_answer_count,
                        active.n_words AS active_answer_count,
                        pending.source_word AS pending_source_word,
@@ -4253,7 +4268,15 @@ class ERDQueue:
             return {}
         placeholders = ','.join('?' for _ in ids)
         rows = self._conn.execute(
-            f"SELECT a.*, b.branch_key FROM active_branches a "
+            f"""SELECT a.*, b.branch_key,
+                       CASE WHEN a.status = 'open' THEN COALESCE(
+                           (SELECT MAX(owner_priority)
+                            FROM live_branch_source_rows
+                            WHERE branch_id = a.branch_id),
+                           CASE WHEN a.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
+                                THEN 0 ELSE a.priority END
+                       ) ELSE a.priority END AS effective_priority
+               FROM active_branches a """
             f"JOIN branches b ON b.branch_id = a.branch_id "
             f"WHERE a.branch_id IN ({placeholders})", ids
         ).fetchall()
@@ -4271,7 +4294,15 @@ class ERDQueue:
         if branch_id is None:
             return None
         return self._conn.execute(
-            "SELECT a.*, b.branch_key FROM active_branches a "
+            f"""SELECT a.*, b.branch_key,
+                       CASE WHEN a.status = 'open' THEN COALESCE(
+                           (SELECT MAX(owner_priority)
+                            FROM live_branch_source_rows
+                            WHERE branch_id = a.branch_id),
+                           CASE WHEN a.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
+                                THEN 0 ELSE a.priority END
+                       ) ELSE a.priority END AS effective_priority
+               FROM active_branches a """
             "JOIN branches b ON b.branch_id = a.branch_id "
             "WHERE a.branch_id = ?", (branch_id,)
         ).fetchone()
