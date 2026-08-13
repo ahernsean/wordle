@@ -11,6 +11,7 @@ import os
 import random
 import tempfile
 import unittest
+from unittest import mock
 
 from cache_sqlite import ScoreCache
 from pattern_matrix import PatternMatrix
@@ -297,6 +298,73 @@ class TestThePoolCannotDrift(_VocabularyMixin, unittest.TestCase):
 
     ANSWERS = ['aided', 'bided', 'sided', 'tided']
     WIDE = ['aided', 'bided', 'sided', 'tided', 'abacs']
+
+    def test_approval_does_not_survive_the_pool_gaining_a_word(self):
+        """A list that passed once must not go on passing after it grows.
+
+        Remembering an approval against the object that earned it is the same
+        defect as a stale memo key, one layer out: `abacs` separates all four
+        answers, so the wider pool reaches 2.0 where the table still prices
+        2.25 — a floor above what the search can play.
+        """
+        pool = list(self.ANSWERS)
+        table = BranchFloorTable(pool, cache=ResponseCache(self.ANSWERS))
+        self.assertTrue(table.matches_pool(pool))
+        pool.append('abacs')
+        self.assertFalse(
+            table.matches_pool(pool),
+            "the table vouched for a pool it cannot price")
+
+    def test_only_the_tables_own_tuple_is_approved_by_identity(self):
+        table = BranchFloorTable(self.ANSWERS, cache=ResponseCache(self.ANSWERS))
+        self.assertIsInstance(table.candidate_pool, tuple)
+        self.assertTrue(table.matches_pool(table.candidate_pool))
+        equal_list = list(self.ANSWERS)
+        self.assertTrue(table.matches_pool(equal_list),
+                        "an equal word set is still the same pool")
+
+    def test_a_grown_pool_cannot_prune_a_strategy_it_can_play(self):
+        """The defect end to end, at `evaluate_candidate`.
+
+        With the wider pool the parent is solvable below the incumbent, so a
+        table still vouching for the grown list would return OVER_ERD_LIMIT on
+        a candidate the search can in fact afford.
+        """
+        pool = list(self.ANSWERS)
+        cache = ResponseCache(self.ANSWERS)
+        table = BranchFloorTable(pool, cache=cache)
+        self.assertTrue(table.matches_pool(pool))
+        pool.append('abacs')
+        with self.assertRaises(ValueError):
+            evaluate_candidate(
+                self.ANSWERS, self.ANSWERS[0], cache, None,
+                best_erd=2.944444, guesses=pool, policy=ERD_ALL, budget=5,
+                branch_floor_table=table)
+
+    def test_the_search_adopts_the_tables_pool(self):
+        """Validation happens once; what the search then plays is the tuple.
+
+        Adopting it is what leaves no second object to drift — the caller's
+        list is never consulted again.
+        """
+        pool = list(self.guess_words)
+        table = BranchFloorTable(pool, cache=self._response_cache(),
+                                 pattern_matrix=self.pattern_matrix)
+        seen = []
+        original = BranchFloorTable.sub_branch_cost_lower_bound
+
+        def record(self_, sub_branch, candidate):
+            seen.append(True)
+            return original(self_, sub_branch, candidate)
+
+        with mock.patch.object(BranchFloorTable,
+                               'sub_branch_cost_lower_bound', record):
+            evaluate_candidate(
+                self._branch(12, seed=77), self.guess_words[0],
+                self._response_cache(), None, best_erd=float('inf'),
+                guesses=pool, policy=ERD_ALL, budget=4,
+                pattern_matrix=self.pattern_matrix, branch_floor_table=table)
+        self.assertTrue(seen, "the floor table was never consulted")
 
 
 class TestASuppliedTableMustBeTheSearchesPool(_VocabularyMixin, unittest.TestCase):

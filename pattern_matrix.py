@@ -252,9 +252,9 @@ class PatternMatrix:
         a same-size pool holding different words fails while passing a count
         test.
 
-        The verified pool is held by reference, so the steady state (one pool
-        object for a whole solve) costs a pointer comparison and later calls
-        never rebuild the set.
+        An approval is remembered only against a tuple.  A list that passed
+        once can gain a word afterwards, and a remembered approval would then
+        keep vouching for a pool this matrix no longer answers for.
         """
         if candidate_pool is self._verified_guess_pool:
             return True
@@ -265,7 +265,8 @@ class PatternMatrix:
             return False
         if any(word not in self._guess_index for word in pool_words):
             return False
-        self._verified_guess_pool = candidate_pool
+        if isinstance(candidate_pool, tuple):
+            self._verified_guess_pool = candidate_pool
         return True
 
     def branch_cost_lower_bound(self, branch_indices):

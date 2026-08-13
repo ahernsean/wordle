@@ -1126,7 +1126,6 @@ class BranchFloorTable:
             else None)
         self._capacity = capacity
         self._floors = OrderedDict()
-        self._verified_pool = None
         self.hits = 0
         self.misses = 0
 
@@ -1135,18 +1134,25 @@ class BranchFloorTable:
 
         A table answers only for its own pool, so a caller that supplies one
         must be holding it against the same words the search draws candidates
-        from.  Identity is checked first, so the steady state -- one pool object
-        for a whole solve -- costs a pointer comparison rather than rebuilding
-        a set per candidate.
+        from.
+
+        An approval is never remembered against the object that earned it.
+        A pool is usually a list, and a remembered approval would go on
+        holding after that same list gained a word: the table would keep
+        answering with floors priced for the smaller pool, which sit above
+        what the larger one can reach, and the search would prune strategies
+        it can actually play.  The only pool whose approval survives is this
+        table's own `candidate_pool`, which is a tuple and cannot gain one.
+
+        That is what makes the pointer comparison below both the fast path and
+        the safe one, and why callers adopt `candidate_pool` after validating
+        against it rather than carrying their own list forward.
         """
+        if candidate_pool is self.candidate_pool:
+            return True
         if candidate_pool is None:
             return False
-        if candidate_pool is self._verified_pool:
-            return True
-        if set(candidate_pool) != set(self.candidate_pool):
-            return False
-        self._verified_pool = candidate_pool
-        return True
+        return set(candidate_pool) == set(self.candidate_pool)
 
     def branch_cost_lower_bound(self, sub_branch):
         key = tuple(sorted(sub_branch))
@@ -1346,11 +1352,17 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     floor_hit is always returned (even on early returns) so the caller can
     aggregate taint across all candidates it tries, including discarded ones.
     """
-    if (branch_floor_table is not None
-            and not branch_floor_table.matches_pool(guesses)):
-        raise ValueError(
-            "branch_floor_table's candidate pool is not this search's guess "
-            "words; its floors would price strategies the search cannot play")
+    if branch_floor_table is not None:
+        if not branch_floor_table.matches_pool(guesses):
+            raise ValueError(
+                "branch_floor_table's candidate pool is not this search's "
+                "guess words; its floors would price strategies the search "
+                "cannot play")
+        # Draw candidates from the table's own tuple from here on.  The
+        # caller's list has been checked once, at this instant; adopting the
+        # immutable pool the floors were priced against means a later change
+        # to that list cannot put the two out of step behind our back.
+        guesses = branch_floor_table.candidate_pool
     if n is None:
         n = len(branch_words)
     # Liveness tick: fire once per candidate evaluation (the dominant work
@@ -1382,13 +1394,19 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     has_self = _ALL_GREEN_PATTERN in groups
     candidate_cost_lower_bound = _candidate_cost_lower_bound(
         groups.values(), has_self, n)
-    # Report the work-metric inputs (group sizes, the effective lower bound,
+    # Report the work-metric inputs (group sizes, the closed-form lower bound,
     # the bound actually in force after any external tightening) so a
     # measurement layer can log predicted-vs-actual without recomputing them.
-    # It fires exactly once per candidate, and always with the bound that
-    # decided the candidate's fate: a candidate cut by the two-level gate below
-    # does near-zero work, so reporting it against the weaker closed-form bound
-    # would record the engine's main fast path as a prediction miss.
+    # It fires exactly once per candidate.
+    #
+    # The bound reported is the closed form `3 - (G + has_self)/n` and not the
+    # tighter two-level bound the gate below may act on.  analyze_swarm_telemetry
+    # inverts that identity to recover has_self from the stored value, so a
+    # tighter number in this field decodes as a different candidate: at n=40
+    # with 17 groups and has_self true, 2.55 is the closed form and reads back
+    # correctly, while the effective 2.575 reads back as has_self false.
+    # `pruned` carries which gate actually cut the candidate, so predicted work
+    # still reflects the two-level gate without moving what this field means.
     def _observe(pruned):
         if metric_observer is not None:
             metric_observer([len(g) for g in groups.values()], has_self,
@@ -1767,6 +1785,10 @@ def min_expected_guesses(branch_words, cache, score_cache,
         raise ValueError(
             "branch_floor_table's candidate pool is not this search's guess "
             "words; its floors would price strategies the search cannot play")
+    # The whole recursion draws candidates from the table's own tuple, so no
+    # list the caller still holds can drift from the pool the floors price.
+    if branch_floor_table is not None:
+        guesses = branch_floor_table.candidate_pool
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat,
                         note_depth, progress_callback, subbranch_solver,

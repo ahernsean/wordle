@@ -579,9 +579,13 @@ class _BranchWorker:
             cache_path, self.all_words, self.all_answers, self.score_cache)
         # One table for the worker's whole lifetime: every claim draws its
         # candidates from all_words, so the pool never changes and floors carry
-        # over between claims.
+        # over between claims.  all_words then becomes the table's own tuple,
+        # which is both what makes the per-candidate pool check a pointer
+        # comparison and what stops the worker's pool from ever diverging from
+        # the pool its floors are priced against.
         self.branch_floor_table = BranchFloorTable(
             self.all_words, cache=self.rcache, pattern_matrix=self.pattern_matrix)
+        self.all_words = self.branch_floor_table.candidate_pool
         self.queue = ERDQueue(queue_path)
 
         self.started = int(time.time())

@@ -14,12 +14,12 @@ Three checks:
    serial result.  Catches races in inter-process coordination (update_branch_best,
    complete_chunk) that thread-based tests cannot exercise.
 
-3. Coordination-floor drain smoke (fork only): spawn 1 vs 4 swarm_workers,
-   drain 80 tiny disjoint branches from a shared queue, and assert 4 workers
-   finish in < 90% of 1-worker time.  The branches carry near-zero solve work,
-   so this measures the coordination fabric alone: it guards against total
-   serialization, NOT strong scaling.  Key design constraints are documented
-   on TestCooperativeDrainSmoke.
+3. Claim-handout drain smoke (fork only): spawn 1 vs 4 swarm_workers, drain
+   80 small disjoint branches from a shared queue, and assert 4 workers finish
+   in < 90% of 1-worker time.  Its contribution is the claim COUNT — 80 against
+   the strong-scaling guard's 4 — so a queue that serializes handout fails here
+   and passes there.  It guards against total serialization, NOT strong
+   scaling.  Key design constraints are documented on TestCooperativeDrainSmoke.
 
 4. Solve-dominated strong scaling (fork only): 1 vs 4 swarm_workers over
    trap-family branches heavy enough that solving dominates coordination,
@@ -43,8 +43,6 @@ from wordle_engine import ResponseCache, min_expected_guesses, ERD_ALL
 import erd_swarm
 from erd_swarm import _BranchWorker, ROOT_BUDGET
 from erd_queue import ERDQueue, encode_subset
-from wordle_engine import (BranchFloorTable, ResponseCache,
-                           sub_branch_cost_lower_bound)
 from tests.trap_workloads import (build_trap_branches, build_candidates,
                                   seed_cost_model)
 
@@ -293,10 +291,10 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(self._tmp.cleanup)
         # A frozen word sample (tests/fixtures/drain_smoke/), not the live
-        # lists: this measures the coordination floor, which is a constant, so
-        # the workload must stay identical across vocabulary changes rather
-        # than resampling by list position. Regenerate the fixture only to
-        # deliberately refresh the sample, never on a routine list update.
+        # lists: the workload must stay identical across vocabulary changes
+        # rather than resampling by list position, so that a speedup number is
+        # comparable run to run. Regenerate the fixture only to deliberately
+        # refresh or resize the sample, never on a routine list update.
         fixture_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "fixtures", "drain_smoke")
         with open(os.path.join(fixture_dir, "pool.txt")) as f:
@@ -393,7 +391,7 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
             return
         status = '✅ PASSED' if passed else '❌ FAILED'
         lines = [
-            f'## Coordination-floor drain smoke — {status}',
+            f'## Claim-handout drain smoke — {status}',
             '',
             f'**{n} workers vs 1 worker** | '
             f'speedup: **{t1/tN:.2f}x** | '
@@ -425,10 +423,10 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
     def _write_result_file(n, t1, tN, passed, ratio):
         """Record the measured drain speedup as JSON so a dedicated CI step
         can display and re-check it, the way `coverage report` surfaces the
-        coverage number in its own step. Path is $COORDINATION_FLOOR_RESULT_PATH
-        (default coordination_floor_result.json in the cwd)."""
-        path = os.environ.get('COORDINATION_FLOOR_RESULT_PATH',
-                              'coordination_floor_result.json')
+        coverage number in its own step. Path is $DRAIN_SMOKE_RESULT_PATH
+        (default drain_smoke_result.json in the cwd)."""
+        path = os.environ.get('DRAIN_SMOKE_RESULT_PATH',
+                              'drain_smoke_result.json')
         with open(path, 'w') as f:
             json.dump({
                 'workers':      n,
@@ -513,7 +511,7 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
     # cost model is seeded so entry-gate promotion fires as it does in
     # production.  If coordination overhead grows to dominate solve time —
     # the epoch-4 disease (tiny-claim storms, dropped ceilings) — the speedup
-    # collapses toward the coordination floor (~1.25x) and this fails.
+    # collapses toward 1x and this fails.
     #
     # The complementary guard is tests/test_swarm_vs_engine_overhead.py: this
     # test pins the SLOPE (more workers help), that one pins the CONSTANT
@@ -545,10 +543,12 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
     _BRANCH_SIZE = 80
     _BASE_CANDIDATES = 150
     _BUDGET = 4
-    # Required t1/tN speedup by worker count.  These sit far above the ~1.25x
-    # coordination floor, so a regression into coordination-bound behaviour
-    # fails unambiguously.  Do NOT lower these to make a regressed run pass —
-    # that buries the signal this guard exists to raise.
+    # Required t1/tN speedup by worker count.  These sit far above the 1x a
+    # serialized swarm measures, so a regression into coordination-bound
+    # behaviour fails unambiguously.  Do NOT lower these to make a regressed
+    # run pass — that buries the signal this guard exists to raise.  When an
+    # engine speedup shrinks the drain until the fixed per-worker startup
+    # dominates, give the fixture more to do instead.
     _MIN_SPEEDUP = {2: 1.3, 3: 1.5, 4: 1.7}
 
     def setUp(self):
@@ -649,20 +649,36 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
         could quietly flatten multi-worker scaling.  This pins that the
         workload actually builds floors, rather than the speedup assertion
         passing because the machinery never ran.
+
+        It asserts on a real `_BranchWorker` solving a fixture branch, and on
+        that worker's OWN table.  Driving a table built here would keep
+        passing if the worker stopped supplying its table to
+        evaluate_candidate, or if ordering and the entry gate cut every
+        candidate before a floor was ever needed — the timed leg would then
+        measure inert machinery, which is the false pass this test exists to
+        prevent.
         """
-        table = BranchFloorTable(self._candidates,
-                                 cache=ResponseCache(self._pool))
-        multi_word_groups = 0
-        for branch in self._branches:
-            for candidate in self._candidates[:40]:
-                for group in table._cache.group_words(candidate, branch).values():
-                    if len(group) > 1:
-                        sub_branch_cost_lower_bound(group, candidate, table)
-                        multi_word_groups += 1
-        self.assertGreater(multi_word_groups, 0,
-                           "every response group is a singleton: this "
-                           "workload cannot exercise the branch floor")
-        self.assertGreater(table.misses, 0, "no floor was actually built")
+        cache_path = os.path.join(self._tmp.name, "cache_floor.sqlite3")
+        queue_path = os.path.join(self._tmp.name, "queue_floor.sqlite3")
+        ScoreCache(cache_path, self._pool).close()
+        seed_cost_model(queue_path)
+        branch_words = self._branches[0]
+        queue = ERDQueue(queue_path)
+        queue.create_branch(encode_subset(branch_words), len(branch_words),
+                            len(self._candidates), budget=self._BUDGET)
+        queue.close()
+
+        worker = _BranchWorker(0, cache_path, queue_path, None)
+        try:
+            worker.solve_branch_focused(encode_subset(branch_words))
+            misses = worker.branch_floor_table.misses
+        finally:
+            worker.close()
+        self.assertGreater(
+            misses, 0,
+            "the worker solved a fixture branch without building a single "
+            "floor: this workload cannot detect a floor-construction "
+            "regression, so the timed legs below prove nothing about it")
 
     def test_workers_scale_when_solving_dominates_coordination(self):
         n = min(4, os.cpu_count() or 1)
