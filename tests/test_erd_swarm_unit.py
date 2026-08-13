@@ -114,6 +114,7 @@ def _bare_worker():
     w._packing_stats_cache = {}
     w.rcache = mock.MagicMock()
     w.pattern_matrix = None
+    w.branch_floor_table = None
     w.score_cache = mock.MagicMock()
     w.score_cache.read_hits = 0
     w.score_cache.read_misses = 0

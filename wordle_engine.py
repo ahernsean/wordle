@@ -6,7 +6,7 @@ No UI dependencies. All display/interaction is handled by the caller.
 
 import math
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from enum import Enum, auto
 
 from cache_sqlite import ScoreCache
@@ -387,6 +387,23 @@ def calculate_group_counts(test_word, words):
 _GROUP_WORDS_FAST_PATH_PROMOTION_THRESHOLD = 250
 
 
+# Branch ERD floors held per cache instance. Each entry is one key plus a
+# float, so the ceiling is a bounded few tens of MB at the branch sizes the
+# bound is worth computing for.
+_BRANCH_FLOOR_CAPACITY = 200_000
+
+# Smallest sub-branch given a computed floor; below this the all-singletons
+# floor stands. A floor costs one pass over the candidate pool whatever the
+# sub-branch's size, while its effect on the parent's bound carries weight k/n
+# — so the small sub-branches, which are also by far the most numerous, buy the
+# least tightening per pass. Skipping them keeps nearly all of the pruning —
+# on a 502-word first-guess branch whose ERD exceeds 3.0, 99.3% of a candidate
+# sample against 100.0% — for roughly half the floors. Each worker builds its
+# own floors, so this is also what keeps the per-process cost from flattening
+# multi-worker scaling.
+_BRANCH_FLOOR_MINIMUM_SIZE = 8
+
+
 class ResponseCache:
     """Lazily caches word-to-pattern mappings for each guess word.
 
@@ -410,6 +427,32 @@ class ResponseCache:
         self._answer_index = {word: i for i, word in enumerate(answer_words)}
         self._cache = {}   # guess → bytes (pattern_int per answer, canonical order)
         self._fast_path_use_counts = defaultdict(int)  # cold guess → group_words fast-path tally
+
+    def branch_cost_lower_bound(self, subset, candidate_pool):
+        """Admissible floor on subset's ERD over candidate_pool — the reference
+        implementation of PatternMatrix.branch_cost_lower_bound.
+
+        Every candidate costs at least 3 - (group_count + has_self)/k, so the
+        widest split any pool word achieves gives a floor no strategy playing
+        from that pool can beat.  Never below the all-singletons floor.
+
+        Pure: the result depends only on the arguments.  Memoizing belongs to
+        BranchFloorTable, which holds one pool for its lifetime — a floor
+        cached here could otherwise be served to a search allowed to play words
+        the pool it was computed from did not contain.
+        """
+        size = len(subset)
+        if size <= 1:
+            return float(size)
+        subset_words = set(subset)
+        widest_split = 0
+        for guess in candidate_pool:
+            split = len(self.group_counts(guess, subset))
+            if guess in subset_words:
+                split += 1
+            if split > widest_split:
+                widest_split = split
+        return max(all_singletons_floor(size), 3.0 - widest_split / size)
 
     def _ensure(self, guess):
         """Build the mapping for guess if not cached, persisting/reloading via SQLite.
@@ -1053,6 +1096,113 @@ def _candidate_cost_lower_bound(group_sizes, has_self, n):
     return 3.0 - (len(group_sizes) + (1 if has_self else 0)) / n
 
 
+def all_singletons_floor(size):
+    """ERD floor for a branch of `size` words attained by a perfect split: one
+    guess wins outright, every other word is named on the guess after."""
+    return 2.0 - 1.0 / size
+
+
+class BranchFloorTable:
+    """Branch ERD floors for ONE candidate pool, fixed at construction.
+
+    A floor is only a floor over the words that may actually be played: a wider
+    pool splits a branch more finely and so lowers it.  Serving a floor
+    computed against a narrower pool than the search may play would claim a
+    floor above reachable strategies, which prunes the optimum and silently
+    raises the reported ERD.  The pool is therefore a property of this object
+    rather than an argument to its methods — there is no per-call pool to
+    disagree with the memo, and none to pass wrongly.
+
+    Construct one per solve, from the same word list the search draws its
+    candidates from (_solve_subset's candidate_list), and share it across the
+    whole recursion: reuse across parents is what makes the floors cheaper than
+    the search they replace.  The memo is bounded and insertion-ordered,
+    evicting oldest-first, because a branch under evaluation revisits its own
+    sub-branches across consecutive candidates.
+
+    The vectorized path is used only when the matrix's rows ARE the pool;
+    otherwise the matrix would answer for a vocabulary the search cannot play
+    and the reference implementation is used instead.  Both compute the same
+    value for the same pool.
+    """
+
+    def __init__(self, candidate_pool, cache=None, pattern_matrix=None,
+                 capacity=_BRANCH_FLOOR_CAPACITY):
+        self.candidate_pool = tuple(candidate_pool)
+        self._cache = cache
+        self._pattern_matrix = (
+            pattern_matrix
+            if pattern_matrix is not None
+            and pattern_matrix.is_guess_pool(self.candidate_pool)
+            else None)
+        self._capacity = capacity
+        self._floors = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    def branch_cost_lower_bound(self, sub_branch):
+        key = tuple(sorted(sub_branch))
+        cached = self._floors.get(key)
+        if cached is not None:
+            self.hits += 1
+            self._floors.move_to_end(key)
+            return cached
+        self.misses += 1
+        floor = None
+        if self._pattern_matrix is not None:
+            branch_indices = self._pattern_matrix.answer_indices_or_none(sub_branch)
+            if branch_indices is not None:
+                floor = self._pattern_matrix.branch_cost_lower_bound(branch_indices)
+        if floor is None:
+            if self._cache is None:
+                return all_singletons_floor(len(sub_branch))
+            floor = self._cache.branch_cost_lower_bound(sub_branch,
+                                                        self.candidate_pool)
+        self._floors[key] = floor
+        if len(self._floors) > self._capacity:
+            self._floors.popitem(last=False)
+        return floor
+
+    def sub_branch_cost_lower_bound(self, sub_branch, candidate):
+        """Admissible floor on what `sub_branch` costs the parent that reached it.
+
+        A singleton is one guess, or none at all when it is the candidate just
+        played.  Otherwise the floor is `all_singletons_floor`, raised to the
+        sub-branch's own floor once it is large enough to be worth one pass
+        over the pool.
+
+        `all_singletons_floor` assumes some guess shatters the sub-branch into
+        singletons and is itself a member — true only for small, well-separated
+        sets.  The pool-wide floor instead asks what the guess words can
+        actually do to these words, and is the larger of the two on every
+        branch the split does not genuinely shatter.  Both are admissible, so
+        the maximum is too.
+        """
+        size = len(sub_branch)
+        if size == 1:
+            return 0.0 if sub_branch[0] == candidate else 1.0
+        floor = all_singletons_floor(size)
+        if size < _BRANCH_FLOOR_MINIMUM_SIZE:
+            return floor
+        return max(floor, self.branch_cost_lower_bound(sub_branch))
+
+
+def sub_branch_cost_lower_bound(sub_branch, candidate, branch_floor_table=None):
+    """`branch_floor_table`'s floor for this sub-branch, or the all-singletons
+    floor when no table is supplied — a weaker bound, never a wrong one.
+
+    Searches that vary their candidate pool per node (the answers-only policy,
+    where each node's pool is its own branch words) pass no table: a pool that
+    changes as the recursion descends is exactly what a table may not hold.
+    """
+    if branch_floor_table is None:
+        size = len(sub_branch)
+        if size == 1:
+            return 0.0 if sub_branch[0] == candidate else 1.0
+        return all_singletons_floor(size)
+    return branch_floor_table.sub_branch_cost_lower_bound(sub_branch, candidate)
+
+
 def estimate_candidate_work(group_sizes, has_self, n, best_erd, budget, typical):
     """Predicted search work (in nodes), UNCUT sum over recursed groups.
 
@@ -1145,7 +1295,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    note_depth=None, budget=None,
                    subbranch_solver=None, bound_provider=None,
                    mid_loop_publisher=None, metric_observer=None,
-                   pattern_matrix=None, branch_indices=None):
+                   pattern_matrix=None, branch_indices=None,
+                   branch_floor_table=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1212,19 +1363,22 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     has_self = _ALL_GREEN_PATTERN in groups
     candidate_cost_lower_bound = _candidate_cost_lower_bound(
         groups.values(), has_self, n)
-    erd_lower_bound_pruned = candidate_cost_lower_bound >= best_erd
-    # Report the work-metric inputs the moment they are known
-    # (candidate_cost_lower_bound, group sizes, the bound actually in force
-    # after any external tightening) so a measurement layer can log
-    # predicted-vs-actual without recomputing them. ERD-pruned candidates are
-    # reported too — their near-zero cost is the signal.
-    if metric_observer is not None:
-        metric_observer([len(g) for g in groups.values()], has_self,
-                        candidate_cost_lower_bound, best_erd,
-                        erd_lower_bound_pruned)
-    if erd_lower_bound_pruned:
+    # Report the work-metric inputs (group sizes, the effective lower bound,
+    # the bound actually in force after any external tightening) so a
+    # measurement layer can log predicted-vs-actual without recomputing them.
+    # It fires exactly once per candidate, and always with the bound that
+    # decided the candidate's fate: a candidate cut by the two-level gate below
+    # does near-zero work, so reporting it against the weaker closed-form bound
+    # would record the engine's main fast path as a prediction miss.
+    def _observe(effective_lower_bound, pruned):
+        if metric_observer is not None:
+            metric_observer([len(g) for g in groups.values()], has_self,
+                            effective_lower_bound, best_erd, pruned)
+
+    if candidate_cost_lower_bound >= best_erd:
         # Provably can't beat the bound (but may well be feasible) — a cutoff,
         # not infeasibility.  See OVER_ERD_LIMIT in _solve_subset.
+        _observe(candidate_cost_lower_bound, True)
         return (OVER_ERD_LIMIT, None, None, False)
 
     cost = 1.0
@@ -1238,13 +1392,10 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # Alpha-beta: solve each sub-branch under a derived ceiling so a deep node
     # prunes from a tight bound instead of inf.  remaining_groups_cost_lower_bound[i]
     # is an admissible lower bound on the weighted cost of the sub-branches
-    # *after* position i (each sub-branch of size k costs >= lb(k); the
-    # all-singletons split attains it, so it never over-counts).  The self
+    # *after* position i (each sub-branch of size k costs >= lb(k)).  The self
     # singleton contributes 0.
     def _sub_lb(sg):
-        if len(sg) == 1:
-            return 0.0 if sg[0] == candidate else 1.0
-        return 2.0 - 1.0 / len(sg)
+        return sub_branch_cost_lower_bound(sg, candidate, branch_floor_table)
 
     remaining_groups_cost_lower_bound = [0.0] * (len(ordered) + 1)
     for i in range(len(ordered) - 1, -1, -1):
@@ -1252,6 +1403,19 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
         remaining_groups_cost_lower_bound[i] = (
             remaining_groups_cost_lower_bound[i + 1]
             + (len(sub_i) / n) * _sub_lb(sub_i))
+
+    # Second gate, on the same sum the ceilings are derived from.  Position 0
+    # holds every sub-branch's floor, so 1 + that is this candidate's cost
+    # lower bound priced per sub-branch rather than by group count alone.  It
+    # is never below candidate_cost_lower_bound and rises above 3.0 where that
+    # bound cannot, which is the range large branches live in.
+    two_level_cost_lower_bound = 1.0 + remaining_groups_cost_lower_bound[0]
+    effective_cost_lower_bound = max(candidate_cost_lower_bound,
+                                     two_level_cost_lower_bound)
+    erd_lower_bound_pruned = effective_cost_lower_bound >= best_erd
+    _observe(effective_cost_lower_bound, erd_lower_bound_pruned)
+    if erd_lower_bound_pruned:
+        return (OVER_ERD_LIMIT, None, None, False)
 
     for i, (pattern_code, sub_branch) in enumerate(ordered):
         # Tighten the bound from any inter-worker improvement before computing
@@ -1282,7 +1446,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             policy, cancel_check, heartbeat, note_depth, None,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code,
-            mid_loop_publisher=mid_loop_publisher, pattern_matrix=pattern_matrix)
+            mid_loop_publisher=mid_loop_publisher, pattern_matrix=pattern_matrix,
+            branch_floor_table=branch_floor_table)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
@@ -1309,6 +1474,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, note_depth,
                   progress_callback, subbranch_solver=None,
+                  branch_floor_table=None,
                   ceiling=float('inf'), entry_guess=None, entry_pattern=None,
                   mid_loop_publisher=None, pattern_matrix=None):
     """Budget-aware core of min_expected_guesses.
@@ -1482,6 +1648,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                 mid_loop_publisher=mid_loop_publisher,
                 pattern_matrix=pattern_matrix,
                 branch_indices=branch_indices,
+                branch_floor_table=branch_floor_table,
             )
         if status in _ABORT_STATUSES:
             return status
@@ -1544,7 +1711,7 @@ def min_expected_guesses(branch_words, cache, score_cache,
                           cancel_check=None, heartbeat=None,
                           note_depth=None, budget=None,
                           subbranch_solver=None, mid_loop_publisher=None,
-                          pattern_matrix=None):
+                          pattern_matrix=None, branch_floor_table=None):
     """
     Exact expected guesses to solve branch_words, playing optimally.
 
@@ -1569,9 +1736,17 @@ def min_expected_guesses(branch_words, cache, score_cache,
     (when budgeted) `branch_words` is unsolvable within budget.  Partial results
     already written to score_cache are kept and valid either way.
     """
+    # One table for the whole solve: the pool is fixed here, where the
+    # search's own candidate list is known.  guesses=None means each node
+    # draws candidates from its own branch words, a pool that changes as the
+    # recursion descends and so cannot back a table.
+    if branch_floor_table is None and guesses is not None:
+        branch_floor_table = BranchFloorTable(
+            guesses, cache=cache, pattern_matrix=pattern_matrix)
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat,
                         note_depth, progress_callback, subbranch_solver,
+                        branch_floor_table=branch_floor_table,
                         mid_loop_publisher=mid_loop_publisher,
                         pattern_matrix=pattern_matrix)
     if res in _ABORT_STATUSES:

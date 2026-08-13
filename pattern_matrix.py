@@ -31,6 +31,12 @@ CandidateStats = collections.namedtuple(
 _COUNT_CHUNK_ROWS = 1024
 
 
+# Branch ERD floors held per PatternMatrix. Each entry is one bytes key plus a
+# float; 200k entries cost roughly 40 MB at the branch sizes the bound is worth
+# computing for, which is small next to the matrix itself.
+_BRANCH_FLOOR_CAPACITY = 200_000
+
+
 def _compute_answer_list_id(answer_words):
     """SHA-256 identity of the answer universe (matches ScoreCache._ensure_answer_list)."""
     return hashlib.sha256("\n".join(answer_words).encode()).hexdigest()
@@ -88,6 +94,9 @@ class PatternMatrix:
         self.answer_list_id = _compute_answer_list_id(answer_words)
         self._guess_index = {w: i for i, w in enumerate(guess_words)}
         self._answer_index = {w: i for i, w in enumerate(answer_words)}
+        self._verified_guess_pool = None
+        self.branch_floor_hits = 0
+        self.branch_floor_misses = 0
 
     @classmethod
     def build(cls, guess_words, answer_words, score_cache=None):
@@ -231,6 +240,58 @@ class PatternMatrix:
                 offset_patterns.ravel(), minlength=rows * 243
             ).reshape(rows, 243)
         return counts
+
+    def is_guess_pool(self, candidate_pool):
+        """True when candidate_pool is exactly this matrix's guess vocabulary.
+
+        branch_cost_lower_bound minimizes over every matrix row, so it answers
+        for the matrix's own vocabulary and no other pool.  A pool missing even
+        one row's word may be unable to reach the split that row achieves,
+        making the matrix's floor higher than that pool can attain — the one
+        direction that is inadmissible.  Equal lengths do not establish this:
+        a same-size pool holding different words fails while passing a count
+        test.
+
+        The verified pool is held by reference, so the steady state (one pool
+        object for a whole solve) costs a pointer comparison and later calls
+        never rebuild the set.
+        """
+        if candidate_pool is self._verified_guess_pool:
+            return True
+        if len(candidate_pool) != self.n_guesses:
+            return False
+        pool_words = set(candidate_pool)
+        if len(pool_words) != self.n_guesses:
+            return False
+        if any(word not in self._guess_index for word in pool_words):
+            return False
+        self._verified_guess_pool = candidate_pool
+        return True
+
+    def branch_cost_lower_bound(self, branch_indices):
+        """Admissible floor on the branch's own ERD, over the whole guess vocabulary.
+
+        A branch's ERD is the minimum over candidates of that candidate's cost,
+        and every candidate costs at least 3 - (group_count + has_self)/k, so
+        the minimum of that expression over all guess words is a floor no
+        strategy can beat.  Never returns less than 2 - 1/k, the floor a
+        perfect all-singletons split attains.
+
+        Unlike candidate_stats().cost_lower_bound.min(), which bounds one
+        candidate's cost, this bounds the whole branch — which is what a parent
+        needs to price a sub-branch it has not solved yet.
+        """
+        branch_size = len(branch_indices)
+        if branch_size <= 1:
+            return float(branch_size)
+        all_singletons_floor = 2.0 - 1.0 / branch_size
+        counts = self.counts_for_all_candidates(branch_indices)
+        group_count = (counts > 0).sum(axis=1)
+        has_self = counts[:, 242] > 0
+        # Largest (group_count + has_self) gives the smallest per-candidate
+        # bound, so it is the branch-wide floor.
+        widest_split = int((group_count + has_self).max())
+        return max(all_singletons_floor, 3.0 - widest_split / branch_size)
 
     def patterns_for_candidates(self, candidate_indices, branch_indices):
         """Raw (len(candidate_indices), n) uint8 slice of response pattern values."""
