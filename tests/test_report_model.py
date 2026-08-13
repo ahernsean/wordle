@@ -32,7 +32,7 @@ from report_model import (
     parse_report_branch_target,
     resolve_branch_reference,
 )
-from wordle_engine import ERD_ALL, GAME_GUESSES
+from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache
 
 
 ANSWERS = ["salet", "crane", "nurdy", "khaki"]
@@ -182,6 +182,38 @@ class ReportModelTest(unittest.TestCase):
             summary["response_group_count"],
             report["data"]["response_group_counts"]["response_group_count"],
         )
+
+    def test_reports_live_owner_priority_for_stale_promoted_branch(self):
+        response_groups = ResponseCache(ANSWERS).group_words("salet", ANSWERS)
+        pattern, branch_words = next(iter(response_groups.items()))
+        branch_key = ScoreCache.encode_subset(branch_words)
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (branch_key, len(branch_words), 9, "salet", pattern),
+        ])
+        claimed = queue.claim_next("worker-0")
+        queue.create_branch(
+            branch_key, len(branch_words), 5, priority=1_000_001,
+            source_word="salet", source_pattern=pattern,
+            source_work_id=claimed["source_work_id"],
+        )
+        queue.close()
+
+        overview = collect_overview_report(self.sources)
+        word = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+        ))
+        branch = collect_report(self.sources, ReportRequest(
+            report_kind="branch",
+            branch_target=parse_report_branch_target(
+                "@" + branch_reference(branch_key)),
+        ))
+
+        self.assertEqual(overview["data"]["branches"][0]["priority"], 9)
+        self.assertEqual(
+            next(row for row in word["data"]["response_groups"]
+                 if row["priority"] is not None)["priority"], 9)
+        self.assertEqual(branch["data"]["queue"]["priority"], 9)
 
     def test_response_group_key_orders_status_by_lifecycle(self):
         order = [

@@ -25,6 +25,7 @@ WORDS_C = ["crane", "slate", "trace"]
 def _make_args(queue_path, **overrides):
     args = types.SimpleNamespace(
         word="salet",
+        source_word=None,
         priority=1,
         source_work_id=None,
         queue=queue_path,
@@ -44,6 +45,12 @@ class TestQueueSourcePriority(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             erd_search.cmd_queue_source_priority(args)
+        return buf.getvalue()
+
+    def _run_branch_priority(self, args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            erd_search.cmd_queue_priority(args)
         return buf.getvalue()
 
     def test_sets_priority_for_pending_root_active_root_and_descendant(self):
@@ -107,6 +114,36 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
         self.assertEqual(queue.get_pending_branch(key)['priority'], 0)
+
+    def test_ownerless_source_word_updates_only_open_ownerless_branches(self):
+        queue = ERDQueue(self.queue_path)
+        ownerless_key = ScoreCache.encode_subset(WORDS_A)
+        owned_key = ScoreCache.encode_subset(WORDS_B)
+        done_key = ScoreCache.encode_subset(WORDS_C)
+        queue.create_branch(ownerless_key, len(WORDS_A), 20,
+                            priority=0, source_word='salet')
+        queue.add_pending_many([(owned_key, len(WORDS_B), 1, 'salet', 0)])
+        claimed = queue.claim_next('worker-0')
+        queue.create_branch(owned_key, len(WORDS_B), 20,
+                            priority=claimed['priority'], source_word='salet',
+                            source_work_id=claimed['source_work_id'])
+        queue.create_branch(done_key, len(WORDS_C), 20,
+                            priority=0, source_word='salet')
+        queue._conn.execute(
+            "UPDATE active_branches SET status = 'finalized' WHERE branch_id = ?",
+            (queue._intern_branch(done_key),))
+        queue.close()
+
+        output = self._run_branch_priority(_make_args(
+            self.queue_path, source_word='salet', priority=9))
+
+        self.assertIn('1 ownerless open branch(es)', output)
+        self.assertIn('ownerless', output)
+        queue = ERDQueue(self.queue_path)
+        self.addCleanup(queue.close)
+        self.assertEqual(queue.get_active_branch(ownerless_key)['priority'], 9)
+        self.assertEqual(queue.get_active_branch(owned_key)['priority'], 1)
+        self.assertEqual(queue.get_active_branch(done_key)['priority'], 0)
 
     def test_unknown_word_reported_distinctly(self):
         queue = ERDQueue(self.queue_path)

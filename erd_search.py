@@ -373,6 +373,21 @@ def cmd_queue_priority(args):
     values in the range 0–999 are reserved for normal use: 0 = default,
     higher = sooner.
     """
+    if getattr(args, 'source_word', None):
+        queue = ERDQueue(args.queue)
+        try:
+            updated = queue.set_ownerless_active_priority(
+                args.source_word.strip().lower(), args.priority)
+        except ValueError as error:
+            print(error)
+            return
+        finally:
+            queue.close()
+        print(f'{updated:,} ownerless open branch(es) for '
+              f'{args.source_word.strip().upper()}: priority set to '
+              f'{args.priority}.')
+        return
+
     from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
@@ -1229,8 +1244,12 @@ def main():
     # -- queue priority --
     p_qp = qsub.add_parser('priority',
                             help='Set the priority of a queued branch')
-    p_qp.add_argument('--word', required=True, metavar='WORD')
-    p_qp.add_argument('--pattern', required=True, metavar='PAT',
+    qp_target = p_qp.add_mutually_exclusive_group(required=True)
+    qp_target.add_argument('--word', metavar='WORD')
+    qp_target.add_argument('--source-word', metavar='WORD',
+                           help='Set every ownerless open branch attributed '
+                                'to this word')
+    p_qp.add_argument('--pattern', metavar='PAT',
                       help='Response pattern (5 chars: g=green y=yellow -=gray)')
     p_qp.add_argument('--priority', required=True, type=int, metavar='N',
                       help='New priority (higher = worked sooner; '
@@ -1326,6 +1345,12 @@ def main():
     ensure_runtime_dir()
     if args.cmd == 'view' and args.format == 'json' and args.watch is not None:
         parser.error('--format json cannot be used with --watch; use jsonl')
+    if (args.cmd == 'queue' and args.queue_cmd == 'priority'
+            and args.word is not None and args.pattern is None):
+        parser.error('--pattern is required with --word')
+    if (args.cmd == 'queue' and args.queue_cmd == 'priority'
+            and args.source_word is not None and args.pattern is not None):
+        parser.error('--pattern can only be used with --word')
     if args.cmd == 'view':
         try:
             args.branch_target = parse_report_branch_target(args.spine)

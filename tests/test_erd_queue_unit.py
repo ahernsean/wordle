@@ -72,6 +72,57 @@ class _TmpQueue(unittest.TestCase):
         return claim[1][0] if claim is not None else None
 
 
+class TestLegacyPriorityMigration(unittest.TestCase):
+    def test_migration_neutralizes_only_unfinished_legacy_priorities(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            queue_path = os.path.join(temporary_directory, 'q.sqlite3')
+            queue = ProductionERDQueue(queue_path)
+            active_key = ScoreCache.encode_subset(WORDS)
+            pending_key = ScoreCache.encode_subset(WORDS[:4])
+            done_key = ScoreCache.encode_subset(WORDS[:3])
+            queue.create_branch(active_key, len(WORDS), N_CANDIDATES,
+                                priority=0, source_word='crane')
+            queue.add_pending_many([
+                (pending_key, 4, 0, 'slate', 0),
+                (done_key, 3, 0, 'trace', 0),
+            ])
+            queue._conn.execute(
+                'UPDATE active_branches SET priority = ?',
+                (erd_queue.LEGACY_PROMOTED_PRIORITY_MIN,))
+            queue._conn.execute(
+                "UPDATE pending_branches SET priority = ?",
+                (erd_queue.LEGACY_PROMOTED_PRIORITY_MIN + 1,))
+            queue._conn.execute(
+                "UPDATE pending_branches SET status = 'done' WHERE branch_id = ?",
+                (queue._intern_branch(done_key),))
+            queue._conn.execute("""
+                UPDATE source_work SET state = 'complete'
+                WHERE source_work_id = (
+                    SELECT source_work_id FROM branch_source_work WHERE branch_id = ?
+                )
+            """, (queue._intern_branch(done_key),))
+            queue._conn.execute(
+                "UPDATE branch_source_work SET resolved_at = 1 WHERE branch_id = ?",
+                (queue._intern_branch(done_key),))
+            queue._conn.execute(
+                "DELETE FROM schema_migrations "
+                "WHERE name = 'neutralize_legacy_promoted_priorities'")
+            queue.close()
+
+            queue = ProductionERDQueue(queue_path)
+            self.addCleanup(queue.close)
+            self.assertEqual(queue.get_active_branch(active_key)['priority'], 0)
+            self.assertEqual(queue.get_pending_branch(pending_key)['priority'], 0)
+            self.assertEqual(
+                queue.get_pending_branch(done_key)['priority'],
+                erd_queue.LEGACY_PROMOTED_PRIORITY_MIN + 1)
+            self.assertEqual(queue.check_source_work_invariants(), [])
+            self.assertEqual(queue._conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations "
+                "WHERE name = 'neutralize_legacy_promoted_priorities'").fetchone()[0],
+                1)
+
+
 class TestBranchLifecycle(_TmpQueue):
     def test_create_branch_returns_true_first_call(self):
         self.assertTrue(self.q.create_branch(self.key, len(WORDS), N_CANDIDATES))
@@ -754,6 +805,37 @@ class TestCheckpoint(_TmpQueue):
 
 
 class TestClaimNext(_TmpQueue):
+    def test_legacy_priority_is_clamped_but_still_claimable(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             priority=erd_queue.LEGACY_PROMOTED_PRIORITY_MIN,
+                             source_word='crane')
+
+        owner = self.q.owner_row_for_branch(self.key)
+        self.assertEqual(owner['owner_priority'], 0)
+        self.assertEqual(
+            [bytes(row['branch_key'])
+             for row in self.q.direct_branches_in_progress()], [self.key])
+        self.assertIsNotNone(self.q.claim_next_bundle(
+            self.key, 'worker-0', N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1))
+        self.q._conn.execute(
+            'UPDATE active_branches SET priority = 0 WHERE branch_id = ?',
+            (self.q._intern_branch(self.key),))
+
+    def test_invariant_reports_legacy_priority_with_source_and_membership(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             priority=erd_queue.LEGACY_PROMOTED_PRIORITY_MIN,
+                             source_word='crane')
+
+        violations = self.q.check_source_work_invariants()
+
+        self.assertIn(
+            '1 open branch(es) at or above legacy priority 1,000,000: crane '
+            'without live membership', violations)
+        self.q._conn.execute(
+            'UPDATE active_branches SET priority = 0 WHERE branch_id = ?',
+            (self.q._intern_branch(self.key),))
+
     def test_source_work_invariant_checker_reports_each_violation(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         direct_key = ScoreCache.encode_subset(WORDS[:3])

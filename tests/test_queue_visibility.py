@@ -555,7 +555,8 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(tree[0]["branch_key"], small_key)
 
         summary = self.q.queue_summary()
-        self.assertEqual(summary["by_priority"]["coop"], 1)
+        self.assertEqual(summary["by_priority"]["coop"], 0)
+        self.assertGreaterEqual(summary["by_priority"]["0"], 2)
         self.assertGreaterEqual(summary["by_priority"]["1-999"], 2)
         self.assertEqual(summary["by_size"]["2-9"], 1)
         self.assertEqual(summary["by_size"]["10-99"], 1)
