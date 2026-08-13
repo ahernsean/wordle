@@ -652,6 +652,37 @@ class ReportClientBrowserTest(unittest.TestCase):
             result,
         )
 
+    def test_worker_card_title_wraps_a_long_state_instead_of_clipping(self):
+        self.page.set_viewport_size({"width": 700, "height": 800})
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/workers')).json();
+          report.data.rows[0]={...report.data.rows[0],state:'transitioning'};
+          applyReport(report,null,{...__reportClient.getState(),kind:'workers'});
+          const card=document.querySelector('.worker');
+          const title=card.querySelector('.card-title');
+          const chip=title.querySelector('.chip');
+          const word=title.querySelector('.word');
+          const cardRect=card.getBoundingClientRect();
+          const wordRect=word.getBoundingClientRect();
+          return {
+            chipText:chip.textContent,
+            chipHeight:chip.getBoundingClientRect().height,
+            titleHeight:title.getBoundingClientRect().height,
+            letters:[...word.querySelectorAll('.letter')].map(letter=>letter.textContent),
+            wordFitsWithinCard:wordRect.right<=cardRect.right+1&&wordRect.left>=cardRect.left-1,
+          };
+        }""")
+        # The state text arrives and renders whole -- overflow-wrap:anywhere
+        # on the ancestor .card must not be allowed to slice it mid-word.
+        self.assertEqual(result["chipText"], "transitioning")
+        self.assertLess(result["chipHeight"], 20, result)
+        # Too wide for one line at this width, so the candidate tiles drop to
+        # a line of their own rather than being clipped or spilling past the
+        # card: all five letters render, and the tiles land inside the card.
+        self.assertGreater(result["titleHeight"], result["chipHeight"] + 5, result)
+        self.assertEqual(result["letters"], ["N", "U", "R", "D", "Y"])
+        self.assertTrue(result["wordFitsWithinCard"], result)
+
     def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
