@@ -86,6 +86,9 @@ DEFAULT_REPUBLISH_LIMIT = 3
 SOURCE_PRIORITY_MIN = 0
 SOURCE_PRIORITY_MAX = 999
 
+# Priorities at or above this bound are never allowed to preempt requested work.
+LEGACY_PROMOTED_PRIORITY_MIN = 1_000_000
+
 # A worker's scheduling role, recorded alongside its heartbeat so a report can
 # explain why the worker is running the branch it is on: PREFERRED is a
 # highest-requested-priority eligible source at the claim boundary that
@@ -308,6 +311,11 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
 CREATE TABLE IF NOT EXISTS run_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name         TEXT PRIMARY KEY,
+    completed_at INTEGER NOT NULL
 );
 
 -- A branch currently being solved cooperatively by one or more workers, each
@@ -1269,6 +1277,16 @@ class ERDQueue:
                     AND source.state = 'complete'
               )
         """, (int(time.time()),))
+        self._apply_queue_migration(
+            "neutralize_legacy_promoted_priorities",
+            (
+                "UPDATE active_branches SET priority = 0 "
+                "WHERE status = 'open' AND priority >= ?",
+                "UPDATE pending_branches SET priority = 0 "
+                "WHERE status != 'done' AND priority >= ?",
+            ),
+            (LEGACY_PROMOTED_PRIORITY_MIN,),
+        )
         self._rebuild_queue_views()
 
         # Claims bundle index on the (post-normalization) branch_id key.  After
@@ -1344,6 +1362,23 @@ class ERDQueue:
         self._conn.execute(
             "INSERT OR IGNORE INTO run_meta (key, value) VALUES ('epoch', '0')")
 
+    def _apply_queue_migration(self, name: str, statements: tuple[str, ...],
+                               parameters: tuple = ()) -> None:
+        """Apply one named queue-data migration exactly once."""
+        self._conn.execute("SAVEPOINT queue_data_migration")
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name, completed_at) "
+                "VALUES (?, ?)", (name, int(time.time())))
+            if cur.rowcount:
+                for statement in statements:
+                    self._conn.execute(statement, parameters)
+            self._conn.execute("RELEASE queue_data_migration")
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK TO queue_data_migration")
+            self._conn.execute("RELEASE queue_data_migration")
+            raise
+
     def _rebuild_queue_views(self):
         """Restore queue views when their stored definition differs from code."""
         view_definitions = {
@@ -1360,7 +1395,7 @@ class ERDQueue:
                 WHERE membership.resolved_at IS NULL
                   AND source.state != 'complete'
             """,
-            "active_branch_owner_rows": """
+            "active_branch_owner_rows": f"""
                 CREATE VIEW active_branch_owner_rows AS
                 SELECT active.*,
                        branch.branch_key,
@@ -1369,7 +1404,11 @@ class ERDQueue:
                            AS owner_source_word,
                        COALESCE(owner.owner_root_pattern, active.source_pattern)
                            AS owner_root_pattern,
-                       COALESCE(owner.owner_priority, active.priority)
+                       COALESCE(
+                           owner.owner_priority,
+                           CASE WHEN active.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
+                                THEN 0 ELSE active.priority END
+                       )
                            AS owner_priority
                 FROM active_branches AS active
                 JOIN branches AS branch USING (branch_id)
@@ -3484,7 +3523,7 @@ class ERDQueue:
             b = "none" if r["budget"] is None else str(r["budget"])
             by_budget[b] = by_budget.get(b, 0) + 1
             pri = r["priority"] or 0
-            if pri >= 1_000_000:
+            if pri >= LEGACY_PROMOTED_PRIORITY_MIN:
                 by_priority["coop"] += 1
             elif pri == 0:
                 by_priority["0"] += 1
@@ -4306,6 +4345,21 @@ class ERDQueue:
             (priority, branch_id))
         return self._conn.execute("SELECT changes()").fetchone()[0] > 0
 
+    def set_ownerless_active_priority(self, source_word: str, priority: int) -> int:
+        """Set priority on open, ownerless branches attributed to source_word."""
+        check_source_priority_range(priority)
+        cur = self._conn.execute("""
+            UPDATE active_branches AS active
+            SET priority = ?
+            WHERE active.status = 'open'
+              AND lower(active.source_word) = lower(?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM live_branch_source_rows AS owner
+                  WHERE owner.branch_id = active.branch_id
+              )
+        """, (priority, source_word))
+        return cur.rowcount
+
     def set_source_work_priority(self, source_work_id: int, priority: int) -> bool:
         """Atomically change a source request and every owned branch priority."""
         check_source_priority_range(priority)
@@ -4538,6 +4592,29 @@ class ERDQueue:
                 f"source_work_id {row['source_work_id']} has requested priority "
                 f"{row['requested_priority']} outside "
                 f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}"
+            )
+
+        legacy_active_priorities = self._conn.execute("""
+            SELECT active.source_word,
+                   EXISTS (
+                       SELECT 1 FROM live_branch_source_rows AS owner
+                       WHERE owner.branch_id = active.branch_id
+                   ) AS has_live_membership,
+                   COUNT(*) AS branch_count
+            FROM active_branches AS active
+            WHERE active.status = 'open'
+              AND active.priority >= ?
+            GROUP BY active.source_word, has_live_membership
+            ORDER BY has_live_membership, active.source_word
+        """, (LEGACY_PROMOTED_PRIORITY_MIN,)).fetchall()
+        for row in legacy_active_priorities:
+            source_word = row["source_word"] or "(none)"
+            membership = ("with live membership" if row["has_live_membership"]
+                          else "without live membership")
+            violations.append(
+                f"{row['branch_count']} open branch(es) at or above legacy "
+                f"priority {LEGACY_PROMOTED_PRIORITY_MIN:,}: {source_word} "
+                f"{membership}"
             )
 
         invalid_effective_priorities = self._conn.execute("""

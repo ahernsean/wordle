@@ -413,10 +413,15 @@ Priority values: 0 = default; 1 = high; use 0–999 for normal work.
 
 ```bash
 python3.13 erd_search.py queue priority --word salet --pattern ..... --priority 1
+
+# Repair open branches with no live source-work membership for one source word:
+python3.13 erd_search.py queue priority --source-word salet --priority 1
 ```
 
-Only affects branches with status `pending` (priority is read at claim time, so
-changing it on an in-progress branch has no effect).
+The `--word`/`--pattern` form affects only branches with status `pending`.
+The `--source-word` form affects only open branches without a live source-work
+membership, including active branches left by older queue data. It never changes
+branches owned by a live request; use `queue source-priority` for those.
 
 ### Change a source-work request's priority
 
