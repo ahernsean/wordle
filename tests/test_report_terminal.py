@@ -692,11 +692,13 @@ class OverviewRendererTest(unittest.TestCase):
             "rows": [{
                 "branch_reference": "abcd1234ef00", "answer_count": 33,
                 "best_erd": 2.793103449275866, "ceiling": 2.0000000009999996,
+                "spine": "RAISE ----- CRANE y----",
             }],
         }
         output = render_report(report, width=120)
         self.assertIn("best_erd=2.793", output)
         self.assertIn("ceiling=2.000", output)
+        self.assertIn("spine=RAISE ----- CRANE y----", output)
         self.assertNotIn("2.793103449275866", output)
 
     def test_hotspot_render_labels_population_window_and_truncation(self):
@@ -960,7 +962,33 @@ class CollectionRendererTest(unittest.TestCase):
         })
         queue_output = render_report(queue_report, width=120)
         self.assertIn("guess_depth=2", queue_output)
+        self.assertIn("spine=RAISE ----- CRANE y----", queue_output)
         self.assertNotIn(" d=2", queue_output)
+        narrow_queue_output = render_report(queue_report, width=40)
+        self.assertTrue(all(
+            len(line) <= 40 for line in narrow_queue_output.splitlines()
+        ))
+
+        fallback_queue_report = self._report("queue", {
+            "summary": {
+                "branch_count_by_status": {"pending": 1},
+                "branch_count_by_phase": {"evaluating": 1},
+            },
+            "matched_rows": 1,
+            "rows": [{
+                "branch_reference": "fedcba987654",
+                "branch_status": "pending",
+                "branch_phase": "evaluating",
+                "answer_count": 2,
+                "source_word": "raise",
+                "source_pattern": "-----",
+                "priority": 7,
+                "worker_count": 0,
+            }],
+        })
+        fallback_queue_output = render_report(fallback_queue_report, width=120)
+        self.assertIn("guess_depth=1", fallback_queue_output)
+        self.assertIn("spine=RAISE -----", fallback_queue_output)
 
         worker = deepcopy(overview_report()["data"]["workers"][0])
         worker["state"] = "stale"
