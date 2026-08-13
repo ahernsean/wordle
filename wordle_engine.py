@@ -1137,8 +1137,27 @@ class BranchFloorTable:
             else None)
         self._capacity = capacity
         self._floors = OrderedDict()
+        self._verified_pool = None
         self.hits = 0
         self.misses = 0
+
+    def matches_pool(self, candidate_pool):
+        """True when candidate_pool is the word set this table was built for.
+
+        A table answers only for its own pool, so a caller that supplies one
+        must be holding it against the same words the search draws candidates
+        from.  Identity is checked first, so the steady state -- one pool object
+        for a whole solve -- costs a pointer comparison rather than rebuilding
+        a set per candidate.
+        """
+        if candidate_pool is None:
+            return False
+        if candidate_pool is self._verified_pool:
+            return True
+        if set(candidate_pool) != set(self.candidate_pool):
+            return False
+        self._verified_pool = candidate_pool
+        return True
 
     def branch_cost_lower_bound(self, sub_branch):
         key = tuple(sorted(sub_branch))
@@ -1332,6 +1351,11 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     floor_hit is always returned (even on early returns) so the caller can
     aggregate taint across all candidates it tries, including discarded ones.
     """
+    if (branch_floor_table is not None
+            and not branch_floor_table.matches_pool(guesses)):
+        raise ValueError(
+            "branch_floor_table's candidate pool is not this search's guess "
+            "words; its floors would price strategies the search cannot play")
     if n is None:
         n = len(branch_words)
     # Liveness tick: fire once per candidate evaluation (the dominant work
@@ -1370,15 +1394,15 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # decided the candidate's fate: a candidate cut by the two-level gate below
     # does near-zero work, so reporting it against the weaker closed-form bound
     # would record the engine's main fast path as a prediction miss.
-    def _observe(effective_lower_bound, pruned):
+    def _observe(pruned):
         if metric_observer is not None:
             metric_observer([len(g) for g in groups.values()], has_self,
-                            effective_lower_bound, best_erd, pruned)
+                            candidate_cost_lower_bound, best_erd, pruned)
 
     if candidate_cost_lower_bound >= best_erd:
         # Provably can't beat the bound (but may well be feasible) — a cutoff,
         # not infeasibility.  See OVER_ERD_LIMIT in _solve_subset.
-        _observe(candidate_cost_lower_bound, True)
+        _observe(True)
         return (OVER_ERD_LIMIT, None, None, False)
 
     cost = 1.0
@@ -1413,7 +1437,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     effective_cost_lower_bound = max(candidate_cost_lower_bound,
                                      two_level_cost_lower_bound)
     erd_lower_bound_pruned = effective_cost_lower_bound >= best_erd
-    _observe(effective_cost_lower_bound, erd_lower_bound_pruned)
+    _observe(erd_lower_bound_pruned)
     if erd_lower_bound_pruned:
         return (OVER_ERD_LIMIT, None, None, False)
 
@@ -1740,9 +1764,14 @@ def min_expected_guesses(branch_words, cache, score_cache,
     # search's own candidate list is known.  guesses=None means each node
     # draws candidates from its own branch words, a pool that changes as the
     # recursion descends and so cannot back a table.
-    if branch_floor_table is None and guesses is not None:
-        branch_floor_table = BranchFloorTable(
-            guesses, cache=cache, pattern_matrix=pattern_matrix)
+    if branch_floor_table is None:
+        if guesses is not None:
+            branch_floor_table = BranchFloorTable(
+                guesses, cache=cache, pattern_matrix=pattern_matrix)
+    elif not branch_floor_table.matches_pool(guesses):
+        raise ValueError(
+            "branch_floor_table's candidate pool is not this search's guess "
+            "words; its floors would price strategies the search cannot play")
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat,
                         note_depth, progress_callback, subbranch_solver,

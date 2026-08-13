@@ -299,6 +299,36 @@ class TestThePoolCannotDrift(_VocabularyMixin, unittest.TestCase):
     WIDE = ['aided', 'bided', 'sided', 'tided', 'abacs']
 
 
+class TestASuppliedTableMustBeTheSearchesPool(_VocabularyMixin, unittest.TestCase):
+    """Owning its memo stops a table serving a foreign pool internally; it does
+    not stop a caller handing in a table built for different words. A table
+    bound to a sub-branch alone reports a floor that ignores every other word
+    the search may play, which prunes reachable strategies."""
+
+    def _reject(self, table, guesses):
+        words = self._branch(20, seed=61)
+        with self.assertRaises(ValueError):
+            evaluate_candidate(words, self.guess_words[0],
+                               self._response_cache(), None, guesses=guesses,
+                               policy=ERD_ALL, budget=5,
+                               pattern_matrix=self.pattern_matrix,
+                               branch_floor_table=table)
+
+    def test_table_bound_to_a_narrower_pool_is_rejected(self):
+        narrow = BranchFloorTable(self.guess_words[:40],
+                                  cache=self._response_cache())
+        self._reject(narrow, self.guess_words)
+
+    def test_table_is_rejected_when_the_search_has_no_pool(self):
+        self._reject(self._table(), None)
+
+    def test_matching_pool_is_accepted_by_word_set_not_by_object(self):
+        table = self._table()
+        self.assertTrue(table.matches_pool(list(self.guess_words)))
+        self.assertFalse(table.matches_pool(self.guess_words[:-1]))
+        self.assertFalse(table.matches_pool(None))
+
+
 class TestMinimumSizeThreshold(_VocabularyMixin, unittest.TestCase):
 
     def test_below_the_threshold_the_all_singletons_floor_stands(self):
@@ -361,8 +391,11 @@ class TestGatesAreObservedOnce(_VocabularyMixin, unittest.TestCase):
         seen = self._observe(words, candidate, between)
         self.assertEqual(len(seen), 1)
         bound, pruned = seen[0]
-        self.assertTrue(pruned)
-        self.assertGreaterEqual(bound, between)
+        self.assertTrue(pruned, "the second gate cut it, so it must read as pruned")
+        # The reported bound stays the closed form: analyze_swarm_telemetry
+        # inverts 3 - (G + has_self)/n from this field to recover has_self, so
+        # storing the tighter effective bound here would corrupt that.
+        self.assertEqual(bound, closed_form)
 
 
 if __name__ == "__main__":
