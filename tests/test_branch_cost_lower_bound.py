@@ -390,6 +390,72 @@ class TestThePoolCannotDrift(_VocabularyMixin, unittest.TestCase):
                 best_erd=2.944444, guesses=pool, policy=ERD_ALL, budget=5,
                 branch_floor_table=table)
 
+    # A parent whose candidate splits off one word and leaves the other eight
+    # together, so the eight-word group is what a pool prices and a ninth guess
+    # word can visibly change.
+    DRIFT_PARENT = ['aback', 'again', 'agita', 'agora', 'alarm', 'alias',
+                    'allay', 'altar', 'abase']
+    DRIFT_CANDIDATE = 'aahed'
+    DRIFT_GROUP = ['aback', 'again', 'agita', 'agora', 'alarm', 'alias',
+                   'allay', 'altar']
+    DRIFT_EXTRA = 'agars'
+
+    def _drift_solve(self, mutate):
+        """Evaluate the parent while a heartbeat may append to the guess list."""
+        pool = list(self.DRIFT_GROUP)
+        table = BranchFloorTable(list(self.DRIFT_GROUP),
+                                 cache=ResponseCache(self.DRIFT_PARENT))
+        fired = []
+
+        def heartbeat():
+            if mutate and not fired:
+                fired.append(True)
+                pool.append(self.DRIFT_EXTRA)
+
+        result = evaluate_candidate(
+            self.DRIFT_PARENT, self.DRIFT_CANDIDATE,
+            ResponseCache(self.DRIFT_PARENT + [self.DRIFT_EXTRA]), None,
+            best_erd=float('inf'), guesses=pool, policy=ERD_ALL, budget=5,
+            heartbeat=heartbeat, branch_floor_table=table)
+        self.assertEqual(bool(fired), mutate, "the heartbeat never ran")
+        return result[:2]
+
+    def test_a_callback_cannot_widen_the_pool_after_validation(self):
+        """The search consumes what was validated, not what the caller still holds.
+
+        Validating the caller's list establishes only what the pool was at that
+        instant; `heartbeat` runs afterwards.  A callback that appends to that
+        list leaves the table pricing eight words while the search draws
+        candidates from nine — floors above what the wider pool reaches.  The
+        entry snapshot is what closes it, so appending must not be able to
+        change the answer at all.
+        """
+        self.assertEqual(self._drift_solve(mutate=False),
+                         self._drift_solve(mutate=True),
+                         "a heartbeat changed the pool the search ran on")
+
+    def test_a_table_cannot_be_repointed_at_another_pool(self):
+        """The other direction: an immutable pool, a table swapped underneath it.
+
+        Validation passes, then the pool the table prices for is replaced.  The
+        memo it has already filled was computed against the old words, so every
+        stored floor would now answer for a vocabulary the table no longer
+        claims.  Construction is the only time the pool is set.
+        """
+        table = BranchFloorTable(tuple(self.DRIFT_GROUP),
+                                 cache=ResponseCache(self.DRIFT_PARENT))
+        with self.assertRaises(AttributeError):
+            table.candidate_pool = tuple(self.DRIFT_GROUP[:4])
+
+    def test_a_repointed_table_cannot_invalidate_memoized_floors(self):
+        """Floors already memoized stay floors for the words they were priced on."""
+        table = BranchFloorTable(tuple(self.WIDE), cache=ResponseCache(self.ANSWERS))
+        before = table.branch_cost_lower_bound(self.ANSWERS)
+        with self.assertRaises(AttributeError):
+            table.candidate_pool = tuple(self.ANSWERS)
+        self.assertEqual(table.candidate_pool, tuple(self.WIDE))
+        self.assertEqual(table.branch_cost_lower_bound(self.ANSWERS), before)
+
     def test_a_supplied_table_does_not_impose_its_own_candidate_order(self):
         """Order breaks ties; a table has no standing to change it.
 

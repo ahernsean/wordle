@@ -1079,20 +1079,61 @@ def _by_group_size(item):
 def _candidate_cost_lower_bound(group_sizes, has_self, n):
     """The engine's admissible lower bound on a candidate's ERD, shared by
     evaluate_candidate and the cost-estimator functions below: cost >=
-    3 - (number_of_groups + has_self) / n. group_sizes need only support
-    len() — evaluate_candidate passes groups.values() directly rather than
-    materializing a list of sizes."""
+    3 - (number_of_groups + has_self) / n.
+
+    Why that holds.  Playing this candidate on a branch of `n` words sends each
+    answer into one response group.  Only one answer can be finished by the
+    guess itself — the candidate, when it is one of the branch words — and that
+    line costs 1.  Within any other group, the next guess can finish at most one
+    more answer, at a cost of 2; every remaining answer in that group needs at
+    least a third guess.  So a group of `m` answers costs at least
+    `2 + 3(m - 1) = 3m - 1`, and summing over the `G - has_self` groups that are
+    not the candidate's own gives at least `3(n - has_self) - (G - has_self)`.
+    Adding the candidate's own line, `1 = 3 - 2`, the total over all answers is
+    at least `3n - G - has_self`.  Dividing by `n` gives the bound.
+
+    Its ceiling is what makes the branch floor necessary: `G + has_self` cannot
+    exceed `n + 1`, so this can never reach 3.0, and on a branch whose true ERD
+    is 3.0 or more it prunes nothing at all.
+
+    group_sizes need only support len() — evaluate_candidate passes
+    groups.values() directly rather than materializing a list of sizes.
+    """
     return 3.0 - (len(group_sizes) + (1 if has_self else 0)) / n
 
 
 def all_singletons_floor(size):
     """ERD floor for a branch of `size` words attained by a perfect split: one
-    guess wins outright, every other word is named on the guess after."""
+    guess wins outright, every other word is named on the guess after.
+
+    Admissible for the same reason and one level weaker: at most one answer is
+    found in one guess, so the total over `size` answers is at least
+    `1 + 2(size - 1)`.  It asks nothing about which words may be played, which
+    is why it holds for any pool and why the branch floor — which does ask —
+    is the larger of the two on every branch no guess actually shatters.
+    """
     return 2.0 - 1.0 / size
 
 
 class BranchFloorTable:
     """Branch ERD floors for ONE candidate pool, fixed at construction.
+
+    The floor for a branch is the best `_candidate_cost_lower_bound` any word
+    in the pool can be held to: since every candidate costs at least
+    `3 - (G_c + has_self_c) / k`, the branch costs at least that minimized over
+    the pool, which is `3 - max_c(G_c + has_self_c) / k`.  Taking the maximum
+    of that with `all_singletons_floor(k)` is admissible because each is
+    separately a lower bound on the same quantity, and the larger of two lower
+    bounds is a lower bound.
+
+    Both terms are minimized over the pool the search will draw candidates
+    from, and that is the invariant the whole thing rests on: the pool this
+    table prices against and the pool the search may play must be the same
+    words, and must stay the same words for the entire solve.  Widening either
+    one alone breaks it.  A search allowed to play a word the table did not
+    price may have a strategy cheaper than the floor claims possible, and the
+    floor then prunes it — which raises the reported ERD with nothing to mark
+    that a better line was discarded.
 
     A floor is only a floor over the words that may actually be played: a wider
     pool splits a branch more finely and so lowers it.  Serving a floor
@@ -1120,20 +1161,33 @@ class BranchFloorTable:
         # A tuple is kept as-is so a caller that snapshotted its pool holds the
         # very object this table answers for, and the per-candidate check
         # stays a pointer comparison.
-        self.candidate_pool = (candidate_pool
-                               if isinstance(candidate_pool, tuple)
-                               else tuple(candidate_pool))
+        self._candidate_pool = (candidate_pool
+                                if isinstance(candidate_pool, tuple)
+                                else tuple(candidate_pool))
         self._cache = cache
         self._pattern_matrix = (
             pattern_matrix
             if pattern_matrix is not None
-            and pattern_matrix.is_guess_pool(self.candidate_pool)
+            and pattern_matrix.is_guess_pool(self._candidate_pool)
             else None)
         self._capacity = capacity
         self._floors = OrderedDict()
         self._verified_pool = None
         self.hits = 0
         self.misses = 0
+
+    @property
+    def candidate_pool(self):
+        """The words this table prices strategies over, fixed at construction.
+
+        Read-only: the memo holds floors computed against these words, and a
+        pool swapped in afterwards would leave every stored floor priced for
+        words the table no longer claims — approval granted for one vocabulary,
+        answers given for another.  That is the same inadmissible pairing a
+        mutable pool produces, reached from the other side.  The memo stays
+        mutable; only what it is a memo *of* is frozen.
+        """
+        return self._candidate_pool
 
     def matches_pool(self, candidate_pool):
         """True when candidate_pool is the word set this table was built for.
@@ -1159,10 +1213,10 @@ class BranchFloorTable:
         """
         if candidate_pool is None:
             return False
-        if (candidate_pool is self.candidate_pool
+        if (candidate_pool is self._candidate_pool
                 or candidate_pool is self._verified_pool):
             return True
-        if set(candidate_pool) != set(self.candidate_pool):
+        if set(candidate_pool) != set(self._candidate_pool):
             return False
         if isinstance(candidate_pool, tuple):
             self._verified_pool = candidate_pool
@@ -1185,7 +1239,7 @@ class BranchFloorTable:
             if self._cache is None:
                 return all_singletons_floor(len(sub_branch))
             floor = self._cache.branch_cost_lower_bound(sub_branch,
-                                                        self.candidate_pool)
+                                                        self._candidate_pool)
         self._floors[key] = floor
         if len(self._floors) > self._capacity:
             self._floors.popitem(last=False)
@@ -1366,6 +1420,17 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     floor_hit is always returned (even on early returns) so the caller can
     aggregate taint across all candidates it tries, including discarded ones.
     """
+    # Snapshot the caller's pool before anything else can see it, keeping ITS
+    # order (which breaks ties among equal-cost candidates).  Validating the
+    # object the caller still holds only establishes what the pool was at that
+    # instant: `heartbeat` runs below, and a callback that appends to a list
+    # handed in here would widen the search while the table goes on quoting
+    # floors priced for the narrower pool — floors that sit above what the
+    # wider pool can reach, so the search prunes strategies it can play.  A
+    # caller already holding a tuple hands over that same object, so a table
+    # built for it still matches by identity.
+    if guesses is not None:
+        guesses = tuple(guesses)
     if (branch_floor_table is not None
             and not branch_floor_table.matches_pool(guesses)):
         raise ValueError(
