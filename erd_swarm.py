@@ -567,7 +567,10 @@ class _BranchWorker:
         self._adaptive = enable_adaptive_decomposition
 
         self.all_answers = load_word_list(ANSWER_FILE)
-        self.all_words = load_word_list(WORDS_FILE)
+        # Immutable, and in the order the file gives: candidate order breaks
+        # ties among equal-cost candidates, and every claim draws from this
+        # one pool for the worker's lifetime.
+        self.all_words = tuple(load_word_list(WORDS_FILE))
         self.n_candidates = len(self.all_words)
         max_entries = mem_cache_limit(n_workers)
         logger.info('%s mem_cache cap: %d entries (~%.0f MB)',
@@ -579,13 +582,10 @@ class _BranchWorker:
             cache_path, self.all_words, self.all_answers, self.score_cache)
         # One table for the worker's whole lifetime: every claim draws its
         # candidates from all_words, so the pool never changes and floors carry
-        # over between claims.  all_words then becomes the table's own tuple,
-        # which is both what makes the per-candidate pool check a pointer
-        # comparison and what stops the worker's pool from ever diverging from
-        # the pool its floors are priced against.
+        # over between claims.  The table holds that same tuple, which is what
+        # keeps the per-candidate pool check a pointer comparison.
         self.branch_floor_table = BranchFloorTable(
             self.all_words, cache=self.rcache, pattern_matrix=self.pattern_matrix)
-        self.all_words = self.branch_floor_table.candidate_pool
         self.queue = ERDQueue(queue_path)
 
         self.started = int(time.time())

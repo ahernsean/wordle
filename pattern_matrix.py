@@ -254,8 +254,12 @@ class PatternMatrix:
 
         An approval is remembered only against a tuple.  A list that passed
         once can gain a word afterwards, and a remembered approval would then
-        keep vouching for a pool this matrix no longer answers for.
+        keep vouching for a pool this matrix no longer answers for.  The
+        no-pool case is settled before that memo is consulted, so an unset
+        memo is never mistaken for a pool that matched.
         """
+        if candidate_pool is None:
+            return False
         if candidate_pool is self._verified_guess_pool:
             return True
         if len(candidate_pool) != self.n_guesses:

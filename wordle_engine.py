@@ -1117,7 +1117,12 @@ class BranchFloorTable:
 
     def __init__(self, candidate_pool, cache=None, pattern_matrix=None,
                  capacity=_BRANCH_FLOOR_CAPACITY):
-        self.candidate_pool = tuple(candidate_pool)
+        # A tuple is kept as-is so a caller that snapshotted its pool holds the
+        # very object this table answers for, and the per-candidate check
+        # stays a pointer comparison.
+        self.candidate_pool = (candidate_pool
+                               if isinstance(candidate_pool, tuple)
+                               else tuple(candidate_pool))
         self._cache = cache
         self._pattern_matrix = (
             pattern_matrix
@@ -1126,6 +1131,7 @@ class BranchFloorTable:
             else None)
         self._capacity = capacity
         self._floors = OrderedDict()
+        self._verified_pool = None
         self.hits = 0
         self.misses = 0
 
@@ -1136,23 +1142,31 @@ class BranchFloorTable:
         must be holding it against the same words the search draws candidates
         from.
 
-        An approval is never remembered against the object that earned it.
-        A pool is usually a list, and a remembered approval would go on
-        holding after that same list gained a word: the table would keep
-        answering with floors priced for the smaller pool, which sit above
-        what the larger one can reach, and the search would prune strategies
-        it can actually play.  The only pool whose approval survives is this
-        table's own `candidate_pool`, which is a tuple and cannot gain one.
+        An approval is remembered only against a pool that cannot change.  A
+        list that passed once can gain a word afterwards, and a remembered
+        approval would go on holding: the table would keep answering with
+        floors priced for the smaller pool, which sit above what the larger
+        one can reach, and the search would prune strategies it can actually
+        play.  A tuple cannot gain a word, so its approval is safe to keep —
+        which is why callers snapshot their pool as a tuple rather than
+        carrying a list forward.
 
-        That is what makes the pointer comparison below both the fast path and
-        the safe one, and why callers adopt `candidate_pool` after validating
-        against it rather than carrying their own list forward.
+        Word-set equality is deliberate: order is the search's business, not
+        this table's.  Two pools of the same words split a branch identically,
+        so they have the same floors, while the order among equal-cost
+        candidates decides which one the search records.  A table therefore
+        approves an ordering it does not share, and must never impose its own.
         """
-        if candidate_pool is self.candidate_pool:
-            return True
         if candidate_pool is None:
             return False
-        return set(candidate_pool) == set(self.candidate_pool)
+        if (candidate_pool is self.candidate_pool
+                or candidate_pool is self._verified_pool):
+            return True
+        if set(candidate_pool) != set(self.candidate_pool):
+            return False
+        if isinstance(candidate_pool, tuple):
+            self._verified_pool = candidate_pool
+        return True
 
     def branch_cost_lower_bound(self, sub_branch):
         key = tuple(sorted(sub_branch))
@@ -1352,17 +1366,11 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     floor_hit is always returned (even on early returns) so the caller can
     aggregate taint across all candidates it tries, including discarded ones.
     """
-    if branch_floor_table is not None:
-        if not branch_floor_table.matches_pool(guesses):
-            raise ValueError(
-                "branch_floor_table's candidate pool is not this search's "
-                "guess words; its floors would price strategies the search "
-                "cannot play")
-        # Draw candidates from the table's own tuple from here on.  The
-        # caller's list has been checked once, at this instant; adopting the
-        # immutable pool the floors were priced against means a later change
-        # to that list cannot put the two out of step behind our back.
-        guesses = branch_floor_table.candidate_pool
+    if (branch_floor_table is not None
+            and not branch_floor_table.matches_pool(guesses)):
+        raise ValueError(
+            "branch_floor_table's candidate pool is not this search's guess "
+            "words; its floors would price strategies the search cannot play")
     if n is None:
         n = len(branch_words)
     # Liveness tick: fire once per candidate evaluation (the dominant work
@@ -1777,6 +1785,13 @@ def min_expected_guesses(branch_words, cache, score_cache,
     # search's own candidate list is known.  guesses=None means each node
     # draws candidates from its own branch words, a pool that changes as the
     # recursion descends and so cannot back a table.
+    # Snapshot the caller's pool, keeping ITS order: order breaks ties among
+    # equal-cost candidates and so decides which guess the search records,
+    # whereas a table's order says nothing about its floors.  The snapshot is
+    # what the whole recursion then draws from, so a later change to the list
+    # the caller still holds cannot put the search and the floors out of step.
+    if guesses is not None:
+        guesses = tuple(guesses)
     if branch_floor_table is None:
         if guesses is not None:
             branch_floor_table = BranchFloorTable(
@@ -1785,10 +1800,6 @@ def min_expected_guesses(branch_words, cache, score_cache,
         raise ValueError(
             "branch_floor_table's candidate pool is not this search's guess "
             "words; its floors would price strategies the search cannot play")
-    # The whole recursion draws candidates from the table's own tuple, so no
-    # list the caller still holds can drift from the pool the floors price.
-    if branch_floor_table is not None:
-        guesses = branch_floor_table.candidate_pool
     res = _solve_subset(branch_words, cache, score_cache, budget, deadline,
                         guesses, policy, cancel_check, heartbeat,
                         note_depth, progress_callback, subbranch_solver,

@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from cache_sqlite import ScoreCache
+from erd_queue import encode_subset
 from pattern_matrix import PatternMatrix
 from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from wordle_engine import (
@@ -50,6 +51,12 @@ class _VocabularyMixin:
 
     def _response_cache(self):
         return ResponseCache(self.answer_words)
+
+    def _score_cache(self, words):
+        handle = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return ScoreCache(handle.name, words)
 
     def _table(self, pool=None, with_matrix=True):
         return BranchFloorTable(
@@ -193,6 +200,29 @@ class TestPoolIdentity(unittest.TestCase):
     abacs distinguishes all four and brings the achievable ERD down to 2.0.
     Serving 2.25 to a search allowed to play abacs prunes the optimum.
     """
+
+    def test_no_pool_is_not_this_matrixs_vocabulary(self):
+        """`None` is the absence of a pool, never a match.
+
+        A fresh matrix has no remembered approval, so an identity check
+        reached before this one would compare None against None and vouch for
+        a pool that was never supplied.
+        """
+        matrix = PatternMatrix.build(['aided', 'bided', 'sided', 'tided'],
+                                     ['aided', 'bided', 'sided', 'tided'])
+        self.assertFalse(matrix.is_guess_pool(None))
+        self.assertTrue(
+            matrix.is_guess_pool(('aided', 'bided', 'sided', 'tided')))
+        self.assertFalse(matrix.is_guess_pool(None),
+                         "a remembered approval answered for no pool at all")
+
+    def test_matrix_approval_does_not_survive_a_list_gaining_a_word(self):
+        words = ['aided', 'bided', 'sided', 'tided']
+        matrix = PatternMatrix.build(words, words)
+        pool = list(words)
+        self.assertTrue(matrix.is_guess_pool(pool))
+        pool.append('abacs')
+        self.assertFalse(matrix.is_guess_pool(pool))
 
     ANSWERS = ['aided', 'bided', 'sided', 'tided']
     NARROW_POOL = ['aided', 'bided', 'sided', 'tided']
@@ -340,6 +370,34 @@ class TestThePoolCannotDrift(_VocabularyMixin, unittest.TestCase):
                 self.ANSWERS, self.ANSWERS[0], cache, None,
                 best_erd=2.944444, guesses=pool, policy=ERD_ALL, budget=5,
                 branch_floor_table=table)
+
+    def test_a_supplied_table_does_not_impose_its_own_candidate_order(self):
+        """Order breaks ties; a table has no standing to change it.
+
+        `crane` and `slate` both cost 1.5 on this branch, so the stable sort
+        and the strict `cost < best_erd` comparison make the caller's order
+        the tie breaker.  A table validates on word set, so one built from the
+        reversed pool passes — and must leave the recorded guess alone.
+        """
+        branch = ['crane', 'slate']
+        pool = ['crane', 'slate']
+
+        def solve(table):
+            cache = ResponseCache(branch)
+            score_cache = self._score_cache(branch)
+            min_expected_guesses(branch, cache, score_cache, guesses=pool,
+                                 policy=ERD_ALL, budget=5,
+                                 branch_floor_table=table)
+            recorded = score_cache.read(encode_subset(branch), ERD_ALL)
+            score_cache.close()
+            return recorded
+
+        plain = solve(None)
+        reversed_table = solve(BranchFloorTable(list(reversed(pool)),
+                                                cache=ResponseCache(branch)))
+        self.assertEqual(plain[0], reversed_table[0],
+                         "the table's construction order replaced the "
+                         "search's tie breaker")
 
     def test_the_search_adopts_the_tables_pool(self):
         """Validation happens once; what the search then plays is the tuple.
