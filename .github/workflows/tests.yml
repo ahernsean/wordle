@@ -7,7 +7,42 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  unit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install coverage numpy
+
+      - name: Run unit suite with coverage
+        run: |
+          test_modules=()
+          for test_file in tests/test_*.py; do
+            case "$test_file" in
+              tests/test_report_client.py|tests/test_erd_parallel.py|tests/test_erd_scaling.py|tests/test_swarm_vs_engine_overhead.py)
+                continue
+                ;;
+            esac
+            module=${test_file%.py}
+            test_modules+=("${module//\//.}")
+          done
+          coverage run --parallel-mode -m unittest "${test_modules[@]}"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: .coverage.*
+          include-hidden-files: true
+
+  browser:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,10 +59,35 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Run test suite with coverage
-        run: coverage run -m unittest discover -s tests -t . -p 'test_*.py'
+      - name: Run browser suite with coverage
+        run: coverage run --parallel-mode -m unittest tests.test_report_client
         env:
           REQUIRE_PLAYWRIGHT_BROWSER: "1"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-browser
+          path: .coverage.*
+          include-hidden-files: true
+
+  scaling:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install coverage numpy
+
+      # Strong scaling requires four idle cores, so this runner has no unrelated tests.
+      - name: Run swarm integration and scaling suite with coverage
+        run: coverage run --parallel-mode -m unittest tests.test_erd_parallel tests.test_erd_scaling tests.test_swarm_vs_engine_overhead
 
       - name: Validate claim-handout drain (N workers not slower than 1)
         if: always()
@@ -99,5 +159,42 @@ jobs:
           print('PASS')
           PY
 
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-scaling
+          path: .coverage.*
+          include-hidden-files: true
+
+  test:
+    if: always()
+    needs: [unit, browser, scaling]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require every test suite to pass
+        env:
+          UNIT_RESULT: ${{ needs.unit.result }}
+          BROWSER_RESULT: ${{ needs.browser.result }}
+          SCALING_RESULT: ${{ needs.scaling.result }}
+        run: test "$UNIT_RESULT $BROWSER_RESULT $SCALING_RESULT" = "success success success"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install coverage
+        run: python -m pip install coverage
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage
+          merge-multiple: true
+
       - name: Enforce coverage threshold (>98%)
-        run: coverage report --fail-under=98
+        run: |
+          coverage combine coverage
+          coverage report --fail-under=98
