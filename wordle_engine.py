@@ -1291,6 +1291,84 @@ def sub_branch_cost_lower_bound(sub_branch, candidate, branch_floor_table=None):
     return branch_floor_table.sub_branch_cost_lower_bound(sub_branch, candidate)
 
 
+def _candidate_response_groups(branch_words, candidate, cache,
+                               pattern_matrix=None, branch_indices=None):
+    """Response groups for one candidate, using the same kernel dispatch as
+    evaluate_candidate.
+
+    Kept separate so a worker can prove a whole claimed bundle against the
+    two-level entry bound before it performs any per-candidate queue writes.
+    """
+    if cache:
+        if (pattern_matrix is not None and branch_indices is None
+                and not cache.is_cached(candidate)):
+            branch_indices = pattern_matrix.answer_indices_or_none(branch_words)
+        return cache.group_words(
+            candidate, branch_words,
+            pattern_matrix=pattern_matrix,
+            branch_indices=branch_indices,
+        )
+    groups = defaultdict(list)
+    for answer in branch_words:
+        pattern = _encode_response(calculate_response(candidate, answer))
+        groups[pattern].append(answer)
+    return groups
+
+
+def _remaining_groups_cost_lower_bounds(ordered_groups, candidate,
+                                        branch_size, branch_floor_table):
+    """Suffix sums used by both the two-level entry gate and sub-ceilings."""
+    remaining_groups_cost_lower_bound = [0.0] * (len(ordered_groups) + 1)
+    for index in range(len(ordered_groups) - 1, -1, -1):
+        sub_branch = ordered_groups[index][1]
+        remaining_groups_cost_lower_bound[index] = (
+            remaining_groups_cost_lower_bound[index + 1]
+            + (len(sub_branch) / branch_size) * sub_branch_cost_lower_bound(
+                sub_branch, candidate, branch_floor_table)
+        )
+    return remaining_groups_cost_lower_bound
+
+
+def candidate_two_level_cost_lower_bound(
+        branch_words, candidate, cache, guesses=None,
+        pattern_matrix=None, branch_indices=None, branch_floor_table=None):
+    """Admissible two-level ERD lower bound for one candidate.
+
+    This is evaluate_candidate's entry proof without recursion.  It performs
+    the candidate's response partition and prices each response group through
+    the same BranchFloorTable the search uses.  A caller may therefore batch
+    several proofs outside a queue transaction and persist only the candidates
+    whose returned bound reaches the branch's current best ERD or ceiling.
+
+    The candidate pool is snapshotted and checked against branch_floor_table
+    for the same reason as evaluate_candidate: a floor priced against a
+    different pool can exceed a strategy the search is allowed to play.
+    """
+    if guesses is not None:
+        guesses = tuple(guesses)
+    if (branch_floor_table is not None
+            and not branch_floor_table.matches_pool(guesses)):
+        raise ValueError(
+            "branch_floor_table's candidate pool is not this search's guess "
+            "words; its floors would price strategies the search cannot play")
+    branch_size = len(branch_words)
+    groups = _candidate_response_groups(
+        branch_words, candidate, cache,
+        pattern_matrix=pattern_matrix,
+        branch_indices=branch_indices,
+    )
+    has_self = _ALL_GREEN_PATTERN in groups
+    closed_form_cost_lower_bound = _candidate_cost_lower_bound(
+        groups.values(), has_self, branch_size)
+    ordered_groups = sorted(groups.items(), key=_by_group_size, reverse=True)
+    remaining_groups_cost_lower_bound = _remaining_groups_cost_lower_bounds(
+        ordered_groups, candidate, branch_size, branch_floor_table)
+    two_level_cost_lower_bound = (
+        1.0 + remaining_groups_cost_lower_bound[0]
+    )
+    return max(closed_form_cost_lower_bound, two_level_cost_lower_bound)
+
+
 def estimate_candidate_work(group_sizes, has_self, n, best_erd, budget, typical):
     """Predicted search work (in nodes), UNCUT sum over recursed groups.
 
@@ -1443,21 +1521,11 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # that all prune below without recursing.  Observation only.
     if heartbeat is not None:
         heartbeat()
-    if cache:
-        # A warm candidate always dispatches to the loop (group_words's own
-        # warm/cold check), so deriving branch_indices for it would be wasted
-        # work — skip it only when the caller didn't already supply one.
-        if (pattern_matrix is not None and branch_indices is None
-                and not cache.is_cached(candidate)):
-            branch_indices = pattern_matrix.answer_indices_or_none(branch_words)
-        groups = cache.group_words(candidate, branch_words,
-                                   pattern_matrix=pattern_matrix,
-                                   branch_indices=branch_indices)
-    else:
-        groups = defaultdict(list)
-        for answer in branch_words:
-            pat = _encode_response(calculate_response(candidate, answer))
-            groups[pat].append(answer)
+    groups = _candidate_response_groups(
+        branch_words, candidate, cache,
+        pattern_matrix=pattern_matrix,
+        branch_indices=branch_indices,
+    )
 
     # Tighten the bound from any external update before starting evaluation.
     if bound_provider is not None:
@@ -1504,15 +1572,12 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # is an admissible lower bound on the weighted cost of the sub-branches
     # *after* position i (each sub-branch of size k costs >= lb(k)).  The self
     # singleton contributes 0.
-    def _sub_lb(sg):
-        return sub_branch_cost_lower_bound(sg, candidate, branch_floor_table)
+    remaining_groups_cost_lower_bound = _remaining_groups_cost_lower_bounds(
+        ordered, candidate, n, branch_floor_table)
 
-    remaining_groups_cost_lower_bound = [0.0] * (len(ordered) + 1)
-    for i in range(len(ordered) - 1, -1, -1):
-        sub_i = ordered[i][1]
-        remaining_groups_cost_lower_bound[i] = (
-            remaining_groups_cost_lower_bound[i + 1]
-            + (len(sub_i) / n) * _sub_lb(sub_i))
+    def _sub_lb(sub_branch):
+        return sub_branch_cost_lower_bound(
+            sub_branch, candidate, branch_floor_table)
 
     # Second gate, on the same sum the ceilings are derived from.  Position 0
     # holds every sub-branch's floor, so 1 + that is this candidate's cost

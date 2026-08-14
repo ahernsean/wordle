@@ -44,6 +44,7 @@ from wordle_engine import (
     NO_INFORMATION_GAINED,
     _ABORT_STATUSES,
     cache_all_scores,
+    candidate_two_level_cost_lower_bound,
     evaluate_candidate,
     estimate_candidate_work,
     load_word_list,
@@ -217,6 +218,11 @@ BUNDLE_REPUBLISH_LIMIT = int(
 BUNDLE_SMALL_COUNT = int(
     os.environ.get('BUNDLE_SMALL_COUNT', str(DEFAULT_SMALL_COUNT)))
 BUNDLE_COUNT_CAP = int(os.environ.get('BUNDLE_COUNT_CAP', str(DEFAULT_COUNT_CAP)))
+
+# The vectorized packer bound is structurally below 3.0.  At and above this
+# ERD, only the two-level bound can produce entry prunes, so claimed bundles
+# get one worker-side prune pass before ordinary candidate evaluation.
+TWO_LEVEL_ERD_PRUNE_MINIMUM_ERD = 3.0
 
 # _claim_bundle's cap on transparent CLAIM_RETRY retries for one call: the
 # race claim_next_bundle reports via CLAIM_RETRY (mark_claims_done beating
@@ -1086,9 +1092,9 @@ class _BranchWorker:
 
     def _log_wal_traffic(self, now, force=False):
         """Log this worker's per-table WAL write/read rate since the last such
-        log, largest first.  Names which coordination traffic (bulk-elimination
-        sweeps, holes-scan re-reads, claims, updates, deletes) is pouring into
-        the shared WAL — the breakdown the WAL file itself does not carry.
+        log, largest first.  Names which coordination traffic (one-level ERD-
+        prune sweeps, holes-scan re-reads, claims, updates, deletes) is pouring
+        into the shared WAL — the breakdown the WAL file itself does not carry.
 
         Self-throttled to WAL_TRAFFIC_LOG_SECONDS and called from the heartbeat
         (so it fires even during a single long candidate) so a fast runaway
@@ -1396,11 +1402,70 @@ class _BranchWorker:
             return False
         return True
 
+    def _complete_bundle_two_level_erd_prunes(
+            self, branch_key, words, n_words, bundle_id, candidate_indices):
+        """Complete two-level ERD prunes before ordinary evaluation.
+
+        The expensive response partition and branch-floor work happens here,
+        outside the queue's write transaction.  Only the final completion of
+        all pruned members is coordinated through SQLite.
+
+        Returns (pruned_indices, cancelled).  A cancellation still persists
+        prunes already established, then leaves every other claim unfinished
+        for the normal stale-reclaim path.
+        """
+        if (not self._adaptive or self.pattern_matrix is None
+                or self.branch_floor_table is None or not candidate_indices):
+            return frozenset(), False
+        best_guess, best_erd, branch_ceiling = self.queue.read_branch_best(
+            branch_key)
+        bounds = [bound for bound in (best_erd, branch_ceiling)
+                  if bound is not None]
+        if not bounds:
+            return frozenset(), False
+        bound_erd = min(bounds)
+        if (not math.isfinite(bound_erd)
+                or bound_erd < TWO_LEVEL_ERD_PRUNE_MINIMUM_ERD):
+            return frozenset(), False
+
+        branch_indices = self.pattern_matrix.answer_indices(words)
+        claim_started_at = int(time.time())
+        pruned_candidate_indices = []
+        inspected_candidate_count = 0
+        cancelled = False
+        for candidate_index in candidate_indices:
+            if self.cancel():
+                cancelled = True
+                break
+            candidate = self.all_words[candidate_index]
+            self._cur_candidate = candidate
+            self._heartbeat(
+                branch_key, n_words, candidate_index, claim_started_at,
+                best_guess, best_erd, bound_erd=bound_erd)
+            inspected_candidate_count += 1
+            candidate_cost_lower_bound = candidate_two_level_cost_lower_bound(
+                words, candidate, self.rcache, guesses=self.all_words,
+                pattern_matrix=self.pattern_matrix,
+                branch_indices=branch_indices,
+                branch_floor_table=self.branch_floor_table)
+            if candidate_cost_lower_bound >= bound_erd:
+                pruned_candidate_indices.append(candidate_index)
+
+        if inspected_candidate_count:
+            self.queue.complete_bundle_two_level_erd_prunes(
+                branch_key, bundle_id, pruned_candidate_indices,
+                nodes_spent=inspected_candidate_count)
+        return frozenset(pruned_candidate_indices), cancelled
+
     def evaluate_bundle(self, branch_key, words, n_words, bundle_id, indices,
                         forced, budget=None):
-        """Evaluate a claim_next_bundle bundle, folding each candidate's
-        result into the branch's shared best as it goes (evaluate_claim per
-        idx, in the bundle's best-first order).
+        """Handle a claim_next_bundle bundle in best-first order.
+
+        When the branch bound is at least 3.0, the closed-form packer proof is
+        structurally unable to eliminate a candidate.  The worker first runs
+        the stronger two-level entry bound over the claimed bundle outside a
+        queue transaction, then completes every proof through one coordinated
+        write.  Survivors continue through evaluate_claim normally.
 
         Sequential-sibling pruning is preserved exactly as a single-candidate
         sweep: each evaluate_claim call re-reads the branch's shared best,
@@ -1432,10 +1497,30 @@ class _BranchWorker:
         cancelled mid-evaluation, leaving the unfinished remainder's claims
         done=0 for reclaim (same contract as evaluate_claim).
         """
-        nodes_at_bundle_start = self._nodes
-        wall_t0 = time.time()
-        bundle_start_idx = min(indices) if indices else None
-        bundle_end_idx = max(indices) if indices else None
+        claimed_candidate_indices = indices
+        prune_nodes_at_start = self._nodes
+        prune_wall_t0 = time.time()
+        pruned_candidate_indices, cancelled = (
+            self._complete_bundle_two_level_erd_prunes(
+                branch_key, words, n_words, bundle_id,
+                claimed_candidate_indices))
+        if cancelled:
+            self._finish_bundle(branch_key, bundle_id, prune_nodes_at_start,
+                                prune_wall_t0, censored=True)
+            return False
+        indices = [candidate_index for candidate_index in claimed_candidate_indices
+                   if candidate_index not in pruned_candidate_indices]
+        if not indices:
+            self._finish_bundle(branch_key, bundle_id, prune_nodes_at_start,
+                                prune_wall_t0, censored=False)
+            return True
+
+        nodes_at_bundle_start = prune_nodes_at_start
+        wall_t0 = prune_wall_t0
+        bundle_start_idx = (min(claimed_candidate_indices)
+                            if claimed_candidate_indices else None)
+        bundle_end_idx = (max(claimed_candidate_indices)
+                          if claimed_candidate_indices else None)
         for pos, idx in enumerate(indices):
             if not self._evaluate_bundle_member(
                     branch_key, words, n_words, idx, budget, bundle_id,
@@ -1518,6 +1603,9 @@ class _BranchWorker:
         # Claims drained to finalize, captured before delete_branch drops the rows.
         completed_candidates = self.queue.branch_done_candidates(branch_key)
         bulk_done_candidates = self.queue.branch_bulk_done_candidates(branch_key)
+        (one_level_erd_pruned_candidates,
+         two_level_erd_pruned_candidates) = (
+            self.queue.branch_erd_pruned_candidate_counts(branch_key))
         n_claims = completed_candidates - bulk_done_candidates
         cut = best_guess is None and cut_occurred
         ceiling_proves_loss = (
@@ -1612,6 +1700,10 @@ class _BranchWorker:
                 total_bundle_wall_millis=total_bundle_wall_millis,
                 censored_units=censored_units, ceiling=ceiling,
                 bulk_done_candidates=bulk_done_candidates,
+                one_level_erd_pruned_candidates=
+                    one_level_erd_pruned_candidates,
+                two_level_erd_pruned_candidates=
+                    two_level_erd_pruned_candidates,
                 best_guess=best_guess, best_erd=best_erd,
                 cache_write_millis=cache_write_millis,
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
@@ -2108,7 +2200,7 @@ class _BranchWorker:
         - (context, branch, bundle_id, indices, forced) if a bundle was
           claimed off the newly promoted branch;
         - _PROMOTED_NO_BUNDLE if a branch was created (or fully resolved via
-          bulk-elimination/finalize) but no bundle is claimable right now;
+          ERD-prune/finalize) but no bundle is claimable right now;
         - None if source_work_id has no pending branch left to promote.
         """
         while True:
@@ -2152,7 +2244,7 @@ class _BranchWorker:
             'budget': budget,
         }
         context = WorkContext.from_branch_row(branch, scheduling_role)
-        # A bulk-elimination sweep can complete the branch without returning
+        # A one-level ERD-prune sweep can complete the branch without returning
         # worker work; otherwise another worker grabbed every remaining slot.
         if claim is None:
             if (self.queue.branch_done_candidates(claimed['branch_key'])

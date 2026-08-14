@@ -68,8 +68,8 @@ def cost_size_bucket(n_words: int) -> int:
 # values buy diminishing returns per §1's table).
 DEFAULT_SMALL_COUNT = 8
 # count_cap: a backward-compatible hard upper bound on the survivor count in
-# a bundle.  Bulk-eliminated candidates are completed directly and never enter
-# a bundle, so small_count is the effective limit under the default settings.
+# a bundle.  One-level ERD-pruned candidates are completed directly and never
+# enter a bundle, so small_count is the effective limit under the defaults.
 DEFAULT_COUNT_CAP = 500
 # republish_limit: how many times the same candidate may be republished
 # (adaptive_claim_packing.md §7's bounded-republish-depth guardrail) before
@@ -360,11 +360,13 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- being proven infeasible.  Only meaningful at finalize when best_guess is
     -- NULL, where it distinguishes CUT (>= ceiling) from a proven loss.
     cut_occurred   INTEGER NOT NULL DEFAULT 0,
-    -- Candidates completed directly from the exact lower-bound elimination
-    -- test, without a worker evaluation or per-candidate telemetry row.
+    -- Legacy combined count for candidates completed by either ERD-prune
+    -- method, retained for storage and programmatic compatibility.
     bulk_done_candidates INTEGER NOT NULL DEFAULT 0,
+    one_level_erd_pruned_candidates INTEGER NOT NULL DEFAULT 0,
+    two_level_erd_pruned_candidates INTEGER NOT NULL DEFAULT 0,
     -- Tightest branch bound against which every candidate slot received a
-    -- bulk-elimination sweep.  NULL means no finite bound has been swept.
+    -- one-level ERD-prune sweep.  NULL means no finite bound has been swept.
     bulk_done_bound REAL,
     -- claim_next_bundle's forward cursor: count of best-first positions that
     -- have been covered or packed into a bundle at least once.  Positions
@@ -605,10 +607,12 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     created_at              INTEGER,
     finalized_at            INTEGER,
     nodes_spent             INTEGER,
-    -- Candidates completed through worker evaluation; bulk lower-bound
-    -- proofs are counted separately.
+    -- Candidates completed through worker evaluation; ERD prunes are counted
+    -- separately by method.
     n_claims                INTEGER,
     bulk_done_candidates    INTEGER,
+    one_level_erd_pruned_candidates INTEGER,
+    two_level_erd_pruned_candidates INTEGER,
     n_bundles               INTEGER,
     max_bundle_nodes        INTEGER,
     total_bundle_wall_millis INTEGER,
@@ -974,15 +978,41 @@ class ERDQueue:
             "ceiling": "REAL",
             "cut_occurred": "INTEGER NOT NULL DEFAULT 0",
             "bulk_done_candidates": "INTEGER NOT NULL DEFAULT 0",
+            "one_level_erd_pruned_candidates": "INTEGER NOT NULL DEFAULT 0",
+            "two_level_erd_pruned_candidates": "INTEGER NOT NULL DEFAULT 0",
             "bulk_done_bound": "REAL",
         })
         self._add_columns("branch_finalize_log", {
             "ceiling": "REAL",
             "outcome": "TEXT",
             "bulk_done_candidates": "INTEGER",
+            "one_level_erd_pruned_candidates": "INTEGER",
+            "two_level_erd_pruned_candidates": "INTEGER",
             "best_guess": "TEXT",
             "best_erd": "REAL",
         }, schema="telemetry")
+
+        # Every persisted aggregate predating the provenance split came from
+        # the one-level candidate bound; worker-side two-level pruning did not
+        # yet exist.  Keep bulk_done_candidates as the legacy combined count.
+        provenance_migration = "split_erd_prune_provenance"
+        if self._conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (provenance_migration,)).fetchone() is None:
+            self._conn.execute("""
+                UPDATE active_branches
+                SET one_level_erd_pruned_candidates = bulk_done_candidates,
+                    two_level_erd_pruned_candidates = 0
+            """)
+            self._conn.execute("""
+                UPDATE telemetry.branch_finalize_log
+                SET one_level_erd_pruned_candidates =
+                        COALESCE(bulk_done_candidates, 0),
+                    two_level_erd_pruned_candidates = 0
+            """)
+            self._conn.execute(
+                "INSERT INTO schema_migrations (name, completed_at) "
+                "VALUES (?, ?)", (provenance_migration, int(time.time())))
 
         # Branch-attributed claim telemetry and coordination phase breakdown
         # (issue #197): additive/nullable, so an existing row simply keeps
@@ -1153,6 +1183,8 @@ class ERDQueue:
                     ceiling        REAL,
                     cut_occurred   INTEGER NOT NULL DEFAULT 0,
                     bulk_done_candidates INTEGER NOT NULL DEFAULT 0,
+                    one_level_erd_pruned_candidates INTEGER NOT NULL DEFAULT 0,
+                    two_level_erd_pruned_candidates INTEGER NOT NULL DEFAULT 0,
                     bulk_done_bound REAL,
                     pack_cursor    INTEGER NOT NULL DEFAULT 0
                 );
@@ -1162,7 +1194,10 @@ class ERDQueue:
                            a.best_guess, a.status, a.created_at, a.finalized_at,
                            a.budget, a.best_max_depth, a.tainted, a.nodes_spent,
                            a.spine, a.ceiling, a.cut_occurred,
-                           a.bulk_done_candidates, a.bulk_done_bound,
+                           a.bulk_done_candidates,
+                           a.one_level_erd_pruned_candidates,
+                           a.two_level_erd_pruned_candidates,
+                           a.bulk_done_bound,
                            a.pack_cursor
                     FROM active_branches a
                     JOIN branches b ON b.branch_key = a.branch_key;
@@ -2193,7 +2228,7 @@ class ERDQueue:
                           republish_limit=DEFAULT_REPUBLISH_LIMIT,
                           expected_source_work_id=None,
                           expected_source_priority=None):
-        """Atomically bulk-complete eliminations and claim a survivor bundle.
+        """Atomically complete one-level ERD prunes and claim survivors.
 
         Runs the exact-elimination classification from
         adaptive_claim_packing.md §5 inside one BEGIN IMMEDIATE transaction:
@@ -2334,20 +2369,24 @@ class ERDQueue:
                     INSERT OR REPLACE INTO candidate_claims
                         (branch_id, idx, claimed_by, claimed_at, done, done_at,
                          bundle_id)
-                    VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
+                    VALUES (?, ?, 'one-level-erd-prune', ?, 1, ?, NULL)
                 """, [(branch_id, idx, now, now)
                       for idx in eliminated_indices])
                 self._tally_wal_traffic(
-                    'candidate_claims/bulk-eliminate', len(eliminated_indices),
+                    'candidate_claims/one-level-erd-prune',
+                    len(eliminated_indices),
                     len(eliminated_indices) * _CLAIM_ROW_WAL_BYTES)
                 self._conn.execute("""
                     UPDATE active_branches
                     SET bulk_done_candidates = bulk_done_candidates + ?,
+                        one_level_erd_pruned_candidates =
+                            one_level_erd_pruned_candidates + ?,
                         cut_occurred = CASE
                             WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
                             ELSE cut_occurred END
                     WHERE branch_id = ?
-                """, (len(eliminated_indices), branch_id))
+                """, (len(eliminated_indices), len(eliminated_indices),
+                      branch_id))
                 for idx in eliminated_indices:
                     claim_rows[idx] = {"idx": idx, "done": 1}
             if bound_tightened:
@@ -2390,21 +2429,24 @@ class ERDQueue:
                         INSERT INTO candidate_claims
                             (branch_id, idx, claimed_by, claimed_at, done,
                              done_at, bundle_id)
-                        VALUES (?, ?, 'bulk-elimination', ?, 1, ?, NULL)
+                            VALUES (?, ?, 'one-level-erd-prune', ?, 1, ?, NULL)
                     """, [(branch_id, idx, now, now)
                           for idx in eliminated_holes])
                     self._tally_wal_traffic(
-                        'candidate_claims/bulk-eliminate-hole',
+                        'candidate_claims/one-level-erd-prune-hole',
                         len(eliminated_holes),
                         len(eliminated_holes) * _CLAIM_ROW_WAL_BYTES)
                     self._conn.execute("""
                         UPDATE active_branches
                         SET bulk_done_candidates = bulk_done_candidates + ?,
+                            one_level_erd_pruned_candidates =
+                                one_level_erd_pruned_candidates + ?,
                             cut_occurred = CASE
                                 WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
                                 ELSE cut_occurred END
                         WHERE branch_id = ?
-                    """, (len(eliminated_holes), branch_id))
+                    """, (len(eliminated_holes), len(eliminated_holes),
+                          branch_id))
                 survivor_limit = min(small_count, count_cap)
                 bundle = [idx for idx in holes
                           if cost_lower_bound[idx] < bound][:survivor_limit]
@@ -2600,6 +2642,78 @@ class ERDQueue:
         n = self._conn.execute("SELECT changes()").fetchone()[0]
         self._tally_wal_traffic(
             'candidate_claims/complete', n, n * _CLAIM_ROW_WAL_BYTES)
+
+    def complete_bundle_two_level_erd_prunes(self, branch_key, bundle_id,
+                                             candidate_indices, nodes_spent=0):
+        """Complete claimed candidates pruned by the two-level ERD bound.
+
+        The worker computes the bounds before entering this transaction.  A
+        branch's best ERD only decreases and its ceiling is immutable, so a
+        candidate proved unable to beat the worker's earlier bound remains
+        unable to beat every bound visible here.
+
+        Only unfinished rows still owned by bundle_id are changed.  A stale
+        worker whose bundle was reclaimed therefore cannot overwrite the new
+        owner's claim, while a queue-level one-level ERD-prune sweep that
+        already completed a row is left untouched and not counted twice.
+        nodes_spent folds the bundle preflight's candidate-entry nodes into
+        the same transaction as the completion update.
+        """
+        candidate_indices = list(candidate_indices)
+        if not candidate_indices and nodes_spent <= 0:
+            return 0
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return 0
+        placeholders = ",".join("?" for _ in candidate_indices)
+        now = int(time.time())
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if candidate_indices:
+                self._conn.execute(f"""
+                    UPDATE candidate_claims
+                    SET claimed_by = 'two-level-erd-prune', done = 1,
+                        done_at = ?, bundle_id = NULL
+                    WHERE branch_id = ? AND bundle_id = ? AND done = 0
+                      AND idx IN ({placeholders})
+                      AND EXISTS (
+                          SELECT 1 FROM active_branches
+                          WHERE branch_id = ? AND status = 'open'
+                      )
+                """, (now, branch_id, bundle_id, *candidate_indices, branch_id))
+                completed_candidate_count = self._conn.execute(
+                    "SELECT changes()").fetchone()[0]
+            else:
+                completed_candidate_count = 0
+            updated_branch_count = 0
+            if completed_candidate_count or nodes_spent > 0:
+                self._conn.execute("""
+                    UPDATE active_branches
+                    SET bulk_done_candidates = bulk_done_candidates + ?,
+                        two_level_erd_pruned_candidates =
+                            two_level_erd_pruned_candidates + ?,
+                        nodes_spent = nodes_spent + ?,
+                        cut_occurred = CASE
+                            WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
+                            ELSE cut_occurred END
+                    WHERE branch_id = ? AND status = 'open'
+                """, (completed_candidate_count, completed_candidate_count,
+                      max(0, nodes_spent), branch_id))
+                updated_branch_count = self._conn.execute(
+                    "SELECT changes()").fetchone()[0]
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._tally_wal_traffic(
+            'candidate_claims/two-level-erd-prune',
+            completed_candidate_count,
+            completed_candidate_count * _CLAIM_ROW_WAL_BYTES)
+        if nodes_spent > 0:
+            self._tally_wal_traffic(
+                'active_branches/nodes-spent', updated_branch_count,
+                updated_branch_count * _CLAIM_ROW_WAL_BYTES)
+        return completed_candidate_count
 
     def update_branch_best(self, branch_key, best_guess, best_erd, max_depth=None):
         """Lower the branch's running best (monotone — never raises it).
@@ -2801,7 +2915,7 @@ class ERDQueue:
             (branch_id,)).fetchone()[0]
 
     def branch_bulk_done_candidates(self, branch_key) -> int:
-        """Return the aggregate number completed by exact elimination."""
+        """Return the legacy combined count completed by ERD pruning."""
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
             return 0
@@ -2810,14 +2924,28 @@ class ERDQueue:
             "WHERE branch_id = ?", (branch_id,)).fetchone()
         return 0 if row is None else row[0]
 
+    def branch_erd_pruned_candidate_counts(self, branch_key) -> tuple[int, int]:
+        """Return one-level and two-level ERD-pruned candidate counts."""
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return 0, 0
+        row = self._conn.execute("""
+            SELECT one_level_erd_pruned_candidates,
+                   two_level_erd_pruned_candidates
+            FROM active_branches WHERE branch_id = ?
+        """, (branch_id,)).fetchone()
+        return (0, 0) if row is None else (row[0], row[1])
+
     def candidate_progress_by_branch_keys(self, branch_keys: list[bytes]) -> dict:
-        """Return evaluated and bulk-completed candidate counts by branch."""
+        """Return evaluated and ERD-pruned candidate counts by branch."""
         if not branch_keys:
             return {}
         progress = {
             bytes(branch_key): {
                 "completed_candidate_count": 0,
                 "bulk_completed_candidate_count": 0,
+                "one_level_erd_pruned_candidate_count": 0,
+                "two_level_erd_pruned_candidate_count": 0,
             }
             for branch_key in branch_keys
         }
@@ -2834,17 +2962,23 @@ class ERDQueue:
             progress[bytes(row["branch_key"])]["completed_candidate_count"] = (
                 row["completed_candidate_count"]
             )
-        bulk_rows = self._conn.execute(
-            f"""SELECT b.branch_key, a.bulk_done_candidates
+        prune_rows = self._conn.execute(
+            f"""SELECT b.branch_key, a.bulk_done_candidates,
+                       a.one_level_erd_pruned_candidates,
+                       a.two_level_erd_pruned_candidates
                 FROM active_branches a
                 JOIN branches b ON b.branch_id = a.branch_id
                 WHERE b.branch_key IN ({placeholders})""",
             branch_keys,
         ).fetchall()
-        for row in bulk_rows:
-            progress[bytes(row["branch_key"])][
-                "bulk_completed_candidate_count"
-            ] = row["bulk_done_candidates"]
+        for row in prune_rows:
+            branch_progress = progress[bytes(row["branch_key"])]
+            branch_progress["bulk_completed_candidate_count"] = (
+                row["bulk_done_candidates"])
+            branch_progress["one_level_erd_pruned_candidate_count"] = (
+                row["one_level_erd_pruned_candidates"])
+            branch_progress["two_level_erd_pruned_candidate_count"] = (
+                row["two_level_erd_pruned_candidates"])
         return progress
 
     def try_finalize_branch(self, branch_key) -> bool:
@@ -3284,6 +3418,8 @@ class ERDQueue:
                        active.best_max_depth,
                        active.nodes_spent,
                        active.bulk_done_candidates,
+                       active.one_level_erd_pruned_candidates,
+                       active.two_level_erd_pruned_candidates,
                        active.ceiling,
                        active.spine,
                        active.created_at,
@@ -3408,6 +3544,10 @@ class ERDQueue:
                 "candidate_count": row["candidate_count"],
                 "completed_candidate_count": row["completed_candidate_count"],
                 "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
+                "one_level_erd_pruned_candidate_count":
+                    row["one_level_erd_pruned_candidates"] or 0,
+                "two_level_erd_pruned_candidate_count":
+                    row["two_level_erd_pruned_candidates"] or 0,
                 "worker_count": row["worker_count"],
                 "search_node_count": row["nodes_spent"] or 0,
                 "ceiling": row["ceiling"],
@@ -3733,6 +3873,10 @@ class ERDQueue:
                 "epoch": row["epoch"],
                 "evaluated_candidate_count": row["n_claims"],
                 "bulk_completed_candidate_count": row["bulk_done_candidates"],
+                "one_level_erd_pruned_candidate_count":
+                    row["one_level_erd_pruned_candidates"],
+                "two_level_erd_pruned_candidate_count":
+                    row["two_level_erd_pruned_candidates"],
                 "recorded_at": row["recorded_at"],
             })
         cut_rows = self._conn.execute("""
@@ -3975,6 +4119,8 @@ class ERDQueue:
         table = {
             "evaluated-candidates": "branch_finalize_log",
             "bulk-completed-candidates": "branch_finalize_log",
+            "one-level-erd-prunes": "branch_finalize_log",
+            "two-level-erd-prunes": "branch_finalize_log",
             "cut-reuse": "cut_reuse_misses",
             "coordination": "claim_telemetry",
         }.get(field)
@@ -3986,8 +4132,15 @@ class ERDQueue:
             table, epoch, since, sample_size, sample_spine_prefix,
             sample_branch_key,
         )
-        if field in ("evaluated-candidates", "bulk-completed-candidates"):
-            metric = "n_claims" if field == "evaluated-candidates" else "bulk_done_candidates"
+        if field in (
+                "evaluated-candidates", "bulk-completed-candidates",
+                "one-level-erd-prunes", "two-level-erd-prunes"):
+            metric = {
+                "evaluated-candidates": "n_claims",
+                "bulk-completed-candidates": "bulk_done_candidates",
+                "one-level-erd-prunes": "one_level_erd_pruned_candidates",
+                "two-level-erd-prunes": "two_level_erd_pruned_candidates",
+            }[field]
             spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""
             parameters = [epoch, since]
             if spine_prefix:
@@ -4013,6 +4166,10 @@ class ERDQueue:
                 "loss_proof": self._report_loss_proof(row),
                 "evaluated_candidate_count": row["n_claims"] or 0,
                 "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
+                "one_level_erd_pruned_candidate_count":
+                    row["one_level_erd_pruned_candidates"] or 0,
+                "two_level_erd_pruned_candidate_count":
+                    row["two_level_erd_pruned_candidates"] or 0,
                 "search_node_count": row["nodes_spent"] or 0,
                 "recorded_at": row["recorded_at"],
             } for row in rows]
@@ -4970,7 +5127,9 @@ class ERDQueue:
                                 total_bundle_wall_millis=None, censored_units=None,
                                 ceiling=None, outcome=None,
                                 bulk_done_candidates=None, best_guess=None,
-                                best_erd=None, cache_write_millis=None):
+                                best_erd=None, cache_write_millis=None,
+                                one_level_erd_pruned_candidates=None,
+                                two_level_erd_pruned_candidates=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -4979,17 +5138,23 @@ class ERDQueue:
         them (a branch solved entirely from reused cache entries never
         claims a bundle).  ceiling is the alpha-beta ceiling the branch was
         solved under (NULL = exact solve); outcome is 'exact', 'cut', or 'loss'.
-        bulk_done_candidates preserves the aggregate eliminated count without
+        bulk_done_candidates preserves the legacy combined ERD-prune count;
+        the one-level and two-level counts preserve its provenance without
         restoring per-candidate telemetry writes.  best_guess/best_erd capture
         the exact solved line at finalize time so later reports do not need to
-        infer it from mutable cache state.  If a bulk sweep supersedes an
-        in-flight claim that later finishes, n_claims excludes that overlap
-        even though its per-claim telemetry row still exists.
+        infer it from mutable cache state.  If a one-level ERD-prune sweep
+        supersedes an in-flight claim that later finishes, n_claims excludes
+        that overlap even though its per-claim telemetry row still exists.
         cache_write_millis is the wall time the finalizing worker spent
         publishing the result (score-cache/loss/cut writes and the cost-model
         fold) — the finalize phase of the coordination breakdown, kept here
         rather than on claim_telemetry because it belongs to the branch.
         """
+        if (one_level_erd_pruned_candidates is None
+                and two_level_erd_pruned_candidates is None
+                and bulk_done_candidates is not None):
+            one_level_erd_pruned_candidates = bulk_done_candidates
+            two_level_erd_pruned_candidates = 0
         now = int(time.time())
         self._conn.execute("""
             INSERT INTO telemetry.branch_finalize_log
@@ -4997,13 +5162,15 @@ class ERDQueue:
                  finalized_at, nodes_spent, n_claims, n_bundles,
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
                  ceiling, outcome, bulk_done_candidates, best_guess, best_erd,
-                 cache_write_millis, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cache_write_millis, one_level_erd_pruned_candidates,
+                 two_level_erd_pruned_candidates, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
               bulk_done_candidates, best_guess, best_erd, cache_write_millis,
-              now))
+              one_level_erd_pruned_candidates,
+              two_level_erd_pruned_candidates, now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

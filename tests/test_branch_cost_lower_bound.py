@@ -7,6 +7,7 @@ inadmissible floor would prune the optimum and silently return a wrong answer â€
 and the pattern-matrix and pure-Python implementations must agree, since the
 engine chooses between them by which kernel a caller passes.
 """
+import math
 import os
 import random
 import tempfile
@@ -19,7 +20,7 @@ from pattern_matrix import PatternMatrix
 from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from wordle_engine import (
     ERD_ALL, BranchFloorTable, ResponseCache, all_singletons_floor,
-    evaluate_candidate,
+    candidate_two_level_cost_lower_bound, evaluate_candidate,
     _candidate_cost_lower_bound, min_expected_guesses,
     sub_branch_cost_lower_bound,
 )
@@ -671,6 +672,24 @@ class TestGatesAreObservedOnce(_VocabularyMixin, unittest.TestCase):
         # inverts 3 - (G + has_self)/n from this field to recover has_self, so
         # storing the tighter effective bound here would corrupt that.
         self.assertEqual(bound, closed_form)
+
+    def test_two_level_erd_prune_bound_is_the_engine_entry_gate(self):
+        words = self._branch(40, seed=32)
+        candidate = self.guess_words[0]
+        table = self._table()
+        lower_bound = candidate_two_level_cost_lower_bound(
+            words, candidate, self._response_cache(),
+            guesses=self.guess_words, pattern_matrix=self.pattern_matrix,
+            branch_floor_table=table)
+
+        at_bound = self._observe(words, candidate, lower_bound)
+        above_bound = self._observe(
+            words, candidate, math.nextafter(lower_bound, math.inf))
+
+        self.assertEqual(len(at_bound), 1)
+        self.assertTrue(at_bound[0][1])
+        self.assertEqual(len(above_bound), 1)
+        self.assertFalse(above_bound[0][1])
 
 
 if __name__ == "__main__":

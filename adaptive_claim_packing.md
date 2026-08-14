@@ -1,4 +1,4 @@
-# Survivor claim packing with bulk elimination and republish-on-overrun
+# Survivor claim packing with ERD pruning and republish-on-overrun
 
 This is the plan to replace the swarm's single-candidate claiming with
 count-bundled claim packing over an **exact binary split**: at handout time,
@@ -34,10 +34,27 @@ magnitude model) was:
 | 32 | 144.1× | 260.5× |
 | 64 | 230.9× | 346.0× |
 
-Direct bulk completion removes the eliminated candidates' claim transactions
-entirely. `analyze_swarm_telemetry.py estimate_claim_reduction` remains a
-historical estimator for pre-bulk-completion epochs; current claim reduction is
-measured directly by the swarm-overhead CI guard.
+## ERD-prune terminology and storage provenance
+
+A **one-level ERD prune** completes a candidate from the vectorized,
+closed-form candidate lower bound. A **two-level ERD prune** completes a
+candidate from the response-group `BranchFloorTable` lower bound. "Bulk" is
+only how completions are packaged into SQLite writes; it is not the name of
+either proof method.
+
+The schema predates this distinction. `bulk_done_candidates` is retained as a
+legacy combined counter and `bulk_done_bound` records the one-level sweep
+bound. Historical `claimed_by = 'bulk-elimination'` rows are one-level ERD
+prunes. The provenance migration copies every pre-existing combined count into
+the one-level counter because two-level bundle pruning did not yet exist, then
+new work increments the combined counter and exactly one method-specific
+counter. Reports expose the two method-specific counts rather than the legacy
+combined count.
+
+Direct ERD-prune completion removes the eliminated candidates' claim
+transactions entirely. `analyze_swarm_telemetry.py estimate_claim_reduction`
+remains a historical estimator for epochs before batched completion; current
+claim reduction is measured directly by the swarm-overhead CI guard.
 
 ### Relationship to issues #67 and #68
 
@@ -150,7 +167,7 @@ it can never be wrong.
 
 Two pieces, one feedback loop:
 
-- **Bulk elimination plus survivor packing.** When the branch bound tightens,
+- **One-level ERD pruning plus survivor packing.** When the branch bound tightens,
   every incomplete candidate is classified by the exact test
   `candidate_cost_lower_bound(c) >= B`, where `B` is the branch's current
   real `best_erd` read inside the claim transaction. Provably-eliminated
@@ -163,7 +180,7 @@ Two pieces, one feedback loop:
   wall cap before it is done, the worker stops, returns its unfinished
   candidates to the unclaimed pool, and they are re-packed on the next
   handout — with a tighter `B` than last time, so remainder mass tends to
-  become bulk-done rather than re-enter worker bundles.
+  receive one-level ERD prunes rather than re-enter worker bundles.
 
 The division of labor:
 
@@ -251,7 +268,7 @@ is chosen from republish-safety, not from a cost model (§12).
 
 ---
 
-## 5. Bulk elimination and survivor packing
+## 5. ERD pruning and survivor packing
 
 Candidates are kept in the engine's best-first order (`Σk²` ascending).
 The claim path walks them front-to-back with a single monotonic cursor.
@@ -272,7 +289,7 @@ def claim_next_bundle(cursor, candidates_best_first, B, last_swept_B,
 
 Behaviour:
 
-- **Bound tightening → one bulk-done sweep.** The sweep considers every
+- **Bound tightening → one-level ERD-prune sweep.** The sweep considers every
   incomplete slot against the newly tighter bound and writes authoritative
   done rows with one `executemany`. A racing done=0 claim is replaced because
   the admissible lower bound is already a complete proof.
@@ -288,6 +305,15 @@ Behaviour:
   republishes it. `count_cap` remains a backward-compatible hard upper bound
   on survivor bundle size; under the defaults, `small_count` is the effective
   limit.
+
+At branch bounds of at least `3.0`, the one-level bound is structurally unable
+to prune. A worker therefore preflights its already-claimed survivor bundle
+with the two-level `BranchFloorTable` bound. The response partition and floor
+lookups happen outside the SQLite write transaction; every two-level ERD prune
+from that pass is completed in one transaction, and only the surviving bundle
+members enter ordinary candidate evaluation. This preserves the small claim
+bundle and stale-reclaim contracts while removing their per-candidate
+completion and telemetry writes.
 
 **Cost of the walk (absorbs #68).** The cursor advances monotonically through
 best-first order, so the common (no-hole) path is O(1) amortized per candidate
@@ -320,13 +346,14 @@ change:
   `n_candidates` rows are `done=1`, whoever observes full coverage.
 
 Crucially, every source of work-to-do flows through `claim_next_bundle` and
-therefore is either bulk-completed or placed in a survivor bundle:
+therefore receives a one-level ERD prune or is placed in a survivor bundle:
 
-- Fresh candidates → bulk completion or survivor bundles.
+- Fresh candidates → one-level ERD pruning or survivor bundles.
 - Reclaimed candidates from a dead worker (`reclaim_stale_claims` deletes
   the `done=0` rows → they reappear in the unclaimed pool) → the claim path
-  bulk-completes or **re-bundles** them.
-- Republished candidates from an overrun (§7) → the claim path bulk-completes
+  applies one-level ERD pruning or **re-bundles** them.
+- Republished candidates from an overrun (§7) → the claim path applies a
+  one-level ERD prune
   or **re-bundles** them.
 
 There is no code path that hands out a lone candidate. This is the
@@ -352,7 +379,7 @@ cap and still has unfinished candidates `R`. The worker:
    §6) and re-packed — against a `B` that is at least as tight as when
    they were first packed, and usually tighter (the bundle head just
    solved). The common case: yesterday's "not yet eliminated" remainder
-   becomes bulk-done. No estimate is scaled, because there is no estimate.
+   receives an ERD prune. No estimate is scaled, because there is no estimate.
 
 **(b) Within-candidate overrun** — a *single* candidate's own recursive
 subtree exceeds the cap. This is not a packing problem; it is the existing
@@ -502,14 +529,16 @@ Remaining (PR2):
   `small_count`.
 - **Cursor and bound state are shared across processes (correctness
   constraint, not optional).** Worker *processes* call `claim_next_bundle`
-  concurrently. `active_branches.pack_cursor` and `bulk_done_bound` are
+  concurrently. `active_branches.pack_cursor` and the legacy-named
+  `bulk_done_bound` are
   advanced under the same `BEGIN IMMEDIATE` that inserts claim or done rows,
   while the current `B` is read from that branch row in the transaction.
   Holes from reclaim/republish are handled by `holes_pass` once the forward
   cursor is exhausted, never by rewinding on every call — preserving #68's
   lazy end-of-sweep semantics and the O(1)-amortized common path.
 - **Sweep cost inside the lock.** A full classification sweep runs only when
-  `B` strictly tightens, recorded by `active_branches.bulk_done_bound` in the
+  `B` strictly tightens, recorded by the legacy-named
+  `active_branches.bulk_done_bound` in the
   same transaction. Repeated claims at an unchanged bound resume the forward
   cursor and stop after filling one survivor bundle; they never rescan all
   claim rows or all candidate positions.

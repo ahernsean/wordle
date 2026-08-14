@@ -29,20 +29,21 @@ class _TmpQueue(unittest.TestCase):
 
 
 class TestWALTrafficAttribution(_TmpQueue):
-    def test_bulk_elimination_is_attributed_to_candidate_claims(self):
-        # A tight bound eliminates every candidate in one bulk INSERT OR REPLACE.
+    def test_one_level_erd_pruning_is_attributed_to_candidate_claims(self):
+        # A tight bound prunes every candidate in one INSERT OR REPLACE batch.
         self.q.update_branch_best(self.key, "salet", 1.0)
         self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES,
             small_count=5, count_cap=500)
         rows, byts = self.q.wal_traffic_snapshot()
-        self.assertEqual(rows["candidate_claims/bulk-eliminate"], N_CANDIDATES)
+        category = "candidate_claims/one-level-erd-prune"
+        self.assertEqual(rows[category], N_CANDIDATES)
         # The byte estimate is floored at a per-commit page cost: WAL frames
         # are whole 4 KiB pages, so a commit can never cost less than a couple
         # of pages regardless of row width.
-        self.assertGreaterEqual(byts["candidate_claims/bulk-eliminate"],
+        self.assertGreaterEqual(byts[category],
                                 N_CANDIDATES * erd_queue._CLAIM_ROW_WAL_BYTES)
-        self.assertGreaterEqual(byts["candidate_claims/bulk-eliminate"],
+        self.assertGreaterEqual(byts[category],
                                 2 * erd_queue._WAL_PAGE_BYTES)
 
     def test_write_tally_is_floored_at_page_grain(self):
@@ -141,7 +142,7 @@ class TestWALTrafficAttribution(_TmpQueue):
             self.key, "w0", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES,
             small_count=5, count_cap=500)
         report = self.q.wal_traffic_report()
-        self.assertIn("candidate_claims/bulk-eliminate", report)
+        self.assertIn("candidate_claims/one-level-erd-prune", report)
         self.assertIn("rows", report)
 
 

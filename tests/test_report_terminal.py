@@ -20,7 +20,7 @@ from report_terminal import DisplayOrder, WatchSession, render_overview, render_
 
 def overview_report():
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "report_kind": "overview",
         "generated_at": 1000,
         "branch_target": None,
@@ -77,6 +77,8 @@ def overview_report():
                 "candidate_count": 100,
                 "completed_candidate_count": 25,
                 "bulk_completed_candidate_count": 5,
+                "one_level_erd_pruned_candidate_count": 4,
+                "two_level_erd_pruned_candidate_count": 1,
                 "priority": 10,
                 "is_cooperative": False,
                 "source_word": "salet",
@@ -329,18 +331,18 @@ class OverviewRendererTest(unittest.TestCase):
         expected_branch_headings = {
             50: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
             55: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
-            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk"),
-            60: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk"),
+            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
+            60: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
             79: (
-                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk",
+                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
             80: (
-                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk",
+                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
             120: (
-                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "Bulk",
+                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD", "ETA",
             ),
         }
@@ -374,6 +376,7 @@ class OverviewRendererTest(unittest.TestCase):
             line for line in wide.splitlines() if "Ref" in line and "GuessD" in line
         )
         self.assertIn("Best", wide_branch_header)
+        self.assertIn("4/1", wide)
 
     def test_reordered_input_keeps_prior_identity_order(self):
         first = overview_report()
@@ -613,7 +616,9 @@ class OverviewRendererTest(unittest.TestCase):
             "claim_summary": {
                 "total_claim_count": 12972, "done_count": 12819,
                 "in_flight_count": 5, "evaluated_count": 11200,
-                "bulk_eliminated_count": 1619, "provenance_unknown_count": 0,
+                "one_level_erd_pruned_count": 1500,
+                "two_level_erd_pruned_count": 119,
+                "provenance_unknown_count": 0,
                 "worker_contributions": [
                     {"worker_id": "worker-0", "done_count": 6484},
                     {"worker_id": "worker-2", "done_count": 6335},
@@ -623,7 +628,8 @@ class OverviewRendererTest(unittest.TestCase):
         }
         output = render_report(report, width=100)
         self.assertIn("12,819 done", output)
-        self.assertIn("1,619 bulk proofs", output)
+        self.assertIn("1,500 one-level ERD prunes", output)
+        self.assertIn("119 two-level ERD prunes", output)
         self.assertIn("5 in flight", output)
         self.assertIn("by worker: w0 6,484", output)
         self.assertNotIn("idx=", output)
@@ -763,7 +769,7 @@ class CandidateSweepBarTest(unittest.TestCase):
 
     def test_branch_report_renders_sweep_with_worker_position(self):
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "report_kind": "branch",
             "generated_at": 1000,
             "branch_target": None,
@@ -1565,7 +1571,7 @@ class ViewParserTest(unittest.TestCase):
 def root_progress_report(estimate=None, requested_at=1_798_000_000):
     return {
         "report_kind": "root_progress",
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": 1_800_000_000,
         "tree": False,
         "sources": {

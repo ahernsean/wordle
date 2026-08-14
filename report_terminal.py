@@ -96,6 +96,18 @@ def _count_increase_rule(field):
     return rule
 
 
+def _any_count_increase_rule(*fields):
+    def rule(row, previous_row):
+        if previous_row is None:
+            return None
+        increased = any(
+            (row.get(field) or 0) > (previous_row.get(field) or 0)
+            for field in fields
+        )
+        return "green" if increased else None
+    return rule
+
+
 def _best_erd_improvement_rule(row, previous_row):
     if previous_row is None or row.get("best_erd") is None:
         return None
@@ -745,9 +757,11 @@ def _branch_columns(display_order):
             "Ans", "answer_count", remove_priority=10, alignment="right"
         ),
         TerminalColumn(
-            "Bulk", "bulk_completed_candidate_count", remove_priority=20,
+            "ERD1/2", _display_erd_prunes, remove_priority=20,
             alignment="right",
-            highlight_rule=_count_increase_rule("bulk_completed_candidate_count"),
+            highlight_rule=_any_count_increase_rule(
+                "one_level_erd_pruned_candidate_count",
+                "two_level_erd_pruned_candidate_count"),
         ),
         TerminalColumn(
             "Best", "display_best", remove_priority=30,
@@ -770,6 +784,12 @@ def _display_done(row):
     candidate_count = row["candidate_count"]
     total = f"{candidate_count:,}" if candidate_count is not None else "—"
     return f"{row['completed_candidate_count']:,}/{total}"
+
+
+def _display_erd_prunes(row):
+    one_level = row.get("one_level_erd_pruned_candidate_count") or 0
+    two_level = row.get("two_level_erd_pruned_candidate_count") or 0
+    return f"{one_level:,}/{two_level:,}"
 
 
 def _display_best(row):
@@ -1040,12 +1060,20 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         if queue["candidate_count"] is not None:
             completed = queue["completed_candidate_count"]
             progress = f"{completed}/{queue['candidate_count']}"
+        one_level_erd_prunes = queue.get(
+            "one_level_erd_pruned_candidate_count",
+            queue["bulk_completed_candidate_count"],
+        )
+        two_level_erd_prunes = queue.get(
+            "two_level_erd_pruned_candidate_count", 0)
         queue_lines = [
             "Queue",
             _fit(
                 f"  status={queue['branch_status']} phase={queue['branch_phase']}  "
                 f"priority={queue['priority']}  "
-                f"progress={progress}  bulk={queue['bulk_completed_candidate_count']}  "
+                f"progress={progress}  "
+                f"one-level-ERD-prunes={one_level_erd_prunes:,}  "
+                f"two-level-ERD-prunes={two_level_erd_prunes:,}  "
                 f"best={queue['best_guess'] or '—'}  nodes={_abbreviate_number(queue['search_node_count'])}",
                 width,
             ),
@@ -1107,10 +1135,15 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     )
     claim_summary = data.get("claim_summary") or {}
     if claim_summary.get("total_claim_count"):
+        one_level_erd_prunes = claim_summary.get(
+            "one_level_erd_pruned_count",
+            claim_summary.get("bulk_eliminated_count", 0),
+        )
         completion_fields = [
             f"{claim_summary['done_count']:,} done",
             f"{claim_summary['evaluated_count']:,} evaluated",
-            f"{claim_summary['bulk_eliminated_count']:,} bulk proofs",
+            f"{one_level_erd_prunes:,} one-level ERD prunes",
+            f"{claim_summary.get('two_level_erd_pruned_count', 0):,} two-level ERD prunes",
         ]
         if claim_summary.get("provenance_unknown_count"):
             completion_fields.append(
@@ -1150,6 +1183,12 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     finalizations = data.get("recent_finalizations", [])
     for finalization in finalizations:
         spine = finalization.get("spine") or "(spine unknown)"
+        one_level_erd_prunes = finalization.get(
+            "one_level_erd_pruned_candidate_count",
+            finalization.get("bulk_completed_candidate_count", 0),
+        )
+        two_level_erd_prunes = finalization.get(
+            "two_level_erd_pruned_candidate_count", 0)
         proof = " unsolvable-within-budget" if finalization.get("loss_proof") == \
             "ceiling_above_budget" else ""
         telemetry_lines.append(_fit(
@@ -1157,7 +1196,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             f"epoch={finalization['epoch']} "
             f"nodes={_abbreviate_number(finalization['search_node_count'])} "
             f"evaluated={finalization['evaluated_candidate_count']} "
-            f"bulk={finalization['bulk_completed_candidate_count']}",
+            f"one-level-ERD-prunes={one_level_erd_prunes:,} "
+            f"two-level-ERD-prunes={two_level_erd_prunes:,}",
             width,
         ))
     finalization_total = data.get("finalization_total_count", len(finalizations))

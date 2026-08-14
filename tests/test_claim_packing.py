@@ -290,6 +290,28 @@ class TestClaimNextBundle(_TmpQueue):
         self.assertEqual(self.q.branch_done_candidates(self.key), N_CANDIDATES)
         self.assertEqual(self.q.branch_bulk_done_candidates(self.key), len(holes))
 
+    def test_holes_pass_records_one_level_erd_prunes_after_bound_was_swept(self):
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=N_CANDIDATES, count_cap=N_CANDIDATES)
+        holes = indices[:4]
+        for idx in indices[4:]:
+            self.q.complete_candidate(self.key, idx)
+        self.q.republish_remainder(self.key, bundle_id, holes)
+        self.q.update_branch_best(self.key, "salet", 1.0)
+        self.q._conn.execute("""
+            UPDATE active_branches SET bulk_done_bound = 1.0
+            WHERE branch_id = ?
+        """, (self.q._intern_branch(self.key),))
+
+        claim = self.q.claim_next_bundle(
+            self.key, "w1", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES)
+
+        self.assertIsNone(claim)
+        self.assertEqual(
+            self.q.branch_erd_pruned_candidate_counts(self.key),
+            (len(holes), 0))
+
     def test_bulk_completion_supersedes_in_flight_claim(self):
         _bundle_id, indices, _forced = self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
@@ -300,7 +322,11 @@ class TestClaimNextBundle(_TmpQueue):
         rows = {row["idx"]: row for row in self.q.claims_for_branch(self.key)}
         for idx in indices:
             self.assertEqual(rows[idx]["done"], 1)
-            self.assertEqual(rows[idx]["claimed_by"], "bulk-elimination")
+            self.assertEqual(rows[idx]["claimed_by"], "one-level-erd-prune")
+        self.assertEqual(
+            self.q.branch_erd_pruned_candidate_counts(self.key),
+            (N_CANDIDATES, 0),
+        )
         self.assertTrue(self.q.try_finalize_branch(self.key))
 
     def test_returns_none_for_finalized_branch(self):
@@ -407,6 +433,92 @@ class TestClaimNextBundle(_TmpQueue):
                 self.q.complete_candidate(self.key, idx)
                 done.add(idx)
         self.assertEqual(done, set(range(N_CANDIDATES)))
+
+
+class TestTwoLevelERDPruneCompletion(_TmpQueue):
+    def _claim_bundle(self, worker_id="worker-0"):
+        return self.q.claim_next_bundle(
+            self.key, worker_id, N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=5, count_cap=5)
+
+    def test_completes_selected_bundle_members_as_two_level_erd_prunes(self):
+        bundle_id, candidate_indices, _forced = self._claim_bundle()
+        pruned_candidate_indices = candidate_indices[:3]
+
+        completed_candidate_count = (
+            self.q.complete_bundle_two_level_erd_prunes(
+                self.key, bundle_id, pruned_candidate_indices,
+                nodes_spent=len(candidate_indices)))
+
+        self.assertEqual(completed_candidate_count, 3)
+        rows = {row["idx"]: row for row in self.q.claims_for_branch(self.key)}
+        for candidate_index in pruned_candidate_indices:
+            self.assertEqual(rows[candidate_index]["done"], 1)
+            self.assertEqual(
+                rows[candidate_index]["claimed_by"], "two-level-erd-prune")
+            self.assertIsNone(rows[candidate_index]["bundle_id"])
+        for candidate_index in candidate_indices[3:]:
+            self.assertEqual(rows[candidate_index]["done"], 0)
+            self.assertEqual(rows[candidate_index]["bundle_id"], bundle_id)
+        self.assertEqual(self.q.branch_bulk_done_candidates(self.key), 3)
+        self.assertEqual(
+            self.q.branch_erd_pruned_candidate_counts(self.key), (0, 3))
+        self.assertEqual(
+            self.q.get_branch(self.key)["nodes_spent"], len(candidate_indices))
+
+    def test_stale_bundle_cannot_complete_a_new_owners_claims(self):
+        old_bundle_id, candidate_indices, _forced = self._claim_bundle()
+        new_bundle_id = "worker-1:999:0"
+        branch_id = self.q._intern_branch(self.key)
+        self.q._conn.execute("""
+            UPDATE candidate_claims
+            SET claimed_by = 'worker-1', bundle_id = ?
+            WHERE branch_id = ? AND bundle_id = ?
+        """, (new_bundle_id, branch_id, old_bundle_id))
+
+        completed_candidate_count = (
+            self.q.complete_bundle_two_level_erd_prunes(
+                self.key, old_bundle_id, candidate_indices))
+
+        self.assertEqual(completed_candidate_count, 0)
+        rows = {row["idx"]: row for row in self.q.claims_for_branch(self.key)}
+        for candidate_index in candidate_indices:
+            self.assertEqual(rows[candidate_index]["done"], 0)
+            self.assertEqual(rows[candidate_index]["bundle_id"], new_bundle_id)
+
+    def test_ceiling_prunes_mark_a_branch_as_cut(self):
+        self.q._conn.execute(
+            "UPDATE active_branches SET ceiling = 3.2 WHERE branch_id = ?",
+            (self.q._intern_branch(self.key),))
+        bundle_id, candidate_indices, _forced = self._claim_bundle()
+
+        self.q.complete_bundle_two_level_erd_prunes(
+            self.key, bundle_id, candidate_indices)
+
+        self.assertTrue(self.q.read_branch_meta(self.key)[-1])
+
+    def test_no_candidates_and_no_nodes_is_a_no_op(self):
+        self.assertEqual(
+            self.q.complete_bundle_two_level_erd_prunes(
+                self.key, "bundle", [], nodes_spent=0),
+            0)
+
+    def test_unknown_branch_is_not_created_by_completion(self):
+        unknown_key = encode_subset(["bacon", "caper"])
+        self.assertEqual(
+            self.q.complete_bundle_two_level_erd_prunes(
+                unknown_key, "bundle", [0], nodes_spent=1),
+            0)
+        self.assertIsNone(self.q.get_branch(unknown_key))
+
+    def test_preflight_nodes_are_recorded_without_a_pruned_candidate(self):
+        bundle_id, _candidate_indices, _forced = self._claim_bundle()
+
+        completed = self.q.complete_bundle_two_level_erd_prunes(
+            self.key, bundle_id, [], nodes_spent=4)
+
+        self.assertEqual(completed, 0)
+        self.assertEqual(self.q.get_branch(self.key)["nodes_spent"], 4)
 
 
 class TestRepublishRemainder(_TmpQueue):
@@ -821,7 +933,7 @@ class TestStructuralClaimReduction(_SwarmBase):
         n_bundles = len(bundle_sizes)
         self.assertGreater(n_bundles, 0)
         # Concrete reduction factor: this fixture (24 candidates, default
-        # small_count=8/count_cap=500) bulk-completes the ERD-pruned tail once
+        # small_count=8/count_cap=500) completes the ERD-pruned tail once
         # the first candidate solves, so the claim count drops well below
         # one-per-candidate.
         self.assertLessEqual(n_bundles, n_candidates // 2,

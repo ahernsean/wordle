@@ -934,7 +934,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # candidate — the branch holds far more claims than a browser can render.
         self.assertIn("12,819 done", text)
         self.assertIn("11,200 evaluated", text)
-        self.assertIn("1,619 bulk proofs", text)
+        self.assertIn("1,500 one-level ERD prunes", text)
+        self.assertIn("119 two-level ERD prunes", text)
         self.assertIn("5 in flight", text)
         self.assertIn("w0 6,484", text)
         # Nothing fetches the raw per-candidate list, and no per-candidate rows
@@ -1069,6 +1070,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("updated at", text)
         self.assertIn("10s ago", text)
         self.assertNotIn("990", text)
+
+    def test_finalizations_show_both_erd_prune_metrics(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Recent finalizations")
+        text = self.page.locator("section:has-text('Recent finalizations')").inner_text()
+        self.assertIn("one-level ERD prunes", text)
+        self.assertIn("two-level ERD prunes", text)
+
+    def test_branch_queue_shows_both_erd_prune_metrics(self):
+        self.apply_branch_target("RAISE .....")
+        facts = self.page.locator(
+            "section:has-text('Queue') .labeled-facts").first
+        text = facts.inner_text()
+        self.assertIn("one-level ERD prunes", text)
+        self.assertIn("two-level ERD prunes", text)
 
     def test_ceiling_proven_loss_explains_its_proof(self):
         text = self.page.evaluate("""async () => {

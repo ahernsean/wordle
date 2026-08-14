@@ -30,6 +30,21 @@ Queue mutations remain grouped under `erd_search.py queue`: `add`, `remove`,
 `reconcile-orphaned-ownership`. The `queue` group has no read-only dashboard
 commands.
 
+### ERD-prune provenance
+
+Use **one-level ERD prune** for a candidate completed by the vectorized
+closed-form candidate bound, and **two-level ERD prune** for a candidate
+completed by the response-group `BranchFloorTable` bound. Reports must show
+these as separate metrics wherever candidate-prune completion is displayed.
+
+The SQLite names `bulk_done_candidates`, `bulk_done_bound`, and the historical
+`claimed_by = 'bulk-elimination'` value predate that vocabulary. They remain as
+legacy storage and compatibility names, not user-facing terminology. Existing
+`bulk-elimination` claims are one-level ERD prunes. New claims use
+`one-level-erd-prune` or `two-level-erd-prune`, and the legacy aggregate remains
+the sum of both provenance-specific counters. Do not rename the legacy columns
+without a separate compatibility migration.
+
 ---
 
 ## Anchored vocabulary
@@ -343,6 +358,15 @@ Run the test suite before committing and pushing any change that touches code:
 
 ```
 python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
+```
+
+GitHub CI also enforces total coverage of at least 98%.  Write tests for every
+new or changed executable path, then run the coverage gate locally before
+pushing a code change:
+
+```
+python3.13 -m coverage run -m unittest discover -s tests -t . -p 'test_*.py'
+python3.13 -m coverage report --fail-under=98
 ```
 
 Use `python3.13`, not the default `python` (3.9): only 3.13 has playwright, so

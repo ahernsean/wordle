@@ -120,6 +120,8 @@ def _bare_worker():
     w.score_cache.read_misses = 0
     w.queue = mock.MagicMock()
     w.queue.read_branch_best.return_value = (None, None, None)
+    w.queue.branch_bulk_done_candidates.return_value = 0
+    w.queue.branch_erd_pruned_candidate_counts.return_value = (0, 0)
     w.queue.get_cost_typical.return_value = None  # cold model by default
     w.queue.checkpoint_paused.return_value = False
     w.queue.wal_traffic_snapshot.return_value = ({}, {})
@@ -2450,6 +2452,108 @@ class TestClaimBundleRetry(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(w.queue.claim_next_bundle.call_count, 1)
+
+
+class TestTwoLevelERDPruneBundles(unittest.TestCase):
+    def _worker(self, bound_erd=3.1):
+        worker = _bare_worker()
+        worker.pattern_matrix = mock.MagicMock()
+        worker.pattern_matrix.answer_indices.return_value = list(range(len(BRANCH)))
+        worker.branch_floor_table = object()
+        worker.queue.read_branch_best.return_value = (
+            "clart", bound_erd, None)
+        worker.queue.complete_bundle_two_level_erd_prunes.side_effect = (
+            lambda _branch_key, _bundle_id, candidate_indices, nodes_spent=0:
+                len(candidate_indices))
+
+        def count_heartbeat(*_args, **_kwargs):
+            worker._nodes += 1
+
+        worker._heartbeat = mock.MagicMock(side_effect=count_heartbeat)
+        return worker
+
+    def test_an_all_pruned_bundle_uses_one_completion_write(self):
+        worker = self._worker()
+        candidate_indices = [0, 1, 2]
+        worker._evaluate_bundle_member = mock.MagicMock(return_value=True)
+
+        with mock.patch.object(
+                erd_swarm, "candidate_two_level_cost_lower_bound",
+                return_value=3.2) as lower_bound:
+            completed = worker.evaluate_bundle(
+                b"branch", BRANCH, len(BRANCH), "bundle-1",
+                candidate_indices, frozenset(), budget=5)
+
+        self.assertTrue(completed)
+        self.assertEqual(lower_bound.call_count, len(candidate_indices))
+        worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
+            b"branch", "bundle-1", candidate_indices,
+            nodes_spent=len(candidate_indices))
+        worker.queue.add_nodes_spent.assert_not_called()
+        worker._evaluate_bundle_member.assert_not_called()
+        worker.queue.record_bundle_stats.assert_called_once()
+
+    def test_only_survivors_reach_ordinary_candidate_evaluation(self):
+        worker = self._worker()
+        candidate_indices = [0, 1, 2]
+        worker._evaluate_bundle_member = mock.MagicMock(return_value=True)
+
+        with mock.patch.object(
+                erd_swarm, "candidate_two_level_cost_lower_bound",
+                side_effect=[3.2, 2.9, 3.3]):
+            completed = worker.evaluate_bundle(
+                b"branch", BRANCH, len(BRANCH), "bundle-1",
+                candidate_indices, frozenset(), budget=5)
+
+        self.assertTrue(completed)
+        worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
+            b"branch", "bundle-1", [0, 2],
+            nodes_spent=len(candidate_indices))
+        self.assertEqual(worker._evaluate_bundle_member.call_count, 1)
+        self.assertEqual(worker._evaluate_bundle_member.call_args.args[3], 1)
+
+    def test_a_bound_below_three_uses_the_existing_evaluation_path(self):
+        worker = self._worker(bound_erd=2.9)
+        candidate_indices = [0, 1, 2]
+        worker._evaluate_bundle_member = mock.MagicMock(return_value=True)
+
+        with mock.patch.object(
+                erd_swarm, "candidate_two_level_cost_lower_bound") as lower_bound:
+            completed = worker.evaluate_bundle(
+                b"branch", BRANCH, len(BRANCH), "bundle-1",
+                candidate_indices, frozenset(), budget=5)
+
+        self.assertTrue(completed)
+        lower_bound.assert_not_called()
+        worker.queue.complete_bundle_two_level_erd_prunes.assert_not_called()
+        self.assertEqual(worker._evaluate_bundle_member.call_count,
+                         len(candidate_indices))
+
+    def test_missing_bound_skips_the_two_level_preflight(self):
+        worker = self._worker()
+        worker.queue.read_branch_best.return_value = (None, None, None)
+
+        pruned, cancelled = worker._complete_bundle_two_level_erd_prunes(
+            b"branch", BRANCH, len(BRANCH), "bundle-1", [0])
+
+        self.assertEqual(pruned, frozenset())
+        self.assertFalse(cancelled)
+        worker.queue.complete_bundle_two_level_erd_prunes.assert_not_called()
+
+    def test_preflight_cancellation_persists_prior_prunes(self):
+        worker = self._worker()
+        worker.cancel = mock.MagicMock(side_effect=[False, True])
+
+        with mock.patch.object(
+                erd_swarm, "candidate_two_level_cost_lower_bound",
+                return_value=3.2):
+            pruned, cancelled = worker._complete_bundle_two_level_erd_prunes(
+                b"branch", BRANCH, len(BRANCH), "bundle-1", [0, 1])
+
+        self.assertEqual(pruned, frozenset({0}))
+        self.assertTrue(cancelled)
+        worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
+            b"branch", "bundle-1", [0], nodes_spent=1)
 
 
 class TestMidLoopPublisher(unittest.TestCase):
