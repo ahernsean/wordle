@@ -87,20 +87,29 @@ def oracle_response(guess, answer):
 class ExactERD:
     """Exhaustive minimum expected remaining depth over a fixed candidate pool.
 
-    `solve` returns `(total, max_remaining_depth, best_guesses)`, or None when
-    the words cannot be solved within the budget.  `total` is the sum over
-    answers of the guesses each one takes, an integer: ERD is `total / n`, and
-    keeping the numerator lets every comparison be exact.  `best_guesses` is
-    every candidate attaining that minimum, because which one the engine
-    records depends on the order it happens to try them in, and no order is
-    more correct than another among equals.
+    `solve` returns `(total, depths, best_guesses)`, or None when the words
+    cannot be solved within the budget.  `total` is the sum over answers of the
+    guesses each one takes, an integer: ERD is `total / n`, and keeping the
+    numerator lets every comparison be exact.  `best_guesses` is every
+    candidate attaining that minimum, because which one the engine records
+    depends on the order it happens to try them in, and no order is more
+    correct than another among equals.
 
-    Depth is minimized only among the strategies that already attain the
-    minimum total, matching what the engine reports: it chooses on ERD and the
-    worst-case line length is whatever that choice implies.  Both are
-    separable across response groups — the total is a sum and the depth a max —
-    so minimizing them group by group is the same as minimizing them over whole
-    strategies.
+    `depths` is the *set* of worst-case line lengths reachable while still
+    attaining that minimum, not the shortest of them.  The engine chooses on
+    ERD alone and reports whatever depth its choice implies, so more than one
+    depth can be correct for the same optimal ERD — but only the ones in this
+    set are, and a stored depth outside it is wrong even when it falls between
+    the shortest and the budget.  `guess_depths` gives the same set per optimal
+    guess, which is what lets the recorded guess be checked against its own
+    depths rather than against the best any guess could manage.
+
+    A set is needed rather than a single value because the total is a sum over
+    response groups while the depth is a max: minimizing the sum is separable
+    group by group, but every combination of ERD-optimal sub-strategies then
+    yields some max, and the engine may land on any of them.  A max of `v` is
+    reachable exactly when some group can supply `v` and no group is forced
+    above it.
 
     There is no pruning here of any kind.  The single candidate exclusion is a
     guess that leaves every word in one group and is not itself one of them:
@@ -134,10 +143,36 @@ class ExactERD:
         self._memo[key] = result = self._solve(words, budget)
         return result
 
+    def _outcome(self, candidate, words, sub_budget):
+        """`(total, depths)` for playing `candidate` here, or None if infeasible.
+
+        The depth set is every worst-case line length reachable while each
+        response group is solved ERD-optimally.  A group can be held to any
+        depth in its own set, so a max of `v` is reachable exactly when some
+        group offers `v` and every group can stay at or below it — which is
+        what the `floor` below expresses.
+        """
+        total = len(words)
+        group_depths = []
+        for group in self._groups(candidate, words):
+            if len(group) == 1 and group[0] == candidate:
+                continue
+            sub = self.solve(group, sub_budget)
+            if sub is None:
+                return None
+            total += sub[0]
+            group_depths.append(sub[1])
+        if not group_depths:
+            return (total, frozenset({1}))
+        floor = max(min(depths) for depths in group_depths)
+        return (total, frozenset(
+            1 + depth
+            for depths in group_depths for depth in depths if depth >= floor))
+
     def _solve(self, words, budget):
         n = len(words)
         if n == 0:
-            return (0, 0, ())
+            return (0, frozenset({0}), ())
         if budget is not None and budget < 1:
             return None
         if n == 1:
@@ -145,37 +180,44 @@ class ExactERD:
             # happens to list it: every answer is a legal guess in Wordle, so
             # the engine resolves a singleton without consulting the pool and
             # the oracle must model the same game.
-            return (1, 1, (words[0],))
+            return (1, frozenset({1}), (words[0],))
         sub_budget = None if budget is None else budget - 1
         best_total = None
-        best_depth = None
+        best_depths = frozenset()
         best_guesses = []
         for candidate in self.pool:
             groups = self._groups(candidate, words)
             if len(groups) == 1 and candidate not in words:
                 continue
-            total = n
-            depth = 1
-            feasible = True
-            for group in groups:
-                if len(group) == 1 and group[0] == candidate:
-                    continue
-                sub = self.solve(group, sub_budget)
-                if sub is None:
-                    feasible = False
-                    break
-                total += sub[0]
-                depth = max(depth, 1 + sub[1])
-            if not feasible:
+            outcome = self._outcome(candidate, words, sub_budget)
+            if outcome is None:
                 continue
+            total, depths = outcome
             if best_total is None or total < best_total:
-                best_total, best_depth, best_guesses = total, depth, [candidate]
+                best_total, best_depths, best_guesses = total, depths, [candidate]
             elif total == best_total:
                 best_guesses.append(candidate)
-                best_depth = min(best_depth, depth)
+                best_depths |= depths
         if best_total is None:
             return None
-        return (best_total, best_depth, tuple(best_guesses))
+        return (best_total, best_depths, tuple(best_guesses))
+
+    def guess_depths(self, words, budget):
+        """`{guess: depths}` for every ERD-optimal guess, or {} if unsolvable.
+
+        The engine records one guess and the depth its own descent produced.
+        Checking that depth against this guess's own set is exact; checking it
+        against the shortest depth any optimal guess could reach would accept a
+        stored depth no strategy actually attains, and `max_remaining_depth` is
+        the feasibility gate and the cache-reuse key.
+        """
+        words = tuple(sorted(words))
+        result = self.solve(words, budget)
+        if result is None:
+            return {}
+        sub_budget = None if budget is None else budget - 1
+        return {candidate: self._outcome(candidate, words, sub_budget)[1]
+                for candidate in result[2]}
 
     def erd(self, words, budget):
         """The exact optimum as a Fraction, or None when unsolvable."""
@@ -262,10 +304,10 @@ class TestTheOracleIsSound(_CaseMixin, unittest.TestCase):
         """
         words = ['chino', 'fakir', 'regal', 'share']
         oracle = ExactERD(words)
-        total, depth, guesses = oracle.solve(words, 5)
+        total, depths, guesses = oracle.solve(words, 5)
         self.assertEqual(len({oracle_response('chino', w) for w in words}), 4)
         self.assertEqual(total, 7)
-        self.assertEqual(depth, 2)
+        self.assertEqual(depths, frozenset({2}))
         self.assertEqual(oracle.erd(words, 5), Fraction(7, 4))
         self.assertIn('chino', guesses)
 
@@ -278,7 +320,7 @@ class TestTheOracleIsSound(_CaseMixin, unittest.TestCase):
         """
         words = ['aided', 'bided', 'sided', 'tided']
         oracle = ExactERD(words)
-        self.assertEqual(oracle.solve(words, 5)[:2], (10, 4))
+        self.assertEqual(oracle.solve(words, 5)[:2], (10, frozenset({4})))
         self.assertIsNotNone(oracle.solve(words, 4))
         self.assertEqual(oracle.erd(words, 5), Fraction(10, 4))
 
@@ -289,8 +331,10 @@ class TestTheOracleIsSound(_CaseMixin, unittest.TestCase):
         guess even from a pool that does not list it — which is what lets a
         pool of foreign words solve anything at all.
         """
-        self.assertEqual(ExactERD(['crane']).solve(['crane'], 1), (1, 1, ('crane',)))
-        self.assertEqual(ExactERD(['slate']).solve(['crane'], 5), (1, 1, ('crane',)))
+        self.assertEqual(ExactERD(['crane']).solve(['crane'], 1),
+                         (1, frozenset({1}), ('crane',)))
+        self.assertEqual(ExactERD(['slate']).solve(['crane'], 5),
+                         (1, frozenset({1}), ('crane',)))
         self.assertIsNone(ExactERD(['slate']).solve(['crane'], 0))
 
     def test_a_budget_below_the_needed_depth_is_unsolvable(self):
@@ -301,6 +345,47 @@ class TestTheOracleIsSound(_CaseMixin, unittest.TestCase):
         # The unseparable four need all four guesses, so three is not enough.
         one_apart = ExactERD(['aided', 'bided', 'sided', 'tided'])
         self.assertIsNone(one_apart.solve(['aided', 'bided', 'sided', 'tided'], 3))
+
+    def test_an_in_range_depth_is_not_automatically_an_attainable_one(self):
+        """Why the depth check reads a set and not an interval.
+
+        These four are told apart by one guess, so every ERD-optimal strategy
+        finishes in two and no reachable line is longer — even though the
+        budget allows five.  A depth of 3 sits between the shortest optimum and
+        the budget while corresponding to no strategy at all, so a check that
+        only bounded the recorded depth from both sides would wave it through.
+        """
+        words = ['chino', 'fakir', 'regal', 'share']
+        oracle = ExactERD(words)
+        for guess, depths in oracle.guess_depths(words, 5).items():
+            with self.subTest(guess=guess):
+                self.assertEqual(depths, frozenset({2}))
+                self.assertNotIn(3, depths)
+                self.assertNotIn(5, depths)
+
+    def test_the_depth_set_is_usually_narrower_than_the_budget_allows(self):
+        """The tightening is not a technicality — it is most of the interval.
+
+        Across the sweep the attainable depths for an optimal guess almost
+        always leave some longer line unreachable, so accepting anything up to
+        the budget would accept a stored depth no strategy produces.
+        """
+        rng = random.Random(31337)
+        narrower = 0
+        cases = 0
+        for _ in range(60):
+            branch = sorted(rng.sample(self.answers, rng.randint(2, 7)))
+            pool = rng.choice([self.narrow_pool, self.wide_pool])
+            budget = rng.choice([4, 5])
+            if ExactERD(pool).solve(branch, budget) is None:
+                continue
+            for depths in ExactERD(pool).guess_depths(branch, budget).values():
+                cases += 1
+                if set(range(min(depths), budget + 1)) - set(depths):
+                    narrower += 1
+        self.assertGreater(cases, 100)
+        self.assertGreater(narrower, cases // 2,
+                           "the depth set is no tighter than a range check")
 
     def test_a_non_splitting_candidate_is_never_the_optimum(self):
         """The one candidate the oracle skips could not have won anyway.
@@ -327,7 +412,7 @@ class TestTheEngineMatchesTheOracle(_CaseMixin, unittest.TestCase):
         if expected is None:
             self.assertIsNone(erd, "engine solved what no strategy can")
             return
-        total, min_depth, best_guesses = expected
+        total, _depths, best_guesses = expected
         self.assertIsNotNone(erd, "engine gave up on a solvable branch")
         self.assertEqual(round(erd * len(branch)), total,
                          "ERD %r is not %d/%d" % (erd, total, len(branch)))
@@ -336,7 +421,10 @@ class TestTheEngineMatchesTheOracle(_CaseMixin, unittest.TestCase):
                       "recorded %r, which is not ERD-optimal" % (guess,))
         if budget is not None:
             self.assertLessEqual(depth, budget)
-            self.assertGreaterEqual(depth, min_depth)
+            reachable = oracle.guess_depths(branch, budget)[guess]
+            self.assertIn(depth, sorted(reachable),
+                          "recorded depth %r for %r, which no ERD-optimal "
+                          "strategy on that guess attains" % (depth, guess))
 
     def test_branch_sizes_against_the_wide_pool(self):
         for size in range(2, 9):
@@ -575,7 +663,7 @@ class TestPruningBoundaries(_CaseMixin, unittest.TestCase):
         for _ in range(20):
             branch = sorted(rng.sample(self.answers, rng.randint(2, 7)))
             n = len(branch)
-            total, _depth, _guesses = ExactERD(self.wide_pool).solve(branch, 5)
+            total, _depths, _guesses = ExactERD(self.wide_pool).solve(branch, 5)
             computed = self._solve(branch, self.wide_pool, 5, float('inf'))[1]
             with self.subTest(branch=branch):
                 # On the 1/n grid, and nowhere near the next point on it.
@@ -746,7 +834,8 @@ class TestTheFloorIsLoadBearing(unittest.TestCase):
 
     def test_the_engine_matches_the_oracle_on_hard_branches(self):
         for name, branch, pool, budget in self.cases():
-            total, min_depth, best_guesses = ExactERD(pool).solve(branch, budget)
+            oracle = ExactERD(pool)
+            total, _depths, _best = oracle.solve(branch, budget)
             (status, cost, depth, _floor), _n = self._solve(
                 branch, pool, budget, float('inf'))
             with self.subTest(case=name):
@@ -755,8 +844,12 @@ class TestTheFloorIsLoadBearing(unittest.TestCase):
                                  "%s: %r is not %d/%d"
                                  % (name, cost, total, len(branch)))
                 if budget is not None:
-                    self.assertGreaterEqual(depth, min_depth)
                     self.assertLessEqual(depth, budget)
+                    reachable = set()
+                    for depths in oracle.guess_depths(branch, budget).values():
+                        reachable |= depths
+                    self.assertIn(depth, sorted(reachable),
+                                  "%s: depth %r is unattainable" % (name, depth))
 
     def test_the_optimum_survives_a_tight_incumbent_on_hard_branches(self):
         """The regime the swarm runs in, on branches that need the floor.
