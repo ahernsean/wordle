@@ -1359,19 +1359,25 @@ class ViewParserTest(unittest.TestCase):
         handler_names = (
             "cmd_start", "cmd_stop", "cmd_restart", "cmd_run", "cmd_view",
             "cmd_queue_add", "cmd_queue_clear", "cmd_queue_remove",
-            "cmd_queue_priority", "cmd_reset_stale", "cmd_queue_clear_disk_stop",
-            "cmd_queue_set_disk_stop",
+            "cmd_queue_priority", "cmd_queue_source_priority",
+            "cmd_reset_stale", "cmd_queue_clear_disk_stop",
+            "cmd_queue_set_disk_stop", "cmd_queue_reconcile_orphaned_ownership",
             "cmd_epoch_show", "cmd_epoch_set",
         )
-        patches = [patch.object(erd_search, name) for name in handler_names]
-        started_patches = [handler_patch.start() for handler_patch in patches]
-        self.addCleanup(lambda: [handler_patch.stop() for handler_patch in patches])
+        patches = {name: patch.object(erd_search, name)
+                   for name in handler_names}
+        handlers = {name: handler_patch.start()
+                    for name, handler_patch in patches.items()}
+        self.addCleanup(lambda: [handler_patch.stop()
+                                 for handler_patch in patches.values()])
         self.assertTrue(commands)
         for arguments in commands:
             with self.subTest(arguments=arguments):
                 with patch("sys.argv", ["erd_search.py", *arguments]):
                     erd_search.main()
-        self.assertTrue(any(handler.called for handler in started_patches))
+        self.assertTrue(any(handler.called for handler in handlers.values()))
+        self.assertTrue(handlers["cmd_queue_source_priority"].called)
+        self.assertTrue(handlers["cmd_queue_reconcile_orphaned_ownership"].called)
 
     def test_removed_read_commands_fail_argparse(self):
         removed_commands = [
