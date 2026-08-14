@@ -290,6 +290,28 @@ class TestClaimNextBundle(_TmpQueue):
         self.assertEqual(self.q.branch_done_candidates(self.key), N_CANDIDATES)
         self.assertEqual(self.q.branch_bulk_done_candidates(self.key), len(holes))
 
+    def test_holes_pass_records_one_level_erd_prunes_after_bound_was_swept(self):
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=N_CANDIDATES, count_cap=N_CANDIDATES)
+        holes = indices[:4]
+        for idx in indices[4:]:
+            self.q.complete_candidate(self.key, idx)
+        self.q.republish_remainder(self.key, bundle_id, holes)
+        self.q.update_branch_best(self.key, "salet", 1.0)
+        self.q._conn.execute("""
+            UPDATE active_branches SET bulk_done_bound = 1.0
+            WHERE branch_id = ?
+        """, (self.q._intern_branch(self.key),))
+
+        claim = self.q.claim_next_bundle(
+            self.key, "w1", N_CANDIDATES, _ORDER, [2.5] * N_CANDIDATES)
+
+        self.assertIsNone(claim)
+        self.assertEqual(
+            self.q.branch_erd_pruned_candidate_counts(self.key),
+            (len(holes), 0))
+
     def test_bulk_completion_supersedes_in_flight_claim(self):
         _bundle_id, indices, _forced = self.q.claim_next_bundle(
             self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
