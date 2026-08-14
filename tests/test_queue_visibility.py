@@ -63,6 +63,48 @@ class QueueVisibilityTests(unittest.TestCase):
             )
         self.assertEqual(indexes, indexes_after)
 
+    def test_erd_prune_provenance_migration_backfills_legacy_counts_once(self):
+        self.q.create_branch(self.user_key, len(WORDS), 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches
+            SET bulk_done_candidates = 7,
+                one_level_erd_pruned_candidates = 0,
+                two_level_erd_pruned_candidates = 0
+            WHERE branch_id = ?
+        """, (branch_id,))
+        self.q.add_branch_finalize_log(
+            self.user_key, "CRANE -----", 5, 5, 10, 20, 100, 3,
+            bulk_done_candidates=5,
+        )
+        self.q._conn.execute("""
+            UPDATE telemetry.branch_finalize_log
+            SET one_level_erd_pruned_candidates = 0,
+                two_level_erd_pruned_candidates = 0
+        """)
+        self.q._conn.execute(
+            "DELETE FROM schema_migrations "
+            "WHERE name = 'split_erd_prune_provenance'")
+
+        self.q._migrate()
+        active_counts = self.q.branch_erd_pruned_candidate_counts(self.user_key)
+        finalize_counts = self.q._conn.execute("""
+            SELECT one_level_erd_pruned_candidates,
+                   two_level_erd_pruned_candidates
+            FROM telemetry.branch_finalize_log
+        """).fetchone()
+        self.assertEqual(active_counts, (7, 0))
+        self.assertEqual(tuple(finalize_counts), (5, 0))
+
+        self.q._conn.execute("""
+            UPDATE active_branches
+            SET two_level_erd_pruned_candidates = 2
+            WHERE branch_id = ?
+        """, (branch_id,))
+        self.q._migrate()
+        self.assertEqual(
+            self.q.branch_erd_pruned_candidate_counts(self.user_key), (7, 2))
+
     def test_branch_report_telemetry_is_bounded_and_preserves_outcomes(self):
         self.q.create_branch(self.user_key, len(WORDS), 10)
         self.q.record_bundle_stats(self.user_key, "bundle-1", 50, 20, censored=True)
@@ -246,27 +288,36 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(tree_result["sampled_row_count"], 1)
         self.assertEqual(tree_result["rows"][0]["spine"], "CRANE -----")
 
-    def test_cut_reuse_and_bulk_completion_hotspots_are_normalized(self):
+    def test_cut_reuse_and_erd_prune_hotspots_are_normalized(self):
         now = int(time.time())
         self.q.add_cut_reuse_miss(self.user_key, 5, 4, None, 2.5, 3)
         self.q.add_branch_finalize_log(
             self.user_key, "CRANE -----", 5, 4, now - 1, now,
             100, 3, outcome="cut", bulk_done_candidates=9,
+            one_level_erd_pruned_candidates=5,
+            two_level_erd_pruned_candidates=4,
         )
 
         cut_reuse = self.q.report_hotspots(
             "cut-reuse", epoch=0, since=now - 60,
             sample_size=10, limit=1,
         )
-        bulk_completion = self.q.report_hotspots(
-            "bulk-completed-candidates", epoch=0, since=now - 60,
+        one_level = self.q.report_hotspots(
+            "one-level-erd-prunes", epoch=0, since=now - 60,
+            sample_size=10, limit=1,
+        )
+        two_level = self.q.report_hotspots(
+            "two-level-erd-prunes", epoch=0, since=now - 60,
             sample_size=10, limit=1,
         )
 
         self.assertEqual(cut_reuse["population"], "recent_cut_reuse_misses")
         self.assertEqual(cut_reuse["rows"][0]["cut_reuse_miss_count"], 1)
         self.assertEqual(
-            bulk_completion["rows"][0]["bulk_completed_candidate_count"], 9
+            one_level["rows"][0]["one_level_erd_pruned_candidate_count"], 5
+        )
+        self.assertEqual(
+            two_level["rows"][0]["two_level_erd_pruned_candidate_count"], 4
         )
         with self.assertRaisesRegex(ValueError, "unsupported hotspot field"):
             self.q.report_hotspots("unknown", 0, now - 60, 10, 1)

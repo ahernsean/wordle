@@ -60,8 +60,8 @@ ALLOWED_PARAMETERS = SCALAR_PARAMETERS
 SORT_FIELDS = {"default", "age", "size", "workers", "priority", "nodes", "slowest"}
 HOTSPOT_FIELDS = {
     "nodes", "age", "size", "workers", "priority", "slowest",
-    "evaluated-candidates", "bulk-completed-candidates", "cut-reuse",
-    "coordination",
+    "evaluated-candidates", "bulk-completed-candidates",
+    "one-level-erd-prunes", "two-level-erd-prunes", "cut-reuse", "coordination",
 }
 class InvalidRequest(ValueError):
     pass

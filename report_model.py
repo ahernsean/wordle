@@ -31,7 +31,7 @@ from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
 from wordle_ui import fmt_pattern, parse_pattern
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
 
@@ -225,6 +225,7 @@ def validate_report_request(request: ReportRequest) -> None:
         )
     historical_hotspot = request.hotspot_field in (
         "evaluated-candidates", "bulk-completed-candidates",
+        "one-level-erd-prunes", "two-level-erd-prunes",
         "cut-reuse", "coordination",
     )
     if report_kind == "hotspots" and historical_hotspot and (
@@ -490,6 +491,13 @@ def _normalize_branch(
         "bulk_completed_candidate_count": progress[
             "bulk_completed_candidate_count"
         ],
+        "one_level_erd_pruned_candidate_count": progress.get(
+            "one_level_erd_pruned_candidate_count",
+            progress["bulk_completed_candidate_count"],
+        ),
+        "two_level_erd_pruned_candidate_count": progress.get(
+            "two_level_erd_pruned_candidate_count", 0
+        ),
         "priority": row["priority"],
         "is_cooperative": not bool(_row_value(row, "is_user_queued", False)),
         "source_word": source_word.lower() if source_word else None,
@@ -733,6 +741,12 @@ def _queue_overview(sources, generated_at, answer_set, report):
                 ],
                 "bulk_completed_candidate_count": row[
                     "bulk_completed_candidate_count"
+                ],
+                "one_level_erd_pruned_candidate_count": row[
+                    "one_level_erd_pruned_candidate_count"
+                ],
+                "two_level_erd_pruned_candidate_count": row[
+                    "two_level_erd_pruned_candidate_count"
                 ],
             }
             normalized = _normalize_branch(
@@ -1545,7 +1559,8 @@ def _summarize_claims(normalized_claims):
     contributions are the useful signal; the raw list stays available only to
     programmatic consumers via include_claims.
     """
-    done_count = evaluated_count = bulk_count = provenance_unknown_count = 0
+    done_count = evaluated_count = provenance_unknown_count = 0
+    one_level_erd_pruned_count = two_level_erd_pruned_count = 0
     in_flight_count = 0
     done_by_worker = {}
     for claim in normalized_claims:
@@ -1556,8 +1571,10 @@ def _summarize_claims(normalized_claims):
         kind = claim["completion_kind"]
         if kind == "evaluated":
             evaluated_count += 1
-        elif kind == "bulk_eliminated":
-            bulk_count += 1
+        elif kind == "one_level_erd_pruned":
+            one_level_erd_pruned_count += 1
+        elif kind == "two_level_erd_pruned":
+            two_level_erd_pruned_count += 1
         else:
             provenance_unknown_count += 1
         worker_id = claim["worker_id"]
@@ -1575,7 +1592,8 @@ def _summarize_claims(normalized_claims):
         "done_count": done_count,
         "in_flight_count": in_flight_count,
         "evaluated_count": evaluated_count,
-        "bulk_eliminated_count": bulk_count,
+        "one_level_erd_pruned_count": one_level_erd_pruned_count,
+        "two_level_erd_pruned_count": two_level_erd_pruned_count,
         "provenance_unknown_count": provenance_unknown_count,
         "worker_contributions": worker_contributions,
     }
@@ -1584,10 +1602,14 @@ def _summarize_claims(normalized_claims):
 def _normalize_claim(row, republish_count):
     claimed_by = _row_value(row, "claimed_by")
     done = bool(row["done"])
-    bulk_eliminated = claimed_by == "bulk-elimination"
+    one_level_erd_pruned = claimed_by in (
+        "bulk-elimination", "one-level-erd-prune")
+    two_level_erd_pruned = claimed_by == "two-level-erd-prune"
     sound_worker = bool(claimed_by and re.fullmatch(r"worker-[0-9]+", claimed_by))
-    if done and bulk_eliminated:
-        completion_kind = "bulk_eliminated"
+    if done and one_level_erd_pruned:
+        completion_kind = "one_level_erd_pruned"
+    elif done and two_level_erd_pruned:
+        completion_kind = "two_level_erd_pruned"
     elif done and sound_worker:
         completion_kind = "evaluated"
     else:
@@ -1730,6 +1752,12 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         "bulk_completed_candidate_count": _row_value(
             active_row, "bulk_done_candidates", 0
         ),
+        "one_level_erd_pruned_candidate_count": _row_value(
+            active_row, "one_level_erd_pruned_candidates", 0
+        ),
+        "two_level_erd_pruned_candidate_count": _row_value(
+            active_row, "two_level_erd_pruned_candidates", 0
+        ),
     }
     queue_payload = None
     if active_row is not None or pending_row is not None:
@@ -1745,6 +1773,12 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             "candidate_count": _row_value(active_row, "n_candidates"),
             "completed_candidate_count": progress["completed_candidate_count"],
             "bulk_completed_candidate_count": progress["bulk_completed_candidate_count"],
+            "one_level_erd_pruned_candidate_count": progress[
+                "one_level_erd_pruned_candidate_count"
+            ],
+            "two_level_erd_pruned_candidate_count": progress[
+                "two_level_erd_pruned_candidate_count"
+            ],
             "best_guess": _row_value(active_row, "best_guess"),
             "best_guess_is_answer": bool(
                 _row_value(active_row, "best_guess")

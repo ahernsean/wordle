@@ -891,7 +891,7 @@ class TestClaimNext(_TmpQueue):
         self.q.clear()
 
     def test_reconcile_orphaned_branch_ownership_demotes_stranded_branch(self):
-        # Mirrors claim_next_bundle's bulk-elimination retracting the
+        # Mirrors claim_next_bundle's one-level ERD pruning retracting the
         # in-flight candidate whose promoted sub-branch stays open (issue
         # #215): the branch's only membership row is gone but the branch
         # itself is untouched and still status='open'.
@@ -953,7 +953,7 @@ class TestClaimNext(_TmpQueue):
     def test_resolve_branch_memberships_self_heals_orphaned_sibling(self):
         # Two branches promoted under the same source-work request: the root
         # (self.key) finalizes normally while its sibling (other_key) was
-        # already orphaned by a bulk-elimination race and never touched
+        # already orphaned by a one-level ERD-prune race and never touched
         # again.  Finalizing the root must not silently strand the sibling
         # forever -- resolving any membership sweeps for this routine
         # pruning residue and demotes it so it stays claimable.

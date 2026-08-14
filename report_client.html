@@ -252,7 +252,7 @@
           <label class="field" id="sort-field"><span class="fieldlabel">Sort</span><select id="sort"></select></label>
           <label class="field" id="group-by-field"><span class="fieldlabel">Group by</span><select id="group-by"><option value="">none</option><option value="status">status</option><option value="answer_count">answer count</option><option value="cache_state">cache state</option><option value="worker_presence">worker</option><option value="priority">priority</option></select></label>
           <label class="field" id="limit-field"><span id="limit-label">Branches shown</span><input id="limit" type="number" min="1"></label>
-          <label class="field" id="by-field"><span class="fieldlabel">Hotspot field</span><select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>bulk-completed-candidates</option><option>cut-reuse</option><option>coordination</option></select></label>
+          <label class="field" id="by-field"><span class="fieldlabel">Hotspot field</span><select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>one-level-erd-prunes</option><option>two-level-erd-prunes</option><option>cut-reuse</option><option>coordination</option></select></label>
           <label class="field" id="epoch-field">Epoch<input id="epoch" class="narrow" type="number"></label>
           <label class="field" id="since-seconds-field"><span class="fieldlabel">Stats window (s)</span><input id="since-seconds" type="number" min="1" title="time window for hotspot aggregation"></label>
         </div>
@@ -263,7 +263,7 @@
   <script>
   (() => {
     "use strict";
-    const SCHEMA_VERSION=2, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
+    const SCHEMA_VERSION=3, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
     // iOS Safari's native <select> picker ignores the "hidden" attribute on
@@ -363,7 +363,7 @@
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_phase=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
-      if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
+      if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
       if(normalized.tree){normalized.claims=false;normalized.answers=false;}
       else normalized.tree_cursor=null;
@@ -433,7 +433,7 @@
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
-      const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","cut-reuse","coordination"].includes(currentState.by);
+      const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(currentState.by);
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
       byId("sort-field").hidden=kind==="cache"||isHotspots;
       byId("group-by-field").hidden=!wordReport;
@@ -956,7 +956,7 @@
       identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
       fragment.append(section("Identity",identityMetrics));
       if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine"),spineTargetText=spineText(branch.spine);copyButton.addEventListener("click",()=>copyText(spineTargetText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));spineSection.append(copyButton);fragment.append(spineSection);}
-      fragment.append(section("Queue",data.queue?labeledFacts([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["bulk proofs",data.queue.bulk_completed_candidate_count],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
+      fragment.append(section("Queue",data.queue?labeledFacts([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
       fragment.append(section("Cache",labeledFacts(candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at))));
       const ownership=data.branch_ownership||{};
@@ -993,7 +993,7 @@
           }
           if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdValue(row.ceiling,row.answer_count,{ceiling:true})+" exceeds budget "+valueOrDash(row.budget));
           else if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
-          facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.bulk_completed_candidate_count)+" bulk proofs",numText(row.search_node_count)+" nodes");
+          facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.one_level_erd_pruned_candidate_count??row.bulk_completed_candidate_count)+" one-level ERD prunes",numText(row.two_level_erd_pruned_candidate_count??0)+" two-level ERD prunes",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
           if(row.wall_millis)facts.push(numText(row.wall_millis)+" ms");
           card.append(statLine(facts));
@@ -1056,7 +1056,7 @@
       const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words ("+numText(branch.answer_count)+")"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
       const claimSummary=data.claim_summary;
       if(claimSummary&&claimSummary.total_claim_count){
-        const completion=[numText(claimSummary.done_count)+" done",numText(claimSummary.evaluated_count)+" evaluated",numText(claimSummary.bulk_eliminated_count)+" bulk proofs"];
+        const completion=[numText(claimSummary.done_count)+" done",numText(claimSummary.evaluated_count)+" evaluated",numText(claimSummary.one_level_erd_pruned_count??claimSummary.bulk_eliminated_count??0)+" one-level ERD prunes",numText(claimSummary.two_level_erd_pruned_count??0)+" two-level ERD prunes"];
         if(claimSummary.provenance_unknown_count)completion.push(numText(claimSummary.provenance_unknown_count)+" unattributed");
         if(claimSummary.in_flight_count)completion.push(numText(claimSummary.in_flight_count)+" in flight");
         const detail=element("section","section");detail.append(element("h2","","Candidate detail"),statLine(completion));

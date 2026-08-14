@@ -1181,7 +1181,8 @@ def main():
     p_view.add_argument(
         '--by', choices=(
             'nodes', 'age', 'size', 'workers', 'priority', 'slowest',
-            'evaluated-candidates', 'bulk-completed-candidates',
+            'evaluated-candidates', 'one-level-erd-prunes',
+            'two-level-erd-prunes',
             'cut-reuse', 'coordination'))
     p_view.add_argument('--epoch', type=int, metavar='N')
     p_view.add_argument('--since-seconds', type=int, metavar='N')

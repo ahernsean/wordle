@@ -253,10 +253,13 @@ class SemanticReportTest(unittest.TestCase):
                 (branch_id, 1, "bulk-elimination", now, now, None),
                 (branch_id, 2, "worker-3", now, now, "bundle-1"),
                 (branch_id, 3, "legacy-holder", now, now, None),
+                (branch_id, 4, "two-level-erd-prune", now, now, None),
             ],
         )
         queue._conn.execute(
-            "UPDATE active_branches SET bulk_done_candidates = 1 "
+            "UPDATE active_branches SET bulk_done_candidates = 2, "
+            "one_level_erd_pruned_candidates = 1, "
+            "two_level_erd_pruned_candidates = 1 "
             "WHERE branch_id = ?", (branch_id,),
         )
         queue._conn.execute(
@@ -266,7 +269,10 @@ class SemanticReportTest(unittest.TestCase):
         queue.add_branch_finalize_log(
             branch_key, f"RAISE {pattern}", len(answer_words), 5,
             now - 10, now, 500, 2, outcome="exact",
-            bulk_done_candidates=1, best_guess="cigar", best_erd=1.875,
+            bulk_done_candidates=2,
+            one_level_erd_pruned_candidates=1,
+            two_level_erd_pruned_candidates=1,
+            best_guess="cigar", best_erd=1.875,
         )
         queue.close()
         branch_target = parse_report_branch_target(f"RAISE {pattern}")
@@ -276,20 +282,22 @@ class SemanticReportTest(unittest.TestCase):
         claims = {
             claim["candidate_index"]: claim for claim in report["data"]["claims"]
         }
-        self.assertEqual(claims[1]["completion_kind"], "bulk_eliminated")
+        self.assertEqual(claims[1]["completion_kind"], "one_level_erd_pruned")
         self.assertIsNone(claims[1]["worker_id"])
         self.assertEqual(claims[2]["completion_kind"], "evaluated")
         self.assertEqual(claims[2]["worker_id"], "worker-3")
         self.assertEqual(claims[2]["republish_count"], 4)
         self.assertIsNone(claims[3]["completion_kind"])
+        self.assertEqual(claims[4]["completion_kind"], "two_level_erd_pruned")
         self.assertTrue(report["data"]["provenance_unknown"])
         # The bounded summary is present regardless of include_claims and
-        # aggregates the same three claims: one evaluated, one bulk, one
-        # unattributed, with the evaluated one credited to its worker.
+        # aggregates the same four claims: one evaluated, one prune from each
+        # ERD method, and one unattributed.
         summary = report["data"]["claim_summary"]
-        self.assertEqual(summary["done_count"], 3)
+        self.assertEqual(summary["done_count"], 4)
         self.assertEqual(summary["evaluated_count"], 1)
-        self.assertEqual(summary["bulk_eliminated_count"], 1)
+        self.assertEqual(summary["one_level_erd_pruned_count"], 1)
+        self.assertEqual(summary["two_level_erd_pruned_count"], 1)
         self.assertEqual(summary["provenance_unknown_count"], 1)
         self.assertEqual(summary["in_flight_count"], 0)
         self.assertEqual(
@@ -299,10 +307,13 @@ class SemanticReportTest(unittest.TestCase):
         summary_without_detail = collect_report(
             self.sources, ReportRequest(branch_target=branch_target)
         )["data"]["claim_summary"]
-        self.assertEqual(summary_without_detail["done_count"], 3)
+        self.assertEqual(summary_without_detail["done_count"], 4)
         self.assertNotIn("answer_words", report["data"]["branch"])
         self.assertEqual(
-            report["data"]["queue"]["bulk_completed_candidate_count"], 1
+            report["data"]["queue"]["one_level_erd_pruned_candidate_count"], 1
+        )
+        self.assertEqual(
+            report["data"]["queue"]["two_level_erd_pruned_candidate_count"], 1
         )
         self.assertEqual(
             report["data"]["recent_finalizations"][0]["outcome"], "exact"
@@ -313,6 +324,16 @@ class SemanticReportTest(unittest.TestCase):
         )
         self.assertEqual(
             report["data"]["recent_finalizations"][0]["bulk_completed_candidate_count"],
+            2,
+        )
+        self.assertEqual(
+            report["data"]["recent_finalizations"][0][
+                "one_level_erd_pruned_candidate_count"],
+            1,
+        )
+        self.assertEqual(
+            report["data"]["recent_finalizations"][0][
+                "two_level_erd_pruned_candidate_count"],
             1,
         )
         self.assertEqual(

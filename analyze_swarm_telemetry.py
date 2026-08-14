@@ -172,7 +172,8 @@ def estimate_claim_reduction(conn, epoch, small_count, count_cap):
     the ERD-pruned G = total - N coalesce into ceil(G/count_cap) count-capped
     bulk bundles.  This models epochs whose n_claims still meant total candidate
     coverage; current epochs record worker-evaluated claims separately from
-    bulk-done candidates and are measured directly by the CI overhead guard.
+    one-level ERD-pruned candidates and are measured directly by the CI
+    overhead guard.
     """
     import math
     total_by = {bytes(r[0]): r[1] for r in conn.execute(

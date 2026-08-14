@@ -667,6 +667,8 @@ class ReportModelTest(unittest.TestCase):
         )
         queue._conn.execute(
             "UPDATE active_branches SET bulk_done_candidates = 2, "
+            "one_level_erd_pruned_candidates = 1, "
+            "two_level_erd_pruned_candidates = 1, "
             "best_guess = 'CRANE', best_erd = 2.25, best_max_depth = 3, "
             "nodes_spent = 1234 WHERE branch_id = ?",
             (queue._intern_branch(branch_key),),
@@ -694,6 +696,8 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(branch["source_pattern"], "-----")
         self.assertEqual(branch["completed_candidate_count"], 1)
         self.assertEqual(branch["bulk_completed_candidate_count"], 2)
+        self.assertEqual(branch["one_level_erd_pruned_candidate_count"], 1)
+        self.assertEqual(branch["two_level_erd_pruned_candidate_count"], 1)
         self.assertEqual(branch["best_max_remaining_depth"], 3)
         self.assertNotIn("best_max_depth", branch)
         self.assertTrue(branch["best_guess_is_answer"])
@@ -994,7 +998,8 @@ class ReportModelTest(unittest.TestCase):
             (queue._intern_branch(first_key),),
         )
         queue._conn.execute(
-            "UPDATE active_branches SET bulk_done_candidates = 3 "
+            "UPDATE active_branches SET bulk_done_candidates = 3, "
+            "one_level_erd_pruned_candidates = 3 "
             "WHERE branch_id = ?", (queue._intern_branch(second_key),),
         )
         progress = queue.candidate_progress_by_branch_keys(
@@ -1006,6 +1011,8 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(progress[missing_key], {
             "completed_candidate_count": 0,
             "bulk_completed_candidate_count": 0,
+            "one_level_erd_pruned_candidate_count": 0,
+            "two_level_erd_pruned_candidate_count": 0,
         })
         queue.close()
 
