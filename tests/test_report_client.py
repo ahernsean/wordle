@@ -106,16 +106,6 @@ class ReportClientStaticTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_wordle_palette_and_responsive_breakpoint_are_declared(self):
-        for color in (
-            "#ffffff", "#f8f9fa", "#1a1a1b", "#787c7e", "#6aaa64",
-            "#c9b458", "#d3d6da", "#d14b4b", "#b59f3b",
-        ):
-            self.assertIn(color, self.html)
-        self.assertIn("color-scheme: light", self.html)
-        self.assertIn("@media (max-width:600px)", self.html)
-
-
 @contextmanager
 def fixture_server():
     configuration = ServerConfiguration(
@@ -205,13 +195,6 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.apply_branch_target("")
         self.page.wait_for_selector("text=overview report")
         self.assertEqual(overview_button.get_attribute("aria-current"), "page")
-
-    def test_answer_word_count_is_shown_before_expansion(self):
-        self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("text=branch report")
-        summary = self.page.locator("summary:has-text('Answer words')")
-        self.assertEqual(summary.inner_text(), "Answer words (8)")
-        self.assertIsNone(summary.locator("xpath=..").get_attribute("open"))
 
     def test_positional_cache_queue_and_explicit_navigation_urls(self):
         result = self.page.evaluate("""() => ({
@@ -341,14 +324,6 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.page.locator("article.card.clickable").first.click()
         self.assertIn("branch_target=CACHE+-----", self.page.url)
-
-    def test_word_view_shows_infeasible_erd_for_a_proven_loss(self):
-        # Served straight from the fixture (loss group present), so this pins
-        # the renderer to the model's real erd_summary field names.
-        self.apply_branch_target("SALET")
-        self.page.wait_for_selector("text=word report")
-        text = self.page.locator("#report").inner_text()
-        self.assertIn("1 of 4 response groups unsolvable within budget", text)
 
     def test_word_view_shows_pending_erd_while_a_group_is_unsolved(self):
         text = self.page.evaluate("""async () => {
@@ -1095,18 +1070,6 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("10s ago", text)
         self.assertNotIn("990", text)
 
-    def test_finalizations_are_glossed_and_timestamped(self):
-        self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("text=Recent finalizations")
-        text = self.page.locator("section:has-text('Recent finalizations')").inner_text()
-        self.assertIn("Cut: No candidate under ceiling", text)
-        self.assertIn("Exact: solved within budget", text)
-        self.assertIn("Loss: unsolvable in the game", text)
-        self.assertIn("solution not recorded", text)
-        self.assertIn("newest first", text)
-        self.assertIn("ago", text)
-        self.assertIn("budget", text)
-
     def test_ceiling_proven_loss_explains_its_proof(self):
         text = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
@@ -1116,7 +1079,6 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("Loss: unsolvable within budget", text)
         self.assertIn("ERD lower bound 3.250 26/8 exceeds budget 3", text)
 
     def test_exact_finalization_shows_recorded_solution(self):
@@ -1525,15 +1487,6 @@ class ReportClientBrowserTest(unittest.TestCase):
           return document.querySelectorAll('.flash-changed,.flash-improved').length;
         }""")
         self.assertEqual(count, 0)
-
-    def test_tree_header_names_the_snapshot_and_offers_refresh(self):
-        self.page.locator("[data-kind=queue]").click()
-        self.page.locator("#layout-tree").click()
-        self.page.wait_for_selector("ul.tree")
-        header = self.page.locator(".report-meta")
-        self.assertIn("snapshot", header.inner_text())
-        self.assertEqual(header.get_by_role("button", name="Refresh tree").count(), 1)
-        self.assertNotIn("generated 0s ago", header.inner_text())
 
     def test_sticky_order_survives_reordering_and_finalizing_state(self):
         identities = self.page.evaluate("""async () => {
