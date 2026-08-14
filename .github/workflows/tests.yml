@@ -172,6 +172,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v5
+
       - name: Require every test suite to pass
         env:
           UNIT_RESULT: ${{ needs.unit.result }}
