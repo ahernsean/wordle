@@ -29,15 +29,15 @@ jobs:
         env:
           REQUIRE_PLAYWRIGHT_BROWSER: "1"
 
-      - name: Validate coordination floor (N tiny-branch workers not slower than 1)
+      - name: Validate claim-handout drain (N workers not slower than 1)
         if: always()
         run: |
           python - <<'PY'
           import json, os, sys
-          path = os.environ.get('COORDINATION_FLOOR_RESULT_PATH',
-                                'coordination_floor_result.json')
+          path = os.environ.get('DRAIN_SMOKE_RESULT_PATH',
+                                'drain_smoke_result.json')
           if not os.path.exists(path):
-              print('Coordination-floor smoke did not run (skipped) — nothing to validate.')
+              print('Claim-handout drain smoke did not run (skipped) — nothing to validate.')
               sys.exit(0)
           with open(path) as f:
               r = json.load(f)

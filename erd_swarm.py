@@ -35,6 +35,7 @@ from erd_lattice import erd_ge
 from wordle_engine import (
     ERD_ALL,
     GAME_GUESSES,
+    BranchFloorTable,
     ResponseCache,
     CANCEL_RECVD,
     SOLVED,
@@ -566,7 +567,10 @@ class _BranchWorker:
         self._adaptive = enable_adaptive_decomposition
 
         self.all_answers = load_word_list(ANSWER_FILE)
-        self.all_words = load_word_list(WORDS_FILE)
+        # Immutable, and in the order the file gives: candidate order breaks
+        # ties among equal-cost candidates, and every claim draws from this
+        # one pool for the worker's lifetime.
+        self.all_words = tuple(load_word_list(WORDS_FILE))
         self.n_candidates = len(self.all_words)
         max_entries = mem_cache_limit(n_workers)
         logger.info('%s mem_cache cap: %d entries (~%.0f MB)',
@@ -576,6 +580,12 @@ class _BranchWorker:
         self.rcache = ResponseCache(self.all_answers, self.score_cache)
         self.pattern_matrix = pattern_matrix_module.PatternMatrix.load_or_build(
             cache_path, self.all_words, self.all_answers, self.score_cache)
+        # One table for the worker's whole lifetime: every claim draws its
+        # candidates from all_words, so the pool never changes and floors carry
+        # over between claims.  The table holds that same tuple, which is what
+        # keeps the per-candidate pool check a pointer comparison.
+        self.branch_floor_table = BranchFloorTable(
+            self.all_words, cache=self.rcache, pattern_matrix=self.pattern_matrix)
         self.queue = ERDQueue(queue_path)
 
         self.started = int(time.time())
@@ -1242,8 +1252,13 @@ class _BranchWorker:
 
         def _metric_observer(group_sizes, has_self, candidate_cost_lower_bound,
                              bound, erd_lower_bound_pruned):
-            metric['predicted'] = estimate_candidate_work(
-                group_sizes, has_self, n_words, bound, budget, self._typical)
+            # A pruned candidate is cut before recursing and so costs nothing,
+            # whichever gate cut it.  estimate_candidate_work only recognizes
+            # the closed-form gate, so honour the engine's classification here
+            # rather than re-deriving it from the group sizes.
+            metric['predicted'] = 0.0 if erd_lower_bound_pruned else (
+                estimate_candidate_work(
+                    group_sizes, has_self, n_words, bound, budget, self._typical))
             metric['bound'] = None if bound == float('inf') else bound
             metric['candidate_cost_lower_bound'] = candidate_cost_lower_bound
             metric['erd_lower_bound_pruned'] = erd_lower_bound_pruned
@@ -1264,6 +1279,7 @@ class _BranchWorker:
             mid_loop_publisher=self._mid_loop_publisher,
             metric_observer=_metric_observer if self._adaptive else None,
             pattern_matrix=self.pattern_matrix,
+            branch_floor_table=self.branch_floor_table,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound()))

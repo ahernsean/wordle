@@ -19,6 +19,6 @@ htmlcov/
 
 # Performance-guard results (written by test_erd_scaling and
 # test_swarm_vs_engine_overhead, read by the CI validate steps)
-coordination_floor_result.json
+drain_smoke_result.json
 strong_scaling_result.json
 swarm_overhead_result.json
