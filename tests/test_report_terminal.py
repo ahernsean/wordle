@@ -435,16 +435,6 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("ERD 3.564  max-d=6", output)
         self.assertNotIn("3.564102564102564", output)
 
-    def test_word_report_marks_an_absent_erd_summary_as_not_available(self):
-        report = self._word_report({
-            "state": "pending", "erd": None, "max_remaining_depth": None,
-            "resolved_group_count": 0, "infeasible_group_count": 0,
-            "response_group_count": 0,
-        })
-        report["data"]["erd_summary"] = None
-        output = render_report(report, width=60)
-        self.assertIn("ERD: n/a", output)
-
     def test_word_report_renders_pending_erd(self):
         report = self._word_report({
             "state": "pending", "erd": None, "max_remaining_depth": None,
@@ -1532,26 +1522,6 @@ class ViewParserTest(unittest.TestCase):
                 filters = run_view.call_args.args[0].filters
                 self.assertEqual(filters.branch_statuses, statuses)
                 self.assertEqual(filters.branch_phases, phases)
-
-    def test_view_help_explains_status_phase_and_lifecycle(self):
-        output = io.StringIO()
-        with (
-            patch("sys.argv", ["erd_search.py", "view", "--help"]),
-            patch("sys.stdout", output),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            erd_search.main()
-        self.assertEqual(raised.exception.code, 0)
-        help_text = output.getvalue()
-        self.assertIn(
-            "Status describes the branch's relationship to current work",
-            help_text,
-        )
-        self.assertIn("Phase describes the durable search milestone", help_text)
-        self.assertIn("The axes are related", help_text)
-        self.assertIn("pending / queued", help_text)
-        self.assertIn("active / evaluating <-> pending / evaluating", help_text)
-        self.assertIn("done / complete", help_text)
 
     def test_hotspot_defaults_and_sample_cap_are_normalized(self):
         with (

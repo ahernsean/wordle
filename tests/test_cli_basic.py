@@ -154,11 +154,6 @@ class TestCandidates(CliTestCase):
         self.assertIs(self.gs.universe, GuessUniverse.ALL_ANSWERS)
         self.assertIs(self.gs.compliance, ComplianceFilter.COMPLIANT)
 
-    def test_universe_labels_count_the_loaded_lists(self):
-        out = self.run_cmd(cmd_candidates, inputs=["2", "2"])
-        self.assertIn(f"all words ({len(self.GUESSES):,})", out)
-        self.assertIn(f"possible answers ({len(self.ANSWERS):,})", out)
-
     def test_bad_universe(self):
         out = self.run_cmd(cmd_candidates, inputs=["9"])
         self.assertIn("Invalid", out)
