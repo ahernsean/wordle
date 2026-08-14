@@ -475,6 +475,29 @@ class TestTwoLevelERDPruneCompletion(_TmpQueue):
 
         self.assertTrue(self.q.read_branch_meta(self.key)[-1])
 
+    def test_no_candidates_and_no_nodes_is_a_no_op(self):
+        self.assertEqual(
+            self.q.complete_bundle_two_level_erd_prunes(
+                self.key, "bundle", [], nodes_spent=0),
+            0)
+
+    def test_unknown_branch_is_not_created_by_completion(self):
+        unknown_key = encode_subset(["bacon", "caper"])
+        self.assertEqual(
+            self.q.complete_bundle_two_level_erd_prunes(
+                unknown_key, "bundle", [0], nodes_spent=1),
+            0)
+        self.assertIsNone(self.q.get_branch(unknown_key))
+
+    def test_preflight_nodes_are_recorded_without_a_pruned_candidate(self):
+        bundle_id, _candidate_indices, _forced = self._claim_bundle()
+
+        completed = self.q.complete_bundle_two_level_erd_prunes(
+            self.key, bundle_id, [], nodes_spent=4)
+
+        self.assertEqual(completed, 0)
+        self.assertEqual(self.q.get_branch(self.key)["nodes_spent"], 4)
+
 
 class TestRepublishRemainder(_TmpQueue):
     def test_republish_deletes_done0_rows_and_bumps_count(self):

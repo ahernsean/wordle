@@ -360,6 +360,15 @@ Run the test suite before committing and pushing any change that touches code:
 python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
 ```
 
+GitHub CI also enforces total coverage of at least 98%.  Write tests for every
+new or changed executable path, then run the coverage gate locally before
+pushing a code change:
+
+```
+python3.13 -m coverage run -m unittest discover -s tests -t . -p 'test_*.py'
+python3.13 -m coverage report --fail-under=98
+```
+
 Use `python3.13`, not the default `python` (3.9): only 3.13 has playwright, so
 under 3.9 the browser contract tests skip rather than run.
 

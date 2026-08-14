@@ -2529,6 +2529,32 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertEqual(worker._evaluate_bundle_member.call_count,
                          len(candidate_indices))
 
+    def test_missing_bound_skips_the_two_level_preflight(self):
+        worker = self._worker()
+        worker.queue.read_branch_best.return_value = (None, None, None)
+
+        pruned, cancelled = worker._complete_bundle_two_level_erd_prunes(
+            b"branch", BRANCH, len(BRANCH), "bundle-1", [0])
+
+        self.assertEqual(pruned, frozenset())
+        self.assertFalse(cancelled)
+        worker.queue.complete_bundle_two_level_erd_prunes.assert_not_called()
+
+    def test_preflight_cancellation_persists_prior_prunes(self):
+        worker = self._worker()
+        worker.cancel = mock.MagicMock(side_effect=[False, True])
+
+        with mock.patch.object(
+                erd_swarm, "candidate_two_level_cost_lower_bound",
+                return_value=3.2):
+            pruned, cancelled = worker._complete_bundle_two_level_erd_prunes(
+                b"branch", BRANCH, len(BRANCH), "bundle-1", [0, 1])
+
+        self.assertEqual(pruned, frozenset({0}))
+        self.assertTrue(cancelled)
+        worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
+            b"branch", "bundle-1", [0], nodes_spent=1)
+
 
 class TestMidLoopPublisher(unittest.TestCase):
     """_MidLoopPublisher.enter() / check() / record_inline() unit tests."""
