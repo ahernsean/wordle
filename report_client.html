@@ -835,9 +835,10 @@
         const line=element("tr",row.started?"":"dim");
         const response=element("td","");
         const responseButton=element("button","tile-button");
-        responseButton.setAttribute("aria-label","Open "+spineToken(data.word,row.pattern)+" branch report");
+        const branchSpine=(data.spine_prefix||String(data.word||"").toUpperCase())+" "+row.pattern;
+        responseButton.setAttribute("aria-label","Open "+branchSpine+" branch report");
         responseButton.append(wordTiles(data.word,row.pattern,data.word_is_answer,"word-sm"));
-        responseButton.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:spineToken(data.word,row.pattern),tree:false,finalization_cursor:""}));
+        responseButton.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:branchSpine,tree:false,finalization_cursor:""}));
         response.append(responseButton);
         line.append(
           response,
