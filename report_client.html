@@ -147,6 +147,8 @@
        letters.  The outline is inset so the tile keeps the same outer box as a
        colored one and rows of both sit on a shared grid. */
     .word > .letter.blank { background:#ffffff; color:var(--text); box-shadow:inset 0 0 0 max(1px,calc(var(--tile) * var(--tile-outline-ratio))) #878a8c; }
+    .tile-button { border:0; padding:0; background:transparent; line-height:0; }
+    .tile-button:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
     /* A guess that is itself a possible answer is notched at the corner of its
        last tile.  currentColor is already the tile's letter color, so one rule
        covers every tone.  The notch is held off the corner: flush to the edge,
@@ -796,7 +798,7 @@
       parts.push("began "+absoluteTime(data.work_started_at));
       return statLine(parts);
     }
-    function renderRootProgressPanel(data,url){
+    function renderRootProgressPanel(data,url,state){
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
       const metrics=element("div","metrics");
       metrics.append(
@@ -825,14 +827,21 @@
         fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
       }
       const table=element("table","root-progress"),head=element("thead",""),headRow=element("tr","");
-      for(const columnName of ["Pattern","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
+      for(const columnName of ["Response","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
       head.append(headRow);
       table.append(head);
       const body=element("tbody","");
       for(const row of data.response_groups||[]){
         const line=element("tr",row.started?"":"dim");
+        const response=element("td","");
+        const responseButton=element("button","tile-button");
+        const branchSpine=(data.spine_prefix||String(data.word||"").toUpperCase())+" "+row.pattern;
+        responseButton.setAttribute("aria-label","Open "+branchSpine+" branch report");
+        responseButton.append(wordTiles(data.word,row.pattern,data.word_is_answer,"word-sm"));
+        responseButton.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:branchSpine,tree:false,finalization_cursor:""}));
+        response.append(responseButton);
         line.append(
-          element("td","",row.pattern),
+          response,
           element("td","state-"+row.state.replace(/ /g,"-"),row.state),
           element("td","",numText(row.answer_count)),
           element("td","",row.started?numText(row.branch_count):"—"),
@@ -854,11 +863,11 @@
       fragment.append(element("p","dim","Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock. Counts cover epoch "+data.epoch+"."));
       return fragment;
     }
-    function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount){
+    function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount);});
+      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
       headlineHost.replaceChildren(renderRootProgressHeadline(data,solvedGroupCount));
-      host.replaceChildren(renderRootProgressPanel(data,url),refresh);
+      host.replaceChildren(renderRootProgressPanel(data,url,state),refresh);
       // The panel is built before the report is mounted, and scroll offsets do
       // not apply to a detached element.  A microtask runs after the mount and
       // before the paint, so the restored position is never seen scrolling.
@@ -871,24 +880,24 @@
     // the computing notice, re-fire the request and re-render the error every
     // couple of seconds -- and those two messages wrap to different heights, so
     // the whole page below the panel would shift each time.  Refresh retries.
-    function renderRootProgressFailure(headlineHost,host,url,message,solvedGroupCount){
+    function renderRootProgressFailure(headlineHost,host,url,message,solvedGroupCount,state){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount);});
+      refresh.addEventListener("click",()=>{rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
       headlineHost.replaceChildren();
       host.replaceChildren(element("p","error",message),refresh);
     }
-    function attachRootProgress(headlineHost,host,url,solvedGroupCount){
+    function attachRootProgress(headlineHost,host,url,solvedGroupCount,state){
       const failure=rootProgressFailure.get(url);
-      if(failure!==undefined){renderRootProgressFailure(headlineHost,host,url,failure,solvedGroupCount);return;}
+      if(failure!==undefined){renderRootProgressFailure(headlineHost,host,url,failure,solvedGroupCount,state);return;}
       const cached=rootProgressCache.get(url);
-      if(cached){renderRootProgressInto(headlineHost,host,url,cached,solvedGroupCount);return;}
+      if(cached){renderRootProgressInto(headlineHost,host,url,cached,solvedGroupCount,state);return;}
       host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
       if(rootProgressPending.has(url))return;
       rootProgressPending.add(url);
       fetch(url,{headers:{Accept:"application/json"}})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
-        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount);})
-        .catch(error=>{rootProgressFailure.set(url,error.message);if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount);})
+        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);})
+        .catch(error=>{rootProgressFailure.set(url,error.message);if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount,state);})
         .finally(()=>rootProgressPending.delete(url));
     }
     function renderWord(report,previous,state){
@@ -910,7 +919,7 @@
       // solved-group count is only passed on when the ERD line above is the
       // one that shows it, so the headline reports the same partition.
       attachRootProgress(progressHeadline,progressHost,progressURL,
-        erd&&erd.state!=="complete"&&erd.state!=="infeasible"?erd.resolved_group_count:null);
+        erd&&erd.state!=="complete"&&erd.state!=="infeasible"?erd.resolved_group_count:null,state);
       fragment.append(progressHeadline,progressDetails);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched · "+numText(totalRows)+" total response groups"));
       const previousRows=previousBy(previous,"response_groups","branch_key_hex");

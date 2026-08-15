@@ -384,7 +384,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # already shows elsewhere: queued -> evaluating -> finalizing -> done.
         self.assertEqual(
             headers,
-            ["Pattern", "State", "Answers", "Done", "Evaluating", "Nodes",
+            ["Response", "State", "Answers", "Done", "Evaluating", "Nodes",
              "Share", "Elapsed", "Worker-time"])
 
     def test_root_progress_table_keeps_its_scroll_position_across_polls(self):
@@ -483,6 +483,58 @@ class ReportClientBrowserTest(unittest.TestCase):
             "table.root-progress tbody tr td:nth-child(2)",
             "cells => cells.map(c => c.textContent)")
         self.assertEqual(set(states), {"waiting", "working", "solved", "loss"})
+
+    def test_root_progress_table_renders_each_response_as_letter_tiles(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.root-progress tbody tr")
+        table = self.page.locator("table.root-progress")
+        self.assertEqual(
+            table.locator("thead th").first.inner_text(), "Response")
+        responses = table.locator("tbody tr > td:nth-child(1) .word")
+        self.assertGreater(responses.count(), 0)
+        self.assertTrue(all(
+            re.fullmatch(r"[A-Z]{5} [gy-]{5}",
+                         response.get_attribute("data-spine"))
+            for response in responses.all()))
+        self.assertTrue(all(
+            response.locator(".letter").count() == 5
+            for response in responses.all()))
+
+    def test_root_progress_response_tiles_open_the_branch_report(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress tbody tr")
+        tile = self.page.locator("table.root-progress .tile-button").first
+        branch_target = tile.get_attribute("aria-label").removeprefix("Open ").removesuffix(" branch report")
+        tile.click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), branch_target)
+
+    def test_root_progress_response_tiles_preserve_a_deeper_spine(self):
+        def deeper_progress(route):
+            response = route.fetch()
+            progress = response.json()
+            progress["data"]["spine_prefix"] = "SALET ----- CRANE"
+            progress["data"]["word"] = "crane"
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/root-progress**", deeper_progress)
+        try:
+            self.apply_branch_target("SALET ----- CRANE")
+            self.page.wait_for_selector("table.root-progress tbody tr")
+            tile = self.page.locator("table.root-progress .tile-button").first
+            branch_target = (
+                tile.get_attribute("aria-label")
+                .removeprefix("Open ").removesuffix(" branch report"))
+            self.assertEqual(branch_target, "SALET ----- CRANE -y---")
+            tile.click()
+            self.page.wait_for_selector("text=branch report")
+            self.assertEqual(
+                self.page.locator("#branch-target-input").input_value(),
+                branch_target)
+        finally:
+            self.page.unroute("**/api/view/root-progress**")
 
     def test_root_progress_failure_renders_once_and_stops_refiring(self):
         # A failed scan that is not held gets re-requested every poll, and the
