@@ -1589,8 +1589,13 @@ def _render_root_progress_sections(report, width, display_order):
             width,
         ))
     else:
+        provisional_text = (
+            f" (provisional; {_abbreviate_duration(estimate['sample_duration_seconds'])} sample)"
+            if estimate.get("provisional") else ""
+        )
         summary.append(_fit(
             f"  estimate ~{_abbreviate_duration(estimate['estimated_seconds'])}"
+            f"{provisional_text}"
             f" for {estimate['remaining_candidate_count']:,} candidates"
             f" at ~{estimate['candidates_per_day']:,.0f}/day",
             width,

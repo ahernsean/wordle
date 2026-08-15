@@ -446,6 +446,14 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.locator("table.root-progress").count(), 1)
 
+    def test_root_progress_headline_marks_a_warm_up_estimate_provisional(self):
+        headline = self.page.evaluate("""() => renderRootProgressHeadline({
+          totals:{state_counts:{}}, work_started_at:1785575213,
+          estimate:{estimated_seconds:3600, provisional:true},
+        }, null).innerText""")
+
+        self.assertIn("~1.0h remaining (provisional)", headline)
+
     def test_root_progress_headline_states_no_coverage_percentage(self):
         # Cost concentrates so hard that breadth of coverage reads as
         # percent-complete: 98.8% of answers reached beside ~12d remaining

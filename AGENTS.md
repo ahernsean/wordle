@@ -354,15 +354,23 @@ or a clear, which keep the same container.
 
 ## Before committing and pushing
 
-Run the test suite before committing and pushing any change that touches code:
+Before committing and pushing a code change, run the targeted tests that cover
+the changed behavior and its related paths. Use `python3.13`; for example:
+
+```
+python3.13 -m unittest tests.test_report_model tests.test_report_terminal
+```
+
+Write tests for every new or changed executable path. Run the full suite when
+the change has broad cross-layer risk, when targeted tests do not provide
+enough confidence, or when the user asks for it:
 
 ```
 python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
 ```
 
-GitHub CI also enforces total coverage of at least 98%.  Write tests for every
-new or changed executable path, then run the coverage gate locally before
-pushing a code change:
+GitHub CI enforces total coverage of at least 98%; run its coverage gate
+locally when running the full suite:
 
 ```
 python3.13 -m coverage run -m unittest discover -s tests -t . -p 'test_*.py'
