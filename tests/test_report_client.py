@@ -484,6 +484,23 @@ class ReportClientBrowserTest(unittest.TestCase):
             "cells => cells.map(c => c.textContent)")
         self.assertEqual(set(states), {"waiting", "working", "solved", "loss"})
 
+    def test_root_progress_table_renders_each_response_as_letter_tiles(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.root-progress tbody tr")
+        table = self.page.locator("table.root-progress")
+        self.assertEqual(
+            table.locator("thead th").first.inner_text(), "Response")
+        responses = table.locator("tbody tr > td:nth-child(1) .word")
+        self.assertGreater(responses.count(), 0)
+        self.assertTrue(all(
+            re.fullmatch(r"[A-Z]{5} [gy-]{5}",
+                         response.get_attribute("data-spine"))
+            for response in responses.all()))
+        self.assertTrue(all(
+            response.locator(".letter").count() == 5
+            for response in responses.all()))
+
     def test_root_progress_failure_renders_once_and_stops_refiring(self):
         # A failed scan that is not held gets re-requested every poll, and the
         # computing notice and the error wrap to different heights -- so the

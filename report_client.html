@@ -825,14 +825,16 @@
         fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
       }
       const table=element("table","root-progress"),head=element("thead",""),headRow=element("tr","");
-      for(const columnName of ["Pattern","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
+      for(const columnName of ["Response","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
       head.append(headRow);
       table.append(head);
       const body=element("tbody","");
       for(const row of data.response_groups||[]){
         const line=element("tr",row.started?"":"dim");
+        const response=element("td","");
+        response.append(wordTiles(data.word,row.pattern,data.word_is_answer,"word-sm"));
         line.append(
-          element("td","",row.pattern),
+          response,
           element("td","state-"+row.state.replace(/ /g,"-"),row.state),
           element("td","",numText(row.answer_count)),
           element("td","",row.started?numText(row.branch_count):"—"),
