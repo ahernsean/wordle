@@ -501,6 +501,16 @@ class ReportClientBrowserTest(unittest.TestCase):
             response.locator(".letter").count() == 5
             for response in responses.all()))
 
+    def test_root_progress_response_tiles_open_the_branch_report(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress tbody tr")
+        tile = self.page.locator("table.root-progress .tile-button").first
+        branch_target = tile.get_attribute("aria-label").removeprefix("Open ").removesuffix(" branch report")
+        tile.click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), branch_target)
+
     def test_root_progress_failure_renders_once_and_stops_refiring(self):
         # A failed scan that is not held gets re-requested every poll, and the
         # computing notice and the error wrap to different heights -- so the
