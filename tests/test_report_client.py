@@ -248,6 +248,30 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             row_summary.locator(".word").get_attribute("data-spine"), "RAISE -----")
 
+    def test_tree_root_response_branches_align_as_siblings(self):
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/queue?tree=1')).json();
+          const first=report.data.nodes[0];
+          const second={
+            ...first,
+            node_id:'raise:--g--',
+            spine:'RAISE --g--',
+            branch_reference:'222222222222',
+            step:{...first.step,pattern:'--g--'}
+          };
+          report.data.nodes=[first,second];
+          report.data.paging={parent_spine:'',cursor:null,page_size:10,
+            returned_group_count:1,total_group_count:1,next_cursor:null};
+          applyReport(report,null,parsePageState({search:'?kind=queue&tree=1'}));
+        }""")
+        group = self.page.locator("ul.tree > li.word-group")
+        group.locator("> details > summary").click()
+        rows = group.locator("> details > .tree-pattern-page > ul.patterns > li")
+        self.assertEqual(rows.count(), 2)
+        first_x = rows.nth(0).bounding_box()["x"]
+        second_x = rows.nth(1).bounding_box()["x"]
+        self.assertEqual(first_x, second_x)
+
     def test_tree_pages_response_patterns_inside_a_word_group(self):
         self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view/queue?tree=1')).json();
