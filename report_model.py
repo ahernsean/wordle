@@ -1289,7 +1289,7 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
 ROOT_PROGRESS_RECENT_WINDOW_SECONDS = 86400
 
 
-def _root_progress_estimate(active_branches, recent_window_seconds):
+def _root_progress_estimate(active_branches, recent_window_seconds, now):
     """A completion estimate for the branches currently carrying the work.
 
     Only in-flight branches can be estimated: their candidate lists have a
@@ -1306,6 +1306,11 @@ def _root_progress_estimate(active_branches, recent_window_seconds):
     Those branches are reported as stalled instead, so excluding them hides
     nothing.
 
+    A newly opened root has less history than the window.  Its rate therefore
+    uses the observed span from its first sampled branch through `now`, rather
+    than treating the unseen part of the window as idle time.  Such an estimate
+    is explicitly provisional until the full window has elapsed.
+
     Returns None when nothing has completed inside the window, which is the
     honest answer for an idle or just-restarted root.
     """
@@ -1313,23 +1318,31 @@ def _root_progress_estimate(active_branches, recent_window_seconds):
     recent = 0
     stalled_remaining = 0
     stalled_count = 0
+    sample_started_at = None
     for branch in active_branches:
         branch_remaining = max(0, branch["candidate_count"]
                                   - branch["done_candidate_count"])
         if branch["recent_done_candidate_count"]:
             remaining += branch_remaining
             recent += branch["recent_done_candidate_count"]
+            created_at = branch["created_at"]
+            sample_started_at = (created_at if sample_started_at is None else
+                                 min(sample_started_at, created_at))
         elif branch_remaining:
             stalled_remaining += branch_remaining
             stalled_count += 1
     if not recent or not remaining:
         return None
-    rate_per_second = recent / recent_window_seconds
+    sample_duration_seconds = min(
+        recent_window_seconds, max(1, now - sample_started_at))
+    rate_per_second = recent / sample_duration_seconds
     return {
         "remaining_candidate_count": remaining,
         "recent_candidate_count": recent,
         "candidates_per_day": rate_per_second * 86400,
         "estimated_seconds": remaining / rate_per_second,
+        "sample_duration_seconds": sample_duration_seconds,
+        "provisional": sample_duration_seconds < recent_window_seconds,
         "stalled_branch_count": stalled_count,
         "stalled_remaining_candidate_count": stalled_remaining,
     }
@@ -1491,7 +1504,7 @@ def collect_root_progress_report(sources: ReportSources,
     data["work_latest_at"] = progress["work_latest_at"]
     data["estimate"] = _root_progress_estimate(
         progress["active_branches"],
-        progress["recent_window_seconds"])
+        progress["recent_window_seconds"], generated_at)
     data["active_branches"] = progress["active_branches"]
     # A request time later than the work it asked for is not a request time.
     # Rebuilding the queue's source_work rows stamps every one of them with the

@@ -1704,6 +1704,20 @@ class RootProgressRendererTest(unittest.TestCase):
         self.assertIn("79 waiting groups", output)
         self.assertIn("9 stalled branches", output)
 
+    def test_provisional_estimate_states_its_sample_duration(self):
+        output = render_report(root_progress_report(estimate={
+            "remaining_candidate_count": 7171,
+            "recent_candidate_count": 576,
+            "candidates_per_day": 576.0,
+            "estimated_seconds": 1_075_650.0,
+            "sample_duration_seconds": 600,
+            "provisional": True,
+            "stalled_branch_count": 0,
+            "stalled_remaining_candidate_count": 0,
+        }), width=120)
+
+        self.assertIn("provisional; 10m sample", output)
+
     def test_absent_estimate_is_stated_rather_than_guessed(self):
         output = render_report(root_progress_report(), width=120)
         self.assertIn("estimate unavailable", output)

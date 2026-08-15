@@ -1327,13 +1327,13 @@ class RootProgressReportTest(unittest.TestCase):
         estimate = _root_progress_estimate([
             # Progressing: 400 of 1,000 candidates left, 100/day observed.
             {"candidate_count": 1000, "done_candidate_count": 600,
-             "recent_done_candidate_count": 100},
+             "recent_done_candidate_count": 100, "created_at": 0},
             # Stalled at 99%: waiting on published sub-branches, not on its
             # own candidates.  Its remainder must not be charged to the
             # rate above, which it is not producing.
             {"candidate_count": 1000, "done_candidate_count": 990,
-             "recent_done_candidate_count": 0},
-        ], 86400)
+             "recent_done_candidate_count": 0, "created_at": 0},
+        ], 86400, 86400)
 
         self.assertEqual(estimate["remaining_candidate_count"], 400)
         self.assertEqual(estimate["candidates_per_day"], 100)
@@ -1341,11 +1341,22 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(estimate["stalled_branch_count"], 1)
         self.assertEqual(estimate["stalled_remaining_candidate_count"], 10)
 
+    def test_estimate_uses_the_available_sample_span_until_the_window_fills(self):
+        estimate = _root_progress_estimate([
+            {"candidate_count": 1000, "done_candidate_count": 100,
+             "recent_done_candidate_count": 100, "created_at": 1000},
+        ], 86400, 1600)
+
+        self.assertEqual(estimate["sample_duration_seconds"], 600)
+        self.assertTrue(estimate["provisional"])
+        self.assertEqual(estimate["candidates_per_day"], 14_400)
+        self.assertEqual(estimate["estimated_seconds"], 5400)
+
     def test_estimate_is_absent_when_nothing_completed_in_the_window(self):
         self.assertIsNone(_root_progress_estimate([
             {"candidate_count": 1000, "done_candidate_count": 10,
-             "recent_done_candidate_count": 0},
-        ], 86400))
+             "recent_done_candidate_count": 0, "created_at": 0},
+        ], 86400, 86400))
 
     def test_root_progress_requires_a_word_target(self):
         with self.assertRaises(ValueError):

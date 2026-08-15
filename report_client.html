@@ -792,7 +792,7 @@
     function renderRootProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
       const counts=totals.state_counts||{};
-      if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining");
+      if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""));
       if(counts.working)parts.push(numText(counts.working)+" groups working");
       if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");
       parts.push("began "+absoluteTime(data.work_started_at));
@@ -820,7 +820,7 @@
       const estimate=data.estimate;
       if(estimate){
         fragment.append(statLine([
-          "~"+formatDuration(estimate.estimated_seconds)+" remaining",
+          "~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional; "+formatDuration(estimate.sample_duration_seconds)+" sample)":""),
           numText(estimate.remaining_candidate_count)+" candidates at ~"+numText(Math.round(estimate.candidates_per_day))+"/day",
           excludedText(totals,estimate)]));
       }else{
