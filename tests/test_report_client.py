@@ -799,6 +799,24 @@ class ReportClientBrowserTest(unittest.TestCase):
                                10 / 31, delta=0.02)
         self.assertIn("31", segments.nth(0).inner_text())
 
+    def test_leaderboard_poll_renders_changed_data(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/leaderboard')) return response;
+            const report = await response.json();
+            report.data.rows[0].erd = 9.876;
+            return new Response(JSON.stringify(report), {
+              status: 200,
+              headers: {'Content-Type': 'application/json'},
+            });
+          });
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.876", self.page.locator("#report").inner_text())
+
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request
         # timer fires on the view switch (the fold can take several seconds).
@@ -2321,6 +2339,25 @@ class ReportClientBrowserTest(unittest.TestCase):
                         " client: document.documentElement.clientWidth})"
                     )
                     self.assertLessEqual(measured["scroll"], measured["client"])
+
+    def test_touch_layout_does_not_cover_controls_with_sticky_header(self):
+        context = self.browser.new_context(
+            viewport={"width": 800, "height": 600},
+            has_touch=True,
+            is_mobile=True,
+        )
+        page = context.new_page()
+        try:
+            page.goto(self.base_url)
+            page.wait_for_selector("h1")
+            self.assertEqual(
+                page.locator("header").evaluate(
+                    "node => getComputedStyle(node).position"
+                ),
+                "static",
+            )
+        finally:
+            context.close()
 
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
