@@ -1776,22 +1776,41 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("not found", self.page.locator("#report .error").inner_text())
         self.page.unroute("**/api/view**")
 
-    def test_overview_cards_animate_moves_and_departures(self):
+    def test_overview_card_departure_moves_only_the_nearest_survivor(self):
         result = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view')).json();
           applyReport(report,null,__reportClient.getState());
           const before=[...document.querySelectorAll('.grid > [data-identity]')].map(node=>node.dataset.identity);
           const reordered=structuredClone(report);
-          reordered.data.branches.reverse();
-          reordered.data.branches.shift();
+          reordered.data.branches.splice(1,1);
           applyReport(reordered,report,__reportClient.getState());
-          const moved=[...document.querySelectorAll('.grid > [data-identity]')].filter(node=>node.getAnimations().length).length;
+          const moved=[...document.querySelectorAll('.grid > [data-identity]')].filter(node=>node.getAnimations().length).map(node=>node.dataset.identity);
           const leaveClones=document.querySelectorAll('.leave-layer > *').length;
           return {before,moved,leaveClones};
         }""")
-        self.assertGreater(len(result["before"]), 1)
-        self.assertGreater(result["moved"], 0)
+        self.assertGreater(len(result["before"]), 2)
+        self.assertEqual(len(result["moved"]), 1)
+        self.assertEqual(result["moved"][0], result["before"][2])
         self.assertEqual(result["leaveClones"], 1)
+
+    def test_overview_card_reorder_animates_all_moved_survivors(self):
+        result = self.page.evaluate("""async () => {
+          const state={...__reportClient.getState(),kind:'queue',sort:'default'};
+          const report=await (await fetch('/api/view/queue')).json();
+          applyReport(report,null,state);
+          const reordered=structuredClone(report);
+          reordered.data.rows.reverse();
+          applyReport(reordered,report,{...state,sort:'priority'});
+          const grid=document.querySelector('.grid');
+          return {
+            moved:[...grid.querySelectorAll(':scope > [data-identity]')]
+              .filter(node=>node.getAnimations().length)
+              .map(node=>node.dataset.identity),
+            leaveClones:document.querySelectorAll('.leave-layer > *').length,
+          };
+        }""")
+        self.assertGreater(len(result["moved"]), 1)
+        self.assertEqual(result["leaveClones"], 0)
 
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
