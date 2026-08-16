@@ -78,6 +78,7 @@
       .conn-wrap:hover .refresh-pop, .refresh-pop:hover { opacity:1; visibility:visible; transform:none; }
     }
     main { width:min(1200px,100%); margin:auto; padding:.5rem clamp(.5rem,1.5vw,1rem) 2rem; }
+    main:has(.grid.leaderboard) { width:min(1600px,100%); }
     .report-meta { display:flex; flex-wrap:wrap; gap:.2rem .6rem; align-items:baseline; margin:.2rem 0 .35rem; }
     details.source-paths { display:inline-block; }
     details.source-paths[open] { display:block; flex-basis:100%; }
@@ -93,6 +94,7 @@
     .metric strong { overflow-wrap:anywhere; }
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,15rem),1fr)); gap:.4rem; }
     .grid.workers { grid-template-columns:repeat(auto-fill,minmax(min(100%,12.5rem),1fr)); }
+    .grid.leaderboard { grid-template-columns:minmax(0,1fr); gap:.65rem; }
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
     .section { margin:.45rem 0; }
     .card.active { border-color:var(--green); }
@@ -159,6 +161,27 @@
        slash, and the pair never breaks across a line. */
     .word-erd { white-space:normal; }
     .word-erd > .word-erd-pair { white-space:nowrap; }
+    .leaderboard-card { padding:.65rem .75rem; }
+    .leaderboard-card .card-title { font-size:1.05rem; gap:.55rem; }
+    .leaderboard-rank { color:var(--dim); }
+    .response-visual-key { display:flex; flex-wrap:wrap; align-items:center; gap:.35rem .45rem; margin:.35rem 0 .45rem; font-size:.8rem; color:var(--dim); }
+    .response-color-gradient { flex:0 1 10rem; min-width:5rem; height:.55rem; border-radius:999px; background:linear-gradient(90deg,hsl(320 70% 42%),hsl(0 62% 43%),hsl(62 62% 43%),hsl(125 62% 43%),hsl(210 62% 43%)); }
+    .response-visual-label { margin:.4rem 0 .15rem; color:var(--dim); font-size:.8rem; }
+    .answer-strip { display:flex; width:100%; height:2.25rem; overflow:hidden; border:1px solid var(--border); border-radius:4px; background:var(--border); }
+    .answer-segment { display:flex; align-items:center; justify-content:center; min-width:0; overflow:hidden; color:#ffffff; font-size:.72rem; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.65); box-shadow:inset -1px 0 rgba(255,255,255,.5); }
+    .answer-segment-label, .response-count-segment-label { display:block; text-align:center; line-height:.9rem; white-space:nowrap; }
+    .answer-segment:last-child { box-shadow:none; }
+    .response-group-bridge { position:relative; z-index:2; display:block; width:100%; height:3rem; margin-bottom:-8px; overflow:visible; pointer-events:none; }
+    .response-count-track { position:relative; z-index:1; display:flex; justify-content:center; width:100%; height:1.6rem; }
+    .response-count-fill { display:flex; height:100%; overflow:hidden; border:1px solid var(--border); border-radius:4px; }
+    .response-count-segment { display:flex; align-items:center; justify-content:center; min-width:0; overflow:hidden; color:#ffffff; font-size:.68rem; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.65); box-shadow:inset -1px 0 rgba(255,255,255,.5); }
+    .response-count-segment-label { flex:0 0 auto; line-height:.62rem; }
+    .response-count-segment:last-child { box-shadow:none; }
+    .response-bucket-legend { position:relative; min-height:.9rem; margin-top:1rem; color:var(--dim); font-size:.72rem; }
+    .response-bucket-legend > svg { position:absolute; left:0; top:-1rem; width:100%; height:calc(100% + 1rem); overflow:visible; pointer-events:none; }
+    .response-bucket-legend > span { position:absolute; z-index:1; white-space:nowrap; transform:translateX(-50%); }
+    .response-bucket-legend > span::before { content:""; display:inline-block; width:.55rem; height:.55rem; margin-right:.16rem; border-radius:1px; vertical-align:-.08rem; background:var(--bucket-color); }
+    .leaderboard-worst-case { margin-top:.15rem; font-size:.8rem; }
     .progress-line { margin:.25rem 0; }
     .progress { height:.3rem; border-radius:999px; background:var(--border); overflow:hidden; }
     .progress > span { display:block; height:100%; background:var(--green); }
@@ -216,6 +239,7 @@
     @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
     @media (max-width:600px) {
       header { position:static; }
+      .response-count-segment { font-size:0; }
     }
   </style>
 </head>
@@ -1169,6 +1193,101 @@
       return entries;
     }
     function displayEntries(row,generatedAt){return candidateErdKvEntries(row,row.answer_count,generatedAt,["row_id","branch_reference","spine"]);}
+    function answerGroupColor(answerCount){if(answerCount>256)return "hsl(320 70% 42%)";const logarithmicPosition=Math.min(1,Math.log2(Math.max(1,answerCount))/9);return "hsl("+Math.round(210*(1-logarithmicPosition))+" 62% 43%)";}
+    const RESPONSE_GROUP_BUCKETS=[
+      {minimumAnswerCount:257,maximumAnswerCount:Infinity,labelText:"257+"},
+      {minimumAnswerCount:129,maximumAnswerCount:256,labelText:"129–256"},
+      {minimumAnswerCount:65,maximumAnswerCount:128,labelText:"65–128"},
+      {minimumAnswerCount:33,maximumAnswerCount:64,labelText:"33–64"},
+      {minimumAnswerCount:17,maximumAnswerCount:32,labelText:"17–32"},
+      {minimumAnswerCount:9,maximumAnswerCount:16,labelText:"9–16"},
+      {minimumAnswerCount:5,maximumAnswerCount:8,labelText:"5–8"},
+      {minimumAnswerCount:2,maximumAnswerCount:4,labelText:"2–4"},
+      {minimumAnswerCount:1,maximumAnswerCount:1,labelText:"1"}
+    ];
+    function responseGroupBuckets(groups){return RESPONSE_GROUP_BUCKETS.map(bucket=>{const bucketGroups=groups.filter(group=>group.answer_count>=bucket.minimumAnswerCount&&group.answer_count<=bucket.maximumAnswerCount),responseGroupCount=bucketGroups.length,answerCount=bucketGroups.reduce((total,group)=>total+group.answer_count,0);return {...bucket,groups:bucketGroups,responseGroupCount,answerCount,color:answerGroupColor(Number.isFinite(bucket.maximumAnswerCount)?bucket.maximumAnswerCount:512)};});}
+    function svgElement(name){return document.createElementNS("http://www.w3.org/2000/svg",name);}
+    function renderAnswerStrip(row){
+      const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
+      strip.setAttribute("aria-label","Answer probability by first-response group for "+String(row.word||"").toUpperCase());
+      for(const [index,group] of groups.entries()){
+        const probability=answerCount?group.answer_count/answerCount:0,segment=element("span","answer-segment");
+        if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);}
+        segment.style.flexGrow=String(group.answer_count);segment.style.flexBasis="0";segment.style.backgroundColor=answerGroupColor(group.answer_count);
+        segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability";
+        strip.append(segment);
+      }
+      return strip;
+    }
+    function renderResponseCountHistogram(row,maximumResponseGroupCount){
+      const groups=row.response_groups||[],track=element("div","response-count-track"),fill=element("div","response-count-fill"),buckets=responseGroupBuckets(groups),legend=element("div","response-bucket-legend"),fillWidth=maximumResponseGroupCount?groups.length/maximumResponseGroupCount:0;
+      fill.style.width=(maximumResponseGroupCount?100*groups.length/maximumResponseGroupCount:0)+"%";let responseGroupPosition=0;
+      for(const bucket of buckets){
+        if(bucket.responseGroupCount){
+          const countText=numText(bucket.responseGroupCount),segment=element("span","response-count-segment"),label=element("span","response-count-segment-label"),wordLabel=bucket.labelText+(bucket.labelText==="1"?" word:":" words:");label.append(wordLabel,document.createElement("br"),countText+" groups");segment.append(label);
+          segment.style.flexGrow=String(bucket.responseGroupCount);segment.style.flexBasis="0";segment.style.backgroundColor=bucket.color;
+          segment.dataset.countText=countText;
+          segment.title=bucket.labelText+(bucket.labelText==="1"?" answer":" answers")+" · "+numText(bucket.responseGroupCount)+(bucket.responseGroupCount===1?" response group":" response groups");fill.append(segment);
+          const legendItem=element("span","",bucket.labelText+(bucket.labelText==="1"?" word: ":" words: ")+countText),segmentCenter=(responseGroupPosition+bucket.responseGroupCount/2)/groups.length;legendItem.style.setProperty("--bucket-color",bucket.color);legendItem.dataset.segmentCenter=String((1-fillWidth)/2+fillWidth*segmentCenter);legendItem.dataset.bucketColor=bucket.color;legend.append(legendItem);segment.dataset.legendIndex=String(legend.children.length-1);responseGroupPosition+=bucket.responseGroupCount;
+        }
+      }
+      track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+" out of a vocabulary maximum of "+numText(maximumResponseGroupCount));
+      track.append(fill);requestAnimationFrame(()=>{for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(legend.children.length)layoutResponseBucketLegend(legend);else legend.remove();});return [track,legend];
+    }
+    function layoutResponseBucketLegend(legend){
+      legend.querySelector(":scope > svg")?.remove();const items=[...legend.querySelectorAll(":scope > span")],width=legend.clientWidth,padding=4,gap=6,leaderGap=16,laneHeight=Math.max(...items.map(item=>item.offsetHeight))+6;
+      const itemData=items.map((item,index)=>({item,index,width:item.offsetWidth,height:item.offsetHeight,sourceX:Number(item.dataset.segmentCenter)*width}));
+      function pack(rows){
+        const placements=[];
+        for(let row=0;row<=Math.max(...rows);row++){
+          const rowItems=itemData.filter(data=>rows[data.index]===row);if(!rowItems.length)continue;
+          const requiredWidth=rowItems.reduce((total,data)=>total+data.width,0)+gap*(rowItems.length-1);if(requiredWidth>width-2*padding)return null;
+          const centers=[];for(let index=0;index<rowItems.length;index++){const data=rowItems[index],minimum=index?centers[index-1]+rowItems[index-1].width/2+data.width/2+gap:data.width/2+padding;centers.push(Math.max(data.sourceX,minimum));}
+          const maximum=width-rowItems.at(-1).width/2-padding;if(centers.at(-1)>maximum){centers[centers.length-1]=maximum;for(let index=centers.length-2;index>=0;index--)centers[index]=Math.min(centers[index],centers[index+1]-rowItems[index].width/2-rowItems[index+1].width/2-gap);}
+          if(centers[0]<rowItems[0].width/2+padding)return null;
+          for(let index=0;index<rowItems.length;index++)placements[rowItems[index].index]={...rowItems[index],x:centers[index],row,top:leaderGap+row*laneHeight};
+        }
+        return placements;
+      }
+      function cubicPoint(placement,progress){const routeY=Math.max(7,placement.top-3),inverse=1-progress,sourceX=placement.sourceX,targetX=placement.x;return {x:inverse**3*sourceX+3*inverse**2*progress*sourceX+3*inverse*progress**2*targetX+progress**3*targetX,y:3*inverse**2*progress*routeY+3*inverse*progress**2*routeY+progress**3*placement.top};}
+      function leaderTouchesLabel(placement,placements){for(let step=1;step<24;step++){const point=cubicPoint(placement,step/24);for(const other of placements){if(other.index===placement.index)continue;const left=other.x-other.width/2-1,right=other.x+other.width/2+1,bottom=other.top+other.height+1;if(point.x>=left&&point.x<=right&&point.y>=other.top-1&&point.y<=bottom)return true;}}return false;}
+      let best=null;
+      function consider(rows){const placements=pack(rows);if(!placements||placements.some(placement=>leaderTouchesLabel(placement,placements)))return;const score=placements.reduce((total,placement)=>total+(placement.x-placement.sourceX)**2/width+placement.row*40,0);if(!best||score<best.score)best={placements,score};}
+      for(let railCount=1;railCount<=4&&!best;railCount++){
+        const rows=[];
+        function search(index,highestRow){if(index===itemData.length){consider(rows);return;}for(let row=0;row<=Math.min(railCount-1,highestRow+1);row++){rows[index]=row;search(index+1,Math.max(highestRow,row));}}
+        search(0,-1);
+      }
+      const placements=best?.placements||pack(itemData.map((_,index)=>index))||[];
+      for(const placement of placements){placement.item.style.left=placement.x+"px";placement.item.style.top=((placement.top-leaderGap))+"px";}
+      legend.style.minHeight=Math.max(laneHeight,...placements.map(placement=>placement.top-leaderGap+placement.height))+"px";
+      const leaders=svgElement("svg");leaders.setAttribute("viewBox","0 0 "+width+" "+(legend.offsetHeight+leaderGap));leaders.setAttribute("preserveAspectRatio","none");
+      for(const placement of placements){const routeY=Math.max(7,placement.top-3),path=svgElement("path");path.setAttribute("d","M "+placement.sourceX+" 0 C "+placement.sourceX+" "+routeY+" "+placement.x+" "+routeY+" "+placement.x+" "+placement.top);path.setAttribute("fill","none");path.setAttribute("stroke",placement.item.dataset.bucketColor);path.setAttribute("stroke-width","1.5");path.setAttribute("stroke-linecap","round");path.setAttribute("opacity",".82");leaders.append(path);}
+      legend.prepend(leaders);
+    }
+    function renderResponseGroupBridge(row,maximumResponseGroupCount){
+      const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),buckets=responseGroupBuckets(groups),svg=svgElement("svg"),viewWidth=1000,viewHeight=48,bottomBarTop=viewHeight-8,fillWidth=maximumResponseGroupCount?viewWidth*groups.length/maximumResponseGroupCount:0,lowerPosition=(viewWidth-fillWidth)/2;
+      svg.setAttribute("class","response-group-bridge");svg.setAttribute("viewBox","0 0 "+viewWidth+" "+viewHeight);svg.setAttribute("preserveAspectRatio","none");svg.setAttribute("aria-hidden","true");
+      let topPosition=0,bottomPosition=lowerPosition;
+      for(const bucket of buckets){
+        const topWidth=answerCount?viewWidth*bucket.answerCount/answerCount:0,bottomWidth=maximumResponseGroupCount?viewWidth*bucket.responseGroupCount/maximumResponseGroupCount:0;
+        if(bucket.responseGroupCount){
+          const topCenter=topPosition+topWidth/2,bottomCenter=bottomPosition+bottomWidth/2,path=svgElement("path");
+          if(bucket.responseGroupCount===1||topWidth<20){const connectorStartDepth=16,middleDepth=bottomBarTop-12;path.setAttribute("d","M "+topCenter+" 0 L "+topCenter+" "+connectorStartDepth+" C "+topCenter+" "+middleDepth+" "+bottomCenter+" "+middleDepth+" "+bottomCenter+" "+bottomBarTop);}else{const curveDepth=Math.min(16,Math.max(9,topWidth/7)),edgeInset=Math.min(18,topWidth/4),centerInset=Math.min(28,topWidth/3),middleDepth=Math.max(curveDepth+6,bottomBarTop-12);path.setAttribute("d","M "+topPosition+" 0 C "+(topPosition+edgeInset)+" "+curveDepth+" "+(topCenter-centerInset)+" 0 "+topCenter+" "+curveDepth+" C "+(topCenter+centerInset)+" 0 "+(topPosition+topWidth-edgeInset)+" "+curveDepth+" "+(topPosition+topWidth)+" 0 M "+topCenter+" "+curveDepth+" C "+topCenter+" "+middleDepth+" "+bottomCenter+" "+middleDepth+" "+bottomCenter+" "+bottomBarTop);}
+          path.setAttribute("fill","none");path.setAttribute("stroke",bucket.color);path.setAttribute("stroke-width","2");path.setAttribute("stroke-linecap","round");path.setAttribute("stroke-linejoin","round");path.setAttribute("opacity",".7");svg.append(path);
+        }
+        topPosition+=topWidth;bottomPosition+=bottomWidth;
+      }
+      return svg;
+    }
+    function responseGroupFacts(row){
+      const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),fragment=document.createDocumentFragment();
+      if(groups.length){
+        const largest=groups[0],largestProbability=answerCount?largest.answer_count/answerCount:0,twoLargestAnswerCount=groups.slice(0,2).reduce((total,group)=>total+group.answer_count,0),twoLargestProbability=answerCount?twoLargestAnswerCount/answerCount:0;
+        fragment.append(statLine(["Largest: "+numText(largest.answer_count)+(largest.answer_count===1?" answer":" answers")+" ("+fixed(largestProbability*100,1)+"%)","Two largest: "+numText(twoLargestAnswerCount)+" answers ("+fixed(twoLargestProbability*100,1)+"%)"]));
+      }
+      return fragment;
+    }
     function renderLeaderboard(report,previous,state){
       const data=report.data,fragment=document.createDocumentFragment(),counts=data.counts||{},metrics=element("div","metrics");
       metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("infeasible",counts.infeasible),metric("candidates",data.candidate_count));
@@ -1176,8 +1295,9 @@
       const rows=data.rows||[];
       fragment.append(element("p","dim","Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete"));
       if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
-      const grid=element("div","grid"),previousRows=previousBy(previous,"rows","word");
-      for(const row of rows){const card=element("article","card "+changeClass(row,previousRows.get(String(row.word))));card.dataset.identity=row.word;const title=element("div","card-title");const entry=element("span","word-erd");entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","chip","#"+row.rank),entry);card.append(title,statLine(["max remaining depth "+row.max_remaining_depth]));grid.append(card);}
+      const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243,key=element("div","response-visual-key");key.append(element("span","","Response-group size:"),element("span","","512+ answers"),element("span","response-color-gradient"),element("span","","1 answer"));fragment.append(key);
+      const grid=element("div","grid leaderboard"),previousRows=previousBy(previous,"rows","word");
+      for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd"),[histogram,legend]=renderResponseCountHistogram(row,maximumResponseGroupCount),responseGroupCount=(row.response_groups||[]).length;entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,element("div","response-visual-label",numText(responseGroupCount)+" answer groups (more groups = better)"),renderAnswerStrip(row),renderResponseGroupBridge(row,maximumResponseGroupCount),histogram,legend,responseGroupFacts(row),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
       fragment.append(grid);return fragment;
     }
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
@@ -1239,7 +1359,7 @@
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;
-      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
@@ -1280,7 +1400,8 @@
         // navigation (sameView is false: Go, Back/Forward, clicking a card)
         // always renders regardless of focus or selection, since replacing
         // the old view is the point of navigating.
-        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection()))applyReport(report,previous,state);
+        const quietLeaderboardPoll=sameView&&report.report_kind==="leaderboard";
+        if(!quietLeaderboardPoll&&(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection())))applyReport(report,previous,state);
         lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }
@@ -1337,7 +1458,7 @@
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
-      addEventListener("resize",()=>layoutSpines(byId("report")));
+      addEventListener("resize",()=>{layoutSpines(byId("report"));if(currentState?.kind==="leaderboard"&&lastReport)applyReport(lastReport,null,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};

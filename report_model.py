@@ -2318,7 +2318,7 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
     all_answers = load_word_list(sources.answer_list_path)
     all_candidates = load_word_list(sources.candidate_list_path)
     answer_set = set(all_answers)
-    data = {}
+    data = {"response_pattern_count": 3 ** 5}
     report = _semantic_report(
         "leaderboard", sources, request.branch_target, generated_at, data, request
     )
@@ -2331,6 +2331,10 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
         )
         skeletons = _candidate_group_skeletons(
             sources, all_answers, all_candidates, cache
+        )
+        data["maximum_response_group_count"] = max(
+            (len(groups) for _, groups in skeletons),
+            default=0,
         )
         exact_by_key, loss_by_key = cache.report_branch_row_maps(ERD_ALL)
         counts = {"complete": 0, "pending": 0, "infeasible": 0}
@@ -2358,12 +2362,33 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
                     "word_is_answer": candidate in answer_set,
                     "erd": summary["erd"],
                     "max_remaining_depth": summary["max_remaining_depth"],
+                    "_response_group_skeletons": groups,
                 })
         ranked_rows.sort(
             key=lambda row: (row["erd"], row["max_remaining_depth"], row["word"])
         )
         for rank, row in enumerate(ranked_rows, start=1):
             row["rank"] = rank
+        displayed_rows = (
+            ranked_rows[:limit] if limit is not None else ranked_rows
+        )
+        for row in displayed_rows:
+            response_group_skeletons = row.pop("_response_group_skeletons")
+            row["answer_count"] = sum(
+                answer_count
+                for _, answer_count, _ in response_group_skeletons
+            )
+            row["response_groups"] = [
+                {
+                    "pattern": pattern,
+                    "answer_count": answer_count,
+                }
+                for pattern, answer_count, _ in sorted(
+                    response_group_skeletons,
+                    key=lambda group: group[1],
+                    reverse=True,
+                )
+            ]
         # Publish only after the whole vocabulary is folded.  A mid-loop cache
         # error must not leave a truncated ranking that reads as complete.
         data.update({
@@ -2371,7 +2396,7 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
             "counts": counts,
             "total_rows": len(ranked_rows),
             "matched_rows": len(ranked_rows),
-            "rows": ranked_rows[:limit] if limit is not None else ranked_rows,
+            "rows": displayed_rows,
         })
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
