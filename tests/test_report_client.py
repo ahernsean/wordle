@@ -1671,6 +1671,35 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("disconnected", chip.get_attribute("class") or "")
         self.assertEqual(chip.inner_text(), "●")
 
+    def test_poll_does_not_replace_a_slow_active_request(self):
+        result = self.page.evaluate("""async () => {
+          const realFetch = window.fetch;
+          const report = await (await realFetch('/api/view')).json();
+          const realNow = Date.now;
+          const resolutions = [];
+          let calls = 0;
+          window.fetch = () => new Promise(resolve => {
+            calls += 1;
+            resolutions.push(resolve);
+          });
+          const first = __reportClient.fetchReport();
+          await Promise.resolve();
+          Date.now = () => realNow() + 61000;
+          const second = __reportClient.fetchReport();
+          const callsBeforeResolution = calls;
+          for (const resolve of resolutions) {
+            resolve(new Response(JSON.stringify(report), {
+              status: 200,
+              headers: {'Content-Type': 'application/json'},
+            }));
+          }
+          await Promise.all([first, second]);
+          window.fetch = realFetch;
+          Date.now = realNow;
+          return callsBeforeResolution;
+        }""")
+        self.assertEqual(result, 1)
+
     def test_branch_view_pins_branch_target_to_its_spine(self):
         # Navigating by a queue reference resolves once; the client then pins
         # the view to the branch's spine so later polls never depend on the

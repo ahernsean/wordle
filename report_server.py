@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+from threading import Event, Lock
 from urllib.parse import parse_qs, urlsplit
 
 from report_model import (
@@ -65,6 +66,15 @@ HOTSPOT_FIELDS = {
 }
 class InvalidRequest(ValueError):
     pass
+
+
+class InFlightLeaderboardReport:
+    """One leaderboard collection shared by concurrent identical requests."""
+
+    def __init__(self):
+        self.completed = Event()
+        self.report = None
+        self.error = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +320,33 @@ def load_fixtures(directory):
 
 
 def make_handler(configuration):
+    leaderboard_reports = {}
+    leaderboard_reports_lock = Lock()
+
+    def collect_leaderboard_once(request):
+        with leaderboard_reports_lock:
+            in_flight = leaderboard_reports.get(request)
+            if in_flight is None:
+                in_flight = InFlightLeaderboardReport()
+                leaderboard_reports[request] = in_flight
+                is_builder = True
+            else:
+                is_builder = False
+        if is_builder:
+            try:
+                in_flight.report = collect_report(configuration.sources, request)
+            except Exception as error:
+                in_flight.error = error
+            finally:
+                in_flight.completed.set()
+                with leaderboard_reports_lock:
+                    leaderboard_reports.pop(request, None)
+        else:
+            in_flight.completed.wait()
+        if in_flight.error is not None:
+            raise in_flight.error
+        return in_flight.report
+
     class ReportHandler(BaseHTTPRequestHandler):
         def log_message(self, _format, *_args):
             return
@@ -370,6 +407,8 @@ def make_handler(configuration):
                     report = configuration.fixtures[
                         fixture_name_for_request(target.path, request)
                     ]
+                elif request.report_kind == "leaderboard":
+                    report = collect_leaderboard_once(request)
                 else:
                     report = collect_report(configuration.sources, request)
             except ValueError as error:
