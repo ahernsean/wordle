@@ -1333,7 +1333,7 @@
         }
       }
       const leaving=[...before].filter(([identity])=>!present.has(identity));
-      const cardsToMove=new Set();
+      const cardsToMove=new Set(leaving.length?[]:movedCandidates.map(candidate=>candidate.node));
       for(const [,{rect}] of leaving){
         let closest=null;
         for(const candidate of movedCandidates){

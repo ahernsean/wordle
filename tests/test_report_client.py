@@ -1793,6 +1793,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["moved"][0], result["before"][2])
         self.assertEqual(result["leaveClones"], 1)
 
+    def test_overview_card_reorder_animates_all_moved_survivors(self):
+        result = self.page.evaluate("""async () => {
+          const state={...__reportClient.getState(),kind:'queue',sort:'default'};
+          const report=await (await fetch('/api/view/queue')).json();
+          applyReport(report,null,state);
+          const reordered=structuredClone(report);
+          reordered.data.rows.reverse();
+          applyReport(reordered,report,{...state,sort:'priority'});
+          const grid=document.querySelector('.grid');
+          return {
+            moved:[...grid.querySelectorAll(':scope > [data-identity]')]
+              .filter(node=>node.getAnimations().length)
+              .map(node=>node.dataset.identity),
+            leaveClones:document.querySelectorAll('.leave-layer > *').length,
+          };
+        }""")
+        self.assertGreater(len(result["moved"]), 1)
+        self.assertEqual(result["leaveClones"], 0)
+
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Bundle and republish")
