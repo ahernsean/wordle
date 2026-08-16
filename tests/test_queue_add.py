@@ -7,6 +7,9 @@ import os
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
+from unittest.mock import patch
 
 import erd_search
 from erd_queue import ERDQueue, encode_subset
@@ -16,6 +19,8 @@ from cache_sqlite import ScoreCache
 # "fuzzy"'s all-gray branch (code 0) has ~1,868 answer words in
 # all_answers.txt -- well over the old 300-word default cap.
 LARGE_BRANCH_WORD = 'fuzzy'
+NON_CANDIDATE_ENGLISH_WORD = 'bogon'
+NON_CANDIDATE_SURNAME = 'ahern'
 
 
 def _make_args(tmp_dir, **overrides):
@@ -70,6 +75,48 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         queue = ERDQueue(args.queue)
         self.addCleanup(queue.close)
         self.assertIsNone(queue.get_pending_branch(branch_key))
+
+    def test_non_candidate_words_are_rejected_before_queue_creation(self):
+        candidate_words = load_word_list(erd_search.WORDS_FILE)
+        for word in (NON_CANDIDATE_ENGLISH_WORD, NON_CANDIDATE_SURNAME):
+            with self.subTest(word=word):
+                self.assertEqual(len(word), 5)
+                self.assertNotIn(word, candidate_words)
+                args = _make_args(self._tmp.name, word=word)
+
+                with self.assertRaisesRegex(ValueError, 'invalid candidate word'):
+                    erd_search.cmd_queue_add(args)
+
+                self.assertFalse(os.path.exists(args.queue))
+
+    def test_word_list_with_invalid_word_is_rejected_atomically(self):
+        word_list_path = os.path.join(self._tmp.name, 'words.txt')
+        with open(word_list_path, 'w') as word_file:
+            word_file.write(f'{LARGE_BRANCH_WORD}\n{NON_CANDIDATE_ENGLISH_WORD}\n')
+        args = _make_args(self._tmp.name, word=None, word_list=word_list_path)
+
+        with self.assertRaisesRegex(ValueError, NON_CANDIDATE_ENGLISH_WORD):
+            erd_search.cmd_queue_add(args)
+
+        self.assertFalse(os.path.exists(args.queue))
+
+    def test_cli_reports_invalid_word_as_an_error(self):
+        args = _make_args(self._tmp.name, word=NON_CANDIDATE_ENGLISH_WORD)
+        error_output = StringIO()
+
+        with patch.object(erd_search.sys, 'argv', [
+                'erd_search.py', 'queue', 'add', '--word',
+                NON_CANDIDATE_ENGLISH_WORD,
+                '--cache', args.cache, '--queue', args.queue]), \
+                redirect_stderr(error_output):
+            with self.assertRaises(SystemExit) as raised:
+                erd_search.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn(
+            f'invalid candidate word(s): {NON_CANDIDATE_ENGLISH_WORD}',
+            error_output.getvalue())
+        self.assertFalse(os.path.exists(args.queue))
 
 
 if __name__ == '__main__':
