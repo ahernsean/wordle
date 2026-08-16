@@ -1504,7 +1504,7 @@ def _render_leaderboard_sections(report, width):
             width,
         ),
     ]
-    rows = ["Rank  Opener   ERD    MaxRD"]
+    rows = ["Rank  Opener   ERD    Worst-case guesses"]
     for row in data["rows"]:
         word = row["word"].upper() + ("*" if row["word_is_answer"] else "")
         rows.append(_fit(

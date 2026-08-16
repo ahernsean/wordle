@@ -770,9 +770,34 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("SALET", text)
         self.assertIn("3.564", text)
         self.assertNotIn("3.5643502648", text)
+        self.assertIn("Worst-case solve: 6 guesses", text)
+        self.assertNotIn("max remaining depth", text)
+        self.assertNotIn("expected guesses remaining", text)
+        self.assertIn("5 answer groups (more groups = better)", text)
+        self.assertIn("Largest: 31 answers (31.0%)", text)
+        self.assertIn("Two largest: 55 answers (55.0%)", text)
         self.assertIn("CRANE", text)
         self.assertTrue(self.answer_notch(
             self.page.locator(".card", has_text="CRANE").first.locator(".word")))
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        self.assertEqual(cards.count(), 2)
+        first_box = cards.nth(0).bounding_box()
+        second_box = cards.nth(1).bounding_box()
+        self.assertGreaterEqual(second_box["y"], first_box["y"] + first_box["height"])
+        rank = cards.nth(0).locator(".leaderboard-rank")
+        self.assertEqual(rank.inner_text(), "#1")
+        self.assertNotIn("chip", rank.get_attribute("class").split())
+        answer_strip = cards.nth(0).locator(".answer-strip")
+        segments = answer_strip.locator(".answer-segment")
+        self.assertEqual(segments.count(), 5)
+        first_box = segments.nth(0).bounding_box()
+        second_box = segments.nth(1).bounding_box()
+        last_box = segments.nth(4).bounding_box()
+        self.assertAlmostEqual(first_box["width"] / second_box["width"],
+                               31 / 24, delta=0.02)
+        self.assertAlmostEqual(last_box["width"] / first_box["width"],
+                               10 / 31, delta=0.02)
+        self.assertIn("31", segments.nth(0).inner_text())
 
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request

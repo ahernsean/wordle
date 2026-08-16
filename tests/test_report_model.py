@@ -411,6 +411,12 @@ class ReportModelTest(unittest.TestCase):
         self.assertAlmostEqual(data["rows"][2]["erd"], 2.0)
         self.assertTrue(data["rows"][0]["word_is_answer"])
         self.assertFalse(data["rows"][2]["word_is_answer"])
+        self.assertEqual(data["rows"][0]["answer_count"], 2)
+        self.assertEqual(
+            [group["answer_count"] for group in data["rows"][0]["response_groups"]],
+            [1, 1],
+        )
+        self.assertEqual(data["response_pattern_count"], 243)
 
     def test_leaderboard_report_counts_partition_the_candidate_list(self):
         report = collect_report(

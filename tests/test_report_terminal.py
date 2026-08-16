@@ -487,12 +487,12 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("3.564", output)
         self.assertNotIn("3.5643502648", output)
         self.assertIn("CRANE*", output)  # word_is_answer renders the asterisk
-        # The MaxRD header column sits directly over its values.
+        # The worst-case header column sits directly over its values.
         lines = output.splitlines()
-        header = next(line for line in lines if "MaxRD" in line)
+        header = next(line for line in lines if "Worst-case guesses" in line)
         row = next(line for line in lines if line.strip().startswith("1")).rstrip()
         value_column = len(row) - len(row.split()[-1])
-        self.assertEqual(header.index("MaxRD"), value_column)
+        self.assertEqual(header.index("Worst-case guesses"), value_column)
 
     def test_leaderboard_report_renders_empty_fallback(self):
         report = self._leaderboard_report(
