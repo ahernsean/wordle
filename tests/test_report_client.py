@@ -799,6 +799,24 @@ class ReportClientBrowserTest(unittest.TestCase):
                                10 / 31, delta=0.02)
         self.assertIn("31", segments.nth(0).inner_text())
 
+    def test_leaderboard_poll_renders_changed_data(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/leaderboard')) return response;
+            const report = await response.json();
+            report.data.rows[0].erd = 9.876;
+            return new Response(JSON.stringify(report), {
+              status: 200,
+              headers: {'Content-Type': 'application/json'},
+            });
+          });
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.876", self.page.locator("#report").inner_text())
+
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request
         # timer fires on the view switch (the fold can take several seconds).

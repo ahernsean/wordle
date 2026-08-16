@@ -1392,22 +1392,10 @@
         if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
         const report=await response.json();if(generation!==requestGeneration)return;
         const sameView=context===lastContext,previous=sameView?lastReport:null;
-        // A quiet poll of the view already on screen must never yank a
-        // control out from under an in-progress interaction: a native
-        // <select>'s open dropdown has no DOM state to restore once its
-        // element is destroyed, a rebuilt <summary>/<input>/<textarea>
-        // silently drops the focus or in-progress text the user had, and
-        // replaceChildren collapses any text selection the user is mid-way
-        // through making -- fatal on iPhone, where a long-press selection has
-        // to survive until the Copy tap lands.  Skip the visual apply in
-        // that case only -- lastReport/lastContext still advance, so the
-        // next poll (once focus moves on or the selection collapses) renders
-        // current data rather than replaying this skipped one.  A real
-        // navigation (sameView is false: Go, Back/Forward, clicking a card)
-        // always renders regardless of focus or selection, since replacing
-        // the old view is the point of navigating.
-        const quietLeaderboardPoll=sameView&&report.report_kind==="leaderboard";
-        if(!quietLeaderboardPoll&&(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection())))applyReport(report,previous,state);
+        // A same-view poll may rebuild the report unless an interaction would
+        // be destroyed: native controls have no DOM state to restore after
+        // replacement, and replaceChildren collapses an active text selection.
+        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection()))applyReport(report,previous,state);
         lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }
