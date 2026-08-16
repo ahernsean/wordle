@@ -29,26 +29,53 @@ def _services_acted_on(run):
 
 class CmdStartTest(unittest.TestCase):
     def test_starts_both_services_by_default(self):
-        with patch.object(erd_search, '_run_systemctl', return_value=0) as run:
+        with (
+            patch.object(erd_search, '_run_systemctl', return_value=0) as run,
+            patch.object(erd_search, '_run_journalctl', return_value=0) as journal,
+            patch.object(erd_search.time, 'time', return_value=123.5),
+        ):
             erd_search.cmd_start(_args())
         run.assert_any_call(erd_search._SYSTEMD_SERVICE, 'start')
         run.assert_any_call(erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'start')
-        run.assert_any_call(erd_search._SYSTEMD_SERVICE, 'status', '--no-pager')
         run.assert_any_call(
-            erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager')
+            erd_search._SYSTEMD_SERVICE, 'status', '--no-pager', '--lines=0')
+        run.assert_any_call(
+            erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager',
+            '--lines=0')
+        journal.assert_any_call(erd_search._SYSTEMD_SERVICE, 123.5)
+        journal.assert_any_call(erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 123.5)
+
+    def test_journal_diagnostics_start_at_command_timestamp(self):
+        completed = SimpleNamespace(returncode=0)
+        with patch('subprocess.run', return_value=completed) as run:
+            self.assertEqual(
+                erd_search._run_journalctl('wordle-erd', 123.5), 0)
+        run.assert_called_once_with(
+            ['journalctl', '--user', '--unit', 'wordle-erd', '--since',
+             '@123.5', '--no-pager', '--full'],
+            capture_output=False)
 
     def test_swarm_only_skips_report_server(self):
-        with patch.object(erd_search, '_run_systemctl', return_value=0) as run:
+        with (
+            patch.object(erd_search, '_run_systemctl', return_value=0) as run,
+            patch.object(erd_search, '_run_journalctl', return_value=0) as journal,
+        ):
             erd_search.cmd_start(_args(swarm_only=True))
         self.assertEqual(_services_acted_on(run), {erd_search._SYSTEMD_SERVICE})
+        journal.assert_called_once_with(erd_search._SYSTEMD_SERVICE, ANY)
 
     def test_web_only_skips_supervisor(self):
-        with patch.object(erd_search, '_run_systemctl', return_value=0) as run:
+        with (
+            patch.object(erd_search, '_run_systemctl', return_value=0) as run,
+            patch.object(erd_search, '_run_journalctl', return_value=0) as journal,
+        ):
             erd_search.cmd_start(_args(web_only=True))
         self.assertEqual(
             _services_acted_on(run),
             {erd_search._REPORT_SERVER_SYSTEMD_SERVICE},
         )
+        journal.assert_called_once_with(
+            erd_search._REPORT_SERVER_SYSTEMD_SERVICE, ANY)
 
     def test_aborts_before_report_server_when_supervisor_fails(self):
         def fake(service, action, *extra):
@@ -79,9 +106,11 @@ class CmdStartTest(unittest.TestCase):
                 erd_search.cmd_start(_args())
         self.assertEqual(raised.exception.code, 3)
         # Status is still printed for both services for diagnostics.
-        run.assert_any_call(erd_search._SYSTEMD_SERVICE, 'status', '--no-pager')
         run.assert_any_call(
-            erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager')
+            erd_search._SYSTEMD_SERVICE, 'status', '--no-pager', '--lines=0')
+        run.assert_any_call(
+            erd_search._REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager',
+            '--lines=0')
 
 
 class CmdStopTest(unittest.TestCase):
