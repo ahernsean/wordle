@@ -167,6 +167,21 @@ def cmd_queue_add(args):
     from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
+    if args.word:
+        words_to_process = [args.word.strip().lower()]
+    else:
+        words_to_process = [word.strip().lower()
+                            for word in load_word_list(args.word_list)]
+
+    candidate_words = set(load_word_list(WORDS_FILE))
+    invalid_words = [word for word in words_to_process
+                     if len(word) != 5 or word not in candidate_words]
+    if invalid_words:
+        invalid_display = ', '.join(sorted(set(invalid_words)))
+        raise ValueError(
+            f'invalid candidate word(s): {invalid_display}; expected '
+            f'five-letter words from {WORDS_FILE}')
+
     priority_words = {w.strip().lower() for w in (args.priority_words or [])}
     if priority_words and not args.word_list:
         print('Warning: --priority-words only applies with --word-list; '
@@ -176,11 +191,6 @@ def cmd_queue_add(args):
     score_cache = ScoreCache(args.cache, all_answers)
     rcache = ResponseCache(all_answers, score_cache)
     queue = ERDQueue(args.queue)
-
-    if args.word:
-        words_to_process = [args.word.strip().lower()]
-    else:
-        words_to_process = load_word_list(args.word_list)
 
     unknown = priority_words - set(words_to_process)
     if unknown:
@@ -1439,7 +1449,13 @@ def main():
             'clear-disk-stop': cmd_queue_clear_disk_stop,
             'set-disk-stop': cmd_queue_set_disk_stop,
         }
-        qdispatch[args.queue_cmd](args)
+        if args.queue_cmd == 'add':
+            try:
+                qdispatch[args.queue_cmd](args)
+            except ValueError as error:
+                parser.error(str(error))
+        else:
+            qdispatch[args.queue_cmd](args)
         return
 
     if args.cmd == 'epoch':
