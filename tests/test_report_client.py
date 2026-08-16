@@ -1671,16 +1671,22 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("disconnected", chip.get_attribute("class") or "")
         self.assertEqual(chip.inner_text(), "●")
 
-    def test_poll_does_not_replace_a_slow_active_request(self):
+    def test_poll_retries_a_stalled_request_after_timeout(self):
         result = self.page.evaluate("""async () => {
           const realFetch = window.fetch;
           const report = await (await realFetch('/api/view')).json();
           const realNow = Date.now;
           const resolutions = [];
           let calls = 0;
-          window.fetch = () => new Promise(resolve => {
+          let firstRequestAborted = false;
+          window.fetch = (_url, options) => new Promise(resolve => {
             calls += 1;
             resolutions.push(resolve);
+            if (calls === 1) {
+              options.signal.addEventListener('abort', () => {
+                firstRequestAborted = true;
+              });
+            }
           });
           const first = __reportClient.fetchReport();
           await Promise.resolve();
@@ -1696,9 +1702,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           await Promise.all([first, second]);
           window.fetch = realFetch;
           Date.now = realNow;
-          return callsBeforeResolution;
+          return {callsBeforeResolution, firstRequestAborted};
         }""")
-        self.assertEqual(result, 1)
+        self.assertEqual(result["callsBeforeResolution"], 2)
+        self.assertTrue(result["firstRequestAborted"])
 
     def test_branch_view_pins_branch_target_to_its_spine(self):
         # Navigating by a queue reference resolves once; the client then pins

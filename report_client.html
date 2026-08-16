@@ -297,7 +297,7 @@
   <script>
   (() => {
     "use strict";
-    const SCHEMA_VERSION=3, DEFAULT_POLL=2000, SLOW_REQUEST_MILLIS=2000;
+    const SCHEMA_VERSION=3, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
     // iOS Safari's native <select> picker ignores the "hidden" attribute on
@@ -309,7 +309,7 @@
     const treelessKinds=new Set(["cache","hotspots","leaderboard"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
     const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
@@ -1390,9 +1390,12 @@
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     async function fetchReport(){
       if(document.hidden)return;
-      if(activeRequestController)return;
+      if(activeRequestController){
+        if(Date.now()-activeRequestStartedAt<STUCK_REQUEST_MILLIS)return;
+        abortActiveRequest();
+      }
       const state=normalizeState(currentState),context=contextKey(state),generation=++requestGeneration,controller=new AbortController();
-      activeRequestController=controller;
+      activeRequestController=controller;activeRequestStartedAt=Date.now();
       // On a view switch (new context), a slow report — the leaderboard folds
       // every candidate — would otherwise leave a blank pane; show a notice if
       // it has not arrived within SLOW_REQUEST_MILLIS.  Same-context polls keep
