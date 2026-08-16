@@ -524,6 +524,16 @@ def _run_systemctl(service: str, action: str, *extra: str) -> int:
     return result.returncode
 
 
+def _run_journalctl(service: str, since: float) -> int:
+    """Print journal entries for ``service`` written since ``since``."""
+    import subprocess
+    result = subprocess.run(
+        ['journalctl', '--user', '--unit', service, '--since', f'@{since}',
+         '--no-pager', '--full'],
+        capture_output=False)
+    return result.returncode
+
+
 def _service_scope_noun(args) -> str:
     """The subject describing which services a scoped command acted on."""
     if args.swarm_only:
@@ -555,6 +565,7 @@ def _start_or_restart_services(args, action: str) -> None:
     server is attempted independently and its failure is reported without
     undoing the supervisor action -- these are two separately-managed
     services, not a transaction."""
+    diagnostics_since = time.time()
     if not args.web_only:
         rc = _run_systemctl(_SYSTEMD_SERVICE, action)
         if rc != 0:
@@ -575,9 +586,13 @@ def _start_or_restart_services(args, action: str) -> None:
                   file=sys.stderr)
 
     if not args.web_only:
-        _run_systemctl(_SYSTEMD_SERVICE, 'status', '--no-pager')
+        _run_systemctl(_SYSTEMD_SERVICE, 'status', '--no-pager', '--lines=0')
+        _run_journalctl(_SYSTEMD_SERVICE, diagnostics_since)
     if not args.swarm_only:
-        _run_systemctl(_REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager')
+        _run_systemctl(
+            _REPORT_SERVER_SYSTEMD_SERVICE, 'status', '--no-pager',
+            '--lines=0')
+        _run_journalctl(_REPORT_SERVER_SYSTEMD_SERVICE, diagnostics_since)
     if server_rc != 0:
         sys.exit(server_rc)
 
