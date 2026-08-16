@@ -239,7 +239,12 @@
     @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
     @media (max-width:600px) {
       header { position:static; }
-      .response-count-segment { font-size:0; }
+      .answer-segment, .response-count-segment { font-size:0; }
+      .answer-segment[data-answer-count]::after { content:attr(data-answer-count); font-size:.66rem; }
+      .response-count-segment[data-response-group-count]::after { content:attr(data-response-group-count); font-size:.66rem; }
+      .response-bucket-legend { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem .55rem; min-height:0; margin-top:.4rem; }
+      .response-bucket-legend > svg { display:none; }
+      .response-bucket-legend > span { position:static; transform:none; font-size:.72rem; }
     }
   </style>
 </head>
@@ -1212,7 +1217,7 @@
       strip.setAttribute("aria-label","Answer probability by first-response group for "+String(row.word||"").toUpperCase());
       for(const [index,group] of groups.entries()){
         const probability=answerCount?group.answer_count/answerCount:0,segment=element("span","answer-segment");
-        if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);}
+        if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);segment.dataset.answerCount=numText(group.answer_count);}
         segment.style.flexGrow=String(group.answer_count);segment.style.flexBasis="0";segment.style.backgroundColor=answerGroupColor(group.answer_count);
         segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability";
         strip.append(segment);
@@ -1226,13 +1231,14 @@
         if(bucket.responseGroupCount){
           const countText=numText(bucket.responseGroupCount),segment=element("span","response-count-segment"),label=element("span","response-count-segment-label"),wordLabel=bucket.labelText+(bucket.labelText==="1"?" word:":" words:");label.append(wordLabel,document.createElement("br"),countText+" groups");segment.append(label);
           segment.style.flexGrow=String(bucket.responseGroupCount);segment.style.flexBasis="0";segment.style.backgroundColor=bucket.color;
+          if(bucket.responseGroupCount/groups.length>=.06)segment.dataset.responseGroupCount=countText;
           segment.dataset.countText=countText;
           segment.title=bucket.labelText+(bucket.labelText==="1"?" answer":" answers")+" · "+numText(bucket.responseGroupCount)+(bucket.responseGroupCount===1?" response group":" response groups");fill.append(segment);
           const legendItem=element("span","",bucket.labelText+(bucket.labelText==="1"?" word: ":" words: ")+countText),segmentCenter=(responseGroupPosition+bucket.responseGroupCount/2)/groups.length;legendItem.style.setProperty("--bucket-color",bucket.color);legendItem.dataset.segmentCenter=String((1-fillWidth)/2+fillWidth*segmentCenter);legendItem.dataset.bucketColor=bucket.color;legend.append(legendItem);segment.dataset.legendIndex=String(legend.children.length-1);responseGroupPosition+=bucket.responseGroupCount;
         }
       }
       track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+" out of a vocabulary maximum of "+numText(maximumResponseGroupCount));
-      track.append(fill);requestAnimationFrame(()=>{for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(legend.children.length)layoutResponseBucketLegend(legend);else legend.remove();});return [track,legend];
+      track.append(fill);requestAnimationFrame(()=>{if(matchMedia("(max-width: 600px)").matches){for(const segment of fill.children)segment.replaceChildren();const legendItems=[...legend.children],leftColumnSize=Math.ceil(legendItems.length/2),mobileOrder=[];for(let index=0;index<leftColumnSize;index++){mobileOrder.push(legendItems[index]);if(legendItems[index+leftColumnSize])mobileOrder.push(legendItems[index+leftColumnSize]);}legend.append(...mobileOrder);return;}for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(legend.children.length)layoutResponseBucketLegend(legend);else legend.remove();});return [track,legend];
     }
     function layoutResponseBucketLegend(legend){
       legend.querySelector(":scope > svg")?.remove();const items=[...legend.querySelectorAll(":scope > span")],width=legend.clientWidth,padding=4,gap=6,leaderGap=16,laneHeight=Math.max(...items.map(item=>item.offsetHeight))+6;
