@@ -1316,14 +1316,13 @@
     function animateGridTransitions(root,before,sameView){
       if(!sameView||!before.size||matchMedia("(prefers-reduced-motion: reduce)").matches)return;
       const present=new Set();
+      const movedCandidates=[];
       for(const node of root.querySelectorAll(".grid > [data-identity]")){
         present.add(node.dataset.identity);
         const prior=before.get(node.dataset.identity);
         if(prior){
-          // FLIP: a card that survived the refresh glides from where it was to
-          // where it landed, so watching one branch never means chasing it.
           const after=node.getBoundingClientRect(),dx=prior.rect.left-after.left,dy=prior.rect.top-after.top;
-          if(dx||dy)node.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:"none"}],{duration:350,easing:"ease",fill:"forwards"});
+          if(dx||dy)movedCandidates.push({node,prior:prior.rect,after});
         }else{
           // A brand-new card grows in from the right while fading up to full
           // size, rather than just barely swelling in place -- the same
@@ -1334,6 +1333,21 @@
         }
       }
       const leaving=[...before].filter(([identity])=>!present.has(identity));
+      const cardsToMove=new Set();
+      for(const [,{rect}] of leaving){
+        let closest=null;
+        for(const candidate of movedCandidates){
+          if(cardsToMove.has(candidate.node))continue;
+          const distance=(candidate.after.left-rect.left)**2+(candidate.after.top-rect.top)**2;
+          if(!closest||distance<closest.distance)closest={candidate,distance};
+        }
+        if(closest)cardsToMove.add(closest.candidate.node);
+      }
+      for(const candidate of movedCandidates){
+        if(!cardsToMove.has(candidate.node))continue;
+        const dx=candidate.prior.left-candidate.after.left,dy=candidate.prior.top-candidate.after.top;
+        candidate.node.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:"none"}],{duration:350,easing:"ease",fill:"forwards"});
+      }
       if(!leaving.length)return;
       const layer=element("div","leave-layer");document.body.append(layer);
       for(const [,{rect,node}] of leaving){
