@@ -239,6 +239,8 @@
     @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
     @media (max-width:600px), (hover:none) and (pointer:coarse) {
       header { position:static; }
+    }
+    @media (max-width:600px) {
       .answer-segment, .response-count-segment { font-size:0; }
       .answer-segment[data-answer-count]::after { content:attr(data-answer-count); font-size:.66rem; }
       .response-count-segment[data-response-group-count]::after { content:attr(data-response-group-count); font-size:.66rem; }
