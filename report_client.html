@@ -237,7 +237,7 @@
     @keyframes added { from { box-shadow:0 0 0 3px var(--green); } }
     @keyframes improved { from { border-color:var(--green); background:#e8f4e7; } }
     @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
-    @media (max-width:600px) {
+    @media (max-width:600px), (hover:none) and (pointer:coarse) {
       header { position:static; }
       .answer-segment, .response-count-segment { font-size:0; }
       .answer-segment[data-answer-count]::after { content:attr(data-answer-count); font-size:.66rem; }

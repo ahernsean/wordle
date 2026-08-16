@@ -2322,6 +2322,25 @@ class ReportClientBrowserTest(unittest.TestCase):
                     )
                     self.assertLessEqual(measured["scroll"], measured["client"])
 
+    def test_touch_layout_does_not_cover_controls_with_sticky_header(self):
+        context = self.browser.new_context(
+            viewport={"width": 800, "height": 600},
+            has_touch=True,
+            is_mobile=True,
+        )
+        page = context.new_page()
+        try:
+            page.goto(self.base_url)
+            page.wait_for_selector("h1")
+            self.assertEqual(
+                page.locator("header").evaluate(
+                    "node => getComputedStyle(node).position"
+                ),
+                "static",
+            )
+        finally:
+            context.close()
+
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
