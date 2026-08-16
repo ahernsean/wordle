@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Lock, Thread
 import io
 import json
 import os
@@ -371,6 +371,46 @@ class ReportServerTest(unittest.TestCase):
                 status, _headers, body = request(base_url, "/api/view")
         self.assertEqual(status, 500)
         self.assertNotIn("secret", body.decode())
+
+    def test_concurrent_leaderboard_requests_share_one_collection(self):
+        started = Event()
+        release = Event()
+        call_lock = Lock()
+        call_count = 0
+        report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+
+        def collect_slowly(_sources, _request):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+            started.set()
+            release.wait(2)
+            return report
+
+        with patch("report_server.collect_report", side_effect=collect_slowly):
+            with running_server(self.live_configuration) as base_url:
+                responses = []
+                first = Thread(
+                    target=lambda: responses.append(
+                        request(base_url, "/api/view/leaderboard")
+                    )
+                )
+                second = Thread(
+                    target=lambda: responses.append(
+                        request(base_url, "/api/view/leaderboard")
+                    )
+                )
+                first.start()
+                self.assertTrue(started.wait(1))
+                second.start()
+                time.sleep(0.05)
+                release.set()
+                first.join(2)
+                second.join(2)
+        self.assertEqual(call_count, 1)
+        self.assertEqual(
+            [status for status, _headers, _body in responses], [200, 200]
+        )
 
 
 class ReportServerMainTest(unittest.TestCase):
