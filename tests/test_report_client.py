@@ -2378,6 +2378,47 @@ class ReportClientBrowserTest(unittest.TestCase):
         finally:
             context.close()
 
+    def test_tablet_leaderboard_keeps_legends_for_unlabeled_bar_segments(self):
+        context = self.browser.new_context(
+            viewport={"width": 834, "height": 1112},
+            has_touch=True,
+            is_mobile=True,
+        )
+        page = context.new_page()
+        try:
+            page.goto(self.base_url + "?kind=leaderboard")
+            page.wait_for_selector("text=Opener leaderboard")
+            measured = page.evaluate("""async () => {
+              const report = await (await fetch('/api/view/leaderboard')).json();
+              report.data.rows[0].response_groups = [
+                ...Array.from({length: 24}, (_, index) => ({
+                  pattern: String(index), answer_count: 1,
+                })),
+                ...[2, 5, 9, 17, 33, 65, 129].map((answer_count, index) => ({
+                  pattern: 'large-' + String(index), answer_count,
+                })),
+              ];
+              applyReport(report, null,
+                {...__reportClient.getState(), kind: 'leaderboard'});
+              await new Promise(requestAnimationFrame);
+              const segment = [...document.querySelectorAll('.response-count-segment')]
+                .find(node => node.title.startsWith('2–4 answers'));
+              const legend = [...document.querySelectorAll('.response-bucket-legend > span')]
+                .find(node => node.textContent === '2–4 words: 1');
+              return {
+                touch: matchMedia('(hover:none) and (pointer:coarse)').matches,
+                fontSize: getComputedStyle(segment).fontSize,
+                segmentText: segment.textContent,
+                legendText: legend?.textContent,
+              };
+            }""")
+            self.assertTrue(measured["touch"], measured)
+            self.assertNotEqual(measured["fontSize"], "0px", measured)
+            self.assertEqual(measured["segmentText"], "", measured)
+            self.assertEqual(measured["legendText"], "2–4 words: 1", measured)
+        finally:
+            context.close()
+
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
