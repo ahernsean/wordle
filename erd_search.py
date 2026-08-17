@@ -22,12 +22,13 @@ run             Start the supervisor directly (without systemd), for
                 runtime/erd_search.log.
 
 queue           Queue mutation operations.
-queue add       Add branches for a word or word list to the work queue.
+queue add       Add branches for one or more words to the work queue.
                 Idempotent: existing branches are never duplicated; priority
-                is upgraded if the new request is higher.  With --word-list,
-                --priority-words marks a subset of the list's words as
+                is upgraded if the new request is higher.  With --words-file,
+                --priority-words marks a subset of the file's words as
                 higher priority.  --delete-erd-cache forces a recompute of
-                branches that are already cached.
+                branches that are already cached.  Reports how many branches
+                were newly queued, already queued, and already cached.
 
 queue clear     Wipe all queue state (pending branches, active state, candidate
                 claims, heartbeats).  Does not touch the ERD cache.
@@ -97,7 +98,7 @@ from runtime_paths import (
     DEFAULT_SEARCH_LOG_PATH,
     ensure_runtime_dir,
 )
-from wordle_engine import ERD_ALL, ResponseCache, load_word_list
+from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
 from erd_queue import (
     DISK_STOP_FRACTION,
     ERDQueue,
@@ -149,29 +150,33 @@ def cmd_view(args):
 # ---------------------------------------------------------------------------
 
 def cmd_queue_add(args):
-    """Add branches for one word (or a word-list file) to the queue.
+    """Add branches for one or more words (or a words-file) to the queue.
 
-    With --word: adds all response branches for that word with at least 2
-    answer words (and at most --max-branch-size, if given).  With --pattern
-    as well: adds only that single branch.
+    With --word: adds all response branches for each given word with at
+    least 2 answer words (and at most --max-branch-size, if given).  With
+    --pattern as well: adds only that single branch per word.
 
-    With --word-list: walks every word in the file, same as --word repeated.
-    --priority-words marks a subset of those words as higher priority: they
-    are queued at --priority while the rest are queued at 0.
+    With --words-file: walks every word in the file, same as --word with
+    that file's contents.  --priority-words marks a subset of those words as
+    higher priority: they are queued at --priority while the rest are queued
+    at 0.
 
     Already-queued branches are never duplicated; their priority is upgraded
-    if the new request is higher.  --delete-erd-cache deletes each queued
-    branch's existing ERD cache entry first, so it gets recomputed instead of
-    being claimed and immediately marked done as already-cached.
+    if the new request is higher.  For each word, reports how many of its
+    branches are newly queued, were already queued, and are already cached
+    (so a worker will resolve them instantly without doing any search).
+    --delete-erd-cache deletes each queued branch's existing ERD cache entry
+    first, so it gets recomputed instead of being claimed and immediately
+    marked done as already-cached.
     """
     from wordle_ui import parse_pattern, fmt_pattern
 
     all_answers = load_word_list(ANSWER_FILE)
     if args.word:
-        words_to_process = [args.word.strip().lower()]
+        words_to_process = [word.strip().lower() for word in args.word]
     else:
         words_to_process = [word.strip().lower()
-                            for word in load_word_list(args.word_list)]
+                            for word in load_word_list(args.words_file)]
 
     candidate_words = set(load_word_list(WORDS_FILE))
     invalid_words = [word for word in words_to_process
@@ -183,9 +188,9 @@ def cmd_queue_add(args):
             f'five-letter words from {WORDS_FILE}')
 
     priority_words = {w.strip().lower() for w in (args.priority_words or [])}
-    if priority_words and not args.word_list:
-        print('Warning: --priority-words only applies with --word-list; '
-              'ignoring it.  Use --priority directly for a single --word.')
+    if priority_words and not args.words_file:
+        print('Warning: --priority-words only applies with --words-file; '
+              'ignoring it.  Use --priority directly with --word.')
         priority_words = set()
 
     score_cache = ScoreCache(args.cache, all_answers)
@@ -197,7 +202,13 @@ def cmd_queue_add(args):
         print(f'Warning: priority words not in the word list: '
               f'{", ".join(sorted(unknown))}')
 
-    n_added = 0
+    # A branch reached by --word has guess_depth 1 (one guess played), so it
+    # is solved at ROOT_BUDGET - 1 == GAME_GUESSES - 1.
+    branch_budget = GAME_GUESSES - 1
+
+    n_new = 0
+    n_already_queued = 0
+    n_already_cached = 0
     try:
         for word in words_to_process:
             priority = (args.priority if (not priority_words
@@ -229,14 +240,37 @@ def cmd_queue_add(args):
                          or len(branch) <= args.max_branch_size)
                 ]
             if rows:
+                branch_keys = [branch_key for branch_key, *_rest in rows]
+                already_queued_keys = set(
+                    queue.status_by_branch_keys(branch_keys))
+                cache_states = score_cache.report_branch_states(
+                    branch_keys, ERD_ALL, budget=branch_budget)
+                already_cached_keys = {
+                    key for key, state in cache_states.items()
+                    if state['cache_state'] in ('exact', 'loss')}
+
                 if args.delete_erd_cache:
-                    for branch_key, *_rest in rows:
+                    for branch_key in branch_keys:
                         score_cache.delete(branch_key, ERD_ALL)
                 queue.add_pending_many(rows)
-                n_added += len(rows)
+
+                word_already_queued = len(already_queued_keys)
+                word_already_cached = len(already_cached_keys)
+                word_new = len(rows) - word_already_queued
+                n_new += word_new
+                n_already_queued += word_already_queued
+                n_already_cached += word_already_cached
+                print(f'{word.upper()}: {len(rows):,} branch(es) — '
+                      f'{word_new:,} new, {word_already_queued:,} already '
+                      f'queued, {word_already_cached:,} already cached '
+                      f'(resolved instantly, no search needed).')
 
         total = queue.total_branches()
-        print(f'Added {n_added:,} branch(es).  Queue total: {total:,}.')
+        n_added = n_new + n_already_queued
+        print(f'\n{n_added:,} branch(es) processed across '
+              f'{len(words_to_process):,} word(s): {n_new:,} new, '
+              f'{n_already_queued:,} already queued, {n_already_cached:,} '
+              f'already cached.  Queue total: {total:,}.')
 
     except KeyboardInterrupt:
         print('\nInterrupted.')
@@ -1221,21 +1255,23 @@ def main():
 
     # -- queue add --
     p_qa = qsub.add_parser('add',
-                           help='Add branches for a word (or word list) to the queue')
+                           help='Add branches for one or more words to the queue')
     qa_word = p_qa.add_mutually_exclusive_group(required=True)
-    qa_word.add_argument('--word', metavar='WORD',
-                         help='Single guess word (e.g. salet)')
-    qa_word.add_argument('--word-list', metavar='FILE',
-                         help=f'File of words to add (default list: {WORDS_FILE})')
+    qa_word.add_argument('--word', nargs='+', metavar='WORD',
+                         help='One or more guess words, space-separated '
+                              '(e.g. --word salet crane raise)')
+    qa_word.add_argument('--words-file', metavar='FILE',
+                         help=f'File of words to add, one per line '
+                              f'(default list: {WORDS_FILE})')
     p_qa.add_argument('--pattern', metavar='PAT',
                       help='Only add this specific response pattern for --word '
                            '(5 chars: g=green y=yellow -=gray).  '
-                           'Omit to add all patterns for the word.')
+                           'Omit to add all patterns for the word(s).')
     p_qa.add_argument('--priority', type=int, default=0, metavar='N',
                       help='Priority for queued branches (default: 0).  '
                            'Higher numbers are worked sooner.')
     p_qa.add_argument('--priority-words', nargs='+', metavar='WORD',
-                      help='With --word-list: only these words are queued at '
+                      help='With --words-file: only these words are queued at '
                            '--priority, the rest at 0 (e.g. '
                            '--priority-words salet crane)')
     p_qa.add_argument('--max-branch-size', type=int, default=None, metavar='N',
