@@ -17,6 +17,7 @@ from report_model import (
     ReportRequest,
     ReportSources,
     WORKER_STALE_SECONDS,
+    collect_ambiguous_branch_reference_report,
     collect_report,
     parse_report_branch_target,
 )
@@ -168,13 +169,35 @@ def _format_branch_erd(value, answer_count, *, ceiling=False):
 
 
 def _display_reference(branch_reference):
-    """Four-character display prefix of a branch reference.
+    """Eight-character display prefix of a branch reference.
 
-    Collisions among the few dozen simultaneously live branches are
-    vanishingly unlikely over a 16-bit space, and any prefix remains a valid
-    @reference branch_target.
+    Resolution runs against the whole cache, not just the live branches a
+    report happens to show, so the prefix must stay unique over that larger
+    population: at ~569,000 distinct branches, 8 hex characters gives ~6.7e-5
+    expected collisions. Any prefix remains a valid @reference branch_target.
     """
-    return branch_reference[:4]
+    return branch_reference[:8]
+
+
+def _ambiguous_reference_lines(error, sources, request):
+    """Render an ambiguous-@reference error with the candidates it resolved to."""
+    lines = [f"view: {error}"]
+    report = collect_ambiguous_branch_reference_report(sources, request, error)
+    for candidate in report["data"]["candidates"]:
+        preview = ", ".join(word.upper() for word in candidate["answer_preview"])
+        if candidate["answer_count"] > len(candidate["answer_preview"]):
+            preview += "…"
+        lines.append(
+            f"  @{candidate['branch_reference']} "
+            f"n={candidate['answer_count']} {preview}"
+        )
+        if candidate["spine"]:
+            spine_text = " ".join(
+                f"{step['word'].upper()} {step['pattern']}"
+                for step in candidate["spine"]
+            )
+            lines.append(f"    spine={spine_text}")
+    return lines
 
 
 def _hotkey_label(display_order, branch_key_hex):
@@ -1941,7 +1964,13 @@ class WatchSession:
         try:
             report = self._collect()
         except Exception as error:
-            self.error_stream.write(f"view: {error}\n")
+            if hasattr(error, "candidates"):
+                lines = _ambiguous_reference_lines(
+                    error, self._sources(), self.current_request
+                )
+            else:
+                lines = [f"view: {error}"]
+            self.error_stream.write("\n".join(lines) + "\n")
             raise SystemExit(1)
         if self.args.format == "jsonl":
             self.output_stream.write(
@@ -1966,7 +1995,13 @@ class WatchSession:
                     )
                     self.output_stream.flush()
                 except Exception as error:
-                    self.error_stream.write(f"view: {error}\n")
+                    if hasattr(error, "candidates"):
+                        lines = _ambiguous_reference_lines(
+                            error, self._sources(), self.current_request
+                        )
+                    else:
+                        lines = [f"view: {error}"]
+                    self.error_stream.write("\n".join(lines) + "\n")
                     self.error_stream.flush()
                 time.sleep(self.args.watch)
         except KeyboardInterrupt:

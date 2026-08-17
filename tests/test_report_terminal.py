@@ -11,11 +11,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from cache_sqlite import ScoreCache, branch_reference
 import erd_search
 from erd_queue import ERDQueue, encode_subset
 import report_terminal
 from report_model import ReportFilters, parse_report_branch_target
 from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
+from wordle_engine import ERD_ALL
 
 
 def overview_report():
@@ -328,20 +330,23 @@ class OverviewRendererTest(unittest.TestCase):
             "worker_id": "worker-12", "worker_number": "12",
         })
 
+        # Ref is an eight-character prefix (#212), four wider than the digest
+        # prefix it replaced, so every removal threshold below is shifted
+        # later by that same four characters relative to the old widths.
         expected_branch_headings = {
-            50: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
-            55: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
-            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
-            60: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
-            79: (
+            54: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
+            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
+            63: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
+            64: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
+            83: (
                 "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
-            80: (
+            84: (
                 "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
-            120: (
+            124: (
                 "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD", "ETA",
             ),
@@ -1343,6 +1348,96 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         ):
             erd_search.main()
         self.assertEqual(raised.exception.code, 2)
+
+
+class BranchReferenceRoundTripTest(unittest.TestCase):
+    """A handle printed by `view --queue` must resolve, unmodified, through a
+    later `view @handle` -- even when a shorter prefix would have collided
+    against another branch elsewhere in the cache (#212)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+
+    def _run(self, *args):
+        output = io.StringIO()
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view",
+                "--queue-path", self.queue_path,
+                "--cache-path", self.cache_path,
+                *args,
+            ]),
+            redirect_stdout(output),
+        ):
+            erd_search.main()
+        return output.getvalue()
+
+    def _seed_four_character_collision(self):
+        """Two branch keys whose references share a 4-character prefix --
+        the width the printer used to truncate to -- found by the birthday
+        approach: over enough samples in a 65536-slot space, an internal
+        collision is all but certain."""
+        keys_by_four_char_prefix = {}
+        for index in range(10000):
+            branch_key = f"branch {index}".encode()
+            prefix = branch_reference(branch_key)[:4]
+            if prefix in keys_by_four_char_prefix:
+                return keys_by_four_char_prefix[prefix], branch_key
+            keys_by_four_char_prefix[prefix] = branch_key
+        self.fail("no 4-character reference collision found")
+
+    def test_queue_printed_handle_resolves_despite_a_four_character_collision(self):
+        queued_key, cache_only_key = self._seed_four_character_collision()
+
+        queue = ERDQueue(self.queue_path)
+        queue.add_pending_many([(queued_key, 2, 1, "salet", 0)])
+        queue.close()
+
+        cache = ScoreCache(self.cache_path, ["salet"], checkpoint_on_close=False)
+        cache.write_loss(cache_only_key, ERD_ALL, 3)
+        cache.close()
+
+        displayed_handle = "@" + branch_reference(queued_key)[:8]
+        queue_text = self._run("--queue")
+        self.assertIn(displayed_handle, queue_text)
+
+        branch_text = self._run(displayed_handle)
+        self.assertIn(f"Branch {displayed_handle}", branch_text)
+        self.assertNotIn("ambiguous", branch_text)
+
+    def test_hand_typed_short_prefix_lists_every_candidate_in_full(self):
+        queued_key, cache_only_key = self._seed_four_character_collision()
+
+        queue = ERDQueue(self.queue_path)
+        queue.add_pending_many([(queued_key, 2, 1, "salet", 0)])
+        queue.close()
+
+        cache = ScoreCache(self.cache_path, ["salet"], checkpoint_on_close=False)
+        cache.write_loss(cache_only_key, ERD_ALL, 3)
+        cache.close()
+
+        short_prefix = "@" + branch_reference(queued_key)[:4]
+        error_output = io.StringIO()
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view",
+                "--queue-path", self.queue_path,
+                "--cache-path", self.cache_path,
+                short_prefix,
+            ]),
+            redirect_stdout(io.StringIO()),
+            patch("sys.stderr", error_output),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            erd_search.main()
+        self.assertEqual(raised.exception.code, 1)
+        text = error_output.getvalue()
+        self.assertIn("ambiguous", text)
+        self.assertIn("@" + branch_reference(queued_key), text)
+        self.assertIn("@" + branch_reference(cache_only_key), text)
 
 
 class ViewParserTest(unittest.TestCase):
