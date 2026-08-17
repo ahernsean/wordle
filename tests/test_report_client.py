@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import copy
+import json
 from http.server import ThreadingHTTPServer
 from html.parser import HTMLParser
 import os
@@ -28,6 +29,63 @@ FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
 CLIENT_POLL_MILLIS = 2000
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
 REQUIRE_PLAYWRIGHT_BROWSER = os.environ.get("REQUIRE_PLAYWRIGHT_BROWSER") == "1"
+
+# Longer than the grid choreography, so a report applied before this has elapsed
+# is one the transition has already finished with.
+GRID_TRANSITION_MILLIS = 1700
+
+# Helpers for the grid-transition tests, prepended to their page scripts.
+#
+# parkThePoll matters more than it looks: these tests sample across more than a
+# poll interval, and a refresh landing mid-sample re-renders the report
+# underneath the measurement.  The result reads as a phantom jump in the numbers.
+GRID_SCRIPT_HELPERS = """
+  const parkThePoll=()=>{window.fetch=()=>new Promise(()=>{});};
+  // Fetched once and kept, because parking the poll takes fetch with it.
+  const overviewReport=async()=>{
+    if(!window.__overviewFixture){
+      window.__overviewFixture=await (await fetch('/api/view')).json();
+      parkThePoll();
+    }
+    return window.__overviewFixture;
+  };
+  const settled=()=>new Promise(resolve=>setTimeout(resolve,%d));
+  const namedBranches=(base,names)=>{
+    const report=structuredClone(base);
+    report.data.branches=names.map((name,index)=>{
+      const row=structuredClone(base.data.branches[index%%base.data.branches.length]);
+      row.branch_key_hex=name;row.branch_reference=name;return row;
+    });
+    return report;
+  };
+  // Every card's (row, column) read off the laid-out grid rather than from the
+  // DOM order, so the assertions describe what is on screen.
+  const gridCells=()=>{
+    const grid=document.querySelector('.grid'),box=grid.getBoundingClientRect();
+    const cards=[...grid.querySelectorAll(':scope > [data-identity]')];
+    const axis=values=>[...new Set(values)].sort((left,right)=>left-right);
+    const offset=node=>{
+      const rect=node.getBoundingClientRect();
+      return [Math.round(rect.top-box.top),Math.round(rect.left-box.left)];
+    };
+    const tops=axis(cards.map(node=>offset(node)[0])),lefts=axis(cards.map(node=>offset(node)[1]));
+    return Object.fromEntries(cards.map(node=>
+      [node.dataset.identity,[tops.indexOf(offset(node)[0]),lefts.indexOf(offset(node)[1])]]));
+  };
+  const workersHeading=()=>[...document.querySelectorAll('#report h2')]
+    .find(node=>node.textContent==='Workers');
+  const sampleEveryFrame=async collect=>{
+    const samples=[],start=performance.now();
+    await new Promise(resolve=>{
+      const tick=()=>{
+        samples.push([Math.round(performance.now()-start),...collect()]);
+        if(performance.now()-start<%d)requestAnimationFrame(tick);else resolve();
+      };
+      requestAnimationFrame(tick);
+    });
+    return samples;
+  };
+""" % (GRID_TRANSITION_MILLIS, GRID_TRANSITION_MILLIS)
 
 
 def _preinstalled_chromium():
@@ -1812,41 +1870,206 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("not found", self.page.locator("#report .error").inner_text())
         self.page.unroute("**/api/view**")
 
-    def test_overview_card_departure_moves_only_the_nearest_survivor(self):
-        result = self.page.evaluate("""async () => {
-          const report=await (await fetch('/api/view')).json();
-          applyReport(report,null,__reportClient.getState());
-          const before=[...document.querySelectorAll('.grid > [data-identity]')].map(node=>node.dataset.identity);
-          const reordered=structuredClone(report);
-          reordered.data.branches.splice(1,1);
-          applyReport(reordered,report,__reportClient.getState());
-          const moved=[...document.querySelectorAll('.grid > [data-identity]')].filter(node=>node.getAnimations().length).map(node=>node.dataset.identity);
-          const leaveClones=document.querySelectorAll('.leave-layer > *').length;
-          return {before,moved,leaveClones};
-        }""")
-        self.assertGreater(len(result["before"]), 2)
-        self.assertEqual(len(result["moved"]), 1)
-        self.assertEqual(result["moved"][0], result["before"][2])
-        self.assertEqual(result["leaveClones"], 1)
+    def grid_script(self, body):
+        return "async () => {" + GRID_SCRIPT_HELPERS + body + "}"
 
-    def test_overview_card_reorder_animates_all_moved_survivors(self):
-        result = self.page.evaluate("""async () => {
+    def two_column_overview(self):
+        """A viewport where the branch grid lays out in exactly two columns."""
+        self.page.set_viewport_size({"width": 500, "height": 1400})
+        self.page.wait_for_selector(".grid > [data-identity]")
+        columns = self.page.evaluate(
+            "() => getComputedStyle(document.querySelector('.grid'))"
+            ".gridTemplateColumns.split(' ').filter(Boolean).length"
+        )
+        self.assertEqual(columns, 2)
+
+    def test_overview_departure_compacts_within_its_own_column(self):
+        self.two_column_overview()
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const five=namedBranches(base,['P','Q','R','S','T']);
+          const withoutP=namedBranches(base,['Q','R','S','T']);
+          applyReport(five,null,state);await settled();
+          // A second identical report lets the packing settle onto the columns
+          // it will actually use before anything departs.
+          applyReport(five,five,state);await settled();
+          const before=gridCells();
+          applyReport(withoutP,five,state);await settled();
+          return {before,after:gridCells()};
+        """))
+        # P sits at the top of the left column, R and T beneath it.
+        self.assertEqual(result["before"]["P"], [0, 0])
+        self.assertEqual(result["before"]["R"], [1, 0])
+        self.assertEqual(result["before"]["T"], [2, 0])
+        # Its column closes upward and the right column is untouched.
+        self.assertEqual(result["after"]["R"], [0, 0])
+        self.assertEqual(result["after"]["T"], [1, 0])
+        self.assertEqual(result["after"]["Q"], result["before"]["Q"])
+        self.assertEqual(result["after"]["S"], result["before"]["S"])
+
+    def test_overview_crosses_columns_only_to_save_a_row(self):
+        self.two_column_overview()
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const four=namedBranches(base,['A','B','C','D']);
+          const leftColumn=namedBranches(base,['A','C']);
+          applyReport(four,null,state);await settled();
+          applyReport(four,four,state);await settled();
+          const before=gridCells();
+          applyReport(leftColumn,four,state);await settled();
+          return {before,after:gridCells()};
+        """))
+        # A over C in the left column, B over D in the right.
+        self.assertEqual(result["before"]["A"], [0, 0])
+        self.assertEqual(result["before"]["C"], [1, 0])
+        # With the right column gone, staying put would cost a second row, so C
+        # moves diagonally up into it.
+        self.assertEqual(result["after"]["A"], [0, 0])
+        self.assertEqual(result["after"]["C"], [0, 1])
+
+    def test_overview_arrivals_fill_in_reading_order(self):
+        self.two_column_overview()
+        cells = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          applyReport(namedBranches(base,['seed']),null,state);await settled();
+          applyReport(namedBranches(base,['P','Q','R','S','T']),
+                      namedBranches(base,['seed']),state);await settled();
+          return gridCells();
+        """))
+        self.assertEqual(
+            [cells[name] for name in ("P", "Q", "R", "S", "T")],
+            [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]],
+        )
+
+    def test_grid_transition_moves_the_page_below_it_monotonically(self):
+        """The content under the grid must never reverse direction mid-flight.
+
+        Every jump reported against this animation has been the page below the
+        grid lurching one way and gliding back the other, because its position
+        was the sum of separately animated card boxes.  The grid now carries one
+        animated height, so a transition may move that content but only ever in
+        the direction it is going to end up.
+        """
+        self.two_column_overview()
+        for label, before_names, after_names in (
+            ("shrinking", list("abcdefgh"), list("ace")),
+            ("growing", list("ace"), list("abcdefgh")),
+        ):
+            with self.subTest(label):
+                samples = self.page.evaluate(self.grid_script("""
+                  const [beforeNames,afterNames]=%s;
+                  const base=await overviewReport();
+                  const state=__reportClient.getState();
+                  applyReport(namedBranches(base,beforeNames),null,state);await settled();
+                  const start=Math.round(workersHeading().getBoundingClientRect().top);
+                  applyReport(namedBranches(base,afterNames),
+                              namedBranches(base,beforeNames),state);
+                  const samples=await sampleEveryFrame(
+                    ()=>[Math.round(workersHeading().getBoundingClientRect().top)]);
+                  return [[0,start],...samples];
+                """ % json.dumps([before_names, after_names])))
+                positions = [top for _, top in samples]
+                steps = [
+                    second - first
+                    for first, second in zip(positions, positions[1:])
+                    if second != first
+                ]
+                self.assertTrue(steps, "the page below the grid never moved")
+                self.assertTrue(
+                    all(step > 0 for step in steps) or all(step < 0 for step in steps),
+                    f"page below the grid reversed direction: {steps}",
+                )
+
+    def test_grid_transition_never_widens_the_document(self):
+        """Overflow during an animation is invisible to a resting measurement.
+
+        A card translated past the right edge widens the document for as long as
+        it is out there, and the phone rescales the whole page to fit and back.
+        test_no_horizontal_scroll_at_required_widths only ever measures a settled
+        layout, so it cannot see this.
+        """
+        for width in (390, 500, 620, 880):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 900})
+                self.page.wait_for_selector(".grid > [data-identity]")
+                samples = self.page.evaluate(self.grid_script("""
+                  const base=await overviewReport();
+                  const state=__reportClient.getState();
+                  const few=namedBranches(base,['a','b','c']);
+                  const many=namedBranches(base,['a','b','c','d','e','f','g','h']);
+                  applyReport(few,null,state);await settled();
+                  applyReport(many,few,state);
+                  const growing=await sampleEveryFrame(()=>[
+                    document.documentElement.scrollWidth,document.documentElement.clientWidth]);
+                  applyReport(few,many,state);
+                  const shrinking=await sampleEveryFrame(()=>[
+                    document.documentElement.scrollWidth,document.documentElement.clientWidth]);
+                  return [...growing,...shrinking];
+                """))
+                overflowing = [
+                    (millis, scroll, client)
+                    for millis, scroll, client in samples
+                    if scroll > client
+                ]
+                self.assertEqual(overflowing, [], f"document widened at {width}px")
+
+    def test_grid_transition_returns_the_grid_to_normal_layout(self):
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const many=namedBranches(base,['a','b','c','d','e','f']);
+          const few=namedBranches(base,['b','d']);
+          applyReport(many,null,state);await settled();
+          applyReport(few,many,state);
+          const midFlight={
+            gridStyle:document.querySelector('.grid').getAttribute('style')||'',
+            pinned:[...document.querySelectorAll('.grid > [data-identity]')]
+              .filter(node=>node.style.position==='absolute').length,
+          };
+          await settled();
+          const grid=document.querySelector('.grid');
+          return {midFlight,
+            identities:[...grid.querySelectorAll(':scope > [data-identity]')]
+              .map(node=>node.dataset.identity),
+            gridStyle:grid.getAttribute('style')||'',
+            styled:[...grid.querySelectorAll(':scope > [data-identity]')]
+              .filter(node=>node.getAttribute('style')).length};
+        """))
+        # Mid-flight the grid is a fixed-height canvas of pinned cards.
+        self.assertIn("height", result["midFlight"]["gridStyle"])
+        self.assertGreater(result["midFlight"]["pinned"], 0)
+        # Afterwards nothing of that remains, and the departed cards are gone.
+        self.assertEqual(sorted(result["identities"]), ["b", "d"])
+        self.assertEqual(result["gridStyle"], "")
+        self.assertEqual(result["styled"], 0)
+
+    def test_queue_reorder_animates_every_moved_card(self):
+        """Grids whose order carries meaning still reflow, and all of them move.
+
+        Only the overview's branches are packed by column; a sort the user chose
+        must reorder as asked.
+        """
+        result = self.page.evaluate(self.grid_script("""
           const state={...__reportClient.getState(),kind:'queue',sort:'default'};
           const report=await (await fetch('/api/view/queue')).json();
+          parkThePoll();
           applyReport(report,null,state);
+          const identities=()=>[...document.querySelectorAll('.grid > [data-identity]')]
+            .map(node=>node.dataset.identity);
+          const before=identities();
           const reordered=structuredClone(report);
           reordered.data.rows.reverse();
           applyReport(reordered,report,{...state,sort:'priority'});
-          const grid=document.querySelector('.grid');
-          return {
-            moved:[...grid.querySelectorAll(':scope > [data-identity]')]
-              .filter(node=>node.getAnimations().length)
-              .map(node=>node.dataset.identity),
-            leaveClones:document.querySelectorAll('.leave-layer > *').length,
-          };
-        }""")
+          const moved=[...document.querySelectorAll('.grid > [data-identity]')]
+            .filter(node=>node.getAnimations().length).map(node=>node.dataset.identity);
+          await settled();
+          return {moved,before,after:identities()};
+        """))
         self.assertGreater(len(result["moved"]), 1)
-        self.assertEqual(result["leaveClones"], 0)
+        self.assertEqual(result["after"], list(reversed(result["before"])))
 
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
