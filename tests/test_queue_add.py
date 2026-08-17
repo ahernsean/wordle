@@ -8,6 +8,7 @@ import re
 import tempfile
 import types
 import unittest
+from collections import namedtuple
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
@@ -42,13 +43,26 @@ def _make_args(tmp_dir, **overrides):
     return args
 
 
+SummaryCounts = namedtuple(
+    'SummaryCounts', ['new', 'new_cached', 'already_queued',
+                       'already_queued_cached', 'total'])
+
+_SUMMARY_LINE_RE = re.compile(
+    r'branch\(es\) processed across [\d,]+ word\(s\): '
+    r'([\d,]+) new \(([\d,]+) of which already cached\), '
+    r'([\d,]+) already queued \(([\d,]+) of which already cached\)\.\s+'
+    r'Queue total: ([\d,]+)')
+
+
 def _parse_summary_counts(output):
-    """Extract (new, already_queued, already_cached) from cmd_queue_add's
-    closing summary line, as ints (comma separators stripped)."""
-    match = re.search(
-        r'([\d,]+) new, ([\d,]+) already queued, ([\d,]+) already cached',
-        output)
-    return tuple(int(group.replace(',', '')) for group in match.groups())
+    """Extract counts from cmd_queue_add's closing summary line specifically
+    (not any per-word line, which shares the same "N new (...), M already
+    queued (...)" shape but reports one word's counts instead of the run's
+    totals) -- anchored on the "processed across ... Queue total:" text that
+    only the closing line contains."""
+    match = _SUMMARY_LINE_RE.search(output)
+    return SummaryCounts(*(int(group.replace(',', ''))
+                           for group in match.groups()))
 
 
 class TestQueueAddMaxBranchSize(unittest.TestCase):
@@ -159,20 +173,21 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         first_run_output = StringIO()
         with redirect_stdout(first_run_output):
             erd_search.cmd_queue_add(args)
-        first_new, _first_already_queued, _first_cached = _parse_summary_counts(
-            first_run_output.getvalue())
-        self.assertGreater(first_new, 0)
+        first_summary = _parse_summary_counts(first_run_output.getvalue())
+        self.assertGreater(first_summary.new, 0)
 
         second_run_output = StringIO()
         with redirect_stdout(second_run_output):
             erd_search.cmd_queue_add(args)
 
-        second_new, second_already_queued, _second_cached = _parse_summary_counts(
-            second_run_output.getvalue())
-        self.assertEqual(second_new, 0)
-        self.assertEqual(second_already_queued, first_new)
+        second_summary = _parse_summary_counts(second_run_output.getvalue())
+        self.assertEqual(second_summary.new, 0)
+        self.assertEqual(second_summary.already_queued, first_summary.new)
 
-    def test_already_cached_branch_is_reported_separately_from_new(self):
+    def test_already_cached_branch_is_reported_as_new_and_cached(self):
+        # Pre-cached but never queued: falls in the "new" bucket, with the
+        # cached count as a sub-count of it -- new/already_queued stay a
+        # true partition of the branch total (issue found in PR review).
         branch_key = self._all_gray_branch_key()
         args = _make_args(self._tmp.name)
 
@@ -187,9 +202,10 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         with redirect_stdout(output):
             erd_search.cmd_queue_add(args)
 
-        _new, _already_queued, already_cached = _parse_summary_counts(
-            output.getvalue())
-        self.assertEqual(already_cached, 1)
+        summary = _parse_summary_counts(output.getvalue())
+        self.assertEqual(summary.new_cached, 1)
+        self.assertEqual(summary.already_queued_cached, 0)
+        self.assertEqual(summary.new + summary.already_queued, summary.total)
 
 
 if __name__ == '__main__':

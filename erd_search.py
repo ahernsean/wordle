@@ -28,7 +28,8 @@ queue add       Add branches for one or more words to the work queue.
                 --priority-words marks a subset of the file's words as
                 higher priority.  --delete-erd-cache forces a recompute of
                 branches that are already cached.  Reports how many branches
-                were newly queued, already queued, and already cached.
+                are new versus already queued, and how many of each are
+                already cached.
 
 queue clear     Wipe all queue state (pending branches, active state, candidate
                 claims, heartbeats).  Does not touch the ERD cache.
@@ -163,8 +164,9 @@ def cmd_queue_add(args):
 
     Already-queued branches are never duplicated; their priority is upgraded
     if the new request is higher.  For each word, reports how many of its
-    branches are newly queued, were already queued, and are already cached
-    (so a worker will resolve them instantly without doing any search).
+    branches are new versus already queued (a true partition of the branch
+    total), and how many of each are already resolved in the ERD cache (so a
+    worker will resolve them instantly without doing any search).
     --delete-erd-cache deletes each queued branch's existing ERD cache entry
     first, so it gets recomputed instead of being claimed and immediately
     marked done as already-cached.
@@ -207,8 +209,9 @@ def cmd_queue_add(args):
     branch_budget = GAME_GUESSES - 1
 
     n_new = 0
+    n_new_cached = 0
     n_already_queued = 0
-    n_already_cached = 0
+    n_already_queued_cached = 0
     try:
         for word in words_to_process:
             priority = (args.priority if (not priority_words
@@ -254,23 +257,34 @@ def cmd_queue_add(args):
                         score_cache.delete(branch_key, ERD_ALL)
                 queue.add_pending_many(rows)
 
+                # already_cached_keys is a cross-cutting subset: a branch
+                # can be new-to-the-queue *and* already resolved in the
+                # cache from earlier work.  new/already_queued stay a true
+                # partition of the branch total; already-cached is reported
+                # as a sub-count of whichever bucket each branch falls in.
                 word_already_queued = len(already_queued_keys)
-                word_already_cached = len(already_cached_keys)
                 word_new = len(rows) - word_already_queued
+                word_new_cached = len(already_cached_keys - already_queued_keys)
+                word_already_queued_cached = len(
+                    already_cached_keys & already_queued_keys)
                 n_new += word_new
+                n_new_cached += word_new_cached
                 n_already_queued += word_already_queued
-                n_already_cached += word_already_cached
+                n_already_queued_cached += word_already_queued_cached
                 print(f'{word.upper()}: {len(rows):,} branch(es) — '
-                      f'{word_new:,} new, {word_already_queued:,} already '
-                      f'queued, {word_already_cached:,} already cached '
-                      f'(resolved instantly, no search needed).')
+                      f'{word_new:,} new ({word_new_cached:,} of which '
+                      f'already cached), {word_already_queued:,} already '
+                      f'queued ({word_already_queued_cached:,} of which '
+                      f'already cached).')
 
         total = queue.total_branches()
         n_added = n_new + n_already_queued
         print(f'\n{n_added:,} branch(es) processed across '
-              f'{len(words_to_process):,} word(s): {n_new:,} new, '
-              f'{n_already_queued:,} already queued, {n_already_cached:,} '
-              f'already cached.  Queue total: {total:,}.')
+              f'{len(words_to_process):,} word(s): {n_new:,} new '
+              f'({n_new_cached:,} of which already cached), '
+              f'{n_already_queued:,} already queued '
+              f'({n_already_queued_cached:,} of which already cached).  '
+              f'Queue total: {total:,}.')
 
     except KeyboardInterrupt:
         print('\nInterrupted.')
