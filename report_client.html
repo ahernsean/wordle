@@ -534,13 +534,25 @@
           if(columns[index]&&columns[index][row]!==undefined)result.push(columns[index][row]);
       return result;
     }
+    // Grids are matched across a refresh by this key, never by their position
+    // among the report's grids.  A word report emits one grid per response group
+    // and a branch report's grids are each conditional, so the same position can
+    // hold a different grid from one refresh to the next; pairing by position
+    // would then compare a grid against a stranger, and every card in it would
+    // read as having both left and arrived.  The key is the name the grid's rows
+    // are already ordered or packed under.
+    function gridElement(key,variant){
+      const grid=element("div","grid"+(variant?" "+variant:""));
+      grid.dataset.gridKey=key;
+      return grid;
+    }
     // The packing needs to know how many columns the grid actually has, which
     // only the laid-out page can say.  Each render records it for the next one;
     // a first render, or one straight after a viewport change, packs on the
     // previous count and corrects itself on the following refresh.
     function recordGridColumnCounts(root,state){
-      for(const grid of root.querySelectorAll("[data-pack-order]"))
-        gridColumnCounts.set(contextKey(state)+"|"+grid.dataset.packOrder,
+      for(const grid of root.querySelectorAll(".grid[data-grid-key]"))
+        gridColumnCounts.set(contextKey(state)+"|"+grid.dataset.gridKey,
           getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length);
     }
     function previousBy(report,collection,identity){return new Map((((report||{}).data||{})[collection]||[]).map(row=>[String(row[identity]),row]));}
@@ -838,14 +850,13 @@
       fragment.append(element("h2","","Branches · status "+(state.branch_status.length?state.branch_status.join(", "):"all")));
       const liveWorkersByBranch=new Map();for(const worker of report.data.workers||[]){if(!worker.is_live||worker.branch_key_hex===null||worker.branch_key_hex===undefined)continue;const key=String(worker.branch_key_hex);if(!liveWorkersByBranch.has(key))liveWorkersByBranch.set(key,[]);liveWorkersByBranch.get(key).push(worker);}
       const previousWorkersById=previousBy(previous,"workers","worker_id");
-      const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");
-      branches.dataset.packOrder="branches";
+      const branches=gridElement("branches"),previousRows=previousBy(previous,"branches","branch_key_hex");
       for(const row of packedRows(report.data.branches||[],"branch_key_hex","branches",state)){
         const key=String(row.branch_key_hex);
         branches.append(cardForBranch(row,previousRows.get(key),liveWorkersByBranch.get(key)||[],previousWorkersById));
       }
       fragment.append(branches,element("h2","","Workers"));
-      const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at));fragment.append(workers);return fragment;
+      const workers=gridElement("workers","workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at));fragment.append(workers);return fragment;
     }
     const formatDuration=seconds=>{
       if(seconds===null||seconds===undefined||seconds<0)return "—";
@@ -1043,14 +1054,14 @@
           const percentage=responseSummary?.answer_count?Math.round(100*group.rollup.answer_count/responseSummary.answer_count):0;
           const summaryEl=element("summary","clickable");
           summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(group.rollup.branch_count)+(group.rollup.branch_count===1?" branch":" branches")+" · "+numText(group.rollup.answer_count)+(group.rollup.answer_count===1?" answer":" answers")+" ("+percentage+"%) · trivial "+numText(group.rollup.trivial_count)+" · exact "+numText(group.rollup.exact_count)+" · loss "+numText(group.rollup.loss_count)+" · missing "+numText(group.rollup.missing_count)));
-          const grid=element("div","grid");
+          const grid=gridElement("response-groups/"+group.label);
           for(const row of ordered(group.rows,"branch_key_hex","response-groups/"+group.label,state))grid.append(responseGroupCard(row));
           details.append(summaryEl,grid);
           container.append(details);
         }
         fragment.append(container);
       }else{
-        const grid=element("div","grid");
+        const grid=gridElement("response-groups");
         for(const row of ordered(shownRows,"branch_key_hex","response-groups",state))grid.append(responseGroupCard(row));
         fragment.append(grid);
       }
@@ -1074,10 +1085,10 @@
         ownershipRow("Claim holders off-branch",ownership.claim_holders_off_branch||[],{showBranch:true}),
       );
       fragment.append(ownershipSection);
-      if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
+      if(data.workers?.length){const workers=gridElement("workers","workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
       if(data.recent_finalizations?.length||data.finalization_total_count){
         const outcomeGloss={exact:"Exact: solved within budget",cut:"Cut: No candidate under ceiling",loss:"Loss: unsolvable in the game",unknown:"Finalized"};
-        const finalizations=element("div","grid");
+        const finalizations=gridElement("finalizations");
         const activeEpoch=report.sources?.queue?.epoch;
         for(const row of data.recent_finalizations){
           const historical=row.epoch!==null&&activeEpoch!==null&&row.epoch!==activeEpoch;
@@ -1135,7 +1146,7 @@
         fragment.append(wrap);
       }
       if(data.cut_reuse_misses?.length){
-        const misses=element("div","grid");
+        const misses=gridElement("cut-reuse-misses");
         for(const row of data.cut_reuse_misses){
           const card=element("article","card outcome-cut");
           const title=element("div","card-title");
@@ -1172,7 +1183,7 @@
       }
       return fragment;
     }
-    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=element("div","grid");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
+    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=gridElement("branch-reference-matches");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
     /* Sibling nodes in payload order, gathered under the word that was played.
        A node with no recorded guess has no word to gather under and stands
        alone under a null key. */
@@ -1224,7 +1235,7 @@
       const buildPage=(siblings,paging,parentSpine)=>{const holder=element("div","tree-page"),tree=buildGroupedList(siblings,parentSpine||"","tree");holder.append(tree);const key=pageKey(parentSpine),history=treePageHistory.get(key)||[],returnedGroupCount=paging.returned_group_count??wordGroups(siblings).length,totalGroupCount=paging.total_group_count??returnedGroupCount;if(history.length||paging.next_cursor)holder.append(buildPager({summary:"Showing "+numText(returnedGroupCount)+" of "+numText(totalGroupCount)+" child groups",previous:history.length?()=>{const prior=history.pop();treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:prior||null},false);else loadPage(parentSpine,prior,holder);}:null,next:paging.next_cursor?()=>{history.push(paging.cursor||null);treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:paging.next_cursor},false);else loadPage(parentSpine,paging.next_cursor,holder);}:null}));return holder;};
       fragment.append(buildPage(data.nodes||[],data.paging||{},data.paging?.parent_spine||""));return fragment;
     }
-    function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=element("div","grid"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
+    function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=gridElement("queue"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
     function workerFactSections(worker,generatedAt){
       const fragment=document.createDocumentFragment();
       const identity=[["worker",workerName(worker)],["PID",worker.pid],["state",worker.state],["last heartbeat",relativeAge(worker.updated_at,generatedAt)]];
@@ -1247,7 +1258,7 @@
     function renderWorkers(report,previous,state){
       const rows=report.data.rows||[];
       if(state.worker_id){const fragment=document.createDocumentFragment();if(!rows.length){fragment.append(element("p","empty","Worker is no longer reporting."));return fragment;}fragment.append(element("h2","","Worker "+workerName(rows[0])),workerFactSections(rows[0],report.generated_at));return fragment;}
-      const grid=element("div","grid workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(rows,"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;
+      const grid=gridElement("worker-collection","workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(rows,"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;
     }
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}
     // A word and its ERD are folded into one "WORD*/2.809" entry rather than
@@ -1374,14 +1385,14 @@
       for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd"),[histogram,legend]=renderResponseCountHistogram(row,maximumResponseGroupCount),responseGroupCount=(row.response_groups||[]).length;entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,element("div","response-visual-label",numText(responseGroupCount)+" answer groups (more groups = better)"),renderAnswerStrip(row),renderResponseGroupBridge(row,maximumResponseGroupCount),histogram,legend,responseGroupFacts(row),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
       fragment.append(grid);return fragment;
     }
-    function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
-    function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=element("div","grid"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,labeledFacts(displayEntries(row,report.generated_at)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
+    function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=gridElement("cache"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
+    function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=gridElement("hotspots"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,labeledFacts(displayEntries(row,report.generated_at)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
     function captureGridCards(root){
-      return [...root.querySelectorAll(".grid")].map(grid=>({
+      return new Map([...root.querySelectorAll(".grid[data-grid-key]")].map(grid=>[grid.dataset.gridKey,{
         rect:grid.getBoundingClientRect(),
         cards:new Map([...grid.querySelectorAll(":scope > [data-identity]")]
           .map(node=>[node.dataset.identity,{node,rect:node.getBoundingClientRect()}])),
-      }));
+      }]));
     }
     const DEPART_MILLIS=400,SETTLE_MILLIS=500,ARRIVE_MILLIS=400,SETTLE_STAGGER_MILLIS=20,SETTLE_STAGGER_LIMIT=8;
     // For the length of a transition the grid stops being a grid.  Its cards are
@@ -1393,10 +1404,9 @@
     // content below the grid moves once, smoothly, and cannot be jerked around.
     // Animating the cards' own heights instead makes the page follow a sum of
     // separately animated boxes, mediated by row sizing and stretch, computed
-    // from measurements of a layout that never appears on screen -- which is
-    // where every jump so far has come from.  Cards out of flow also cannot
-    // widen the document, and an arriving card that paints a frame before its
-    // animation starts is merely early, not a layout event.
+    // from measurements of a layout that never appears on screen.  Cards out of
+    // flow also cannot widen the document, and an arriving card that paints a
+    // frame before its animation starts is merely early, not a layout event.
     //
     // Three beats, with opacity saying whether a card exists and geometry saying
     // where it is, never at the same time:
@@ -1426,13 +1436,22 @@
       return transition;
     }
     function animateGridTransitions(root,before,sameView){
-      if(!sameView||!before.length||matchMedia("(prefers-reduced-motion: reduce)").matches)return;
-      const grids=[...root.querySelectorAll(".grid")];
-      if(grids.length!==before.length)return;
-      grids.forEach((grid,index)=>animateGrid(grid,before[index]));
+      if(!sameView||!before.size||matchMedia("(prefers-reduced-motion: reduce)").matches)return;
+      for(const grid of root.querySelectorAll(".grid[data-grid-key]")){
+        const prior=before.get(grid.dataset.gridKey);
+        // A grid this refresh introduced has nothing to animate from, and one
+        // the last refresh had is simply gone; either way its neighbours are
+        // unaffected.
+        if(prior)animateGrid(grid,prior);
+      }
     }
     function animateGrid(grid,before){
       const gridRect=grid.getBoundingClientRect();
+      // An unrendered grid -- a response group whose details element is
+      // collapsed -- measures 0x0, so there is no geometry to move between and
+      // pinning its cards would leave the section blank if it were opened
+      // mid-transition.
+      if(!gridRect.width||!before.rect.width)return;
       const cards=[...grid.querySelectorAll(":scope > [data-identity]")];
       const present=new Set(cards.map(node=>node.dataset.identity));
       const leaving=[...before.cards].filter(([identity])=>!present.has(identity));

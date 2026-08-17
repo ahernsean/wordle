@@ -41,11 +41,15 @@ GRID_TRANSITION_MILLIS = 1700
 # underneath the measurement.  The result reads as a phantom jump in the numbers.
 GRID_SCRIPT_HELPERS = """
   const parkThePoll=()=>{window.fetch=()=>new Promise(()=>{});};
-  // Fetched once and kept, because parking the poll takes fetch with it.
+  // Parked before the fixture is fetched, not after: a poll issued while the
+  // fixture request is still open would land mid-measurement and re-render the
+  // report underneath it.  The fixture is then fetched through the saved real
+  // fetch, and kept, because parking took the global one with it.
   const overviewReport=async()=>{
     if(!window.__overviewFixture){
-      window.__overviewFixture=await (await fetch('/api/view')).json();
+      const realFetch=window.fetch.bind(window);
       parkThePoll();
+      window.__overviewFixture=await (await realFetch('/api/view')).json();
     }
     return window.__overviewFixture;
   };
@@ -2016,6 +2020,98 @@ class ReportClientBrowserTest(unittest.TestCase):
                 ]
                 self.assertEqual(overflowing, [], f"document widened at {width}px")
 
+    def test_grids_are_paired_by_name_not_by_position(self):
+        """A word report's grids come and go, so position is not identity.
+
+        One response group disappearing while another appears leaves the grid
+        count unchanged.  Pairing by position would then measure a grid against
+        a different grid entirely, and every card in it would be classified as
+        having both left and arrived: live cards fading out as ghosts inside a
+        neighbour while their real cards wipe in as though newly claimed.
+        """
+        result = self.page.evaluate(self.grid_script("""
+          const realFetch=window.fetch.bind(window);
+          parkThePoll();
+          const base=await (await realFetch('/api/view?branch_target=CRANE')).json();
+          const state={...__reportClient.getState(),branch_target:'CRANE',group_by:'status'};
+          const grouped=(labels)=>{
+            const report=structuredClone(base);
+            report.data.response_group_groups=labels.map(label=>({
+              label,
+              rollup:{answer_count:2,branch_count:2},
+              rows:[1,2].map(index=>{
+                const row=structuredClone(base.data.response_groups[0]);
+                row.branch_key_hex=label+index;row.branch_reference=label+index;
+                return row;
+              }),
+            }));
+            return report;
+          };
+          const before=grouped(['alpha','beta']),after=grouped(['beta','gamma']);
+          applyReport(before,null,state);await settled();
+          applyReport(after,before,state);
+          const gridsNow=()=>[...document.querySelectorAll('.grid[data-grid-key]')].map(grid=>({
+            key:grid.dataset.gridKey,
+            cards:[...grid.querySelectorAll(':scope > [data-identity]')].map(node=>node.dataset.identity),
+          }));
+          const midFlight=gridsNow();
+          await settled();
+          return {midFlight,settledGrids:gridsNow()};
+        """))
+        # Mid-flight, no card may appear under two grids: that only happens when
+        # a grid is measured against one it is not.
+        seen = [
+            identity
+            for grid in result["midFlight"]
+            for identity in grid["cards"]
+        ]
+        self.assertEqual(sorted(seen), sorted(set(seen)), f"card in two grids: {result['midFlight']}")
+        # beta survives untouched; alpha's cards are gone and gamma's are its own.
+        settled_grids = {grid["key"]: sorted(grid["cards"]) for grid in result["settledGrids"]}
+        self.assertEqual(
+            settled_grids,
+            {
+                "response-groups/beta": ["beta1", "beta2"],
+                "response-groups/gamma": ["gamma1", "gamma2"],
+            },
+        )
+
+    def test_packing_rebuild_preserves_reading_order_across_a_resize(self):
+        """The column count is always one refresh behind a viewport change.
+
+        That is only safe because rebuilding the columns for a new count is
+        order-preserving, so the cards a reader is looking at stay in the order
+        they were in.  Nothing else pins that identity.
+        """
+        refresh = self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const eight=namedBranches(base,['a','b','c','d','e','f','g','h']);
+          applyReport(eight,window.__applied||null,state);
+          window.__applied=eight;
+          await settled();
+          const branches=document.querySelector('.grid[data-grid-key="branches"]');
+          return {
+            order:[...branches.querySelectorAll(':scope > [data-identity]')]
+              .map(node=>node.dataset.identity),
+            columns:getComputedStyle(branches)
+              .gridTemplateColumns.split(' ').filter(Boolean).length,
+          };
+        """)
+        self.two_column_overview()
+        self.page.evaluate(refresh)
+        narrow = self.page.evaluate(refresh)
+        self.page.set_viewport_size({"width": 1000, "height": 1400})
+        # The first refresh after a resize still packs on the old column count;
+        # the second is the one that rebuilds the columns for the new one.
+        first_after = self.page.evaluate(refresh)
+        rebuilt = self.page.evaluate(refresh)
+        self.assertEqual(narrow["columns"], 2)
+        self.assertEqual(narrow["order"], list("abcdefgh"))
+        self.assertGreater(first_after["columns"], 2)
+        self.assertEqual(first_after["order"], list("abcdefgh"))
+        self.assertEqual(rebuilt["order"], list("abcdefgh"))
+
     def test_grid_transition_returns_the_grid_to_normal_layout(self):
         result = self.page.evaluate(self.grid_script("""
           const base=await overviewReport();
@@ -2054,8 +2150,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         """
         result = self.page.evaluate(self.grid_script("""
           const state={...__reportClient.getState(),kind:'queue',sort:'default'};
-          const report=await (await fetch('/api/view/queue')).json();
+          const realFetch=window.fetch.bind(window);
           parkThePoll();
+          const report=await (await realFetch('/api/view/queue')).json();
           applyReport(report,null,state);
           const identities=()=>[...document.querySelectorAll('.grid > [data-identity]')]
             .map(node=>node.dataset.identity);
