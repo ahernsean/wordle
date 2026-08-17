@@ -1,0 +1,15 @@
+{
+  "schema_version": 3, "report_kind": "sources", "generated_at": 1000,
+  "branch_target": {"kind": "root", "steps": [], "trailing_word": null, "branch_reference": null, "input_text": ""},
+  "filters": {}, "tree": false,
+  "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
+  "data": {"summary": [
+    {"source_work_id": 1, "source_word": "salet", "requested_priority": 5, "state": "queued", "root_count": 1, "branch_count": 2},
+    {"source_work_id": 2, "source_word": "raise", "requested_priority": 3, "state": "queued", "root_count": 1, "branch_count": 2}
+  ], "matched_rows": 4, "rows": [
+    {"source_work_id": 1, "source_word": "salet", "requested_priority": 5, "source_state": "queued", "branch_reference": "222222222222", "branch_key_hex": "02", "root_pattern": "-y---", "parent_branch_reference": null, "branch_status": "active", "branch_phase": "evaluating", "branch_effective_priority": 5, "worker_count": 2, "owner_count": 2, "is_shared": true, "resolved_at": null},
+    {"source_work_id": 1, "source_word": "salet", "requested_priority": 5, "source_state": "queued", "branch_reference": "333333333333", "branch_key_hex": "03", "root_pattern": "--g--", "parent_branch_reference": "222222222222", "branch_status": "active", "branch_phase": "finalizing", "branch_effective_priority": 5, "worker_count": 1, "owner_count": 1, "is_shared": false, "resolved_at": null},
+    {"source_work_id": 2, "source_word": "raise", "requested_priority": 3, "source_state": "queued", "branch_reference": "222222222222", "branch_key_hex": "02", "root_pattern": "-----", "parent_branch_reference": "111111111111", "branch_status": "active", "branch_phase": "evaluating", "branch_effective_priority": 5, "worker_count": 2, "owner_count": 2, "is_shared": true, "resolved_at": null},
+    {"source_work_id": 2, "source_word": "raise", "requested_priority": 3, "source_state": "queued", "branch_reference": "444444444444", "branch_key_hex": "04", "root_pattern": "-----", "parent_branch_reference": null, "branch_status": "pending", "branch_phase": "queued", "branch_effective_priority": 3, "worker_count": 0, "owner_count": 1, "is_shared": false, "resolved_at": null}
+  ]}
+}

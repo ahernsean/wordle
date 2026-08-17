@@ -245,7 +245,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(self.page.locator("[data-kind]").count(), 6)
+        self.assertEqual(self.page.locator("[data-kind]").count(), 7)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
@@ -1816,6 +1816,15 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.assertTrue(self.page.locator("#filters-group").is_hidden())
         self.assertTrue(self.page.locator("#sort-field").is_hidden())
+        # A source-work membership has no branch filters and no ordering of its
+        # own: the report reads only the source word and the row limit.
+        self.page.locator("[data-kind=sources]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'sources'"
+        )
+        self.assertTrue(self.page.locator("#filters-group").is_hidden())
+        self.assertTrue(self.page.locator("#sort-field").is_hidden())
+        self.assertFalse(self.page.locator("#limit-field").is_hidden())
 
     def test_word_report_sort_only_offers_options_the_server_accepts(self):
         # A word report's sort is restricted server-side to size/workers/
@@ -2696,7 +2705,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # reached phone widths overflowing because it was never measured here.
         for path in (
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
-            "?kind=leaderboard", "?kind=queue&tree=1", "?branch_target=RAISE+.....",
+            "?kind=leaderboard", "?kind=sources", "?kind=queue&tree=1",
+            "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
             # The word view carries the root-progress table, which is wider
             # than a phone and must scroll inside its own box.
@@ -2932,14 +2942,102 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("branch key hex", cache_text)
         self.assertNotIn("branch_key_hex", cache_text)
 
+    def open_sources(self):
+        self.page.locator("[data-kind=sources]").click()
+        self.page.wait_for_selector("text=sources report")
+
+    def test_sources_view_lists_requests_and_one_row_per_owning_request(self):
+        self.open_sources()
+        requests = self.page.locator("[data-grid-key=source-requests] > .card")
+        ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
+        self.assertEqual(requests.count(), 2)
+        self.assertEqual(ownership.count(), 4)
+        request_text = " ".join(requests.first.inner_text().split())
+        self.assertIn("requested priority 5", request_text)
+        self.assertIn("1 root", request_text)
+        self.assertIn("2 branches", request_text)
+        # The shared branch is never reduced to a single owner: each owning
+        # request gets its own row, carrying that request's requested priority
+        # beside the branch's effective one.
+        shared = " ".join(
+            self.page.locator('[data-identity="2:02"]').inner_text().split()
+        )
+        self.assertIn("shared", shared)
+        self.assertIn("requested priority 3", shared)
+        self.assertIn("effective priority 5", shared)
+        self.assertIn("owners 2", shared)
+        self.assertIn("parent @11111111", shared)
+        sole = " ".join(
+            self.page.locator('[data-identity="2:04"]').inner_text().split()
+        )
+        self.assertIn("sole", sole)
+        self.assertNotIn("parent", sole)
+
+    def test_sources_ownership_row_draws_its_lineage_as_a_spine_step(self):
+        self.open_sources()
+        root_step = self.page.locator('[data-identity="1:02"] .word')
+        self.assertEqual(root_step.count(), 1)
+        self.assertEqual(root_step.get_attribute("data-spine"), "SALET -y---")
+
+    def test_sources_request_card_narrows_the_report_to_that_word(self):
+        self.open_sources()
+        self.page.locator("[data-grid-key=source-requests] > .card").first.click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === 'SALET'"
+        )
+        self.assertIn("kind=sources", self.page.url)
+        self.assertIn("branch_target=SALET", self.page.url)
+
+    def test_sources_ownership_card_opens_the_branch_it_names(self):
+        self.open_sources()
+        self.page.locator('[data-identity="2:04"]').click()
+        self.page.wait_for_selector("text=branch report")
+
+    def test_sources_state_drops_filters_and_targets_the_report_rejects(self):
+        # The sources report accepts only a trailing word and a row limit, and
+        # rejects everything else rather than ignoring it, so the client must
+        # not forward a branch spine or a branch filter it happens to be
+        # carrying from the view the operator came from.
+        result = self.page.evaluate("""() => ({
+          explicit: buildAPIURL(parsePageState({search:'?kind=sources'})),
+          word: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=SALET'})),
+          branch: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=RAISE+-----'})),
+          reference: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=%40222222222222'})),
+          filtered: buildAPIURL(parsePageState({search:'?kind=sources&branch_status=active&priority=3&sort=size&tree=1'})),
+          limited: buildAPIURL(parsePageState({search:'?kind=sources&limit=2'}))
+        })""")
+        self.assertEqual(result["explicit"], "/api/view/sources")
+        self.assertEqual(result["word"], "/api/view/sources?branch_target=SALET")
+        self.assertEqual(result["branch"], "/api/view/sources")
+        self.assertEqual(result["reference"], "/api/view/sources")
+        self.assertEqual(result["filtered"], "/api/view/sources")
+        self.assertEqual(result["limited"], "/api/view/sources?limit=2")
+
+    def test_worker_cards_name_the_scheduling_role_and_why(self):
+        preferred = self.page.locator('.card.worker[data-identity="worker-0"]')
+        self.assertIn("preferred", preferred.inner_text())
+        reason = preferred.get_by_title("serving its preferred source work")
+        self.assertEqual(reason.count(), 1)
+        fallback = self.page.locator('.card.worker[data-identity="worker-3"]')
+        self.assertIn("fallback", fallback.inner_text())
+        self.assertIn(
+            "no claimable bundle",
+            fallback.get_by_title(re.compile("fallback")).get_attribute("title"),
+        )
+        # A worker between claims has no role recorded, and none is invented
+        # for it on the card.
+        idle = self.page.locator('.card.worker[data-identity="worker-1"]')
+        self.assertNotIn("unattributed", idle.inner_text())
+        self.assertEqual(idle.get_by_title(re.compile("serving")).count(), 0)
+
     def test_layout_toggle_is_hidden_where_there_is_no_topology(self):
         toggle = self.page.locator("#layout-toggle")
         flat = self.page.locator("#layout-flat")
         tree = self.page.locator("#layout-tree")
         self.assertTrue(toggle.is_visible())
-        # Cache, hotspots, and leaderboard have no branch topology, so the
-        # layout switch is hidden entirely rather than shown-but-inert.
-        for treeless in ("cache", "hotspots", "leaderboard"):
+        # Cache, hotspots, leaderboard, and sources have no branch topology, so
+        # the layout switch is hidden entirely rather than shown-but-inert.
+        for treeless in ("cache", "hotspots", "leaderboard", "sources"):
             self.page.locator(f"[data-kind={treeless}]").click()
             self.page.wait_for_selector(f"text={treeless} report")
             self.assertFalse(toggle.is_visible())

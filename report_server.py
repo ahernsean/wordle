@@ -44,6 +44,7 @@ FIXTURE_FILENAMES = (
     "hotspots.json",
     "leaderboard.json",
     "root_progress.json",
+    "sources.json",
 )
 BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
 INTEGER_PARAMETERS = {
@@ -124,6 +125,7 @@ def parse_report_request(path, query):
         "/api/view/cache": "cache",
         "/api/view/hotspots": "hotspots",
         "/api/view/leaderboard": "leaderboard",
+        "/api/view/sources": "sources",
         "/api/view/root-progress": "root_progress",
     }.get(path)
     if explicit_kind is None:
@@ -234,7 +236,7 @@ def parse_report_request(path, query):
     if hotspot_field is not None and hotspot_field not in HOTSPOT_FIELDS:
         raise InvalidRequest(f"invalid hotspot field {hotspot_field!r}")
     hotspot_field = hotspot_field or ("nodes" if explicit_kind == "hotspots" else None)
-    if tree and explicit_kind in ("cache", "hotspots", "leaderboard"):
+    if tree and explicit_kind in ("cache", "hotspots", "leaderboard", "sources"):
         raise InvalidRequest(f"tree cannot be used with {explicit_kind}")
     worker_id = _single_value(parameters, "worker")
     if worker_id is not None and explicit_kind != "workers":

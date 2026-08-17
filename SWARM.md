@@ -202,7 +202,9 @@ live owner's) priority side by side, plus its promotion lineage (root
 pattern and immediate parent). A trailing word narrows to that word's
 request(s). Each worker's own report row shows whether it is serving its
 preferred (highest-priority eligible) source or fallback work claimed
-because the preferred source had no claimable bundle.
+because the preferred source had no claimable bundle. The browser report
+serves the same view under its Sources tab, and names the same scheduling
+role on every worker card.
 
 Use `--answers` for answer-word arrays on word or branch reports and `--claims`
 for sparse candidate detail on one branch. Collection filters include branch

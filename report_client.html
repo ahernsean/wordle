@@ -252,7 +252,7 @@
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="sources">Sources</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
       <span class="conn-wrap">
         <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
@@ -304,8 +304,8 @@
     // DOM rather than toggled — an absent option can't appear in any picker.
     const SORT_OPTIONS_DEFAULT=[["","default"],["age","age"],["size","size"],["workers","workers"],["priority","priority"],["nodes","nodes"],["slowest","slowest"]];
     const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
-    const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard"]);
-    const treelessKinds=new Set(["cache","hotspots","leaderboard"]);
+    const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","sources"]);
+    const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
     let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
@@ -385,7 +385,10 @@
     const bool=value=>value==="1"||value==="true";
     const intOrNull=value=>{if(value===null||value===""||value===undefined)return null;const parsed=Number.parseInt(value,10);return Number.isFinite(parsed)?parsed:null;};
     const branchValues=(value,allowed)=>value===undefined?undefined:[...(value||[])].filter(item=>allowed.includes(item));
-    const isInferredWordState=(kind,branchTarget)=>kind==="auto"&&branchTarget.split(/\s+/).filter(Boolean).length%2===1&&!branchTarget.startsWith("@");
+    // A branch target naming a word: an odd number of spine tokens ends in a
+    // guess with no response, and a reference never names a word.
+    const isWordTarget=branchTarget=>String(branchTarget||"").trim().split(/\s+/).filter(Boolean).length%2===1&&!String(branchTarget||"").startsWith("@");
+    const isInferredWordState=(kind,branchTarget)=>kind==="auto"&&isWordTarget(branchTarget);
 
     function normalizeState(state){
       const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
@@ -395,6 +398,10 @@
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_phase=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;}
+      // The sources report reads only the source word and the row limit; every
+      // branch filter is meaningless against a membership row, and a target
+      // that is not a word is rejected outright by the report.
+      if(normalized.kind==="sources"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.claims=false;normalized.answers=false;if(!isWordTarget(normalized.branch_target))normalized.branch_target="";}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
@@ -467,8 +474,8 @@
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
       const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(currentState.by);
-      byId("filters-group").hidden=kind==="cache"||historicalHotspot;
-      byId("sort-field").hidden=kind==="cache"||isHotspots;
+      byId("filters-group").hidden=kind==="cache"||kind==="sources"||historicalHotspot;
+      byId("sort-field").hidden=kind==="cache"||kind==="sources"||isHotspots;
       byId("group-by-field").hidden=!wordReport;
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
       byId("limit-label").textContent=currentState.tree?"Items per page":kind==="auto"?"Branches shown":"Rows shown";
@@ -771,6 +778,15 @@
     function navigateWorker(worker){
       setState({...currentState,kind:"workers",worker_id:worker.worker_id,branch_target:"",tree:false,branch_status:[],branch_phase:[],minimum_answer_count:null,maximum_answer_count:null,budget:null,priority:null,sort:"",claims:false,answers:false,finalization_cursor:"",tree_cursor:null});
     }
+    // Why this worker is on the branch it is on: the recorded scheduling role,
+    // carrying the model's reason text as its tooltip.  A worker between claims
+    // has no role recorded and shows none.
+    function schedulingRoleCell(worker){
+      if(!worker.scheduling_role)return null;
+      const cell=element("span","",worker.scheduling_role);
+      cell.title=worker.scheduling_role_reason||worker.scheduling_role;
+      return cell;
+    }
     function workerCard(worker,previous,generatedAt){
       const age=relativeAge(worker.updated_at,generatedAt);
       // The model computes the one worker state (see report_model.worker_state),
@@ -788,6 +804,7 @@
       if(worker.nodes_per_second!==null&&worker.nodes_per_second!==undefined)parts.push(formatInteger(Math.round(worker.nodes_per_second))+" nodes/s");
       parts.push(age);
       if(worker.branch_reference)parts.push("@"+shortReference(worker.branch_reference));
+      const role=schedulingRoleCell(worker);if(role)parts.push(role);
       card.append(statLine(parts));
       card.classList.add("clickable");card.addEventListener("click",()=>navigateWorker(worker));
       return card;
@@ -1260,6 +1277,62 @@
       if(state.worker_id){const fragment=document.createDocumentFragment();if(!rows.length){fragment.append(element("p","empty","Worker is no longer reporting."));return fragment;}fragment.append(element("h2","","Worker "+workerName(rows[0])),workerFactSections(rows[0],report.generated_at));return fragment;}
       const grid=gridElement("worker-collection","workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(rows,"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;
     }
+    // A membership is a (request, branch) pair, so neither half identifies it
+    // on its own: the same branch appears once per owning request.
+    const membershipIdentity=row=>row.source_work_id+":"+row.branch_key_hex;
+    const withMembershipIdentity=rows=>(rows||[]).map(row=>({...row,membership_identity:membershipIdentity(row)}));
+    function sourceRequestCard(row,previous,state){
+      const card=element("article","card clickable "+changeClass(row,previous));
+      card.dataset.identity=String(row.source_work_id);
+      const title=element("div","card-title");
+      title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)),element("span","dim","#"+row.source_work_id));
+      card.append(title,statLine([
+        "requested priority "+valueOrDash(row.requested_priority),
+        numText(row.root_count)+(row.root_count===1?" root":" roots"),
+        numText(row.branch_count)+(row.branch_count===1?" branch":" branches"),
+      ]));
+      card.addEventListener("click",()=>setState({...state,kind:"sources",branch_target:String(row.source_word||"").toUpperCase()}));
+      return card;
+    }
+    function sourceMembershipCard(row,previous){
+      const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previous));
+      card.dataset.identity=row.membership_identity;
+      const title=element("div","card-title");
+      title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),...statusChips(row),element("span","chip",row.is_shared?"shared":"sole"));
+      card.append(title);
+      // The root (word, response) the membership descends from is a spine step,
+      // so it is drawn as one rather than spelled out as a bare pattern.
+      if(row.root_pattern)card.append(renderSpine([{word:row.source_word,pattern:row.root_pattern}],"word-sm"));
+      card.append(labeledFacts([
+        ["source","#"+row.source_work_id+" "+String(row.source_word||"-").toUpperCase()],
+        ["requested priority",row.requested_priority],
+        ["effective priority",row.branch_effective_priority],
+        ["owners",row.owner_count],
+        ["parent",row.parent_branch_reference?"@"+shortReference(row.parent_branch_reference):null],
+        ["workers",row.worker_count],
+      ]));
+      card.addEventListener("click",()=>navigateBranch(row));
+      return card;
+    }
+    function renderSources(report,previous,state){
+      const fragment=document.createDocumentFragment(),data=report.data;
+      const requests=data.summary||[],rows=withMembershipIdentity(data.rows),matchedRows=data.matched_rows??rows.length;
+      const sharedBranchCount=new Set(rows.filter(row=>row.is_shared).map(row=>String(row.branch_key_hex))).size;
+      const metrics=element("div","metrics");
+      metrics.append(metric("requests",requests.length),metric("ownership rows",matchedRows),metric("shared branches",sharedBranchCount));
+      fragment.append(metrics,element("h2","","Source-work requests"));
+      if(!requests.length)fragment.append(element("p","empty","No source-work requests"));
+      const requestGrid=gridElement("source-requests"),previousRequests=previousBy(previous,"summary","source_work_id");
+      for(const row of ordered(requests,"source_work_id","source-requests",state))requestGrid.append(sourceRequestCard(row,previousRequests.get(String(row.source_work_id)),state));
+      fragment.append(requestGrid,element("h2","","Branch ownership"));
+      fragment.append(element("p","dim","Shown "+numText(rows.length)+" of "+numText(matchedRows)+" matched · one row per owning request, so a branch two requests own appears once for each · effective priority is the highest live owner's"));
+      if(!rows.length)fragment.append(element("p","empty","No branches owned"));
+      const ownership=gridElement("source-memberships");
+      const previousMemberships=new Map(withMembershipIdentity((((previous||{}).data)||{}).rows).map(row=>[row.membership_identity,row]));
+      for(const row of ordered(rows,"membership_identity","source-memberships",state))ownership.append(sourceMembershipCard(row,previousMemberships.get(row.membership_identity)));
+      fragment.append(ownership);
+      return fragment;
+    }
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}
     // A word and its ERD are folded into one "WORD*/2.809" entry rather than
     // two separately labeled facts; best_erd is dropped once best_guess has
@@ -1520,7 +1593,7 @@
       // measured at rest rather than part-way through somebody else's animation.
       endGridTransitions();
       const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;document.querySelector("details.filters").hidden=report.report_kind==="branch_reference_matches";if(report.report_kind!=="branch_reference_matches")content.append(reportHeader(report,state));
-      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else throw new Error("Unknown report kind");
+      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else if(report.report_kind==="sources")content.append(renderSources(report,previousReport,state));else throw new Error("Unknown report kind");
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;
