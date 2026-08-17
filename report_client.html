@@ -232,7 +232,6 @@
     .clickable { cursor:pointer; }
     .clickable:hover { border-color:var(--green); }
     .badge { background:var(--red); color:white; border-radius:4px; padding:.1rem .35rem; }
-    .leave-layer { position:fixed; inset:0; pointer-events:none; z-index:50; }
     .flash-added { animation:added 1.5s; } .flash-improved { animation:improved 1.5s; } .flash-changed { animation:changed 1.5s; }
     @keyframes added { from { box-shadow:0 0 0 3px var(--green); } }
     @keyframes improved { from { border-color:var(--green); background:#e8f4e7; } }
@@ -308,7 +307,7 @@
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
-    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
+    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
     let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
@@ -482,6 +481,79 @@
       const previous=stickyOrders.get(key)||[], present=new Set(incoming), result=previous.filter(identity=>present.has(identity));
       for(const identity of incoming)if(!result.includes(identity))result.push(identity);stickyOrders.set(key,result);
       const indexed=new Map(rows.map(row=>[String(row[identityName]),row]));return result.map(identity=>indexed.get(identity));
+    }
+    // Overview branches carry no meaningful order, so their grid is packed by
+    // column rather than flowed like words in a paragraph.  A card holds its
+    // column, and a departure is absorbed by the cards below it in that column
+    // sliding straight up; only when a column would otherwise leave the grid
+    // taller than it needs to be does a card cross columns, moving diagonally
+    // into the shorter one.  Row count is always the minimum the cards fit in.
+    function packedRows(rows,identityName,orderName,state){
+      const key=contextKey(state)+"|"+orderName;
+      const columnCount=Math.max(1,gridColumnCounts.get(key)||1);
+      const present=new Map(rows.map(row=>[String(row[identityName]),row]));
+      const stored=packedOrders.get(key);
+      let columns;
+      if(stored&&stored.columnCount===columnCount)columns=stored.columns.map(column=>column.filter(identity=>present.has(identity)));
+      else{
+        // No history, or the viewport changed how many columns fit: rebuild the
+        // columns from the arrangement currently on screen, which is the order
+        // the cards are read in.
+        columns=Array.from({length:columnCount},()=>[]);
+        const showing=stored?rowMajor(stored.columns,stored.columnCount):[];
+        showing.filter(identity=>present.has(identity)).forEach((identity,index)=>columns[index%columnCount].push(identity));
+      }
+      const placed=new Set(columns.flat());
+      const arrivals=rows.map(row=>String(row[identityName])).filter(identity=>!placed.has(identity));
+      const total=placed.size+arrivals.length;
+      // Column sizes that pack every card into the fewest rows, longest column
+      // first so the only empty cells fall at the end of the last row.
+      const target=index=>Math.floor(total/columnCount)+(index<total%columnCount?1:0);
+      const room=index=>target(index)-columns[index].length;
+      const surplus=[];
+      columns.forEach((column,index)=>{while(column.length>target(index))surplus.push({identity:column.pop(),from:index});});
+      for(const card of surplus){
+        let best=-1;
+        for(let index=0;index<columnCount;index++)if(room(index)>0&&(best<0||Math.abs(index-card.from)<Math.abs(best-card.from)))best=index;
+        columns[best].push(card.identity);
+      }
+      // Arrivals go to the shortest column that still has room, which fills a
+      // batch of them left to right, in reading order.
+      for(const identity of arrivals){
+        let best=-1;
+        for(let index=0;index<columnCount;index++)if(room(index)>0&&(best<0||columns[index].length<columns[best].length))best=index;
+        columns[best].push(identity);
+      }
+      packedOrders.set(key,{columnCount,columns});
+      return rowMajor(columns,columnCount).map(identity=>present.get(identity));
+    }
+    function rowMajor(columns,columnCount){
+      const result=[],rowCount=Math.max(0,...columns.map(column=>column.length));
+      for(let row=0;row<rowCount;row++)
+        for(let index=0;index<columnCount;index++)
+          if(columns[index]&&columns[index][row]!==undefined)result.push(columns[index][row]);
+      return result;
+    }
+    // Grids are matched across a refresh by this key, never by their position
+    // among the report's grids.  A word report emits one grid per response group
+    // and a branch report's grids are each conditional, so the same position can
+    // hold a different grid from one refresh to the next; pairing by position
+    // would then compare a grid against a stranger, and every card in it would
+    // read as having both left and arrived.  The key is the name the grid's rows
+    // are already ordered or packed under.
+    function gridElement(key,variant){
+      const grid=element("div","grid"+(variant?" "+variant:""));
+      grid.dataset.gridKey=key;
+      return grid;
+    }
+    // The packing needs to know how many columns the grid actually has, which
+    // only the laid-out page can say.  Each render records it for the next one;
+    // a first render, or one straight after a viewport change, packs on the
+    // previous count and corrects itself on the following refresh.
+    function recordGridColumnCounts(root,state){
+      for(const grid of root.querySelectorAll(".grid[data-grid-key]"))
+        gridColumnCounts.set(contextKey(state)+"|"+grid.dataset.gridKey,
+          getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length);
     }
     function previousBy(report,collection,identity){return new Map((((report||{}).data||{})[collection]||[]).map(row=>[String(row[identity]),row]));}
     function semanticProjection(value){
@@ -778,8 +850,13 @@
       fragment.append(element("h2","","Branches · status "+(state.branch_status.length?state.branch_status.join(", "):"all")));
       const liveWorkersByBranch=new Map();for(const worker of report.data.workers||[]){if(!worker.is_live||worker.branch_key_hex===null||worker.branch_key_hex===undefined)continue;const key=String(worker.branch_key_hex);if(!liveWorkersByBranch.has(key))liveWorkersByBranch.set(key,[]);liveWorkersByBranch.get(key).push(worker);}
       const previousWorkersById=previousBy(previous,"workers","worker_id");
-      const branches=element("div","grid"),previousRows=previousBy(previous,"branches","branch_key_hex");for(const row of ordered(report.data.branches||[],"branch_key_hex","branches",state))branches.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex)),liveWorkersByBranch.get(String(row.branch_key_hex))||[],previousWorkersById));fragment.append(branches,element("h2","","Workers"));
-      const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at));fragment.append(workers);return fragment;
+      const branches=gridElement("branches"),previousRows=previousBy(previous,"branches","branch_key_hex");
+      for(const row of packedRows(report.data.branches||[],"branch_key_hex","branches",state)){
+        const key=String(row.branch_key_hex);
+        branches.append(cardForBranch(row,previousRows.get(key),liveWorkersByBranch.get(key)||[],previousWorkersById));
+      }
+      fragment.append(branches,element("h2","","Workers"));
+      const workers=gridElement("workers","workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const row of ordered(report.data.workers||[],"worker_id","workers",state))workers.append(workerCard(row,previousWorkers.get(String(row.worker_id)),report.generated_at));fragment.append(workers);return fragment;
     }
     const formatDuration=seconds=>{
       if(seconds===null||seconds===undefined||seconds<0)return "—";
@@ -977,14 +1054,14 @@
           const percentage=responseSummary?.answer_count?Math.round(100*group.rollup.answer_count/responseSummary.answer_count):0;
           const summaryEl=element("summary","clickable");
           summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(group.rollup.branch_count)+(group.rollup.branch_count===1?" branch":" branches")+" · "+numText(group.rollup.answer_count)+(group.rollup.answer_count===1?" answer":" answers")+" ("+percentage+"%) · trivial "+numText(group.rollup.trivial_count)+" · exact "+numText(group.rollup.exact_count)+" · loss "+numText(group.rollup.loss_count)+" · missing "+numText(group.rollup.missing_count)));
-          const grid=element("div","grid");
+          const grid=gridElement("response-groups/"+group.label);
           for(const row of ordered(group.rows,"branch_key_hex","response-groups/"+group.label,state))grid.append(responseGroupCard(row));
           details.append(summaryEl,grid);
           container.append(details);
         }
         fragment.append(container);
       }else{
-        const grid=element("div","grid");
+        const grid=gridElement("response-groups");
         for(const row of ordered(shownRows,"branch_key_hex","response-groups",state))grid.append(responseGroupCard(row));
         fragment.append(grid);
       }
@@ -1008,10 +1085,10 @@
         ownershipRow("Claim holders off-branch",ownership.claim_holders_off_branch||[],{showBranch:true}),
       );
       fragment.append(ownershipSection);
-      if(data.workers?.length){const workers=element("div","grid workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
+      if(data.workers?.length){const workers=gridElement("workers","workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
       if(data.recent_finalizations?.length||data.finalization_total_count){
         const outcomeGloss={exact:"Exact: solved within budget",cut:"Cut: No candidate under ceiling",loss:"Loss: unsolvable in the game",unknown:"Finalized"};
-        const finalizations=element("div","grid");
+        const finalizations=gridElement("finalizations");
         const activeEpoch=report.sources?.queue?.epoch;
         for(const row of data.recent_finalizations){
           const historical=row.epoch!==null&&activeEpoch!==null&&row.epoch!==activeEpoch;
@@ -1069,7 +1146,7 @@
         fragment.append(wrap);
       }
       if(data.cut_reuse_misses?.length){
-        const misses=element("div","grid");
+        const misses=gridElement("cut-reuse-misses");
         for(const row of data.cut_reuse_misses){
           const card=element("article","card outcome-cut");
           const title=element("div","card-title");
@@ -1106,7 +1183,7 @@
       }
       return fragment;
     }
-    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=element("div","grid");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
+    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=gridElement("branch-reference-matches");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
     /* Sibling nodes in payload order, gathered under the word that was played.
        A node with no recorded guess has no word to gather under and stands
        alone under a null key. */
@@ -1158,7 +1235,7 @@
       const buildPage=(siblings,paging,parentSpine)=>{const holder=element("div","tree-page"),tree=buildGroupedList(siblings,parentSpine||"","tree");holder.append(tree);const key=pageKey(parentSpine),history=treePageHistory.get(key)||[],returnedGroupCount=paging.returned_group_count??wordGroups(siblings).length,totalGroupCount=paging.total_group_count??returnedGroupCount;if(history.length||paging.next_cursor)holder.append(buildPager({summary:"Showing "+numText(returnedGroupCount)+" of "+numText(totalGroupCount)+" child groups",previous:history.length?()=>{const prior=history.pop();treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:prior||null},false);else loadPage(parentSpine,prior,holder);}:null,next:paging.next_cursor?()=>{history.push(paging.cursor||null);treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:paging.next_cursor},false);else loadPage(parentSpine,paging.next_cursor,holder);}:null}));return holder;};
       fragment.append(buildPage(data.nodes||[],data.paging||{},data.paging?.parent_spine||""));return fragment;
     }
-    function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=element("div","grid"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
+    function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_phase||{}))summary.append(metric("phase "+key,value));fragment.append(summary);const grid=gridElement("queue"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
     function workerFactSections(worker,generatedAt){
       const fragment=document.createDocumentFragment();
       const identity=[["worker",workerName(worker)],["PID",worker.pid],["state",worker.state],["last heartbeat",relativeAge(worker.updated_at,generatedAt)]];
@@ -1181,7 +1258,7 @@
     function renderWorkers(report,previous,state){
       const rows=report.data.rows||[];
       if(state.worker_id){const fragment=document.createDocumentFragment();if(!rows.length){fragment.append(element("p","empty","Worker is no longer reporting."));return fragment;}fragment.append(element("h2","","Worker "+workerName(rows[0])),workerFactSections(rows[0],report.generated_at));return fragment;}
-      const grid=element("div","grid workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(rows,"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;
+      const grid=gridElement("worker-collection","workers"),previousRows=previousBy(previous,"rows","worker_id");for(const row of ordered(rows,"worker_id","worker-collection",state))grid.append(workerCard(row,previousRows.get(String(row.worker_id)),report.generated_at));return grid;
     }
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}
     // A word and its ERD are folded into one "WORD*/2.809" entry rather than
@@ -1308,62 +1385,125 @@
       for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd"),[histogram,legend]=renderResponseCountHistogram(row,maximumResponseGroupCount),responseGroupCount=(row.response_groups||[]).length;entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,element("div","response-visual-label",numText(responseGroupCount)+" answer groups (more groups = better)"),renderAnswerStrip(row),renderResponseGroupBridge(row,maximumResponseGroupCount),histogram,legend,responseGroupFacts(row),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
       fragment.append(grid);return fragment;
     }
-    function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=element("div","grid"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
-    function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=element("div","grid"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,labeledFacts(displayEntries(row,report.generated_at)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
+    function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=gridElement("cache"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
+    function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=gridElement("hotspots"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,labeledFacts(displayEntries(row,report.generated_at)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
     function captureGridCards(root){
-      const map=new Map();
-      for(const node of root.querySelectorAll(".grid > [data-identity]"))map.set(node.dataset.identity,{rect:node.getBoundingClientRect(),node});
-      return map;
+      return new Map([...root.querySelectorAll(".grid[data-grid-key]")].map(grid=>[grid.dataset.gridKey,{
+        rect:grid.getBoundingClientRect(),
+        cards:new Map([...grid.querySelectorAll(":scope > [data-identity]")]
+          .map(node=>[node.dataset.identity,{node,rect:node.getBoundingClientRect()}])),
+      }]));
+    }
+    const DEPART_MILLIS=400,SETTLE_MILLIS=500,ARRIVE_MILLIS=400,SETTLE_STAGGER_MILLIS=20,SETTLE_STAGGER_LIMIT=8;
+    // For the length of a transition the grid stops being a grid.  Its cards are
+    // pinned to their final boxes with absolute positions and moved by transform
+    // alone, and the grid carries one explicit height animating from what it was
+    // to what it will be.
+    //
+    // That single height is the only thing the rest of the page can see, so the
+    // content below the grid moves once, smoothly, and cannot be jerked around.
+    // Animating the cards' own heights instead makes the page follow a sum of
+    // separately animated boxes, mediated by row sizing and stretch, computed
+    // from measurements of a layout that never appears on screen.  Cards out of
+    // flow also cannot widen the document, and an arriving card that paints a
+    // frame before its animation starts is merely early, not a layout event.
+    //
+    // Three beats, with opacity saying whether a card exists and geometry saying
+    // where it is, never at the same time:
+    //   depart  the leaving card fades out where it stood
+    //   settle  the grid resizes and every surviving card slides to its new
+    //           position, all at unchanged opacity
+    //   arrive  the new card wipes into a space that has stopped moving
+    let gridTransitions=[];
+    function endGridTransitions(){
+      const running=gridTransitions;gridTransitions=[];
+      for(const transition of running)transition.finish();
+    }
+    function beginGridTransition(){
+      const animations=[],restore=[];
+      let finished=false;
+      const transition={
+        animate(node,keyframes,options){const animation=node.animate(keyframes,options);animations.push(animation);return animation;},
+        onFinish(undo){restore.push(undo);},
+        finish(){
+          if(finished)return;
+          finished=true;
+          for(const animation of animations)animation.cancel();
+          for(const undo of restore)undo();
+        },
+      };
+      gridTransitions.push(transition);
+      return transition;
     }
     function animateGridTransitions(root,before,sameView){
       if(!sameView||!before.size||matchMedia("(prefers-reduced-motion: reduce)").matches)return;
-      const present=new Set();
-      const movedCandidates=[];
-      for(const node of root.querySelectorAll(".grid > [data-identity]")){
-        present.add(node.dataset.identity);
-        const prior=before.get(node.dataset.identity);
-        if(prior){
-          const after=node.getBoundingClientRect(),dx=prior.rect.left-after.left,dy=prior.rect.top-after.top;
-          if(dx||dy)movedCandidates.push({node,prior:prior.rect,after});
-        }else{
-          // A brand-new card grows in from the right while fading up to full
-          // size, rather than just barely swelling in place -- the same
-          // leftward-exit/rightward-entry language as the departure below, so
-          // a card being replaced by an unrelated one reads as a clear
-          // handoff even though the two never share a slot.
-          node.animate([{opacity:0,transform:"translateX(50px) scale(.7)"},{opacity:1,transform:"none"}],{duration:380,easing:"ease-out",fill:"forwards"});
-        }
+      for(const grid of root.querySelectorAll(".grid[data-grid-key]")){
+        const prior=before.get(grid.dataset.gridKey);
+        // A grid this refresh introduced has nothing to animate from, and one
+        // the last refresh had is simply gone; either way its neighbours are
+        // unaffected.
+        if(prior)animateGrid(grid,prior);
       }
-      const leaving=[...before].filter(([identity])=>!present.has(identity));
-      const cardsToMove=new Set(leaving.length?[]:movedCandidates.map(candidate=>candidate.node));
-      for(const [,{rect}] of leaving){
-        let closest=null;
-        for(const candidate of movedCandidates){
-          if(cardsToMove.has(candidate.node))continue;
-          const distance=(candidate.after.left-rect.left)**2+(candidate.after.top-rect.top)**2;
-          if(!closest||distance<closest.distance)closest={candidate,distance};
-        }
-        if(closest)cardsToMove.add(closest.candidate.node);
+    }
+    function animateGrid(grid,before){
+      const gridRect=grid.getBoundingClientRect();
+      // An unrendered grid -- a response group whose details element is
+      // collapsed -- measures 0x0, so there is no geometry to move between and
+      // pinning its cards would leave the section blank if it were opened
+      // mid-transition.
+      if(!gridRect.width||!before.rect.width)return;
+      const cards=[...grid.querySelectorAll(":scope > [data-identity]")];
+      const present=new Set(cards.map(node=>node.dataset.identity));
+      const leaving=[...before.cards].filter(([identity])=>!present.has(identity));
+      const placements=cards.map(node=>{
+        const rect=node.getBoundingClientRect(),was=before.cards.get(node.dataset.identity);
+        const placement={node,left:rect.left-gridRect.left,top:rect.top-gridRect.top,width:rect.width,height:rect.height};
+        if(was){placement.dx=was.rect.left-before.rect.left-placement.left;placement.dy=was.rect.top-before.rect.top-placement.top;}
+        return placement;
+      });
+      const arriving=placements.filter(placement=>placement.dx===undefined);
+      const settling=placements.filter(placement=>placement.dx||placement.dy);
+      const resizing=before.rect.height!==gridRect.height;
+      if(!leaving.length&&!arriving.length&&!settling.length&&!resizing)return;
+      const departMillis=leaving.length?DEPART_MILLIS:0;
+      const settleMillis=settling.length||resizing?SETTLE_MILLIS:0;
+      const staggerMillis=settling.length?Math.min(settling.length-1,SETTLE_STAGGER_LIMIT)*SETTLE_STAGGER_MILLIS:0;
+      const settleEnd=departMillis+settleMillis,arriveStart=settleEnd+staggerMillis,total=arriveStart+ARRIVE_MILLIS;
+      const transition=beginGridTransition();
+      const pin=(node,left,top,width,height)=>{
+        Object.assign(node.style,{position:"absolute",margin:"0",left:left+"px",top:top+"px",width:width+"px",height:height+"px"});
+        transition.onFinish(()=>Object.assign(node.style,{position:"",margin:"",left:"",top:"",width:"",height:"",overflow:"",pointerEvents:""}));
+      };
+      for(const placement of placements)pin(placement.node,placement.left,placement.top,placement.width,placement.height);
+      Object.assign(grid.style,{position:"relative",overflow:"hidden",height:before.rect.height+"px"});
+      transition.onFinish(()=>Object.assign(grid.style,{position:"",overflow:"",height:""}));
+      // The grid's own height runs the length of the choreography, so it is also
+      // what tells the transition it is over and everything can go back to being
+      // laid out normally.
+      transition.animate(grid,[
+        {height:before.rect.height+"px",offset:0},
+        {height:before.rect.height+"px",offset:departMillis/total,easing:"ease-in-out"},
+        {height:gridRect.height+"px",offset:settleEnd/total},
+        {height:gridRect.height+"px",offset:1},
+      ],{duration:total,fill:"backwards"}).onfinish=()=>transition.finish();
+      // The card that left is put back into the grid at the box it occupied,
+      // out of flow, so it fades over its own space without holding any.
+      for(const [,{node,rect}] of leaving){
+        node.style.pointerEvents="none";
+        grid.append(node);
+        pin(node,rect.left-before.rect.left,rect.top-before.rect.top,rect.width,rect.height);
+        transition.onFinish(()=>node.remove());
+        transition.animate(node,[{opacity:1},{opacity:0}],{duration:departMillis,easing:"ease-in",fill:"forwards"});
       }
-      for(const candidate of movedCandidates){
-        if(!cardsToMove.has(candidate.node))continue;
-        const dx=candidate.prior.left-candidate.after.left,dy=candidate.prior.top-candidate.after.top;
-        candidate.node.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:"none"}],{duration:350,easing:"ease",fill:"forwards"});
-      }
-      if(!leaving.length)return;
-      const layer=element("div","leave-layer");document.body.append(layer);
-      for(const [,{rect,node}] of leaving){
-        const clone=node.cloneNode(true);
-        Object.assign(clone.style,{position:"fixed",margin:"0",left:rect.left+"px",top:rect.top+"px",width:rect.width+"px",height:rect.height+"px"});
-        layer.append(clone);
-        // fill:"forwards" holds the faded-out end state until layer.remove()
-        // below actually deletes the clone -- without it, the browser drops
-        // the animation's effect the instant it ends and the clone reverts to
-        // its un-animated style (fully opaque), flashing back into view for
-        // the remaining time before removal.
-        clone.animate([{opacity:1,transform:"none"},{opacity:0,transform:"translateX(-50px) scale(.7)"}],{duration:380,easing:"ease-in",fill:"forwards"});
-      }
-      setTimeout(()=>layer.remove(),400);
+      settling.forEach((placement,index)=>transition.animate(placement.node,
+        [{transform:`translate(${placement.dx}px,${placement.dy}px)`},{transform:"none"}],
+        {duration:settleMillis,delay:departMillis+Math.min(index,SETTLE_STAGGER_LIMIT)*SETTLE_STAGGER_MILLIS,
+         easing:"ease-in-out",fill:"backwards"}));
+      for(const placement of arriving)transition.animate(placement.node,[
+        {opacity:0,clipPath:"inset(0 0 100% 0)",offset:0},
+        {opacity:0,clipPath:"inset(0 0 100% 0)",offset:arriveStart/total,easing:"ease-out"},
+        {opacity:1,clipPath:"inset(0 0 0 0)",offset:1},
+      ],{duration:total,fill:"backwards"});
     }
     function reportHasFocusedControl(){
       const active=document.activeElement;
@@ -1376,12 +1516,15 @@
     }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
+      // A refresh landing mid-choreography ends it first, so the grid is
+      // measured at rest rather than part-way through somebody else's animation.
+      endGridTransitions();
       const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;document.querySelector("details.filters").hidden=report.report_kind==="branch_reference_matches";if(report.report_kind!=="branch_reference_matches")content.append(reportHeader(report,state));
       if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else throw new Error("Unknown report kind");
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;
-      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
