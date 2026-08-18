@@ -1141,6 +1141,45 @@ class SourceReportTest(unittest.TestCase):
     tearDown = ReportModelTest.tearDown
     _open_queue = ReportModelTest._open_queue
 
+    def _source_rows_for(self, word):
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="sources",
+            branch_target=parse_report_branch_target([word]),
+        ))
+        return {row["source_word"]: row for row in report["data"]["rows"]}
+
+    def test_collapsed_report_is_one_row_per_request_whatever_the_branch_count(self):
+        # The report's unit is the request: a root that spawned a hundred
+        # branches is one row, not a hundred, and no branch rows are emitted
+        # until a request is named.
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(ANSWERS[:2] + [f"w{index:04d}"]), 3, 5,
+             "salet", index)
+            for index in range(40)
+        ])
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(ANSWERS[:2] + [f"x{index:04d}"]), 3, 3,
+             "crane", index)
+            for index in range(15)
+        ])
+        queue.close()
+
+        report = collect_report(
+            self.sources, ReportRequest(report_kind="sources"))
+
+        data = report["data"]
+        self.assertEqual(len(data["summary"]), 2)
+        self.assertEqual(data["rows"], [])
+        self.assertEqual(data["matched_rows"], 0)
+        rollups = {row["source_word"]: row for row in data["summary"]}
+        self.assertEqual(rollups["salet"]["branch_count"], 40)
+        self.assertEqual(rollups["salet"]["open_branch_count"], 40)
+        self.assertEqual(rollups["salet"]["done_branch_count"], 0)
+        self.assertEqual(rollups["crane"]["branch_count"], 15)
+        # Naming one request is what opens its branches.
+        self.assertEqual(len(self._source_rows_for("crane")), 1)
+
     def test_source_report_exposes_multiple_owners_with_requested_and_effective_priority(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()
@@ -1153,7 +1192,9 @@ class SourceReportTest(unittest.TestCase):
 
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertEqual(len(report["data"]["summary"]), 2)
-        rows = {row["source_word"]: row for row in report["data"]["rows"]}
+        # Each owner's own row comes from naming that owner's word; the shared
+        # branch is still never reduced to one owner's claim.
+        rows = {**self._source_rows_for("salet"), **self._source_rows_for("crane")}
         self.assertEqual(set(rows), {"salet", "crane"})
         self.assertEqual(rows["salet"]["requested_priority"], 1)
         self.assertEqual(rows["crane"]["requested_priority"], 9)
@@ -1200,25 +1241,31 @@ class SourceReportTest(unittest.TestCase):
         shared_key = ScoreCache.encode_subset(ANSWERS[:2])
         solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
         queue = self._open_queue()
-        queue.add_pending_many([(solo_key, 2, 9, "crane", 0)])
-        queue.add_pending_many([(shared_key, 2, 1, "salet", 1)])
+        # SALET owns a solo branch and one shared with NURDY, in that order, so
+        # a limit of one leaves the shared branch outside the returned rows.
+        queue.add_pending_many([(solo_key, 2, 1, "salet", 0),
+                                (shared_key, 2, 1, "salet", 1)])
         queue.add_pending_many([(shared_key, 2, 1, "nurdy", 2)])
         queue.close()
 
-        full = collect_report(self.sources, ReportRequest(report_kind="sources"))
-        limited = collect_report(
-            self.sources,
-            ReportRequest(report_kind="sources", filters=ReportFilters(limit=1)),
+        salet = ReportRequest(
+            report_kind="sources",
+            branch_target=parse_report_branch_target(["salet"]),
         )
+        full = collect_report(self.sources, salet)
+        limited = collect_report(self.sources, ReportRequest(
+            report_kind="sources", branch_target=salet.branch_target,
+            filters=ReportFilters(limit=1),
+        ))
 
-        self.assertEqual(full["data"]["matched_rows"], 3)
+        self.assertEqual(full["data"]["matched_rows"], 2)
         self.assertEqual(full["data"]["shared_branch_count"], 1)
         # The limit truncates the returned rows only.  Both counts describe
         # every matched row, so a shared branch whose rows all fall past the
         # limit is still counted as shared.
         self.assertEqual(len(limited["data"]["rows"]), 1)
         self.assertFalse(limited["data"]["rows"][0]["is_shared"])
-        self.assertEqual(limited["data"]["matched_rows"], 3)
+        self.assertEqual(limited["data"]["matched_rows"], 2)
         self.assertEqual(limited["data"]["shared_branch_count"], 1)
 
     def test_workers_report_exposes_scheduling_role_and_source_work_id(self):

@@ -45,6 +45,7 @@ FIXTURE_FILENAMES = (
     "leaderboard.json",
     "root_progress.json",
     "sources.json",
+    "sources-word.json",
 )
 BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
 INTEGER_PARAMETERS = {
@@ -304,6 +305,10 @@ def fixture_name_for_request(path, request):
     kind = request.report_kind
     if request.tree:
         return f"{kind}-tree.json"
+    # The source report lists a request's branches only once that request is
+    # named, so the two shapes need two fixtures.
+    if kind == "sources" and request.branch_target.kind == "word":
+        return "sources-word.json"
     return f"{kind}.json"
 
 

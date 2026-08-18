@@ -2589,16 +2589,47 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
-def _source_summary_payload(row):
+def _source_summary_payload(row, rollup):
+    """One request, with its branches rolled up.
+
+    This is the report's unit: a request that spawned a thousand branches is
+    one row, not a thousand.  root_count and branch_count span every branch the
+    request has ever owned; the rollup counts only those still owned live, so a
+    branch that finalized and released its ownership reads as done.
+    """
     source_word = _row_value(row, "source_word")
+    branch_count = row["branch_count"] or 0
+    open_branch_count = rollup["open_branch_count"]
     return {
         "source_work_id": row["source_work_id"],
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
+        "requested_at": _row_value(row, "requested_at"),
         "state": row["state"],
         "root_count": row["root_count"] or 0,
-        "branch_count": row["branch_count"] or 0,
+        "branch_count": branch_count,
+        "open_branch_count": open_branch_count,
+        "done_branch_count": max(0, branch_count - open_branch_count),
+        "worker_count": rollup["worker_count"],
     }
+
+
+def _source_rollups(membership_rows):
+    """Per-request branch totals, keyed by source_work_id."""
+    rollups = collections.defaultdict(
+        lambda: {"open_branch_count": 0, "worker_count": 0}
+    )
+    for row in membership_rows:
+        worker_count = _row_value(row, "worker_count", 0)
+        _branch_status, branch_phase = branch_status_and_phase(
+            _row_value(row, "pending_status"), _row_value(row, "active_status"),
+            worker_count,
+        )
+        rollup = rollups[row["source_work_id"]]
+        if branch_phase != "complete":
+            rollup["open_branch_count"] += 1
+        rollup["worker_count"] += worker_count
+    return rollups
 
 
 def _source_membership_payload(row, owner_count):
@@ -2642,12 +2673,14 @@ def _source_membership_payload(row, owner_count):
 
 
 def collect_source_report(sources: ReportSources, request: ReportRequest) -> dict:
-    """Report every source-work request, its recorded requested priority, and
-    every branch it owns (or shares) — the reporting half of #200's operator
-    surface.  A branch with more than one live owner is never reduced to a
-    single display label: each owning request gets its own row, with the
-    branch's own effective (materialized) priority reported alongside each
-    owner's individually requested priority."""
+    """Report every source-work request with its branches rolled up — the
+    reporting half of #200's operator surface.
+
+    One request is one row: ten queued root words report ten rows, whatever the
+    branch count underneath them.  Naming a source word opens that request's
+    branches, and only there is a branch with more than one live owner shown as
+    one row per owning request, with the branch's own effective (materialized)
+    priority reported alongside each owner's individually requested priority."""
     generated_at = int(time.time())
     data = {"summary": [], "matched_rows": 0, "shared_branch_count": 0,
             "rows": []}
@@ -2665,32 +2698,40 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         if source_word is not None:
             summary_rows = [row for row in summary_rows
                             if (row["source_word"] or "").lower() == source_word]
-        data["summary"] = [_source_summary_payload(row) for row in summary_rows]
-
-        # Owner counts are computed from every live membership so a branch
-        # shared with a request outside the word filter still reports
-        # is_shared correctly, rather than only counting the filtered rows.
+        # Rolled up from every live membership, not only the named word's, so
+        # each request's own totals are complete whichever request is in scope.
         all_membership_rows = queue.source_membership_rows()
-        owner_counts = collections.Counter(
-            row["branch_id"] for row in all_membership_rows
-        )
-        membership_rows = (
-            [row for row in all_membership_rows
-             if (row["source_word"] or "").lower() == source_word]
-            if source_word is not None else all_membership_rows
-        )
-        payload_rows = [
-            _source_membership_payload(row, owner_counts[row["branch_id"]])
-            for row in membership_rows
+        rollups = _source_rollups(all_membership_rows)
+        data["summary"] = [
+            _source_summary_payload(row, rollups[row["source_work_id"]])
+            for row in summary_rows
         ]
-        data["matched_rows"] = len(payload_rows)
-        # Counted over every matched row, like matched_rows itself: a shared
-        # branch whose rows all fall past the row limit is still shared.
-        data["shared_branch_count"] = len({
-            row["branch_key_hex"] for row in payload_rows if row["is_shared"]
-        })
-        limit = request.filters.limit
-        data["rows"] = payload_rows[:limit] if limit is not None else payload_rows
+
+        # Branch rows belong to one named request.  Emitting them for every
+        # request would bury ten queued roots under the hundreds of branches
+        # they spawned, which is the explosion this report exists to roll up.
+        if source_word is not None:
+            # Owner counts are computed from every live membership so a branch
+            # shared with a request outside the word filter still reports
+            # is_shared correctly, rather than only counting the filtered rows.
+            owner_counts = collections.Counter(
+                row["branch_id"] for row in all_membership_rows
+            )
+            payload_rows = [
+                _source_membership_payload(row, owner_counts[row["branch_id"]])
+                for row in all_membership_rows
+                if (row["source_word"] or "").lower() == source_word
+            ]
+            data["matched_rows"] = len(payload_rows)
+            # Counted over every matched row, like matched_rows itself: a shared
+            # branch whose rows all fall past the row limit is still shared.
+            data["shared_branch_count"] = len({
+                row["branch_key_hex"] for row in payload_rows if row["is_shared"]
+            })
+            limit = request.filters.limit
+            data["rows"] = (
+                payload_rows[:limit] if limit is not None else payload_rows
+            )
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)

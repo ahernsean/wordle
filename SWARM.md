@@ -194,17 +194,27 @@ The rollup scans the epoch's `branch_finalize_log` rows, which carry no spine
 index, so it takes seconds. The web client fetches it after the word report
 renders and caches it per target; the terminal report pays it on each run.
 
-`--sources` reports every source-work request: its recorded requested
-priority, the request state, and every branch it owns — including branches
-shared with another request, shown as one row per owning request with both
-that request's own requested priority and the branch's effective (highest
-live owner's) priority side by side, plus its promotion lineage (root
-pattern and immediate parent). A trailing word narrows to that word's
-request(s). Each worker's own report row shows whether it is serving its
-preferred (highest-priority eligible) source or fallback work claimed
-because the preferred source had no claimable bundle. The browser report
-serves the same view under its Sources tab, and names the same scheduling
-role on every worker card.
+`--sources` reports one row per source-work request — ten queued root words
+are ten rows, whatever the branch count underneath them. Each row carries the
+request's recorded requested priority, its state, how many branches it has
+ever owned, how many of those are still open versus done, the live workers on
+them, and how long ago it was requested. `roots` counts the branches directly
+off the root word; `branches` spans every depth beneath it, so promoted
+sub-branches are included.
+
+A trailing word narrows to that word's request(s) **and** lists the branches
+it owns — including branches shared with another request, shown as one row per
+owning request with both that request's own requested priority and the
+branch's effective (highest live owner's) priority side by side, plus its
+promotion lineage (root pattern and immediate parent). That per-branch list is
+deliberately opt-in: a root can own hundreds of branches, and printing them
+for every request buries the requests themselves.
+
+Each worker's own report row shows whether it is serving its preferred
+(highest-priority eligible) source or fallback work claimed because the
+preferred source had no claimable bundle. The browser report serves the same
+view under its Sources tab — one card per request, and clicking one opens that
+request's branches — and names the same scheduling role on every worker card.
 
 Use `--answers` for answer-word arrays on word or branch reports and `--claims`
 for sparse candidate detail on one branch. Collection filters include branch

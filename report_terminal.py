@@ -1450,16 +1450,81 @@ def _render_hotspot_sections(report, width, display_order):
     return [("header", header), ("hotspots", lines)]
 
 
+def _source_display_row(source, generated_at):
+    requested_at = source.get("requested_at")
+    return {
+        **source,
+        "display_request": f"#{source['source_work_id']}",
+        "display_word": (source["source_word"] or "-").upper(),
+        "display_state": source["state"],
+        "display_roots": f"{source['root_count']:,}",
+        "display_branches": f"{source['branch_count']:,}",
+        "display_open": f"{source.get('open_branch_count', 0):,}",
+        "display_done": f"{source.get('done_branch_count', 0):,}",
+        "display_workers": f"{source.get('worker_count', 0):,}",
+        "display_age": (
+            _abbreviate_duration(generated_at - requested_at)
+            if requested_at is not None else "—"
+        ),
+    }
+
+
+def _source_columns():
+    return [
+        TerminalColumn("Req", "display_request", required=True),
+        TerminalColumn("Word", "display_word", required=True),
+        TerminalColumn(
+            "Pri", "requested_priority", required=True, alignment="right"
+        ),
+        TerminalColumn("State", "display_state", required=True),
+        TerminalColumn(
+            "Open", "display_open", required=True, alignment="right"
+        ),
+        TerminalColumn(
+            "Done", "display_done", required=True, alignment="right"
+        ),
+        TerminalColumn(
+            "Branches", "display_branches", remove_priority=10,
+            alignment="right",
+        ),
+        TerminalColumn(
+            "Roots", "display_roots", remove_priority=20, alignment="right"
+        ),
+        TerminalColumn(
+            "W", "display_workers", remove_priority=30, alignment="right"
+        ),
+        TerminalColumn(
+            "Age", "display_age", remove_priority=40, alignment="right"
+        ),
+    ]
+
+
 def _render_source_sections(report, width, display_order):
+    """One line per request, with its branches rolled up.
+
+    The branch lines appear only for a named source word: listing every
+    request's branches would bury ten queued roots under the hundreds each of
+    them spawned.
+    """
     data = report["data"]
+    generated_at = report["generated_at"]
     header = _semantic_header(report, "Source-work report", width)
-    lines = [f"Requests: {len(data.get('summary', []))}   "
-            f"memberships: {data.get('matched_rows', 0)} matched"]
-    for source in data.get("summary", []):
+    summary = data.get("summary", [])
+    counts = f"Requests: {len(summary):,}"
+    if data.get("rows"):
+        counts += f"   memberships: {data.get('matched_rows', 0):,} matched"
+    lines = [counts]
+    if summary:
+        lines.extend(_render_table(
+            _source_columns(),
+            [_source_display_row(source, generated_at) for source in summary],
+            width, indent="  ",
+        ))
+    if summary and not data.get("rows"):
+        lines.append("")
         lines.append(_fit(
-            f"  #{source['source_work_id']} {(source['source_word'] or '-').upper()}  "
-            f"requested={source['requested_priority']}  {source['state']}  "
-            f"roots={source['root_count']} branches={source['branch_count']}",
+            "  Name a source word for its branches: view --sources "
+            f"{(summary[0]['source_word'] or 'WORD').upper()}",
             width,
         ))
     if data.get("rows"):

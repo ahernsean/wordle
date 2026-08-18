@@ -2946,22 +2946,38 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("[data-kind=sources]").click()
         self.page.wait_for_selector("text=sources report")
 
-    def test_sources_view_lists_requests_and_one_row_per_owning_request(self):
+    def test_sources_view_collapses_every_request_to_one_card(self):
+        # The report's unit is the request: three queued roots owning 1,376
+        # branches between them read as three cards, and no branch card is
+        # rendered until one of them is named.
         self.open_sources()
         requests = self.page.locator("[data-grid-key=source-requests] > .card")
-        ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
-        self.assertEqual(requests.count(), 2)
-        self.assertEqual(ownership.count(), 4)
+        self.assertEqual(requests.count(), 3)
+        self.assertEqual(
+            self.page.locator("[data-grid-key=source-memberships]").count(), 0
+        )
         metrics = " ".join(
             self.page.locator("#report .metrics").first.inner_text().split()
         )
-        self.assertIn("2 requests", metrics)
-        self.assertIn("4 memberships", metrics)
-        self.assertIn("1 shared branches", metrics)
+        self.assertIn("3 requests", metrics)
+        self.assertIn("1,376 branches", metrics)
+        self.assertIn("1,211 open", metrics)
         request_text = " ".join(requests.first.inner_text().split())
-        self.assertIn("requested priority 5", request_text)
-        self.assertIn("1 root", request_text)
-        self.assertIn("2 branches", request_text)
+        self.assertIn("priority 5", request_text)
+        self.assertIn("1,240 branches", request_text)
+        self.assertIn("1,203 open", request_text)
+        self.assertIn("37 done", request_text)
+        self.assertIn("12 roots", request_text)
+        self.assertIn("3 workers", request_text)
+        self.assertIn("Pick a request to list the branches it owns.",
+                      self.page.locator("#report").inner_text())
+
+    def test_sources_branch_cards_appear_only_for_the_named_request(self):
+        self.open_sources()
+        self.page.locator("[data-grid-key=source-requests] > .card").first.click()
+        self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
+        ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
+        self.assertEqual(ownership.count(), 4)
         # The shared branch is never reduced to a single owner: each owning
         # request gets its own row, carrying that request's requested priority
         # beside the branch's effective one.
@@ -2978,30 +2994,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.assertIn("sole", sole)
         self.assertNotIn("parent", sole)
+        ownership_text = " ".join(
+            self.page.locator("#report").inner_text().split()
+        )
+        self.assertIn("Shown 4 of 4 matched", ownership_text)
+        self.assertIn("1 shared branch", ownership_text)
+
+    def open_named_source(self):
+        self.open_sources()
+        self.page.locator("[data-grid-key=source-requests] > .card").first.click()
+        self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
 
     def test_sources_metrics_survive_a_row_limit_truncating_the_grid(self):
         # matched_rows and shared_branch_count are the model's pre-limit
         # counts; a limit that drops every shared row from the grid must not
         # silently shrink the metric beside it.  The fixture server ignores
         # limit, so the truncated payload is applied directly.
-        metrics = self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources')).json();
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
           report.data.rows = report.data.rows.filter(row => !row.is_shared);
-          applyReport(report, null, parsePageState({search:'?kind=sources'}));
-          return document.querySelector('#report .metrics').innerText;
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&branch_target=SALET'}));
         }""")
-        metrics = " ".join(metrics.split())
-        self.assertIn("4 memberships", metrics)
-        self.assertIn("1 shared branches", metrics)
         shown = self.page.locator("[data-grid-key=source-memberships] > .card")
         self.assertEqual(shown.count(), 2)
-        self.assertIn(
-            "Shown 2 of 4 matched",
-            " ".join(self.page.locator("#report").inner_text().split()),
-        )
+        report_text = " ".join(self.page.locator("#report").inner_text().split())
+        self.assertIn("Shown 2 of 4 matched", report_text)
+        self.assertIn("1 shared branch", report_text)
 
     def test_sources_ownership_row_draws_its_lineage_as_a_spine_step(self):
-        self.open_sources()
+        self.open_named_source()
         root_step = self.page.locator('[data-identity="1:02"] .word')
         self.assertEqual(root_step.count(), 1)
         self.assertEqual(root_step.get_attribute("data-spine"), "SALET -y---")
@@ -3027,7 +3049,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector(marked, state="detached")
 
     def test_sources_ownership_card_opens_the_branch_it_names(self):
-        self.open_sources()
+        self.open_named_source()
         self.page.locator('[data-identity="2:04"]').click()
         self.page.wait_for_selector("text=branch report")
 

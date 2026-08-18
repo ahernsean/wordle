@@ -458,7 +458,7 @@ class SourcesRequestTest(unittest.TestCase):
                 with self.assertRaisesRegex(InvalidRequest, message):
                     parse_report_request("/api/view/sources", query)
 
-    def test_fixture_shape_matches_a_live_source_report(self):
+    def test_fixture_shapes_match_a_live_source_report(self):
         with tempfile.TemporaryDirectory() as directory:
             queue_path = os.path.join(directory, "queue.sqlite3")
             queue = ERDQueue(queue_path)
@@ -473,17 +473,34 @@ class SourcesRequestTest(unittest.TestCase):
             live = collect_report(
                 sources, parse_report_request("/api/view/sources", "")
             )
-        fixture = load_fixtures(FIXTURE_DIRECTORY)["sources.json"]
-        self.assertEqual(set(fixture["data"]), set(live["data"]))
+            live_word = collect_report(
+                sources,
+                parse_report_request("/api/view/sources", "branch_target=SALET"),
+            )
+        fixtures = load_fixtures(FIXTURE_DIRECTORY)
+        collapsed, worded = fixtures["sources.json"], fixtures["sources-word.json"]
+        self.assertEqual(set(collapsed["data"]), set(live["data"]))
         self.assertEqual(
-            set(fixture["data"]["summary"][0]), set(live["data"]["summary"][0])
+            set(collapsed["data"]["summary"][0]), set(live["data"]["summary"][0])
         )
+        # The collapsed report is requests only: branch rows wait for a word.
+        self.assertEqual(collapsed["data"]["rows"], [])
+        self.assertEqual(live["data"]["rows"], [])
         self.assertEqual(
-            set(fixture["data"]["rows"][0]), set(live["data"]["rows"][0])
+            set(worded["data"]["rows"][0]), set(live_word["data"]["rows"][0])
         )
-        # The fixture must carry the shared-ownership case the view exists to
-        # show: one branch, two owning requests, one effective priority.
-        self.assertTrue(any(row["is_shared"] for row in fixture["data"]["rows"]))
+        # The word fixture must carry the shared-ownership case the branch rows
+        # exist to show: one branch, two owning requests, one effective priority.
+        self.assertTrue(any(row["is_shared"] for row in worded["data"]["rows"]))
+
+    def test_word_target_selects_the_word_scoped_fixture(self):
+        with running_server(fixture_configuration()) as base_url:
+            collapsed = json.loads(request(base_url, "/api/view/sources")[2])
+            worded = json.loads(
+                request(base_url, "/api/view/sources?branch_target=SALET")[2]
+            )
+        self.assertEqual(collapsed["data"]["rows"], [])
+        self.assertTrue(worded["data"]["rows"])
 
 
 class RootProgressRequestTest(unittest.TestCase):

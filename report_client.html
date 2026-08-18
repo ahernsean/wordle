@@ -1285,7 +1285,7 @@
     // on its own: the same branch appears once per owning request.
     const membershipIdentity=row=>row.source_work_id+":"+row.branch_key_hex;
     const withMembershipIdentity=rows=>(rows||[]).map(row=>({...row,membership_identity:membershipIdentity(row)}));
-    function sourceRequestCard(row,previous,state){
+    function sourceRequestCard(row,previous,state,generatedAt){
       const card=element("article","card clickable "+changeClass(row,previous));
       card.dataset.identity=String(row.source_work_id);
       // The filtering card is also the clearing card: clicking the request the
@@ -1296,10 +1296,18 @@
       if(isFiltered)card.setAttribute("aria-current","true");
       const title=element("div","card-title");
       title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)),element("span","dim","#"+row.source_work_id));
-      card.append(title,statLine([
-        "requested priority "+valueOrDash(row.requested_priority),
-        numText(row.root_count)+(row.root_count===1?" root":" roots"),
+      card.append(title);
+      // How far along the request is, as one bar: every branch it has ever
+      // owned, against those that have finished.
+      if(row.branch_count){const line=element("div","progress-line");line.append(progress(row.done_branch_count,row.branch_count));card.append(line);}
+      card.append(statLine([
+        "priority "+valueOrDash(row.requested_priority),
         numText(row.branch_count)+(row.branch_count===1?" branch":" branches"),
+        numText(row.open_branch_count)+" open",
+        numText(row.done_branch_count)+" done",
+        numText(row.root_count)+(row.root_count===1?" root":" roots"),
+        row.worker_count?numText(row.worker_count)+(row.worker_count===1?" worker":" workers"):null,
+        row.requested_at===null||row.requested_at===undefined?null:"requested "+relativeAge(row.requested_at,generatedAt),
       ]));
       card.addEventListener("click",()=>setState({...state,kind:"sources",branch_target:isFiltered?"":word}));
       return card;
@@ -1324,20 +1332,33 @@
       card.addEventListener("click",()=>navigateBranch(row));
       return card;
     }
+    // One card per request, whatever the branch count underneath it.  A
+    // request's branches are listed only once it is the named one, so ten
+    // queued roots read as ten cards rather than as the hundreds of branches
+    // they spawned.
     function renderSources(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;
-      const requests=data.summary||[],rows=withMembershipIdentity(data.rows),matchedRows=data.matched_rows??rows.length;
+      const requests=data.summary||[],rows=withMembershipIdentity(data.rows);
+      const branchTotal=requests.reduce((total,row)=>total+(row.branch_count||0),0);
+      const openTotal=requests.reduce((total,row)=>total+(row.open_branch_count||0),0);
       const metrics=element("div","metrics");
-      // Both counts come from the model, which counts them before the row
-      // limit truncates the grid, so neither silently means "of those shown".
-      metrics.append(metric("requests",requests.length),metric("memberships",matchedRows),metric("shared branches",data.shared_branch_count));
+      metrics.append(metric("requests",requests.length),metric("branches",branchTotal),metric("open",openTotal));
       fragment.append(metrics,element("h2","","Source-work requests"));
       if(!requests.length)fragment.append(element("p","empty","No source-work requests"));
+      else if(!rows.length)fragment.append(element("p","dim","Pick a request to list the branches it owns."));
       const requestGrid=gridElement("source-requests"),previousRequests=previousBy(previous,"summary","source_work_id");
-      for(const row of ordered(requests,"source_work_id","source-requests",state))requestGrid.append(sourceRequestCard(row,previousRequests.get(String(row.source_work_id)),state));
-      fragment.append(requestGrid,element("h2","","Branch ownership"));
-      fragment.append(element("p","dim","Shown "+numText(rows.length)+" of "+numText(matchedRows)+" matched · one row per owning request, so a branch two requests own appears once for each · effective priority is the highest live owner's"));
-      if(!rows.length)fragment.append(element("p","empty","No branches owned"));
+      for(const row of ordered(requests,"source_work_id","source-requests",state))requestGrid.append(sourceRequestCard(row,previousRequests.get(String(row.source_work_id)),state,report.generated_at));
+      fragment.append(requestGrid);
+      if(!rows.length)return fragment;
+      // Both counts come from the model, which counts them before the row
+      // limit truncates the grid, so neither silently means "of those shown".
+      const matchedRows=data.matched_rows??rows.length;
+      fragment.append(element("h2","","Branch ownership"),statLine([
+        "Shown "+numText(rows.length)+" of "+numText(matchedRows)+" matched",
+        numText(data.shared_branch_count)+(data.shared_branch_count===1?" shared branch":" shared branches"),
+        "one row per owning request, so a branch two requests own appears once for each",
+        "effective priority is the highest live owner's",
+      ]));
       const ownership=gridElement("source-memberships");
       const previousMemberships=new Map(withMembershipIdentity((((previous||{}).data)||{}).rows).map(row=>[row.membership_identity,row]));
       for(const row of ordered(rows,"membership_identity","source-memberships",state))ownership.append(sourceMembershipCard(row,previousMemberships.get(row.membership_identity)));
