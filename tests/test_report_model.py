@@ -1240,6 +1240,28 @@ class SourceReportTest(unittest.TestCase):
              self._source_words(sort="open")["summary"]],
             ["nurdy", "salet", "crane"])
 
+    def test_branch_totals_count_a_shared_branch_once(self):
+        # Two different words owning one branch is the case the report exists
+        # to show, and it is exactly where summing per-word counts goes wrong.
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(shared_key, 2, 5, "salet", 0)])
+        queue.add_pending_many([(shared_key, 2, 3, "crane", 0),
+                                (solo_key, 2, 3, "crane", 1)])
+        queue.close()
+
+        data = self._source_words()
+
+        self.assertEqual(
+            sum(row["branch_count"] for row in data["summary"]), 3)
+        self.assertEqual(data["matched_branch_count"], 2)
+        self.assertEqual(data["matched_open_branch_count"], 2)
+        # The totals follow the filter, so they describe the words on screen.
+        narrowed = self._source_words(source_states=("complete",))
+        self.assertEqual(narrowed["matched_branch_count"], 0)
+        self.assertEqual(narrowed["matched_open_branch_count"], 0)
+
     def test_source_offset_pages_through_the_words(self):
         self._queue_words(*[(word, 5, 1) for word in
                             ("salet", "crane", "nurdy", "khaki", "penis")])

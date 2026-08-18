@@ -2790,17 +2790,19 @@ def _source_membership_payload(row, owner_count):
 
 
 def collect_source_report(sources: ReportSources, request: ReportRequest) -> dict:
-    """Report every source-work request with its branches rolled up — the
-    reporting half of #200's operator surface.
+    """Report every source word with its requests and branches rolled up —
+    the reporting half of #200's operator surface.
 
-    One request is one row: ten queued root words report ten rows, whatever the
-    branch count underneath them.  Naming a source word opens that request's
-    branches, and only there is a branch with more than one live owner shown as
-    one row per owning request, with the branch's own effective (materialized)
-    priority reported alongside each owner's individually requested priority."""
+    One word is one row: ten queued root words report ten rows, whatever the
+    branch count underneath them, and a word requested more than once still
+    reports one row.  Naming a word opens that word's branches, and only there
+    is a branch with more than one live owner shown as one row per owning
+    request, with the branch's own effective (materialized) priority reported
+    alongside each owner's individually requested priority."""
     generated_at = int(time.time())
     data = {"summary": [], "total_source_word_count": 0,
-            "matched_source_word_count": 0, "source_word_offset": 0,
+            "matched_source_word_count": 0, "matched_branch_count": 0,
+            "matched_open_branch_count": 0, "source_word_offset": 0,
             "matched_rows": 0, "shared_branch_count": 0, "rows": []}
     report = _semantic_report(
         "sources", sources, request.branch_target, generated_at, data, request
@@ -2833,6 +2835,28 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                          if row["state"] in source_states]
         collapsed = _sorted_source_words(collapsed, request.filters.sort)
         data["matched_source_word_count"] = len(collapsed)
+        # Counted across the matched words with each branch counted once: two
+        # words can own the same branch, so summing their per-word counts
+        # double-counts precisely the shared ownership this report exists to
+        # show.
+        matched_words = [row["source_word"] for row in collapsed]
+        data["matched_branch_count"] = queue.distinct_branch_count_for_words(
+            matched_words
+        )
+        matched_word_set = set(matched_words)
+        open_branch_ids = set()
+        for row in all_membership_rows:
+            row_word = (_row_value(row, "source_word") or "").lower() or None
+            if row_word not in matched_word_set:
+                continue
+            worker_count = _row_value(row, "worker_count", 0)
+            _branch_status, branch_phase = branch_status_and_phase(
+                _row_value(row, "pending_status"),
+                _row_value(row, "active_status"), worker_count,
+            )
+            if branch_phase != "complete":
+                open_branch_ids.add(row["branch_id"])
+        data["matched_open_branch_count"] = len(open_branch_ids)
         # limit is a page size and source_offset is where that page starts, so
         # the words past the first page stay reachable rather than truncated
         # away.  An offset past the end yields an empty page, not the last one:

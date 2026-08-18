@@ -4629,6 +4629,25 @@ class ERDQueue:
             ORDER BY MAX(s.requested_priority) DESC, s.source_word
         """).fetchall()
 
+    def distinct_branch_count_for_words(self, source_words):
+        """Count the branches owned by these source words, each branch once.
+
+        Two words can own the same branch, so summing their branch counts
+        double-counts exactly the shared ownership the source report exists to
+        show.  Counted over every membership, resolved or not, to match the
+        per-word branch_count in source_word_rows().
+        """
+        words = [word for word in source_words if word is not None]
+        if not words:
+            return 0
+        placeholders = ",".join("?" for _ in words)
+        return self._conn.execute(f"""
+            SELECT COUNT(DISTINCT m.branch_id)
+            FROM branch_source_work AS m
+            JOIN source_work AS s ON s.source_work_id = m.source_work_id
+            WHERE s.source_word IN ({placeholders})
+        """, words).fetchone()[0]
+
     def source_membership_rows(self, source_work_id=None, source_word=None,
                                include_resolved=False):
         """Return one row per (source_work_id, branch_id) membership.

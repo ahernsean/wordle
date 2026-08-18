@@ -217,9 +217,10 @@ word's own lifecycle, not a branch's, so it is a separate filter from
 are rejected for other reports rather than silently ignored. `--limit` caps
 the rows the terminal prints, and the count says so (`Source words: 3 of 10`).
 
-Grouping and paging are browser-only. The Sources tab groups by state, worker
-presence, or priority, each group collapsing under a rollup of the words it
-holds. There, `limit` is a page size rather than a cap: with `source_offset`
+Grouping and paging are browser-only. The Sources tab groups by state out of
+the box — what is running, what is waiting, what is finished — and can group by
+worker presence or priority instead, or not at all; each group collapses under
+a rollup of the words it holds. There, `limit` is a page size rather than a cap: with `source_offset`
 it pages the word list (`Showing 6–10 of 12 words`), so the words past the
 first page stay reachable. Changing a filter, the sort or the grouping returns
 to the first page, since page 3 of one ordering is not page 3 of another.
@@ -235,8 +236,9 @@ for every request buries the requests themselves.
 Each worker's own report row shows whether it is serving its preferred
 (highest-priority eligible) source or fallback work claimed because the
 preferred source had no claimable bundle. The browser report serves the same
-view under its Sources tab — one card per request, and clicking one opens that
-request's branches — and names the same scheduling role on every worker card.
+view under its Sources tab — one card per source word, and clicking one opens
+that word's branches — and names the same scheduling role on every worker
+card.
 
 Use `--answers` for answer-word arrays on word or branch reports and `--claims`
 for sparse candidate detail on one branch. Collection filters include branch

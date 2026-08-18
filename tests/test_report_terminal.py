@@ -1424,6 +1424,20 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         self.assertEqual(rollups["raise"]["requested_priority"], 8)
         self.assertIn("Reqs", self._run())
 
+    def test_a_named_word_with_no_live_branches_says_so(self):
+        # Naming a word whose branches have all finished must not print the
+        # "name a source word" hint naming the word already named.
+        queue = ERDQueue(self.queue_path)
+        queue.mark_done(encode_subset(["crane", "slate"]))
+        queue.close()
+
+        text = self._run("slate")
+
+        self.assertIn("SLATE owns no live branches", text)
+        self.assertNotIn("view --sources SLATE", text)
+        # The unnamed report still points the way in.
+        self.assertIn("Name a source word", self._run())
+
     def test_source_state_filter_and_sort_reach_the_rendered_table(self):
         # --source-state and --sort are the terminal's half of the same
         # filtering the browser gets; grouping is browser-only.

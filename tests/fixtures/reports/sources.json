@@ -70,8 +70,72 @@
         "direct_branch_count": 2
       }
     ],
+    "summary_groups": [
+      {
+        "label": "queued",
+        "rows": [
+          {
+            "source_word": "salet",
+            "requested_priority": 5,
+            "requested_at": 400,
+            "request_count": 2,
+            "state": "queued",
+            "branch_count": 1240,
+            "open_branch_count": 1203,
+            "done_branch_count": 37,
+            "worker_count": 3,
+            "direct_branch_count": 12
+          },
+          {
+            "source_word": "raise",
+            "requested_priority": 3,
+            "requested_at": 200,
+            "request_count": 1,
+            "state": "queued",
+            "branch_count": 96,
+            "open_branch_count": 8,
+            "done_branch_count": 88,
+            "worker_count": 1,
+            "direct_branch_count": 4
+          }
+        ],
+        "rollup": {
+          "source_word_count": 2,
+          "branch_count": 1336,
+          "open_branch_count": 1211,
+          "done_branch_count": 125,
+          "worker_count": 4
+        }
+      },
+      {
+        "label": "complete",
+        "rows": [
+          {
+            "source_word": "crane",
+            "requested_priority": 1,
+            "requested_at": 100,
+            "request_count": 1,
+            "state": "complete",
+            "branch_count": 40,
+            "open_branch_count": 0,
+            "done_branch_count": 40,
+            "worker_count": 0,
+            "direct_branch_count": 2
+          }
+        ],
+        "rollup": {
+          "source_word_count": 1,
+          "branch_count": 40,
+          "open_branch_count": 0,
+          "done_branch_count": 40,
+          "worker_count": 0
+        }
+      }
+    ],
     "total_source_word_count": 3,
     "matched_source_word_count": 3,
+    "matched_branch_count": 1376,
+    "matched_open_branch_count": 1211,
     "source_word_offset": 0,
     "matched_rows": 0,
     "shared_branch_count": 0,

@@ -1530,11 +1530,11 @@ def _source_columns(summary):
 
 
 def _render_source_sections(report, width, display_order):
-    """One line per request, with its branches rolled up.
+    """One line per source word, with its requests and branches rolled up.
 
-    The branch lines appear only for a named source word: listing every
-    request's branches would bury ten queued roots under the hundreds each of
-    them spawned.
+    The branch lines appear only for a named source word: listing every word's
+    branches would bury ten queued roots under the hundreds each of them
+    spawned.
     """
     data = report["data"]
     generated_at = report["generated_at"]
@@ -1556,9 +1556,16 @@ def _render_source_sections(report, width, display_order):
             [_source_display_row(source, generated_at) for source in summary],
             width, indent="  ",
         ))
+    named_word = (report["branch_target"] or {}).get("trailing_word")
     if summary and not data.get("rows"):
         lines.append("")
+        # A named word with no rows owns no live branch, which is not the same
+        # as no word having been named: suggesting the word already named
+        # would send the reader back where they are.
         lines.append(_fit(
+            f"  {named_word.upper()} owns no live branches: its work has "
+            "finished and released them."
+            if named_word else
             "  Name a source word for its branches: view --sources "
             f"{(summary[0]['source_word'] or 'WORD').upper()}",
             width,

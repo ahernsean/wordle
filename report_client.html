@@ -313,7 +313,7 @@
     const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
     const SORT_OPTIONS_SOURCES=[["","priority (default)"],["word","word"],["branches","branches"],["open","open"],["done","done"],["workers","workers"],["age","age"]];
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
-    const GROUP_BY_OPTIONS_SOURCES=[["","none"],["state","state"],["worker_presence","worker"],["priority","priority"]];
+    const GROUP_BY_OPTIONS_SOURCES=[["state","state (default)"],["worker_presence","worker"],["priority","priority"],["none","none"]];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","sources"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
@@ -419,7 +419,11 @@
       // displayed spine prefix would promise a narrower answer than it gives.
       if(normalized.kind==="sources"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.claims=false;normalized.answers=false;
         if(!SORT_OPTIONS_SOURCES.some(([value])=>value===normalized.sort))normalized.sort="";
-        if(!GROUP_BY_OPTIONS_SOURCES.some(([value])=>value===normalized.group_by))normalized.group_by="";normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
+        // Grouped by state unless asked otherwise: the states partition the
+        // words into what is running, what is waiting, and what is finished,
+        // which is the first cut an operator makes by eye anyway.  "none" is
+        // an explicit choice rather than the absence of one.
+        if(!GROUP_BY_OPTIONS_SOURCES.some(([value])=>value===normalized.group_by))normalized.group_by="state";normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
@@ -1315,7 +1319,7 @@
     const membershipIdentity=row=>row.source_work_id+":"+row.branch_key_hex;
     const withMembershipIdentity=rows=>(rows||[]).map(row=>({...row,membership_identity:membershipIdentity(row)}));
     function sourceWordCard(row,previous,state,generatedAt){
-      const card=element("article","card clickable "+changeClass(row,previous));
+      const card=element("article","card source-word clickable "+changeClass(row,previous));
       card.dataset.identity=String(row.source_word);
       // The filtering card is also the clearing card: clicking the word the
       // view is already narrowed to widens it back to every word, and the
@@ -1331,7 +1335,7 @@
       // word was queued more than once and its rows are merged.
       if(row.request_count>1)title.append(element("span","chip",numText(row.request_count)+" requests"));
       card.append(title);
-      // How far along the request is, as one bar: every branch it has ever
+      // How far along the word is, as one bar: every branch it has ever
       // owned, against those that have finished.
       if(row.branch_count){const line=element("div","progress-line");line.append(progress(row.done_branch_count,row.branch_count));card.append(line);}
       card.append(statLine([
@@ -1385,23 +1389,30 @@
       pager.append(previousButton,nextButton);
       return pager;
     }
-    // One card per request, whatever the branch count underneath it.  A
-    // request's branches are listed only once it is the named one, so ten
-    // queued roots read as ten cards rather than as the hundreds of branches
-    // they spawned.
+    // One card per source word, whatever the branch count underneath it.  A
+    // word's branches are listed only once it is the named one, so ten queued
+    // roots read as ten cards rather than as the hundreds of branches they
+    // spawned.
     function renderSources(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;
       const sourceWords=data.summary||[],rows=withMembershipIdentity(data.rows);
-      const branchTotal=sourceWords.reduce((total,row)=>total+(row.branch_count||0),0);
-      const openTotal=sourceWords.reduce((total,row)=>total+(row.open_branch_count||0),0);
       const totalWords=data.total_source_word_count??sourceWords.length;
       const matchedWords=data.matched_source_word_count??sourceWords.length;
       const metrics=element("div","metrics");
-      metrics.append(metric("source words",sourceWords.length),metric("branches",branchTotal),metric("open",openTotal));
+      // The branch totals come from the model, which counts each branch once
+      // across the matched words; summing the per-word counts here would
+      // double-count a branch two words own.
+      metrics.append(metric("source words",matchedWords),metric("branches",data.matched_branch_count),metric("open",data.matched_open_branch_count));
       fragment.append(metrics,element("h2","","Source words"));
       if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+numText(totalWords)+" words match this state filter."));
+      const namedWord=(state.branch_target||"").trim();
       if(!sourceWords.length)fragment.append(element("p","empty",totalWords?"No source word matches this state filter":"No source-work requests"));
-      else if(!rows.length)fragment.append(element("p","dim","Pick a word to list the branches it owns."));
+      // A named word with no rows owns no live branch — its work has finished
+      // and released its ownership — which is a different thing from not
+      // having picked a word yet.
+      else if(!rows.length)fragment.append(element("p","dim",namedWord
+        ?namedWord.toUpperCase()+" owns no live branches: its work has finished and released them."
+        :"Pick a word to list the branches it owns."));
       const previousWords=previousBy(previous,"summary","source_word");
       const wordCard=row=>sourceWordCard(row,previousWords.get(String(row.source_word)),state,report.generated_at);
       if(data.summary_groups){

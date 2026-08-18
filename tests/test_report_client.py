@@ -2952,11 +2952,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         # branches between them read as three cards, and no branch card is
         # rendered until one of them is named.
         self.open_sources()
-        requests = self.page.locator("[data-grid-key=source-words] > .card")
+        requests = self.page.locator(".card.source-word")
         self.assertEqual(requests.count(), 3)
         self.assertEqual(
             self.page.locator("[data-grid-key=source-memberships]").count(), 0
         )
+        # Grouped by state out of the box: the fixture's two queued words and
+        # its one complete word read as two groups without touching a control.
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().group_by"), "state")
+        groups = self.page.locator(".source-word-groups > details")
+        self.assertEqual(groups.count(), 2)
+        self.assertEqual(
+            [" ".join(groups.nth(index).locator("summary strong").inner_text().split())
+             for index in range(2)],
+            ["queued", "complete"])
         metrics = " ".join(
             self.page.locator("#report .metrics").first.inner_text().split()
         )
@@ -2994,7 +3004,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#group-by option", "options => options.map(o => o.value)"),
-            ["", "state", "worker_presence", "priority"])
+            ["state", "worker_presence", "priority", "none"])
+        # State is the default, and "none" is an explicit choice rather than
+        # the absence of one.
+        self.assertEqual(self.page.locator("#group-by").input_value(), "state")
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
@@ -3007,18 +3020,22 @@ class ReportClientBrowserTest(unittest.TestCase):
           grouped: buildAPIURL(parsePageState({search:'?kind=sources&group_by=state'})),
           branchSort: buildAPIURL(parsePageState({search:'?kind=sources&sort=nodes'})),
           branchGroup: buildAPIURL(parsePageState({search:'?kind=sources&group_by=cache_state'})),
+          ungrouped: buildAPIURL(parsePageState({search:'?kind=sources&group_by=none'})),
           elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&source_state=queued'}))
         })""")
+        self.assertEqual(result["ungrouped"], "/api/view/sources?group_by=none")
         # URLSearchParams percent-encodes the separator; the server decodes it.
-        self.assertEqual(result["filtered"],
-                         "/api/view/sources?source_state=queued%2Cactive")
-        self.assertEqual(result["sorted"], "/api/view/sources?sort=branches")
+        self.assertEqual(
+            result["filtered"],
+            "/api/view/sources?source_state=queued%2Cactive&group_by=state")
+        self.assertEqual(result["sorted"],
+                         "/api/view/sources?sort=branches&group_by=state")
         self.assertEqual(result["grouped"], "/api/view/sources?group_by=state")
-        # A sort or grouping this report cannot serve is dropped rather than
-        # sent to be rejected, and the source filter never leaks to a report
-        # that would reject it.
-        self.assertEqual(result["branchSort"], "/api/view/sources")
-        self.assertEqual(result["branchGroup"], "/api/view/sources")
+        # A sort or grouping this report cannot serve falls back to the
+        # default rather than being sent to be rejected, and the source filter
+        # never leaks to a report that would reject it.
+        self.assertEqual(result["branchSort"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["branchGroup"], "/api/view/sources?group_by=state")
         self.assertEqual(result["elsewhere"], "/api/view/queue")
 
     def test_sources_pager_walks_the_word_list(self):
@@ -3097,7 +3114,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_sources_branch_cards_appear_only_for_the_named_word(self):
         self.open_sources()
-        self.page.locator("[data-grid-key=source-words] > .card").first.click()
+        self.page.locator(".card.source-word").first.click()
         self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
         ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
         self.assertEqual(ownership.count(), 4)
@@ -3125,7 +3142,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def open_named_source(self):
         self.open_sources()
-        self.page.locator("[data-grid-key=source-words] > .card").first.click()
+        self.page.locator(".card.source-word").first.click()
         self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
 
     def test_sources_metrics_survive_a_row_limit_truncating_the_grid(self):
@@ -3145,6 +3162,40 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("Shown 2 of 4 matched", report_text)
         self.assertIn("1 shared branch", report_text)
 
+    def test_named_word_with_no_live_branches_is_not_the_unpicked_state(self):
+        # An empty row list means two different things, and telling a reader
+        # to pick a word they have already picked is the wrong one.
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          report.data.rows = [];
+          report.data.matched_rows = 0;
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&branch_target=SALET'}));
+        }""")
+        text = " ".join(self.page.locator("#report").inner_text().split())
+        self.assertIn("SALET owns no live branches", text)
+        self.assertNotIn("Pick a word", text)
+        # Unpicked still points the way in.
+        self.open_sources()
+        self.assertIn("Pick a word to list the branches it owns.",
+                      self.page.locator("#report").inner_text())
+
+    def test_sources_metrics_count_a_branch_two_words_own_once(self):
+        # The totals come from the model, which counts each branch once; the
+        # client must not re-derive them by summing the per-word counts.
+        metrics = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          report.data.matched_branch_count = 900;
+          report.data.matched_open_branch_count = 700;
+          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          return document.querySelector('#report .metrics').innerText;
+        }""")
+        metrics = " ".join(metrics.split())
+        self.assertIn("900 branches", metrics)
+        self.assertIn("700 open", metrics)
+        # 1,376 is what summing the fixture's per-word counts would give.
+        self.assertNotIn("1,376", metrics)
+
     def test_sources_ownership_row_draws_its_lineage_as_a_spine_step(self):
         self.open_named_source()
         root_step = self.page.locator('[data-identity="1:02"] .word')
@@ -3153,7 +3204,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_sources_request_card_narrows_the_report_and_clears_it_again(self):
         self.open_sources()
-        card = self.page.locator("[data-grid-key=source-words] > .card").first
+        card = self.page.locator(".card.source-word").first
         card.click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === 'SALET'"
@@ -3163,7 +3214,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The card that set the filter is the one that clears it, and is drawn
         # as the filter in force while it is -- otherwise nothing in the view
         # widens it again.
-        marked = "[data-grid-key=source-words] > .card.filtered"
+        marked = ".card.source-word.filtered"
         self.page.wait_for_selector(marked).click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === ''"
@@ -3193,13 +3244,18 @@ class ReportClientBrowserTest(unittest.TestCase):
           filtered: buildAPIURL(parsePageState({search:'?kind=sources&branch_status=active&priority=3&sort=size&tree=1'})),
           limited: buildAPIURL(parsePageState({search:'?kind=sources&limit=2'}))
         })""")
-        self.assertEqual(result["explicit"], "/api/view/sources")
-        self.assertEqual(result["word"], "/api/view/sources?branch_target=SALET")
-        self.assertEqual(result["spineToWord"], "/api/view/sources?branch_target=CRANE")
-        self.assertEqual(result["branch"], "/api/view/sources")
-        self.assertEqual(result["reference"], "/api/view/sources")
-        self.assertEqual(result["filtered"], "/api/view/sources")
-        self.assertEqual(result["limited"], "/api/view/sources?limit=2")
+        # Grouping by state is the default, and the request says so rather
+        # than leaving the server to guess: a pasted URL reproduces the view.
+        self.assertEqual(result["explicit"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["word"],
+                         "/api/view/sources?branch_target=SALET&group_by=state")
+        self.assertEqual(result["spineToWord"],
+                         "/api/view/sources?branch_target=CRANE&group_by=state")
+        self.assertEqual(result["branch"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["reference"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["filtered"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["limited"],
+                         "/api/view/sources?group_by=state&limit=2")
 
     def test_worker_cards_name_the_scheduling_role_and_why(self):
         preferred = self.page.locator('.card.worker[data-identity="worker-0"]')

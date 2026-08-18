@@ -470,8 +470,11 @@ class SourcesRequestTest(unittest.TestCase):
                 queue_path, os.path.join(directory, "cache.sqlite3"),
                 "unused-answers", "unused-guesses",
             )
+            # The collapsed fixture stands in for the browser's default
+            # request, which groups by state, so the live comparison must ask
+            # for the same shape.
             live = collect_report(
-                sources, parse_report_request("/api/view/sources", "")
+                sources, parse_report_request("/api/view/sources", "group_by=state")
             )
             live_word = collect_report(
                 sources,
