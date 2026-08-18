@@ -1240,6 +1240,30 @@ class SourceReportTest(unittest.TestCase):
              self._source_words(sort="open")["summary"]],
             ["nurdy", "salet", "crane"])
 
+    def test_source_offset_pages_through_the_words(self):
+        self._queue_words(*[(word, 5, 1) for word in
+                            ("salet", "crane", "nurdy", "khaki", "penis")])
+
+        pages = [
+            self._source_words(sort="word", limit=2, source_offset=offset)
+            for offset in (0, 2, 4, 6)
+        ]
+
+        self.assertEqual(
+            [[row["source_word"] for row in page["summary"]] for page in pages],
+            [["crane", "khaki"], ["nurdy", "penis"], ["salet"], []],
+        )
+        # Every page reports the same matched total and its own start, which
+        # is what lets a client know it has more to page through.
+        for offset, page in zip((0, 2, 4, 6), pages):
+            self.assertEqual(page["matched_source_word_count"], 5)
+            self.assertEqual(page["source_word_offset"], offset)
+        # Paging is over the matched words, so a state filter repaginates
+        # rather than leaving holes where the filtered-out words were.
+        filtered = self._source_words(
+            sort="word", limit=2, source_offset=0, source_states=("queued",))
+        self.assertEqual(filtered["matched_source_word_count"], 5)
+
     def test_source_grouping_buckets_words_with_their_own_rollup(self):
         self._queue_words(("salet", 5, 3), ("crane", 5, 1), ("nurdy", 1, 7))
 
@@ -1263,6 +1287,7 @@ class SourceReportTest(unittest.TestCase):
     def test_source_only_filters_and_sorts_are_rejected_elsewhere(self):
         for filters, message in (
             ({"source_states": ("queued",)}, "source_state requires"),
+            ({"source_offset": 2}, "source_offset requires"),
             ({"sort": "branches"}, "requires a source report"),
         ):
             with self.subTest(filters=filters):

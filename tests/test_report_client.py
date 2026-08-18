@@ -3021,6 +3021,43 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["branchGroup"], "/api/view/sources")
         self.assertEqual(result["elsewhere"], "/api/view/queue")
 
+    def test_sources_pager_walks_the_word_list(self):
+        # The page size is the "Words per page" control; without a pager a
+        # limit would just truncate the list with no way to the rest.  The
+        # fixture server ignores query parameters, so the paged payload is
+        # applied directly -- the pager is what is under test.
+        def apply_page(offset, shown):
+            self.page.evaluate("""async ([offset, shown]) => {
+              const report = await (await fetch('/api/view/sources')).json();
+              report.data.matched_source_word_count = 12;
+              report.data.total_source_word_count = 12;
+              report.data.source_word_offset = offset;
+              report.data.summary = report.data.summary.slice(0, shown);
+              applyReport(report, null,
+                parsePageState({search:'?kind=sources&limit=3'}));
+            }""", [offset, shown])
+        apply_page(0, 3)
+        pager = self.page.locator(".source-word-pager")
+        self.assertIn("Showing 1–3 of 12 words",
+                      " ".join(pager.inner_text().split()))
+        previous_button = pager.locator("button", has_text="Prev")
+        next_button = pager.locator("button", has_text="Next")
+        # Nothing before the first page, and nothing after the last.
+        self.assertTrue(previous_button.is_disabled())
+        self.assertFalse(next_button.is_disabled())
+        apply_page(9, 3)
+        self.assertIn("Showing 10–12 of 12 words",
+                      " ".join(pager.inner_text().split()))
+        self.assertFalse(pager.locator("button", has_text="Prev").is_disabled())
+        self.assertTrue(pager.locator("button", has_text="Next").is_disabled())
+
+    def test_sources_pager_is_absent_without_a_page_size(self):
+        self.open_sources()
+        self.assertEqual(self.page.locator(".source-word-pager").count(), 0)
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().source_offset"),
+            None)
+
     def test_sources_grouping_buckets_cards_under_their_rollup(self):
         # The fixture server ignores query parameters, so the grouped payload
         # is applied directly -- the renderer is what is under test.

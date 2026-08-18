@@ -72,6 +72,7 @@
     ],
     "total_source_word_count": 3,
     "matched_source_word_count": 3,
+    "source_word_offset": 0,
     "matched_rows": 0,
     "shared_branch_count": 0,
     "rows": []

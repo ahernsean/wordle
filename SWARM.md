@@ -214,9 +214,15 @@ word's own lifecycle, not a branch's, so it is a separate filter from
 10`, so a filtered report never looks like the whole queue. `--sort` takes
 `word`, `priority` (the default, and the order the swarm serves them in),
 `branches`, `open`, `done`, `workers`, or `age`; those four source-only sorts
-are rejected for other reports rather than silently ignored. Grouping is
-browser-only: the Sources tab groups by state, worker presence, or priority,
-each group collapsing under a rollup of the words it holds.
+are rejected for other reports rather than silently ignored. `--limit` caps
+the rows the terminal prints, and the count says so (`Source words: 3 of 10`).
+
+Grouping and paging are browser-only. The Sources tab groups by state, worker
+presence, or priority, each group collapsing under a rollup of the words it
+holds. There, `limit` is a page size rather than a cap: with `source_offset`
+it pages the word list (`Showing 6–10 of 12 words`), so the words past the
+first page stay reachable. Changing a filter, the sort or the grouping returns
+to the first page, since page 3 of one ordering is not page 3 of another.
 
 A trailing word narrows to that word's request(s) **and** lists the branches
 it owns — including branches shared with another request, shown as one row per

@@ -52,7 +52,7 @@ FIXTURE_FILENAMES = (
 BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
 INTEGER_PARAMETERS = {
     "minimum_answer_count", "maximum_answer_count", "budget", "priority",
-    "limit", "epoch", "since_seconds", "sample_size",
+    "limit", "epoch", "since_seconds", "sample_size", "source_offset",
 }
 SCALAR_PARAMETERS = {
     "branch_target", "sort", "group_by", "by", "worker", "branch_status",
@@ -281,6 +281,7 @@ def parse_report_request(path, query):
         sort=sort,
         group_by=group_by,
         source_states=source_states,
+        source_offset=integer_values["source_offset"],
         limit=limit,
         finalization_cursor_direction=finalization_cursor_direction,
         finalization_cursor_recorded_at=finalization_cursor_recorded_at,

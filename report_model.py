@@ -112,6 +112,7 @@ class ReportFilters:
     finalization_cursor_id: int | None = None
     group_by: str | None = None
     source_states: tuple[str, ...] = ()
+    source_offset: int | None = None
 
 
 BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
@@ -244,6 +245,11 @@ def validate_report_request(request: ReportRequest) -> None:
         )
     if request.filters.source_states and report_kind != "sources":
         raise ValueError("source_state requires a source report")
+    if request.filters.source_offset is not None:
+        if report_kind != "sources":
+            raise ValueError("source_offset requires a source report")
+        if request.filters.source_offset < 0:
+            raise ValueError("source_offset cannot be negative")
     if request.filters.sort is not None:
         if report_kind == "sources":
             if request.filters.sort not in SOURCE_SORT_FIELDS:
@@ -2794,8 +2800,8 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     priority reported alongside each owner's individually requested priority."""
     generated_at = int(time.time())
     data = {"summary": [], "total_source_word_count": 0,
-            "matched_source_word_count": 0, "matched_rows": 0,
-            "shared_branch_count": 0, "rows": []}
+            "matched_source_word_count": 0, "source_word_offset": 0,
+            "matched_rows": 0, "shared_branch_count": 0, "rows": []}
     report = _semantic_report(
         "sources", sources, request.branch_target, generated_at, data, request
     )
@@ -2826,9 +2832,18 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             collapsed = [row for row in collapsed
                          if row["state"] in source_states]
         collapsed = _sorted_source_words(collapsed, request.filters.sort)
-        limit = request.filters.limit
         data["matched_source_word_count"] = len(collapsed)
-        data["summary"] = collapsed[:limit] if limit is not None else collapsed
+        # limit is a page size and source_offset is where that page starts, so
+        # the words past the first page stay reachable rather than truncated
+        # away.  An offset past the end yields an empty page, not the last one:
+        # the count above is what tells the client how far it can page.
+        offset = request.filters.source_offset or 0
+        limit = request.filters.limit
+        data["source_word_offset"] = offset
+        data["summary"] = (
+            collapsed[offset:offset + limit] if limit is not None
+            else collapsed[offset:]
+        )
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_source_words(
