@@ -173,8 +173,9 @@ def _display_reference(branch_reference):
 
     Resolution runs against the whole cache, not just the live branches a
     report happens to show, so the prefix must stay unique over that larger
-    population: at ~569,000 distinct branches, 8 hex characters gives ~6.7e-5
-    expected collisions. Any prefix remains a valid @reference branch_target.
+    population: at 288,095 distinct cached branches, 8 hex characters gives
+    ~6.7e-5 expected other branches sharing a given printed handle
+    (288,095 / 16**8). Any prefix remains a valid @reference branch_target.
     """
     return branch_reference[:8]
 
@@ -189,7 +190,7 @@ def _ambiguous_reference_lines(error, sources, request):
             preview += "…"
         lines.append(
             f"  @{candidate['branch_reference']} "
-            f"n={candidate['answer_count']} {preview}"
+            f"n={candidate['answer_count']:,} {preview}"
         )
         if candidate["spine"]:
             spine_text = " ".join(
@@ -1960,17 +1961,28 @@ class WatchSession:
         else:
             self._run_non_tty_text()
 
+    def _error_lines(self, error):
+        """Render a caught report-collection error for display.
+
+        An ambiguous @reference carries the candidates the resolver already
+        found; showing them is best-effort so a failure while decoding them
+        (e.g. an unreadable answer list) still surfaces the original error
+        rather than replacing it with a new one.
+        """
+        if hasattr(error, "candidates"):
+            try:
+                return _ambiguous_reference_lines(
+                    error, self._sources(), self.current_request
+                )
+            except Exception:
+                pass
+        return [f"view: {error}"]
+
     def _run_once(self):
         try:
             report = self._collect()
         except Exception as error:
-            if hasattr(error, "candidates"):
-                lines = _ambiguous_reference_lines(
-                    error, self._sources(), self.current_request
-                )
-            else:
-                lines = [f"view: {error}"]
-            self.error_stream.write("\n".join(lines) + "\n")
+            self.error_stream.write("\n".join(self._error_lines(error)) + "\n")
             raise SystemExit(1)
         if self.args.format == "jsonl":
             self.output_stream.write(
@@ -1995,13 +2007,9 @@ class WatchSession:
                     )
                     self.output_stream.flush()
                 except Exception as error:
-                    if hasattr(error, "candidates"):
-                        lines = _ambiguous_reference_lines(
-                            error, self._sources(), self.current_request
-                        )
-                    else:
-                        lines = [f"view: {error}"]
-                    self.error_stream.write("\n".join(lines) + "\n")
+                    self.error_stream.write(
+                        "\n".join(self._error_lines(error)) + "\n"
+                    )
                     self.error_stream.flush()
                 time.sleep(self.args.watch)
         except KeyboardInterrupt:
@@ -2022,7 +2030,9 @@ class WatchSession:
                     ) + "\n")
                     self.previous_report = report
                 except Exception as error:
-                    self.output_stream.write(f"--- error ---\nview: {error}\n")
+                    self.output_stream.write(
+                        "--- error ---\n" + "\n".join(self._error_lines(error)) + "\n"
+                    )
                 self.output_stream.flush()
                 time.sleep(self.args.watch)
         except KeyboardInterrupt:
@@ -2138,7 +2148,10 @@ class WatchSession:
                         + self._navigation_section()
                     )
                 except Exception as error:
-                    sections = [("error", ["Error", f"  view: {error}"])]
+                    sections = [(
+                        "error",
+                        ["Error"] + ["  " + line for line in self._error_lines(error)],
+                    )]
                     report = None
                 if not self.previous_sections:
                     self._write_initial_sections(sections)
