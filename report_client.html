@@ -434,6 +434,7 @@
       if(normalized.kind==="auto"&&normalized.branch_target===""){normalized.answers=false;normalized.claims=false;}
       const inferredWord=isInferredWordState(normalized.kind,normalized.branch_target);
       if(inferredWord&&!['size','workers','priority'].includes(normalized.sort))normalized.sort="size";
+      if(inferredWord&&!GROUP_BY_OPTIONS_WORD.some(([value])=>value===normalized.group_by))normalized.group_by="";
       if(!inferredWord&&normalized.kind!=="sources")normalized.group_by="";
       return normalized;
     }
@@ -1334,11 +1335,17 @@
       // A word usually holds one request; the count is shown only where the
       // word was queued more than once and its rows are merged.
       if(row.request_count>1)title.append(element("span","chip",numText(row.request_count)+" requests"));
+      // The branch list is the other thing this card leads to, so it gets its
+      // own control rather than taking the card's own click.
+      const branchesButton=element("button","",isFiltered?"Hide branches":"Branches");
+      branchesButton.addEventListener("click",event=>{event.stopPropagation();setState({...state,kind:"sources",branch_target:isFiltered?"":word});});
+      title.append(branchesButton);
       card.append(title);
       // How far along the word is, as one bar: every branch it has ever
       // owned, against those that have finished.
       if(row.branch_count){const line=element("div","progress-line");line.append(progress(row.done_branch_count,row.branch_count));card.append(line);}
       card.append(statLine([
+        sourceWordErdText(row.erd_summary),
         "priority "+valueOrDash(row.requested_priority),
         numText(row.branch_count)+(row.branch_count===1?" branch":" branches"),
         numText(row.open_branch_count)+" open",
@@ -1347,7 +1354,7 @@
         row.worker_count?numText(row.worker_count)+(row.worker_count===1?" worker":" workers"):null,
         row.requested_at===null||row.requested_at===undefined?null:"requested "+relativeAge(row.requested_at,generatedAt),
       ]));
-      card.addEventListener("click",()=>setState({...state,kind:"sources",branch_target:isFiltered?"":word}));
+      card.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:word,tree:false,claims:false,answers:false,finalization_cursor:""}));
       return card;
     }
     function sourceMembershipCard(row,previous){
@@ -1369,6 +1376,15 @@
       ]));
       card.addEventListener("click",()=>navigateBranch(row));
       return card;
+    }
+    // A word's ERD is the point of queueing it: exact once every response
+    // group is solved, unbounded once one is proven unsolvable, and a solved
+    // count while it is still being searched.
+    function sourceWordErdText(summary){
+      if(!summary)return null;
+      if(summary.state==="complete")return "ERD "+fixed(summary.erd,3)+" · max "+valueOrDash(summary.max_remaining_depth);
+      if(summary.state==="infeasible")return "ERD ∞ · "+numText(summary.infeasible_group_count)+" unsolvable";
+      return "ERD pending · "+numText(summary.resolved_group_count)+"/"+numText(summary.response_group_count)+" groups solved";
     }
     // The page size is the "Words per page" control, so a limit that would
     // otherwise just truncate the list becomes a page through it.  With no

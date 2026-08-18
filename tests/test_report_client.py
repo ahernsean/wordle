@@ -3112,9 +3112,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.locator(".source-word-groups .card").count(), 3)
 
-    def test_sources_branch_cards_appear_only_for_the_named_word(self):
+    def test_sources_card_opens_the_word_report_where_its_erd_lives(self):
+        # The card leads to the word report: that is where a word's ERD,
+        # response groups and root progress are, and it is what an operator
+        # reaches for after seeing a word listed.
         self.open_sources()
         self.page.locator(".card.source-word").first.click()
+        self.page.wait_for_selector("text=word report")
+        self.assertIn("branch_target=SALET", self.page.url)
+        self.assertNotIn("kind=sources", self.page.url)
+        # The source-only grouping cannot be served by a word report, so it
+        # must not ride along into a request that would be rejected.
+        self.assertNotIn("group_by", self.page.url)
+
+    def test_sources_card_shows_the_words_own_erd(self):
+        self.open_sources()
+        cards = {
+            card.locator("[data-spine]").first.get_attribute("data-spine"):
+                " ".join(card.inner_text().split())
+            for card in self.page.locator(".card.source-word").all()
+        }
+        # Complete: the exact ERD and the worst-case line it earned.
+        self.assertIn("ERD 3.421 · max 5", cards["RAISE"])
+        self.assertIn("ERD 3.389 · max 4", cards["CRANE"])
+        # Still searching: how much of it is solved, not a number that moves.
+        self.assertIn("ERD pending · 96/148 groups solved", cards["SALET"])
+
+    def test_sources_branch_cards_appear_only_for_the_named_word(self):
+        self.open_sources()
+        self.page.locator(".card.source-word").first.locator(
+            "button", has_text="Branches").click()
         self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
         ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
         self.assertEqual(ownership.count(), 4)
@@ -3142,7 +3169,8 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def open_named_source(self):
         self.open_sources()
-        self.page.locator(".card.source-word").first.click()
+        self.page.locator(".card.source-word").first.locator(
+            "button", has_text="Branches").click()
         self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
 
     def test_sources_metrics_survive_a_row_limit_truncating_the_grid(self):
@@ -3175,10 +3203,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = " ".join(self.page.locator("#report").inner_text().split())
         self.assertIn("SALET owns no live branches", text)
         self.assertNotIn("Pick a word", text)
-        # Unpicked still points the way in.
+        # Unpicked still points the way in.  Waited for rather than asserted
+        # outright: the applied payload above already rendered a sources
+        # report, so "sources report" is on screen before the refetch lands.
         self.open_sources()
-        self.assertIn("Pick a word to list the branches it owns.",
-                      self.page.locator("#report").inner_text())
+        self.page.wait_for_selector(
+            "text=Pick a word to list the branches it owns.")
 
     def test_sources_metrics_count_a_branch_two_words_own_once(self):
         # The totals come from the model, which counts each branch once; the
@@ -3202,10 +3232,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(root_step.count(), 1)
         self.assertEqual(root_step.get_attribute("data-spine"), "SALET -y---")
 
-    def test_sources_request_card_narrows_the_report_and_clears_it_again(self):
+    def test_sources_branches_control_narrows_the_report_and_clears_it_again(self):
         self.open_sources()
         card = self.page.locator(".card.source-word").first
-        card.click()
+        card.locator("button", has_text="Branches").click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === 'SALET'"
         )
@@ -3215,7 +3245,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         # as the filter in force while it is -- otherwise nothing in the view
         # widens it again.
         marked = ".card.source-word.filtered"
-        self.page.wait_for_selector(marked).click()
+        self.page.wait_for_selector(marked)
+        self.page.locator(marked).locator(
+            "button", has_text="Hide branches").click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === ''"
         )

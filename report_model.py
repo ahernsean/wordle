@@ -2723,6 +2723,67 @@ def _grouped_source_words(rows, group_by):
     return [grouped[key] for key in sorted(grouped)]
 
 
+def _source_word_erd_summaries(sources, source_words, report):
+    """Fold each word's response groups into its own ERD.
+
+    A source word's ERD is the whole point of queueing it, and it is not
+    stored: it is folded from the cached result of each of the word's response
+    groups, the same way the word report folds it for one word.  Only the words
+    on the page are folded, so the cost is bounded by the page size rather than
+    by how much is queued.
+    """
+    summaries = {}
+    if not source_words:
+        return summaries
+    cache = None
+    try:
+        all_answers = load_word_list(sources.answer_list_path)
+        response_cache = ResponseCache(all_answers, score_cache=None)
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+        # A root word spends the first guess, leaving the rest for its groups.
+        group_budget = GAME_GUESSES - 1
+        for word in source_words:
+            if word is None:
+                continue
+            groups = response_cache.group_words(word, all_answers)
+            group_rows = []
+            branch_keys = []
+            for pattern_code, answer_words in sorted(groups.items()):
+                if not answer_words:
+                    continue
+                branch_key = ScoreCache.encode_subset(answer_words)
+                branch_keys.append(branch_key)
+                group_rows.append({
+                    "pattern": fmt_pattern(pattern_code),
+                    "answer_count": len(answer_words),
+                    "branch_key": branch_key,
+                })
+            states = cache.report_branch_states(
+                branch_keys, ERD_ALL, group_budget
+            )
+            summaries[word] = _candidate_erd_summary([
+                {
+                    "pattern": row["pattern"],
+                    "answer_count": row["answer_count"],
+                    "best_erd": states[bytes(row["branch_key"])]["best_erd"],
+                    "max_remaining_depth":
+                        states[bytes(row["branch_key"])]["max_remaining_depth"],
+                    "cache_state":
+                        states[bytes(row["branch_key"])]["cache_state"],
+                }
+                for row in group_rows
+            ], group_budget)
+        report["sources"]["cache"]["ok"] = True
+    except (sqlite3.Error, OSError) as error:
+        report["sources"]["cache"]["error"] = str(error)
+    finally:
+        if cache is not None:
+            cache.close()
+    return summaries
+
+
 def _source_rollups(membership_rows):
     """Per-word live-branch totals, keyed by source word.
 
@@ -2868,6 +2929,12 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             collapsed[offset:offset + limit] if limit is not None
             else collapsed[offset:]
         )
+        # Folded for the page only, and attached to the rows it describes.
+        erd_summaries = _source_word_erd_summaries(
+            sources, [row["source_word"] for row in data["summary"]], report
+        )
+        for row in data["summary"]:
+            row["erd_summary"] = erd_summaries.get(row["source_word"])
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_source_words(

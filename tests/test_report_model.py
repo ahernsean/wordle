@@ -1240,6 +1240,51 @@ class SourceReportTest(unittest.TestCase):
              self._source_words(sort="open")["summary"]],
             ["nurdy", "salet", "crane"])
 
+    def test_each_source_word_carries_its_own_erd(self):
+        # A word's ERD is why it was queued, and it is folded from its cached
+        # response groups rather than stored, so the report must do the fold.
+        # NURDY is the one of these that leaves a two-answer group, so it is
+        # the one whose ERD needs the cache; the others partition this answer
+        # list into singletons, which are solved by playing them.
+        self._queue_words(("nurdy", 5, 1), ("crane", 3, 1))
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        response_cache = ResponseCache(ANSWERS, score_cache=None)
+        now = int(time.time())
+        for _pattern_code, words in response_cache.group_words(
+                "crane", ANSWERS).items():
+            if not words:
+                continue
+            cache._conn.execute(
+                "INSERT OR REPLACE INTO branch_best_by_policy "
+                "(branch_key, policy, answer_list_id, best_guess, best_score, "
+                " max_depth, solve_budget, updated_at) "
+                "VALUES (?, ?, ?, 'salet', 1.0, 1, ?, ?)",
+                (ScoreCache.encode_subset(words), ERD_ALL,
+                 cache.answer_list_id, GAME_GUESSES - 1, now),
+            )
+        cache._conn.commit()
+        cache.close()
+
+        rows = {row["source_word"]: row
+                for row in self._source_words()["summary"]}
+
+        # Every group of CRANE is solved, so its ERD is exact: the guess
+        # itself, plus the mean of its groups -- and the all-green group costs
+        # nothing, since that guess was the answer.  1 + (0+1+1+1)/4.
+        crane = rows["crane"]["erd_summary"]
+        self.assertEqual(crane["state"], "complete")
+        self.assertEqual(crane["erd"], 1.75)
+        self.assertEqual(crane["max_remaining_depth"], 2)
+        # NURDY's two-answer group has nothing cached, so it reports how far
+        # along it is rather than a number that would move under the reader.
+        nurdy = rows["nurdy"]["erd_summary"]
+        self.assertEqual(nurdy["state"], "pending")
+        self.assertIsNone(nurdy["erd"])
+        # Its two singleton groups are solved by playing them; the
+        # two-answer group is the one still outstanding.
+        self.assertEqual(nurdy["resolved_group_count"], 2)
+        self.assertEqual(nurdy["response_group_count"], 3)
+
     def test_branch_totals_count_a_shared_branch_once(self):
         # Two different words owning one branch is the case the report exists
         # to show, and it is exactly where summing per-word counts goes wrong.

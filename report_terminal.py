@@ -1474,6 +1474,17 @@ def _render_hotspot_sections(report, width, display_order):
     return [("header", header), ("hotspots", lines)]
 
 
+def _display_source_erd(summary):
+    """A word's own ERD, once every one of its response groups is solved."""
+    if not summary:
+        return "—"
+    if summary["state"] == "complete":
+        return f"{summary['erd']:.3f}"
+    if summary["state"] == "infeasible":
+        return "∞"
+    return f"{summary['resolved_group_count']:,}/{summary['response_group_count']:,}"
+
+
 def _source_display_row(source, generated_at):
     requested_at = source.get("requested_at")
     return {
@@ -1481,6 +1492,7 @@ def _source_display_row(source, generated_at):
         "display_requests": f"{source.get('request_count', 1):,}",
         "display_word": (source["source_word"] or "-").upper(),
         "display_state": source["state"],
+        "display_erd": _display_source_erd(source.get("erd_summary")),
         "display_direct": f"{source['direct_branch_count']:,}",
         "display_branches": f"{source['branch_count']:,}",
         "display_open": f"{source.get('open_branch_count', 0):,}",
@@ -1507,6 +1519,7 @@ def _source_columns(summary):
             "Pri", "requested_priority", required=True, alignment="right"
         ),
         TerminalColumn("State", "display_state", required=True),
+        TerminalColumn("ERD", "display_erd", required=True, alignment="right"),
         TerminalColumn(
             "Open", "display_open", required=True, alignment="right"
         ),

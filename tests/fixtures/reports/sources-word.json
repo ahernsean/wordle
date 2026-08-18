@@ -43,7 +43,15 @@
         "open_branch_count": 1203,
         "done_branch_count": 37,
         "worker_count": 3,
-        "direct_branch_count": 12
+        "direct_branch_count": 12,
+        "erd_summary": {
+          "state": "pending",
+          "erd": null,
+          "max_remaining_depth": null,
+          "response_group_count": 148,
+          "resolved_group_count": 96,
+          "infeasible_group_count": 0
+        }
       }
     ],
     "total_source_word_count": 1,

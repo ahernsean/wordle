@@ -196,9 +196,19 @@ renders and caches it per target; the terminal report pays it on each run.
 
 `--sources` reports one row per source word — ten queued root words are ten
 rows, whatever the branch count underneath them. Each row carries the word's
-requested priority, its state, how many branches it has ever owned, how many
-of those are still open versus done, the live workers on them, and how long
-ago it was requested. `Direct` counts the branches the word asked for outright
+requested priority, its state, its own ERD, how many branches it has ever
+owned, how many of those are still open versus done, the live workers on them,
+and how long ago it was requested.
+
+The `ERD` column is the word's own expected remaining depth, folded from the
+cached result of each of its response groups the way the word report folds it:
+an exact value once every group is solved, `∞` once one is proven unsolvable,
+and `solved/total` groups while it is still being searched. The fold is done
+only for the rows on the page — about 6 ms a word against the full answer list
+— so a long queue costs no more than a short one. In the browser the same
+number is on each card, and clicking the card opens that word's full report,
+where its response groups and root progress are; the card's own `Branches`
+control is what lists the branches it owns. `Direct` counts the branches the word asked for outright
 — its own response groups; `Branches` spans every depth beneath it, so
 sub-branches promoted during the search are included too, and the two are
 equal until promotion starts.

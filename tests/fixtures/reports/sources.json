@@ -43,7 +43,15 @@
         "open_branch_count": 1203,
         "done_branch_count": 37,
         "worker_count": 3,
-        "direct_branch_count": 12
+        "direct_branch_count": 12,
+        "erd_summary": {
+          "state": "pending",
+          "erd": null,
+          "max_remaining_depth": null,
+          "response_group_count": 148,
+          "resolved_group_count": 96,
+          "infeasible_group_count": 0
+        }
       },
       {
         "source_word": "raise",
@@ -55,7 +63,15 @@
         "open_branch_count": 8,
         "done_branch_count": 88,
         "worker_count": 1,
-        "direct_branch_count": 4
+        "direct_branch_count": 4,
+        "erd_summary": {
+          "state": "complete",
+          "erd": 3.4207,
+          "max_remaining_depth": 5,
+          "response_group_count": 132,
+          "resolved_group_count": 132,
+          "infeasible_group_count": 0
+        }
       },
       {
         "source_word": "crane",
@@ -67,7 +83,15 @@
         "open_branch_count": 0,
         "done_branch_count": 40,
         "worker_count": 0,
-        "direct_branch_count": 2
+        "direct_branch_count": 2,
+        "erd_summary": {
+          "state": "complete",
+          "erd": 3.3891,
+          "max_remaining_depth": 4,
+          "response_group_count": 141,
+          "resolved_group_count": 141,
+          "infeasible_group_count": 0
+        }
       }
     ],
     "summary_groups": [
@@ -84,7 +108,15 @@
             "open_branch_count": 1203,
             "done_branch_count": 37,
             "worker_count": 3,
-            "direct_branch_count": 12
+            "direct_branch_count": 12,
+            "erd_summary": {
+              "state": "pending",
+              "erd": null,
+              "max_remaining_depth": null,
+              "response_group_count": 148,
+              "resolved_group_count": 96,
+              "infeasible_group_count": 0
+            }
           },
           {
             "source_word": "raise",
@@ -96,7 +128,15 @@
             "open_branch_count": 8,
             "done_branch_count": 88,
             "worker_count": 1,
-            "direct_branch_count": 4
+            "direct_branch_count": 4,
+            "erd_summary": {
+              "state": "complete",
+              "erd": 3.4207,
+              "max_remaining_depth": 5,
+              "response_group_count": 132,
+              "resolved_group_count": 132,
+              "infeasible_group_count": 0
+            }
           }
         ],
         "rollup": {
@@ -120,7 +160,15 @@
             "open_branch_count": 0,
             "done_branch_count": 40,
             "worker_count": 0,
-            "direct_branch_count": 2
+            "direct_branch_count": 2,
+            "erd_summary": {
+              "state": "complete",
+              "erd": 3.3891,
+              "max_remaining_depth": 4,
+              "response_group_count": 141,
+              "resolved_group_count": 141,
+              "infeasible_group_count": 0
+            }
           }
         ],
         "rollup": {
