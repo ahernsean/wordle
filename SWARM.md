@@ -198,7 +198,7 @@ renders and caches it per target; the terminal report pays it on each run.
 rows, whatever the branch count underneath them. Each row carries the word's
 requested priority, its state, how many branches it has ever owned, how many
 of those are still open versus done, the live workers on them, and how long
-ago it was requested. `Roots` counts the branches the word asked for directly
+ago it was requested. `Direct` counts the branches the word asked for outright
 — its own response groups; `Branches` spans every depth beneath it, so
 sub-branches promoted during the search are included too, and the two are
 equal until promotion starts.

@@ -4607,9 +4607,9 @@ class ERDQueue:
         therefore counted distinctly rather than summed across requests, which
         would report a shared branch once per owning request.
 
-        root_count counts the branches the requests asked for directly; a
-        branch acquired later by promotion carries a parent_branch_id and is
-        counted only in branch_count.
+        direct_branch_count counts the branches the requests asked for
+        directly; a branch acquired later by promotion carries a
+        parent_branch_id and is counted only in branch_count.
         """
         return self._conn.execute("""
             SELECT s.source_word,
@@ -4620,7 +4620,8 @@ class ERDQueue:
                    MAX(s.state != 'complete') AS has_incomplete_request,
                    COUNT(DISTINCT m.branch_id) AS branch_count,
                    COUNT(DISTINCT CASE WHEN m.parent_branch_id IS NULL
-                                       THEN m.branch_id END) AS root_count
+                                       THEN m.branch_id END)
+                       AS direct_branch_count
             FROM source_work s
             LEFT JOIN branch_source_work m
               ON m.source_work_id = s.source_work_id

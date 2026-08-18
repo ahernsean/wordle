@@ -97,8 +97,8 @@
     .grid.leaderboard { grid-template-columns:minmax(0,1fr); gap:.65rem; }
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
     .section { margin:.45rem 0; }
-    .card.active, .card[aria-current="true"] { border-color:var(--green); }
-    .card[aria-current="true"] { background:#edf5ec; }
+    .card.active, .card.filtered { border-color:var(--green); }
+    .card.filtered { background:#edf5ec; }
     .card.finalizing, .stale { border-color:var(--amber); }
     .card.transitioning { border-color:var(--dim); }
     .dead { border-color:var(--red); }
@@ -1295,7 +1295,7 @@
       // however many requests that word holds.
       const word=String(row.source_word||"").toUpperCase();
       const isFiltered=state.branch_target.toUpperCase()===word&&word!=="";
-      if(isFiltered)card.setAttribute("aria-current","true");
+      if(isFiltered)card.classList.add("filtered");
       const title=element("div","card-title");
       title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)));
       // A word usually holds one request; the count is shown only where the
@@ -1310,7 +1310,7 @@
         numText(row.branch_count)+(row.branch_count===1?" branch":" branches"),
         numText(row.open_branch_count)+" open",
         numText(row.done_branch_count)+" done",
-        numText(row.root_count)+(row.root_count===1?" root":" roots"),
+        numText(row.direct_branch_count)+" direct",
         row.worker_count?numText(row.worker_count)+(row.worker_count===1?" worker":" workers"):null,
         row.requested_at===null||row.requested_at===undefined?null:"requested "+relativeAge(row.requested_at,generatedAt),
       ]));

@@ -209,7 +209,7 @@ class TestQueueSourcePriority(unittest.TestCase):
         self.assertIn('--source-work-id', output)
         for source_work_id in ids:
             self.assertIn(f'id {source_work_id}', output)
-        self.assertIn('root(s)', output)
+        self.assertIn('direct', output)
         self.assertIn('branch(es)', output)
         self.assertIn('queued', output)
 

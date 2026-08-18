@@ -536,7 +536,7 @@ def cmd_queue_source_priority(args):
                         row['requested_at']).strftime('%Y-%m-%d %H:%M')
                     print(f'  id {candidate_id}  '
                           f'priority {row["requested_priority"]}  '
-                          f'{row["state"]}  {row["root_count"]} root(s), '
+                          f'{row["state"]}  {row["root_count"]} direct, '
                           f'{row["branch_count"]} branch(es)  '
                           f'requested {requested_at}')
                 return

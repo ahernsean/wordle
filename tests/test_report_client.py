@@ -2967,7 +2967,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("1,240 branches", request_text)
         self.assertIn("1,203 open", request_text)
         self.assertIn("37 done", request_text)
-        self.assertIn("12 roots", request_text)
+        self.assertIn("12 direct", request_text)
         self.assertIn("3 workers", request_text)
         self.assertIn("Pick a word to list the branches it owns.",
                       self.page.locator("#report").inner_text())
@@ -3040,10 +3040,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.assertIn("kind=sources", self.page.url)
         self.assertIn("branch_target=SALET", self.page.url)
-        # The card that set the filter is the one that clears it, and says so
-        # while it is the filter in force -- otherwise nothing in the view
+        # The card that set the filter is the one that clears it, and is drawn
+        # as the filter in force while it is -- otherwise nothing in the view
         # widens it again.
-        marked = "[data-grid-key=source-words] > .card[aria-current=\"true\"]"
+        marked = "[data-grid-key=source-words] > .card.filtered"
         self.page.wait_for_selector(marked).click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === ''"

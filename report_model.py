@@ -2594,9 +2594,14 @@ def _source_summary_payload(row, rollup):
 
     This is the report's unit: a word that spawned a thousand branches is one
     row, not a thousand, and a word requested more than once is still one row.
-    root_count and branch_count span every branch the word's requests have ever
-    owned; the rollup counts only those still owned live, so a branch that
-    finalized and released its ownership reads as done.
+    direct_branch_count and branch_count span every branch the word's requests
+    have ever owned; the rollup counts only those still owned live, so a branch
+    that finalized and released its ownership reads as done.
+
+    direct_branch_count is the branches the word asked for outright — its own
+    response groups.  A branch the search promoted under that word's ownership
+    later counts only in branch_count, so the two are equal until promotion
+    starts.
     """
     source_word = _row_value(row, "source_word")
     branch_count = row["branch_count"] or 0
@@ -2607,7 +2612,7 @@ def _source_summary_payload(row, rollup):
         "requested_at": _row_value(row, "requested_at"),
         "request_count": row["request_count"] or 0,
         "state": _merged_source_state(row),
-        "root_count": row["root_count"] or 0,
+        "direct_branch_count": row["direct_branch_count"] or 0,
         "branch_count": branch_count,
         "open_branch_count": open_branch_count,
         "done_branch_count": max(0, branch_count - open_branch_count),

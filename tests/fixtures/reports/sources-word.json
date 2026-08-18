@@ -39,11 +39,11 @@
         "requested_at": 400,
         "request_count": 2,
         "state": "queued",
-        "root_count": 12,
         "branch_count": 1240,
         "open_branch_count": 1203,
         "done_branch_count": 37,
-        "worker_count": 3
+        "worker_count": 3,
+        "direct_branch_count": 12
       }
     ],
     "matched_rows": 4,

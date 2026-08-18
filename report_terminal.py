@@ -1457,7 +1457,7 @@ def _source_display_row(source, generated_at):
         "display_requests": f"{source.get('request_count', 1):,}",
         "display_word": (source["source_word"] or "-").upper(),
         "display_state": source["state"],
-        "display_roots": f"{source['root_count']:,}",
+        "display_direct": f"{source['direct_branch_count']:,}",
         "display_branches": f"{source['branch_count']:,}",
         "display_open": f"{source.get('open_branch_count', 0):,}",
         "display_done": f"{source.get('done_branch_count', 0):,}",
@@ -1494,7 +1494,7 @@ def _source_columns(summary):
             alignment="right",
         ),
         TerminalColumn(
-            "Roots", "display_roots", remove_priority=20, alignment="right"
+            "Direct", "display_direct", remove_priority=20, alignment="right"
         ),
         TerminalColumn(
             "W", "display_workers", remove_priority=30, alignment="right"
