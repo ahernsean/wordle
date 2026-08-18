@@ -5,17 +5,20 @@ from copy import deepcopy
 import io
 import json
 import os
+import random
 import shlex
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from cache_sqlite import ScoreCache, branch_reference
 import erd_search
 from erd_queue import ERDQueue, encode_subset
 import report_terminal
 from report_model import ReportFilters, parse_report_branch_target
 from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
+from wordle_engine import ERD_ALL
 
 
 def overview_report():
@@ -328,20 +331,23 @@ class OverviewRendererTest(unittest.TestCase):
             "worker_id": "worker-12", "worker_number": "12",
         })
 
+        # The Ref column holds an eight-character reference plus its "@", so
+        # each threshold below is the narrowest width at which the columns
+        # listed still fit.
         expected_branch_headings = {
-            50: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
-            55: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
-            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
-            60: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
-            79: (
+            54: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
+            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
+            63: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
+            64: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
+            83: (
                 "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
-            80: (
+            84: (
                 "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
-            120: (
+            124: (
                 "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD", "ETA",
             ),
@@ -1082,6 +1088,70 @@ class ViewSessionTest(unittest.TestCase):
         self.assertIn("--- generated_at=1000 ---", output.getvalue())
         self.assertNotIn("\033", output.getvalue())
 
+    def test_non_tty_watch_lists_ambiguity_candidates_on_error(self):
+        first_key = encode_subset(["salet", "crane"])
+        second_key = encode_subset(["nurdy", "khaki"])
+        error = ValueError("branch reference @abcd is ambiguous")
+        error.candidates = [
+            {"branch_reference": branch_reference(first_key),
+             "branch_key": first_key, "spine": "salet -----"},
+            {"branch_reference": branch_reference(second_key),
+             "branch_key": second_key, "spine": None},
+        ]
+        output = io.StringIO()
+        with (
+            patch("report_terminal.collect_report", side_effect=error),
+            patch("report_terminal.time.sleep", side_effect=KeyboardInterrupt),
+        ):
+            WatchSession(
+                view_args(watch=1.0), FakeInput(), output, io.StringIO()
+            ).run()
+        text = output.getvalue()
+        self.assertIn("ambiguous", text)
+        self.assertIn("@" + branch_reference(first_key), text)
+        self.assertIn("@" + branch_reference(second_key), text)
+        self.assertIn("spine=SALET -----", text)
+
+    def test_tty_watch_lists_ambiguity_candidates_on_error(self):
+        first_key = encode_subset(["salet", "crane"])
+        second_key = encode_subset(["nurdy", "khaki"])
+        error = ValueError("branch reference @abcd is ambiguous")
+        error.candidates = [
+            {"branch_reference": branch_reference(first_key),
+             "branch_key": first_key, "spine": "salet -----"},
+            {"branch_reference": branch_reference(second_key),
+             "branch_key": second_key, "spine": None},
+        ]
+        output = FakeOutput(tty=True)
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), output, io.StringIO()
+        )
+        session._collect = Mock(side_effect=error)
+        session._wait_for_refresh = Mock(return_value=False)
+        with (
+            patch("report_terminal.termios.tcgetattr", return_value=[0, 0, 0, 0]),
+            patch("report_terminal.termios.tcsetattr"),
+        ):
+            session.run()
+        text = output.getvalue()
+        self.assertIn("ambiguous", text)
+        self.assertIn("@" + branch_reference(first_key), text)
+        self.assertIn("@" + branch_reference(second_key), text)
+
+    def test_error_lines_falls_back_when_candidate_rendering_fails(self):
+        """Enrichment failure (e.g. an unreadable answer list) must not
+        replace the original error -- it degrades to the bare message."""
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(), io.StringIO(), io.StringIO()
+        )
+        error = ValueError("branch reference @abcd is ambiguous")
+        error.candidates = []
+        with patch(
+            "report_terminal.collect_ambiguous_branch_reference_report",
+            side_effect=RuntimeError("answer list unreadable"),
+        ):
+            self.assertEqual(session._error_lines(error), [f"view: {error}"])
+
     def test_shrinking_section_clears_old_lines(self):
         output = io.StringIO()
         session = WatchSession(view_args(watch=1.0), FakeInput(tty=True), output)
@@ -1414,6 +1484,124 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         ):
             erd_search.main()
         self.assertEqual(raised.exception.code, 2)
+
+
+_REAL_WORD_POOL = [
+    "salet", "crane", "nurdy", "khaki", "fuzzy", "raise", "slate", "adieu",
+    "mango", "brisk", "vapid", "zesty", "gloom", "humid", "joker", "witty",
+    "ovate", "plumb", "quirk", "xenon",
+]
+
+
+class BranchReferenceRoundTripTest(unittest.TestCase):
+    """A handle printed by `view --queue` must resolve, unmodified, through a
+    later `view @handle` -- even when a shorter prefix would have collided
+    against another branch elsewhere in the cache (#212)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+
+    def _run(self, *args):
+        output = io.StringIO()
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view",
+                "--queue-path", self.queue_path,
+                "--cache-path", self.cache_path,
+                *args,
+            ]),
+            redirect_stdout(output),
+        ):
+            erd_search.main()
+        return output.getvalue()
+
+    def _seed_four_character_collision(self):
+        """Two branch keys whose references share a 4-character prefix --
+        the width the printer used to truncate to -- found by the birthday
+        approach: over enough samples in a 65536-slot space, an internal
+        collision is all but certain."""
+        keys_by_four_char_prefix = {}
+        for index in range(10000):
+            branch_key = f"branch {index}".encode()
+            prefix = branch_reference(branch_key)[:4]
+            if prefix in keys_by_four_char_prefix:
+                return keys_by_four_char_prefix[prefix], branch_key
+            keys_by_four_char_prefix[prefix] = branch_key
+        self.fail("no 4-character reference collision found")
+
+    def _seed_four_character_collision_with_real_words(self):
+        """Two branch keys, each five real words encoded via
+        ScoreCache.encode_subset(), whose references share a 4-character
+        prefix -- found the same way as _seed_four_character_collision, but
+        from real words so decoding produces a real answer preview, and five
+        words each so a preview truncates and exercises the ellipsis."""
+        keys_by_four_char_prefix = {}
+        for index in range(10000):
+            words = random.Random(index).sample(_REAL_WORD_POOL, 5)
+            branch_key = encode_subset(words)
+            prefix = branch_reference(branch_key)[:4]
+            existing = keys_by_four_char_prefix.get(prefix)
+            if existing is not None and existing != branch_key:
+                return existing, branch_key
+            keys_by_four_char_prefix[prefix] = branch_key
+        self.fail("no 4-character reference collision found")
+
+    def test_queue_printed_handle_resolves_despite_a_four_character_collision(self):
+        queued_key, cache_only_key = self._seed_four_character_collision()
+
+        queue = ERDQueue(self.queue_path)
+        queue.add_pending_many([(queued_key, 2, 1, "salet", 0)])
+        queue.close()
+
+        cache = ScoreCache(self.cache_path, ["salet"], checkpoint_on_close=False)
+        cache.write_loss(cache_only_key, ERD_ALL, 3)
+        cache.close()
+
+        displayed_handle = "@" + branch_reference(queued_key)[:8]
+        queue_text = self._run("--queue")
+        self.assertIn(displayed_handle, queue_text)
+
+        branch_text = self._run(displayed_handle)
+        self.assertIn(f"Branch {displayed_handle}", branch_text)
+        self.assertNotIn("ambiguous", branch_text)
+
+    def test_hand_typed_short_prefix_lists_every_candidate_in_full(self):
+        queued_key, cache_only_key = self._seed_four_character_collision_with_real_words()
+
+        queue = ERDQueue(self.queue_path)
+        queue.add_pending_many([(queued_key, 5, 1, "salet", 0)])
+        queue.close()
+
+        cache = ScoreCache(self.cache_path, ["salet"], checkpoint_on_close=False)
+        cache.write_loss(cache_only_key, ERD_ALL, 3)
+        cache.close()
+
+        short_prefix = "@" + branch_reference(queued_key)[:4]
+        error_output = io.StringIO()
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view",
+                "--queue-path", self.queue_path,
+                "--cache-path", self.cache_path,
+                short_prefix,
+            ]),
+            redirect_stdout(io.StringIO()),
+            patch("sys.stderr", error_output),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            erd_search.main()
+        self.assertEqual(raised.exception.code, 1)
+        text = error_output.getvalue()
+        self.assertIn("ambiguous", text)
+        self.assertIn("@" + branch_reference(queued_key), text)
+        self.assertIn("@" + branch_reference(cache_only_key), text)
+        # Each candidate holds five words, one more than the three-word
+        # preview -- covers the truncated-preview ellipsis.
+        self.assertIn("n=5", text)
+        self.assertEqual(text.count("…"), 2)
 
 
 class ViewParserTest(unittest.TestCase):
