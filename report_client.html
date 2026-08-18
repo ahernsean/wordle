@@ -1285,12 +1285,14 @@
     // on its own: the same branch appears once per owning request.
     const membershipIdentity=row=>row.source_work_id+":"+row.branch_key_hex;
     const withMembershipIdentity=rows=>(rows||[]).map(row=>({...row,membership_identity:membershipIdentity(row)}));
-    function sourceRequestCard(row,previous,state,generatedAt){
+    function sourceWordCard(row,previous,state,generatedAt){
       const card=element("article","card clickable "+changeClass(row,previous));
       card.dataset.identity=String(row.source_word);
-      // The filtering card is also the clearing card: clicking the request the
-      // view is already narrowed to widens it back to every request, and the
-      // narrowed-to card says so.
+      // The filtering card is also the clearing card: clicking the word the
+      // view is already narrowed to widens it back to every word, and the
+      // narrowed-to card says so.  The filter is word-scoped, and so is the
+      // card, so the marked card and the filter always name the same thing
+      // however many requests that word holds.
       const word=String(row.source_word||"").toUpperCase();
       const isFiltered=state.branch_target.toUpperCase()===word&&word!=="";
       if(isFiltered)card.setAttribute("aria-current","true");
@@ -1341,17 +1343,17 @@
     // they spawned.
     function renderSources(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;
-      const requests=data.summary||[],rows=withMembershipIdentity(data.rows);
-      const branchTotal=requests.reduce((total,row)=>total+(row.branch_count||0),0);
-      const openTotal=requests.reduce((total,row)=>total+(row.open_branch_count||0),0);
+      const sourceWords=data.summary||[],rows=withMembershipIdentity(data.rows);
+      const branchTotal=sourceWords.reduce((total,row)=>total+(row.branch_count||0),0);
+      const openTotal=sourceWords.reduce((total,row)=>total+(row.open_branch_count||0),0);
       const metrics=element("div","metrics");
-      metrics.append(metric("source words",requests.length),metric("branches",branchTotal),metric("open",openTotal));
+      metrics.append(metric("source words",sourceWords.length),metric("branches",branchTotal),metric("open",openTotal));
       fragment.append(metrics,element("h2","","Source words"));
-      if(!requests.length)fragment.append(element("p","empty","No source-work requests"));
+      if(!sourceWords.length)fragment.append(element("p","empty","No source-work requests"));
       else if(!rows.length)fragment.append(element("p","dim","Pick a word to list the branches it owns."));
-      const requestGrid=gridElement("source-requests"),previousRequests=previousBy(previous,"summary","source_word");
-      for(const row of ordered(requests,"source_word","source-requests",state))requestGrid.append(sourceRequestCard(row,previousRequests.get(String(row.source_word)),state,report.generated_at));
-      fragment.append(requestGrid);
+      const wordGrid=gridElement("source-words"),previousWords=previousBy(previous,"summary","source_word");
+      for(const row of ordered(sourceWords,"source_word","source-words",state))wordGrid.append(sourceWordCard(row,previousWords.get(String(row.source_word)),state,report.generated_at));
+      fragment.append(wordGrid);
       if(!rows.length)return fragment;
       // Both counts come from the model, which counts them before the row
       // limit truncates the grid, so neither silently means "of those shown".

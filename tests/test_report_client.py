@@ -2951,7 +2951,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # branches between them read as three cards, and no branch card is
         # rendered until one of them is named.
         self.open_sources()
-        requests = self.page.locator("[data-grid-key=source-requests] > .card")
+        requests = self.page.locator("[data-grid-key=source-words] > .card")
         self.assertEqual(requests.count(), 3)
         self.assertEqual(
             self.page.locator("[data-grid-key=source-memberships]").count(), 0
@@ -2977,7 +2977,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_sources_branch_cards_appear_only_for_the_named_word(self):
         self.open_sources()
-        self.page.locator("[data-grid-key=source-requests] > .card").first.click()
+        self.page.locator("[data-grid-key=source-words] > .card").first.click()
         self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
         ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
         self.assertEqual(ownership.count(), 4)
@@ -3005,7 +3005,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def open_named_source(self):
         self.open_sources()
-        self.page.locator("[data-grid-key=source-requests] > .card").first.click()
+        self.page.locator("[data-grid-key=source-words] > .card").first.click()
         self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
 
     def test_sources_metrics_survive_a_row_limit_truncating_the_grid(self):
@@ -3033,7 +3033,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_sources_request_card_narrows_the_report_and_clears_it_again(self):
         self.open_sources()
-        card = self.page.locator("[data-grid-key=source-requests] > .card").first
+        card = self.page.locator("[data-grid-key=source-words] > .card").first
         card.click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === 'SALET'"
@@ -3043,7 +3043,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The card that set the filter is the one that clears it, and says so
         # while it is the filter in force -- otherwise nothing in the view
         # widens it again.
-        marked = "[data-grid-key=source-requests] > .card[aria-current=\"true\"]"
+        marked = "[data-grid-key=source-words] > .card[aria-current=\"true\"]"
         self.page.wait_for_selector(marked).click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === ''"
