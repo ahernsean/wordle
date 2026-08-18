@@ -1454,7 +1454,7 @@ def _source_display_row(source, generated_at):
     requested_at = source.get("requested_at")
     return {
         **source,
-        "display_request": f"#{source['source_work_id']}",
+        "display_requests": f"{source.get('request_count', 1):,}",
         "display_word": (source["source_word"] or "-").upper(),
         "display_state": source["state"],
         "display_roots": f"{source['root_count']:,}",
@@ -1469,10 +1469,16 @@ def _source_display_row(source, generated_at):
     }
 
 
-def _source_columns():
+def _source_columns(summary):
+    # A word usually holds one request, so the request count earns a column
+    # only where some word holds more than one.
+    merged = [
+        TerminalColumn("Reqs", "display_requests", alignment="right",
+                       remove_priority=5)
+    ] if any(row.get("request_count", 1) > 1 for row in summary) else []
     return [
-        TerminalColumn("Req", "display_request", required=True),
         TerminalColumn("Word", "display_word", required=True),
+        *merged,
         TerminalColumn(
             "Pri", "requested_priority", required=True, alignment="right"
         ),
@@ -1510,13 +1516,14 @@ def _render_source_sections(report, width, display_order):
     generated_at = report["generated_at"]
     header = _semantic_header(report, "Source-work report", width)
     summary = data.get("summary", [])
-    counts = f"Requests: {len(summary):,}"
+    request_count = sum(row.get("request_count", 1) for row in summary)
+    counts = f"Source words: {len(summary):,}   requests: {request_count:,}"
     if data.get("rows"):
         counts += f"   memberships: {data.get('matched_rows', 0):,} matched"
     lines = [counts]
     if summary:
         lines.extend(_render_table(
-            _source_columns(),
+            _source_columns(summary),
             [_source_display_row(source, generated_at) for source in summary],
             width, indent="  ",
         ))

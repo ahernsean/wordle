@@ -4599,6 +4599,35 @@ class ERDQueue:
             ORDER BY s.requested_priority DESC, s.source_work_id
         """).fetchall()
 
+    def source_word_rows(self):
+        """Return one row per source word, merging that word's requests.
+
+        Source work is keyed by (word, priority), so one word can hold several
+        requests, and two of them can own the same branch.  Branches are
+        therefore counted distinctly rather than summed across requests, which
+        would report a shared branch once per owning request.
+
+        root_count counts the branches the requests asked for directly; a
+        branch acquired later by promotion carries a parent_branch_id and is
+        counted only in branch_count.
+        """
+        return self._conn.execute("""
+            SELECT s.source_word,
+                   MIN(s.requested_at) AS requested_at,
+                   MAX(s.requested_priority) AS requested_priority,
+                   COUNT(DISTINCT s.source_work_id) AS request_count,
+                   MAX(s.state = 'active') AS has_active_request,
+                   MAX(s.state != 'complete') AS has_incomplete_request,
+                   COUNT(DISTINCT m.branch_id) AS branch_count,
+                   COUNT(DISTINCT CASE WHEN m.parent_branch_id IS NULL
+                                       THEN m.branch_id END) AS root_count
+            FROM source_work s
+            LEFT JOIN branch_source_work m
+              ON m.source_work_id = s.source_work_id
+            GROUP BY s.source_word
+            ORDER BY MAX(s.requested_priority) DESC, s.source_word
+        """).fetchall()
+
     def source_membership_rows(self, source_work_id=None, source_word=None,
                                include_resolved=False):
         """Return one row per (source_work_id, branch_id) membership.

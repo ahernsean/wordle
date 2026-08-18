@@ -2590,22 +2590,23 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
 
 
 def _source_summary_payload(row, rollup):
-    """One request, with its branches rolled up.
+    """One source word, with its requests and branches rolled up.
 
-    This is the report's unit: a request that spawned a thousand branches is
-    one row, not a thousand.  root_count and branch_count span every branch the
-    request has ever owned; the rollup counts only those still owned live, so a
-    branch that finalized and released its ownership reads as done.
+    This is the report's unit: a word that spawned a thousand branches is one
+    row, not a thousand, and a word requested more than once is still one row.
+    root_count and branch_count span every branch the word's requests have ever
+    owned; the rollup counts only those still owned live, so a branch that
+    finalized and released its ownership reads as done.
     """
     source_word = _row_value(row, "source_word")
     branch_count = row["branch_count"] or 0
     open_branch_count = rollup["open_branch_count"]
     return {
-        "source_work_id": row["source_work_id"],
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
-        "state": row["state"],
+        "request_count": row["request_count"] or 0,
+        "state": _merged_source_state(row),
         "root_count": row["root_count"] or 0,
         "branch_count": branch_count,
         "open_branch_count": open_branch_count,
@@ -2614,18 +2615,37 @@ def _source_summary_payload(row, rollup):
     }
 
 
+def _merged_source_state(row):
+    """The state of a word whose requests may disagree.
+
+    A word is only complete once every one of its requests is, and reads as
+    active while any request is being worked.
+    """
+    if not _row_value(row, "has_incomplete_request", 0):
+        return "complete"
+    return "active" if _row_value(row, "has_active_request", 0) else "queued"
+
+
 def _source_rollups(membership_rows):
-    """Per-request branch totals, keyed by source_work_id."""
+    """Per-word live-branch totals, keyed by source word.
+
+    A branch owned by two of a word's requests holds two membership rows, so
+    branches are counted once per word rather than once per membership.
+    """
     rollups = collections.defaultdict(
-        lambda: {"open_branch_count": 0, "worker_count": 0}
+        lambda: {"open_branch_count": 0, "worker_count": 0, "branch_ids": set()}
     )
     for row in membership_rows:
+        source_word = (_row_value(row, "source_word") or "").lower() or None
+        rollup = rollups[source_word]
+        if row["branch_id"] in rollup["branch_ids"]:
+            continue
+        rollup["branch_ids"].add(row["branch_id"])
         worker_count = _row_value(row, "worker_count", 0)
         _branch_status, branch_phase = branch_status_and_phase(
             _row_value(row, "pending_status"), _row_value(row, "active_status"),
             worker_count,
         )
-        rollup = rollups[row["source_work_id"]]
         if branch_phase != "complete":
             rollup["open_branch_count"] += 1
         rollup["worker_count"] += worker_count
@@ -2694,22 +2714,24 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             request.branch_target.trailing_word
             if request.branch_target.kind == "word" else None
         )
-        summary_rows = queue.source_work_rows()
+        summary_rows = queue.source_word_rows()
         if source_word is not None:
             summary_rows = [row for row in summary_rows
                             if (row["source_word"] or "").lower() == source_word]
         # Rolled up from every live membership, not only the named word's, so
-        # each request's own totals are complete whichever request is in scope.
+        # each word's own totals are complete whichever word is in scope.
         all_membership_rows = queue.source_membership_rows()
         rollups = _source_rollups(all_membership_rows)
         data["summary"] = [
-            _source_summary_payload(row, rollups[row["source_work_id"]])
+            _source_summary_payload(
+                row, rollups[(_row_value(row, "source_word") or "").lower() or None]
+            )
             for row in summary_rows
         ]
 
-        # Branch rows belong to one named request.  Emitting them for every
-        # request would bury ten queued roots under the hundreds of branches
-        # they spawned, which is the explosion this report exists to roll up.
+        # Branch rows belong to one named word.  Emitting them for every word
+        # would bury ten queued roots under the hundreds of branches they
+        # spawned, which is the explosion this report exists to roll up.
         if source_word is not None:
             # Owner counts are computed from every live membership so a branch
             # shared with a request outside the word filter still reports

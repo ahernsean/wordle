@@ -34,10 +34,10 @@
   "data": {
     "summary": [
       {
-        "source_work_id": 1,
         "source_word": "salet",
         "requested_priority": 5,
         "requested_at": 400,
+        "request_count": 2,
         "state": "queued",
         "root_count": 12,
         "branch_count": 1240,
@@ -46,10 +46,10 @@
         "worker_count": 3
       },
       {
-        "source_work_id": 2,
         "source_word": "raise",
         "requested_priority": 3,
         "requested_at": 200,
+        "request_count": 1,
         "state": "queued",
         "root_count": 4,
         "branch_count": 96,
@@ -58,10 +58,10 @@
         "worker_count": 1
       },
       {
-        "source_work_id": 3,
         "source_word": "crane",
         "requested_priority": 1,
         "requested_at": 100,
+        "request_count": 1,
         "state": "complete",
         "root_count": 2,
         "branch_count": 40,

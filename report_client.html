@@ -1287,7 +1287,7 @@
     const withMembershipIdentity=rows=>(rows||[]).map(row=>({...row,membership_identity:membershipIdentity(row)}));
     function sourceRequestCard(row,previous,state,generatedAt){
       const card=element("article","card clickable "+changeClass(row,previous));
-      card.dataset.identity=String(row.source_work_id);
+      card.dataset.identity=String(row.source_word);
       // The filtering card is also the clearing card: clicking the request the
       // view is already narrowed to widens it back to every request, and the
       // narrowed-to card says so.
@@ -1295,7 +1295,10 @@
       const isFiltered=state.branch_target.toUpperCase()===word&&word!=="";
       if(isFiltered)card.setAttribute("aria-current","true");
       const title=element("div","card-title");
-      title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)),element("span","dim","#"+row.source_work_id));
+      title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)));
+      // A word usually holds one request; the count is shown only where the
+      // word was queued more than once and its rows are merged.
+      if(row.request_count>1)title.append(element("span","chip",numText(row.request_count)+" requests"));
       card.append(title);
       // How far along the request is, as one bar: every branch it has ever
       // owned, against those that have finished.
@@ -1342,12 +1345,12 @@
       const branchTotal=requests.reduce((total,row)=>total+(row.branch_count||0),0);
       const openTotal=requests.reduce((total,row)=>total+(row.open_branch_count||0),0);
       const metrics=element("div","metrics");
-      metrics.append(metric("requests",requests.length),metric("branches",branchTotal),metric("open",openTotal));
-      fragment.append(metrics,element("h2","","Source-work requests"));
+      metrics.append(metric("source words",requests.length),metric("branches",branchTotal),metric("open",openTotal));
+      fragment.append(metrics,element("h2","","Source words"));
       if(!requests.length)fragment.append(element("p","empty","No source-work requests"));
-      else if(!rows.length)fragment.append(element("p","dim","Pick a request to list the branches it owns."));
-      const requestGrid=gridElement("source-requests"),previousRequests=previousBy(previous,"summary","source_work_id");
-      for(const row of ordered(requests,"source_work_id","source-requests",state))requestGrid.append(sourceRequestCard(row,previousRequests.get(String(row.source_work_id)),state,report.generated_at));
+      else if(!rows.length)fragment.append(element("p","dim","Pick a word to list the branches it owns."));
+      const requestGrid=gridElement("source-requests"),previousRequests=previousBy(previous,"summary","source_word");
+      for(const row of ordered(requests,"source_word","source-requests",state))requestGrid.append(sourceRequestCard(row,previousRequests.get(String(row.source_word)),state,report.generated_at));
       fragment.append(requestGrid);
       if(!rows.length)return fragment;
       // Both counts come from the model, which counts them before the row

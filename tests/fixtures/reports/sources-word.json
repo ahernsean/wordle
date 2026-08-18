@@ -34,10 +34,10 @@
   "data": {
     "summary": [
       {
-        "source_work_id": 1,
         "source_word": "salet",
         "requested_priority": 5,
         "requested_at": 400,
+        "request_count": 2,
         "state": "queued",
         "root_count": 12,
         "branch_count": 1240,

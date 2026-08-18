@@ -194,13 +194,19 @@ The rollup scans the epoch's `branch_finalize_log` rows, which carry no spine
 index, so it takes seconds. The web client fetches it after the word report
 renders and caches it per target; the terminal report pays it on each run.
 
-`--sources` reports one row per source-work request — ten queued root words
-are ten rows, whatever the branch count underneath them. Each row carries the
-request's recorded requested priority, its state, how many branches it has
-ever owned, how many of those are still open versus done, the live workers on
-them, and how long ago it was requested. `roots` counts the branches directly
-off the root word; `branches` spans every depth beneath it, so promoted
-sub-branches are included.
+`--sources` reports one row per source word — ten queued root words are ten
+rows, whatever the branch count underneath them. Each row carries the word's
+requested priority, its state, how many branches it has ever owned, how many
+of those are still open versus done, the live workers on them, and how long
+ago it was requested. `Roots` counts the branches the word asked for directly
+— its own response groups; `Branches` spans every depth beneath it, so
+sub-branches promoted during the search are included too, and the two are
+equal until promotion starts.
+
+Source work is keyed by (word, priority), so queueing one word twice at
+different priorities makes two requests. They merge into that word's single
+row: a `Reqs` column appears, the priority shown is the highest (the one that
+schedules), and a branch both requests own is counted once.
 
 A trailing word narrows to that word's request(s) **and** lists the branches
 it owns — including branches shared with another request, shown as one row per

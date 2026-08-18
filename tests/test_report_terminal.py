@@ -1314,20 +1314,45 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
             erd_search.main()
         return output.getvalue()
 
-    def test_text_output_is_one_row_per_request_not_per_branch(self):
+    def test_text_output_is_one_row_per_word_not_per_branch(self):
         text = self._run()
         self.assertIn("SLATE", text)
         self.assertIn("RAISE", text)
-        # Two requests, ten branches between them: two rows.
+        # Two words, ten branches between them: two rows.
         self.assertEqual(text.count("SLATE"), 1)
         self.assertEqual(len([
-            line for line in text.splitlines() if line.startswith("  #")
+            line for line in text.splitlines()
+            if line.startswith("  ") and line.split()[0] in ("SLATE", "RAISE")
         ]), 2)
-        self.assertIn("Requests: 2", text)
+        self.assertIn("Source words: 2", text)
+        self.assertIn("requests: 2", text)
         # The branch rows are not printed until a word is named, and the report
         # says which command opens them.
         self.assertNotIn("Ownership:", text)
         self.assertIn("view --sources", text)
+
+    def test_a_word_queued_twice_is_one_row_counting_its_branches_once(self):
+        # Source work is keyed by (word, priority), so queueing RAISE again at
+        # a new priority makes a second request that shares a branch with the
+        # first.  The report merges them without counting that branch twice.
+        queue = ERDQueue(self.queue_path)
+        queue.add_pending_many([
+            (encode_subset(["crane", "slate", "w0000"]), 3, 8, "raise", 0),
+            (encode_subset(["crane", "slate", "fresh"]), 3, 8, "raise", 1),
+        ])
+        queue.close()
+
+        report = json.loads(self._run("--format", "json"))
+
+        rollups = {row["source_word"]: row for row in report["data"]["summary"]}
+        self.assertEqual(rollups["raise"]["request_count"], 2)
+        # Nine branches from the first request plus one new one; the branch
+        # both requests own is counted once.
+        self.assertEqual(rollups["raise"]["branch_count"], 10)
+        self.assertEqual(rollups["raise"]["open_branch_count"], 10)
+        # The merged priority is the one that actually schedules.
+        self.assertEqual(rollups["raise"]["requested_priority"], 8)
+        self.assertIn("Reqs", self._run())
 
     def test_naming_a_word_opens_that_request_s_branches(self):
         text = self._run("raise")

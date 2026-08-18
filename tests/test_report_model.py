@@ -1180,6 +1180,31 @@ class SourceReportTest(unittest.TestCase):
         # Naming one request is what opens its branches.
         self.assertEqual(len(self._source_rows_for("crane")), 1)
 
+    def test_one_word_queued_twice_merges_into_one_row(self):
+        # Source work is keyed by (word, priority), so the same word queued at
+        # a second priority is a second request.  The report is per word: the
+        # two fold into one row, the branch they both own is counted once, and
+        # the priority reported is the one that actually schedules.
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(shared_key, 2, 1, "salet", 0)])
+        queue.add_pending_many([(shared_key, 2, 7, "salet", 0),
+                                (solo_key, 2, 7, "salet", 1)])
+        queue.close()
+
+        report = collect_report(
+            self.sources, ReportRequest(report_kind="sources"))
+
+        self.assertEqual(len(report["data"]["summary"]), 1)
+        row = report["data"]["summary"][0]
+        self.assertEqual(row["source_word"], "salet")
+        self.assertEqual(row["request_count"], 2)
+        self.assertEqual(row["requested_priority"], 7)
+        self.assertEqual(row["branch_count"], 2)
+        self.assertEqual(row["open_branch_count"], 2)
+        self.assertEqual(row["worker_count"], 0)
+
     def test_source_report_exposes_multiple_owners_with_requested_and_effective_priority(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()

@@ -2946,8 +2946,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("[data-kind=sources]").click()
         self.page.wait_for_selector("text=sources report")
 
-    def test_sources_view_collapses_every_request_to_one_card(self):
-        # The report's unit is the request: three queued roots owning 1,376
+    def test_sources_view_collapses_every_word_to_one_card(self):
+        # The report's unit is the source word: three queued roots owning 1,376
         # branches between them read as three cards, and no branch card is
         # rendered until one of them is named.
         self.open_sources()
@@ -2959,7 +2959,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         metrics = " ".join(
             self.page.locator("#report .metrics").first.inner_text().split()
         )
-        self.assertIn("3 requests", metrics)
+        self.assertIn("3 source words", metrics)
         self.assertIn("1,376 branches", metrics)
         self.assertIn("1,211 open", metrics)
         request_text = " ".join(requests.first.inner_text().split())
@@ -2969,10 +2969,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("37 done", request_text)
         self.assertIn("12 roots", request_text)
         self.assertIn("3 workers", request_text)
-        self.assertIn("Pick a request to list the branches it owns.",
+        self.assertIn("Pick a word to list the branches it owns.",
                       self.page.locator("#report").inner_text())
+        # A word queued more than once is still one card, and says so rather
+        # than splitting into a card per request.
+        self.assertIn("2 requests", request_text)
 
-    def test_sources_branch_cards_appear_only_for_the_named_request(self):
+    def test_sources_branch_cards_appear_only_for_the_named_word(self):
         self.open_sources()
         self.page.locator("[data-grid-key=source-requests] > .card").first.click()
         self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
