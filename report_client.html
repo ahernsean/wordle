@@ -97,7 +97,8 @@
     .grid.leaderboard { grid-template-columns:minmax(0,1fr); gap:.65rem; }
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
     .section { margin:.45rem 0; }
-    .card.active { border-color:var(--green); }
+    .card.active, .card[aria-current="true"] { border-color:var(--green); }
+    .card[aria-current="true"] { background:#edf5ec; }
     .card.finalizing, .stale { border-color:var(--amber); }
     .card.transitioning { border-color:var(--dim); }
     .dead { border-color:var(--red); }
@@ -399,9 +400,11 @@
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_phase=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;}
       // The sources report reads only the source word and the row limit; every
-      // branch filter is meaningless against a membership row, and a target
-      // that is not a word is rejected outright by the report.
-      if(normalized.kind==="sources"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.claims=false;normalized.answers=false;if(!isWordTarget(normalized.branch_target))normalized.branch_target="";}
+      // branch filter is meaningless against a membership row.  A target that
+      // names no word is dropped, and one that reaches a word through a spine
+      // keeps only that word: the report reads the trailing word alone, so a
+      // displayed spine prefix would promise a narrower answer than it gives.
+      if(normalized.kind==="sources"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.claims=false;normalized.answers=false;normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
@@ -781,9 +784,10 @@
     // Why this worker is on the branch it is on: the recorded scheduling role,
     // carrying the model's reason text as its tooltip.  A worker between claims
     // has no role recorded and shows none.
+    const SCHEDULING_ROLE_TEXT={preferred:"preferred source",fallback:"fallback source",direct:"direct work"};
     function schedulingRoleCell(worker){
       if(!worker.scheduling_role)return null;
-      const cell=element("span","",worker.scheduling_role);
+      const cell=element("span","",SCHEDULING_ROLE_TEXT[worker.scheduling_role]||worker.scheduling_role);
       cell.title=worker.scheduling_role_reason||worker.scheduling_role;
       return cell;
     }
@@ -1284,6 +1288,12 @@
     function sourceRequestCard(row,previous,state){
       const card=element("article","card clickable "+changeClass(row,previous));
       card.dataset.identity=String(row.source_work_id);
+      // The filtering card is also the clearing card: clicking the request the
+      // view is already narrowed to widens it back to every request, and the
+      // narrowed-to card says so.
+      const word=String(row.source_word||"").toUpperCase();
+      const isFiltered=state.branch_target.toUpperCase()===word&&word!=="";
+      if(isFiltered)card.setAttribute("aria-current","true");
       const title=element("div","card-title");
       title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)),element("span","dim","#"+row.source_work_id));
       card.append(title,statLine([
@@ -1291,7 +1301,7 @@
         numText(row.root_count)+(row.root_count===1?" root":" roots"),
         numText(row.branch_count)+(row.branch_count===1?" branch":" branches"),
       ]));
-      card.addEventListener("click",()=>setState({...state,kind:"sources",branch_target:String(row.source_word||"").toUpperCase()}));
+      card.addEventListener("click",()=>setState({...state,kind:"sources",branch_target:isFiltered?"":word}));
       return card;
     }
     function sourceMembershipCard(row,previous){
@@ -1317,9 +1327,10 @@
     function renderSources(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;
       const requests=data.summary||[],rows=withMembershipIdentity(data.rows),matchedRows=data.matched_rows??rows.length;
-      const sharedBranchCount=new Set(rows.filter(row=>row.is_shared).map(row=>String(row.branch_key_hex))).size;
       const metrics=element("div","metrics");
-      metrics.append(metric("requests",requests.length),metric("ownership rows",matchedRows),metric("shared branches",sharedBranchCount));
+      // Both counts come from the model, which counts them before the row
+      // limit truncates the grid, so neither silently means "of those shown".
+      metrics.append(metric("requests",requests.length),metric("memberships",matchedRows),metric("shared branches",data.shared_branch_count));
       fragment.append(metrics,element("h2","","Source-work requests"));
       if(!requests.length)fragment.append(element("p","empty","No source-work requests"));
       const requestGrid=gridElement("source-requests"),previousRequests=previousBy(previous,"summary","source_work_id");

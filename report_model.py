@@ -2649,7 +2649,8 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     branch's own effective (materialized) priority reported alongside each
     owner's individually requested priority."""
     generated_at = int(time.time())
-    data = {"summary": [], "matched_rows": 0, "rows": []}
+    data = {"summary": [], "matched_rows": 0, "shared_branch_count": 0,
+            "rows": []}
     report = _semantic_report(
         "sources", sources, request.branch_target, generated_at, data, request
     )
@@ -2683,6 +2684,11 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             for row in membership_rows
         ]
         data["matched_rows"] = len(payload_rows)
+        # Counted over every matched row, like matched_rows itself: a shared
+        # branch whose rows all fall past the row limit is still shared.
+        data["shared_branch_count"] = len({
+            row["branch_key_hex"] for row in payload_rows if row["is_shared"]
+        })
         limit = request.filters.limit
         data["rows"] = payload_rows[:limit] if limit is not None else payload_rows
         _mark_queue_source_ok(report)

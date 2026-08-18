@@ -1196,6 +1196,31 @@ class SourceReportTest(unittest.TestCase):
                         if bytes.fromhex(r["branch_key_hex"]) == solo_key)
         self.assertFalse(solo_row["is_shared"])
 
+    def test_shared_branch_count_spans_matched_rows_not_the_limited_window(self):
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(solo_key, 2, 9, "crane", 0)])
+        queue.add_pending_many([(shared_key, 2, 1, "salet", 1)])
+        queue.add_pending_many([(shared_key, 2, 1, "nurdy", 2)])
+        queue.close()
+
+        full = collect_report(self.sources, ReportRequest(report_kind="sources"))
+        limited = collect_report(
+            self.sources,
+            ReportRequest(report_kind="sources", filters=ReportFilters(limit=1)),
+        )
+
+        self.assertEqual(full["data"]["matched_rows"], 3)
+        self.assertEqual(full["data"]["shared_branch_count"], 1)
+        # The limit truncates the returned rows only.  Both counts describe
+        # every matched row, so a shared branch whose rows all fall past the
+        # limit is still counted as shared.
+        self.assertEqual(len(limited["data"]["rows"]), 1)
+        self.assertFalse(limited["data"]["rows"][0]["is_shared"])
+        self.assertEqual(limited["data"]["matched_rows"], 3)
+        self.assertEqual(limited["data"]["shared_branch_count"], 1)
+
     def test_workers_report_exposes_scheduling_role_and_source_work_id(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()

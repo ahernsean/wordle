@@ -2952,6 +2952,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
         self.assertEqual(requests.count(), 2)
         self.assertEqual(ownership.count(), 4)
+        metrics = " ".join(
+            self.page.locator("#report .metrics").first.inner_text().split()
+        )
+        self.assertIn("2 requests", metrics)
+        self.assertIn("4 memberships", metrics)
+        self.assertIn("1 shared branches", metrics)
         request_text = " ".join(requests.first.inner_text().split())
         self.assertIn("requested priority 5", request_text)
         self.assertIn("1 root", request_text)
@@ -2973,34 +2979,70 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("sole", sole)
         self.assertNotIn("parent", sole)
 
+    def test_sources_metrics_survive_a_row_limit_truncating_the_grid(self):
+        # matched_rows and shared_branch_count are the model's pre-limit
+        # counts; a limit that drops every shared row from the grid must not
+        # silently shrink the metric beside it.  The fixture server ignores
+        # limit, so the truncated payload is applied directly.
+        metrics = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          report.data.rows = report.data.rows.filter(row => !row.is_shared);
+          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          return document.querySelector('#report .metrics').innerText;
+        }""")
+        metrics = " ".join(metrics.split())
+        self.assertIn("4 memberships", metrics)
+        self.assertIn("1 shared branches", metrics)
+        shown = self.page.locator("[data-grid-key=source-memberships] > .card")
+        self.assertEqual(shown.count(), 2)
+        self.assertIn(
+            "Shown 2 of 4 matched",
+            " ".join(self.page.locator("#report").inner_text().split()),
+        )
+
     def test_sources_ownership_row_draws_its_lineage_as_a_spine_step(self):
         self.open_sources()
         root_step = self.page.locator('[data-identity="1:02"] .word')
         self.assertEqual(root_step.count(), 1)
         self.assertEqual(root_step.get_attribute("data-spine"), "SALET -y---")
 
-    def test_sources_request_card_narrows_the_report_to_that_word(self):
+    def test_sources_request_card_narrows_the_report_and_clears_it_again(self):
         self.open_sources()
-        self.page.locator("[data-grid-key=source-requests] > .card").first.click()
+        card = self.page.locator("[data-grid-key=source-requests] > .card").first
+        card.click()
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === 'SALET'"
         )
         self.assertIn("kind=sources", self.page.url)
         self.assertIn("branch_target=SALET", self.page.url)
+        # The card that set the filter is the one that clears it, and says so
+        # while it is the filter in force -- otherwise nothing in the view
+        # widens it again.
+        marked = "[data-grid-key=source-requests] > .card[aria-current=\"true\"]"
+        self.page.wait_for_selector(marked).click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === ''"
+        )
+        self.assertNotIn("branch_target", self.page.url)
+        self.page.wait_for_selector(marked, state="detached")
 
     def test_sources_ownership_card_opens_the_branch_it_names(self):
         self.open_sources()
         self.page.locator('[data-identity="2:04"]').click()
         self.page.wait_for_selector("text=branch report")
 
-    def test_sources_state_drops_filters_and_targets_the_report_rejects(self):
-        # The sources report accepts only a trailing word and a row limit, and
-        # rejects everything else rather than ignoring it, so the client must
+    def test_sources_state_keeps_only_the_word_and_limit_the_report_reads(self):
+        # The sources report reads a trailing word and a row limit, and rejects
+        # a target naming no word rather than ignoring it, so the client must
         # not forward a branch spine or a branch filter it happens to be
-        # carrying from the view the operator came from.
+        # carrying from the view the operator came from.  A spine that does
+        # reach a word is accepted by the report, which then answers for the
+        # trailing word alone -- so the prefix is dropped here rather than
+        # displayed as though it had narrowed the answer.
         result = self.page.evaluate("""() => ({
           explicit: buildAPIURL(parsePageState({search:'?kind=sources'})),
           word: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=SALET'})),
+          spineToWord: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=SALET+-y---+CRANE'})),
           branch: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=RAISE+-----'})),
           reference: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=%40222222222222'})),
           filtered: buildAPIURL(parsePageState({search:'?kind=sources&branch_status=active&priority=3&sort=size&tree=1'})),
@@ -3008,6 +3050,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         })""")
         self.assertEqual(result["explicit"], "/api/view/sources")
         self.assertEqual(result["word"], "/api/view/sources?branch_target=SALET")
+        self.assertEqual(result["spineToWord"], "/api/view/sources?branch_target=CRANE")
         self.assertEqual(result["branch"], "/api/view/sources")
         self.assertEqual(result["reference"], "/api/view/sources")
         self.assertEqual(result["filtered"], "/api/view/sources")
@@ -3015,11 +3058,13 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_worker_cards_name_the_scheduling_role_and_why(self):
         preferred = self.page.locator('.card.worker[data-identity="worker-0"]')
-        self.assertIn("preferred", preferred.inner_text())
+        # The visible text carries the noun: "preferred" alone would not say
+        # preferred what, and a tooltip cannot supply it on a touch screen.
+        self.assertIn("preferred source", preferred.inner_text())
         reason = preferred.get_by_title("serving its preferred source work")
         self.assertEqual(reason.count(), 1)
         fallback = self.page.locator('.card.worker[data-identity="worker-3"]')
-        self.assertIn("fallback", fallback.inner_text())
+        self.assertIn("fallback source", fallback.inner_text())
         self.assertIn(
             "no claimable bundle",
             fallback.get_by_title(re.compile("fallback")).get_attribute("title"),
