@@ -764,6 +764,63 @@ class TestRivalFinalizeRecovery(unittest.TestCase):
         sleep.assert_called_once()
 
 
+class TestSolveBranchFocusedLostFinalizeRace(unittest.TestCase):
+    """_solve_branch_focused_in_context has two call sites where a rival
+    worker may finalize the branch first (maybe_finalize returns False).
+    Both must retry rather than abandoning the branch — driven directly
+    (not through the mocked-out integration path) so the retry actually
+    runs under a controlled interleaving."""
+
+    def _branch_row(self, w, branch_key):
+        return {
+            'branch_key': branch_key,
+            'n_candidates': w.n_candidates,
+            'n_words': len(BRANCH),
+            'budget': ROOT_BUDGET,
+            'source_work_id': None,
+        }
+
+    def test_lost_race_with_claim_exhausted_retries_via_await_rival(self):
+        w = _bare_worker()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        branch = self._branch_row(w, branch_key)
+        # First pass: every candidate is already claimed elsewhere, and this
+        # worker loses the finalize race to a rival.  Second pass: the rival
+        # has since deleted the (now-finalized) branch row.
+        w.queue.get_branch.side_effect = [branch, None]
+        w._claim_bundle = mock.MagicMock(return_value=None)
+        w.queue.branch_done_candidates.return_value = w.n_candidates
+        w.maybe_finalize = mock.MagicMock(return_value=False)
+        w._await_rival_finalize = mock.MagicMock()
+
+        w._solve_branch_focused_in_context(branch)
+
+        w._await_rival_finalize.assert_called_once_with(
+            branch_key, sorted(BRANCH), len(BRANCH), w.n_candidates)
+        self.assertEqual(w.queue.get_branch.call_count, 2)
+
+    def test_lost_race_after_evaluate_bundle_loops_back_without_await(self):
+        w = _bare_worker()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        branch = self._branch_row(w, branch_key)
+        # First pass: this worker wins a claim, completes it, and the branch
+        # is now fully done — but a rival finalizes first.  This call site
+        # loops straight back to the top rather than awaiting the rival.
+        # Second pass: the rival has since deleted the branch row.
+        w.queue.get_branch.side_effect = [branch, None]
+        w._claim_bundle = mock.MagicMock(return_value=(1, [0, 1], False))
+        w.evaluate_bundle = mock.MagicMock(return_value=True)
+        w.queue.branch_done_candidates.return_value = w.n_candidates
+        w.maybe_finalize = mock.MagicMock(return_value=False)
+        w._await_rival_finalize = mock.MagicMock()
+
+        w._solve_branch_focused_in_context(branch)
+
+        w.maybe_finalize.assert_called_once()
+        w._await_rival_finalize.assert_not_called()
+        self.assertEqual(w.queue.get_branch.call_count, 2)
+
+
 class TestCooperativeSolveCachedPath(unittest.TestCase):
     """cooperative_solve returns the cached result immediately when the branch
     is already solved in ScoreCache, without claiming or evaluating any candidate."""
