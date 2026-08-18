@@ -46,6 +46,8 @@
         "direct_branch_count": 12
       }
     ],
+    "total_source_word_count": 1,
+    "matched_source_word_count": 1,
     "matched_rows": 4,
     "shared_branch_count": 1,
     "rows": [

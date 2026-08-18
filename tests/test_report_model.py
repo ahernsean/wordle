@@ -1180,6 +1180,103 @@ class SourceReportTest(unittest.TestCase):
         # Naming one request is what opens its branches.
         self.assertEqual(len(self._source_rows_for("crane")), 1)
 
+    def _queue_words(self, *rows):
+        queue = self._open_queue()
+        for index, (word, priority, count) in enumerate(rows):
+            queue.add_pending_many([
+                (ScoreCache.encode_subset(
+                    ANSWERS[:2] + [f"{word}{item:04d}"]), 3, priority, word,
+                 index * 100 + item)
+                for item in range(count)
+            ])
+        queue.close()
+
+    def _source_words(self, **filters):
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="sources", filters=ReportFilters(**filters)))
+        return report["data"]
+
+    def test_source_state_filter_narrows_and_reports_what_it_hid(self):
+        self._queue_words(("salet", 5, 3), ("crane", 1, 2))
+        queue = self._open_queue()
+        # CRANE's branches all finish, which resolves its memberships and
+        # completes its only request, so the word reads complete.
+        for item in range(2):
+            queue.mark_done(
+                ScoreCache.encode_subset(ANSWERS[:2] + [f"crane{item:04d}"]))
+        queue.close()
+
+        every = self._source_words()
+        self.assertEqual(every["total_source_word_count"], 2)
+        complete = self._source_words(source_states=("complete",))
+        self.assertEqual(
+            [row["source_word"] for row in complete["summary"]], ["crane"])
+        queued = self._source_words(source_states=("queued",))
+        self.assertEqual(
+            [row["source_word"] for row in queued["summary"]], ["salet"])
+        # The total is the unfiltered count, so a filtered report can say how
+        # much it is hiding rather than looking like the whole queue.
+        self.assertEqual(complete["total_source_word_count"], 2)
+        self.assertEqual(
+            complete["matched_source_word_count"], len(complete["summary"]))
+
+    def test_source_sorts_order_by_the_column_named(self):
+        self._queue_words(("salet", 5, 3), ("crane", 9, 1), ("nurdy", 1, 7))
+
+        # The default is the order the queue serves them in: priority first.
+        self.assertEqual(
+            [row["source_word"] for row in self._source_words()["summary"]],
+            ["crane", "salet", "nurdy"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="word")["summary"]],
+            ["crane", "nurdy", "salet"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="branches")["summary"]],
+            ["nurdy", "salet", "crane"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="open")["summary"]],
+            ["nurdy", "salet", "crane"])
+
+    def test_source_grouping_buckets_words_with_their_own_rollup(self):
+        self._queue_words(("salet", 5, 3), ("crane", 5, 1), ("nurdy", 1, 7))
+
+        groups = self._source_words(group_by="priority")["summary_groups"]
+
+        self.assertEqual([group["label"] for group in groups],
+                         ["priority 5", "priority 1"])
+        self.assertEqual(groups[0]["rollup"]["source_word_count"], 2)
+        # The rollup sums the group's rows, so a collapsed group still says
+        # how much work it holds.
+        self.assertEqual(groups[0]["rollup"]["branch_count"], 4)
+        self.assertEqual(groups[0]["rollup"]["open_branch_count"], 4)
+        self.assertEqual(groups[1]["rollup"]["branch_count"], 7)
+        self.assertEqual(
+            [row["source_word"] for row in groups[1]["rows"]], ["nurdy"])
+        # Every word lands in exactly one group.
+        self.assertEqual(
+            sum(len(group["rows"]) for group in groups),
+            len(self._source_words()["summary"]))
+
+    def test_source_only_filters_and_sorts_are_rejected_elsewhere(self):
+        for filters, message in (
+            ({"source_states": ("queued",)}, "source_state requires"),
+            ({"sort": "branches"}, "requires a source report"),
+        ):
+            with self.subTest(filters=filters):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(ReportRequest(
+                        report_kind="queue", filters=ReportFilters(**filters)))
+        with self.assertRaisesRegex(ValueError, "source reports must be"):
+            validate_report_request(ReportRequest(
+                report_kind="sources", filters=ReportFilters(sort="nodes")))
+        with self.assertRaisesRegex(ValueError, "source reports must be"):
+            validate_report_request(ReportRequest(
+                report_kind="sources",
+                filters=ReportFilters(group_by="cache_state")))
+
     def test_one_word_queued_twice_merges_into_one_row(self):
         # Source work is keyed by (word, priority), so the same word queued at
         # a second priority is a second request.  The report is per word: the

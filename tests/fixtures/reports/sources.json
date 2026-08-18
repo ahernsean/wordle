@@ -70,6 +70,8 @@
         "direct_branch_count": 2
       }
     ],
+    "total_source_word_count": 3,
+    "matched_source_word_count": 3,
     "matched_rows": 0,
     "shared_branch_count": 0,
     "rows": []

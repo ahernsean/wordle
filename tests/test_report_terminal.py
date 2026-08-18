@@ -1354,6 +1354,22 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         self.assertEqual(rollups["raise"]["requested_priority"], 8)
         self.assertIn("Reqs", self._run())
 
+    def test_source_state_filter_and_sort_reach_the_rendered_table(self):
+        # --source-state and --sort are the terminal's half of the same
+        # filtering the browser gets; grouping is browser-only.
+        sorted_by_word = self._run("--sort", "word")
+        rows = [line.split()[0] for line in sorted_by_word.splitlines()
+                if line.startswith("  ") and line.split()[0] in
+                ("SLATE", "RAISE")]
+        self.assertEqual(rows, ["RAISE", "SLATE"])
+        # Nothing is complete yet, so filtering to complete empties the table
+        # and says so against the unfiltered total rather than reading as an
+        # empty queue.
+        complete = self._run("--source-state", "complete")
+        self.assertIn("Source words: 0 of 2", complete)
+        self.assertNotIn("SLATE", complete)
+        self.assertIn("Source words: 2", self._run("--source-state", "queued"))
+
     def test_naming_a_word_opens_that_request_s_branches(self):
         text = self._run("raise")
         self.assertIn("Ownership:", text)

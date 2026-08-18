@@ -208,6 +208,16 @@ different priorities makes two requests. They merge into that word's single
 row: a `Reqs` column appears, the priority shown is the highest (the one that
 schedules), and a branch both requests own is counted once.
 
+`--source-state` narrows to `queued`, `active`, `complete`, or `all` — a
+word's own lifecycle, not a branch's, so it is a separate filter from
+`--branch-status`. When it hides anything the count reads `Source words: 3 of
+10`, so a filtered report never looks like the whole queue. `--sort` takes
+`word`, `priority` (the default, and the order the swarm serves them in),
+`branches`, `open`, `done`, `workers`, or `age`; those four source-only sorts
+are rejected for other reports rather than silently ignored. Grouping is
+browser-only: the Sources tab groups by state, worker presence, or priority,
+each group collapsing under a rollup of the words it holds.
+
 A trailing word narrows to that word's request(s) **and** lists the branches
 it owns — including branches shared with another request, shown as one row per
 owning request with both that request's own requested priority and the

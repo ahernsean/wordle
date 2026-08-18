@@ -1517,7 +1517,12 @@ def _render_source_sections(report, width, display_order):
     header = _semantic_header(report, "Source-work report", width)
     summary = data.get("summary", [])
     request_count = sum(row.get("request_count", 1) for row in summary)
-    counts = f"Source words: {len(summary):,}   requests: {request_count:,}"
+    total_words = data.get("total_source_word_count", len(summary))
+    shown_words = (
+        f"{len(summary):,}" if len(summary) == total_words
+        else f"{len(summary):,} of {total_words:,}"
+    )
+    counts = f"Source words: {shown_words}   requests: {request_count:,}"
     if data.get("rows"):
         counts += f"   memberships: {data.get('matched_rows', 0):,} matched"
     lines = [counts]

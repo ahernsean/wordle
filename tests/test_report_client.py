@@ -1816,14 +1816,15 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.assertTrue(self.page.locator("#filters-group").is_hidden())
         self.assertTrue(self.page.locator("#sort-field").is_hidden())
-        # A source-work membership has no branch filters and no ordering of its
-        # own: the report reads only the source word and the row limit.
+        # The source view keeps the filter group for its own state filter and
+        # drops the branch-shaped half of it; which controls it offers is
+        # pinned by test_sources_controls_offer_source_axes_not_branch_ones.
         self.page.locator("[data-kind=sources]").click()
         self.page.wait_for_function(
             "() => __reportClient.getState().kind === 'sources'"
         )
-        self.assertTrue(self.page.locator("#filters-group").is_hidden())
-        self.assertTrue(self.page.locator("#sort-field").is_hidden())
+        self.assertFalse(self.page.locator("#filters-group").is_hidden())
+        self.assertTrue(self.page.locator("#branch-filters").is_hidden())
         self.assertFalse(self.page.locator("#limit-field").is_hidden())
 
     def test_word_report_sort_only_offers_options_the_server_accepts(self):
@@ -2974,6 +2975,88 @@ class ReportClientBrowserTest(unittest.TestCase):
         # A word queued more than once is still one card, and says so rather
         # than splitting into a card per request.
         self.assertIn("2 requests", request_text)
+
+    def test_sources_controls_offer_source_axes_not_branch_ones(self):
+        self.open_sources()
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        # A source word has its own state; branch status, phase, answer count,
+        # budget and priority all describe one branch, so they stay hidden.
+        self.assertFalse(self.page.locator("#source-state-filters").is_hidden())
+        self.assertTrue(self.page.locator("#branch-filters").is_hidden())
+        self.assertFalse(self.page.locator("#sort-field").is_hidden())
+        self.assertFalse(self.page.locator("#group-by-field").is_hidden())
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "[data-source-state]", "inputs => inputs.map(i => i.value)"),
+            ["queued", "active", "complete"])
+        # iOS Safari shows hidden <option>s, so each report's own strategies
+        # must be the only ones in the DOM.
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "#group-by option", "options => options.map(o => o.value)"),
+            ["", "state", "worker_presence", "priority"])
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "#sort option", "options => options.map(o => o.value)"),
+            ["", "word", "branches", "open", "done", "workers", "age"])
+
+    def test_sources_state_filter_and_sort_reach_the_request(self):
+        result = self.page.evaluate("""() => ({
+          filtered: buildAPIURL(parsePageState({search:'?kind=sources&source_state=queued,active'})),
+          sorted: buildAPIURL(parsePageState({search:'?kind=sources&sort=branches'})),
+          grouped: buildAPIURL(parsePageState({search:'?kind=sources&group_by=state'})),
+          branchSort: buildAPIURL(parsePageState({search:'?kind=sources&sort=nodes'})),
+          branchGroup: buildAPIURL(parsePageState({search:'?kind=sources&group_by=cache_state'})),
+          elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&source_state=queued'}))
+        })""")
+        # URLSearchParams percent-encodes the separator; the server decodes it.
+        self.assertEqual(result["filtered"],
+                         "/api/view/sources?source_state=queued%2Cactive")
+        self.assertEqual(result["sorted"], "/api/view/sources?sort=branches")
+        self.assertEqual(result["grouped"], "/api/view/sources?group_by=state")
+        # A sort or grouping this report cannot serve is dropped rather than
+        # sent to be rejected, and the source filter never leaks to a report
+        # that would reject it.
+        self.assertEqual(result["branchSort"], "/api/view/sources")
+        self.assertEqual(result["branchGroup"], "/api/view/sources")
+        self.assertEqual(result["elsewhere"], "/api/view/queue")
+
+    def test_sources_grouping_buckets_cards_under_their_rollup(self):
+        # The fixture server ignores query parameters, so the grouped payload
+        # is applied directly -- the renderer is what is under test.
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          const rows = report.data.summary;
+          const bucket = state => rows.filter(row => row.state === state);
+          const rollup = group => ({
+            source_word_count: group.length,
+            branch_count: group.reduce((total, row) => total + row.branch_count, 0),
+            open_branch_count: group.reduce((total, row) => total + row.open_branch_count, 0),
+            done_branch_count: group.reduce((total, row) => total + row.done_branch_count, 0),
+            worker_count: group.reduce((total, row) => total + row.worker_count, 0),
+          });
+          report.data.summary_groups = ['queued', 'complete'].map(state => ({
+            label: state, rows: bucket(state), rollup: rollup(bucket(state)),
+          }));
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&group_by=state'}));
+        }""")
+        groups = self.page.locator(".source-word-groups > details")
+        self.assertEqual(groups.count(), 2)
+        first = " ".join(groups.first.locator("summary").inner_text().split())
+        self.assertIn("queued", first)
+        self.assertIn("2 words", first)
+        self.assertIn("1,336 branches", first)
+        self.assertIn("1,211 open", first)
+        self.assertEqual(
+            groups.first.locator("[data-grid-key='source-words/queued'] > .card")
+            .count(), 2)
+        self.assertEqual(
+            groups.nth(1).locator("[data-grid-key='source-words/complete'] > .card")
+            .count(), 1)
+        # Every word lands in exactly one group.
+        self.assertEqual(
+            self.page.locator(".source-word-groups .card").count(), 3)
 
     def test_sources_branch_cards_appear_only_for_the_named_word(self):
         self.open_sources()

@@ -269,22 +269,25 @@
     </div>
     <details class="filters"><summary>Filters &amp; view</summary>
       <div class="control-group" id="filters-group">
-        <div class="group-head"><span class="gname">Filters:</span><span class="ghint">narrow the branches — applied as you change them</span></div>
-        <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
-        <div class="status-line"><span class="label">Branch phase</span><span class="statuses" id="branch-phases"></span></div>
-        <div class="dim lifecycle-legend">Phase: queued → evaluating → finalizing → complete. Status: worker active or not.</div>
-        <div class="field-flow">
-          <label class="field">Min answers<input id="minimum-answer-count" type="number"></label>
-          <label class="field">Max answers<input id="maximum-answer-count" type="number"></label>
-          <label class="field">Budget<input id="budget" class="narrow" type="number"></label>
-          <label class="field">Priority<input id="priority" class="medium" type="number"></label>
+        <div class="group-head"><span class="gname">Filters:</span><span class="ghint">narrow what's listed — applied as you change them</span></div>
+        <div class="status-line" id="source-state-filters"><span class="label">Source state</span><span class="statuses" id="source-states"></span></div>
+        <div id="branch-filters">
+          <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
+          <div class="status-line"><span class="label">Branch phase</span><span class="statuses" id="branch-phases"></span></div>
+          <div class="dim lifecycle-legend">Phase: queued → evaluating → finalizing → complete. Status: worker active or not.</div>
+          <div class="field-flow">
+            <label class="field">Min answers<input id="minimum-answer-count" type="number"></label>
+            <label class="field">Max answers<input id="maximum-answer-count" type="number"></label>
+            <label class="field">Budget<input id="budget" class="narrow" type="number"></label>
+            <label class="field">Priority<input id="priority" class="medium" type="number"></label>
+          </div>
         </div>
       </div>
       <div class="control-group" id="view-group">
         <div class="group-head"><span class="gname">View</span><span class="ghint">order &amp; scope what's shown</span></div>
         <div class="field-flow">
           <label class="field" id="sort-field"><span class="fieldlabel">Sort</span><select id="sort"></select></label>
-          <label class="field" id="group-by-field"><span class="fieldlabel">Group by</span><select id="group-by"><option value="">none</option><option value="status">status</option><option value="answer_count">answer count</option><option value="cache_state">cache state</option><option value="worker_presence">worker</option><option value="priority">priority</option></select></label>
+          <label class="field" id="group-by-field"><span class="fieldlabel">Group by</span><select id="group-by"></select></label>
           <label class="field" id="limit-field"><span id="limit-label">Branches shown</span><input id="limit" type="number" min="1"></label>
           <label class="field" id="by-field"><span class="fieldlabel">Hotspot field</span><select id="by"><option value="">nodes</option><option>age</option><option>size</option><option>workers</option><option>priority</option><option>slowest</option><option>evaluated-candidates</option><option>one-level-erd-prunes</option><option>two-level-erd-prunes</option><option>cut-reuse</option><option>coordination</option></select></label>
           <label class="field" id="epoch-field">Epoch<input id="epoch" class="narrow" type="number"></label>
@@ -300,11 +303,17 @@
     const SCHEMA_VERSION=3, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
+    // A source word's lifecycle, which is not a branch's: queued until a
+    // worker picks one of its requests up, complete once every request is.
+    const sourceStateNames=["queued","active","complete"];
     // iOS Safari's native <select> picker ignores the "hidden" attribute on
     // <option> elements, so context-dependent choices are rebuilt into the
     // DOM rather than toggled — an absent option can't appear in any picker.
     const SORT_OPTIONS_DEFAULT=[["","default"],["age","age"],["size","size"],["workers","workers"],["priority","priority"],["nodes","nodes"],["slowest","slowest"]];
     const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
+    const SORT_OPTIONS_SOURCES=[["","priority (default)"],["word","word"],["branches","branches"],["open","open"],["done","done"],["workers","workers"],["age","age"]];
+    const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
+    const GROUP_BY_OPTIONS_SOURCES=[["","none"],["state","state"],["worker_presence","worker"],["priority","priority"]];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","sources"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
@@ -392,9 +401,11 @@
     const isInferredWordState=(kind,branchTarget)=>kind==="auto"&&isWordTarget(branchTarget);
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),source_state:branchValues(state.source_state,sourceStateNames)||[],minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
       if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree?["active"]:[];
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
+      if(normalized.source_state===undefined)normalized.source_state=[];
+      if(normalized.kind!=="sources")normalized.source_state=[];
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
@@ -404,7 +415,9 @@
       // names no word is dropped, and one that reaches a word through a spine
       // keeps only that word: the report reads the trailing word alone, so a
       // displayed spine prefix would promise a narrower answer than it gives.
-      if(normalized.kind==="sources"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.claims=false;normalized.answers=false;normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
+      if(normalized.kind==="sources"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.claims=false;normalized.answers=false;
+        if(!SORT_OPTIONS_SOURCES.some(([value])=>value===normalized.sort))normalized.sort="";
+        if(!GROUP_BY_OPTIONS_SOURCES.some(([value])=>value===normalized.group_by))normalized.group_by="";normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
@@ -415,13 +428,13 @@
       if(normalized.kind==="auto"&&normalized.branch_target===""){normalized.answers=false;normalized.claims=false;}
       const inferredWord=isInferredWordState(normalized.kind,normalized.branch_target);
       if(inferredWord&&!['size','workers','priority'].includes(normalized.sort))normalized.sort="size";
-      if(!inferredWord)normalized.group_by="";
+      if(!inferredWord&&normalized.kind!=="sources")normalized.group_by="";
       return normalized;
     }
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),source_state:parseFilter("source_state"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -431,6 +444,7 @@
       const addBranchFilter=(name,values,defaults)=>{if(JSON.stringify(values)===JSON.stringify(defaults))return;query.set(name,values.length?values.join(","):"all");};
       addBranchFilter("branch_status",state.branch_status,defaultStatuses);
       addBranchFilter("branch_phase",state.branch_phase,[]);
+      addBranchFilter("source_state",state.source_state,[]);
       for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","group_by","limit","by","epoch","since_seconds","sample_size"])if(state[name]!==null&&state[name]!=="")query.set(name,String(state[name]));
       if(state.worker_id)query.set("worker",state.worker_id);
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
@@ -464,27 +478,40 @@
       byId("layout-flat").setAttribute("aria-pressed",currentState.tree?"false":"true");
       byId("layout-tree").setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
-      const kind=currentState.kind, isHotspots=kind==="hotspots";
+      const kind=currentState.kind, isHotspots=kind==="hotspots", isSources=kind==="sources";
       const wordReport=isInferredWordState(kind,currentState.branch_target);
-      const sortSelect=byId("sort"),sortMode=wordReport?"word":"default";
+      const sortSelect=byId("sort"),sortMode=isSources?"sources":wordReport?"word":"default";
+      const sortOptions=isSources?SORT_OPTIONS_SOURCES:wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT;
       if(sortSelect.dataset.mode!==sortMode){
-        sortSelect.replaceChildren(...(wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT).map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
+        sortSelect.replaceChildren(...sortOptions.map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
         sortSelect.dataset.mode=sortMode;
       }
-      sortSelect.value=currentState.sort;byId("by").value=currentState.by;byId("group-by").value=currentState.group_by;
+      // Same rebuild for group-by: its strategies differ per report, and a
+      // hidden <option> still shows in iOS Safari's picker.
+      const groupSelect=byId("group-by"),groupMode=isSources?"sources":"word";
+      if(groupSelect.dataset.mode!==groupMode){
+        groupSelect.replaceChildren(...(isSources?GROUP_BY_OPTIONS_SOURCES:GROUP_BY_OPTIONS_WORD).map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
+        groupSelect.dataset.mode=groupMode;
+      }
+      sortSelect.value=currentState.sort;byId("by").value=currentState.by;groupSelect.value=currentState.group_by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
+      document.querySelectorAll("[data-source-state]").forEach(input=>input.checked=currentState.source_state.includes(input.value));
       const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(currentState.by);
-      byId("filters-group").hidden=kind==="cache"||kind==="sources"||historicalHotspot;
-      byId("sort-field").hidden=kind==="cache"||kind==="sources"||isHotspots;
-      byId("group-by-field").hidden=!wordReport;
+      byId("filters-group").hidden=kind==="cache"||historicalHotspot;
+      // A source word is filtered by its own state, never by branch status,
+      // phase, answer count, budget or priority -- those describe one branch.
+      byId("source-state-filters").hidden=!isSources;
+      byId("branch-filters").hidden=isSources;
+      byId("sort-field").hidden=kind==="cache"||isHotspots;
+      byId("group-by-field").hidden=!wordReport&&!isSources;
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
       byId("limit-label").textContent=currentState.tree?"Items per page":kind==="auto"?"Branches shown":"Rows shown";
       byId("limit-field").hidden=currentState.tree;
     }
-    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),source_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -1346,14 +1373,37 @@
       const sourceWords=data.summary||[],rows=withMembershipIdentity(data.rows);
       const branchTotal=sourceWords.reduce((total,row)=>total+(row.branch_count||0),0);
       const openTotal=sourceWords.reduce((total,row)=>total+(row.open_branch_count||0),0);
+      const totalWords=data.total_source_word_count??sourceWords.length;
       const metrics=element("div","metrics");
       metrics.append(metric("source words",sourceWords.length),metric("branches",branchTotal),metric("open",openTotal));
       fragment.append(metrics,element("h2","","Source words"));
-      if(!sourceWords.length)fragment.append(element("p","empty","No source-work requests"));
+      if(sourceWords.length!==totalWords)fragment.append(element("p","dim","Shown "+numText(sourceWords.length)+" of "+numText(totalWords)+" — the rest are filtered out by source state."));
+      if(!sourceWords.length)fragment.append(element("p","empty",totalWords?"No source word matches this state filter":"No source-work requests"));
       else if(!rows.length)fragment.append(element("p","dim","Pick a word to list the branches it owns."));
-      const wordGrid=gridElement("source-words"),previousWords=previousBy(previous,"summary","source_word");
-      for(const row of ordered(sourceWords,"source_word","source-words",state))wordGrid.append(sourceWordCard(row,previousWords.get(String(row.source_word)),state,report.generated_at));
-      fragment.append(wordGrid);
+      const previousWords=previousBy(previous,"summary","source_word");
+      const wordCard=row=>sourceWordCard(row,previousWords.get(String(row.source_word)),state,report.generated_at);
+      if(data.summary_groups){
+        // Each group carries its own rollup, so a collapsed group still says
+        // how much work it holds.
+        const container=element("div","source-word-groups");
+        for(const group of data.summary_groups){
+          const groupKey="source-group:"+state.group_by+"/"+group.label;
+          const details=element("details","response-group");
+          details.open=!collapsedResponseGroups.has(groupKey);
+          details.addEventListener("toggle",()=>details.open?collapsedResponseGroups.delete(groupKey):collapsedResponseGroups.add(groupKey));
+          const rollup=group.rollup,summaryEl=element("summary","clickable");
+          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(rollup.source_word_count)+(rollup.source_word_count===1?" word":" words")+" · "+numText(rollup.branch_count)+(rollup.branch_count===1?" branch":" branches")+" · "+numText(rollup.open_branch_count)+" open · "+numText(rollup.done_branch_count)+" done · "+numText(rollup.worker_count)+(rollup.worker_count===1?" worker":" workers")));
+          const grid=gridElement("source-words/"+group.label);
+          for(const row of ordered(group.rows,"source_word","source-words/"+group.label,state))grid.append(wordCard(row));
+          details.append(summaryEl,grid);
+          container.append(details);
+        }
+        fragment.append(container);
+      }else{
+        const wordGrid=gridElement("source-words");
+        for(const row of ordered(sourceWords,"source_word","source-words",state))wordGrid.append(wordCard(row));
+        fragment.append(wordGrid);
+      }
       if(!rows.length)return fragment;
       // Both counts come from the model, which counts them before the row
       // limit truncates the grid, so neither silently means "of those shown".
@@ -1701,7 +1751,7 @@
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
       const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
-      addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-phases",branchPhaseNames,"branchPhase");
+      addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-phases",branchPhaseNames,"branchPhase");addFilterControls("source-states",sourceStateNames,"sourceState");
       currentState=parsePageState(location);syncControls();
       byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
       byId("layout-flat").addEventListener("click",()=>setState({...readControls(),tree:false}));

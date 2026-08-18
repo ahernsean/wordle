@@ -111,13 +111,26 @@ class ReportFilters:
     finalization_cursor_recorded_at: int | None = None
     finalization_cursor_id: int | None = None
     group_by: str | None = None
+    source_states: tuple[str, ...] = ()
 
 
 BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
 BRANCH_PHASES = ("queued", "evaluating", "finalizing", "complete")
+# A source word's lifecycle is its own: it is queued until a worker picks one
+# of its requests up, and complete only once every request behind it is.  These
+# are deliberately not the branch statuses, which describe a single branch.
+SOURCE_STATES = ("queued", "active", "complete")
 GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
+SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
+SOURCE_SORT_FIELDS = (
+    "default", "word", "priority", "branches", "open", "done", "workers", "age",
+)
+# Sorts that only a source report can serve, so another report asking for one
+# is rejected rather than quietly sorted some other way.
+SOURCE_ONLY_SORT_FIELDS = ("word", "branches", "open", "done")
+_SOURCE_STATE_GROUP_ORDER = {"active": 0, "queued": 1, "complete": 2}
 _STATUS_GROUP_ORDER = {"active": 0, "pending": 1, "done": 2, "unqueued": 3}
 _ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
 _CACHE_STATE_GROUP_ORDER = {"missing": 0, "loss": 1, "exact": 2, "not_applicable": 3}
@@ -214,15 +227,34 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError(
             "--sort for word reports must be default, size, workers, or priority"
         )
-    if request.filters.group_by is not None and (
+    if request.filters.group_by is not None and report_kind == "sources":
+        if request.filters.group_by not in SOURCE_GROUP_BY_STRATEGIES:
+            raise ValueError(
+                "group_by for source reports must be one of "
+                + ", ".join(SOURCE_GROUP_BY_STRATEGIES)
+            )
+    elif request.filters.group_by is not None and (
         report_kind != "auto"
         or branch_target_kind != "word"
         or request.filters.group_by not in GROUP_BY_STRATEGIES
     ):
         raise ValueError(
-            "group_by requires a word report and must be one of "
+            "group_by requires a word or source report and must be one of "
             + ", ".join(GROUP_BY_STRATEGIES)
         )
+    if request.filters.source_states and report_kind != "sources":
+        raise ValueError("source_state requires a source report")
+    if request.filters.sort is not None:
+        if report_kind == "sources":
+            if request.filters.sort not in SOURCE_SORT_FIELDS:
+                raise ValueError(
+                    "--sort for source reports must be one of "
+                    + ", ".join(SOURCE_SORT_FIELDS)
+                )
+        elif request.filters.sort in SOURCE_ONLY_SORT_FIELDS:
+            raise ValueError(
+                f"--sort {request.filters.sort} requires a source report"
+            )
     historical_hotspot = request.hotspot_field in (
         "evaluated-candidates", "bulk-completed-candidates",
         "one-level-erd-prunes", "two-level-erd-prunes",
@@ -2631,6 +2663,60 @@ def _merged_source_state(row):
     return "active" if _row_value(row, "has_active_request", 0) else "queued"
 
 
+_SOURCE_SORT_KEYS = {
+    "word": lambda row: (row["source_word"] or "",),
+    "priority": lambda row: (-(row["requested_priority"] or 0),
+                             row["source_word"] or ""),
+    "branches": lambda row: (-row["branch_count"], row["source_word"] or ""),
+    "open": lambda row: (-row["open_branch_count"], row["source_word"] or ""),
+    "done": lambda row: (-row["done_branch_count"], row["source_word"] or ""),
+    "workers": lambda row: (-row["worker_count"], row["source_word"] or ""),
+    # Oldest request first: the word that has been waiting longest leads.
+    "age": lambda row: (row["requested_at"] if row["requested_at"] is not None
+                        else float("inf"), row["source_word"] or ""),
+}
+
+
+def _sorted_source_words(rows, sort):
+    """Order the collapsed rows.  The default is the queue's own order:
+    highest requested priority first, which is the order they are served in."""
+    key = _SOURCE_SORT_KEYS.get(sort or "default")
+    return sorted(rows, key=key) if key is not None else rows
+
+
+def _source_word_group_key(row, group_by):
+    """Map a collapsed source row to (sort_key, label) for the strategy."""
+    if group_by == "state":
+        state = row["state"]
+        return (_SOURCE_STATE_GROUP_ORDER.get(state, 9), state)
+    if group_by == "worker_presence":
+        return ((0, "with workers") if row["worker_count"]
+                else (1, "no workers"))
+    priority = row["requested_priority"]
+    return (-(priority or 0), f"priority {priority}")
+
+
+def _grouped_source_words(rows, group_by):
+    """Bucket the collapsed rows, each group carrying its own rollup."""
+    grouped = {}
+    for row in rows:
+        sort_key, label = _source_word_group_key(row, group_by)
+        group = grouped.setdefault(
+            (sort_key, label),
+            {"label": label, "rows": [],
+             "rollup": {"source_word_count": 0, "branch_count": 0,
+                        "open_branch_count": 0, "done_branch_count": 0,
+                        "worker_count": 0}},
+        )
+        group["rows"].append(row)
+        rollup = group["rollup"]
+        rollup["source_word_count"] += 1
+        for field in ("branch_count", "open_branch_count",
+                      "done_branch_count", "worker_count"):
+            rollup[field] += row[field]
+    return [grouped[key] for key in sorted(grouped)]
+
+
 def _source_rollups(membership_rows):
     """Per-word live-branch totals, keyed by source word.
 
@@ -2707,8 +2793,9 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     one row per owning request, with the branch's own effective (materialized)
     priority reported alongside each owner's individually requested priority."""
     generated_at = int(time.time())
-    data = {"summary": [], "matched_rows": 0, "shared_branch_count": 0,
-            "rows": []}
+    data = {"summary": [], "total_source_word_count": 0,
+            "matched_source_word_count": 0, "matched_rows": 0,
+            "shared_branch_count": 0, "rows": []}
     report = _semantic_report(
         "sources", sources, request.branch_target, generated_at, data, request
     )
@@ -2727,12 +2814,26 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         # each word's own totals are complete whichever word is in scope.
         all_membership_rows = queue.source_membership_rows()
         rollups = _source_rollups(all_membership_rows)
-        data["summary"] = [
+        collapsed = [
             _source_summary_payload(
                 row, rollups[(_row_value(row, "source_word") or "").lower() or None]
             )
             for row in summary_rows
         ]
+        data["total_source_word_count"] = len(collapsed)
+        source_states = request.filters.source_states
+        if source_states:
+            collapsed = [row for row in collapsed
+                         if row["state"] in source_states]
+        collapsed = _sorted_source_words(collapsed, request.filters.sort)
+        limit = request.filters.limit
+        data["matched_source_word_count"] = len(collapsed)
+        data["summary"] = collapsed[:limit] if limit is not None else collapsed
+        group_by = request.filters.group_by
+        if group_by is not None and group_by != "none":
+            data["summary_groups"] = _grouped_source_words(
+                data["summary"], group_by
+            )
 
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they
@@ -2755,9 +2856,10 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             data["shared_branch_count"] = len({
                 row["branch_key_hex"] for row in payload_rows if row["is_shared"]
             })
-            limit = request.filters.limit
+            branch_row_limit = request.filters.limit
             data["rows"] = (
-                payload_rows[:limit] if limit is not None else payload_rows
+                payload_rows[:branch_row_limit]
+                if branch_row_limit is not None else payload_rows
             )
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
