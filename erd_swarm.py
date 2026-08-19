@@ -333,8 +333,15 @@ class _MidLoopPublisher:
                 budget, True]
 
     def check(self, token, candidate_list, last_index,
-              best_guess, best_erd, budget):
+              best_guess, best_erd, best_max_remaining_depth, budget):
         """Called every loop iteration (before status-continue checks).
+
+        best_max_remaining_depth is the winning candidate's worst-case line
+        length, carried alongside best_guess/best_erd because the seed below
+        stores all three together: a seeded best with no depth is written to
+        the branch as an unknown depth, and a cached row of unknown depth is
+        never reusable at any budget (see cache_sqlite's reuse rule), so the
+        branch would finalize solved yet unreadable.
 
         candidate_list is the frame's full ordered candidate list and last_index
         is the index just evaluated, so remaining_count is derived cheaply and
@@ -497,7 +504,8 @@ class _MidLoopPublisher:
         # (a None best_guess means no feasible candidate yet — the entry
         # ceiling, if any, rides on the branch's ceiling column instead).
         if best_guess is not None:
-            self._worker.queue.update_branch_best(branch_key, best_guess, best_erd)
+            self._worker.queue.update_branch_best(
+                branch_key, best_guess, best_erd, best_max_remaining_depth)
 
         result = self._worker.cooperative_solve(
             branch_words, budget,

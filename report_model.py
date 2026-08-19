@@ -111,13 +111,28 @@ class ReportFilters:
     finalization_cursor_recorded_at: int | None = None
     finalization_cursor_id: int | None = None
     group_by: str | None = None
+    source_states: tuple[str, ...] = ()
+    source_offset: int | None = None
+    branch_row_offset: int | None = None
 
 
 BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
 BRANCH_PHASES = ("queued", "evaluating", "finalizing", "complete")
+# A source word's lifecycle is its own: it is queued until a worker picks one
+# of its requests up, and complete only once every request behind it is.  These
+# are deliberately not the branch statuses, which describe a single branch.
+SOURCE_STATES = ("queued", "active", "complete")
 GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
+SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
+SOURCE_SORT_FIELDS = (
+    "default", "word", "priority", "branches", "open", "done", "workers", "age",
+)
+# Sorts that only a source report can serve, so another report asking for one
+# is rejected rather than quietly sorted some other way.
+SOURCE_ONLY_SORT_FIELDS = ("word", "branches", "open", "done")
+_SOURCE_STATE_GROUP_ORDER = {"active": 0, "queued": 1, "complete": 2}
 _STATUS_GROUP_ORDER = {"active": 0, "pending": 1, "done": 2, "unqueued": 3}
 _ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
 _CACHE_STATE_GROUP_ORDER = {"missing": 0, "loss": 1, "exact": 2, "not_applicable": 3}
@@ -214,15 +229,42 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError(
             "--sort for word reports must be default, size, workers, or priority"
         )
-    if request.filters.group_by is not None and (
+    if request.filters.group_by is not None and report_kind == "sources":
+        if request.filters.group_by not in SOURCE_GROUP_BY_STRATEGIES:
+            raise ValueError(
+                "group_by for source reports must be one of "
+                + ", ".join(SOURCE_GROUP_BY_STRATEGIES)
+            )
+    elif request.filters.group_by is not None and (
         report_kind != "auto"
         or branch_target_kind != "word"
         or request.filters.group_by not in GROUP_BY_STRATEGIES
     ):
         raise ValueError(
-            "group_by requires a word report and must be one of "
+            "group_by requires a word or source report and must be one of "
             + ", ".join(GROUP_BY_STRATEGIES)
         )
+    if request.filters.source_states and report_kind != "sources":
+        raise ValueError("source_state requires a source report")
+    for name in ("source_offset", "branch_row_offset"):
+        offset = getattr(request.filters, name)
+        if offset is None:
+            continue
+        if report_kind != "sources":
+            raise ValueError(f"{name} requires a source report")
+        if offset < 0:
+            raise ValueError(f"{name} cannot be negative")
+    if request.filters.sort is not None:
+        if report_kind == "sources":
+            if request.filters.sort not in SOURCE_SORT_FIELDS:
+                raise ValueError(
+                    "--sort for source reports must be one of "
+                    + ", ".join(SOURCE_SORT_FIELDS)
+                )
+        elif request.filters.sort in SOURCE_ONLY_SORT_FIELDS:
+            raise ValueError(
+                f"--sort {request.filters.sort} requires a source report"
+            )
     historical_hotspot = request.hotspot_field in (
         "evaluated-candidates", "bulk-completed-candidates",
         "one-level-erd-prunes", "two-level-erd-prunes",
@@ -1045,6 +1087,51 @@ def _candidate_erd_summary(response_groups, group_budget):
     }
 
 
+def _resolved_candidate_erd(cache, branch_key, candidate_word, policy,
+                             response_groups, group_budget, stored_erd_map=None):
+    """A candidate's own ERD at a branch — the single place every caller
+    (word report, leaderboard, sources view) gets this number.
+
+    Once `_candidate_erd_summary` reports a candidate `complete`, the value is
+    an immutable fact: every response group behind it is itself an exact,
+    finalized branch row, and those do not change outside a reverification
+    pass.  So a `complete` fold is persisted the first time it is seen, and
+    every later call for the same (branch, candidate) is one stored-row lookup
+    instead of a fresh fold over the candidate's response groups.
+
+    `stored_erd_map`, when given, comes from `cache.candidate_erd_map` and
+    serves a whole-vocabulary pass (the leaderboard); omit it for a single
+    candidate, which does one direct lookup instead.  `cache` may be None when
+    the caller has no cache connection, leaving the fold unchanged but
+    unpersisted.
+    """
+    stored = None
+    if cache is not None:
+        stored = (
+            cache.candidate_erd_from_map(branch_key, candidate_word, stored_erd_map)
+            if stored_erd_map is not None
+            else cache.read_candidate_erd(branch_key, candidate_word, policy)
+        )
+    # A changed vocabulary reshapes a candidate's own grouping, so a stored row
+    # whose group count no longer matches describes a different partition.
+    if stored is not None and stored["response_group_count"] == len(response_groups):
+        return {
+            "state": "complete",
+            "erd": stored["erd"],
+            "max_remaining_depth": stored["max_remaining_depth"],
+            "resolved_group_count": stored["response_group_count"],
+            "infeasible_group_count": 0,
+            "response_group_count": stored["response_group_count"],
+        }
+    summary = _candidate_erd_summary(response_groups, group_budget)
+    if cache is not None and summary["state"] == "complete":
+        cache.write_candidate_erd(
+            branch_key, candidate_word, policy, summary["erd"],
+            summary["max_remaining_depth"], summary["response_group_count"],
+        )
+    return summary
+
+
 def _response_group_key(row: dict, group_by: str) -> tuple:
     """Map a response-group row to (sort_key, label) for the given strategy."""
     if group_by == "status":
@@ -1163,12 +1250,31 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         for branch_key in branch_keys
     }
     cache = None
+    erd_summary = None
     try:
         cache = ScoreCache(
             sources.cache_path, all_answers, checkpoint_on_close=False
         )
         cache_states = cache.report_branch_states(
             branch_keys, ERD_ALL, group_budget
+        )
+        # Resolved here, while the cache is open, and against the branch this
+        # word is played from — not the root, since a word report can sit at
+        # any spine.
+        erd_summary = _resolved_candidate_erd(
+            cache, resolved.branch_key, word, ERD_ALL,
+            [
+                {
+                    "pattern": row["pattern"],
+                    "answer_count": row["answer_count"],
+                    "best_erd": cache_states[row["branch_key"]]["best_erd"],
+                    "max_remaining_depth":
+                        cache_states[row["branch_key"]]["max_remaining_depth"],
+                    "cache_state": cache_states[row["branch_key"]]["cache_state"],
+                }
+                for row in group_rows
+            ],
+            group_budget,
         )
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
@@ -1279,7 +1385,10 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             row["cache_state"] == "missing" for row in all_response_groups
         ),
     }
-    data["erd_summary"] = _candidate_erd_summary(all_response_groups, group_budget)
+    data["erd_summary"] = (
+        erd_summary if erd_summary is not None
+        else _candidate_erd_summary(all_response_groups, group_budget)
+    )
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = displayed_response_groups
@@ -2305,14 +2414,16 @@ def _candidate_group_skeletons(sources, all_answers, all_candidates, cache):
 
 
 def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -> dict:
-    """Rank every candidate opener by its own ERD, folded on read.
+    """Rank every candidate opener by its own ERD.
 
-    Each candidate's ERD is computed exactly as the word report computes it
-    (`_candidate_erd_summary`), reusing the cache's reusability gate so the
+    Each candidate's ERD is resolved exactly as the word report resolves it
+    (`_resolved_candidate_erd`), reusing the cache's reusability gate so the
     numbers agree with `view WORD`.  Only openers whose whole tree is solved
     have a finite ERD and appear ranked; the rest are summarized as pending or
-    infeasible.  Nothing is persisted — the ranking is recomputed from current
-    cache state.
+    infeasible.  A candidate found complete keeps its folded ERD, so a later
+    build reads one row per solved opener instead of re-folding its response
+    groups; an unsolved candidate is re-folded from current cache state every
+    time, since its value can still change.
     """
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -2337,6 +2448,9 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
             default=0,
         )
         exact_by_key, loss_by_key = cache.report_branch_row_maps(ERD_ALL)
+        stored_erd_map = cache.candidate_erd_map(ERD_ALL)
+        # Every candidate here is an opener, folded against the root branch.
+        root_branch_key = ScoreCache.encode_subset(all_answers)
         counts = {"complete": 0, "pending": 0, "infeasible": 0}
         ranked_rows = []
         for candidate, groups in skeletons:
@@ -2354,7 +2468,10 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
                 }
                 for pattern, answer_count, branch_key in groups
             ]
-            summary = _candidate_erd_summary(response_groups, group_budget)
+            summary = _resolved_candidate_erd(
+                cache, root_branch_key, candidate, ERD_ALL,
+                response_groups, group_budget, stored_erd_map,
+            )
             counts[summary["state"]] += 1
             if summary["state"] == "complete":
                 ranked_rows.append({
@@ -2589,16 +2706,208 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
-def _source_summary_payload(row):
+def _source_summary_payload(row, rollup):
+    """One source word, with its requests and branches rolled up.
+
+    This is the report's unit: a word that spawned a thousand branches is one
+    row, not a thousand, and a word requested more than once is still one row.
+    direct_branch_count and branch_count span every branch the word's requests
+    have ever owned; the rollup counts only those still owned live, so a branch
+    that finalized and released its ownership reads as done.
+
+    direct_branch_count is the branches the word asked for outright — its own
+    response groups.  A branch the search promoted under that word's ownership
+    later counts only in branch_count, so the two are equal until promotion
+    starts.
+    """
     source_word = _row_value(row, "source_word")
+    branch_count = row["branch_count"] or 0
+    open_branch_count = rollup["open_branch_count"]
     return {
-        "source_work_id": row["source_work_id"],
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
-        "state": row["state"],
-        "root_count": row["root_count"] or 0,
-        "branch_count": row["branch_count"] or 0,
+        "requested_at": _row_value(row, "requested_at"),
+        "request_count": row["request_count"] or 0,
+        "state": _merged_source_state(row),
+        "direct_branch_count": row["direct_branch_count"] or 0,
+        "branch_count": branch_count,
+        "open_branch_count": open_branch_count,
+        "done_branch_count": max(0, branch_count - open_branch_count),
+        "worker_count": rollup["worker_count"],
     }
+
+
+def _merged_source_state(row):
+    """The state of a word whose requests may disagree.
+
+    A word is only complete once every one of its requests is, and reads as
+    active while any request is being worked.
+    """
+    if not _row_value(row, "has_incomplete_request", 0):
+        return "complete"
+    return "active" if _row_value(row, "has_active_request", 0) else "queued"
+
+
+_SOURCE_SORT_KEYS = {
+    "word": lambda row: (row["source_word"] or "",),
+    "priority": lambda row: (-(row["requested_priority"] or 0),
+                             row["source_word"] or ""),
+    "branches": lambda row: (-row["branch_count"], row["source_word"] or ""),
+    "open": lambda row: (-row["open_branch_count"], row["source_word"] or ""),
+    "done": lambda row: (-row["done_branch_count"], row["source_word"] or ""),
+    "workers": lambda row: (-row["worker_count"], row["source_word"] or ""),
+    # Oldest request first: the word that has been waiting longest leads.
+    "age": lambda row: (row["requested_at"] if row["requested_at"] is not None
+                        else float("inf"), row["source_word"] or ""),
+}
+
+
+def _sorted_source_words(rows, sort):
+    """Order the collapsed rows.  The default is the queue's own order:
+    highest requested priority first, which is the order they are served in."""
+    key = _SOURCE_SORT_KEYS.get(sort or "default")
+    return sorted(rows, key=key) if key is not None else rows
+
+
+def _source_word_group_key(row, group_by):
+    """Map a collapsed source row to (sort_key, label) for the strategy."""
+    if group_by == "state":
+        state = row["state"]
+        return (_SOURCE_STATE_GROUP_ORDER.get(state, 9), state)
+    if group_by == "worker_presence":
+        return ((0, "with workers") if row["worker_count"]
+                else (1, "no workers"))
+    priority = row["requested_priority"]
+    return (-(priority or 0), f"priority {priority}")
+
+
+def _grouped_source_words(rows, group_by, branch_totals):
+    """Bucket the collapsed rows, each group carrying its own rollup.
+
+    A group's branch totals are counted distinctly over the words in it, for
+    the same reason the report's own are: two words can own the same branch,
+    and summing their per-word counts would count it once per word.
+    """
+    grouped = {}
+    for row in rows:
+        sort_key, label = _source_word_group_key(row, group_by)
+        group = grouped.setdefault(
+            (sort_key, label),
+            {"label": label, "rows": [],
+             "rollup": {"source_word_count": 0, "branch_count": 0,
+                        "open_branch_count": 0, "done_branch_count": 0,
+                        "worker_count": 0}},
+        )
+        group["rows"].append(row)
+        rollup = group["rollup"]
+        rollup["source_word_count"] += 1
+        rollup["worker_count"] += row["worker_count"]
+    for group in grouped.values():
+        branch_count, open_branch_count = branch_totals(
+            [row["source_word"] for row in group["rows"]]
+        )
+        group["rollup"]["branch_count"] = branch_count
+        group["rollup"]["open_branch_count"] = open_branch_count
+        group["rollup"]["done_branch_count"] = max(
+            0, branch_count - open_branch_count
+        )
+    return [grouped[key] for key in sorted(grouped)]
+
+
+def _source_word_erd_summaries(sources, source_words, report):
+    """Resolve each word's own ERD, folding it only when it is not stored.
+
+    A source word's ERD is the whole point of queueing it.  It is derived from
+    the cached result of each of the word's response groups, the same way the
+    word report derives it for one word, and a word whose whole tree is solved
+    keeps its folded value in `candidate_erd_by_policy` so later pages read one
+    row instead of re-folding ~150 groups.  Only the words on the page are
+    resolved, so the cost is bounded by the page size rather than by how much
+    is queued.
+    """
+    summaries = {}
+    if not source_words:
+        return summaries
+    cache = None
+    try:
+        all_answers = load_word_list(sources.answer_list_path)
+        response_cache = ResponseCache(all_answers, score_cache=None)
+        cache = ScoreCache(
+            sources.cache_path, all_answers, checkpoint_on_close=False
+        )
+        # A root word spends the first guess, leaving the rest for its groups.
+        group_budget = GAME_GUESSES - 1
+        # Source words are always openers, so every one folds against the same
+        # branch: the whole answer list, before any guess is played.
+        root_branch_key = ScoreCache.encode_subset(all_answers)
+        for word in source_words:
+            if word is None:
+                continue
+            groups = response_cache.group_words(word, all_answers)
+            group_rows = []
+            branch_keys = []
+            for pattern_code, answer_words in sorted(groups.items()):
+                if not answer_words:
+                    continue
+                branch_key = ScoreCache.encode_subset(answer_words)
+                branch_keys.append(branch_key)
+                group_rows.append({
+                    "pattern": fmt_pattern(pattern_code),
+                    "answer_count": len(answer_words),
+                    "branch_key": branch_key,
+                })
+            states = cache.report_branch_states(
+                branch_keys, ERD_ALL, group_budget
+            )
+            summaries[word] = _resolved_candidate_erd(
+                cache, root_branch_key, word, ERD_ALL,
+                [
+                    {
+                        "pattern": row["pattern"],
+                        "answer_count": row["answer_count"],
+                        "best_erd": states[bytes(row["branch_key"])]["best_erd"],
+                        "max_remaining_depth":
+                            states[bytes(row["branch_key"])]["max_remaining_depth"],
+                        "cache_state":
+                            states[bytes(row["branch_key"])]["cache_state"],
+                    }
+                    for row in group_rows
+                ],
+                group_budget,
+            )
+        report["sources"]["cache"]["ok"] = True
+    except (sqlite3.Error, OSError) as error:
+        report["sources"]["cache"]["error"] = str(error)
+    finally:
+        if cache is not None:
+            cache.close()
+    return summaries
+
+
+def _source_rollups(membership_rows):
+    """Per-word live-branch totals, keyed by source word.
+
+    A branch owned by two of a word's requests holds two membership rows, so
+    branches are counted once per word rather than once per membership.
+    """
+    rollups = collections.defaultdict(
+        lambda: {"open_branch_count": 0, "worker_count": 0, "branch_ids": set()}
+    )
+    for row in membership_rows:
+        source_word = (_row_value(row, "source_word") or "").lower() or None
+        rollup = rollups[source_word]
+        if row["branch_id"] in rollup["branch_ids"]:
+            continue
+        rollup["branch_ids"].add(row["branch_id"])
+        worker_count = _row_value(row, "worker_count", 0)
+        _branch_status, branch_phase = branch_status_and_phase(
+            _row_value(row, "pending_status"), _row_value(row, "active_status"),
+            worker_count,
+        )
+        if branch_phase != "complete":
+            rollup["open_branch_count"] += 1
+        rollup["worker_count"] += worker_count
+    return rollups
 
 
 def _source_membership_payload(row, owner_count):
@@ -2642,14 +2951,21 @@ def _source_membership_payload(row, owner_count):
 
 
 def collect_source_report(sources: ReportSources, request: ReportRequest) -> dict:
-    """Report every source-work request, its recorded requested priority, and
-    every branch it owns (or shares) — the reporting half of #200's operator
-    surface.  A branch with more than one live owner is never reduced to a
-    single display label: each owning request gets its own row, with the
-    branch's own effective (materialized) priority reported alongside each
-    owner's individually requested priority."""
+    """Report every source word with its requests and branches rolled up —
+    the reporting half of #200's operator surface.
+
+    One word is one row: ten queued root words report ten rows, whatever the
+    branch count underneath them, and a word requested more than once still
+    reports one row.  Naming a word opens that word's branches, and only there
+    is a branch with more than one live owner shown as one row per owning
+    request, with the branch's own effective (materialized) priority reported
+    alongside each owner's individually requested priority."""
     generated_at = int(time.time())
-    data = {"summary": [], "matched_rows": 0, "rows": []}
+    data = {"summary": [], "total_source_word_count": 0,
+            "matched_source_word_count": 0, "matched_branch_count": 0,
+            "matched_open_branch_count": 0, "source_word_offset": 0,
+            "matched_rows": 0, "shared_branch_count": 0,
+            "branch_row_offset": 0, "rows": []}
     report = _semantic_report(
         "sources", sources, request.branch_target, generated_at, data, request
     )
@@ -2660,31 +2976,101 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             request.branch_target.trailing_word
             if request.branch_target.kind == "word" else None
         )
-        summary_rows = queue.source_work_rows()
+        summary_rows = queue.source_word_rows()
         if source_word is not None:
             summary_rows = [row for row in summary_rows
                             if (row["source_word"] or "").lower() == source_word]
-        data["summary"] = [_source_summary_payload(row) for row in summary_rows]
-
-        # Owner counts are computed from every live membership so a branch
-        # shared with a request outside the word filter still reports
-        # is_shared correctly, rather than only counting the filtered rows.
+        # Rolled up from every live membership, not only the named word's, so
+        # each word's own totals are complete whichever word is in scope.
         all_membership_rows = queue.source_membership_rows()
-        owner_counts = collections.Counter(
-            row["branch_id"] for row in all_membership_rows
-        )
-        membership_rows = (
-            [row for row in all_membership_rows
-             if (row["source_word"] or "").lower() == source_word]
-            if source_word is not None else all_membership_rows
-        )
-        payload_rows = [
-            _source_membership_payload(row, owner_counts[row["branch_id"]])
-            for row in membership_rows
+        rollups = _source_rollups(all_membership_rows)
+        collapsed = [
+            _source_summary_payload(
+                row, rollups[(_row_value(row, "source_word") or "").lower() or None]
+            )
+            for row in summary_rows
         ]
-        data["matched_rows"] = len(payload_rows)
+        data["total_source_word_count"] = len(collapsed)
+        source_states = request.filters.source_states
+        if source_states:
+            collapsed = [row for row in collapsed
+                         if row["state"] in source_states]
+        collapsed = _sorted_source_words(collapsed, request.filters.sort)
+        data["matched_source_word_count"] = len(collapsed)
+        # Counted with each branch counted once: two words can own the same
+        # branch, so summing their per-word counts double-counts precisely the
+        # shared ownership this report exists to show.
+        def branch_totals(words):
+            word_set = set(words)
+            open_branch_ids = {
+                row["branch_id"] for row in all_membership_rows
+                if (_row_value(row, "source_word") or "").lower() in word_set
+                and branch_status_and_phase(
+                    _row_value(row, "pending_status"),
+                    _row_value(row, "active_status"),
+                    _row_value(row, "worker_count", 0),
+                )[1] != "complete"
+            }
+            return (queue.distinct_branch_count_for_words(words),
+                    len(open_branch_ids))
+
+        matched_words = [row["source_word"] for row in collapsed]
+        (data["matched_branch_count"],
+         data["matched_open_branch_count"]) = branch_totals(matched_words)
+        # limit is a page size and source_offset is where that page starts, so
+        # the words past the first page stay reachable rather than truncated
+        # away.  An offset past the end yields an empty page, not the last one:
+        # the count above is what tells the client how far it can page.
+        offset = request.filters.source_offset or 0
         limit = request.filters.limit
-        data["rows"] = payload_rows[:limit] if limit is not None else payload_rows
+        data["source_word_offset"] = offset
+        data["summary"] = (
+            collapsed[offset:offset + limit] if limit is not None
+            else collapsed[offset:]
+        )
+        # Folded for the page only, and attached to the rows it describes.
+        erd_summaries = _source_word_erd_summaries(
+            sources, [row["source_word"] for row in data["summary"]], report
+        )
+        for row in data["summary"]:
+            row["erd_summary"] = erd_summaries.get(row["source_word"])
+        group_by = request.filters.group_by
+        if group_by is not None and group_by != "none":
+            data["summary_groups"] = _grouped_source_words(
+                data["summary"], group_by, branch_totals
+            )
+
+        # Branch rows belong to one named word.  Emitting them for every word
+        # would bury ten queued roots under the hundreds of branches they
+        # spawned, which is the explosion this report exists to roll up.
+        if source_word is not None:
+            # Owner counts are computed from every live membership so a branch
+            # shared with a request outside the word filter still reports
+            # is_shared correctly, rather than only counting the filtered rows.
+            owner_counts = collections.Counter(
+                row["branch_id"] for row in all_membership_rows
+            )
+            payload_rows = [
+                _source_membership_payload(row, owner_counts[row["branch_id"]])
+                for row in all_membership_rows
+                if (row["source_word"] or "").lower() == source_word
+            ]
+            data["matched_rows"] = len(payload_rows)
+            # Counted over every matched row, like matched_rows itself: a shared
+            # branch whose rows all fall past the row limit is still shared.
+            data["shared_branch_count"] = len({
+                row["branch_key_hex"] for row in payload_rows if row["is_shared"]
+            })
+            # The same page size pages the branch rows, so a named word's
+            # hundreds of branches are reachable rather than truncated away.
+            branch_row_limit = request.filters.limit
+            branch_row_offset = request.filters.branch_row_offset or 0
+            data["branch_row_offset"] = branch_row_offset
+            data["rows"] = (
+                payload_rows[branch_row_offset:branch_row_offset + branch_row_limit]
+                if branch_row_limit is not None
+                else payload_rows[branch_row_offset:]
+            )
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)

@@ -1474,16 +1474,113 @@ def _render_hotspot_sections(report, width, display_order):
     return [("header", header), ("hotspots", lines)]
 
 
+def _display_source_erd(summary):
+    """A word's own ERD, once every one of its response groups is solved."""
+    if not summary:
+        return "—"
+    if summary["state"] == "complete":
+        return f"{summary['erd']:.3f}"
+    if summary["state"] == "infeasible":
+        return "∞"
+    return f"{summary['resolved_group_count']:,}/{summary['response_group_count']:,}"
+
+
+def _source_display_row(source, generated_at):
+    requested_at = source.get("requested_at")
+    return {
+        **source,
+        "display_requests": f"{source.get('request_count', 1):,}",
+        "display_word": (source["source_word"] or "-").upper(),
+        "display_state": source["state"],
+        "display_erd": _display_source_erd(source.get("erd_summary")),
+        "display_direct": f"{source['direct_branch_count']:,}",
+        "display_branches": f"{source['branch_count']:,}",
+        "display_open": f"{source.get('open_branch_count', 0):,}",
+        "display_done": f"{source.get('done_branch_count', 0):,}",
+        "display_workers": f"{source.get('worker_count', 0):,}",
+        "display_age": (
+            _abbreviate_duration(generated_at - requested_at)
+            if requested_at is not None else "—"
+        ),
+    }
+
+
+def _source_columns(summary):
+    # A word usually holds one request, so the request count earns a column
+    # only where some word holds more than one.
+    merged = [
+        TerminalColumn("Reqs", "display_requests", alignment="right",
+                       remove_priority=5)
+    ] if any(row.get("request_count", 1) > 1 for row in summary) else []
+    return [
+        TerminalColumn("Word", "display_word", required=True),
+        *merged,
+        TerminalColumn(
+            "Pri", "requested_priority", required=True, alignment="right"
+        ),
+        TerminalColumn("State", "display_state", required=True),
+        TerminalColumn("ERD", "display_erd", required=True, alignment="right"),
+        TerminalColumn(
+            "Open", "display_open", required=True, alignment="right"
+        ),
+        TerminalColumn(
+            "Done", "display_done", required=True, alignment="right"
+        ),
+        TerminalColumn(
+            "Branches", "display_branches", remove_priority=10,
+            alignment="right",
+        ),
+        TerminalColumn(
+            "Direct", "display_direct", remove_priority=20, alignment="right"
+        ),
+        TerminalColumn(
+            "W", "display_workers", remove_priority=30, alignment="right"
+        ),
+        TerminalColumn(
+            "Age", "display_age", remove_priority=40, alignment="right"
+        ),
+    ]
+
+
 def _render_source_sections(report, width, display_order):
+    """One line per source word, with its requests and branches rolled up.
+
+    The branch lines appear only for a named source word: listing every word's
+    branches would bury ten queued roots under the hundreds each of them
+    spawned.
+    """
     data = report["data"]
+    generated_at = report["generated_at"]
     header = _semantic_header(report, "Source-work report", width)
-    lines = [f"Requests: {len(data.get('summary', []))}   "
-            f"memberships: {data.get('matched_rows', 0)} matched"]
-    for source in data.get("summary", []):
+    summary = data.get("summary", [])
+    request_count = sum(row.get("request_count", 1) for row in summary)
+    total_words = data.get("total_source_word_count", len(summary))
+    shown_words = (
+        f"{len(summary):,}" if len(summary) == total_words
+        else f"{len(summary):,} of {total_words:,}"
+    )
+    counts = f"Source words: {shown_words}   requests: {request_count:,}"
+    if data.get("rows"):
+        counts += f"   memberships: {data.get('matched_rows', 0):,} matched"
+    lines = [counts]
+    if summary:
+        lines.extend(_render_table(
+            _source_columns(summary),
+            [_source_display_row(source, generated_at) for source in summary],
+            width, indent="  ",
+        ))
+    named_word = (report["branch_target"] or {}).get("trailing_word")
+    if summary and not data.get("rows"):
+        lines.append("")
+        # A named word with no rows owns no live branch, which is not the same
+        # as no word having been named: suggesting the word already named
+        # would send the reader back where they are.
         lines.append(_fit(
-            f"  #{source['source_work_id']} {(source['source_word'] or '-').upper()}  "
-            f"requested={source['requested_priority']}  {source['state']}  "
-            f"roots={source['root_count']} branches={source['branch_count']}",
+            f"  {named_word.upper()} owns no live branches: its work has "
+            "finished and released them."
+            if named_word else
+            "  Name a source word for its branches: view --sources "
+            f"{(summary[0]['source_word'] or 'WORD').upper()}",
             width,
         ))
     if data.get("rows"):
@@ -1492,7 +1589,9 @@ def _render_source_sections(report, width, display_order):
     for row in data.get("rows", []):
         hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
         hotkey_prefix = f"{hotkey} " if hotkey else ""
-        shared = "shared" if row["is_shared"] else "sole"
+        # owner_count already carries shared (>1) vs not (1); a "sole"
+        # qualifier would only restate the number printed beside it.
+        shared = "shared, " if row["is_shared"] else ""
         parent = (f" parent=@{_display_reference(row['parent_branch_reference'])}"
                  if row.get("parent_branch_reference") else "")
         lines.append(_fit(
@@ -1502,7 +1601,7 @@ def _render_source_sections(report, width, display_order):
             f"{row['branch_status']}/{row['branch_phase']} "
             f"requested={row['requested_priority']} "
             f"effective={row['branch_effective_priority']} "
-            f"({shared}, {row['owner_count']} owner(s)) "
+            f"({shared}{row['owner_count']} owner(s)) "
             f"root={row['root_pattern']}{parent} "
             f"workers={row['worker_count']}",
             width,

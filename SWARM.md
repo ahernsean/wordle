@@ -194,15 +194,61 @@ The rollup scans the epoch's `branch_finalize_log` rows, which carry no spine
 index, so it takes seconds. The web client fetches it after the word report
 renders and caches it per target; the terminal report pays it on each run.
 
-`--sources` reports every source-work request: its recorded requested
-priority, the request state, and every branch it owns — including branches
-shared with another request, shown as one row per owning request with both
-that request's own requested priority and the branch's effective (highest
-live owner's) priority side by side, plus its promotion lineage (root
-pattern and immediate parent). A trailing word narrows to that word's
-request(s). Each worker's own report row shows whether it is serving its
-preferred (highest-priority eligible) source or fallback work claimed
-because the preferred source had no claimable bundle.
+`--sources` reports one row per source word — ten queued root words are ten
+rows, whatever the branch count underneath them. Each row carries the word's
+requested priority, its state, its own ERD, how many branches it has ever
+owned, how many of those are still open versus done, the live workers on them,
+and how long ago it was requested.
+
+The `ERD` column is the word's own expected remaining depth, folded from the
+cached result of each of its response groups the way the word report folds it:
+an exact value once every group is solved, `∞` once one is proven unsolvable,
+and `solved/total` groups while it is still being searched. The fold is done
+only for the rows on the page — about 6 ms a word against the full answer list
+— so a long queue costs no more than a short one. In the browser the same
+number is on each card, and clicking the card opens that word's full report,
+where its response groups and root progress are; the card's own `Branches`
+control is what lists the branches it owns. `Direct` counts the branches the word asked for outright
+— its own response groups; `Branches` spans every depth beneath it, so
+sub-branches promoted during the search are included too, and the two are
+equal until promotion starts.
+
+Source work is keyed by (word, priority), so queueing one word twice at
+different priorities makes two requests. They merge into that word's single
+row: a `Reqs` column appears, the priority shown is the highest (the one that
+schedules), and a branch both requests own is counted once.
+
+`--source-state` narrows to `queued`, `active`, `complete`, or `all` — a
+word's own lifecycle, not a branch's, so it is a separate filter from
+`--branch-status`. When it hides anything the count reads `Source words: 3 of
+10`, so a filtered report never looks like the whole queue. `--sort` takes
+`word`, `priority` (the default, and the order the swarm serves them in),
+`branches`, `open`, `done`, `workers`, or `age`; those four source-only sorts
+are rejected for other reports rather than silently ignored. `--limit` caps
+the rows the terminal prints, and the count says so (`Source words: 3 of 10`).
+
+Grouping and paging are browser-only. The Sources tab groups by state out of
+the box — what is running, what is waiting, what is finished — and can group by
+worker presence or priority instead, or not at all; each group collapses under
+a rollup of the words it holds. There, `limit` is a page size rather than a cap: with `source_offset`
+it pages the word list (`Showing 6–10 of 12 words`), so the words past the
+first page stay reachable. Changing a filter, the sort or the grouping returns
+to the first page, since page 3 of one ordering is not page 3 of another.
+
+A trailing word narrows to that word's request(s) **and** lists the branches
+it owns — including branches shared with another request, shown as one row per
+owning request with both that request's own requested priority and the
+branch's effective (highest live owner's) priority side by side, plus its
+promotion lineage (root pattern and immediate parent). That per-branch list is
+deliberately opt-in: a root can own hundreds of branches, and printing them
+for every word buries the words themselves.
+
+Each worker's own report row shows whether it is serving its preferred
+(highest-priority eligible) source or fallback work claimed because the
+preferred source had no claimable bundle. The browser report serves the same
+view under its Sources tab — one card per source word, and clicking one opens
+that word's branches — and names the same scheduling role on every worker
+card.
 
 Use `--answers` for answer-word arrays on word or branch reports and `--claims`
 for sparse candidate detail on one branch. Collection filters include branch

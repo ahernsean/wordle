@@ -13,7 +13,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from erd_queue import ERDQueue
+from erd_queue import ERDQueue, encode_subset
 from report_model import ReportSources, collect_report
 from report_server import (
     FIXTURE_FILENAMES,
@@ -195,7 +195,7 @@ class ReportServerTest(unittest.TestCase):
 
     def test_every_explicit_endpoint_returns_its_kind(self):
         with running_server(fixture_configuration()) as base_url:
-            for kind in ("queue", "workers", "cache", "hotspots"):
+            for kind in ("queue", "workers", "cache", "hotspots", "sources"):
                 with self.subTest(kind=kind):
                     status, _headers, body = request(base_url, f"/api/view/{kind}")
                     self.assertEqual(status, 200)
@@ -429,6 +429,81 @@ class ReportServerMainTest(unittest.TestCase):
                     main()
             self.assertEqual(raised.exception.code, 1)
             self.assertIn("already in use", stderr.getvalue())
+
+
+class SourcesRequestTest(unittest.TestCase):
+    def test_bare_endpoint_and_word_target_are_accepted(self):
+        rooted = parse_report_request("/api/view/sources", "")
+        worded = parse_report_request("/api/view/sources", "branch_target=SALET")
+        self.assertEqual(rooted.report_kind, "sources")
+        self.assertEqual(rooted.branch_target.kind, "root")
+        self.assertEqual(worded.report_kind, "sources")
+        self.assertEqual(worded.branch_target.trailing_word, "salet")
+
+    def test_limit_reaches_the_filters(self):
+        request = parse_report_request("/api/view/sources", "limit=2")
+        self.assertEqual(request.filters.limit, 2)
+
+    def test_branch_target_and_tree_are_rejected(self):
+        # A membership row names a branch already; a spine ending in a pattern
+        # selects one branch, which the source report has no view of, and there
+        # is no topology to lay out as a tree.
+        for query, message in (
+            ("branch_target=RAISE+-----", "trailing word"),
+            ("tree=1", "tree cannot be used with sources"),
+            ("worker=worker-1", "worker requires the workers endpoint"),
+            ("answers=1", "answers requires"),
+        ):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, message):
+                    parse_report_request("/api/view/sources", query)
+
+    def test_fixture_shapes_match_a_live_source_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            queue_path = os.path.join(directory, "queue.sqlite3")
+            queue = ERDQueue(queue_path)
+            shared = encode_subset(["cigar", "rebut"])
+            queue.add_pending_many([(shared, 2, 3, "salet", "-y---")])
+            queue.add_pending_many([(shared, 2, 5, "raise", "-----")])
+            queue.close()
+            sources = ReportSources(
+                queue_path, os.path.join(directory, "cache.sqlite3"),
+                "unused-answers", "unused-guesses",
+            )
+            # The collapsed fixture stands in for the browser's default
+            # request, which groups by state, so the live comparison must ask
+            # for the same shape.
+            live = collect_report(
+                sources, parse_report_request("/api/view/sources", "group_by=state")
+            )
+            live_word = collect_report(
+                sources,
+                parse_report_request("/api/view/sources", "branch_target=SALET"),
+            )
+        fixtures = load_fixtures(FIXTURE_DIRECTORY)
+        collapsed, worded = fixtures["sources.json"], fixtures["sources-word.json"]
+        self.assertEqual(set(collapsed["data"]), set(live["data"]))
+        self.assertEqual(
+            set(collapsed["data"]["summary"][0]), set(live["data"]["summary"][0])
+        )
+        # The collapsed report is requests only: branch rows wait for a word.
+        self.assertEqual(collapsed["data"]["rows"], [])
+        self.assertEqual(live["data"]["rows"], [])
+        self.assertEqual(
+            set(worded["data"]["rows"][0]), set(live_word["data"]["rows"][0])
+        )
+        # The word fixture must carry the shared-ownership case the branch rows
+        # exist to show: one branch, two owning requests, one effective priority.
+        self.assertTrue(any(row["is_shared"] for row in worded["data"]["rows"]))
+
+    def test_word_target_selects_the_word_scoped_fixture(self):
+        with running_server(fixture_configuration()) as base_url:
+            collapsed = json.loads(request(base_url, "/api/view/sources")[2])
+            worded = json.loads(
+                request(base_url, "/api/view/sources?branch_target=SALET")[2]
+            )
+        self.assertEqual(collapsed["data"]["rows"], [])
+        self.assertTrue(worded["data"]["rows"])
 
 
 class RootProgressRequestTest(unittest.TestCase):

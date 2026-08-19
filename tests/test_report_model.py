@@ -17,6 +17,7 @@ from report_model import (
     ReportSources,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
+    _resolved_candidate_erd,
     _grouped_response_groups,
     _response_group_key,
     _response_group_rollup,
@@ -142,6 +143,118 @@ class ReportModelTest(unittest.TestCase):
         solved = _candidate_erd_summary([self._group("ggggg", 1, None, None)], 0)
         self.assertEqual(solved["state"], "complete")
         self.assertEqual(solved["erd"], 1.0)
+
+    # SALET against the 4-word fixture list splits into its own all-green
+    # group plus three lone survivors: 1 + (0+1+1+1)/4 = 1.75.
+    _SALET_GROUPS = [
+        {"pattern": "ggggg", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+        {"pattern": "-----", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+        {"pattern": "-----", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+        {"pattern": "-----", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+    ]
+
+    def test_resolved_candidate_erd_persists_a_complete_fold(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        summary = _resolved_candidate_erd(
+            cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5
+        )
+        self.assertEqual(summary["state"], "complete")
+        self.assertAlmostEqual(summary["erd"], 1.75)
+        stored = cache.read_candidate_erd(branch_key, "salet", ERD_ALL)
+        self.assertEqual(stored["erd"], summary["erd"])
+        self.assertEqual(stored["response_group_count"], 4)
+        cache.close()
+
+    def test_resolved_candidate_erd_does_not_persist_a_pending_fold(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        summary = _resolved_candidate_erd(
+            cache, branch_key, "nurdy", ERD_ALL,
+            [self._group("-----", 2, None, None, cache_state="missing")], 5,
+        )
+        self.assertEqual(summary["state"], "pending")
+        self.assertIsNone(cache.read_candidate_erd(branch_key, "nurdy", ERD_ALL))
+        cache.close()
+
+    def test_resolved_candidate_erd_reads_the_stored_row_without_refolding(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        with patch("report_model._candidate_erd_summary") as folded:
+            summary = _resolved_candidate_erd(
+                cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5
+            )
+        folded.assert_not_called()
+        self.assertEqual(summary, {
+            "state": "complete", "erd": 1.75, "max_remaining_depth": 1,
+            "resolved_group_count": 4, "infeasible_group_count": 0,
+            "response_group_count": 4,
+        })
+        cache.close()
+
+    def test_resolved_candidate_erd_refolds_when_the_stored_group_count_is_stale(self):
+        # A changed vocabulary reshapes a candidate's own grouping, so a row
+        # stored for the old shape must not answer for the new one.
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        summary = _resolved_candidate_erd(
+            cache, branch_key, "salet", ERD_ALL,
+            [self._group("ggggg", 1, None, None),
+             self._group("-----", 2, None, None, cache_state="missing")],
+            5,
+        )
+        self.assertEqual(summary["state"], "pending")
+        self.assertEqual(summary["response_group_count"], 2)
+        cache.close()
+
+    def test_resolved_candidate_erd_without_a_cache_still_folds(self):
+        summary = _resolved_candidate_erd(
+            None, ScoreCache.encode_subset(ANSWERS), "salet", ERD_ALL,
+            self._SALET_GROUPS, 5,
+        )
+        self.assertEqual(summary["state"], "complete")
+        self.assertAlmostEqual(summary["erd"], 1.75)
+
+    def test_resolved_candidate_erd_stored_map_path_matches_direct_lookup(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        stored_map = cache.candidate_erd_map(ERD_ALL)
+        with patch("report_model._candidate_erd_summary") as folded:
+            summary = _resolved_candidate_erd(
+                cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5,
+                stored_map,
+            )
+        folded.assert_not_called()
+        self.assertEqual(summary["erd"], 1.75)
+        cache.close()
+
+    def test_leaderboard_persists_and_then_reuses_each_complete_erd(self):
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        cache = ScoreCache(sources.cache_path, ["crane", "slate"],
+                            checkpoint_on_close=False)
+        stored = cache.candidate_erd_map(ERD_ALL)
+        cache.close()
+        # crane/slate/raise complete and are persisted; howdy never completes
+        # in this fixture (both answers collide in one unsolved group).
+        self.assertEqual(len(stored), 3)
+        with patch(
+            "report_model._candidate_erd_summary", wraps=_candidate_erd_summary,
+        ) as folded:
+            second = collect_report(
+                sources, ReportRequest(report_kind="leaderboard")
+            )
+        self.assertEqual(folded.call_count, 1)   # howdy alone
+        self.assertEqual(second["data"]["rows"], first["data"]["rows"])
 
     def test_collect_word_report_populates_candidate_erd_summary(self):
         request = ReportRequest(
@@ -1141,6 +1254,321 @@ class SourceReportTest(unittest.TestCase):
     tearDown = ReportModelTest.tearDown
     _open_queue = ReportModelTest._open_queue
 
+    def _source_rows_for(self, word):
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="sources",
+            branch_target=parse_report_branch_target([word]),
+        ))
+        return {row["source_word"]: row for row in report["data"]["rows"]}
+
+    def test_collapsed_report_is_one_row_per_request_whatever_the_branch_count(self):
+        # The report's unit is the request: a root that spawned a hundred
+        # branches is one row, not a hundred, and no branch rows are emitted
+        # until a request is named.
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(ANSWERS[:2] + [f"w{index:04d}"]), 3, 5,
+             "salet", index)
+            for index in range(40)
+        ])
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(ANSWERS[:2] + [f"x{index:04d}"]), 3, 3,
+             "crane", index)
+            for index in range(15)
+        ])
+        queue.close()
+
+        report = collect_report(
+            self.sources, ReportRequest(report_kind="sources"))
+
+        data = report["data"]
+        self.assertEqual(len(data["summary"]), 2)
+        self.assertEqual(data["rows"], [])
+        self.assertEqual(data["matched_rows"], 0)
+        rollups = {row["source_word"]: row for row in data["summary"]}
+        self.assertEqual(rollups["salet"]["branch_count"], 40)
+        self.assertEqual(rollups["salet"]["open_branch_count"], 40)
+        self.assertEqual(rollups["salet"]["done_branch_count"], 0)
+        self.assertEqual(rollups["crane"]["branch_count"], 15)
+        # Naming one request is what opens its branches.
+        self.assertEqual(len(self._source_rows_for("crane")), 1)
+
+    def _queue_words(self, *rows):
+        queue = self._open_queue()
+        for index, (word, priority, count) in enumerate(rows):
+            queue.add_pending_many([
+                (ScoreCache.encode_subset(
+                    ANSWERS[:2] + [f"{word}{item:04d}"]), 3, priority, word,
+                 index * 100 + item)
+                for item in range(count)
+            ])
+        queue.close()
+
+    def _source_words(self, **filters):
+        report = collect_report(self.sources, ReportRequest(
+            report_kind="sources", filters=ReportFilters(**filters)))
+        return report["data"]
+
+    def test_source_state_filter_narrows_and_reports_what_it_hid(self):
+        self._queue_words(("salet", 5, 3), ("crane", 1, 2))
+        queue = self._open_queue()
+        # CRANE's branches all finish, which resolves its memberships and
+        # completes its only request, so the word reads complete.
+        for item in range(2):
+            queue.mark_done(
+                ScoreCache.encode_subset(ANSWERS[:2] + [f"crane{item:04d}"]))
+        queue.close()
+
+        every = self._source_words()
+        self.assertEqual(every["total_source_word_count"], 2)
+        complete = self._source_words(source_states=("complete",))
+        self.assertEqual(
+            [row["source_word"] for row in complete["summary"]], ["crane"])
+        queued = self._source_words(source_states=("queued",))
+        self.assertEqual(
+            [row["source_word"] for row in queued["summary"]], ["salet"])
+        # The total is the unfiltered count, so a filtered report can say how
+        # much it is hiding rather than looking like the whole queue.
+        self.assertEqual(complete["total_source_word_count"], 2)
+        self.assertEqual(
+            complete["matched_source_word_count"], len(complete["summary"]))
+
+    def test_source_sorts_order_by_the_column_named(self):
+        self._queue_words(("salet", 5, 3), ("crane", 9, 1), ("nurdy", 1, 7))
+
+        # The default is the order the queue serves them in: priority first.
+        self.assertEqual(
+            [row["source_word"] for row in self._source_words()["summary"]],
+            ["crane", "salet", "nurdy"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="word")["summary"]],
+            ["crane", "nurdy", "salet"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="branches")["summary"]],
+            ["nurdy", "salet", "crane"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="open")["summary"]],
+            ["nurdy", "salet", "crane"])
+
+    def test_each_source_word_carries_its_own_erd(self):
+        # A word's ERD is why it was queued.  It is derived from the word's
+        # cached response groups, and kept once the whole tree is solved.
+        # NURDY is the one of these that leaves a two-answer group, so it is
+        # the one whose ERD needs the cache; the others partition this answer
+        # list into singletons, which are solved by playing them.
+        self._queue_words(("nurdy", 5, 1), ("crane", 3, 1))
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        response_cache = ResponseCache(ANSWERS, score_cache=None)
+        now = int(time.time())
+        for _pattern_code, words in response_cache.group_words(
+                "crane", ANSWERS).items():
+            if not words:
+                continue
+            cache._conn.execute(
+                "INSERT OR REPLACE INTO branch_best_by_policy "
+                "(branch_key, policy, answer_list_id, best_guess, best_score, "
+                " max_depth, solve_budget, updated_at) "
+                "VALUES (?, ?, ?, 'salet', 1.0, 1, ?, ?)",
+                (ScoreCache.encode_subset(words), ERD_ALL,
+                 cache.answer_list_id, GAME_GUESSES - 1, now),
+            )
+        cache._conn.commit()
+        cache.close()
+
+        rows = {row["source_word"]: row
+                for row in self._source_words()["summary"]}
+
+        # Every group of CRANE is solved, so its ERD is exact: the guess
+        # itself, plus the mean of its groups -- and the all-green group costs
+        # nothing, since that guess was the answer.  1 + (0+1+1+1)/4.
+        crane = rows["crane"]["erd_summary"]
+        self.assertEqual(crane["state"], "complete")
+        self.assertEqual(crane["erd"], 1.75)
+        self.assertEqual(crane["max_remaining_depth"], 2)
+        # NURDY's two-answer group has nothing cached, so it reports how far
+        # along it is rather than a number that would move under the reader.
+        nurdy = rows["nurdy"]["erd_summary"]
+        self.assertEqual(nurdy["state"], "pending")
+        self.assertIsNone(nurdy["erd"])
+        # Its two singleton groups are solved by playing them; the
+        # two-answer group is the one still outstanding.
+        self.assertEqual(nurdy["resolved_group_count"], 2)
+        self.assertEqual(nurdy["response_group_count"], 3)
+
+        # The solved word's fold is kept, so a later page reads it back
+        # instead of refolding; the unsolved one is not, since its value can
+        # still change.
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        root_branch_key = ScoreCache.encode_subset(ANSWERS)
+        stored = cache.read_candidate_erd(root_branch_key, "crane", ERD_ALL)
+        self.assertEqual(stored["erd"], 1.75)
+        self.assertEqual(stored["max_remaining_depth"], 2)
+        self.assertIsNone(
+            cache.read_candidate_erd(root_branch_key, "nurdy", ERD_ALL))
+        cache.close()
+
+    def test_branch_totals_count_a_shared_branch_once(self):
+        # Two different words owning one branch is the case the report exists
+        # to show, and it is exactly where summing per-word counts goes wrong.
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(shared_key, 2, 5, "salet", 0)])
+        queue.add_pending_many([(shared_key, 2, 3, "crane", 0),
+                                (solo_key, 2, 3, "crane", 1)])
+        queue.close()
+
+        data = self._source_words()
+
+        self.assertEqual(
+            sum(row["branch_count"] for row in data["summary"]), 3)
+        self.assertEqual(data["matched_branch_count"], 2)
+        self.assertEqual(data["matched_open_branch_count"], 2)
+        # The totals follow the filter, so they describe the words on screen.
+        narrowed = self._source_words(source_states=("complete",))
+        self.assertEqual(narrowed["matched_branch_count"], 0)
+        self.assertEqual(narrowed["matched_open_branch_count"], 0)
+
+    def test_source_offset_pages_through_the_words(self):
+        self._queue_words(*[(word, 5, 1) for word in
+                            ("salet", "crane", "nurdy", "khaki", "penis")])
+
+        pages = [
+            self._source_words(sort="word", limit=2, source_offset=offset)
+            for offset in (0, 2, 4, 6)
+        ]
+
+        self.assertEqual(
+            [[row["source_word"] for row in page["summary"]] for page in pages],
+            [["crane", "khaki"], ["nurdy", "penis"], ["salet"], []],
+        )
+        # Every page reports the same matched total and its own start, which
+        # is what lets a client know it has more to page through.
+        for offset, page in zip((0, 2, 4, 6), pages):
+            self.assertEqual(page["matched_source_word_count"], 5)
+            self.assertEqual(page["source_word_offset"], offset)
+        # Paging is over the matched words, so a state filter repaginates
+        # rather than leaving holes where the filtered-out words were.
+        filtered = self._source_words(
+            sort="word", limit=2, source_offset=0, source_states=("queued",))
+        self.assertEqual(filtered["matched_source_word_count"], 5)
+
+    def test_group_rollups_count_a_shared_branch_once(self):
+        # Same defect as the report's own totals, one level down: two words in
+        # the same group owning one branch must not count it twice.
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(shared_key, 2, 5, "salet", 0)])
+        queue.add_pending_many([(shared_key, 2, 5, "crane", 0),
+                                (solo_key, 2, 5, "crane", 1)])
+        queue.close()
+
+        data = self._source_words(group_by="state")
+
+        group = data["summary_groups"][0]
+        self.assertEqual(group["rollup"]["source_word_count"], 2)
+        self.assertEqual(
+            sum(row["branch_count"] for row in group["rows"]), 3)
+        self.assertEqual(group["rollup"]["branch_count"], 2)
+        self.assertEqual(group["rollup"]["open_branch_count"], 2)
+        self.assertEqual(group["rollup"]["done_branch_count"], 0)
+
+    def test_branch_rows_page_like_the_words_do(self):
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(ANSWERS[:2] + [f"w{index:04d}"]), 3, 5,
+             "salet", index)
+            for index in range(5)
+        ])
+        queue.close()
+        salet = parse_report_branch_target(["salet"])
+
+        pages = [
+            collect_report(self.sources, ReportRequest(
+                report_kind="sources", branch_target=salet,
+                filters=ReportFilters(limit=2, branch_row_offset=offset),
+            ))["data"]
+            for offset in (0, 2, 4, 6)
+        ]
+
+        self.assertEqual([len(page["rows"]) for page in pages], [2, 2, 1, 0])
+        for offset, page in zip((0, 2, 4, 6), pages):
+            # Every page names the same matched total and its own start, so a
+            # client knows there is more to page through.
+            self.assertEqual(page["matched_rows"], 5)
+            self.assertEqual(page["branch_row_offset"], offset)
+        # The pages partition the branch rows: no row on two pages, none lost.
+        seen = [row["branch_key_hex"] for page in pages for row in page["rows"]]
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(len(seen), 5)
+
+    def test_source_grouping_buckets_words_with_their_own_rollup(self):
+        self._queue_words(("salet", 5, 3), ("crane", 5, 1), ("nurdy", 1, 7))
+
+        groups = self._source_words(group_by="priority")["summary_groups"]
+
+        self.assertEqual([group["label"] for group in groups],
+                         ["priority 5", "priority 1"])
+        self.assertEqual(groups[0]["rollup"]["source_word_count"], 2)
+        # The rollup sums the group's rows, so a collapsed group still says
+        # how much work it holds.
+        self.assertEqual(groups[0]["rollup"]["branch_count"], 4)
+        self.assertEqual(groups[0]["rollup"]["open_branch_count"], 4)
+        self.assertEqual(groups[1]["rollup"]["branch_count"], 7)
+        self.assertEqual(
+            [row["source_word"] for row in groups[1]["rows"]], ["nurdy"])
+        # Every word lands in exactly one group.
+        self.assertEqual(
+            sum(len(group["rows"]) for group in groups),
+            len(self._source_words()["summary"]))
+
+    def test_source_only_filters_and_sorts_are_rejected_elsewhere(self):
+        for filters, message in (
+            ({"source_states": ("queued",)}, "source_state requires"),
+            ({"source_offset": 2}, "source_offset requires"),
+            ({"sort": "branches"}, "requires a source report"),
+        ):
+            with self.subTest(filters=filters):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(ReportRequest(
+                        report_kind="queue", filters=ReportFilters(**filters)))
+        with self.assertRaisesRegex(ValueError, "source reports must be"):
+            validate_report_request(ReportRequest(
+                report_kind="sources", filters=ReportFilters(sort="nodes")))
+        with self.assertRaisesRegex(ValueError, "source reports must be"):
+            validate_report_request(ReportRequest(
+                report_kind="sources",
+                filters=ReportFilters(group_by="cache_state")))
+
+    def test_one_word_queued_twice_merges_into_one_row(self):
+        # Source work is keyed by (word, priority), so the same word queued at
+        # a second priority is a second request.  The report is per word: the
+        # two fold into one row, the branch they both own is counted once, and
+        # the priority reported is the one that actually schedules.
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(shared_key, 2, 1, "salet", 0)])
+        queue.add_pending_many([(shared_key, 2, 7, "salet", 0),
+                                (solo_key, 2, 7, "salet", 1)])
+        queue.close()
+
+        report = collect_report(
+            self.sources, ReportRequest(report_kind="sources"))
+
+        self.assertEqual(len(report["data"]["summary"]), 1)
+        row = report["data"]["summary"][0]
+        self.assertEqual(row["source_word"], "salet")
+        self.assertEqual(row["request_count"], 2)
+        self.assertEqual(row["requested_priority"], 7)
+        self.assertEqual(row["branch_count"], 2)
+        self.assertEqual(row["open_branch_count"], 2)
+        self.assertEqual(row["worker_count"], 0)
+
     def test_source_report_exposes_multiple_owners_with_requested_and_effective_priority(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()
@@ -1153,7 +1581,9 @@ class SourceReportTest(unittest.TestCase):
 
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertEqual(len(report["data"]["summary"]), 2)
-        rows = {row["source_word"]: row for row in report["data"]["rows"]}
+        # Each owner's own row comes from naming that owner's word; the shared
+        # branch is still never reduced to one owner's claim.
+        rows = {**self._source_rows_for("salet"), **self._source_rows_for("crane")}
         self.assertEqual(set(rows), {"salet", "crane"})
         self.assertEqual(rows["salet"]["requested_priority"], 1)
         self.assertEqual(rows["crane"]["requested_priority"], 9)
@@ -1195,6 +1625,37 @@ class SourceReportTest(unittest.TestCase):
         solo_row = next(r for r in rows
                         if bytes.fromhex(r["branch_key_hex"]) == solo_key)
         self.assertFalse(solo_row["is_shared"])
+
+    def test_shared_branch_count_spans_matched_rows_not_the_limited_window(self):
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        # SALET owns a solo branch and one shared with NURDY, in that order, so
+        # a limit of one leaves the shared branch outside the returned rows.
+        queue.add_pending_many([(solo_key, 2, 1, "salet", 0),
+                                (shared_key, 2, 1, "salet", 1)])
+        queue.add_pending_many([(shared_key, 2, 1, "nurdy", 2)])
+        queue.close()
+
+        salet = ReportRequest(
+            report_kind="sources",
+            branch_target=parse_report_branch_target(["salet"]),
+        )
+        full = collect_report(self.sources, salet)
+        limited = collect_report(self.sources, ReportRequest(
+            report_kind="sources", branch_target=salet.branch_target,
+            filters=ReportFilters(limit=1),
+        ))
+
+        self.assertEqual(full["data"]["matched_rows"], 2)
+        self.assertEqual(full["data"]["shared_branch_count"], 1)
+        # The limit truncates the returned rows only.  Both counts describe
+        # every matched row, so a shared branch whose rows all fall past the
+        # limit is still counted as shared.
+        self.assertEqual(len(limited["data"]["rows"]), 1)
+        self.assertFalse(limited["data"]["rows"][0]["is_shared"])
+        self.assertEqual(limited["data"]["matched_rows"], 2)
+        self.assertEqual(limited["data"]["shared_branch_count"], 1)
 
     def test_workers_report_exposes_scheduling_role_and_source_work_id(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])

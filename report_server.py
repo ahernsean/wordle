@@ -19,6 +19,8 @@ from report_model import (
     BRANCH_STATUSES,
     GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
+    SOURCE_GROUP_BY_STRATEGIES,
+    SOURCE_STATES,
     ReportFilters,
     ReportRequest,
     ReportSources,
@@ -44,21 +46,30 @@ FIXTURE_FILENAMES = (
     "hotspots.json",
     "leaderboard.json",
     "root_progress.json",
+    "sources.json",
+    "sources-word.json",
 )
 BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
 INTEGER_PARAMETERS = {
     "minimum_answer_count", "maximum_answer_count", "budget", "priority",
-    "limit", "epoch", "since_seconds", "sample_size",
+    "limit", "epoch", "since_seconds", "sample_size", "source_offset",
+    "branch_row_offset",
 }
 SCALAR_PARAMETERS = {
     "branch_target", "sort", "group_by", "by", "worker", "branch_status",
-    "branch_phase", "finalization_cursor", "tree_parent", "tree_cursor",
+    "branch_phase", "source_state", "finalization_cursor", "tree_parent",
+    "tree_cursor",
     *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
 }
 FINALIZATION_CURSOR_PATTERN = re.compile(r"(after|before):(\d+):(\d+)")
 ALLOWED_PARAMETERS = SCALAR_PARAMETERS
-SORT_FIELDS = {"default", "age", "size", "workers", "priority", "nodes", "slowest"}
+SORT_FIELDS = {
+    "default", "age", "size", "workers", "priority", "nodes", "slowest",
+    # Source reports order by their own columns; validate_report_request
+    # rejects these for every other kind rather than ignoring them.
+    "word", "branches", "open", "done",
+}
 HOTSPOT_FIELDS = {
     "nodes", "age", "size", "workers", "priority", "slowest",
     "evaluated-candidates", "bulk-completed-candidates",
@@ -124,6 +135,7 @@ def parse_report_request(path, query):
         "/api/view/cache": "cache",
         "/api/view/hotspots": "hotspots",
         "/api/view/leaderboard": "leaderboard",
+        "/api/view/sources": "sources",
         "/api/view/root-progress": "root_progress",
     }.get(path)
     if explicit_kind is None:
@@ -161,6 +173,7 @@ def parse_report_request(path, query):
         raise InvalidRequest("tree_cursor must be a five-letter word")
     branch_status_value = _single_value(parameters, "branch_status")
     branch_phase_value = _single_value(parameters, "branch_phase")
+    source_state_value = _single_value(parameters, "source_state")
     try:
         branch_statuses = (
             parse_branch_filter(
@@ -176,6 +189,10 @@ def parse_report_request(path, query):
         branch_phases = (
             parse_branch_filter(branch_phase_value, "branch phase", BRANCH_PHASES)
             if branch_phase_value is not None else ()
+        )
+        source_states = (
+            parse_branch_filter(source_state_value, "source state", SOURCE_STATES)
+            if source_state_value is not None else ()
         )
     except ValueError as error:
         raise InvalidRequest(str(error)) from error
@@ -219,7 +236,9 @@ def parse_report_request(path, query):
     if sort is not None and sort not in SORT_FIELDS:
         raise InvalidRequest(f"invalid sort field {sort!r}")
     group_by = _single_value(parameters, "group_by")
-    if group_by is not None and group_by not in GROUP_BY_STRATEGIES:
+    if group_by is not None and group_by not in (
+        set(GROUP_BY_STRATEGIES) | set(SOURCE_GROUP_BY_STRATEGIES)
+    ):
         raise InvalidRequest(f"invalid group_by field {group_by!r}")
 
     hotspot_field = _single_value(parameters, "by")
@@ -234,7 +253,7 @@ def parse_report_request(path, query):
     if hotspot_field is not None and hotspot_field not in HOTSPOT_FIELDS:
         raise InvalidRequest(f"invalid hotspot field {hotspot_field!r}")
     hotspot_field = hotspot_field or ("nodes" if explicit_kind == "hotspots" else None)
-    if tree and explicit_kind in ("cache", "hotspots", "leaderboard"):
+    if tree and explicit_kind in ("cache", "hotspots", "leaderboard", "sources"):
         raise InvalidRequest(f"tree cannot be used with {explicit_kind}")
     worker_id = _single_value(parameters, "worker")
     if worker_id is not None and explicit_kind != "workers":
@@ -262,6 +281,9 @@ def parse_report_request(path, query):
         priority=integer_values["priority"],
         sort=sort,
         group_by=group_by,
+        source_states=source_states,
+        source_offset=integer_values["source_offset"],
+        branch_row_offset=integer_values["branch_row_offset"],
         limit=limit,
         finalization_cursor_direction=finalization_cursor_direction,
         finalization_cursor_recorded_at=finalization_cursor_recorded_at,
@@ -302,6 +324,10 @@ def fixture_name_for_request(path, request):
     kind = request.report_kind
     if request.tree:
         return f"{kind}-tree.json"
+    # The source report lists a request's branches only once that request is
+    # named, so the two shapes need two fixtures.
+    if kind == "sources" and request.branch_target.kind == "word":
+        return "sources-word.json"
     return f"{kind}.json"
 
 
