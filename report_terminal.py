@@ -1066,12 +1066,14 @@ def _finalization_schedule_lines(finalization, width):
     facts = []
     if winner_rank is not None:
         facts.append(f"winner ranked {winner_rank:,}")
-    completed_ahead = finalization.get("candidates_completed_before_winner")
-    if completed_ahead is not None:
-        facts.append(f"{completed_ahead:,} candidates completed first")
-    weakest_rank = finalization.get("weakest_best_first_rank_before_winner")
-    if weakest_rank is not None:
-        facts.append(f"weakest of them ranked {weakest_rank:,}")
+        # Both of these are read against the winner's own rank, so neither
+        # says anything without it.
+        completed_ahead = finalization.get("candidates_completed_before_winner")
+        if completed_ahead is not None:
+            facts.append(f"{completed_ahead:,} candidates completed first")
+        weakest_rank = finalization.get("weakest_best_first_rank_before_winner")
+        if weakest_rank is not None:
+            facts.append(f"weakest of them ranked {weakest_rank:,}")
     winner_republish_count = finalization.get("winner_republish_count")
     if winner_republish_count:
         facts.append(f"winner republished {winner_republish_count:,}x")

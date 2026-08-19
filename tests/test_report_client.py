@@ -1334,6 +1334,24 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertNotIn("winner ranked", text)
 
+    def test_finalization_omits_comparisons_without_a_winner_rank(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.recent_finalizations[0]={
+            ...branch.data.recent_finalizations[0],
+            winner_best_first_rank:null,
+            candidates_completed_before_winner:4900,
+            weakest_best_first_rank_before_winner:7795,
+            republished_candidate_count:12,
+            max_candidate_republish_count:2,
+          };
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("12 candidates republished", text)
+        self.assertNotIn("candidates completed first", text)
+        self.assertNotIn("weakest of them ranked", text)
+
     def test_finalization_spine_and_solved_word_agree_on_the_answer_notch(self):
         # A structured spine (what collect_branch_report now emits) must mark
         # the same word the "solved" line marks -- not one marked and the other

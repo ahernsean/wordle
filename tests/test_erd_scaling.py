@@ -564,11 +564,20 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
     # width each either reduce the work or grow the pattern matrix — and so
     # startup — in step with it.
     #
+    # The table is deliberately not monotonic, and 4 < 3 is not a typo.
+    # Measured on one idle 4-core box, two passes over this fixture: 2 workers
+    # 1.64x, 3 workers 1.97x, 4 workers 1.97x.  The 4-worker leg does not beat
+    # the 3-worker one because it spends ~40% more nodes (6.4M against 4.5M at
+    # 1 and 3 workers) on speculative parallel search while the box has no
+    # spare core left to run it on.  That is a property of the workload and the
+    # machine, not of the claim path, so requiring more of 4 than of 3 would
+    # fail runs that are behaving correctly.
+    #
     # 4 is also the only entry CI exercises, on a 4-vCPU shared runner whose
-    # last core is contended: it measures ~0.85x of what an idle 4-core box
-    # measures for the same commit, so this entry carries that margin on top
-    # of the Amdahl one.  The 2- and 3-worker entries are untouched; at this
-    # drain length they still project to 1.57x and 1.94x.
+    # last core is contended: it measures ~0.85x of what the idle box measures
+    # for the same commit, so this entry carries that margin on top.  The 2-
+    # and 3-worker entries keep their original values, which those same
+    # measurements clear by 0.34x and 0.47x.
     _MIN_SPEEDUP = {2: 1.3, 3: 1.5, 4: 1.45}
 
     def setUp(self):

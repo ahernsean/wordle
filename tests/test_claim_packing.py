@@ -808,6 +808,74 @@ class TestBestFirstHoleScheduling(_TmpQueue):
             "reissuing a hole must not cost a full per-branch claims re-read")
 
 
+class TestHoleRecordingIsAtomicWithTheFree(_TmpQueue):
+    """A hole row that commits ahead of its claim row's DELETE is
+    indistinguishable from a stale one, so a claim landing in that window drops
+    it and the position falls back to the end-of-sweep backstop.  The reclaim
+    paths run in autocommit, so each must open its own transaction."""
+
+    def _statements_for(self, action):
+        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "dead-worker", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=4, count_cap=4)
+        self.assertTrue(indices)
+        self.q._conn.execute(
+            "UPDATE candidate_claims SET claimed_at = 0 WHERE branch_id = ?",
+            (self.q._intern_branch(self.key),))
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            action()
+        finally:
+            self.q._conn.set_trace_callback(None)
+        return statements, indices
+
+    def _assert_pair_is_atomic(self, statements):
+        def position(fragment):
+            matches = [i for i, statement in enumerate(statements)
+                       if fragment in statement]
+            self.assertEqual(len(matches), 1, f"{fragment!r} in {statements}")
+            return matches[0]
+        begin = position("BEGIN IMMEDIATE")
+        record = position("INSERT OR REPLACE INTO candidate_holes")
+        free = position("DELETE FROM candidate_claims")
+        commit = position("COMMIT")
+        self.assertLess(begin, record)
+        self.assertLess(record, free)
+        self.assertLess(free, commit)
+
+    def test_stale_reclaim_records_and_frees_in_one_transaction(self):
+        statements, indices = self._statements_for(
+            lambda: self.q.reclaim_stale_claims(heartbeat_timeout_seconds=120))
+        self._assert_pair_is_atomic(statements)
+        self.assertEqual(
+            {row["idx"] for row in self.q._conn.execute(
+                "SELECT idx FROM candidate_holes")}, set(indices))
+
+    def test_worker_reclaim_records_and_frees_in_one_transaction(self):
+        statements, indices = self._statements_for(
+            lambda: self.q.reclaim_claims_of_worker("dead-worker"))
+        self._assert_pair_is_atomic(statements)
+        self.assertEqual(
+            {row["idx"] for row in self.q._conn.execute(
+                "SELECT idx FROM candidate_holes")}, set(indices))
+
+    def test_restart_recovery_records_and_frees_in_one_transaction(self):
+        statements, indices = self._statements_for(
+            self.q.recover_active_branches)
+        self._assert_pair_is_atomic(statements)
+        self.assertEqual(
+            {row["idx"] for row in self.q._conn.execute(
+                "SELECT idx FROM candidate_holes")}, set(indices))
+
+    def test_restart_recovery_reports_the_claims_it_freed(self):
+        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _ORDER, _ZERO_LOWER_BOUND,
+            small_count=4, count_cap=4)
+        _branches, freed = self.q.recover_active_branches()
+        self.assertEqual(freed, len(indices))
+
+
 class TestScheduleDiagnostics(_TmpQueue):
     """Issue #258: per-candidate scheduling evidence survives finalization."""
 
@@ -864,6 +932,53 @@ class TestScheduleDiagnostics(_TmpQueue):
         diagnostics = self.q.candidate_schedule_diagnostics(self.key, winner)
         self.assertIsNone(diagnostics["candidates_completed_before_winner"])
         self.assertEqual(diagnostics["winner_republish_count"], 1)
+
+    def test_publisher_completion_keeps_the_candidate_rank(self):
+        # mark_claims_done replaces the packer's row; the candidate it marks
+        # was evaluated inline, so it is completed work and must keep its rank.
+        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _SHUFFLED_ORDER, _ZERO_LOWER_BOUND,
+            small_count=4, count_cap=4)
+        self.q.mark_claims_done(self.key, [indices[1]])
+        diagnostics = self.q.candidate_schedule_diagnostics(
+            self.key, indices[1])
+        self.assertEqual(diagnostics["winner_best_first_position"], 1)
+
+    def test_a_winner_sharing_its_second_reports_no_work_ahead(self):
+        # done_at has one-second resolution: "zero completed first" alongside
+        # same-second completions means "cannot tell", not "went first".
+        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _SHUFFLED_ORDER, _ZERO_LOWER_BOUND,
+            small_count=4, count_cap=4)
+        for idx in indices:
+            self.q.complete_candidate(self.key, idx)
+        branch_id = self.q._intern_branch(self.key)
+        self.q._conn.execute(
+            "UPDATE candidate_claims SET done_at = 1000 WHERE branch_id = ?",
+            (branch_id,))
+
+        diagnostics = self.q.candidate_schedule_diagnostics(
+            self.key, indices[0])
+
+        self.assertIsNone(diagnostics["candidates_completed_before_winner"])
+        self.assertIsNone(
+            diagnostics["max_best_first_position_before_winner"])
+        self.assertEqual(diagnostics["winner_best_first_position"], 0)
+
+    def test_a_winner_alone_in_its_second_reports_zero_work_ahead(self):
+        _bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _SHUFFLED_ORDER, _ZERO_LOWER_BOUND,
+            small_count=4, count_cap=4)
+        self.q.complete_candidate(self.key, indices[0])
+        branch_id = self.q._intern_branch(self.key)
+        self.q._conn.execute(
+            "UPDATE candidate_claims SET done_at = 1000 "
+            "WHERE branch_id = ? AND idx = ?", (branch_id, indices[0]))
+
+        diagnostics = self.q.candidate_schedule_diagnostics(
+            self.key, indices[0])
+
+        self.assertEqual(diagnostics["candidates_completed_before_winner"], 0)
 
     def test_finalize_log_carries_the_diagnostics(self):
         winner = self._drain_with_deferred_winner()

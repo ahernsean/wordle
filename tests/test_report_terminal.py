@@ -910,6 +910,35 @@ class CandidateSweepBarTest(unittest.TestCase):
         }
         self.assertNotIn("best-first order:", render_report(report, width=200))
 
+    def test_branch_report_omits_comparisons_without_a_winner_rank(self):
+        # "weakest of them ranked M" has no referent without the winner's rank.
+        report = overview_report()
+        report.update({"report_kind": "branch", "branch_target": None})
+        branch = deepcopy(report["data"]["branches"][0])
+        report["data"] = {
+            "branch": branch,
+            "queue": deepcopy(branch),
+            "cache": {"cache_state": "missing", "best_guess": None,
+                      "best_erd": None, "max_remaining_depth": None},
+            "workers": [],
+            "republished_candidates": [], "completed_candidate_indexes": [],
+            "claims": None, "provenance_unknown": False,
+            "recent_finalizations": [{
+                "spine": "CRANE -----", "outcome": "exact", "epoch": 11,
+                "search_node_count": 100, "evaluated_candidate_count": 8,
+                "bulk_completed_candidate_count": 0,
+                "winner_best_first_rank": None,
+                "candidates_completed_before_winner": 4900,
+                "weakest_best_first_rank_before_winner": 7795,
+                "republished_candidate_count": 12,
+                "max_candidate_republish_count": 2,
+            }],
+        }
+        output = render_report(report, width=200)
+        self.assertIn("12 candidates republished", output)
+        self.assertNotIn("candidates completed first", output)
+        self.assertNotIn("weakest of them ranked", output)
+
 
 class CollectionRendererTest(unittest.TestCase):
     def _report(self, report_kind, data, tree=False):

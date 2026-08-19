@@ -1172,9 +1172,11 @@
           if(row.wall_millis)facts.push(numText(row.wall_millis)+" ms");
           card.append(statLine(facts));
           const scheduleFacts=[];
-          if(row.winner_best_first_rank!==null&&row.winner_best_first_rank!==undefined)scheduleFacts.push("winner ranked "+numText(row.winner_best_first_rank));
-          if(row.candidates_completed_before_winner!==null&&row.candidates_completed_before_winner!==undefined)scheduleFacts.push(numText(row.candidates_completed_before_winner)+" candidates completed first");
-          if(row.weakest_best_first_rank_before_winner!==null&&row.weakest_best_first_rank_before_winner!==undefined)scheduleFacts.push("weakest of them ranked "+numText(row.weakest_best_first_rank_before_winner));
+          if(row.winner_best_first_rank!==null&&row.winner_best_first_rank!==undefined){
+            scheduleFacts.push("winner ranked "+numText(row.winner_best_first_rank));
+            if(row.candidates_completed_before_winner!==null&&row.candidates_completed_before_winner!==undefined)scheduleFacts.push(numText(row.candidates_completed_before_winner)+" candidates completed first");
+            if(row.weakest_best_first_rank_before_winner!==null&&row.weakest_best_first_rank_before_winner!==undefined)scheduleFacts.push("weakest of them ranked "+numText(row.weakest_best_first_rank_before_winner));
+          }
           if(row.winner_republish_count)scheduleFacts.push("winner republished "+numText(row.winner_republish_count)+"\u00d7");
           if(row.republished_candidate_count)scheduleFacts.push(numText(row.republished_candidate_count)+" candidates republished (up to "+numText(row.max_candidate_republish_count||0)+"\u00d7 each)");
           if(scheduleFacts.length)card.append(statLine(scheduleFacts));

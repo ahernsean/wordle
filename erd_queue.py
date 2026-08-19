@@ -2313,16 +2313,16 @@ class ERDQueue:
             WHERE branch_id = ?
         """, (n, n, branch_id))
 
-    def _record_holes(self, branch_id_column, where, parameters, label):
+    def _record_holes(self, where, parameters, label):
         """Record every candidate_claims row matching `where` as a hole.
 
-        Runs immediately before the DELETE that frees those rows, inside the
-        caller's transaction, so the position each row carries survives into
-        candidate_holes and the packer can reissue it in best-first order.
-        `where` is the DELETE's own predicate, reused verbatim so the two
-        statements cannot drift.  branch_id_column names the source of the
-        hole's branch (a literal parameter for a single-branch caller, the
-        row's own column for a cross-branch sweep).
+        MUST run in the caller's write transaction, the same one as the DELETE
+        that frees those rows.  A hole row that commits while its claim row
+        still exists is indistinguishable from a stale one, so a
+        claim_next_bundle landing in that window drops it without packing it
+        and the position falls back to the end-of-sweep backstop — the
+        deferral this scheduler exists to remove.  `where` is the DELETE's own
+        predicate, reused verbatim so the two statements cannot drift.
 
         REPLACE, not IGNORE: a position freed twice keeps the position from
         the claim row that was just freed, which is the one the packer will
@@ -2331,11 +2331,33 @@ class ERDQueue:
         self._conn.execute(
             f"INSERT OR REPLACE INTO candidate_holes "
             f"(branch_id, idx, best_first_position) "
-            f"SELECT {branch_id_column}, idx, best_first_position "
+            f"SELECT branch_id, idx, best_first_position "
             f"FROM candidate_claims "
             f"WHERE {where}", parameters)
         n = self._conn.execute("SELECT changes()").fetchone()[0]
         self._tally_wal_traffic(label, n, n * _CLAIM_ROW_WAL_BYTES)
+        return n
+
+    def _free_claims_as_holes(self, where, parameters, hole_label, claim_label):
+        """Atomically record the claims matching `where` as holes and free them.
+
+        The reclaim paths run in autocommit, so the pair needs its own
+        BEGIN IMMEDIATE — see _record_holes for what a concurrent claim does to
+        a hole that commits ahead of its DELETE.  Every caller runs at top
+        level, never inside an open transaction.  Returns the number of claims
+        freed.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._record_holes(where, parameters, hole_label)
+            self._conn.execute(
+                f"DELETE FROM candidate_claims WHERE {where}", parameters)
+            n = self._conn.execute("SELECT changes()").fetchone()[0]
+            self._conn.execute("COMMIT")
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
+        self._tally_wal_traffic(claim_label, n, n * _CLAIM_ROW_WAL_BYTES)
         return n
 
     def _pack_recorded_holes(self, branch_id, bound, cost_lower_bound,
@@ -2733,7 +2755,7 @@ class ERDQueue:
             republished_where = (
                 f"branch_id = ? AND bundle_id = ? "
                 f"AND idx IN ({deleted_placeholders})")
-            self._record_holes("branch_id", republished_where,
+            self._record_holes(republished_where,
                                (branch_id, bundle_id, *deleted),
                                'candidate_holes/republish')
             self._conn.execute(
@@ -3287,15 +3309,9 @@ class ERDQueue:
                   WHERE updated_at >= ?
               )
         """
-        self._record_holes("branch_id", stale_where, (age_floor, hb_cutoff),
-                           'candidate_holes/reclaim-stale')
-        self._conn.execute(
-            f"DELETE FROM candidate_claims WHERE {stale_where}",
-            (age_floor, hb_cutoff))
-        n = self._conn.execute("SELECT changes()").fetchone()[0]
-        self._tally_wal_traffic(
-            'candidate_claims/reclaim-stale', n, n * _CLAIM_ROW_WAL_BYTES)
-        return n
+        return self._free_claims_as_holes(
+            stale_where, (age_floor, hb_cutoff),
+            'candidate_holes/reclaim-stale', 'candidate_claims/reclaim-stale')
 
     def reclaim_claims_of_worker(self, worker_id: str) -> int:
         """Free all in-flight (done=0) candidate claims held by a specific worker.
@@ -3305,15 +3321,10 @@ class ERDQueue:
         the same name starts heartbeating (which would otherwise make the dead
         instance's claims look live again).  done=1 rows are never touched.
         """
-        self._record_holes("branch_id", "done = 0 AND claimed_by = ?",
-                           (worker_id,), 'candidate_holes/reclaim-worker')
-        self._conn.execute(
-            "DELETE FROM candidate_claims WHERE done = 0 AND claimed_by = ?",
-            (worker_id,))
-        n = self._conn.execute("SELECT changes()").fetchone()[0]
-        self._tally_wal_traffic(
-            'candidate_claims/reclaim-worker', n, n * _CLAIM_ROW_WAL_BYTES)
-        return n
+        return self._free_claims_as_holes(
+            "done = 0 AND claimed_by = ?", (worker_id,),
+            'candidate_holes/reclaim-worker',
+            'candidate_claims/reclaim-worker')
 
     def branches_in_progress(self, source_work_id=None):
         """Open branches ordered by effective priority then answer count."""
@@ -3407,11 +3418,10 @@ class ERDQueue:
         # against a ceiling nobody asked for — a consumer only reuses a row
         # whose recorded budget and bound satisfy its own budget and ceiling
         # (see read_cut_result); it never blocks a solve, only saves one.
-        self._record_holes("branch_id", "done = 0", (),
-                           'candidate_holes/recover-restart')
-        cur = self._conn.execute(
-            "DELETE FROM candidate_claims WHERE done = 0")
-        return n_branches_resumed, cur.rowcount
+        freed = self._free_claims_as_holes(
+            "done = 0", (), 'candidate_holes/recover-restart',
+            'candidate_claims/recover-restart')
+        return n_branches_resumed, freed
 
     def worker_counts_by_branch(
         self, timeout_seconds: int = WORKER_LIVENESS_SECONDS
@@ -5161,12 +5171,22 @@ class ERDQueue:
         now = int(time.time())
         indices = list(indices)
         before = self._conn.total_changes
+        # Carry any best_first_position the packer stamped through the
+        # replace: these are the candidates the publisher evaluated inline, so
+        # they are completed work, and dropping their rank would hide them from
+        # candidate_schedule_diagnostics' count of work done ahead of the
+        # winner — and NULL the winner's own rank whenever the publisher is
+        # what finished it, which is common on a branch's best-first prefix.
         self._conn.executemany("""
             INSERT OR REPLACE INTO candidate_claims
-                (branch_id, idx, claimed_by, claimed_at, done, done_at)
-            SELECT ?, ?, 'publisher', ?, 1, ?
+                (branch_id, idx, claimed_by, claimed_at, done, done_at,
+                 best_first_position)
+            SELECT ?, ?, 'publisher', ?, 1, ?,
+                   (SELECT best_first_position FROM candidate_claims
+                    WHERE branch_id = ? AND idx = ?)
             WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_id = ?)
-        """, [(branch_id, idx, now, now, branch_id) for idx in indices])
+        """, [(branch_id, idx, now, now, branch_id, idx, branch_id)
+              for idx in indices])
         written = self._conn.total_changes - before
         self._tally_wal_traffic(
             'candidate_claims/publisher-mark-done', written,
@@ -5409,7 +5429,12 @@ class ERDQueue:
         winner_best_first_position is the winner's rank in the branch's
         best-first candidate order; candidates_completed_before_winner and
         max_best_first_position_before_winner count and rank the
-        worker-evaluated candidates that finished ahead of it.  A weakest rank
+        worker-evaluated candidates that finished ahead of it, ordered by
+        done_at.  That column has one-second resolution, so those two are
+        None rather than zero on a branch whose winner shares its second with
+        other completions — the ordering inside a second is not recoverable,
+        and a zero would read as "no inversion" when the truth is "cannot
+        tell".  A weakest rank
         far past the winner's own is a priority inversion: the branch spent
         itself on later candidates while a strong one waited.
         republished_candidates and max_candidate_republish_count say how much
@@ -5452,6 +5477,18 @@ class ERDQueue:
             WHERE branch_id = ? AND done = 1 AND done_at < ?
               AND best_first_position IS NOT NULL
         """, (branch_id, winner["done_at"])).fetchone()
+        if not ahead["n"]:
+            # done_at has one-second resolution, so a candidate that finished
+            # in the winner's own second is not orderable against it.  A zero
+            # here with such candidates present means "cannot tell", not "the
+            # winner went first", and a report must not show it as evidence.
+            same_second = self._conn.execute("""
+                SELECT COUNT(*) FROM candidate_claims
+                WHERE branch_id = ? AND done = 1 AND done_at = ? AND idx != ?
+                  AND best_first_position IS NOT NULL
+            """, (branch_id, winner["done_at"], winner_idx)).fetchone()[0]
+            if same_second:
+                return diagnostics
         diagnostics["candidates_completed_before_winner"] = ahead["n"]
         diagnostics["max_best_first_position_before_winner"] = ahead["worst"]
         return diagnostics
