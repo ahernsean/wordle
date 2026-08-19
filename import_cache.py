@@ -8,13 +8,14 @@ Usage
 
 Creates the target cache if it doesn't exist yet, or merges into it if it
 already does — adding rows from <source_db> not already present in
---target across all four cache tables. After a successful merge the source
+--target across all five cache tables. After a successful merge the source
 file (and its -wal/-shm siblings) is deleted; pass --keep-source to retain
 it. The source is a transitory export snapshot, so an import that leaves
-nothing behind is the normal end of the export/import cycle. Three of them (answer_list,
-response_decomposition, candidate_scores) are deterministic given the same
-answer-word universe — matching keys imply identical values — so INSERT OR
-IGNORE is exact.
+nothing behind is the normal end of the export/import cycle. Four of them
+(answer_list, response_decomposition, candidate_scores,
+candidate_erd_by_policy) are deterministic given the same answer-word
+universe — matching keys imply identical values — so INSERT OR IGNORE is
+exact.
 
 A missing target restores a working cache rather than erroring: before any
 row is merged, the target is opened once through ScoreCache itself (the
@@ -60,6 +61,7 @@ TABLES = [
     'response_decomposition',
     'branch_best_by_policy',
     'candidate_scores',
+    'candidate_erd_by_policy',
 ]
 
 DEFAULT_TARGET = DEFAULT_CACHE_PATH

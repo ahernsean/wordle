@@ -1087,6 +1087,51 @@ def _candidate_erd_summary(response_groups, group_budget):
     }
 
 
+def _resolved_candidate_erd(cache, branch_key, candidate_word, policy,
+                             response_groups, group_budget, stored_erd_map=None):
+    """A candidate's own ERD at a branch — the single place every caller
+    (word report, leaderboard, sources view) gets this number.
+
+    Once `_candidate_erd_summary` reports a candidate `complete`, the value is
+    an immutable fact: every response group behind it is itself an exact,
+    finalized branch row, and those do not change outside a reverification
+    pass.  So a `complete` fold is persisted the first time it is seen, and
+    every later call for the same (branch, candidate) is one stored-row lookup
+    instead of a fresh fold over the candidate's response groups.
+
+    `stored_erd_map`, when given, comes from `cache.candidate_erd_map` and
+    serves a whole-vocabulary pass (the leaderboard); omit it for a single
+    candidate, which does one direct lookup instead.  `cache` may be None when
+    the caller has no cache connection, leaving the fold unchanged but
+    unpersisted.
+    """
+    stored = None
+    if cache is not None:
+        stored = (
+            cache.candidate_erd_from_map(branch_key, candidate_word, stored_erd_map)
+            if stored_erd_map is not None
+            else cache.read_candidate_erd(branch_key, candidate_word, policy)
+        )
+    # A changed vocabulary reshapes a candidate's own grouping, so a stored row
+    # whose group count no longer matches describes a different partition.
+    if stored is not None and stored["response_group_count"] == len(response_groups):
+        return {
+            "state": "complete",
+            "erd": stored["erd"],
+            "max_remaining_depth": stored["max_remaining_depth"],
+            "resolved_group_count": stored["response_group_count"],
+            "infeasible_group_count": 0,
+            "response_group_count": stored["response_group_count"],
+        }
+    summary = _candidate_erd_summary(response_groups, group_budget)
+    if cache is not None and summary["state"] == "complete":
+        cache.write_candidate_erd(
+            branch_key, candidate_word, policy, summary["erd"],
+            summary["max_remaining_depth"], summary["response_group_count"],
+        )
+    return summary
+
+
 def _response_group_key(row: dict, group_by: str) -> tuple:
     """Map a response-group row to (sort_key, label) for the given strategy."""
     if group_by == "status":
@@ -1205,12 +1250,31 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         for branch_key in branch_keys
     }
     cache = None
+    erd_summary = None
     try:
         cache = ScoreCache(
             sources.cache_path, all_answers, checkpoint_on_close=False
         )
         cache_states = cache.report_branch_states(
             branch_keys, ERD_ALL, group_budget
+        )
+        # Resolved here, while the cache is open, and against the branch this
+        # word is played from — not the root, since a word report can sit at
+        # any spine.
+        erd_summary = _resolved_candidate_erd(
+            cache, resolved.branch_key, word, ERD_ALL,
+            [
+                {
+                    "pattern": row["pattern"],
+                    "answer_count": row["answer_count"],
+                    "best_erd": cache_states[row["branch_key"]]["best_erd"],
+                    "max_remaining_depth":
+                        cache_states[row["branch_key"]]["max_remaining_depth"],
+                    "cache_state": cache_states[row["branch_key"]]["cache_state"],
+                }
+                for row in group_rows
+            ],
+            group_budget,
         )
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
@@ -1321,7 +1385,10 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             row["cache_state"] == "missing" for row in all_response_groups
         ),
     }
-    data["erd_summary"] = _candidate_erd_summary(all_response_groups, group_budget)
+    data["erd_summary"] = (
+        erd_summary if erd_summary is not None
+        else _candidate_erd_summary(all_response_groups, group_budget)
+    )
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = displayed_response_groups
@@ -2347,14 +2414,16 @@ def _candidate_group_skeletons(sources, all_answers, all_candidates, cache):
 
 
 def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -> dict:
-    """Rank every candidate opener by its own ERD, folded on read.
+    """Rank every candidate opener by its own ERD.
 
-    Each candidate's ERD is computed exactly as the word report computes it
-    (`_candidate_erd_summary`), reusing the cache's reusability gate so the
+    Each candidate's ERD is resolved exactly as the word report resolves it
+    (`_resolved_candidate_erd`), reusing the cache's reusability gate so the
     numbers agree with `view WORD`.  Only openers whose whole tree is solved
     have a finite ERD and appear ranked; the rest are summarized as pending or
-    infeasible.  Nothing is persisted — the ranking is recomputed from current
-    cache state.
+    infeasible.  A candidate found complete keeps its folded ERD, so a later
+    build reads one row per solved opener instead of re-folding its response
+    groups; an unsolved candidate is re-folded from current cache state every
+    time, since its value can still change.
     """
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -2379,6 +2448,9 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
             default=0,
         )
         exact_by_key, loss_by_key = cache.report_branch_row_maps(ERD_ALL)
+        stored_erd_map = cache.candidate_erd_map(ERD_ALL)
+        # Every candidate here is an opener, folded against the root branch.
+        root_branch_key = ScoreCache.encode_subset(all_answers)
         counts = {"complete": 0, "pending": 0, "infeasible": 0}
         ranked_rows = []
         for candidate, groups in skeletons:
@@ -2396,7 +2468,10 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
                 }
                 for pattern, answer_count, branch_key in groups
             ]
-            summary = _candidate_erd_summary(response_groups, group_budget)
+            summary = _resolved_candidate_erd(
+                cache, root_branch_key, candidate, ERD_ALL,
+                response_groups, group_budget, stored_erd_map,
+            )
             counts[summary["state"]] += 1
             if summary["state"] == "complete":
                 ranked_rows.append({
@@ -2740,13 +2815,15 @@ def _grouped_source_words(rows, group_by, branch_totals):
 
 
 def _source_word_erd_summaries(sources, source_words, report):
-    """Fold each word's response groups into its own ERD.
+    """Resolve each word's own ERD, folding it only when it is not stored.
 
-    A source word's ERD is the whole point of queueing it, and it is not
-    stored: it is folded from the cached result of each of the word's response
-    groups, the same way the word report folds it for one word.  Only the words
-    on the page are folded, so the cost is bounded by the page size rather than
-    by how much is queued.
+    A source word's ERD is the whole point of queueing it.  It is derived from
+    the cached result of each of the word's response groups, the same way the
+    word report derives it for one word, and a word whose whole tree is solved
+    keeps its folded value in `candidate_erd_by_policy` so later pages read one
+    row instead of re-folding ~150 groups.  Only the words on the page are
+    resolved, so the cost is bounded by the page size rather than by how much
+    is queued.
     """
     summaries = {}
     if not source_words:
@@ -2760,6 +2837,9 @@ def _source_word_erd_summaries(sources, source_words, report):
         )
         # A root word spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
+        # Source words are always openers, so every one folds against the same
+        # branch: the whole answer list, before any guess is played.
+        root_branch_key = ScoreCache.encode_subset(all_answers)
         for word in source_words:
             if word is None:
                 continue
@@ -2779,18 +2859,22 @@ def _source_word_erd_summaries(sources, source_words, report):
             states = cache.report_branch_states(
                 branch_keys, ERD_ALL, group_budget
             )
-            summaries[word] = _candidate_erd_summary([
-                {
-                    "pattern": row["pattern"],
-                    "answer_count": row["answer_count"],
-                    "best_erd": states[bytes(row["branch_key"])]["best_erd"],
-                    "max_remaining_depth":
-                        states[bytes(row["branch_key"])]["max_remaining_depth"],
-                    "cache_state":
-                        states[bytes(row["branch_key"])]["cache_state"],
-                }
-                for row in group_rows
-            ], group_budget)
+            summaries[word] = _resolved_candidate_erd(
+                cache, root_branch_key, word, ERD_ALL,
+                [
+                    {
+                        "pattern": row["pattern"],
+                        "answer_count": row["answer_count"],
+                        "best_erd": states[bytes(row["branch_key"])]["best_erd"],
+                        "max_remaining_depth":
+                            states[bytes(row["branch_key"])]["max_remaining_depth"],
+                        "cache_state":
+                            states[bytes(row["branch_key"])]["cache_state"],
+                    }
+                    for row in group_rows
+                ],
+                group_budget,
+            )
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)

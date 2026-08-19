@@ -17,6 +17,7 @@ from report_model import (
     ReportSources,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
+    _resolved_candidate_erd,
     _grouped_response_groups,
     _response_group_key,
     _response_group_rollup,
@@ -142,6 +143,118 @@ class ReportModelTest(unittest.TestCase):
         solved = _candidate_erd_summary([self._group("ggggg", 1, None, None)], 0)
         self.assertEqual(solved["state"], "complete")
         self.assertEqual(solved["erd"], 1.0)
+
+    # SALET against the 4-word fixture list splits into its own all-green
+    # group plus three lone survivors: 1 + (0+1+1+1)/4 = 1.75.
+    _SALET_GROUPS = [
+        {"pattern": "ggggg", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+        {"pattern": "-----", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+        {"pattern": "-----", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+        {"pattern": "-----", "answer_count": 1, "best_erd": None,
+         "max_remaining_depth": None, "cache_state": "exact"},
+    ]
+
+    def test_resolved_candidate_erd_persists_a_complete_fold(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        summary = _resolved_candidate_erd(
+            cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5
+        )
+        self.assertEqual(summary["state"], "complete")
+        self.assertAlmostEqual(summary["erd"], 1.75)
+        stored = cache.read_candidate_erd(branch_key, "salet", ERD_ALL)
+        self.assertEqual(stored["erd"], summary["erd"])
+        self.assertEqual(stored["response_group_count"], 4)
+        cache.close()
+
+    def test_resolved_candidate_erd_does_not_persist_a_pending_fold(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        summary = _resolved_candidate_erd(
+            cache, branch_key, "nurdy", ERD_ALL,
+            [self._group("-----", 2, None, None, cache_state="missing")], 5,
+        )
+        self.assertEqual(summary["state"], "pending")
+        self.assertIsNone(cache.read_candidate_erd(branch_key, "nurdy", ERD_ALL))
+        cache.close()
+
+    def test_resolved_candidate_erd_reads_the_stored_row_without_refolding(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        with patch("report_model._candidate_erd_summary") as folded:
+            summary = _resolved_candidate_erd(
+                cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5
+            )
+        folded.assert_not_called()
+        self.assertEqual(summary, {
+            "state": "complete", "erd": 1.75, "max_remaining_depth": 1,
+            "resolved_group_count": 4, "infeasible_group_count": 0,
+            "response_group_count": 4,
+        })
+        cache.close()
+
+    def test_resolved_candidate_erd_refolds_when_the_stored_group_count_is_stale(self):
+        # A changed vocabulary reshapes a candidate's own grouping, so a row
+        # stored for the old shape must not answer for the new one.
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        summary = _resolved_candidate_erd(
+            cache, branch_key, "salet", ERD_ALL,
+            [self._group("ggggg", 1, None, None),
+             self._group("-----", 2, None, None, cache_state="missing")],
+            5,
+        )
+        self.assertEqual(summary["state"], "pending")
+        self.assertEqual(summary["response_group_count"], 2)
+        cache.close()
+
+    def test_resolved_candidate_erd_without_a_cache_still_folds(self):
+        summary = _resolved_candidate_erd(
+            None, ScoreCache.encode_subset(ANSWERS), "salet", ERD_ALL,
+            self._SALET_GROUPS, 5,
+        )
+        self.assertEqual(summary["state"], "complete")
+        self.assertAlmostEqual(summary["erd"], 1.75)
+
+    def test_resolved_candidate_erd_stored_map_path_matches_direct_lookup(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        stored_map = cache.candidate_erd_map(ERD_ALL)
+        with patch("report_model._candidate_erd_summary") as folded:
+            summary = _resolved_candidate_erd(
+                cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5,
+                stored_map,
+            )
+        folded.assert_not_called()
+        self.assertEqual(summary["erd"], 1.75)
+        cache.close()
+
+    def test_leaderboard_persists_and_then_reuses_each_complete_erd(self):
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        cache = ScoreCache(sources.cache_path, ["crane", "slate"],
+                            checkpoint_on_close=False)
+        stored = cache.candidate_erd_map(ERD_ALL)
+        cache.close()
+        # crane/slate/raise complete and are persisted; howdy never completes
+        # in this fixture (both answers collide in one unsolved group).
+        self.assertEqual(len(stored), 3)
+        with patch(
+            "report_model._candidate_erd_summary", wraps=_candidate_erd_summary,
+        ) as folded:
+            second = collect_report(
+                sources, ReportRequest(report_kind="leaderboard")
+            )
+        self.assertEqual(folded.call_count, 1)   # howdy alone
+        self.assertEqual(second["data"]["rows"], first["data"]["rows"])
 
     def test_collect_word_report_populates_candidate_erd_summary(self):
         request = ReportRequest(
