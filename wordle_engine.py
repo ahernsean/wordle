@@ -1833,7 +1833,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         if token is not None:
             pub_result = mid_loop_publisher.check(
                 token, candidate_list, i,
-                best_guess, best_erd, budget)
+                best_guess, best_erd, best_max_remaining_depth, budget)
             if pub_result is not None:
                 return pub_result
         if status == OVER_ERD_LIMIT:

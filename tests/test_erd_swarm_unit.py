@@ -2646,14 +2646,14 @@ class TestMidLoopPublisher(unittest.TestCase):
 
     def test_check_returns_none_for_none_token(self):
         pub, _ = self._pub()
-        self.assertIsNone(pub.check(None, CANDIDATES, 0, None, None, 5))
+        self.assertIsNone(pub.check(None, CANDIDATES, 0, None, None, None, 5))
 
     def test_check_cold_model_under_backstop_returns_none(self):
         # Cold model: the node-proportionate check can't arm, and the wall-clock
         # backstop hasn't elapsed on a fresh token, so the frame stays inline.
         pub, _ = self._pub(predicted=None)
         token = pub.enter(BRANCH[:6], budget=0)
-        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, None, 5))
 
     def test_check_fires_on_wall_clock_backstop_when_cold(self):
         # Cold model, but the frame has run past COLD_BACKSTOP_SECONDS: the
@@ -2666,7 +2666,7 @@ class TestMidLoopPublisher(unittest.TestCase):
         w._nodes = nodes_at_entry + 50   # some work done, no prediction to compare
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
-        result = pub.check(token, CANDIDATES, 0, None, None, 5)
+        result = pub.check(token, CANDIDATES, 0, None, None, None, 5)
         self.assertIsNotNone(result)
         w.cooperative_solve.assert_called_once()
         # The firing is recorded for offline tuning, with predicted=None (cold).
@@ -2685,14 +2685,14 @@ class TestMidLoopPublisher(unittest.TestCase):
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
-        pub.check(token, CANDIDATES, 0, None, None, 5)
+        pub.check(token, CANDIDATES, 0, None, None, None, 5)
         w.queue.add_backstop_telemetry.assert_not_called()
 
     def test_check_returns_none_when_under_overrun_threshold(self):
         pub, w = self._pub(predicted=100)
         token = pub.enter(BRANCH[:6], budget=0)
         # _nodes hasn't changed: delta = 0 <= OVERRUN_K * 100
-        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, None, 5))
 
     def test_check_fires_on_overrun(self):
         pub, w = self._pub(predicted=10)
@@ -2704,7 +2704,7 @@ class TestMidLoopPublisher(unittest.TestCase):
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         # last_index=0 of a 10-candidate list → 9 remaining (>= MIN_HANDOFF).
-        result = pub.check(token, CANDIDATES, 0, None, None, 5)
+        result = pub.check(token, CANDIDATES, 0, None, None, None, 5)
         self.assertIsNotNone(result)
         w.cooperative_solve.assert_called_once()
 
@@ -2715,7 +2715,7 @@ class TestMidLoopPublisher(unittest.TestCase):
         # absolute break-even gate (_publish_threshold, bootstrap when cold).
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         # last_index=7 of a 10-candidate list → only 2 remaining (< MIN_HANDOFF=4)
-        self.assertIsNone(pub.check(token, CANDIDATES, 7, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 7, None, None, None, 5))
 
     def test_check_marks_prefix_done(self):
         pub, w = self._pub(predicted=10)
@@ -2726,7 +2726,7 @@ class TestMidLoopPublisher(unittest.TestCase):
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         # last_index=1 → the evaluated prefix is CANDIDATES[:2].
-        pub.check(token, CANDIDATES, 1, None, None, 5)
+        pub.check(token, CANDIDATES, 1, None, None, None, 5)
         call_args = w.queue.mark_claims_done.call_args
         self.assertIsNotNone(call_args)
         marked_indices = call_args[0][1]  # second positional arg is the indices list
@@ -2771,7 +2771,7 @@ class TestPublishStormGuards(unittest.TestCase):
         pub, w = self._pub(predicted=5)
         token = pub.enter(BRANCH[:5], budget=0)
         w._nodes = erd_swarm.OVERRUN_K * 5 + 1   # proportionate trigger true
-        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, None, 5))
         w.queue.create_branch.assert_not_called()
         w.queue.mark_claims_done.assert_not_called()
         self.assertTrue(token[5])   # not disarmed: may fire later in the frame
@@ -2783,14 +2783,14 @@ class TestPublishStormGuards(unittest.TestCase):
         w.queue.create_branch.return_value = False   # raced: row exists
         w.queue.get_branch.return_value = {'budget': 4, 'ceiling': None}
         w.cooperative_solve = mock.MagicMock()
-        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, None, 5))
         self.assertFalse(token[5])
         w.queue.mark_claims_done.assert_not_called()
         w.queue.add_cost_sample.assert_not_called()
         w.cooperative_solve.assert_not_called()
         # Disarmed: later iterations return immediately, touching nothing.
         w.queue.get_branch.reset_mock()
-        self.assertIsNone(pub.check(token, CANDIDATES, 1, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 1, None, None, None, 5))
         w.queue.get_branch.assert_not_called()
 
     def test_cooperative_decline_disarms(self):
@@ -2798,7 +2798,7 @@ class TestPublishStormGuards(unittest.TestCase):
         token = pub.enter(BRANCH[:5], budget=0)
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(return_value=None)
-        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, None, 5))
         self.assertFalse(token[5])
 
     def test_stop_requested_disarms_without_writing(self):
@@ -2806,7 +2806,7 @@ class TestPublishStormGuards(unittest.TestCase):
         token = pub.enter(BRANCH[:5], budget=0)
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w._stop_requested = True
-        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 0, None, None, None, 5))
         self.assertFalse(token[5])
         w.queue.create_branch.assert_not_called()
 
@@ -2843,7 +2843,7 @@ class TestPromotedSpineDepthCap(unittest.TestCase):
         pub = erd_swarm._MidLoopPublisher(w)
         token = pub.enter(BRANCH[:5], budget=3)
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
-        pub.check(token, CANDIDATES, 0, None, None, 3)
+        pub.check(token, CANDIDATES, 0, None, None, None, 3)
         spine = w.queue.create_branch.call_args.kwargs['spine']
         self.assertEqual(spine, 'ALIBI ----- ELOPE y-y-- RENDS -y-y-')
         self.assertEqual(guess_depth_from_spine(spine) + 3, w.root_budget)
@@ -3080,7 +3080,8 @@ class TestNoteDepthDeeperPruning(unittest.TestCase):
 class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
     """Publisher check() with best_guess and with empty done_indices."""
 
-    def _pub_overrun(self, predicted=10, best_guess=None):
+    def _pub_overrun(self, predicted=10, best_guess=None,
+                     best_max_remaining_depth=3):
         w = _bare_worker()
         w.queue.get_cost_typical.return_value = predicted
         pub = erd_swarm._MidLoopPublisher(w)
@@ -3090,13 +3091,18 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
-        result = pub.check(token, CANDIDATES, 0, best_guess, 1.5, 5)
+        result = pub.check(token, CANDIDATES, 0, best_guess, 1.5,
+                           best_max_remaining_depth, 5)
         return result, w, pub
 
     def test_check_calls_update_branch_best_when_best_guess_known(self):
         result, w, _ = self._pub_overrun(best_guess="crane")
         self.assertIsNotNone(result)
-        w.queue.update_branch_best.assert_called_once()
+        # The seed carries the winner's worst-case line, not just its cost: a
+        # branch seeded with an unknown depth finalizes into a cache row no
+        # budget can ever reuse, so it reads as unsolved forever.
+        w.queue.update_branch_best.assert_called_once_with(
+            ScoreCache.encode_subset(BRANCH[:6]), "crane", 1.5, 3)
 
     def test_check_skips_update_branch_best_when_no_best_guess(self):
         result, w, _ = self._pub_overrun(best_guess=None)
@@ -3117,7 +3123,7 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         w.cooperative_solve = mock.MagicMock(
             return_value=(erd_swarm.SOLVED, 2.0, 3, False))
         unknown_words = ["zzzzz"] * 10
-        pub.check(token, unknown_words, 0, None, None, 5)
+        pub.check(token, unknown_words, 0, None, None, None, 5)
         w.queue.mark_claims_done.assert_not_called()
 
 
@@ -3508,7 +3514,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
 
     def test_ceilinged_frame_publishes_ceilinged_branch(self):
         pub, w, token = self._overrunning()
-        pub.check(token, CANDIDATES, 1, None, 2.4, 5)
+        pub.check(token, CANDIDATES, 1, None, 2.4, None, 5)
         self.assertAlmostEqual(
             w.queue.create_branch.call_args.kwargs["ceiling"], 2.4)
         w.queue.mark_claims_done.assert_called_once()
@@ -3517,7 +3523,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
 
     def test_exact_frame_publishes_exact_branch(self):
         pub, w, token = self._overrunning()
-        pub.check(token, CANDIDATES, 1, None, float('inf'), 5)
+        pub.check(token, CANDIDATES, 1, None, float('inf'), None, 5)
         self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
         w.queue.mark_claims_done.assert_called_once()
         w.cooperative_solve.assert_called_once_with(
@@ -3525,9 +3531,10 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
 
     def test_achieved_best_seeds_and_publishes_exact(self):
         pub, w, token = self._overrunning()
-        pub.check(token, CANDIDATES, 1, "crane", 1.8, 5)
+        pub.check(token, CANDIDATES, 1, "crane", 1.8, 4, 5)
         self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
-        w.queue.update_branch_best.assert_called_once()
+        w.queue.update_branch_best.assert_called_once_with(
+            ScoreCache.encode_subset(BRANCH[:6]), "crane", 1.8, 4)
         w.queue.mark_claims_done.assert_called_once()
         w.cooperative_solve.assert_called_once_with(
             BRANCH[:6], 5, ceiling=float('inf'))
@@ -3535,7 +3542,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
     def test_pending_row_suppresses_ceiling_and_prefix_marks(self):
         pub, w, token = self._overrunning()
         w.queue.has_pending_row.return_value = True
-        pub.check(token, CANDIDATES, 1, None, 2.5, 5)
+        pub.check(token, CANDIDATES, 1, None, 2.5, None, 5)
         self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
         # The prefix was priced against the ceiling; in an exact branch those
         # price-outs do not hold, so the marks are skipped and redone there.
@@ -3545,7 +3552,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         pub, w, token = self._overrunning()
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
-        pub.check(token, CANDIDATES, 1, None, 2.5, 5)
+        pub.check(token, CANDIDATES, 1, None, 2.5, None, 5)
         w.queue.mark_claims_done.assert_not_called()
 
     def test_compatible_race_adopts_selected_source(self):
@@ -3557,7 +3564,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
 
-        pub.check(token, CANDIDATES, 1, "crane", 1.8, 5)
+        pub.check(token, CANDIDATES, 1, "crane", 1.8, None, 5)
 
         w.queue.attach_branch_source_work.assert_called_once_with(
             ScoreCache.encode_subset(BRANCH[:6]), 41, 5, None,
@@ -3570,7 +3577,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         pub, w, token = self._overrunning()
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": 2.5, "budget": 4}
-        pub.check(token, CANDIDATES, 1, "crane", 1.8, 5)
+        pub.check(token, CANDIDATES, 1, "crane", 1.8, None, 5)
         w.queue.mark_claims_done.assert_not_called()
         w.queue.update_branch_best.assert_not_called()
 
@@ -3584,7 +3591,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         pub, w, token = self._overrunning()
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": 2.0, "budget": 5}
-        self.assertIsNone(pub.check(token, CANDIDATES, 1, None, 2.4, 5))
+        self.assertIsNone(pub.check(token, CANDIDATES, 1, None, 2.4, None, 5))
         self.assertFalse(token[5])
         w.queue.mark_claims_done.assert_not_called()
         w.cooperative_solve.assert_not_called()
@@ -3600,7 +3607,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         ours = math.nextafter(row_ceiling, math.inf)
         self.assertNotEqual(row_ceiling, ours)
         w.queue.get_branch.return_value = {"ceiling": row_ceiling, "budget": 5}
-        result = pub.check(token, CANDIDATES, 1, None, ours, 5)
+        result = pub.check(token, CANDIDATES, 1, None, ours, None, 5)
         self.assertIsNotNone(result)
         w.cooperative_solve.assert_called_once_with(BRANCH[:6], 5, ceiling=ours)
 
@@ -3615,7 +3622,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         row_ceiling = math.nextafter(best_erd, math.inf)
         self.assertNotEqual(best_erd, row_ceiling)
         w.queue.get_branch.return_value = {"ceiling": row_ceiling, "budget": 5}
-        pub.check(token, CANDIDATES, 1, None, best_erd, 5)
+        pub.check(token, CANDIDATES, 1, None, best_erd, None, 5)
         w.queue.mark_claims_done.assert_called_once()
 
 
