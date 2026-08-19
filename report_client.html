@@ -401,13 +401,14 @@
     const isInferredWordState=(kind,branchTarget)=>kind==="auto"&&isWordTarget(branchTarget);
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),source_state:branchValues(state.source_state,sourceStateNames)||[],source_offset:intOrNull(state.source_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),source_state:branchValues(state.source_state,sourceStateNames)||[],source_offset:intOrNull(state.source_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
       if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree?["active"]:[];
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
       if(normalized.source_state===undefined)normalized.source_state=[];
       if(normalized.kind!=="sources")normalized.source_state=[];
       // Paging is meaningless without a page size, and only this report pages.
       if(normalized.kind!=="sources"||normalized.limit===null||!normalized.source_offset)normalized.source_offset=null;
+      if(normalized.kind!=="sources"||normalized.limit===null||!normalized.branch_row_offset)normalized.branch_row_offset=null;
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
@@ -441,7 +442,7 @@
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),source_state:parseFilter("source_state"),source_offset:query.get("source_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),source_state:parseFilter("source_state"),source_offset:query.get("source_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -452,7 +453,7 @@
       addBranchFilter("branch_status",state.branch_status,defaultStatuses);
       addBranchFilter("branch_phase",state.branch_phase,[]);
       addBranchFilter("source_state",state.source_state,[]);
-      for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","group_by","limit","source_offset","by","epoch","since_seconds","sample_size"])if(state[name]!==null&&state[name]!=="")query.set(name,String(state[name]));
+      for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","group_by","limit","source_offset","branch_row_offset","by","epoch","since_seconds","sample_size"])if(state[name]!==null&&state[name]!=="")query.set(name,String(state[name]));
       if(state.worker_id)query.set("worker",state.worker_id);
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
       if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
@@ -515,10 +516,10 @@
       byId("sort-field").hidden=kind==="cache"||isHotspots;
       byId("group-by-field").hidden=!wordReport&&!isSources;
       byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
-      byId("limit-label").textContent=currentState.tree?"Items per page":kind==="auto"?"Branches shown":"Rows shown";
+      byId("limit-label").textContent=currentState.tree?"Items per page":isSources?"Words per page":kind==="auto"?"Branches shown":"Rows shown";
       byId("limit-field").hidden=currentState.tree;
     }
-    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),source_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,source_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),source_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,source_offset:null,branch_row_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -1389,19 +1390,21 @@
     // The page size is the "Words per page" control, so a limit that would
     // otherwise just truncate the list becomes a page through it.  With no
     // page size set there is nothing to page and no pager is drawn.
-    function sourceWordPager(data,shownCount,matchedCount,state){
-      const pageSize=state.limit,offset=data.source_word_offset??0;
+    // Both of this view's lists page the same way, so they share one pager:
+    // the words, and the branch rows a named word owns.
+    function sourceListPager({state,offset,shownCount,matchedCount,noun,offsetField,className}){
+      const pageSize=state.limit;
       if(!pageSize||matchedCount<=pageSize)return null;
-      const pager=element("div","status-line source-word-pager");
+      const pager=element("div","status-line "+className);
       pager.append(element("span","dim",shownCount
-        ?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(matchedCount)+" words"
-        :"No words on this page, of "+numText(matchedCount)));
+        ?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(matchedCount)+" "+noun
+        :"No "+noun+" on this page, of "+numText(matchedCount)));
       const previousButton=element("button","","Prev");
       previousButton.disabled=offset<=0;
-      previousButton.addEventListener("click",()=>setState({...state,source_offset:Math.max(0,offset-pageSize)}));
+      previousButton.addEventListener("click",()=>setState({...state,[offsetField]:Math.max(0,offset-pageSize)}));
       const nextButton=element("button","","Next");
       nextButton.disabled=offset+shownCount>=matchedCount;
-      nextButton.addEventListener("click",()=>setState({...state,source_offset:offset+pageSize}));
+      nextButton.addEventListener("click",()=>setState({...state,[offsetField]:offset+pageSize}));
       pager.append(previousButton,nextButton);
       return pager;
     }
@@ -1453,8 +1456,11 @@
         for(const row of ordered(sourceWords,"source_word","source-words",state))wordGrid.append(wordCard(row));
         fragment.append(wordGrid);
       }
-      const pager=sourceWordPager(data,sourceWords.length,matchedWords,state);
-      if(pager)fragment.append(pager);
+      const wordPager=sourceListPager({
+        state,offset:data.source_word_offset??0,shownCount:sourceWords.length,
+        matchedCount:matchedWords,noun:"words",offsetField:"source_offset",
+        className:"source-word-pager"});
+      if(wordPager)fragment.append(wordPager);
       if(!rows.length)return fragment;
       // Both counts come from the model, which counts them before the row
       // limit truncates the grid, so neither silently means "of those shown".
@@ -1469,6 +1475,11 @@
       const previousMemberships=new Map(withMembershipIdentity((((previous||{}).data)||{}).rows).map(row=>[row.membership_identity,row]));
       for(const row of ordered(rows,"membership_identity","source-memberships",state))ownership.append(sourceMembershipCard(row,previousMemberships.get(row.membership_identity)));
       fragment.append(ownership);
+      const branchPager=sourceListPager({
+        state,offset:data.branch_row_offset??0,shownCount:rows.length,
+        matchedCount:matchedRows,noun:"branch rows",
+        offsetField:"branch_row_offset",className:"branch-row-pager"});
+      if(branchPager)fragment.append(branchPager);
       return fragment;
     }
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}

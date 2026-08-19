@@ -61,6 +61,7 @@
     "source_word_offset": 0,
     "matched_rows": 4,
     "shared_branch_count": 1,
+    "branch_row_offset": 0,
     "rows": [
       {
         "source_work_id": 1,

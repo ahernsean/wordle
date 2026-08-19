@@ -1826,6 +1826,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertFalse(self.page.locator("#filters-group").is_hidden())
         self.assertTrue(self.page.locator("#branch-filters").is_hidden())
         self.assertFalse(self.page.locator("#limit-field").is_hidden())
+        # The control pages this view rather than capping it, and says so.
+        self.assertEqual(self.page.locator("#limit-label").inner_text(),
+                         "Words per page")
 
     def test_word_report_sort_only_offers_options_the_server_accepts(self):
         # A word report's sort is restricted server-side to size/workers/
@@ -3068,12 +3071,33 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertFalse(pager.locator("button", has_text="Prev").is_disabled())
         self.assertTrue(pager.locator("button", has_text="Next").is_disabled())
 
+    def test_sources_branch_rows_have_their_own_pager(self):
+        # The branch list pages like the word list: a named word can own
+        # hundreds of branches, and a page size that truncated them with no
+        # way to the rest is the defect the word pager already fixed.
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          report.data.matched_rows = 40;
+          report.data.branch_row_offset = 4;
+          report.data.rows = report.data.rows.slice(0, 4);
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&branch_target=SALET&limit=4'}));
+        }""")
+        pager = self.page.locator(".branch-row-pager")
+        self.assertIn("Showing 5–8 of 40 branch rows",
+                      " ".join(pager.inner_text().split()))
+        self.assertFalse(pager.locator("button", has_text="Prev").is_disabled())
+        self.assertFalse(pager.locator("button", has_text="Next").is_disabled())
+        # The word pager is a separate control over a separate list.
+        self.assertEqual(self.page.locator(".source-word-pager").count(), 0)
+
     def test_sources_pager_is_absent_without_a_page_size(self):
         self.open_sources()
         self.assertEqual(self.page.locator(".source-word-pager").count(), 0)
         self.assertEqual(
             self.page.evaluate("() => __reportClient.getState().source_offset"),
             None)
+        self.assertEqual(self.page.locator(".branch-row-pager").count(), 0)
 
     def test_sources_grouping_buckets_cards_under_their_rollup(self):
         # The fixture server ignores query parameters, so the grouped payload

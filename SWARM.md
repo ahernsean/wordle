@@ -241,7 +241,7 @@ owning request with both that request's own requested priority and the
 branch's effective (highest live owner's) priority side by side, plus its
 promotion lineage (root pattern and immediate parent). That per-branch list is
 deliberately opt-in: a root can own hundreds of branches, and printing them
-for every request buries the requests themselves.
+for every word buries the words themselves.
 
 Each worker's own report row shows whether it is serving its preferred
 (highest-priority eligible) source or fallback work claimed because the

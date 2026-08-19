@@ -1331,6 +1331,56 @@ class SourceReportTest(unittest.TestCase):
             sort="word", limit=2, source_offset=0, source_states=("queued",))
         self.assertEqual(filtered["matched_source_word_count"], 5)
 
+    def test_group_rollups_count_a_shared_branch_once(self):
+        # Same defect as the report's own totals, one level down: two words in
+        # the same group owning one branch must not count it twice.
+        shared_key = ScoreCache.encode_subset(ANSWERS[:2])
+        solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
+        queue = self._open_queue()
+        queue.add_pending_many([(shared_key, 2, 5, "salet", 0)])
+        queue.add_pending_many([(shared_key, 2, 5, "crane", 0),
+                                (solo_key, 2, 5, "crane", 1)])
+        queue.close()
+
+        data = self._source_words(group_by="state")
+
+        group = data["summary_groups"][0]
+        self.assertEqual(group["rollup"]["source_word_count"], 2)
+        self.assertEqual(
+            sum(row["branch_count"] for row in group["rows"]), 3)
+        self.assertEqual(group["rollup"]["branch_count"], 2)
+        self.assertEqual(group["rollup"]["open_branch_count"], 2)
+        self.assertEqual(group["rollup"]["done_branch_count"], 0)
+
+    def test_branch_rows_page_like_the_words_do(self):
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(ANSWERS[:2] + [f"w{index:04d}"]), 3, 5,
+             "salet", index)
+            for index in range(5)
+        ])
+        queue.close()
+        salet = parse_report_branch_target(["salet"])
+
+        pages = [
+            collect_report(self.sources, ReportRequest(
+                report_kind="sources", branch_target=salet,
+                filters=ReportFilters(limit=2, branch_row_offset=offset),
+            ))["data"]
+            for offset in (0, 2, 4, 6)
+        ]
+
+        self.assertEqual([len(page["rows"]) for page in pages], [2, 2, 1, 0])
+        for offset, page in zip((0, 2, 4, 6), pages):
+            # Every page names the same matched total and its own start, so a
+            # client knows there is more to page through.
+            self.assertEqual(page["matched_rows"], 5)
+            self.assertEqual(page["branch_row_offset"], offset)
+        # The pages partition the branch rows: no row on two pages, none lost.
+        seen = [row["branch_key_hex"] for page in pages for row in page["rows"]]
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(len(seen), 5)
+
     def test_source_grouping_buckets_words_with_their_own_rollup(self):
         self._queue_words(("salet", 5, 3), ("crane", 5, 1), ("nurdy", 1, 7))
 

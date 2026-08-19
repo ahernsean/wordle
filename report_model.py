@@ -113,6 +113,7 @@ class ReportFilters:
     group_by: str | None = None
     source_states: tuple[str, ...] = ()
     source_offset: int | None = None
+    branch_row_offset: int | None = None
 
 
 BRANCH_STATUSES = ("active", "pending", "done", "unqueued")
@@ -245,11 +246,14 @@ def validate_report_request(request: ReportRequest) -> None:
         )
     if request.filters.source_states and report_kind != "sources":
         raise ValueError("source_state requires a source report")
-    if request.filters.source_offset is not None:
+    for name in ("source_offset", "branch_row_offset"):
+        offset = getattr(request.filters, name)
+        if offset is None:
+            continue
         if report_kind != "sources":
-            raise ValueError("source_offset requires a source report")
-        if request.filters.source_offset < 0:
-            raise ValueError("source_offset cannot be negative")
+            raise ValueError(f"{name} requires a source report")
+        if offset < 0:
+            raise ValueError(f"{name} cannot be negative")
     if request.filters.sort is not None:
         if report_kind == "sources":
             if request.filters.sort not in SOURCE_SORT_FIELDS:
@@ -2702,8 +2706,13 @@ def _source_word_group_key(row, group_by):
     return (-(priority or 0), f"priority {priority}")
 
 
-def _grouped_source_words(rows, group_by):
-    """Bucket the collapsed rows, each group carrying its own rollup."""
+def _grouped_source_words(rows, group_by, branch_totals):
+    """Bucket the collapsed rows, each group carrying its own rollup.
+
+    A group's branch totals are counted distinctly over the words in it, for
+    the same reason the report's own are: two words can own the same branch,
+    and summing their per-word counts would count it once per word.
+    """
     grouped = {}
     for row in rows:
         sort_key, label = _source_word_group_key(row, group_by)
@@ -2717,9 +2726,16 @@ def _grouped_source_words(rows, group_by):
         group["rows"].append(row)
         rollup = group["rollup"]
         rollup["source_word_count"] += 1
-        for field in ("branch_count", "open_branch_count",
-                      "done_branch_count", "worker_count"):
-            rollup[field] += row[field]
+        rollup["worker_count"] += row["worker_count"]
+    for group in grouped.values():
+        branch_count, open_branch_count = branch_totals(
+            [row["source_word"] for row in group["rows"]]
+        )
+        group["rollup"]["branch_count"] = branch_count
+        group["rollup"]["open_branch_count"] = open_branch_count
+        group["rollup"]["done_branch_count"] = max(
+            0, branch_count - open_branch_count
+        )
     return [grouped[key] for key in sorted(grouped)]
 
 
@@ -2864,7 +2880,8 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     data = {"summary": [], "total_source_word_count": 0,
             "matched_source_word_count": 0, "matched_branch_count": 0,
             "matched_open_branch_count": 0, "source_word_offset": 0,
-            "matched_rows": 0, "shared_branch_count": 0, "rows": []}
+            "matched_rows": 0, "shared_branch_count": 0,
+            "branch_row_offset": 0, "rows": []}
     report = _semantic_report(
         "sources", sources, request.branch_target, generated_at, data, request
     )
@@ -2896,28 +2913,26 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                          if row["state"] in source_states]
         collapsed = _sorted_source_words(collapsed, request.filters.sort)
         data["matched_source_word_count"] = len(collapsed)
-        # Counted across the matched words with each branch counted once: two
-        # words can own the same branch, so summing their per-word counts
-        # double-counts precisely the shared ownership this report exists to
-        # show.
+        # Counted with each branch counted once: two words can own the same
+        # branch, so summing their per-word counts double-counts precisely the
+        # shared ownership this report exists to show.
+        def branch_totals(words):
+            word_set = set(words)
+            open_branch_ids = {
+                row["branch_id"] for row in all_membership_rows
+                if (_row_value(row, "source_word") or "").lower() in word_set
+                and branch_status_and_phase(
+                    _row_value(row, "pending_status"),
+                    _row_value(row, "active_status"),
+                    _row_value(row, "worker_count", 0),
+                )[1] != "complete"
+            }
+            return (queue.distinct_branch_count_for_words(words),
+                    len(open_branch_ids))
+
         matched_words = [row["source_word"] for row in collapsed]
-        data["matched_branch_count"] = queue.distinct_branch_count_for_words(
-            matched_words
-        )
-        matched_word_set = set(matched_words)
-        open_branch_ids = set()
-        for row in all_membership_rows:
-            row_word = (_row_value(row, "source_word") or "").lower() or None
-            if row_word not in matched_word_set:
-                continue
-            worker_count = _row_value(row, "worker_count", 0)
-            _branch_status, branch_phase = branch_status_and_phase(
-                _row_value(row, "pending_status"),
-                _row_value(row, "active_status"), worker_count,
-            )
-            if branch_phase != "complete":
-                open_branch_ids.add(row["branch_id"])
-        data["matched_open_branch_count"] = len(open_branch_ids)
+        (data["matched_branch_count"],
+         data["matched_open_branch_count"]) = branch_totals(matched_words)
         # limit is a page size and source_offset is where that page starts, so
         # the words past the first page stay reachable rather than truncated
         # away.  An offset past the end yields an empty page, not the last one:
@@ -2938,7 +2953,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_source_words(
-                data["summary"], group_by
+                data["summary"], group_by, branch_totals
             )
 
         # Branch rows belong to one named word.  Emitting them for every word
@@ -2962,10 +2977,15 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             data["shared_branch_count"] = len({
                 row["branch_key_hex"] for row in payload_rows if row["is_shared"]
             })
+            # The same page size pages the branch rows, so a named word's
+            # hundreds of branches are reachable rather than truncated away.
             branch_row_limit = request.filters.limit
+            branch_row_offset = request.filters.branch_row_offset or 0
+            data["branch_row_offset"] = branch_row_offset
             data["rows"] = (
-                payload_rows[:branch_row_limit]
-                if branch_row_limit is not None else payload_rows
+                payload_rows[branch_row_offset:branch_row_offset + branch_row_limit]
+                if branch_row_limit is not None
+                else payload_rows[branch_row_offset:]
             )
         _mark_queue_source_ok(report)
     except (sqlite3.Error, OSError) as error:
