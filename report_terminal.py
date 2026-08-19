@@ -1589,7 +1589,9 @@ def _render_source_sections(report, width, display_order):
     for row in data.get("rows", []):
         hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
         hotkey_prefix = f"{hotkey} " if hotkey else ""
-        shared = "shared" if row["is_shared"] else "sole"
+        # owner_count already carries shared (>1) vs not (1); a "sole"
+        # qualifier would only restate the number printed beside it.
+        shared = "shared, " if row["is_shared"] else ""
         parent = (f" parent=@{_display_reference(row['parent_branch_reference'])}"
                  if row.get("parent_branch_reference") else "")
         lines.append(_fit(
@@ -1599,7 +1601,7 @@ def _render_source_sections(report, width, display_order):
             f"{row['branch_status']}/{row['branch_phase']} "
             f"requested={row['requested_priority']} "
             f"effective={row['branch_effective_priority']} "
-            f"({shared}, {row['owner_count']} owner(s)) "
+            f"({shared}{row['owner_count']} owner(s)) "
             f"root={row['root_pattern']}{parent} "
             f"workers={row['worker_count']}",
             width,

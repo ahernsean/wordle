@@ -3183,7 +3183,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         sole = " ".join(
             self.page.locator('[data-identity="2:04"]').inner_text().split()
         )
-        self.assertIn("sole", sole)
+        # Owned by only one request: no "shared" chip -- its absence is what
+        # says so, rather than a redundant "sole" chip beside it.
+        self.assertNotIn("shared", sole)
         self.assertNotIn("parent", sole)
         ownership_text = " ".join(
             self.page.locator("#report").inner_text().split()

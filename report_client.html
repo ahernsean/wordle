@@ -1362,7 +1362,8 @@
       const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previous));
       card.dataset.identity=row.membership_identity;
       const title=element("div","card-title");
-      title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),...statusChips(row),element("span","chip",row.is_shared?"shared":"sole"));
+      title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),...statusChips(row));
+      if(row.is_shared)title.append(element("span","chip","shared"));
       card.append(title);
       // The root (word, response) the membership descends from is a spine step,
       // so it is drawn as one rather than spelled out as a bare pattern.
