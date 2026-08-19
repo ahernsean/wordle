@@ -684,14 +684,12 @@ class TestStartupRecovery(_TmpQueue):
             # become re-claimable gaps for the next worker.
             self.assertEqual([c for c in claims if c["done"] == 0], [])
 
-        # The freed gap is not lost, but it isn't immediately reclaimable
-        # either: pack_cursor is past it (2), and holes below the cursor are
-        # only picked up by holes_pass once the cursor exhausts the full
-        # best-first order (adaptive_claim_packing.md §5) — so the next claim
-        # takes the next fresh slot instead.
+        # The freed gap keeps its place in the best-first order: pack_cursor
+        # is past it (2), but a recorded hole outranks every position the
+        # cursor has not reached, so the next claim takes the gap rather than
+        # the next fresh slot.
         next_idx = self._claim_one_idx(coop_key, "worker-1")
-        self.assertNotEqual(next_idx, idx1)
-        self.assertEqual(next_idx, 2)
+        self.assertEqual(next_idx, idx1)
 
 
 class TestCancelAndInspection(_TmpQueue):

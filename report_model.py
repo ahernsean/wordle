@@ -17,6 +17,7 @@ from erd_queue import (
     DISK_WARN_FRACTION,
     ERDQueue,
     WORKER_LIVENESS_SECONDS,
+    best_first_rank,
     derive_telemetry_path,
     disk_stats,
 )
@@ -1636,6 +1637,10 @@ def _normalize_claim(row, republish_count):
         "claimed_at": _row_value(row, "claimed_at"),
         "done_at": _row_value(row, "done_at"),
         "republish_count": republish_count,
+        # 1-based rank in the branch's best-first candidate order, recorded
+        # only for a claim the packer handed out.
+        "best_first_rank": best_first_rank(
+            _row_value(row, "best_first_position")),
     }
 
 

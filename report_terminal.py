@@ -1052,6 +1052,36 @@ def _render_word_sections(report, previous_report, color, width, display_order):
     return [("header", header), ("summary", summary), ("response_groups", rows)]
 
 
+def _finalization_schedule_lines(finalization, width):
+    """Best-first scheduling evidence for one finalized branch, if recorded.
+
+    A winning rank far ahead of the weakest rank completed before it is a
+    priority inversion: the branch spent itself on later candidates while a
+    strong one waited to be reissued.
+    """
+    winner_rank = finalization.get("winner_best_first_rank")
+    republished = finalization.get("republished_candidate_count")
+    if winner_rank is None and not republished:
+        return []
+    facts = []
+    if winner_rank is not None:
+        facts.append(f"winner ranked {winner_rank:,}")
+    completed_ahead = finalization.get("candidates_completed_before_winner")
+    if completed_ahead is not None:
+        facts.append(f"{completed_ahead:,} candidates completed first")
+    weakest_rank = finalization.get("weakest_best_first_rank_before_winner")
+    if weakest_rank is not None:
+        facts.append(f"weakest of them ranked {weakest_rank:,}")
+    winner_republish_count = finalization.get("winner_republish_count")
+    if winner_republish_count:
+        facts.append(f"winner republished {winner_republish_count:,}x")
+    if republished:
+        worst = finalization.get("max_candidate_republish_count") or 0
+        facts.append(f"{republished:,} candidates republished "
+                     f"(up to {worst:,}x each)")
+    return _inline_section("    best-first order:", facts, width)
+
+
 def _render_branch_sections(report, previous_report, color, width, display_order):
     data = report["data"]
     branch = data["branch"]
@@ -1224,6 +1254,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             f"two-level-ERD-prunes={two_level_erd_prunes:,}",
             width,
         ))
+        telemetry_lines.extend(
+            _finalization_schedule_lines(finalization, width))
     finalization_total = data.get("finalization_total_count", len(finalizations))
     if finalization_total > len(finalizations):
         telemetry_lines.append(_fit(

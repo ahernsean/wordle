@@ -857,6 +857,59 @@ class CandidateSweepBarTest(unittest.TestCase):
         }
         self.assertIn("loss unsolvable-within-budget", render_report(report, width=100))
 
+    def test_branch_report_shows_best_first_scheduling_evidence(self):
+        report = overview_report()
+        report.update({"report_kind": "branch", "branch_target": None})
+        branch = deepcopy(report["data"]["branches"][0])
+        report["data"] = {
+            "branch": branch,
+            "queue": deepcopy(branch),
+            "cache": {"cache_state": "missing", "best_guess": None,
+                      "best_erd": None, "max_remaining_depth": None},
+            "workers": [],
+            "republished_candidates": [], "completed_candidate_indexes": [],
+            "claims": None, "provenance_unknown": False,
+            "recent_finalizations": [{
+                "spine": "CRANE -----", "outcome": "exact", "epoch": 11,
+                "search_node_count": 100, "evaluated_candidate_count": 8,
+                "bulk_completed_candidate_count": 0,
+                "winner_best_first_rank": 46,
+                "winner_republish_count": 1,
+                "candidates_completed_before_winner": 4900,
+                "weakest_best_first_rank_before_winner": 7795,
+                "republished_candidate_count": 5305,
+                "max_candidate_republish_count": 3,
+            }],
+        }
+        output = render_report(report, width=200)
+        self.assertIn("winner ranked 46", output)
+        self.assertIn("4,900 candidates completed first", output)
+        self.assertIn("weakest of them ranked 7,795", output)
+        self.assertIn("winner republished 1x", output)
+        self.assertIn("5,305 candidates republished (up to 3x each)", output)
+
+    def test_branch_report_omits_scheduling_evidence_when_unrecorded(self):
+        report = overview_report()
+        report.update({"report_kind": "branch", "branch_target": None})
+        branch = deepcopy(report["data"]["branches"][0])
+        report["data"] = {
+            "branch": branch,
+            "queue": deepcopy(branch),
+            "cache": {"cache_state": "missing", "best_guess": None,
+                      "best_erd": None, "max_remaining_depth": None},
+            "workers": [],
+            "republished_candidates": [], "completed_candidate_indexes": [],
+            "claims": None, "provenance_unknown": False,
+            "recent_finalizations": [{
+                "spine": "CRANE -----", "outcome": "exact", "epoch": 11,
+                "search_node_count": 100, "evaluated_candidate_count": 8,
+                "bulk_completed_candidate_count": 0,
+                "winner_best_first_rank": None,
+                "republished_candidate_count": 0,
+            }],
+        }
+        self.assertNotIn("best-first order:", render_report(report, width=200))
+
 
 class CollectionRendererTest(unittest.TestCase):
     def _report(self, report_kind, data, tree=False):

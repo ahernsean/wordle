@@ -67,6 +67,31 @@ class TestSchemaMigration(unittest.TestCase):
         finally:
             q.close()
 
+    def test_legacy_claim_row_migrates_into_a_positioned_hole(self):
+        # The branch_key rebuild runs on this database, so the position column
+        # must land after it; a legacy claim keeps NULL, which the packer
+        # orders after every hole whose rank it does know.
+        branch_key = encode_subset(["crane", "slate"])
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "INSERT INTO candidate_claims (branch_key, idx, claimed_by, "
+            "claimed_at, done) VALUES (?, 3, 'worker-0', 0, 0)", (branch_key,))
+        conn.commit()
+        conn.close()
+
+        q = ERDQueue(self.path)
+        try:
+            columns = {r["name"] for r in
+                       q._conn.execute("PRAGMA table_info(candidate_claims)")}
+            self.assertIn("best_first_position", columns)
+            self.assertEqual(q.reclaim_stale_claims(heartbeat_timeout_seconds=1), 1)
+            self.assertEqual(
+                [tuple(row) for row in q._conn.execute(
+                    "SELECT idx, best_first_position FROM candidate_holes")],
+                [(3, None)])
+        finally:
+            q.close()
+
     def test_migration_is_idempotent_on_reopen(self):
         ERDQueue(self.path).close()
         q = ERDQueue(self.path)   # second open must not fail or double-create
@@ -613,6 +638,246 @@ class TestRepublishRemainder(_TmpQueue):
         self.assertEqual(self.q.republish_remainder(self.key, "b0", []), {})
 
 
+# A deliberately non-identity best-first order: idx and rank differ
+# everywhere, so a scheduler that confuses one for the other cannot pass.
+_SHUFFLED_ORDER = ([idx for idx in range(N_CANDIDATES) if idx % 2]
+                   + [idx for idx in range(N_CANDIDATES) if not idx % 2])
+
+
+class TestBestFirstHoleScheduling(_TmpQueue):
+    """Issue #258: a republished or reclaimed candidate keeps the rank it had
+    in the branch's best-first order, and is reissued ahead of candidates the
+    forward cursor has not reached yet."""
+
+    def _claim(self, worker_id, order=_SHUFFLED_ORDER, lower_bound=None,
+               small_count=4):
+        return self.q.claim_next_bundle(
+            self.key, worker_id, N_CANDIDATES, order,
+            _ZERO_LOWER_BOUND if lower_bound is None else lower_bound,
+            small_count=small_count, count_cap=small_count)
+
+    def test_republished_remainder_is_reissued_before_virgin_candidates(self):
+        bundle_id, indices, _forced = self._claim("w0")
+        self.assertEqual(indices, _SHUFFLED_ORDER[:4])
+        # The bundle's head is expensive: it finishes, the rest overruns.
+        self.q.complete_candidate(self.key, indices[0])
+        self.q.republish_remainder(self.key, bundle_id, indices[1:])
+
+        _bundle_id, reissued, _forced = self._claim("w1")
+        self.assertEqual(reissued[:3], indices[1:],
+                         "the remainder must come back at its own rank")
+        self.assertEqual(reissued[3], _SHUFFLED_ORDER[4],
+                         "and the bundle tops up from the forward cursor")
+
+    def test_completion_order_follows_best_first_rank_across_a_republish(self):
+        # A scripted worker: every claimed candidate completes, except the
+        # bundle behind an expensive head, which is republished.  The test
+        # controls the work cost, so the completion sequence is deterministic.
+        completed = []
+        overrun_done = False
+        while True:
+            claim = self._claim("w0")
+            if claim is None:
+                break
+            bundle_id, indices, _forced = claim
+            self.q.complete_candidate(self.key, indices[0])
+            completed.append(indices[0])
+            if not overrun_done:
+                overrun_done = True
+                self.q.republish_remainder(self.key, bundle_id, indices[1:])
+                continue
+            for idx in indices[1:]:
+                self.q.complete_candidate(self.key, idx)
+                completed.append(idx)
+        self.assertEqual(completed, _SHUFFLED_ORDER,
+                         "an overrun must not push its remainder behind "
+                         "lower-ranked candidates")
+
+    def test_reclaimed_claim_is_reissued_before_virgin_candidates(self):
+        _bundle_id, indices, _forced = self._claim("dead-worker")
+        self.q._conn.execute(
+            "UPDATE candidate_claims SET claimed_at = 0 WHERE branch_id = ?",
+            (self.q._intern_branch(self.key),))
+        self.assertEqual(self.q.reclaim_stale_claims(heartbeat_timeout_seconds=120),
+                         len(indices))
+        _bundle_id, reissued, _forced = self._claim("w1")
+        self.assertEqual(reissued, indices)
+
+    def test_holes_are_drained_in_best_first_order_not_republish_order(self):
+        bundle_id, indices, _forced = self._claim("w0", small_count=8)
+        # Republish the second half first, then the first half: insertion
+        # order into the hole index is the reverse of best-first order.
+        self.q.republish_remainder(self.key, bundle_id, indices[4:])
+        self.q.republish_remainder(self.key, bundle_id, indices[:4])
+        _bundle_id, reissued, _forced = self._claim("w1", small_count=8)
+        self.assertEqual(reissued, indices)
+
+    def test_hole_superseded_by_the_publisher_is_dropped_not_reissued(self):
+        bundle_id, indices, _forced = self._claim("w0")
+        self.q.republish_remainder(self.key, bundle_id, indices[1:])
+        # The mid-loop publisher completes one of the freed candidates inline.
+        self.q.mark_claims_done(self.key, [indices[2]])
+        _bundle_id, reissued, _forced = self._claim("w1")
+        self.assertNotIn(indices[2], reissued)
+        self.assertEqual(reissued[:2], [indices[1], indices[3]])
+        self.assertEqual(
+            self.q._conn.execute(
+                "SELECT COUNT(*) FROM candidate_holes WHERE branch_id = ?",
+                (self.q._intern_branch(self.key),)).fetchone()[0],
+            0)
+
+    def test_hole_the_bound_now_prunes_is_completed_mid_sweep(self):
+        bundle_id, indices, _forced = self._claim("w0")
+        self.q.republish_remainder(self.key, bundle_id, indices)
+        self.q.update_branch_best(self.key, "salet", 2.0)
+        lower_bound = list(_ZERO_LOWER_BOUND)
+        for idx in indices:
+            lower_bound[idx] = 2.5
+
+        _bundle_id, reissued, _forced = self._claim("w1", lower_bound=lower_bound)
+
+        self.assertEqual(reissued, _SHUFFLED_ORDER[4:8],
+                         "pruned holes must not hold up the forward sweep")
+        self.assertEqual(self.q.branch_erd_pruned_candidate_counts(self.key),
+                         (len(indices), 0))
+
+    def test_coverage_backstop_still_finds_a_hole_missing_from_the_index(self):
+        # The hole index is an ordering accelerator; the end-of-sweep pass
+        # over the claim rows remains the authority on coverage.
+        branch_id = self.q._intern_branch(self.key)
+        while self._claim("w0", small_count=N_CANDIDATES) is not None:
+            pass
+        lost = _SHUFFLED_ORDER[7]
+        self.q._conn.execute(
+            "DELETE FROM candidate_claims WHERE branch_id = ? AND idx = ?",
+            (branch_id, lost))
+        self.q._conn.execute("DELETE FROM candidate_holes")
+
+        _bundle_id, reissued, _forced = self._claim("w1")
+
+        self.assertEqual(reissued, [lost])
+
+    def test_coverage_backstop_prunes_a_hole_the_bound_reaches(self):
+        branch_id = self.q._intern_branch(self.key)
+        while self._claim("w0", small_count=N_CANDIDATES) is not None:
+            pass
+        lost = _SHUFFLED_ORDER[7]
+        self.q._conn.execute(
+            "DELETE FROM candidate_claims WHERE branch_id = ? AND idx = ?",
+            (branch_id, lost))
+        self.q._conn.execute("DELETE FROM candidate_holes")
+        self.q.update_branch_best(self.key, "salet", 2.0)
+        lower_bound = list(_ZERO_LOWER_BOUND)
+        lower_bound[lost] = 2.5
+        self.q._conn.execute(
+            "UPDATE active_branches SET bulk_done_bound = 2.0 "
+            "WHERE branch_id = ?", (branch_id,))
+
+        self.assertIsNone(self._claim("w1", lower_bound=lower_bound))
+        self.assertEqual(self.q.branch_erd_pruned_candidate_counts(self.key),
+                         (1, 0))
+        self.assertEqual(
+            [row["claimed_by"] for row in self.q.claims_for_branch(self.key)
+             if row["idx"] == lost],
+            ["one-level-erd-prune"])
+
+    def test_unpositioned_hole_is_packed_after_positioned_ones(self):
+        # A claim row written before candidate_claims.best_first_position
+        # existed has no recoverable rank.
+        bundle_id, indices, _forced = self._claim("w0")
+        self.q._conn.execute(
+            "UPDATE candidate_claims SET best_first_position = NULL "
+            "WHERE branch_id = ? AND idx = ?",
+            (self.q._intern_branch(self.key), indices[0]))
+        self.q.republish_remainder(self.key, bundle_id, indices)
+        _bundle_id, reissued, _forced = self._claim("w1")
+        self.assertEqual(reissued, indices[1:] + [indices[0]])
+
+    def test_claim_with_holes_does_not_rescan_the_branch(self):
+        bundle_id, indices, _forced = self._claim("w0")
+        self.q.republish_remainder(self.key, bundle_id, indices)
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            self._claim("w1")
+        finally:
+            self.q._conn.set_trace_callback(None)
+        self.assertFalse(any(
+            "SELECT idx, done FROM candidate_claims" in statement
+            for statement in statements),
+            "reissuing a hole must not cost a full per-branch claims re-read")
+
+
+class TestScheduleDiagnostics(_TmpQueue):
+    """Issue #258: per-candidate scheduling evidence survives finalization."""
+
+    def _drain_with_deferred_winner(self):
+        """Republish rank 1 repeatedly behind an expensive head, then let it
+        win.  Returns the winner's idx."""
+        bundle_id, indices, _forced = self.q.claim_next_bundle(
+            self.key, "w0", N_CANDIDATES, _SHUFFLED_ORDER, _ZERO_LOWER_BOUND,
+            small_count=4, count_cap=4)
+        winner = indices[1]
+        self.q.complete_candidate(self.key, indices[0])
+        self.q.republish_remainder(self.key, bundle_id, indices[1:])
+        return winner
+
+    def test_diagnostics_report_rank_republish_and_work_done_ahead(self):
+        winner = self._drain_with_deferred_winner()
+        # Everything the forward cursor reached finishes before the winner.
+        for pass_no in range(3):
+            claim = self.q.claim_next_bundle(
+                self.key, f"w{pass_no}", N_CANDIDATES, _SHUFFLED_ORDER,
+                _ZERO_LOWER_BOUND, small_count=4, count_cap=4)
+            bundle_id, indices, _forced = claim
+            for idx in indices:
+                if idx == winner:
+                    continue
+                self.q.complete_candidate(self.key, idx)
+        time.sleep(1.1)   # done_at has one-second resolution
+        self.q.complete_candidate(self.key, winner)
+
+        diagnostics = self.q.candidate_schedule_diagnostics(self.key, winner)
+
+        self.assertEqual(diagnostics["winner_best_first_position"], 1)
+        self.assertEqual(diagnostics["winner_republish_count"], 1)
+        self.assertGreater(diagnostics["candidates_completed_before_winner"], 1)
+        self.assertGreater(
+            diagnostics["max_best_first_position_before_winner"],
+            diagnostics["winner_best_first_position"])
+        self.assertEqual(diagnostics["republished_candidates"], 3)
+        self.assertEqual(diagnostics["max_candidate_republish_count"], 1)
+
+    def test_diagnostics_are_empty_for_a_branch_with_no_claims(self):
+        diagnostics = self.q.candidate_schedule_diagnostics(
+            encode_subset(["bacon", "caper"]), 0)
+        self.assertEqual(set(diagnostics.values()), {None})
+
+    def test_diagnostics_without_a_winner_still_report_republish_pressure(self):
+        self._drain_with_deferred_winner()
+        diagnostics = self.q.candidate_schedule_diagnostics(self.key)
+        self.assertEqual(diagnostics["republished_candidates"], 3)
+        self.assertIsNone(diagnostics["winner_best_first_position"])
+
+    def test_diagnostics_of_an_unfinished_winner_omit_the_work_ahead(self):
+        winner = self._drain_with_deferred_winner()
+        diagnostics = self.q.candidate_schedule_diagnostics(self.key, winner)
+        self.assertIsNone(diagnostics["candidates_completed_before_winner"])
+        self.assertEqual(diagnostics["winner_republish_count"], 1)
+
+    def test_finalize_log_carries_the_diagnostics(self):
+        winner = self._drain_with_deferred_winner()
+        self.q.complete_candidate(self.key, winner)
+        diagnostics = self.q.candidate_schedule_diagnostics(self.key, winner)
+        self.q.add_branch_finalize_log(
+            self.key, "SALET -----", 5, 6, 0, 1, 100, 4,
+            best_guess="crane", schedule_diagnostics=diagnostics)
+        row = self.q._conn.execute(
+            "SELECT * FROM telemetry.branch_finalize_log").fetchone()
+        for field in ERDQueue.SCHEDULE_DIAGNOSTIC_FIELDS:
+            self.assertEqual(row[field], diagnostics[field])
+
+
 class TestBundleStatsAndFinalizeLog(_TmpQueue):
     def test_finalize_log_preserves_aggregate_bulk_done_count(self):
         self.q.add_branch_finalize_log(
@@ -944,6 +1209,57 @@ class TestStructuralClaimReduction(_SwarmBase):
             singleton_bundles, 1,
             "no path should hand out a lone candidate as standard behavior "
             "(a size-1 bundle may occur only as an emergent tail outcome)")
+
+
+class TestRepublishedRemainderKeepsPriorityInTheSwarm(_SwarmBase):
+    """Issue #258 end to end: with a node cap that overruns every bundle, a
+    real worker's republished remainder is never left outstanding while the
+    packer hands out candidates the forward cursor had not reached."""
+
+    def test_no_virgin_candidate_is_claimed_while_a_hole_is_outstanding(self):
+        cache_path, queue_path = self._db("hole-priority")
+        ScoreCache(cache_path, BRANCH).close()
+        q = ERDQueue(queue_path)
+        q.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET)
+        q.close()
+        w = _BranchWorker(0, cache_path, queue_path, None, small_count=4,
+                          count_cap=4, bundle_node_cap=0, republish_limit=100)
+        republished = set()
+        deferred_holes = []
+        original_claim = w.queue.claim_next_bundle
+        original_republish = w.queue.republish_remainder
+
+        def recording_republish(branch_key, bundle_id, indices):
+            result = original_republish(branch_key, bundle_id, indices)
+            republished.update(result)
+            return result
+
+        def checking_claim(branch_key, *args, **kwargs):
+            branch_id = w.queue._intern_branch(branch_key)
+            before = {row["idx"] for row in w.queue.claims_for_branch(branch_key)}
+            outstanding = {idx for idx in republished if idx not in before}
+            result = original_claim(branch_key, *args, **kwargs)
+            if result is not None and result is not erd_swarm.CLAIM_RETRY:
+                claimed = set(result[1])
+                if claimed - outstanding:
+                    after = {row["idx"]
+                             for row in w.queue.claims_for_branch(branch_key)}
+                    deferred_holes.extend(sorted(outstanding - after))
+            return result
+
+        w.queue.claim_next_bundle = checking_claim
+        w.queue.republish_remainder = recording_republish
+        try:
+            w.solve_branch_focused(self.branch_key)
+        finally:
+            w.close()
+
+        self.assertTrue(republished,
+                        "the node cap did not force a single republish")
+        self.assertEqual(deferred_holes, [],
+                         "a republished candidate was left outstanding while "
+                         "the packer handed out untouched later ones")
 
 
 class TestRepublishOnOverrunConverges(_SwarmBase):

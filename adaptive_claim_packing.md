@@ -70,9 +70,10 @@ claim reduction is measured directly by the swarm-overhead CI guard.
   `claim_candidate` (replaced by `claim_next_bundle`, §6), so #68's
   `next_idx`-on-`active_branches` migration does not apply. Its underlying
   requirement — O(1)-amortized handout so a branch drains in O(n) not
-  O(n²), with reclaimed holes picked up lazily rather than rescanned on
-  every call — is a requirement of the packer, met in §5 (single forward
-  cursor over best-first order) and §12 (shared cursor state). #68's
+  O(n²), with reclaimed holes found by an indexed lookup rather than a
+  rescan on every call — is a requirement of the packer, met in §5 (single
+  forward cursor over best-first order, plus a hole index keyed by position)
+  and §12 (shared cursor state). #68's
   equivalence test (an injected mid-sweep reclaim yields identical
   coverage) is retained there.
 
@@ -281,10 +282,13 @@ def claim_next_bundle(cursor, candidates_best_first, B, last_swept_B,
     if B < last_swept_B:
         mark every incomplete eliminated candidate done in one batch
         last_swept_B = B
-    if cursor past end:
-        return holes_pass()        # §6: reclaimed/republished slots
-    walk forward, skipping eliminated positions covered by the sweep
-    return the next small_count survivors and the advanced cursor
+    bundle = take the lowest-positioned recorded holes that survive B
+    if bundle still short and cursor not past end:
+        walk forward, skipping eliminated positions covered by the sweep,
+        until the bundle holds small_count survivors
+    elif bundle empty and cursor past end:
+        return holes_pass()        # §6: coverage backstop
+    return the bundle and the advanced cursor
 ```
 
 Behaviour:
@@ -319,9 +323,21 @@ completion and telemetry writes.
 best-first order, so the common (no-hole) path is O(1) amortized per candidate
 and a branch drains in O(n_candidates) total forward claim work — never #68's
 O(n²) per-call gap scan. Each strictly tighter bound adds one O(n_candidates)
-proof sweep; repeated claims at the same bound do not. Reclaimed or republished
-positions are picked up by `holes_pass()` once the forward cursor is exhausted,
-preserving #68's lazy end-of-sweep semantics.
+proof sweep; repeated claims at the same bound do not.
+
+**Holes keep their rank (issue #258).** A reclaimed or republished position is
+recorded in `candidate_holes` with the best-first position its claim row
+carried, and every hole lies below the forward cursor by construction. The
+branch's earliest outstanding candidate is therefore the lowest-positioned
+hole whenever one exists, and a virgin position at the cursor otherwise — so
+the packer drains holes first and tops the bundle up from the cursor, without
+ever rewinding it. That keeps a strong candidate stranded by a bundle overrun
+at the rank it earned instead of deferring it behind thousands of weaker
+untouched ones. The cost is an indexed `LIMIT`-shaped read of a table holding
+one row per outstanding hole, not #68's per-call gap scan, so the O(1)-amortized
+common path survives. `holes_pass()` remains as the coverage backstop, reached
+only once the forward sweep is exhausted and no recorded hole survives: a
+position missing from the index can cost priority, never the candidate.
 
 ---
 
@@ -375,9 +391,10 @@ cap and still has unfinished candidates `R`. The worker:
    folded into shared best).
 2. Returns `R` to the unclaimed pool (delete the `done=0` rows for `R`).
 3. Does **not** create `|R|` claims. The positions in `R` re-enter as
-   holes, picked up by the next `claim_next_bundle` / `holes_pass` (§5,
-   §6) and re-packed — against a `B` that is at least as tight as when
-   they were first packed, and usually tighter (the bundle head just
+   holes recorded at their own best-first rank, picked up by the next
+   `claim_next_bundle` (§5) ahead of any position the forward cursor has
+   not reached, and re-packed — against a `B` that is at least as tight as
+   when they were first packed, and usually tighter (the bundle head just
    solved). The common case: yesterday's "not yet eliminated" remainder
    receives an ERD prune. No estimate is scaled, because there is no estimate.
 
@@ -533,9 +550,11 @@ Remaining (PR2):
   `bulk_done_bound` are
   advanced under the same `BEGIN IMMEDIATE` that inserts claim or done rows,
   while the current `B` is read from that branch row in the transaction.
-  Holes from reclaim/republish are handled by `holes_pass` once the forward
-  cursor is exhausted, never by rewinding on every call — preserving #68's
-  lazy end-of-sweep semantics and the O(1)-amortized common path.
+  Holes from reclaim/republish are shared the same way, as `candidate_holes`
+  rows written by the same transaction that frees the claim — never by
+  rewinding the cursor and never by rescanning the claim rows, which is what
+  keeps #68's O(1)-amortized common path while reissuing an early hole first
+  (§5).
 - **Sweep cost inside the lock.** A full classification sweep runs only when
   `B` strictly tightens, recorded by the legacy-named
   `active_branches.bulk_done_bound` in the

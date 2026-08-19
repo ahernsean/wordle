@@ -1693,6 +1693,12 @@ class _BranchWorker:
         try:
             (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
              censored_units) = self.queue.finalize_bundle_stats(branch_key)
+            # Read while the branch's claim rows still exist: delete_branch
+            # below drops the per-candidate record this evidence comes from.
+            winner_idx = (None if best_guess is None or self._word_idx is None
+                          else self._word_idx.get(best_guess))
+            schedule_diagnostics = self.queue.candidate_schedule_diagnostics(
+                branch_key, winner_idx)
             self.queue.add_branch_finalize_log(
                 branch_key, spine, len(words), budget, created_at,
                 finalized_at, nodes_spent, n_claims, n_bundles=n_bundles,
@@ -1706,6 +1712,7 @@ class _BranchWorker:
                     two_level_erd_pruned_candidates,
                 best_guess=best_guess, best_erd=best_erd,
                 cache_write_millis=cache_write_millis,
+                schedule_diagnostics=schedule_diagnostics,
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
         except Exception:

@@ -371,11 +371,11 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- claim_next_bundle's forward cursor: count of best-first positions that
     -- have been covered or packed into a bundle at least once.  Positions
     -- [0, pack_cursor) may hold holes (reclaimed/republished, no current
-    -- candidate_claims row) picked up by holes_pass once the cursor reaches
-    -- n_candidates; positions [pack_cursor, n_candidates) are virgin and
-    -- packed by the O(1)-amortized forward path.  Lives here (not
-    -- worker-local memory) so concurrent claim_next_bundle calls never pack
-    -- overlapping bundles.
+    -- candidate_claims row); those are tracked by position in candidate_holes
+    -- and reissued ahead of any virgin position.  Positions
+    -- [pack_cursor, n_candidates) are virgin and packed by the
+    -- O(1)-amortized forward path.  Lives here (not worker-local memory) so
+    -- concurrent claim_next_bundle calls never pack overlapping bundles.
     pack_cursor    INTEGER NOT NULL DEFAULT 0
 );
 
@@ -422,7 +422,9 @@ CREATE TABLE IF NOT EXISTS cut_results (
 -- done=0 row that stale-reclaim deletes, turning it back into an unclaimed
 -- gap to be redone — never skipped.  Republish-on-overrun deletes the
 -- done=0 rows of a bundle's unfinished remainder the same way, so a
--- reclaimed hole and a republished hole are indistinguishable to the packer.
+-- reclaimed hole and a republished hole are indistinguishable to the packer,
+-- and both are recorded in candidate_holes so the packer can reissue them in
+-- best-first order.
 -- idx = index into the policy-canonical candidate list (all_words for ERD_ALL).
 -- bundle_id groups the rows one claim_next_bundle call hands out together
 -- (a worker evaluates its bundle in one best-first sweep); NULL for a row
@@ -436,12 +438,40 @@ CREATE TABLE IF NOT EXISTS candidate_claims (
     done       INTEGER NOT NULL DEFAULT 0,
     done_at    INTEGER,
     bundle_id  TEXT,
+    -- Where the candidate sits in the branch's best-first candidate order,
+    -- stamped by the packer when it hands the row out.  NULL on a row the
+    -- packer did not create (an ERD-prune completion, mark_claims_done) and on
+    -- rows that predate the column.  Carried into candidate_holes when the row
+    -- is freed, so the packer can reissue the earliest outstanding position
+    -- without knowing the order itself (the order lives in the worker).
+    best_first_position INTEGER,
     PRIMARY KEY (branch_id, idx)
 );
 -- idx_candidate_claims_bundle is created in _migrate(), after the bundle_id
 -- column is guaranteed to exist on an upgraded database: this CREATE TABLE
 -- is a no-op against a pre-existing (pre-bundle_id) table, so an index on
 -- bundle_id here would fail on any database that predates this column.
+
+-- Outstanding holes: best-first positions a reclaim or a republish freed,
+-- which therefore have no candidate_claims row and are waiting to be reissued.
+-- Every hole sits at a position below active_branches.pack_cursor, so the
+-- earliest outstanding candidate of a branch is the lowest-positioned row
+-- whenever this table is non-empty, and a virgin position at the cursor
+-- otherwise.  That is what lets claim_next_bundle reissue a high-ranked
+-- republished candidate ahead of untouched later ones without rescanning the
+-- branch's claim rows.  A row whose idx has since acquired a claim row (an
+-- ERD-prune sweep, the mid-loop publisher) is stale and is dropped the next
+-- time the packer looks at it; the end-of-sweep holes pass over
+-- candidate_claims remains the authority on coverage, so a missing row here
+-- can only cost priority, never a candidate.
+CREATE TABLE IF NOT EXISTS candidate_holes (
+    branch_id INTEGER NOT NULL,
+    idx       INTEGER NOT NULL,
+    best_first_position INTEGER,
+    PRIMARY KEY (branch_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_holes_best_first_position
+    ON candidate_holes(branch_id, best_first_position);
 
 -- Per-candidate republish count: how many times a candidate's cross-candidate
 -- bundle has overrun before this candidate finished (see
@@ -636,6 +666,18 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     -- the publish work only, since the row carrying it is written immediately
     -- after (a row cannot time its own insert or the queue cleanup past it).
     cache_write_millis      INTEGER,
+    -- Best-first scheduling evidence, captured from the branch's own claim
+    -- rows the moment before delete_branch drops them.  A winner whose rank
+    -- is far below the weakest rank completed ahead of it is a priority
+    -- inversion: the branch spent itself on later candidates while a strong
+    -- one sat republished.  NULL on a branch that never claimed through the
+    -- packer, and on rows written before these columns existed.
+    winner_best_first_position INTEGER,
+    winner_republish_count  INTEGER,
+    candidates_completed_before_winner INTEGER,
+    max_best_first_position_before_winner INTEGER,
+    republished_candidates  INTEGER,
+    max_candidate_republish_count INTEGER,
     recorded_at             INTEGER NOT NULL
 );
 
@@ -721,6 +763,15 @@ def derive_telemetry_path(db_path: str) -> str:
         return ":memory:"
     root, ext = os.path.splitext(db_path)
     return f"{root}_telemetry{ext}"
+
+
+def best_first_rank(best_first_position):
+    """1-based rank for a 0-based best-first position; None stays None.
+
+    Positions are stored 0-based, matching the index into a branch's
+    candidate order; every display of one is a rank counting from 1.
+    """
+    return None if best_first_position is None else best_first_position + 1
 
 
 def check_source_priority_range(priority: int) -> None:
@@ -1037,6 +1088,18 @@ class ERDQueue:
             "cache_write_millis": "INTEGER",
         }, schema="telemetry")
 
+        # Best-first scheduling evidence per finalized branch (issue #258):
+        # additive/nullable, so a row written before these columns simply has
+        # no scheduling evidence to show.
+        self._add_columns("branch_finalize_log", {
+            "winner_best_first_position": "INTEGER",
+            "winner_republish_count": "INTEGER",
+            "candidates_completed_before_winner": "INTEGER",
+            "max_best_first_position_before_winner": "INTEGER",
+            "republished_candidates": "INTEGER",
+            "max_candidate_republish_count": "INTEGER",
+        }, schema="telemetry")
+
         report_indexes = (
             ("branch_finalize_log", {"branch_key", "recorded_at"},
              "idx_branch_finalize_log_branch_recorded_at",
@@ -1330,6 +1393,16 @@ class ERDQueue:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
             "ON candidate_claims(branch_id, bundle_id)")
+
+        # candidate_claims.best_first_position: where the claimed candidate
+        # sits in the branch's best-first order,
+        # which candidate_holes inherits when the row is freed.  After the
+        # branch_key rebuild above, whose CREATE TABLE lists its columns
+        # explicitly.  Legacy rows keep NULL: their position was never
+        # recorded, so a hole made from one is packed after every hole whose
+        # position is known.
+        self._add_columns("candidate_claims",
+                          {"best_first_position": "INTEGER"})
 
         # cut_results.tainted: after the branch_key rebuild above so the column
         # lands whether the table is fresh, upgraded, or already migrated.
@@ -2221,6 +2294,118 @@ class ERDQueue:
         self._last_claim_commit_millis = int(
             (time.perf_counter() - _commit_t0) * 1e3)
 
+    def _count_one_level_erd_prunes(self, branch_id, n):
+        """Fold n one-level ERD prunes into a branch's completion counters.
+
+        bulk_done_candidates is the legacy combined count and stays the sum of
+        both prune provenances.  A branch that has no achieved best yet but
+        does have a ceiling is pruning against that ceiling, which makes the
+        outcome a CUT rather than a proven loss.
+        """
+        self._conn.execute("""
+            UPDATE active_branches
+            SET bulk_done_candidates = bulk_done_candidates + ?,
+                one_level_erd_pruned_candidates =
+                    one_level_erd_pruned_candidates + ?,
+                cut_occurred = CASE
+                    WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
+                    ELSE cut_occurred END
+            WHERE branch_id = ?
+        """, (n, n, branch_id))
+
+    def _record_holes(self, branch_id_column, where, parameters, label):
+        """Record every candidate_claims row matching `where` as a hole.
+
+        Runs immediately before the DELETE that frees those rows, inside the
+        caller's transaction, so the position each row carries survives into
+        candidate_holes and the packer can reissue it in best-first order.
+        `where` is the DELETE's own predicate, reused verbatim so the two
+        statements cannot drift.  branch_id_column names the source of the
+        hole's branch (a literal parameter for a single-branch caller, the
+        row's own column for a cross-branch sweep).
+
+        REPLACE, not IGNORE: a position freed twice keeps the position from
+        the claim row that was just freed, which is the one the packer will
+        reissue.
+        """
+        self._conn.execute(
+            f"INSERT OR REPLACE INTO candidate_holes "
+            f"(branch_id, idx, best_first_position) "
+            f"SELECT {branch_id_column}, idx, best_first_position "
+            f"FROM candidate_claims "
+            f"WHERE {where}", parameters)
+        n = self._conn.execute("SELECT changes()").fetchone()[0]
+        self._tally_wal_traffic(label, n, n * _CLAIM_ROW_WAL_BYTES)
+        return n
+
+    def _pack_recorded_holes(self, branch_id, bound, cost_lower_bound,
+                             survivor_limit):
+        """Take a branch's earliest outstanding holes for one bundle.
+
+        Runs inside claim_next_bundle's write transaction and returns the
+        packed [(idx, best_first_position), ...] in best-first order, at most
+        survivor_limit of them.  Holes past that limit keep their
+        candidate_holes rows and are packed by the next claim, still ahead of
+        any virgin position.
+
+        A hole whose idx has since acquired a claim row is stale — a one-level
+        ERD-prune sweep (including this transaction's own) or the mid-loop
+        publisher landed on it — and is dropped without being packed.  A hole
+        the branch's current bound prunes is completed here as a one-level ERD
+        prune, exactly as the end-of-sweep coverage backstop does.  Every hole
+        this call resolves loses its row; the rest are left for the next claim.
+
+        A hole recorded from a claim row that predates the best_first_position
+        column sorts after every positioned hole, since its rank is not
+        recoverable.
+        """
+        hole_rows = self._conn.execute(
+            "SELECT idx, best_first_position FROM candidate_holes "
+            "WHERE branch_id = ? "
+            "ORDER BY best_first_position IS NULL, best_first_position",
+            (branch_id,)).fetchall()
+        if not hole_rows:
+            return []
+        hole_indices = [row["idx"] for row in hole_rows]
+        placeholders = ",".join("?" * len(hole_indices))
+        claimed = {r["idx"] for r in self._conn.execute(
+            f"SELECT idx FROM candidate_claims "
+            f"WHERE branch_id = ? AND idx IN ({placeholders})",
+            (branch_id, *hole_indices))}
+        eliminated = []
+        packed = []
+        for row in hole_rows:
+            idx = row["idx"]
+            if idx in claimed:
+                continue
+            if cost_lower_bound[idx] >= bound:
+                eliminated.append(idx)
+            elif len(packed) < survivor_limit:
+                packed.append((idx, row["best_first_position"]))
+        if eliminated:
+            now = int(time.time())
+            self._conn.executemany("""
+                INSERT INTO candidate_claims
+                    (branch_id, idx, claimed_by, claimed_at, done, done_at,
+                     bundle_id)
+                VALUES (?, ?, 'one-level-erd-prune', ?, 1, ?, NULL)
+            """, [(branch_id, idx, now, now) for idx in eliminated])
+            self._tally_wal_traffic(
+                'candidate_claims/one-level-erd-prune-hole', len(eliminated),
+                len(eliminated) * _CLAIM_ROW_WAL_BYTES)
+            self._count_one_level_erd_prunes(branch_id, len(eliminated))
+        resolved = ([idx for idx in hole_indices if idx in claimed]
+                    + eliminated
+                    + [idx for idx, _position in packed])
+        resolved_placeholders = ",".join("?" * len(resolved))
+        self._conn.execute(
+            f"DELETE FROM candidate_holes WHERE branch_id = ? "
+            f"AND idx IN ({resolved_placeholders})", (branch_id, *resolved))
+        self._tally_wal_traffic(
+            'candidate_holes/pack', len(resolved),
+            len(resolved) * _CLAIM_ROW_WAL_BYTES)
+        return packed
+
     def claim_next_bundle(self, branch_key, worker_id, n_candidates,
                           candidate_order, cost_lower_bound,
                           small_count=DEFAULT_SMALL_COUNT,
@@ -2243,11 +2428,19 @@ class ERDQueue:
         _BranchWorker._packing_stats — so this module never imports numpy or
         the engine directly.
 
-        The forward cursor (active_branches.pack_cursor) tracks how much of
-        candidate_order has been packed at least once; once it reaches
-        n_candidates every further call falls back to a holes pass (idx with
-        no current candidate_claims row — reclaimed or republished slots),
-        packed the same way over the filtered best-first order.
+        Each call packs the branch's earliest outstanding candidates by
+        candidate_order, on whichever side of the forward cursor
+        (active_branches.pack_cursor) they lie.  A hole — an idx with no
+        current candidate_claims row, freed by a reclaim or a republish —
+        carries the best-first position it was claimed at in candidate_holes,
+        and every hole lies below the cursor, so holes are drained in
+        best-first order first and the forward cursor only tops the bundle up.
+        A republished high-ranked candidate is therefore reissued ahead of
+        untouched lower-ranked ones rather than waiting for the forward sweep
+        to finish.  Once the cursor reaches n_candidates and no recorded hole
+        survives, one full pass over the branch's claim rows backstops
+        coverage, so a position missing from candidate_holes can cost
+        priority but never the candidate.
 
         Provably eliminated slots are completed authoritatively in this
         transaction and never returned to a worker.  INSERT OR REPLACE
@@ -2376,17 +2569,8 @@ class ERDQueue:
                     'candidate_claims/one-level-erd-prune',
                     len(eliminated_indices),
                     len(eliminated_indices) * _CLAIM_ROW_WAL_BYTES)
-                self._conn.execute("""
-                    UPDATE active_branches
-                    SET bulk_done_candidates = bulk_done_candidates + ?,
-                        one_level_erd_pruned_candidates =
-                            one_level_erd_pruned_candidates + ?,
-                        cut_occurred = CASE
-                            WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
-                            ELSE cut_occurred END
-                    WHERE branch_id = ?
-                """, (len(eliminated_indices), len(eliminated_indices),
-                      branch_id))
+                self._count_one_level_erd_prunes(
+                    branch_id, len(eliminated_indices))
                 for idx in eliminated_indices:
                     claim_rows[idx] = {"idx": idx, "done": 1}
             if bound_tightened:
@@ -2395,64 +2579,62 @@ class ERDQueue:
                     "WHERE branch_id = ?", (bound, branch_id))
 
             cursor = br["pack_cursor"]
-            if cursor < n_candidates:
-                bundle = []
+            survivor_limit = min(small_count, count_cap)
+            # Outstanding holes all sit below the forward cursor, so the
+            # branch's earliest outstanding candidate is the lowest-positioned
+            # hole whenever any exists.  Draining them first is what keeps a
+            # republished high-ranked candidate ahead of untouched later ones.
+            packed = self._pack_recorded_holes(
+                branch_id, bound, cost_lower_bound, survivor_limit)
+            if len(packed) < survivor_limit and cursor < n_candidates:
                 new_cursor = cursor
-                survivor_limit = min(small_count, count_cap)
-                while new_cursor < n_candidates and len(bundle) < survivor_limit:
+                while new_cursor < n_candidates and len(packed) < survivor_limit:
                     idx = candidate_order[new_cursor]
                     new_cursor += 1
                     if cost_lower_bound[idx] < bound:
-                        bundle.append(idx)
+                        packed.append((idx, new_cursor - 1))
                 self._conn.execute(
                     "UPDATE active_branches SET pack_cursor = ? "
                     "WHERE branch_id = ?", (new_cursor, branch_id))
-            else:
+            elif not packed and cursor >= n_candidates:
+                # Coverage backstop: candidate_holes is an ordering index, and
+                # a position missing from it (a row written by code that
+                # predates the table, or one dropped as stale while its claim
+                # was superseded and later freed) would otherwise never be
+                # reissued.  Whatever this finds is put back into the index and
+                # packed through the same path as any other hole.  Reached only
+                # once the forward sweep is exhausted AND no recorded hole
+                # survived, so the full re-read costs nothing on a branch that
+                # still has work the index knows about.
                 if claim_rows is None:
                     claim_rows = {row["idx"]: row for row in self._conn.execute(
                         "SELECT idx, done FROM candidate_claims "
                         "WHERE branch_id = ?", (branch_id,))}
-                    # A full per-branch claims re-read runs on every claim once
-                    # the branch is packed: pure read volume, but it holds a WAL
-                    # snapshot for its duration, which is what a checkpoint waits
-                    # on.  Tallied so the report shows read pressure, not just
-                    # write pressure.
+                    # A full per-branch claims re-read holds a WAL snapshot for
+                    # its duration, which is what a checkpoint waits on.
+                    # Tallied so the report shows read pressure, not just write
+                    # pressure.
                     self._tally_wal_traffic(
                         'candidate_claims/holes-scan(read)', len(claim_rows),
                         len(claim_rows) * _CLAIM_ROW_WAL_BYTES)
-                holes = [idx for idx in candidate_order if idx not in claim_rows]
-                eliminated_holes = [
-                    idx for idx in holes if cost_lower_bound[idx] >= bound]
-                if eliminated_holes:
-                    now = int(time.time())
-                    self._conn.executemany("""
-                        INSERT INTO candidate_claims
-                            (branch_id, idx, claimed_by, claimed_at, done,
-                             done_at, bundle_id)
-                            VALUES (?, ?, 'one-level-erd-prune', ?, 1, ?, NULL)
-                    """, [(branch_id, idx, now, now)
-                          for idx in eliminated_holes])
+                unindexed = [(idx, position)
+                             for position, idx in enumerate(candidate_order)
+                             if idx not in claim_rows]
+                if unindexed:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO candidate_holes "
+                        "(branch_id, idx, best_first_position) VALUES (?, ?, ?)",
+                        [(branch_id, idx, position)
+                         for idx, position in unindexed])
                     self._tally_wal_traffic(
-                        'candidate_claims/one-level-erd-prune-hole',
-                        len(eliminated_holes),
-                        len(eliminated_holes) * _CLAIM_ROW_WAL_BYTES)
-                    self._conn.execute("""
-                        UPDATE active_branches
-                        SET bulk_done_candidates = bulk_done_candidates + ?,
-                            one_level_erd_pruned_candidates =
-                                one_level_erd_pruned_candidates + ?,
-                            cut_occurred = CASE
-                                WHEN best_erd IS NULL AND ceiling IS NOT NULL THEN 1
-                                ELSE cut_occurred END
-                        WHERE branch_id = ?
-                    """, (len(eliminated_holes), len(eliminated_holes),
-                          branch_id))
-                survivor_limit = min(small_count, count_cap)
-                bundle = [idx for idx in holes
-                          if cost_lower_bound[idx] < bound][:survivor_limit]
-            if not bundle:
+                        'candidate_holes/backstop', len(unindexed),
+                        len(unindexed) * _CLAIM_ROW_WAL_BYTES)
+                    packed = self._pack_recorded_holes(
+                        branch_id, bound, cost_lower_bound, survivor_limit)
+            if not packed:
                 self._commit_claim_transaction(_txn_t0)
                 return None
+            bundle = [idx for idx, _position in packed]
             bundle_id = f"{worker_id}:{self._pid}:{self._bundle_seq}"
             self._bundle_seq += 1
             now = int(time.time())
@@ -2470,9 +2652,11 @@ class ERDQueue:
             # makes this an indexed lookup, not a rescan).
             self._conn.executemany("""
                 INSERT OR IGNORE INTO candidate_claims
-                    (branch_id, idx, claimed_by, claimed_at, done, bundle_id)
-                VALUES (?, ?, ?, ?, 0, ?)
-            """, [(branch_id, idx, worker_id, now, bundle_id) for idx in bundle])
+                    (branch_id, idx, claimed_by, claimed_at, done, bundle_id,
+                     best_first_position)
+                VALUES (?, ?, ?, ?, 0, ?, ?)
+            """, [(branch_id, idx, worker_id, now, bundle_id, position)
+                  for idx, position in packed])
             self._tally_wal_traffic(
                 'candidate_claims/claim', len(bundle),
                 len(bundle) * _CLAIM_ROW_WAL_BYTES)
@@ -2507,7 +2691,10 @@ class ERDQueue:
         rows for `indices` so they re-enter as holes, re-packed by the next
         claim_next_bundle against a B that is at least as tight as when they
         were first packed — never re-inserted as `len(indices)` individual
-        claims.  Also bumps each candidate's persistent republish count
+        claims.  Each freed position is recorded in candidate_holes, so the
+        next claim reissues the strongest of them before any candidate the
+        forward cursor has not reached: a remainder keeps the rank it had
+        when its bundle overran.  Also bumps each candidate's persistent republish count
         (candidate_republish), which survives this delete/re-insert cycle so
         a chronically-stranded candidate is distinguishable from one
         republished for the first time.
@@ -2543,9 +2730,14 @@ class ERDQueue:
                 self._conn.execute("COMMIT")
                 return {}
             deleted_placeholders = ",".join("?" * len(deleted))
+            republished_where = (
+                f"branch_id = ? AND bundle_id = ? "
+                f"AND idx IN ({deleted_placeholders})")
+            self._record_holes("branch_id", republished_where,
+                               (branch_id, bundle_id, *deleted),
+                               'candidate_holes/republish')
             self._conn.execute(
-                f"DELETE FROM candidate_claims WHERE branch_id = ? "
-                f"AND bundle_id = ? AND idx IN ({deleted_placeholders})",
+                f"DELETE FROM candidate_claims WHERE {republished_where}",
                 (branch_id, bundle_id, *deleted))
             self._conn.executemany("""
                 INSERT INTO candidate_republish (branch_id, idx, count)
@@ -3039,6 +3231,9 @@ class ERDQueue:
                     "DELETE FROM candidate_republish WHERE branch_id = ?",
                     (branch_id,))
                 n_republish = self._conn.execute("SELECT changes()").fetchone()[0]
+                self._conn.execute(
+                    "DELETE FROM candidate_holes WHERE branch_id = ?",
+                    (branch_id,))
             self._conn.execute(
                 "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
                 (branch_key,))
@@ -3084,15 +3279,19 @@ class ERDQueue:
         age_floor = now - (min_claim_age_seconds
                            if min_claim_age_seconds is not None
                            else heartbeat_timeout_seconds)
-        self._conn.execute("""
-            DELETE FROM candidate_claims
-            WHERE done = 0
+        stale_where = """
+            done = 0
               AND claimed_at < ?
               AND claimed_by NOT IN (
                   SELECT worker_id FROM worker_heartbeat
                   WHERE updated_at >= ?
               )
-        """, (age_floor, hb_cutoff))
+        """
+        self._record_holes("branch_id", stale_where, (age_floor, hb_cutoff),
+                           'candidate_holes/reclaim-stale')
+        self._conn.execute(
+            f"DELETE FROM candidate_claims WHERE {stale_where}",
+            (age_floor, hb_cutoff))
         n = self._conn.execute("SELECT changes()").fetchone()[0]
         self._tally_wal_traffic(
             'candidate_claims/reclaim-stale', n, n * _CLAIM_ROW_WAL_BYTES)
@@ -3106,6 +3305,8 @@ class ERDQueue:
         the same name starts heartbeating (which would otherwise make the dead
         instance's claims look live again).  done=1 rows are never touched.
         """
+        self._record_holes("branch_id", "done = 0 AND claimed_by = ?",
+                           (worker_id,), 'candidate_holes/reclaim-worker')
         self._conn.execute(
             "DELETE FROM candidate_claims WHERE done = 0 AND claimed_by = ?",
             (worker_id,))
@@ -3206,6 +3407,8 @@ class ERDQueue:
         # against a ceiling nobody asked for — a consumer only reuses a row
         # whose recorded budget and bound satisfy its own budget and ceiling
         # (see read_cut_result); it never blocks a solve, only saves one.
+        self._record_holes("branch_id", "done = 0", (),
+                           'candidate_holes/recover-restart')
         cur = self._conn.execute(
             "DELETE FROM candidate_claims WHERE done = 0")
         return n_branches_resumed, cur.rowcount
@@ -3877,6 +4080,18 @@ class ERDQueue:
                     row["one_level_erd_pruned_candidates"],
                 "two_level_erd_pruned_candidate_count":
                     row["two_level_erd_pruned_candidates"],
+                # Ranks are 1-based for display; the stored columns are
+                # 0-based positions in the branch's best-first order.
+                "winner_best_first_rank": best_first_rank(
+                    row["winner_best_first_position"]),
+                "winner_republish_count": row["winner_republish_count"],
+                "candidates_completed_before_winner":
+                    row["candidates_completed_before_winner"],
+                "weakest_best_first_rank_before_winner": best_first_rank(
+                    row["max_best_first_position_before_winner"]),
+                "republished_candidate_count": row["republished_candidates"],
+                "max_candidate_republish_count":
+                    row["max_candidate_republish_count"],
                 "recorded_at": row["recorded_at"],
             })
         cut_rows = self._conn.execute("""
@@ -4370,6 +4585,7 @@ class ERDQueue:
         self._conn.execute("BEGIN")
         try:
             self._conn.execute("DELETE FROM candidate_claims")
+            self._conn.execute("DELETE FROM candidate_holes")
             self._conn.execute("DELETE FROM active_branches")
             self._conn.execute("DELETE FROM pending_branches")
             self._resolve_branch_memberships(withdraw=True)
@@ -4498,6 +4714,9 @@ class ERDQueue:
                     (branch_id,))
                 self._conn.execute(
                     "DELETE FROM candidate_republish WHERE branch_id = ?",
+                    (branch_id,))
+                self._conn.execute(
+                    "DELETE FROM candidate_holes WHERE branch_id = ?",
                     (branch_id,))
             self._conn.execute(
                 "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
@@ -5121,6 +5340,73 @@ class ERDQueue:
         self._last_claim_transaction_millis = 0
         self._last_claim_commit_millis = 0
 
+    SCHEDULE_DIAGNOSTIC_FIELDS = (
+        "winner_best_first_position",
+        "winner_republish_count",
+        "candidates_completed_before_winner",
+        "max_best_first_position_before_winner",
+        "republished_candidates",
+        "max_candidate_republish_count",
+    )
+
+    def candidate_schedule_diagnostics(self, branch_key, winner_idx=None):
+        """Best-first scheduling evidence for one branch's own claim rows.
+
+        Read the moment before delete_branch drops those rows, so
+        "was the winning candidate reached in rank order, or deferred behind
+        weaker ones" stays answerable from branch_finalize_log alone instead of
+        being reconstructed from aggregate bundle telemetry.
+
+        winner_best_first_position is the winner's rank in the branch's
+        best-first candidate order; candidates_completed_before_winner and
+        max_best_first_position_before_winner count and rank the
+        worker-evaluated candidates that finished ahead of it.  A weakest rank
+        far past the winner's own is a priority inversion: the branch spent
+        itself on later candidates while a strong one waited.
+        republished_candidates and max_candidate_republish_count say how much
+        of that came from bundle overruns.
+
+        A field is None where the branch cannot answer it: no claim rows left
+        (solved from reused cache entries), no winner (a cut or a loss), or a
+        winner whose rank was never recorded because it did not come through
+        the packer.  Ranks come from
+        candidate_claims.best_first_position, which only the packer stamps, so
+        an ERD-pruned candidate is never counted as completed work.
+        """
+        diagnostics = {field: None for field in self.SCHEDULE_DIAGNOSTIC_FIELDS}
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return diagnostics
+        republish = self._conn.execute(
+            "SELECT COUNT(*) AS n, MAX(count) AS worst FROM candidate_republish "
+            "WHERE branch_id = ?", (branch_id,)).fetchone()
+        diagnostics["republished_candidates"] = republish["n"]
+        diagnostics["max_candidate_republish_count"] = republish["worst"]
+        if winner_idx is None:
+            return diagnostics
+        winner_republish = self._conn.execute(
+            "SELECT count FROM candidate_republish WHERE branch_id = ? AND idx = ?",
+            (branch_id, winner_idx)).fetchone()
+        diagnostics["winner_republish_count"] = (
+            0 if winner_republish is None else winner_republish["count"])
+        winner = self._conn.execute(
+            "SELECT best_first_position, done, done_at FROM candidate_claims "
+            "WHERE branch_id = ? AND idx = ?", (branch_id, winner_idx)).fetchone()
+        if winner is None:
+            return diagnostics
+        diagnostics["winner_best_first_position"] = winner["best_first_position"]
+        if not winner["done"] or winner["done_at"] is None:
+            return diagnostics
+        ahead = self._conn.execute("""
+            SELECT COUNT(*) AS n, MAX(best_first_position) AS worst
+            FROM candidate_claims
+            WHERE branch_id = ? AND done = 1 AND done_at < ?
+              AND best_first_position IS NOT NULL
+        """, (branch_id, winner["done_at"])).fetchone()
+        diagnostics["candidates_completed_before_winner"] = ahead["n"]
+        diagnostics["max_best_first_position_before_winner"] = ahead["worst"]
+        return diagnostics
+
     def add_branch_finalize_log(self, branch_key, spine, n_words, budget,
                                 created_at, finalized_at, nodes_spent, n_claims,
                                 n_bundles=None, max_bundle_nodes=None,
@@ -5129,7 +5415,8 @@ class ERDQueue:
                                 bulk_done_candidates=None, best_guess=None,
                                 best_erd=None, cache_write_millis=None,
                                 one_level_erd_pruned_candidates=None,
-                                two_level_erd_pruned_candidates=None):
+                                two_level_erd_pruned_candidates=None,
+                                schedule_diagnostics=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -5149,7 +5436,12 @@ class ERDQueue:
         publishing the result (score-cache/loss/cut writes and the cost-model
         fold) — the finalize phase of the coordination breakdown, kept here
         rather than on claim_telemetry because it belongs to the branch.
+        schedule_diagnostics is candidate_schedule_diagnostics' mapping, which
+        carries the branch's best-first scheduling evidence past the claim
+        rows that are about to be deleted; None leaves every one of its
+        columns NULL.
         """
+        schedule_diagnostics = schedule_diagnostics or {}
         if (one_level_erd_pruned_candidates is None
                 and two_level_erd_pruned_candidates is None
                 and bulk_done_candidates is not None):
@@ -5163,14 +5455,28 @@ class ERDQueue:
                  max_bundle_nodes, total_bundle_wall_millis, censored_units,
                  ceiling, outcome, bulk_done_candidates, best_guess, best_erd,
                  cache_write_millis, one_level_erd_pruned_candidates,
-                 two_level_erd_pruned_candidates, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 two_level_erd_pruned_candidates,
+                 winner_best_first_position, winner_republish_count,
+                 candidates_completed_before_winner,
+                 max_best_first_position_before_winner,
+                 republished_candidates, max_candidate_republish_count,
+                 recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
               bulk_done_candidates, best_guess, best_erd, cache_write_millis,
               one_level_erd_pruned_candidates,
-              two_level_erd_pruned_candidates, now))
+              two_level_erd_pruned_candidates,
+              schedule_diagnostics.get("winner_best_first_position"),
+              schedule_diagnostics.get("winner_republish_count"),
+              schedule_diagnostics.get("candidates_completed_before_winner"),
+              schedule_diagnostics.get(
+                  "max_best_first_position_before_winner"),
+              schedule_diagnostics.get("republished_candidates"),
+              schedule_diagnostics.get("max_candidate_republish_count"),
+              now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):
