@@ -83,6 +83,8 @@ from cache_sqlite import ScoreCache
 from report_model import (
     BRANCH_PHASES,
     BRANCH_STATUSES,
+    SOURCE_SORT_FIELDS,
+    SOURCE_STATES,
     ReportFilters,
     ReportRequest,
     WORKER_LIVENESS_SECONDS,
@@ -138,6 +140,10 @@ def _branch_status_filter(value):
 
 def _branch_phase_filter(value):
     return _comma_separated_filter(value, "branch phase", BRANCH_PHASES)
+
+
+def _source_state_filter(value):
+    return _comma_separated_filter(value, "source state", SOURCE_STATES)
 
 
 def cmd_view(args):
@@ -536,7 +542,7 @@ def cmd_queue_source_priority(args):
                         row['requested_at']).strftime('%Y-%m-%d %H:%M')
                     print(f'  id {candidate_id}  '
                           f'priority {row["requested_priority"]}  '
-                          f'{row["state"]}  {row["root_count"]} root(s), '
+                          f'{row["state"]}  {row["root_count"]} direct, '
                           f'{row["branch_count"]} branch(es)  '
                           f'requested {requested_at}')
                 return
@@ -1243,13 +1249,17 @@ def main():
     p_view.add_argument(
         '--branch-phase', type=_branch_phase_filter, metavar='PHASES',
         help='Comma-separated queued,evaluating,finalizing,complete, or all')
+    p_view.add_argument(
+        '--source-state', type=_source_state_filter, metavar='STATES',
+        help='Comma-separated queued,active,complete, or all (--sources only)')
     p_view.add_argument('--minimum-answer-count', type=int, metavar='N')
     p_view.add_argument('--maximum-answer-count', type=int, metavar='N')
     p_view.add_argument('--budget', type=int, metavar='N')
     p_view.add_argument('--priority', type=int, metavar='N')
     p_view.add_argument('--sort',
-                        choices=('default', 'age', 'size', 'workers',
-                                 'priority', 'nodes', 'slowest'))
+                        choices=tuple(sorted(
+                            {'default', 'age', 'size', 'workers', 'priority',
+                             'nodes', 'slowest', *SOURCE_SORT_FIELDS})))
     p_view.add_argument('--limit', type=int, metavar='N')
     p_view.add_argument(
         '--by', choices=(
@@ -1478,6 +1488,7 @@ def main():
             budget=args.budget,
             priority=args.priority,
             sort=args.sort,
+            source_states=args.source_state or (),
             limit=args.limit,
         )
         args.hotspot_field = hotspot_field if args.hotspots else None

@@ -105,6 +105,11 @@ class ScoreCache:
                               best_guess/best_score columns stay short —
                               "best" is only ever read alongside the policy
                               that decided it
+      candidate_erd_by_policy — a candidate's own ERD at a branch, folded
+                              from its response groups' branch_best_by_policy
+                              rows once every one of them is exact; distinct
+                              from candidate_scores, whose methods are cheap
+                              pre-solve heuristics rather than exact results
       answer_list         — fingerprint of the answer word set
 
     All entries are keyed by answer_list_id so a different answer list
@@ -258,6 +263,32 @@ class ScoreCache:
                 updated_at     INTEGER NOT NULL,
                 PRIMARY KEY (branch_key, policy, answer_list_id)
             )
+        """)
+        # A candidate's own ERD at a branch: the fold of every one of its
+        # response groups, once every group is itself an exact
+        # branch_best_by_policy row.  Keyed by subset_hash rather than the raw
+        # branch_key blob (see candidate_scores._subset_hash) because one
+        # branch — most often the root, the whole answer list — accumulates a
+        # row per solved candidate, and the root's own key is the largest
+        # blob in the schema.  response_group_count lets a reader detect a
+        # stale row (a changed vocabulary reshapes a candidate's groups)
+        # without a second query.
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_erd_by_policy (
+                subset_hash          TEXT    NOT NULL,
+                candidate_word       TEXT    NOT NULL,
+                policy               TEXT    NOT NULL,
+                answer_list_id       TEXT    NOT NULL,
+                erd                  REAL    NOT NULL,
+                max_remaining_depth  INTEGER NOT NULL,
+                response_group_count INTEGER NOT NULL,
+                updated_at           INTEGER NOT NULL,
+                PRIMARY KEY (subset_hash, candidate_word, policy, answer_list_id)
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_candidate_erd_by_policy
+            ON candidate_erd_by_policy(answer_list_id, policy)
         """)
         # 'subset_blob' was renamed to 'subset_key' — same encoding, cleaner
         # name. Databases migrated from lookahead_result or subgroup_pick may
@@ -830,6 +861,74 @@ class ScoreCache:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+    # ------------------------------------------------------------------
+    # Candidate ERD cache (a candidate's own solved ERD at a branch)
+    # ------------------------------------------------------------------
+
+    def read_candidate_erd(self, branch_key, candidate_word, policy):
+        """Return a candidate's stored ERD summary at a branch, or None.
+
+        Only ever written once every one of the candidate's response groups
+        is itself an exact branch_best_by_policy row (see write_candidate_erd),
+        so a hit here needs no further reusability check beyond the caller
+        confirming response_group_count still matches its own grouping.
+        """
+        subset_hash = self._subset_hash(branch_key)
+        row = self._conn.execute("""
+            SELECT erd, max_remaining_depth, response_group_count, updated_at
+            FROM candidate_erd_by_policy
+            WHERE subset_hash = ? AND candidate_word = ? AND policy = ?
+              AND answer_list_id = ?
+        """, (subset_hash, candidate_word, policy, self.answer_list_id)).fetchone()
+        return dict(row) if row is not None else None
+
+    def candidate_erd_map(self, policy):
+        """Bulk-load every stored candidate ERD for a policy, keyed by
+        (subset_hash, candidate_word).
+
+        Mirrors report_branch_row_maps: folding a whole vocabulary one
+        candidate at a time would otherwise cost one query per candidate.
+        """
+        return {
+            (row["subset_hash"], row["candidate_word"]): dict(row)
+            for row in self._conn.execute("""
+                SELECT subset_hash, candidate_word, erd, max_remaining_depth,
+                       response_group_count, updated_at
+                FROM candidate_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ?
+            """, (policy, self.answer_list_id))
+        }
+
+    def candidate_erd_from_map(self, branch_key, candidate_word, stored_map):
+        """Look up a candidate's stored ERD in a map from candidate_erd_map."""
+        return stored_map.get((self._subset_hash(branch_key), candidate_word))
+
+    def write_candidate_erd(self, branch_key, candidate_word, policy, erd,
+                             max_remaining_depth, response_group_count):
+        """Persist a candidate's own solved ERD at a branch.
+
+        Every response group behind it is already an exact, finalized
+        branch_best_by_policy row by the time a caller has an `erd` to pass
+        here, so the value is immutable going forward — write-once in the
+        same sense those rows are. Disk I/O errors are logged and swallowed
+        like write().
+        """
+        subset_hash = self._subset_hash(branch_key)
+        now = int(time.time())
+        try:
+            self._conn.execute("""
+                INSERT OR REPLACE INTO candidate_erd_by_policy
+                    (subset_hash, candidate_word, policy, answer_list_id,
+                     erd, max_remaining_depth, response_group_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (subset_hash, candidate_word, policy, self.answer_list_id,
+                  erd, max_remaining_depth, response_group_count, now))
+        except sqlite3.OperationalError as exc:
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("write_candidate_erd(%s, %s) failed: %s",
+                            policy, candidate_word, exc)
 
     def last_write_ts(self):
         """Return the unix timestamp of the most recent ERD write, or None."""

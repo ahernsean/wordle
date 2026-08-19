@@ -240,6 +240,32 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
         with self.assertRaises(ValueError):
             sc.write_scores(key, [("crane", 1.0)], "entropy_gain")
 
+    # ---- write_candidate_erd() ----
+    def test_write_candidate_erd_swallows_disk_io_error(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
+        key = ScoreCache.encode_subset(ANSWERS)
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        sc._conn = _ConnProxy(sc._conn, execute=boom)
+        with self.assertLogs("wordle", level="WARNING") as cm:
+            sc.write_candidate_erd(key, "crane", ERD_ANSWERS, 3.5, 5, 120)
+        self.assertTrue(any("failed" in m for m in cm.output))
+
+    def test_write_candidate_erd_reraises_non_disk_io_error(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
+        key = ScoreCache.encode_subset(ANSWERS)
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+
+        sc._conn = _ConnProxy(sc._conn, execute=boom)
+        with self.assertRaises(sqlite3.OperationalError):
+            sc.write_candidate_erd(key, "crane", ERD_ANSWERS, 3.5, 5, 120)
+
 
 class TestDeleteLoss(unittest.TestCase):
     """ScoreCache.delete_loss: removes the row AND the session mirror entry,
@@ -333,6 +359,82 @@ class TestCacheSQLiteCloseAndMemory(unittest.TestCase):
         self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 3)
         mc.write_loss(key, ERD_ANSWERS, 5)        # wider: replaces
         self.assertEqual(mc.read_loss(key, ERD_ANSWERS), 5)
+
+
+class TestCandidateErdByPolicy(unittest.TestCase):
+    """A candidate's own solved ERD at a branch: read_candidate_erd,
+    write_candidate_erd, candidate_erd_map, candidate_erd_from_map."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+        self.sc = ScoreCache(self.db, ANSWERS, checkpoint_on_close=False)
+        self.branch_key = ScoreCache.encode_subset(ANSWERS)
+
+    def tearDown(self):
+        self.sc.close()
+        try:
+            os.unlink(self.db)
+        except OSError:
+            pass
+
+    def test_read_miss_returns_none(self):
+        self.assertIsNone(
+            self.sc.read_candidate_erd(self.branch_key, "crane", ERD_ANSWERS)
+        )
+
+    def test_write_then_read_round_trips(self):
+        self.sc.write_candidate_erd(
+            self.branch_key, "crane", ERD_ANSWERS, 3.5, 5, 120
+        )
+        stored = self.sc.read_candidate_erd(self.branch_key, "crane", ERD_ANSWERS)
+        self.assertEqual(stored["erd"], 3.5)
+        self.assertEqual(stored["max_remaining_depth"], 5)
+        self.assertEqual(stored["response_group_count"], 120)
+        self.assertIsInstance(stored["updated_at"], int)
+
+    def test_write_overwrites_prior_value(self):
+        self.sc.write_candidate_erd(
+            self.branch_key, "crane", ERD_ANSWERS, 3.5, 5, 120
+        )
+        self.sc.write_candidate_erd(
+            self.branch_key, "crane", ERD_ANSWERS, 3.6, 6, 121
+        )
+        stored = self.sc.read_candidate_erd(self.branch_key, "crane", ERD_ANSWERS)
+        self.assertEqual(stored["erd"], 3.6)
+        self.assertEqual(stored["response_group_count"], 121)
+
+    def test_a_different_candidate_at_the_same_branch_is_a_separate_row(self):
+        self.sc.write_candidate_erd(
+            self.branch_key, "crane", ERD_ANSWERS, 3.5, 5, 120
+        )
+        self.assertIsNone(
+            self.sc.read_candidate_erd(self.branch_key, "slate", ERD_ANSWERS)
+        )
+
+    def test_candidate_erd_map_bulk_loads_and_from_map_looks_up(self):
+        self.sc.write_candidate_erd(
+            self.branch_key, "crane", ERD_ANSWERS, 3.5, 5, 120
+        )
+        self.sc.write_candidate_erd(
+            self.branch_key, "slate", ERD_ANSWERS, 3.7, 6, 118
+        )
+        stored_map = self.sc.candidate_erd_map(ERD_ANSWERS)
+        self.assertEqual(len(stored_map), 2)
+        crane = self.sc.candidate_erd_from_map(
+            self.branch_key, "crane", stored_map
+        )
+        self.assertEqual(crane["erd"], 3.5)
+        self.assertIsNone(
+            self.sc.candidate_erd_from_map(self.branch_key, "trace", stored_map)
+        )
+
+    def test_candidate_erd_map_is_scoped_to_its_policy(self):
+        self.sc.write_candidate_erd(
+            self.branch_key, "crane", ERD_ANSWERS, 3.5, 5, 120
+        )
+        self.assertEqual(self.sc.candidate_erd_map("erd_words_unfiltered"), {})
 
 
 # ===========================================================================

@@ -1414,6 +1414,13 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         queue = ERDQueue(self.queue_path)
         branch_key = encode_subset(["crane", "slate"])
         queue.add_pending_many([(branch_key, 2, 1, "slate", 0)])
+        # A second request with several branches: the report must render it as
+        # one row, not one row per branch.
+        queue.add_pending_many([
+            (encode_subset(["crane", "slate", f"w{index:04d}"]), 3, 4, "raise",
+             index)
+            for index in range(9)
+        ])
         queue.close()
 
     def _run(self, *args):
@@ -1430,17 +1437,92 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
             erd_search.main()
         return output.getvalue()
 
-    def test_text_output_lists_the_request_and_its_branch(self):
+    def test_text_output_is_one_row_per_word_not_per_branch(self):
         text = self._run()
         self.assertIn("SLATE", text)
-        self.assertIn("requested=1", text)
+        self.assertIn("RAISE", text)
+        # Two words, ten branches between them: two rows.
+        self.assertEqual(text.count("SLATE"), 1)
+        self.assertEqual(len([
+            line for line in text.splitlines()
+            if line.startswith("  ") and line.split()[0] in ("SLATE", "RAISE")
+        ]), 2)
+        self.assertIn("Source words: 2", text)
+        self.assertIn("requests: 2", text)
+        # The branch rows are not printed until a word is named, and the report
+        # says which command opens them.
+        self.assertNotIn("Ownership:", text)
+        self.assertIn("view --sources", text)
 
-    def test_json_output_round_trips_the_summary_and_rows(self):
+    def test_a_word_queued_twice_is_one_row_counting_its_branches_once(self):
+        # Source work is keyed by (word, priority), so queueing RAISE again at
+        # a new priority makes a second request that shares a branch with the
+        # first.  The report merges them without counting that branch twice.
+        queue = ERDQueue(self.queue_path)
+        queue.add_pending_many([
+            (encode_subset(["crane", "slate", "w0000"]), 3, 8, "raise", 0),
+            (encode_subset(["crane", "slate", "fresh"]), 3, 8, "raise", 1),
+        ])
+        queue.close()
+
+        report = json.loads(self._run("--format", "json"))
+
+        rollups = {row["source_word"]: row for row in report["data"]["summary"]}
+        self.assertEqual(rollups["raise"]["request_count"], 2)
+        # Nine branches from the first request plus one new one; the branch
+        # both requests own is counted once.
+        self.assertEqual(rollups["raise"]["branch_count"], 10)
+        self.assertEqual(rollups["raise"]["open_branch_count"], 10)
+        # The merged priority is the one that actually schedules.
+        self.assertEqual(rollups["raise"]["requested_priority"], 8)
+        self.assertIn("Reqs", self._run())
+
+    def test_a_named_word_with_no_live_branches_says_so(self):
+        # Naming a word whose branches have all finished must not print the
+        # "name a source word" hint naming the word already named.
+        queue = ERDQueue(self.queue_path)
+        queue.mark_done(encode_subset(["crane", "slate"]))
+        queue.close()
+
+        text = self._run("slate")
+
+        self.assertIn("SLATE owns no live branches", text)
+        self.assertNotIn("view --sources SLATE", text)
+        # The unnamed report still points the way in.
+        self.assertIn("Name a source word", self._run())
+
+    def test_source_state_filter_and_sort_reach_the_rendered_table(self):
+        # --source-state and --sort are the terminal's half of the same
+        # filtering the browser gets; grouping is browser-only.
+        sorted_by_word = self._run("--sort", "word")
+        rows = [line.split()[0] for line in sorted_by_word.splitlines()
+                if line.startswith("  ") and line.split()[0] in
+                ("SLATE", "RAISE")]
+        self.assertEqual(rows, ["RAISE", "SLATE"])
+        # Nothing is complete yet, so filtering to complete empties the table
+        # and says so against the unfiltered total rather than reading as an
+        # empty queue.
+        complete = self._run("--source-state", "complete")
+        self.assertIn("Source words: 0 of 2", complete)
+        self.assertNotIn("SLATE", complete)
+        self.assertIn("Source words: 2", self._run("--source-state", "queued"))
+
+    def test_naming_a_word_opens_that_request_s_branches(self):
+        text = self._run("raise")
+        self.assertIn("Ownership:", text)
+        self.assertEqual(text.count("@"), 9)
+        self.assertNotIn("SLATE", text)
+
+    def test_json_output_round_trips_the_rolled_up_summary(self):
         report = json.loads(self._run("--format", "json"))
         self.assertEqual(report["report_kind"], "sources")
         self.assertTrue(report["sources"]["queue"]["ok"])
-        self.assertEqual(report["data"]["summary"][0]["source_word"], "slate")
-        self.assertEqual(report["data"]["rows"][0]["requested_priority"], 1)
+        self.assertEqual(report["data"]["rows"], [])
+        rollups = {row["source_word"]: row for row in report["data"]["summary"]}
+        self.assertEqual(rollups["slate"]["requested_priority"], 1)
+        self.assertEqual(rollups["raise"]["branch_count"], 9)
+        self.assertEqual(rollups["raise"]["open_branch_count"], 9)
+        self.assertEqual(rollups["raise"]["done_branch_count"], 0)
 
     def test_jsonl_output_is_one_line(self):
         text = self._run("--format", "jsonl")
@@ -1450,6 +1532,9 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
 
     def test_word_filter_narrows_to_the_matching_request(self):
         report = json.loads(self._run("slate", "--format", "json"))
+        self.assertEqual(
+            [row["source_word"] for row in report["data"]["summary"]], ["slate"]
+        )
         self.assertEqual(
             [row["source_word"] for row in report["data"]["rows"]], ["slate"]
         )

@@ -245,7 +245,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(self.page.locator("[data-kind]").count(), 6)
+        self.assertEqual(self.page.locator("[data-kind]").count(), 7)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
@@ -1850,6 +1850,19 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.assertTrue(self.page.locator("#filters-group").is_hidden())
         self.assertTrue(self.page.locator("#sort-field").is_hidden())
+        # The source view keeps the filter group for its own state filter and
+        # drops the branch-shaped half of it; which controls it offers is
+        # pinned by test_sources_controls_offer_source_axes_not_branch_ones.
+        self.page.locator("[data-kind=sources]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'sources'"
+        )
+        self.assertFalse(self.page.locator("#filters-group").is_hidden())
+        self.assertTrue(self.page.locator("#branch-filters").is_hidden())
+        self.assertFalse(self.page.locator("#limit-field").is_hidden())
+        # The control pages this view rather than capping it, and says so.
+        self.assertEqual(self.page.locator("#limit-label").inner_text(),
+                         "Words per page")
 
     def test_word_report_sort_only_offers_options_the_server_accepts(self):
         # A word report's sort is restricted server-side to size/workers/
@@ -2730,7 +2743,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # reached phone widths overflowing because it was never measured here.
         for path in (
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
-            "?kind=leaderboard", "?kind=queue&tree=1", "?branch_target=RAISE+.....",
+            "?kind=leaderboard", "?kind=sources", "?kind=queue&tree=1",
+            "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
             # The word view carries the root-progress table, which is wider
             # than a phone and must scroll inside its own box.
@@ -2966,14 +2980,402 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("branch key hex", cache_text)
         self.assertNotIn("branch_key_hex", cache_text)
 
+    def open_sources(self):
+        self.page.locator("[data-kind=sources]").click()
+        self.page.wait_for_selector("text=sources report")
+
+    def test_sources_view_collapses_every_word_to_one_card(self):
+        # The report's unit is the source word: three queued roots owning 1,376
+        # branches between them read as three cards, and no branch card is
+        # rendered until one of them is named.
+        self.open_sources()
+        requests = self.page.locator(".card.source-word")
+        self.assertEqual(requests.count(), 3)
+        self.assertEqual(
+            self.page.locator("[data-grid-key=source-memberships]").count(), 0
+        )
+        # Grouped by state out of the box: the fixture's two queued words and
+        # its one complete word read as two groups without touching a control.
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().group_by"), "state")
+        groups = self.page.locator(".source-word-groups > details")
+        self.assertEqual(groups.count(), 2)
+        self.assertEqual(
+            [" ".join(groups.nth(index).locator("summary strong").inner_text().split())
+             for index in range(2)],
+            ["queued", "complete"])
+        metrics = " ".join(
+            self.page.locator("#report .metrics").first.inner_text().split()
+        )
+        self.assertIn("3 source words", metrics)
+        self.assertIn("1,376 branches", metrics)
+        self.assertIn("1,211 open", metrics)
+        request_text = " ".join(requests.first.inner_text().split())
+        self.assertIn("priority 5", request_text)
+        self.assertIn("1,240 branches", request_text)
+        self.assertIn("1,203 open", request_text)
+        self.assertIn("37 done", request_text)
+        self.assertIn("12 direct", request_text)
+        self.assertIn("3 workers", request_text)
+        self.assertIn("Pick a word to list the branches it owns.",
+                      self.page.locator("#report").inner_text())
+        # A word queued more than once is still one card, and says so rather
+        # than splitting into a card per request.
+        self.assertIn("2 requests", request_text)
+
+    def test_sources_controls_offer_source_axes_not_branch_ones(self):
+        self.open_sources()
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        # A source word has its own state; branch status, phase, answer count,
+        # budget and priority all describe one branch, so they stay hidden.
+        self.assertFalse(self.page.locator("#source-state-filters").is_hidden())
+        self.assertTrue(self.page.locator("#branch-filters").is_hidden())
+        self.assertFalse(self.page.locator("#sort-field").is_hidden())
+        self.assertFalse(self.page.locator("#group-by-field").is_hidden())
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "[data-source-state]", "inputs => inputs.map(i => i.value)"),
+            ["queued", "active", "complete"])
+        # iOS Safari shows hidden <option>s, so each report's own strategies
+        # must be the only ones in the DOM.
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "#group-by option", "options => options.map(o => o.value)"),
+            ["state", "worker_presence", "priority", "none"])
+        # State is the default, and "none" is an explicit choice rather than
+        # the absence of one.
+        self.assertEqual(self.page.locator("#group-by").input_value(), "state")
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "#sort option", "options => options.map(o => o.value)"),
+            ["", "word", "branches", "open", "done", "workers", "age"])
+
+    def test_sources_state_filter_and_sort_reach_the_request(self):
+        result = self.page.evaluate("""() => ({
+          filtered: buildAPIURL(parsePageState({search:'?kind=sources&source_state=queued,active'})),
+          sorted: buildAPIURL(parsePageState({search:'?kind=sources&sort=branches'})),
+          grouped: buildAPIURL(parsePageState({search:'?kind=sources&group_by=state'})),
+          branchSort: buildAPIURL(parsePageState({search:'?kind=sources&sort=nodes'})),
+          branchGroup: buildAPIURL(parsePageState({search:'?kind=sources&group_by=cache_state'})),
+          ungrouped: buildAPIURL(parsePageState({search:'?kind=sources&group_by=none'})),
+          elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&source_state=queued'}))
+        })""")
+        self.assertEqual(result["ungrouped"], "/api/view/sources?group_by=none")
+        # URLSearchParams percent-encodes the separator; the server decodes it.
+        self.assertEqual(
+            result["filtered"],
+            "/api/view/sources?source_state=queued%2Cactive&group_by=state")
+        self.assertEqual(result["sorted"],
+                         "/api/view/sources?sort=branches&group_by=state")
+        self.assertEqual(result["grouped"], "/api/view/sources?group_by=state")
+        # A sort or grouping this report cannot serve falls back to the
+        # default rather than being sent to be rejected, and the source filter
+        # never leaks to a report that would reject it.
+        self.assertEqual(result["branchSort"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["branchGroup"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["elsewhere"], "/api/view/queue")
+
+    def test_sources_pager_walks_the_word_list(self):
+        # The page size is the "Words per page" control; without a pager a
+        # limit would just truncate the list with no way to the rest.  The
+        # fixture server ignores query parameters, so the paged payload is
+        # applied directly -- the pager is what is under test.
+        def apply_page(offset, shown):
+            self.page.evaluate("""async ([offset, shown]) => {
+              const report = await (await fetch('/api/view/sources')).json();
+              report.data.matched_source_word_count = 12;
+              report.data.total_source_word_count = 12;
+              report.data.source_word_offset = offset;
+              report.data.summary = report.data.summary.slice(0, shown);
+              applyReport(report, null,
+                parsePageState({search:'?kind=sources&limit=3'}));
+            }""", [offset, shown])
+        apply_page(0, 3)
+        pager = self.page.locator(".source-word-pager")
+        self.assertIn("Showing 1–3 of 12 words",
+                      " ".join(pager.inner_text().split()))
+        previous_button = pager.locator("button", has_text="Prev")
+        next_button = pager.locator("button", has_text="Next")
+        # Nothing before the first page, and nothing after the last.
+        self.assertTrue(previous_button.is_disabled())
+        self.assertFalse(next_button.is_disabled())
+        apply_page(9, 3)
+        self.assertIn("Showing 10–12 of 12 words",
+                      " ".join(pager.inner_text().split()))
+        self.assertFalse(pager.locator("button", has_text="Prev").is_disabled())
+        self.assertTrue(pager.locator("button", has_text="Next").is_disabled())
+
+    def test_sources_branch_rows_have_their_own_pager(self):
+        # The branch list pages like the word list: a named word can own
+        # hundreds of branches, and a page size that truncated them with no
+        # way to the rest is the defect the word pager already fixed.
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          report.data.matched_rows = 40;
+          report.data.branch_row_offset = 4;
+          report.data.rows = report.data.rows.slice(0, 4);
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&branch_target=SALET&limit=4'}));
+        }""")
+        pager = self.page.locator(".branch-row-pager")
+        self.assertIn("Showing 5–8 of 40 branch rows",
+                      " ".join(pager.inner_text().split()))
+        self.assertFalse(pager.locator("button", has_text="Prev").is_disabled())
+        self.assertFalse(pager.locator("button", has_text="Next").is_disabled())
+        # The word pager is a separate control over a separate list.
+        self.assertEqual(self.page.locator(".source-word-pager").count(), 0)
+
+    def test_sources_pager_is_absent_without_a_page_size(self):
+        self.open_sources()
+        self.assertEqual(self.page.locator(".source-word-pager").count(), 0)
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().source_offset"),
+            None)
+        self.assertEqual(self.page.locator(".branch-row-pager").count(), 0)
+
+    def test_sources_grouping_buckets_cards_under_their_rollup(self):
+        # The fixture server ignores query parameters, so the grouped payload
+        # is applied directly -- the renderer is what is under test.
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          const rows = report.data.summary;
+          const bucket = state => rows.filter(row => row.state === state);
+          const rollup = group => ({
+            source_word_count: group.length,
+            branch_count: group.reduce((total, row) => total + row.branch_count, 0),
+            open_branch_count: group.reduce((total, row) => total + row.open_branch_count, 0),
+            done_branch_count: group.reduce((total, row) => total + row.done_branch_count, 0),
+            worker_count: group.reduce((total, row) => total + row.worker_count, 0),
+          });
+          report.data.summary_groups = ['queued', 'complete'].map(state => ({
+            label: state, rows: bucket(state), rollup: rollup(bucket(state)),
+          }));
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&group_by=state'}));
+        }""")
+        groups = self.page.locator(".source-word-groups > details")
+        self.assertEqual(groups.count(), 2)
+        first = " ".join(groups.first.locator("summary").inner_text().split())
+        self.assertIn("queued", first)
+        self.assertIn("2 words", first)
+        self.assertIn("1,336 branches", first)
+        self.assertIn("1,211 open", first)
+        self.assertEqual(
+            groups.first.locator("[data-grid-key='source-words/queued'] > .card")
+            .count(), 2)
+        self.assertEqual(
+            groups.nth(1).locator("[data-grid-key='source-words/complete'] > .card")
+            .count(), 1)
+        # Every word lands in exactly one group.
+        self.assertEqual(
+            self.page.locator(".source-word-groups .card").count(), 3)
+
+    def test_sources_card_opens_the_word_report_where_its_erd_lives(self):
+        # The card leads to the word report: that is where a word's ERD,
+        # response groups and root progress are, and it is what an operator
+        # reaches for after seeing a word listed.
+        self.open_sources()
+        self.page.locator(".card.source-word").first.click()
+        self.page.wait_for_selector("text=word report")
+        self.assertIn("branch_target=SALET", self.page.url)
+        self.assertNotIn("kind=sources", self.page.url)
+        # The source-only grouping cannot be served by a word report, so it
+        # must not ride along into a request that would be rejected.
+        self.assertNotIn("group_by", self.page.url)
+
+    def test_sources_card_shows_the_words_own_erd(self):
+        self.open_sources()
+        cards = {
+            card.locator("[data-spine]").first.get_attribute("data-spine"):
+                " ".join(card.inner_text().split())
+            for card in self.page.locator(".card.source-word").all()
+        }
+        # Complete: the exact ERD and the worst-case line it earned.
+        self.assertIn("ERD 3.421 · max 5", cards["RAISE"])
+        self.assertIn("ERD 3.389 · max 4", cards["CRANE"])
+        # Still searching: how much of it is solved, not a number that moves.
+        self.assertIn("ERD pending · 96/148 groups solved", cards["SALET"])
+
+    def test_sources_branch_cards_appear_only_for_the_named_word(self):
+        self.open_sources()
+        self.page.locator(".card.source-word").first.locator(
+            "button", has_text="Branches").click()
+        self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
+        ownership = self.page.locator("[data-grid-key=source-memberships] > .card")
+        self.assertEqual(ownership.count(), 4)
+        # The shared branch is never reduced to a single owner: each owning
+        # request gets its own row, carrying that request's requested priority
+        # beside the branch's effective one.
+        shared = " ".join(
+            self.page.locator('[data-identity="2:02"]').inner_text().split()
+        )
+        self.assertIn("shared", shared)
+        self.assertIn("requested priority 3", shared)
+        self.assertIn("effective priority 5", shared)
+        self.assertIn("owners 2", shared)
+        self.assertIn("parent @11111111", shared)
+        sole = " ".join(
+            self.page.locator('[data-identity="2:04"]').inner_text().split()
+        )
+        # Owned by only one request: no "shared" chip -- its absence is what
+        # says so, rather than a redundant "sole" chip beside it.
+        self.assertNotIn("shared", sole)
+        self.assertNotIn("parent", sole)
+        ownership_text = " ".join(
+            self.page.locator("#report").inner_text().split()
+        )
+        self.assertIn("Shown 4 of 4 matched", ownership_text)
+        self.assertIn("1 shared branch", ownership_text)
+
+    def open_named_source(self):
+        self.open_sources()
+        self.page.locator(".card.source-word").first.locator(
+            "button", has_text="Branches").click()
+        self.page.wait_for_selector("[data-grid-key=source-memberships] > .card")
+
+    def test_sources_metrics_survive_a_row_limit_truncating_the_grid(self):
+        # matched_rows and shared_branch_count are the model's pre-limit
+        # counts; a limit that drops every shared row from the grid must not
+        # silently shrink the metric beside it.  The fixture server ignores
+        # limit, so the truncated payload is applied directly.
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          report.data.rows = report.data.rows.filter(row => !row.is_shared);
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&branch_target=SALET'}));
+        }""")
+        shown = self.page.locator("[data-grid-key=source-memberships] > .card")
+        self.assertEqual(shown.count(), 2)
+        report_text = " ".join(self.page.locator("#report").inner_text().split())
+        self.assertIn("Shown 2 of 4 matched", report_text)
+        self.assertIn("1 shared branch", report_text)
+
+    def test_named_word_with_no_live_branches_is_not_the_unpicked_state(self):
+        # An empty row list means two different things, and telling a reader
+        # to pick a word they have already picked is the wrong one.
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          report.data.rows = [];
+          report.data.matched_rows = 0;
+          applyReport(report, null,
+            parsePageState({search:'?kind=sources&branch_target=SALET'}));
+        }""")
+        text = " ".join(self.page.locator("#report").inner_text().split())
+        self.assertIn("SALET owns no live branches", text)
+        self.assertNotIn("Pick a word", text)
+        # Unpicked still points the way in.  Waited for rather than asserted
+        # outright: the applied payload above already rendered a sources
+        # report, so "sources report" is on screen before the refetch lands.
+        self.open_sources()
+        self.page.wait_for_selector(
+            "text=Pick a word to list the branches it owns.")
+
+    def test_sources_metrics_count_a_branch_two_words_own_once(self):
+        # The totals come from the model, which counts each branch once; the
+        # client must not re-derive them by summing the per-word counts.
+        metrics = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          report.data.matched_branch_count = 900;
+          report.data.matched_open_branch_count = 700;
+          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          return document.querySelector('#report .metrics').innerText;
+        }""")
+        metrics = " ".join(metrics.split())
+        self.assertIn("900 branches", metrics)
+        self.assertIn("700 open", metrics)
+        # 1,376 is what summing the fixture's per-word counts would give.
+        self.assertNotIn("1,376", metrics)
+
+    def test_sources_ownership_row_draws_its_lineage_as_a_spine_step(self):
+        self.open_named_source()
+        root_step = self.page.locator('[data-identity="1:02"] .word')
+        self.assertEqual(root_step.count(), 1)
+        self.assertEqual(root_step.get_attribute("data-spine"), "SALET -y---")
+
+    def test_sources_branches_control_narrows_the_report_and_clears_it_again(self):
+        self.open_sources()
+        card = self.page.locator(".card.source-word").first
+        card.locator("button", has_text="Branches").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === 'SALET'"
+        )
+        self.assertIn("kind=sources", self.page.url)
+        self.assertIn("branch_target=SALET", self.page.url)
+        # The card that set the filter is the one that clears it, and is drawn
+        # as the filter in force while it is -- otherwise nothing in the view
+        # widens it again.
+        marked = ".card.source-word.filtered"
+        self.page.wait_for_selector(marked)
+        self.page.locator(marked).locator(
+            "button", has_text="Hide branches").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === ''"
+        )
+        self.assertNotIn("branch_target", self.page.url)
+        self.page.wait_for_selector(marked, state="detached")
+
+    def test_sources_ownership_card_opens_the_branch_it_names(self):
+        self.open_named_source()
+        self.page.locator('[data-identity="2:04"]').click()
+        self.page.wait_for_selector("text=branch report")
+
+    def test_sources_state_keeps_only_the_word_and_limit_the_report_reads(self):
+        # The sources report reads a trailing word and a row limit, and rejects
+        # a target naming no word rather than ignoring it, so the client must
+        # not forward a branch spine or a branch filter it happens to be
+        # carrying from the view the operator came from.  A spine that does
+        # reach a word is accepted by the report, which then answers for the
+        # trailing word alone -- so the prefix is dropped here rather than
+        # displayed as though it had narrowed the answer.
+        result = self.page.evaluate("""() => ({
+          explicit: buildAPIURL(parsePageState({search:'?kind=sources'})),
+          word: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=SALET'})),
+          spineToWord: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=SALET+-y---+CRANE'})),
+          branch: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=RAISE+-----'})),
+          reference: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=%40222222222222'})),
+          filtered: buildAPIURL(parsePageState({search:'?kind=sources&branch_status=active&priority=3&sort=size&tree=1'})),
+          limited: buildAPIURL(parsePageState({search:'?kind=sources&limit=2'}))
+        })""")
+        # Grouping by state is the default, and the request says so rather
+        # than leaving the server to guess: a pasted URL reproduces the view.
+        self.assertEqual(result["explicit"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["word"],
+                         "/api/view/sources?branch_target=SALET&group_by=state")
+        self.assertEqual(result["spineToWord"],
+                         "/api/view/sources?branch_target=CRANE&group_by=state")
+        self.assertEqual(result["branch"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["reference"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["filtered"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["limited"],
+                         "/api/view/sources?group_by=state&limit=2")
+
+    def test_worker_cards_name_the_scheduling_role_and_why(self):
+        preferred = self.page.locator('.card.worker[data-identity="worker-0"]')
+        # The visible text carries the noun: "preferred" alone would not say
+        # preferred what, and a tooltip cannot supply it on a touch screen.
+        self.assertIn("preferred source", preferred.inner_text())
+        reason = preferred.get_by_title("serving its preferred source work")
+        self.assertEqual(reason.count(), 1)
+        fallback = self.page.locator('.card.worker[data-identity="worker-3"]')
+        self.assertIn("fallback source", fallback.inner_text())
+        self.assertIn(
+            "no claimable bundle",
+            fallback.get_by_title(re.compile("fallback")).get_attribute("title"),
+        )
+        # A worker between claims has no role recorded, and none is invented
+        # for it on the card.
+        idle = self.page.locator('.card.worker[data-identity="worker-1"]')
+        self.assertNotIn("unattributed", idle.inner_text())
+        self.assertEqual(idle.get_by_title(re.compile("serving")).count(), 0)
+
     def test_layout_toggle_is_hidden_where_there_is_no_topology(self):
         toggle = self.page.locator("#layout-toggle")
         flat = self.page.locator("#layout-flat")
         tree = self.page.locator("#layout-tree")
         self.assertTrue(toggle.is_visible())
-        # Cache, hotspots, and leaderboard have no branch topology, so the
-        # layout switch is hidden entirely rather than shown-but-inert.
-        for treeless in ("cache", "hotspots", "leaderboard"):
+        # Cache, hotspots, leaderboard, and sources have no branch topology, so
+        # the layout switch is hidden entirely rather than shown-but-inert.
+        for treeless in ("cache", "hotspots", "leaderboard", "sources"):
             self.page.locator(f"[data-kind={treeless}]").click()
             self.page.wait_for_selector(f"text={treeless} report")
             self.assertFalse(toggle.is_visible())
