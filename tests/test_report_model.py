@@ -1354,8 +1354,8 @@ class SourceReportTest(unittest.TestCase):
             ["nurdy", "salet", "crane"])
 
     def test_each_source_word_carries_its_own_erd(self):
-        # A word's ERD is why it was queued, and it is folded from its cached
-        # response groups rather than stored, so the report must do the fold.
+        # A word's ERD is why it was queued.  It is derived from the word's
+        # cached response groups, and kept once the whole tree is solved.
         # NURDY is the one of these that leaves a two-answer group, so it is
         # the one whose ERD needs the cache; the others partition this answer
         # list into singletons, which are solved by playing them.
@@ -1397,6 +1397,18 @@ class SourceReportTest(unittest.TestCase):
         # two-answer group is the one still outstanding.
         self.assertEqual(nurdy["resolved_group_count"], 2)
         self.assertEqual(nurdy["response_group_count"], 3)
+
+        # The solved word's fold is kept, so a later page reads it back
+        # instead of refolding; the unsolved one is not, since its value can
+        # still change.
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        root_branch_key = ScoreCache.encode_subset(ANSWERS)
+        stored = cache.read_candidate_erd(root_branch_key, "crane", ERD_ALL)
+        self.assertEqual(stored["erd"], 1.75)
+        self.assertEqual(stored["max_remaining_depth"], 2)
+        self.assertIsNone(
+            cache.read_candidate_erd(root_branch_key, "nurdy", ERD_ALL))
+        cache.close()
 
     def test_branch_totals_count_a_shared_branch_once(self):
         # Two different words owning one branch is the case the report exists
