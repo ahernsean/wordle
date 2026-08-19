@@ -8,6 +8,11 @@
 # the one-off diagnostic and dataset scripts.
 [run]
 branch = True
+# CI splits the suite across three jobs and combines their data files, so each
+# job legitimately leaves some source modules unimported.  The per-job warning
+# says nothing about coverage of the combined run, and lands next to the test
+# summary where it reads as part of a failure.
+disable_warnings = module-not-imported
 source =
     wordle
     wordle_engine

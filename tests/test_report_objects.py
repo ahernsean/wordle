@@ -247,13 +247,13 @@ class SemanticReportTest(unittest.TestCase):
         branch_id = queue._intern_branch(branch_key)
         queue._conn.executemany(
             "INSERT INTO candidate_claims "
-            "(branch_id, idx, claimed_by, claimed_at, done, done_at, bundle_id) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            "(branch_id, idx, claimed_by, claimed_at, done, done_at, bundle_id, "
+            "best_first_position) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
             [
-                (branch_id, 1, "bulk-elimination", now, now, None),
-                (branch_id, 2, "worker-3", now, now, "bundle-1"),
-                (branch_id, 3, "legacy-holder", now, now, None),
-                (branch_id, 4, "two-level-erd-prune", now, now, None),
+                (branch_id, 1, "bulk-elimination", now, now, None, None),
+                (branch_id, 2, "worker-3", now, now, "bundle-1", 45),
+                (branch_id, 3, "legacy-holder", now, now, None, None),
+                (branch_id, 4, "two-level-erd-prune", now, now, None, None),
             ],
         )
         queue._conn.execute(
@@ -287,6 +287,9 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(claims[2]["completion_kind"], "evaluated")
         self.assertEqual(claims[2]["worker_id"], "worker-3")
         self.assertEqual(claims[2]["republish_count"], 4)
+        # Ranks display from 1; the stored position is 0-based.
+        self.assertEqual(claims[2]["best_first_rank"], 46)
+        self.assertIsNone(claims[1]["best_first_rank"])
         self.assertIsNone(claims[3]["completion_kind"])
         self.assertEqual(claims[4]["completion_kind"], "two_level_erd_pruned")
         self.assertTrue(report["data"]["provenance_unknown"])
