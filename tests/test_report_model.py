@@ -19,6 +19,7 @@ from report_model import (
     ReportSources,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
+    _source_word_group_key,
     _resolved_candidate_erd,
     _grouped_response_groups,
     _response_group_key,
@@ -1644,6 +1645,47 @@ class SourceReportTest(unittest.TestCase):
             sum(len(group["rows"]) for group in groups),
             len(self._source_words()["summary"]))
 
+    def test_source_time_grouping_boundaries(self):
+        generated_at = 1_787_270_400  # 20 Aug 2026, noon local time
+        base_row = {"state": "complete", "worker_count": 0,
+                    "requested_priority": 0, "completed_at": generated_at,
+                    "elapsed_millis": 0, "worker_millis": 0,
+                    "requested_at": generated_at}
+        completed = lambda seconds_ago: _source_word_group_key(
+            {**base_row, "completed_at": generated_at - seconds_ago},
+            "completed", generated_at)[1]
+        duration = lambda field, millis: _source_word_group_key(
+            {**base_row, field: millis},
+            "elapsed" if field == "elapsed_millis" else "worker_time",
+            generated_at)[1]
+
+        self.assertEqual(completed(0), "today")
+        self.assertEqual(completed(24 * 60 * 60), "earlier this week")
+        self.assertEqual(completed(7 * 24 * 60 * 60), "earlier this month")
+        self.assertEqual(completed(31 * 24 * 60 * 60), "earlier this year")
+        self.assertEqual(completed(366 * 24 * 60 * 60), "older")
+        self.assertEqual(
+            [duration("elapsed_millis", millis) for millis in
+             (60 * 60 * 1000, 60 * 60 * 1000 + 1,
+              24 * 60 * 60 * 1000 + 1, 7 * 24 * 60 * 60 * 1000 + 1,
+              30 * 24 * 60 * 60 * 1000 + 1)],
+            ["0–1 hour", "under 24 hours", "under 1 week", "under 1 month",
+             "1 month or more"],
+        )
+        self.assertEqual(
+            _source_word_group_key(
+                {**base_row, "requested_at": generated_at - 24 * 60 * 60},
+                "requested", generated_at)[1],
+            "under 24 hours",
+        )
+        self.assertEqual(
+            _source_word_group_key(
+                {**base_row, "completed_at": None, "elapsed_millis": None,
+                 "worker_millis": None},
+                "completed", generated_at)[1],
+            "not completed",
+        )
+
     def test_source_only_filters_and_sorts_are_rejected_elsewhere(self):
         for filters, message in (
             ({"source_states": ("queued",)}, "source_state requires"),
@@ -1659,6 +1701,10 @@ class SourceReportTest(unittest.TestCase):
                 report_kind="sources", filters=ReportFilters(sort="nodes")))
         validate_report_request(ReportRequest(
             report_kind="sources", filters=ReportFilters(sort="age")))
+        for group_by in ("completed", "elapsed", "worker_time", "requested"):
+            with self.subTest(group_by=group_by):
+                validate_report_request(ReportRequest(
+                    report_kind="sources", filters=ReportFilters(group_by=group_by)))
         with self.assertRaisesRegex(ValueError, "source reports must be"):
             validate_report_request(ReportRequest(
                 report_kind="sources",

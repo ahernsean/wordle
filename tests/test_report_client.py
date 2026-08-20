@@ -3110,7 +3110,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#group-by option", "options => options.map(o => o.value)"),
-            ["state", "worker_presence", "priority", "none"])
+            ["state", "completed", "elapsed", "worker_time", "requested",
+             "worker_presence", "priority", "none"])
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")

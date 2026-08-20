@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import collections
+import datetime
 import os
 import re
 import sqlite3
@@ -130,7 +131,10 @@ SOURCE_STATES = ("queued", "active", "complete")
 GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
-SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
+SOURCE_GROUP_BY_STRATEGIES = (
+    "none", "state", "worker_presence", "priority", "completed", "elapsed",
+    "worker_time", "requested",
+)
 SOURCE_SORT_FIELDS = (
     "default", "age", "word", "priority", "branches", "open", "done", "workers",
     "completed", "erd", "requested", "elapsed", "worker_time",
@@ -2817,7 +2821,40 @@ def _sorted_source_words(rows, sort):
     return sorted(rows, key=key) if key is not None else rows
 
 
-def _source_word_group_key(row, group_by):
+def _duration_group_key(duration_millis, missing_label):
+    """Bucket a non-negative duration into the Sources report's time ranges."""
+    if duration_millis is None:
+        return 5, missing_label
+    for index, (maximum_millis, label) in enumerate((
+        (60 * 60 * 1000, "0–1 hour"),
+        (24 * 60 * 60 * 1000, "under 24 hours"),
+        (7 * 24 * 60 * 60 * 1000, "under 1 week"),
+        (30 * 24 * 60 * 60 * 1000, "under 1 month"),
+    )):
+        if duration_millis <= maximum_millis:
+            return index, label
+    return 4, "1 month or more"
+
+
+def _completed_at_group_key(completed_at, generated_at):
+    """Bucket a completion timestamp by its local calendar date."""
+    if completed_at is None:
+        return 5, "not completed"
+    today = datetime.datetime.fromtimestamp(generated_at).date()
+    completed_date = datetime.datetime.fromtimestamp(completed_at).date()
+    if completed_date >= today:
+        return 0, "today"
+    week_start = today - datetime.timedelta(days=today.weekday())
+    if completed_date >= week_start:
+        return 1, "earlier this week"
+    if completed_date.year == today.year and completed_date.month == today.month:
+        return 2, "earlier this month"
+    if completed_date.year == today.year:
+        return 3, "earlier this year"
+    return 4, "older"
+
+
+def _source_word_group_key(row, group_by, generated_at):
     """Map a collapsed source row to (sort_key, label) for the strategy."""
     if group_by == "state":
         state = row["state"]
@@ -2825,11 +2862,24 @@ def _source_word_group_key(row, group_by):
     if group_by == "worker_presence":
         return ((0, "with workers") if row["worker_count"]
                 else (1, "no workers"))
+    if group_by == "completed":
+        return _completed_at_group_key(row["completed_at"], generated_at)
+    if group_by == "elapsed":
+        return _duration_group_key(row["elapsed_millis"], "not completed")
+    if group_by == "worker_time":
+        return _duration_group_key(row["worker_millis"], "not completed")
+    if group_by == "requested":
+        requested_at = row["requested_at"]
+        duration_millis = (
+            max(0, generated_at - requested_at) * 1000
+            if requested_at is not None else None
+        )
+        return _duration_group_key(duration_millis, "not requested")
     priority = row["requested_priority"]
     return (-(priority or 0), f"priority {priority}")
 
 
-def _grouped_source_words(rows, group_by, branch_totals):
+def _grouped_source_words(rows, group_by, branch_totals, generated_at):
     """Bucket the collapsed rows, each group carrying its own rollup.
 
     A group's branch totals are counted distinctly over the words in it, for
@@ -2838,7 +2888,7 @@ def _grouped_source_words(rows, group_by, branch_totals):
     """
     grouped = {}
     for row in rows:
-        sort_key, label = _source_word_group_key(row, group_by)
+        sort_key, label = _source_word_group_key(row, group_by, generated_at)
         group = grouped.setdefault(
             (sort_key, label),
             {"label": label, "rows": [],
@@ -3133,7 +3183,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_source_words(
-                data["summary"], group_by, branch_totals
+                data["summary"], group_by, branch_totals, generated_at
             )
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they

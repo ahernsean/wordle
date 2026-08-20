@@ -318,7 +318,7 @@
     const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
     const SORT_OPTIONS_SOURCES=[["","ERD (lowest first)"],["completed","most recently completed"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
-    const GROUP_BY_OPTIONS_SOURCES=[["state","state (default)"],["worker_presence","worker"],["priority","priority"],["none","none"]];
+    const GROUP_BY_OPTIONS_SOURCES=[["state","state (default)"],["completed","most recently completed"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","date requested"],["worker_presence","worker"],["priority","priority"],["none","none"]];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","sources"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
