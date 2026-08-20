@@ -1344,9 +1344,14 @@ class SourceReportTest(unittest.TestCase):
         queue._conn.commit()
         queue.close()
 
-        # The default is the order the queue serves them in: priority first.
+        # The default is the explicit ERD ordering.
         self.assertEqual(
             [row["source_word"] for row in self._source_words()["summary"]],
+            [row["source_word"] for row in
+             self._source_words(sort="erd")["summary"]])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="priority")["summary"]],
             ["crane", "salet", "nurdy"])
         self.assertEqual(
             [row["source_word"] for row in

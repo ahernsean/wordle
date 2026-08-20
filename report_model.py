@@ -3016,7 +3016,8 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             )
             for row in summary_rows
         ]
-        if request.filters.sort == "erd":
+        source_sort = request.filters.sort or "erd"
+        if source_sort == "erd":
             erd_summaries = _source_word_erd_summaries(
                 sources, [row["source_word"] for row in collapsed], report
             )
@@ -3027,7 +3028,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         if source_states:
             collapsed = [row for row in collapsed
                          if row["state"] in source_states]
-        collapsed = _sorted_source_words(collapsed, request.filters.sort)
+        collapsed = _sorted_source_words(collapsed, source_sort)
         data["matched_source_word_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
         # branch, so summing their per-word counts double-counts precisely the
@@ -3061,7 +3062,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             else collapsed[offset:]
         )
         # Folded for the page only, and attached to the rows it describes.
-        if request.filters.sort != "erd":
+        if source_sort != "erd":
             erd_summaries = _source_word_erd_summaries(
                 sources, [row["source_word"] for row in data["summary"]], report
             )
