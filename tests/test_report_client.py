@@ -3046,6 +3046,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         # A word queued more than once is still one card, and says so rather
         # than splitting into a card per request.
         self.assertIn("2 requests", request_text)
+        complete_text = " ".join(
+            requests.filter(has_text="TARSE").inner_text().split())
+        self.assertIn("completed 8m ago", complete_text)
 
     def test_sources_progress_separates_no_work_from_completed_work(self):
         self.open_sources()

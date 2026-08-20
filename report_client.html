@@ -1385,6 +1385,7 @@
         numText(row.done_branch_count)+" done",
         numText(row.direct_branch_count)+" direct",
         row.worker_count?numText(row.worker_count)+(row.worker_count===1?" worker":" workers"):null,
+        row.completed_at===null||row.completed_at===undefined?null:"completed "+relativeAge(row.completed_at,generatedAt),
         row.requested_at===null||row.requested_at===undefined?null:"requested "+relativeAge(row.requested_at,generatedAt),
       ]));
       card.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:word,tree:false,claims:false,answers:false,finalization_cursor:""}));

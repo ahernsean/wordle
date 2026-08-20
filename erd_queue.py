@@ -4844,7 +4844,7 @@ class ERDQueue:
             SELECT s.source_word,
                    MIN(s.requested_at) AS requested_at,
                    MAX(s.requested_priority) AS requested_priority,
-                   MAX(COALESCE(m.resolved_at, p.completed_at)) AS completed_at,
+                   MAX(m.resolved_at) AS completed_at,
                    COUNT(DISTINCT s.source_work_id) AS request_count,
                    MAX(s.state = 'active') AS has_active_request,
                    MAX(s.state != 'complete') AS has_incomplete_request,

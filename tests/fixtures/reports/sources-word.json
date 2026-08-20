@@ -37,6 +37,7 @@
         "source_word": "salet",
         "requested_priority": 5,
         "requested_at": 400,
+        "completed_at": null,
         "request_count": 2,
         "state": "queued",
         "branch_count": 1240,

@@ -2729,13 +2729,16 @@ def _source_summary_payload(row, rollup):
     source_word = _row_value(row, "source_word")
     branch_count = row["branch_count"] or 0
     open_branch_count = rollup["open_branch_count"]
+    state = _merged_source_state(row)
     return {
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
-        "_completed_at": _row_value(row, "completed_at"),
+        "completed_at": (
+            _row_value(row, "completed_at") if state == "complete" else None
+        ),
         "request_count": row["request_count"] or 0,
-        "state": _merged_source_state(row),
+        "state": state,
         "direct_branch_count": row["direct_branch_count"] or 0,
         "direct_done_branch_count": row["direct_done_branch_count"] or 0,
         "branch_count": branch_count,
@@ -2764,8 +2767,8 @@ _SOURCE_SORT_KEYS = {
     "open": lambda row: (-row["open_branch_count"], row["source_word"] or ""),
     "done": lambda row: (-row["done_branch_count"], row["source_word"] or ""),
     "workers": lambda row: (-row["worker_count"], row["source_word"] or ""),
-    "completed": lambda row: (-(row["_completed_at"] or 0)
-                               if row["_completed_at"] is not None else float("inf"),
+    "completed": lambda row: (-(row["completed_at"] or 0)
+                               if row["completed_at"] is not None else float("inf"),
                                row["source_word"] or ""),
     "requested": lambda row: (-(row["requested_at"] or 0)
                                if row["requested_at"] is not None else float("inf"),
@@ -3070,9 +3073,6 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             data["summary_groups"] = _grouped_source_words(
                 data["summary"], group_by, branch_totals
             )
-        for row in collapsed:
-            row.pop("_completed_at", None)
-
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they
         # spawned, which is the explosion this report exists to roll up.
