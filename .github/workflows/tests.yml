@@ -42,7 +42,7 @@ jobs:
           path: .coverage.*
           include-hidden-files: true
 
-  browser:
+  chromium:
     runs-on: ubuntu-latest
 
     steps:
@@ -59,7 +59,7 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Run browser suite with coverage
+      - name: Run Chromium browser suite with coverage
         run: coverage run --parallel-mode -m unittest tests.test_report_client
         env:
           REQUIRE_PLAYWRIGHT_BROWSER: "1"
@@ -67,7 +67,36 @@ jobs:
       - name: Upload coverage data
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-browser
+          name: coverage-chromium
+          path: .coverage.*
+          include-hidden-files: true
+
+  webkit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install coverage numpy playwright
+
+      # The browser itself runs inside the Microsoft Playwright container
+      # (tests/webkit_container.py), image tag matched to the installed
+      # playwright package's version, so no local WebKit install is needed.
+      - name: Run WebKit browser suite with coverage
+        run: coverage run --parallel-mode -m unittest tests.test_report_client.ReportClientWebKitBrowserTest
+        env:
+          REQUIRE_WEBKIT_CONTAINER_TESTS: "1"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-webkit
           path: .coverage.*
           include-hidden-files: true
 
@@ -168,7 +197,7 @@ jobs:
 
   test:
     if: always()
-    needs: [unit, browser, scaling]
+    needs: [unit, chromium, webkit, scaling]
     runs-on: ubuntu-latest
 
     steps:
@@ -177,9 +206,10 @@ jobs:
       - name: Require every test suite to pass
         env:
           UNIT_RESULT: ${{ needs.unit.result }}
-          BROWSER_RESULT: ${{ needs.browser.result }}
+          CHROMIUM_RESULT: ${{ needs.chromium.result }}
+          WEBKIT_RESULT: ${{ needs.webkit.result }}
           SCALING_RESULT: ${{ needs.scaling.result }}
-        run: test "$UNIT_RESULT $BROWSER_RESULT $SCALING_RESULT" = "success success success"
+        run: test "$UNIT_RESULT $CHROMIUM_RESULT $WEBKIT_RESULT $SCALING_RESULT" = "success success success success"
 
       - name: Set up Python
         uses: actions/setup-python@v6

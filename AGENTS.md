@@ -352,6 +352,28 @@ in the first moments of a session means the install is still in flight — wait
 and retry rather than installing by hand. It skips the reinstall on a compact
 or a clear, which keep the same container.
 
+- **WebKit** cannot run locally on rocky at all — its bundled build needs a
+  glibc newer than the box has, and there is no pre-installed fallback the way
+  there is for Chromium. `tests/webkit_container.py` runs it inside the
+  official `mcr.microsoft.com/playwright` container instead, in `run-server`
+  mode: only the browser process lives in the container, started with
+  `--network host` so it can reach the fixture server's `127.0.0.1` binding.
+  The test process itself stays local and connects over `playwright.webkit.connect()`
+  via a `ws://` endpoint — nothing about `tests/test_report_client.py`'s
+  existing test bodies changes; `ReportClientWebKitBrowserTest` replays them by
+  subclassing `ReportClientBrowserTest` and swapping only
+  `setUpClass`/`tearDownClass`. The `run-server` wire protocol requires the
+  container image tag and the installed `playwright` package to be the exact
+  same version, so the tag is derived from the installed version at run time,
+  never pinned.
+
+  Off by default locally (it needs podman or docker, plus a network pull of
+  the container image) — set `RUN_WEBKIT_CONTAINER_TESTS=1` to opt in, or
+  `REQUIRE_WEBKIT_CONTAINER_TESTS=1` to hard-fail instead of skipping when the
+  container can't start (used by CI's `webkit` job). Rocky has `podman`, not
+  `docker`; `tests/webkit_container.py` tries `podman` first and falls back to
+  `docker`.
+
 ## Before committing and pushing
 
 Before committing and pushing a code change, run the targeted tests that cover
