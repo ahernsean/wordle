@@ -2234,9 +2234,9 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
     def test_widens_its_own_source_when_only_active_branch_is_the_one_excluded(self):
         """The production shape from the issue: a worker blocked on AUDIO's
         only active branch, with AUDIO also holding a pending branch under
-        the SAME source_work_id and a lower-priority source (PENIS) holding
+        the SAME source_work_id and a lower-priority source (SCOPE) holding
         an active one.  The worker must widen AUDIO — promote its own
-        pending branch — rather than serve PENIS, and rather than treat
+        pending branch — rather than serve SCOPE, and rather than treat
         AUDIO's active branch (the one excluded, since it's the one being
         waited on) as already covering the source.
 
@@ -2276,7 +2276,7 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
             source_pattern=claimed_audio["source_pattern"],
             source_work_id=claimed_audio["source_work_id"])
 
-        # PENIS (priority 1): one active branch, joinable and lower priority.
+        # SCOPE (priority 1): one active branch, joinable and lower priority.
         # A BRANCH subset (not CANDIDATES-only words like "brain"): branch
         # words must be valid answers, and the fixture's answer file is
         # BRANCH alone — the join loop below does try to claim this branch
@@ -2285,8 +2285,8 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         # fix under test.
         words_penis = BRANCH[-2:]
         key_penis = ScoreCache.encode_subset(words_penis)
-        q.add_pending_many([(key_penis, len(words_penis), 1, "penis", 20)])
-        claimed_penis = q.claim_next("setup", self._source_work_id(q, "penis"))
+        q.add_pending_many([(key_penis, len(words_penis), 1, "scope", 20)])
+        claimed_penis = q.claim_next("setup", self._source_work_id(q, "scope"))
         q.create_branch(
             key_penis, len(words_penis), n_candidates, budget=ROOT_BUDGET,
             priority=claimed_penis["priority"],

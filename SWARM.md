@@ -141,7 +141,7 @@ been opened at all, when work actually began on it, and a completion estimate.
 It is the report that answers "why is
 this root taking so long" — cost concentrates hard, and the node-share column
 names the group holding it. It takes any spine ending in a word: a bare root,
-or a deeper spine such as `PENIS -y--- LUBES`, which asks the same question at
+or a deeper spine such as `SCOPE -y--- LUBES`, which asks the same question at
 a greater guess_depth. The rollup scopes telemetry by spine prefix, so a longer
 spine is simply a longer prefix.
 
@@ -153,7 +153,7 @@ queue, because a group can be solved with no branch open and nothing finalized
 in this epoch — a group of one answer needs no search at all.
 
 This matters for reading the estimate. The estimate excludes groups still
-`waiting`, not groups the queue never opened: PENIS has 34 groups it never
+`waiting`, not groups the queue never opened: SCOPE has 34 groups it never
 opened, and every one of them is already solved (29 hold a single answer). They
 are not a backlog, and counting them as one would invent work that does not
 exist.
