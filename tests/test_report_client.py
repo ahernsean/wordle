@@ -3055,7 +3055,12 @@ class ReportClientBrowserTest(unittest.TestCase):
                 "spans => spans.map(span => ({className: span.className, width: Number.parseFloat(span.style.width)}))",
             )[:2]
         self.assertEqual([segment["className"] for segment in segments],
-                         ["no-work", ""])
+                         ["no-work work-boundary", ""])
+        self.assertEqual(
+            progress.locator("span.no-work").evaluate(
+                "span => getComputedStyle(span).borderRightWidth"),
+            "1px",
+        )
         self.assertAlmostEqual(segments[0]["width"], 100 * 136 / 148, places=4)
         self.assertAlmostEqual(segments[1]["width"], 100 * 3 / 148, places=4)
         segment_boxes = self.page.locator(
