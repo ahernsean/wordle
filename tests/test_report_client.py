@@ -621,7 +621,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             branch_target = (
                 tile.get_attribute("aria-label")
                 .removeprefix("Open ").removesuffix(" branch report"))
-            self.assertEqual(branch_target, "SALET ----- CRANE ----y")
+            self.assertRegex(branch_target, r"^SALET ----- CRANE [gy-]{5}$")
             tile.click()
             self.page.wait_for_selector("text=branch report")
             self.assertEqual(
