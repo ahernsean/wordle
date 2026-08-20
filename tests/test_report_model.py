@@ -6,11 +6,13 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue
 import erd_search
+import report_model
 from report_model import (
     ReportFilters,
     ReportRequest,
@@ -1417,6 +1419,46 @@ class SourceReportTest(unittest.TestCase):
              self._source_words(sort="worker_time")["summary"]],
             ["crane", "salet", "nurdy"],
         )
+
+    def test_source_report_keeps_erd_summary_shape_when_cache_unavailable(self):
+        self._queue_words(("salet", 5, 1))
+        unavailable_sources = replace(
+            self.sources, answer_list_path="unused-answers"
+        )
+
+        report = collect_source_report(
+            unavailable_sources, ReportRequest(report_kind="sources")
+        )
+
+        self.assertIn("error", report["sources"]["cache"])
+        self.assertIn("erd_summary", report["data"]["summary"][0])
+        self.assertIsNone(report["data"]["summary"][0]["erd_summary"])
+
+    def test_source_erd_summary_cache_invalidates_for_wal_writes(self):
+        self._queue_words(("nurdy", 5, 1))
+        first = self._source_words()["summary"][0]["erd_summary"]
+        self.assertEqual(first["state"], "pending")
+
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        response_cache = ResponseCache(ANSWERS, score_cache=None)
+        for _pattern_code, words in response_cache.group_words(
+                "nurdy", ANSWERS).items():
+            if words:
+                cache.write(
+                    ScoreCache.encode_subset(words), ERD_ALL, "salet", 1.0,
+                    max_depth=1, solve_budget=GAME_GUESSES - 1,
+                )
+        cache._conn.commit()
+
+        second = self._source_words()["summary"][0]["erd_summary"]
+
+        self.assertEqual(second["state"], "complete")
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            report_model._SOURCE_ERD_SUMMARY_CACHE[self.cache_path][1],
+            {"nurdy": second},
+        )
+        cache.close()
 
     def test_each_source_word_carries_its_own_erd(self):
         # A word's ERD is why it was queued.  It is derived from the word's
