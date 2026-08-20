@@ -748,7 +748,6 @@ def _empty_data():
 
 def _queue_overview(sources, generated_at, answer_set, report):
     queue = None
-    timing_cache = None
     try:
         queue = _open_report_queue(sources)
         report["sources"]["telemetry"]["ok"] = True
@@ -2738,14 +2737,16 @@ def _source_summary_payload(row, rollup, timing):
     branch_count = row["branch_count"] or 0
     open_branch_count = rollup["open_branch_count"]
     state = _merged_source_state(row)
+    completed_at = None
+    if state == "complete":
+        completed_at = timing["completed_at"]
+        if completed_at is None:
+            completed_at = _row_value(row, "completed_at")
     return {
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
-        "completed_at": (timing["completed_at"] if state == "complete"
-                         and timing.get("completed_at") is not None
-                         else _row_value(row, "completed_at")
-                         if state == "complete" else None),
+        "completed_at": completed_at,
         "request_count": row["request_count"] or 0,
         "state": state,
         "direct_branch_count": row["direct_branch_count"] or 0,
@@ -2875,7 +2876,14 @@ def _source_word_erd_summaries(sources, source_words, report, cache,
         return summaries
     try:
         response_cache = ResponseCache(all_answers, score_cache=None)
-        cache_version = os.stat(sources.cache_path).st_mtime_ns
+        cache_version = _score_cache_file_signature(sources.cache_path)
+        cached_version, cached_summaries = _SOURCE_ERD_SUMMARY_CACHE.get(
+            sources.cache_path, (None, {})
+        )
+        if cached_version != cache_version:
+            cached_summaries = {}
+            _SOURCE_ERD_SUMMARY_CACHE[sources.cache_path] = (
+                cache_version, cached_summaries)
         # A root word spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
         # Source words are always openers, so every one folds against the same
@@ -2884,8 +2892,7 @@ def _source_word_erd_summaries(sources, source_words, report, cache,
         for word in source_words:
             if word is None:
                 continue
-            cache_key = (sources.cache_path, cache_version, word)
-            cached_summary = _SOURCE_ERD_SUMMARY_CACHE.get(cache_key)
+            cached_summary = cached_summaries.get(word)
             if cached_summary is not None:
                 summaries[word] = cached_summary
                 continue
@@ -2921,12 +2928,24 @@ def _source_word_erd_summaries(sources, source_words, report, cache,
                 ],
                 group_budget,
             )
-            _SOURCE_ERD_SUMMARY_CACHE[cache_key] = summary
+            cached_summaries[word] = summary
             summaries[word] = summary
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     return summaries
+
+
+def _score_cache_file_signature(cache_path):
+    """Identify the cache generation, including uncheckpointed WAL writes."""
+    def file_signature(path):
+        try:
+            stat_result = os.stat(path)
+        except FileNotFoundError:
+            return None
+        return stat_result.st_mtime_ns, stat_result.st_size
+
+    return file_signature(cache_path), file_signature(cache_path + "-wal")
 
 
 def _source_rollups(membership_rows):
@@ -3015,6 +3034,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         "sources", sources, request.branch_target, generated_at, data, request
     )
     queue = None
+    timing_cache = None
     try:
         queue = _open_report_queue(sources)
         source_word = (
@@ -3055,10 +3075,12 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         if source_states:
             collapsed = [row for row in collapsed
                          if row["state"] in source_states]
-        if source_sort in ("default", "erd") and timing_cache is not None:
-            erd_summaries = _source_word_erd_summaries(
-                sources, [row["source_word"] for row in collapsed], report,
-                timing_cache, all_answers,
+        if source_sort in ("default", "erd"):
+            erd_summaries = (
+                _source_word_erd_summaries(
+                    sources, [row["source_word"] for row in collapsed], report,
+                    timing_cache, all_answers,
+                ) if timing_cache is not None else {}
             )
             for row in collapsed:
                 row["erd_summary"] = erd_summaries.get(row["source_word"])
@@ -3096,10 +3118,12 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             else collapsed[offset:]
         )
         # Folded for the page only, and attached to the rows it describes.
-        if source_sort not in ("default", "erd") and timing_cache is not None:
-            erd_summaries = _source_word_erd_summaries(
-                sources, [row["source_word"] for row in data["summary"]], report,
-                timing_cache, all_answers,
+        if source_sort not in ("default", "erd"):
+            erd_summaries = (
+                _source_word_erd_summaries(
+                    sources, [row["source_word"] for row in data["summary"]], report,
+                    timing_cache, all_answers,
+                ) if timing_cache is not None else {}
             )
             for row in data["summary"]:
                 row["erd_summary"] = erd_summaries.get(row["source_word"])

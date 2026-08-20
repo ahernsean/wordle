@@ -3122,7 +3122,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
             ["", "completed", "elapsed", "worker_time", "priority",
-             "requested", "word", "branches", "open", "done", "workers"])
+             "requested", "age", "word", "branches", "open", "done", "workers"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):
         result = self.page.evaluate("""() => ({
