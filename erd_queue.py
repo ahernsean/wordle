@@ -1866,9 +1866,8 @@ class ERDQueue:
 
     def _complete_finished_source_work(self):
         """Mark source requests terminal once every owned branch is complete."""
-        completed_rows = self._conn.execute("""
-            SELECT source_word FROM source_work AS s
-            WHERE state != 'complete'
+        completion_predicate = """
+            state != 'complete'
               AND NOT EXISTS (
                   SELECT 1 FROM branch_source_work m
                   LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
@@ -1877,21 +1876,17 @@ class ERDQueue:
                     AND m.resolved_at IS NULL
                     AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
               )
-        """).fetchall()
+        """
+        completed_rows = self._conn.execute(
+            "SELECT source_word FROM source_work AS s WHERE "
+            + completion_predicate
+        ).fetchall()
         if not completed_rows:
             return []
-        self._conn.execute("""
-            UPDATE source_work AS s SET state = 'complete'
-            WHERE state != 'complete'
-              AND NOT EXISTS (
-                  SELECT 1 FROM branch_source_work m
-                  LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
-                  LEFT JOIN active_branches a ON a.branch_id = m.branch_id
-                  WHERE m.source_work_id = s.source_work_id
-                    AND m.resolved_at IS NULL
-                    AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
-              )
-        """)
+        self._conn.execute(
+            "UPDATE source_work AS s SET state = 'complete' WHERE "
+            + completion_predicate
+        )
         return list({row["source_word"] for row in completed_rows})
 
     def _resolve_branch_memberships(self, branch_id: int = None,

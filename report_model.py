@@ -2821,10 +2821,8 @@ def _sorted_source_words(rows, sort):
     return sorted(rows, key=key) if key is not None else rows
 
 
-def _duration_group_key(duration_millis, missing_label):
+def _duration_group_key(duration_millis):
     """Bucket a non-negative duration into the Sources report's time ranges."""
-    if duration_millis is None:
-        return 5, missing_label
     for index, (maximum_millis, label) in enumerate((
         (60 * 60 * 1000, "[0, 1 hour)"),
         (24 * 60 * 60 * 1000, "[1 hour, 1 day)"),
@@ -2865,16 +2863,14 @@ def _source_word_group_key(row, group_by, generated_at):
     if group_by == "completed":
         return _completed_at_group_key(row["completed_at"], generated_at)
     if group_by == "elapsed":
-        return _duration_group_key(row["elapsed_millis"], "not completed")
+        return (_duration_group_key(row["elapsed_millis"])
+                if row["elapsed_millis"] is not None else (5, "not completed"))
     if group_by == "worker_time":
-        return _duration_group_key(row["worker_millis"], "not completed")
+        return (_duration_group_key(row["worker_millis"])
+                if row["worker_millis"] is not None else (5, "not completed"))
     if group_by == "requested":
-        requested_at = row["requested_at"]
-        duration_millis = (
-            max(0, generated_at - requested_at) * 1000
-            if requested_at is not None else None
-        )
-        return _duration_group_key(duration_millis, "not requested")
+        return _duration_group_key(
+            max(0, generated_at - row["requested_at"]) * 1000)
     priority = row["requested_priority"]
     return (-(priority or 0), f"priority {priority}")
 

@@ -3112,6 +3112,14 @@ class ReportClientBrowserTest(unittest.TestCase):
                 "#group-by option", "options => options.map(o => o.value)"),
             ["state", "completed", "elapsed", "worker_time", "requested",
              "worker_presence", "priority", "none"])
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "#group-by option", "options => options.map(o => [o.value, o.textContent])"),
+            [["state", "state (default)"], ["completed", "completion date"],
+             ["elapsed", "elapsed time"], ["worker_time", "total worker time"],
+             ["requested", "time since request"], ["worker_presence", "worker"],
+             ["priority", "priority"], ["none", "none"]],
+        )
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")

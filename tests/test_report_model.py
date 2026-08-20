@@ -1646,7 +1646,7 @@ class SourceReportTest(unittest.TestCase):
             len(self._source_words()["summary"]))
 
     def test_source_time_grouping_boundaries(self):
-        generated_at = 1_787_270_400  # 20 Aug 2026, noon local time
+        generated_at = 1_787_270_400  # 21 Aug 2026 00:00 UTC (Friday)
         base_row = {"state": "complete", "worker_count": 0,
                     "requested_priority": 0, "completed_at": generated_at,
                     "elapsed_millis": 0, "worker_millis": 0,
