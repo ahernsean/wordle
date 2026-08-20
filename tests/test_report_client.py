@@ -3047,7 +3047,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # than splitting into a card per request.
         self.assertIn("2 requests", request_text)
         complete_text = " ".join(
-            requests.filter(has_text="TARSE").inner_text().split())
+            requests.filter(has_text="CRANE").inner_text().split())
         self.assertIn("completed 8m ago", complete_text)
 
     def test_sources_progress_separates_no_work_from_completed_work(self):
@@ -3113,7 +3113,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")
         self.assertIn(
-            "sorted by ERD (lowest first; default)",
+            "sorted by ERD (lowest first)",
             self.page.locator("#report").inner_text(),
         )
         self.assertEqual(
