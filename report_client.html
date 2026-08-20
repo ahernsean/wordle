@@ -479,7 +479,7 @@
     function setReportStatus(message){const status=byId("report-status");status.hidden=!message;status.textContent=message||"";}
     function pendingReportStatus(state){
       if(displayedState?.kind==="sources"&&state.kind==="sources"&&displayedState.group_by!==state.group_by)return "Showing groups by "+groupByLabel(displayedState)+" while regrouping by "+groupByLabel(state)+"…";
-      return "Computing "+(state.kind==="sources"?"sources report":"report")+"…";
+      return "Computing "+(state.kind==="sources"?"sources report":state.kind==="leaderboard"?"leaderboard":"report")+"…";
     }
     function setState(next,push=true){
       abortActiveRequest();
