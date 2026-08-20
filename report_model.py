@@ -2826,14 +2826,14 @@ def _duration_group_key(duration_millis, missing_label):
     if duration_millis is None:
         return 5, missing_label
     for index, (maximum_millis, label) in enumerate((
-        (60 * 60 * 1000, "0–1 hour"),
-        (24 * 60 * 60 * 1000, "under 24 hours"),
-        (7 * 24 * 60 * 60 * 1000, "under 1 week"),
-        (30 * 24 * 60 * 60 * 1000, "under 1 month"),
+        (60 * 60 * 1000, "[0, 1 hour)"),
+        (24 * 60 * 60 * 1000, "[1 hour, 1 day)"),
+        (7 * 24 * 60 * 60 * 1000, "[1 day, 1 week)"),
+        (30 * 24 * 60 * 60 * 1000, "[1 week, 1 month)"),
     )):
-        if duration_millis <= maximum_millis:
+        if duration_millis < maximum_millis:
             return index, label
-    return 4, "1 month or more"
+    return 4, "[1 month, ∞)"
 
 
 def _completed_at_group_key(completed_at, generated_at):

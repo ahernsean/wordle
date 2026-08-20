@@ -1666,17 +1666,16 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(completed(366 * 24 * 60 * 60), "older")
         self.assertEqual(
             [duration("elapsed_millis", millis) for millis in
-             (60 * 60 * 1000, 60 * 60 * 1000 + 1,
-              24 * 60 * 60 * 1000 + 1, 7 * 24 * 60 * 60 * 1000 + 1,
-              30 * 24 * 60 * 60 * 1000 + 1)],
-            ["0–1 hour", "under 24 hours", "under 1 week", "under 1 month",
-             "1 month or more"],
+             (0, 60 * 60 * 1000, 24 * 60 * 60 * 1000,
+              7 * 24 * 60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000)],
+            ["[0, 1 hour)", "[1 hour, 1 day)", "[1 day, 1 week)",
+             "[1 week, 1 month)", "[1 month, ∞)"],
         )
         self.assertEqual(
             _source_word_group_key(
                 {**base_row, "requested_at": generated_at - 24 * 60 * 60},
                 "requested", generated_at)[1],
-            "under 24 hours",
+            "[1 day, 1 week)",
         )
         self.assertEqual(
             _source_word_group_key(
