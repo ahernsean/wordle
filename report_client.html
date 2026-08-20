@@ -642,7 +642,7 @@
       if(!total)return null;
       const node=element("div","progress source-group-progress");
       node.title=numText(noWork)+" response groups need no work; "+numText(resolved)+" of "+numText(workCount)+" work groups completed";
-      if(noWork){const noWorkBar=element("span","no-work"+(resolved?" work-boundary":""));noWorkBar.style.width=100*noWork/total+"%";node.append(noWorkBar);}
+      if(noWork){const noWorkBar=element("span","no-work work-boundary");noWorkBar.style.width=100*noWork/total+"%";node.append(noWorkBar);}
       if(resolved){const doneBar=element("span","");doneBar.style.width=100*resolved/total+"%";node.append(doneBar);}
       return node;
     }

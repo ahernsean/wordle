@@ -3077,6 +3077,16 @@ class ReportClientBrowserTest(unittest.TestCase):
             "136 response groups need no work; 3 of 12 work groups completed",
         )
 
+    def test_sources_progress_marks_no_work_before_unfinished_work(self):
+        self.open_sources()
+        class_name = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          report.data.summary[0].direct_done_branch_count = 0;
+          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          return document.querySelector('.source-group-progress > span').className;
+        }""")
+        self.assertEqual(class_name, "no-work work-boundary")
+
     def test_sources_controls_offer_source_axes_not_branch_ones(self):
         self.open_sources()
         self.page.locator("details.filters").evaluate("node => node.open = true")
