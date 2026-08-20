@@ -69,6 +69,8 @@
     .refresh-pop .cap { color:var(--dim); font-size:.8rem; }
     .refresh-pop input { width:4.5rem; text-align:right; }
     .conn-wrap.open .refresh-pop { opacity:1; visibility:visible; transform:none; }
+    .report-status { margin:.35rem 0 0; padding:.25rem .45rem; border-left:3px solid var(--amber); background:#fff9e8; color:#6f5a13; }
+    .report-status[hidden] { display:none; }
     /* Where the pointer can hover, opening on hover is layered on top of the
        tap-toggle; a transparent bridge spans the gap so crossing to the panel
        does not dismiss it. */
@@ -300,6 +302,7 @@
         </div>
       </div>
     </details>
+    <p id="report-status" class="report-status" role="status" aria-live="polite" hidden></p>
   </header>
   <main id="report"><p class="empty">Loading report…</p></main>
   <script>
@@ -323,7 +326,7 @@
     const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,computingNotice=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
+    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
     const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
@@ -471,8 +474,13 @@
       return endpoint+(query.size?"?"+query.toString():"");
     }
     function contextKey(state){return buildAPIURL(state);}
-    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}removeComputingNotice();}
-    function removeComputingNotice(){computingNotice?.remove();computingNotice=null;}
+    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}}
+    function groupByLabel(state){const options=state.kind==="sources"?GROUP_BY_OPTIONS_SOURCES:GROUP_BY_OPTIONS_WORD;return options.find(([value])=>value===state.group_by)?.[1]||"none";}
+    function setReportStatus(message){const status=byId("report-status");status.hidden=!message;status.textContent=message||"";}
+    function pendingReportStatus(state){
+      if(displayedState?.kind==="sources"&&state.kind==="sources"&&displayedState.group_by!==state.group_by)return "Showing groups by "+groupByLabel(displayedState)+" while regrouping by "+groupByLabel(state)+"…";
+      return "Computing "+(state.kind==="sources"?"sources report":"report")+"…";
+    }
     function setState(next,push=true){
       abortActiveRequest();
       const previousGroupBy=currentState?.group_by;
@@ -1797,13 +1805,7 @@
       // also folds ERD summaries.  Keep the current report visible while the
       // replacement is being computed, but make the work visible immediately.
       // Same-context polls keep the current data on screen and never show it.
-      removeComputingNotice();
-      if(context!==lastContext){
-        computingNotice=element("p","dim","Computing "+(
-          state.kind==="sources"?"sources report":
-          state.kind==="leaderboard"?"leaderboard":"report"
-        )+"…");byId("report").prepend(computingNotice);
-      }
+      if(context!==lastContext)setReportStatus(pendingReportStatus(state));
       try{
         const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});
         if(generation!==requestGeneration)return;
@@ -1813,7 +1815,9 @@
         // A same-view poll may rebuild the report unless an interaction would
         // be destroyed: native controls have no DOM state to restore after
         // replacement, and replaceChildren collapses an active text selection.
-        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection()))applyReport(report,previous,state);
+        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection())){
+          applyReport(report,previous,state);displayedState=state;
+        }
         lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }
@@ -1827,7 +1831,7 @@
           if(navigated||!lastReport)byId("report").replaceChildren(element("p","error",error.message));
         }
       }
-      finally{removeComputingNotice();if(activeRequestController===controller)activeRequestController=null;}
+      finally{if(activeRequestController===controller){setReportStatus("");activeRequestController=null;}}
     }
     function pinBranchToSpine(report,state){
       // A spine remains the preferred URL because it resolves from the answer

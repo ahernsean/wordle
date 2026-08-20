@@ -3150,6 +3150,40 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["branchGroup"], "/api/view/sources?group_by=state")
         self.assertEqual(result["elsewhere"], "/api/view/queue")
 
+    def test_sources_grouping_marks_visible_cards_as_stale_while_regrouping(self):
+        self.open_sources()
+        result = self.page.evaluate("""async () => {
+          const originalFetch=window.fetch.bind(window);
+          const replacement=await (await originalFetch('/api/view/sources')).json();
+          let release;
+          window.fetch=(url, options)=>String(url).includes('group_by=elapsed')
+            ? new Promise(resolve=>{release=()=>resolve(new Response(JSON.stringify(replacement),{status:200,headers:{'Content-Type':'application/json'}}));})
+            : originalFetch(url, options);
+          const groupBy=document.querySelector('#group-by');
+          groupBy.value='elapsed';
+          groupBy.dispatchEvent(new Event('change',{bubbles:true}));
+          await new Promise(resolve=>setTimeout(resolve,20));
+          const pending={
+            status:document.querySelector('#report-status').textContent,
+            hidden:document.querySelector('#report-status').hidden,
+            groupBy:groupBy.value,
+            oldGroups:[...document.querySelectorAll('.source-word-groups > details > summary strong')].map(node=>node.textContent),
+          };
+          release();
+          await new Promise(resolve=>setTimeout(resolve,20));
+          const settled=document.querySelector('#report-status').hidden;
+          window.fetch=originalFetch;
+          return {pending,settled};
+        }""")
+        self.assertEqual(result["pending"]["groupBy"], "elapsed")
+        self.assertFalse(result["pending"]["hidden"])
+        self.assertEqual(
+            result["pending"]["status"],
+            "Showing groups by state (default) while regrouping by elapsed time…",
+        )
+        self.assertEqual(result["pending"]["oldGroups"], ["queued", "complete"])
+        self.assertTrue(result["settled"])
+
     def test_sources_pager_walks_the_word_list(self):
         # The page size is the "Words per page" control; without a pager a
         # limit would just truncate the list with no way to the rest.  The
