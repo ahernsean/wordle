@@ -1565,11 +1565,9 @@ class _BranchWorker:
         return True
 
     def _snapshot_completed_sources(self, source_words):
-        summaries = {row["source_word"]: row for row in self.queue.source_word_rows()}
         for source_word in source_words or ():
-            row = summaries.get(source_word)
             timing = self.queue.completed_source_timing(source_word)
-            if row is None or timing["completed_at"] is None:
+            if timing["completed_at"] is None:
                 continue
             self.score_cache.write_completed_source_summary(
                 source_word, ERD_ALL, timing["completed_at"],
@@ -1748,7 +1746,7 @@ class _BranchWorker:
             elif cut:
                 self.queue.requeue_pending(branch_key)
             else:
-                self._snapshot_completed_sources(self.queue.mark_done(branch_key))
+                self.queue.mark_done(branch_key)
         except Exception:
             logger.exception('%s pending completion failed for branch %s; '
                              'retaining queued work', self.name, branch_key[:25])
@@ -1757,7 +1755,7 @@ class _BranchWorker:
             except Exception:
                 logger.exception('%s could not requeue branch %s', self.name,
                                  branch_key[:25])
-        self.queue.delete_branch(branch_key)    # drop transient coordination
+        self._snapshot_completed_sources(self.queue.delete_branch(branch_key))
         self._packing_stats_cache.pop(branch_key, None)
         # Restart the coordination window past this finalize.  evaluate_claim
         # telescopes coordination_millis from the previous claim's completion,

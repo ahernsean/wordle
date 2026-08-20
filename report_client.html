@@ -305,7 +305,7 @@
   <script>
   (() => {
     "use strict";
-    const SCHEMA_VERSION=3, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
+    const SCHEMA_VERSION=3, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
     // A source word's lifecycle, which is not a branch's: queued until a
@@ -316,14 +316,14 @@
     // DOM rather than toggled — an absent option can't appear in any picker.
     const SORT_OPTIONS_DEFAULT=[["","default"],["age","age"],["size","size"],["workers","workers"],["priority","priority"],["nodes","nodes"],["slowest","slowest"]];
     const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
-    const SORT_OPTIONS_SOURCES=[["","ERD (lowest first)"],["completed","most recently completed"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
+    const SORT_OPTIONS_SOURCES=[["","ERD (lowest first)"],["completed","most recently completed"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
     const GROUP_BY_OPTIONS_SOURCES=[["state","state (default)"],["worker_presence","worker"],["priority","priority"],["none","none"]];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","sources"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
+    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,computingNotice=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
     const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
@@ -472,7 +472,7 @@
     }
     function contextKey(state){return buildAPIURL(state);}
     function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}clearSlowRequestNotice();}
-    function clearSlowRequestNotice(){if(slowRequestTimer){clearTimeout(slowRequestTimer);slowRequestTimer=null;}}
+    function clearSlowRequestNotice(){computingNotice?.remove();computingNotice=null;}
     function setState(next,push=true){
       abortActiveRequest();
       const previousGroupBy=currentState?.group_by;
@@ -639,7 +639,6 @@
       if(!summary||!summary.response_group_count)return null;
       const total=summary.response_group_count,workCount=Math.min(total,row.direct_branch_count||0);
       const noWork=total-workCount,resolved=Math.min(workCount,row.direct_done_branch_count||0);
-      if(!total)return null;
       const node=element("div","progress source-group-progress");
       node.title=numText(noWork)+" response groups need no work; "+numText(resolved)+" of "+numText(workCount)+" work groups completed";
       if(noWork){const noWorkBar=element("span","no-work work-boundary");noWorkBar.style.width=100*noWork/total+"%";node.append(noWorkBar);}
@@ -1365,8 +1364,6 @@
       if(isFiltered)card.classList.add("filtered");
       const title=element("div","card-title");
       title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)));
-      // A word usually holds one request; the count is shown only where the
-      // word was queued more than once and its rows are merged.
       // The branch list is the other thing this card leads to, so it gets its
       // own control rather than taking the card's own click.
       const branchesButton=element("button","",isFiltered?"Hide branches":"Branches");
@@ -1378,10 +1375,11 @@
       if(row.branch_count){const line=element("div","progress-line");line.append(sourceGroupProgress(row,row.erd_summary)||progress(row.done_branch_count,row.branch_count));card.append(line);}
       card.append(statLine([
         sourceWordErdText(row.erd_summary),
+        // A word usually holds one request; show the count only when merged.
         row.request_count>1?numText(row.request_count)+" requests":null,
         row.state==="complete"?null:"priority "+valueOrDash(row.requested_priority),
         numText(row.branch_count)+(row.branch_count===1?" branch":" branches"),
-        row.state==="complete"?null:numText(row.open_branch_count)+" open",
+        row.open_branch_count?numText(row.open_branch_count)+" open":null,
         numText(row.done_branch_count)+" done",
         numText(row.direct_branch_count)+" direct",
         row.worker_count?numText(row.worker_count)+(row.worker_count===1?" worker":" workers"):null,
@@ -1801,10 +1799,10 @@
       // Same-context polls keep the current data on screen and never show it.
       clearSlowRequestNotice();
       if(context!==lastContext){
-        byId("report").prepend(element("p","dim","Computing "+(
+        computingNotice=element("p","dim","Computing "+(
           state.kind==="sources"?"sources report":
           state.kind==="leaderboard"?"leaderboard":"report"
-        )+"…"));
+        )+"…");byId("report").prepend(computingNotice);
       }
       try{
         const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});

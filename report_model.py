@@ -36,6 +36,10 @@ SCHEMA_VERSION = 3
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
 
+# Source ERD summaries are immutable until the score cache changes.  The
+# Sources view polls frequently, so retain the completed folds between polls.
+_SOURCE_ERD_SUMMARY_CACHE = {}
+
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
 
@@ -128,7 +132,7 @@ GROUP_BY_STRATEGIES = (
 )
 SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
 SOURCE_SORT_FIELDS = (
-    "default", "word", "priority", "branches", "open", "done", "workers",
+    "default", "age", "word", "priority", "branches", "open", "done", "workers",
     "completed", "erd", "requested", "elapsed", "worker_time",
 )
 # Sorts that only a source report can serve, so another report asking for one
@@ -744,6 +748,7 @@ def _empty_data():
 
 def _queue_overview(sources, generated_at, answer_set, report):
     queue = None
+    timing_cache = None
     try:
         queue = _open_report_queue(sources)
         report["sources"]["telemetry"]["ok"] = True
@@ -2737,9 +2742,10 @@ def _source_summary_payload(row, rollup, timing):
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
-        "completed_at": (
-            _row_value(row, "completed_at") if state == "complete" else None
-        ),
+        "completed_at": (timing["completed_at"] if state == "complete"
+                         and timing.get("completed_at") is not None
+                         else _row_value(row, "completed_at")
+                         if state == "complete" else None),
         "request_count": row["request_count"] or 0,
         "state": state,
         "direct_branch_count": row["direct_branch_count"] or 0,
@@ -2765,6 +2771,9 @@ def _merged_source_state(row):
 
 
 _SOURCE_SORT_KEYS = {
+    "default": lambda row: _source_erd_sort_key(row),
+    "age": lambda row: (row["requested_at"] or float("inf"),
+                        row["source_word"] or ""),
     "word": lambda row: (row["source_word"] or "",),
     "priority": lambda row: (-(row["requested_priority"] or 0),
                              row["source_word"] or ""),
@@ -2850,27 +2859,23 @@ def _grouped_source_words(rows, group_by, branch_totals):
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _source_word_erd_summaries(sources, source_words, report):
-    """Resolve each word's own ERD, folding it only when it is not stored.
+def _source_word_erd_summaries(sources, source_words, report, cache,
+                               all_answers):
+    """Resolve each word's own ERD, reusing folds until the cache changes.
 
     A source word's ERD is the whole point of queueing it.  It is derived from
     the cached result of each of the word's response groups, the same way the
     word report derives it for one word, and a word whose whole tree is solved
     keeps its folded value in `candidate_erd_by_policy` so later pages read one
-    row instead of re-folding ~150 groups.  Only the words on the page are
-    resolved, so the cost is bounded by the page size rather than by how much
-    is queued.
+    row instead of re-folding ~150 groups.  ERD order requires every visible
+    source word's summary; unchanged cache files reuse the previous fold.
     """
     summaries = {}
     if not source_words:
         return summaries
-    cache = None
     try:
-        all_answers = load_word_list(sources.answer_list_path)
         response_cache = ResponseCache(all_answers, score_cache=None)
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        cache_version = os.stat(sources.cache_path).st_mtime_ns
         # A root word spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
         # Source words are always openers, so every one folds against the same
@@ -2878,6 +2883,11 @@ def _source_word_erd_summaries(sources, source_words, report):
         root_branch_key = ScoreCache.encode_subset(all_answers)
         for word in source_words:
             if word is None:
+                continue
+            cache_key = (sources.cache_path, cache_version, word)
+            cached_summary = _SOURCE_ERD_SUMMARY_CACHE.get(cache_key)
+            if cached_summary is not None:
+                summaries[word] = cached_summary
                 continue
             groups = response_cache.group_words(word, all_answers)
             group_rows = []
@@ -2895,7 +2905,7 @@ def _source_word_erd_summaries(sources, source_words, report):
             states = cache.report_branch_states(
                 branch_keys, ERD_ALL, group_budget
             )
-            summaries[word] = _resolved_candidate_erd(
+            summary = _resolved_candidate_erd(
                 cache, root_branch_key, word, ERD_ALL,
                 [
                     {
@@ -2911,12 +2921,11 @@ def _source_word_erd_summaries(sources, source_words, report):
                 ],
                 group_budget,
             )
+            _SOURCE_ERD_SUMMARY_CACHE[cache_key] = summary
+            summaries[word] = summary
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
-    finally:
-        if cache is not None:
-            cache.close()
     return summaries
 
 
@@ -3020,39 +3029,39 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         # each word's own totals are complete whichever word is in scope.
         all_membership_rows = queue.source_membership_rows()
         rollups = _source_rollups(all_membership_rows)
-        timing_cache = None
+        all_answers = None
         try:
             all_answers = load_word_list(sources.answer_list_path)
             timing_cache = ScoreCache(sources.cache_path, all_answers,
                                       checkpoint_on_close=False)
             timings = timing_cache.completed_source_summary_map(ERD_ALL)
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError) as error:
             timings = {}
-        finally:
-            if timing_cache is not None:
-                timing_cache.close()
+            report["sources"]["cache"]["error"] = str(error)
         collapsed = [
             _source_summary_payload(
                 row, rollups[(_row_value(row, "source_word") or "").lower() or None],
                 timings.get(
                     (_row_value(row, "source_word") or "").lower() or None,
-                    {"elapsed_millis": None, "worker_millis": None},
+                    {"completed_at": None, "elapsed_millis": None,
+                     "worker_millis": None},
                 ),
             )
             for row in summary_rows
         ]
         source_sort = request.filters.sort or "erd"
-        if source_sort == "erd":
-            erd_summaries = _source_word_erd_summaries(
-                sources, [row["source_word"] for row in collapsed], report
-            )
-            for row in collapsed:
-                row["erd_summary"] = erd_summaries.get(row["source_word"])
         data["total_source_word_count"] = len(collapsed)
         source_states = request.filters.source_states
         if source_states:
             collapsed = [row for row in collapsed
                          if row["state"] in source_states]
+        if source_sort in ("default", "erd") and timing_cache is not None:
+            erd_summaries = _source_word_erd_summaries(
+                sources, [row["source_word"] for row in collapsed], report,
+                timing_cache, all_answers,
+            )
+            for row in collapsed:
+                row["erd_summary"] = erd_summaries.get(row["source_word"])
         collapsed = _sorted_source_words(collapsed, source_sort)
         data["matched_source_word_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
@@ -3087,9 +3096,10 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             else collapsed[offset:]
         )
         # Folded for the page only, and attached to the rows it describes.
-        if source_sort != "erd":
+        if source_sort not in ("default", "erd") and timing_cache is not None:
             erd_summaries = _source_word_erd_summaries(
-                sources, [row["source_word"] for row in data["summary"]], report
+                sources, [row["source_word"] for row in data["summary"]], report,
+                timing_cache, all_answers,
             )
             for row in data["summary"]:
                 row["erd_summary"] = erd_summaries.get(row["source_word"])
@@ -3133,6 +3143,8 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
+        if timing_cache is not None:
+            timing_cache.close()
         if queue is not None:
             queue.close()
     return report

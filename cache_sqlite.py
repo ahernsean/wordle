@@ -939,7 +939,7 @@ class ScoreCache:
                            policy, candidate_word, exc)
 
     def completed_source_summary_map(self, policy):
-        return {row["source_word"]: dict(row) for row in self._conn.execute("""
+        return {row["source_word"].lower(): dict(row) for row in self._conn.execute("""
             SELECT source_word, completed_at, elapsed_millis, worker_millis
             FROM completed_source_summaries
             WHERE policy = ? AND answer_list_id = ?
@@ -947,13 +947,19 @@ class ScoreCache:
 
     def write_completed_source_summary(self, source_word, policy, completed_at,
                                        elapsed_millis, worker_millis):
-        self._conn.execute("""
-            INSERT OR REPLACE INTO completed_source_summaries
-                (source_word, policy, answer_list_id, completed_at,
-                 elapsed_millis, worker_millis)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (source_word, policy, self.answer_list_id, completed_at,
-              elapsed_millis, worker_millis))
+        try:
+            self._conn.execute("""
+                INSERT OR REPLACE INTO completed_source_summaries
+                    (source_word, policy, answer_list_id, completed_at,
+                     elapsed_millis, worker_millis)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (source_word.lower(), policy, self.answer_list_id, completed_at,
+                  elapsed_millis, worker_millis))
+        except sqlite3.OperationalError as exc:
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("write_completed_source_summary(%s, %s) failed: %s",
+                           source_word, policy, exc)
 
     def last_write_ts(self):
         """Return the unix timestamp of the most recent ERD write, or None."""

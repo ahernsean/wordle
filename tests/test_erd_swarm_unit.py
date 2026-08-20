@@ -3168,6 +3168,38 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
         w.queue.mark_done.assert_called_once_with(key)
         w.queue.delete_branch.assert_called_once_with(key)
 
+    def test_branch_cleanup_snapshots_the_source_that_just_completed(self):
+        w = self._finalizing_worker()
+        key = b"branch-key"
+        w.queue.delete_branch.return_value = ["salet"]
+        w._snapshot_completed_sources = mock.MagicMock()
+        with mock.patch.object(erd_swarm, "cache_all_scores"):
+            w.maybe_finalize(key, BRANCH, len(BRANCH))
+        w._snapshot_completed_sources.assert_called_once_with(["salet"])
+
+
+class TestCompletedSourceSnapshots(unittest.TestCase):
+    def test_snapshot_skips_empty_completion_lists_without_queue_aggregation(self):
+        worker = _bare_worker()
+
+        worker._snapshot_completed_sources(None)
+
+        worker.queue.completed_source_timing.assert_not_called()
+        worker.queue.source_word_rows.assert_not_called()
+
+    def test_snapshot_persists_the_completed_source_timing(self):
+        worker = _bare_worker()
+        worker.queue.completed_source_timing.return_value = {
+            "first_created_at": 100,
+            "completed_at": 160,
+            "worker_millis": 2_000,
+        }
+
+        worker._snapshot_completed_sources(["SALET"])
+
+        worker.score_cache.write_completed_source_summary.assert_called_once_with(
+            "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000)
+
 
 class TestSubbranchSolverForwardsCeiling(unittest.TestCase):
     """_subbranch_solver passes the frame's ceiling through to

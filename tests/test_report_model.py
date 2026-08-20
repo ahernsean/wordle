@@ -1351,6 +1351,11 @@ class SourceReportTest(unittest.TestCase):
              self._source_words(sort="erd")["summary"]])
         self.assertEqual(
             [row["source_word"] for row in
+             self._source_words(sort="default")["summary"]],
+            [row["source_word"] for row in
+             self._source_words(sort="erd")["summary"]])
+        self.assertEqual(
+            [row["source_word"] for row in
              self._source_words(sort="priority")["summary"]],
             ["crane", "salet", "nurdy"])
         self.assertEqual(
@@ -1369,6 +1374,10 @@ class SourceReportTest(unittest.TestCase):
             [row["source_word"] for row in
              self._source_words(sort="requested")["summary"]],
             ["crane", "nurdy", "salet"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="age")["summary"]],
+            ["salet", "nurdy", "crane"])
 
     def test_source_timing_fields_and_sorts_roll_up_finalized_branches(self):
         self._queue_words(("salet", 5, 1), ("crane", 3, 1), ("nurdy", 1, 1))
@@ -1383,6 +1392,7 @@ class SourceReportTest(unittest.TestCase):
             crane_key, "CRANE -----", 3, 3, 20, 30, 100, 1,
             total_bundle_wall_millis=5_000,
         )
+        queue.mark_done(crane_key)
         queue.close()
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write_completed_source_summary("salet", ERD_ALL, 40, 30_000, 2_000)
@@ -1394,6 +1404,7 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(rows["salet"]["worker_millis"], 2_000)
         self.assertEqual(rows["crane"]["elapsed_millis"], 10_000)
         self.assertEqual(rows["crane"]["worker_millis"], 5_000)
+        self.assertEqual(rows["crane"]["completed_at"], 30)
         self.assertIsNone(rows["nurdy"]["elapsed_millis"])
         self.assertIsNone(rows["nurdy"]["worker_millis"])
         self.assertEqual(
@@ -1593,9 +1604,8 @@ class SourceReportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source reports must be"):
             validate_report_request(ReportRequest(
                 report_kind="sources", filters=ReportFilters(sort="nodes")))
-        with self.assertRaisesRegex(ValueError, "source reports must be"):
-            validate_report_request(ReportRequest(
-                report_kind="sources", filters=ReportFilters(sort="age")))
+        validate_report_request(ReportRequest(
+            report_kind="sources", filters=ReportFilters(sort="age")))
         with self.assertRaisesRegex(ValueError, "source reports must be"):
             validate_report_request(ReportRequest(
                 report_kind="sources",
