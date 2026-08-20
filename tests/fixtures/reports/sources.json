@@ -46,6 +46,8 @@
         "worker_count": 3,
         "direct_branch_count": 12,
         "direct_done_branch_count": 3,
+        "elapsed_millis": 120000,
+        "worker_millis": 240000,
         "erd_summary": {
           "state": "pending",
           "erd": null,
@@ -68,6 +70,8 @@
         "worker_count": 1,
         "direct_branch_count": 4,
         "direct_done_branch_count": 4,
+        "elapsed_millis": 180000,
+        "worker_millis": 360000,
         "erd_summary": {
           "state": "complete",
           "erd": 3.4207,
@@ -90,6 +94,8 @@
         "worker_count": 0,
         "direct_branch_count": 2,
         "direct_done_branch_count": 2,
+        "elapsed_millis": 480000,
+        "worker_millis": 600000,
         "erd_summary": {
           "state": "complete",
           "erd": 3.3891,
@@ -117,6 +123,8 @@
             "worker_count": 3,
             "direct_branch_count": 12,
             "direct_done_branch_count": 3,
+            "elapsed_millis": 120000,
+            "worker_millis": 240000,
             "erd_summary": {
               "state": "pending",
               "erd": null,
@@ -139,6 +147,8 @@
             "worker_count": 1,
             "direct_branch_count": 4,
             "direct_done_branch_count": 4,
+            "elapsed_millis": 180000,
+            "worker_millis": 360000,
             "erd_summary": {
               "state": "complete",
               "erd": 3.4207,
@@ -173,6 +183,8 @@
             "worker_count": 0,
             "direct_branch_count": 2,
             "direct_done_branch_count": 2,
+            "elapsed_millis": 480000,
+            "worker_millis": 600000,
             "erd_summary": {
               "state": "complete",
               "erd": 3.3891,

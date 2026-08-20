@@ -3038,6 +3038,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("1,211 open", metrics)
         request_text = " ".join(requests.first.inner_text().split())
         self.assertIn("priority 5", request_text)
+        self.assertIn("elapsed 2m", request_text)
+        self.assertIn("worker time 4m", request_text)
         self.assertIn("1,240 branches", request_text)
         self.assertIn("1,203 open", request_text)
         self.assertIn("37 done", request_text)
@@ -3049,6 +3051,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         complete_text = " ".join(
             requests.filter(has_text="CRANE").inner_text().split())
         self.assertIn("completed 8m ago", complete_text)
+        self.assertIn("elapsed 8m", complete_text)
+        self.assertIn("worker time 10m", complete_text)
+        self.assertNotIn("priority 1", complete_text)
+        self.assertNotIn("0 open", complete_text)
 
     def test_sources_progress_separates_no_work_from_completed_work(self):
         self.open_sources()
@@ -3119,8 +3125,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
-            ["", "completed", "priority", "requested", "word", "branches",
-             "open", "done", "workers"])
+            ["", "completed", "elapsed", "worker_time", "priority",
+             "requested", "word", "branches", "open", "done", "workers"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):
         result = self.page.evaluate("""() => ({

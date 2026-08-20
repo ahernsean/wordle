@@ -1370,6 +1370,39 @@ class SourceReportTest(unittest.TestCase):
              self._source_words(sort="requested")["summary"]],
             ["crane", "nurdy", "salet"])
 
+    def test_source_timing_fields_and_sorts_roll_up_finalized_branches(self):
+        self._queue_words(("salet", 5, 1), ("crane", 3, 1), ("nurdy", 1, 1))
+        queue = self._open_queue()
+        salet_key = ScoreCache.encode_subset(ANSWERS[:2] + ["salet0000"])
+        crane_key = ScoreCache.encode_subset(ANSWERS[:2] + ["crane0000"])
+        queue.add_branch_finalize_log(
+            salet_key, "SALET -----", 3, 3, 10, 40, 100, 1,
+            total_bundle_wall_millis=2_000,
+        )
+        queue.add_branch_finalize_log(
+            crane_key, "CRANE -----", 3, 3, 20, 30, 100, 1,
+            total_bundle_wall_millis=5_000,
+        )
+        queue.close()
+
+        rows = {row["source_word"]: row for row in self._source_words()["summary"]}
+        self.assertEqual(rows["salet"]["elapsed_millis"], 30_000)
+        self.assertEqual(rows["salet"]["worker_millis"], 2_000)
+        self.assertEqual(rows["crane"]["elapsed_millis"], 10_000)
+        self.assertEqual(rows["crane"]["worker_millis"], 5_000)
+        self.assertIsNone(rows["nurdy"]["elapsed_millis"])
+        self.assertIsNone(rows["nurdy"]["worker_millis"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="elapsed")["summary"]],
+            ["salet", "crane", "nurdy"],
+        )
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="worker_time")["summary"]],
+            ["crane", "salet", "nurdy"],
+        )
+
     def test_each_source_word_carries_its_own_erd(self):
         # A word's ERD is why it was queued.  It is derived from the word's
         # cached response groups, and kept once the whole tree is solved.

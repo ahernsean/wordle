@@ -129,11 +129,14 @@ GROUP_BY_STRATEGIES = (
 SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
 SOURCE_SORT_FIELDS = (
     "default", "word", "priority", "branches", "open", "done", "workers",
-    "completed", "erd", "requested",
+    "completed", "erd", "requested", "elapsed", "worker_time",
 )
 # Sorts that only a source report can serve, so another report asking for one
 # is rejected rather than quietly sorted some other way.
-SOURCE_ONLY_SORT_FIELDS = ("word", "branches", "open", "done", "completed", "erd", "requested")
+SOURCE_ONLY_SORT_FIELDS = (
+    "word", "branches", "open", "done", "completed", "erd", "requested",
+    "elapsed", "worker_time",
+)
 _SOURCE_STATE_GROUP_ORDER = {"active": 0, "queued": 1, "complete": 2}
 _STATUS_GROUP_ORDER = {"active": 0, "pending": 1, "done": 2, "unqueued": 3}
 _ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
@@ -2712,7 +2715,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
-def _source_summary_payload(row, rollup):
+def _source_summary_payload(row, rollup, timing):
     """One source word, with its requests and branches rolled up.
 
     This is the report's unit: a word that spawned a thousand branches is one
@@ -2745,6 +2748,8 @@ def _source_summary_payload(row, rollup):
         "open_branch_count": open_branch_count,
         "done_branch_count": max(0, branch_count - open_branch_count),
         "worker_count": rollup["worker_count"],
+        "elapsed_millis": timing["elapsed_millis"],
+        "worker_millis": timing["worker_millis"],
     }
 
 
@@ -2774,6 +2779,12 @@ _SOURCE_SORT_KEYS = {
                                if row["requested_at"] is not None else float("inf"),
                                row["source_word"] or ""),
     "erd": lambda row: _source_erd_sort_key(row),
+    "elapsed": lambda row: (-(row["elapsed_millis"] or 0)
+                            if row["elapsed_millis"] is not None else float("inf"),
+                            row["source_word"] or ""),
+    "worker_time": lambda row: (-(row["worker_millis"] or 0)
+                                if row["worker_millis"] is not None else float("inf"),
+                                row["source_word"] or ""),
 }
 
 
@@ -2789,8 +2800,7 @@ def _source_erd_sort_key(row):
 
 
 def _sorted_source_words(rows, sort):
-    """Order the collapsed rows.  The default is the queue's own order:
-    highest requested priority first, which is the order they are served in."""
+    """Order collapsed source-word rows by the requested source-report field."""
     key = _SOURCE_SORT_KEYS.get(sort or "default")
     return sorted(rows, key=key) if key is not None else rows
 
@@ -3010,9 +3020,30 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         # each word's own totals are complete whichever word is in scope.
         all_membership_rows = queue.source_membership_rows()
         rollups = _source_rollups(all_membership_rows)
+        timing_rows = queue.source_word_timing_rows()
+        timings = {}
+        for timing_row in timing_rows:
+            first_created_at = timing_row["first_created_at"]
+            if first_created_at is None:
+                elapsed_millis = None
+            else:
+                latest_at = (generated_at if timing_row["open_branch_count"]
+                             else timing_row["last_finalized_at"])
+                elapsed_millis = (
+                    (latest_at - first_created_at) * 1000
+                    if latest_at is not None else None
+                )
+            timings[(timing_row["source_word"] or "").lower() or None] = {
+                "elapsed_millis": elapsed_millis,
+                "worker_millis": timing_row["worker_millis"],
+            }
         collapsed = [
             _source_summary_payload(
-                row, rollups[(_row_value(row, "source_word") or "").lower() or None]
+                row, rollups[(_row_value(row, "source_word") or "").lower() or None],
+                timings.get(
+                    (_row_value(row, "source_word") or "").lower() or None,
+                    {"elapsed_millis": None, "worker_millis": None},
+                ),
             )
             for row in summary_rows
         ]

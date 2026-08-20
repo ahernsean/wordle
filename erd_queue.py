@@ -681,6 +681,9 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     recorded_at             INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS telemetry.idx_branch_finalize_log_branch_key
+    ON branch_finalize_log(branch_key);
+
 -- One row per re-solve forced by a cut: a consumer needed branch_key but the
 -- only known result was a cut whose bound (or budget validity) could not
 -- satisfy it.  The cost side of the ceiling-propagation ledger — how often a
@@ -4862,6 +4865,73 @@ class ERDQueue:
             LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
             GROUP BY s.source_word
             ORDER BY MAX(s.requested_priority) DESC, s.source_word
+        """).fetchall()
+
+    def source_word_timing_rows(self):
+        """Return elapsed and summed worker time for each source word.
+
+        A branch can have more than one request from the same source word, so
+        each finalized branch and each active branch contributes once per word.
+        Finalized bundle spans are durable telemetry; active work extends the
+        elapsed interval but has no completed bundle time yet.
+        """
+        return self._conn.execute("""
+            WITH finalized AS (
+                SELECT DISTINCT source.source_word,
+                       finalization.id AS finalization_id,
+                       finalization.created_at,
+                       finalization.finalized_at,
+                       finalization.total_bundle_wall_millis
+                FROM branch_source_work AS membership
+                JOIN source_work AS source
+                  ON source.source_work_id = membership.source_work_id
+                JOIN branches AS branch ON branch.branch_id = membership.branch_id
+                JOIN telemetry.branch_finalize_log AS finalization
+                  ON finalization.branch_key = branch.branch_key
+            ), active AS (
+                SELECT DISTINCT source.source_word,
+                       branch.branch_id,
+                       branch.created_at
+                FROM branch_source_work AS membership
+                JOIN source_work AS source
+                  ON source.source_work_id = membership.source_work_id
+                JOIN active_branches AS branch ON branch.branch_id = membership.branch_id
+                WHERE branch.status = 'open'
+            ), finalization_totals AS (
+                SELECT source_word,
+                       MIN(created_at) AS first_created_at,
+                       MAX(finalized_at) AS last_finalized_at,
+                       SUM(COALESCE(total_bundle_wall_millis, 0)) AS worker_millis
+                FROM finalized
+                GROUP BY source_word
+            ), active_totals AS (
+                SELECT source_word,
+                       MIN(created_at) AS first_created_at,
+                       COUNT(*) AS open_branch_count
+                FROM active
+                GROUP BY source_word
+            ), words AS (
+                SELECT source_word FROM finalization_totals
+                UNION
+                SELECT source_word FROM active_totals
+            )
+            SELECT words.source_word,
+                   CASE
+                       WHEN finalization_totals.first_created_at IS NULL
+                       THEN active_totals.first_created_at
+                       WHEN active_totals.first_created_at IS NULL
+                       THEN finalization_totals.first_created_at
+                       ELSE MIN(finalization_totals.first_created_at,
+                                active_totals.first_created_at)
+                   END AS first_created_at,
+                   finalization_totals.last_finalized_at,
+                   COALESCE(finalization_totals.worker_millis, 0) AS worker_millis,
+                   COALESCE(active_totals.open_branch_count, 0) AS open_branch_count
+            FROM words
+            LEFT JOIN finalization_totals
+              ON finalization_totals.source_word = words.source_word
+            LEFT JOIN active_totals ON active_totals.source_word = words.source_word
+            ORDER BY words.source_word
         """).fetchall()
 
     def distinct_branch_count_for_words(self, source_words):
