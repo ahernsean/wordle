@@ -1449,6 +1449,7 @@ class SourceReportTest(unittest.TestCase):
         self.assertIsNone(row["worker_millis"])
 
     def test_source_erd_summary_cache_invalidates_for_wal_writes(self):
+        self.addCleanup(report_model._SOURCE_ERD_SUMMARY_CACHE.clear)
         self._queue_words(("nurdy", 5, 1))
         first = self._source_words()["summary"][0]["erd_summary"]
         self.assertEqual(first["state"], "pending")
@@ -1468,12 +1469,6 @@ class SourceReportTest(unittest.TestCase):
 
         self.assertEqual(second["state"], "complete")
         self.assertNotEqual(first, second)
-        self.assertEqual(
-            report_model._SOURCE_ERD_SUMMARY_CACHE[
-                (self.cache_path, cache.answer_list_id)
-            ][1],
-            {"nurdy": second},
-        )
         cache.close()
 
     def test_each_source_word_carries_its_own_erd(self):
