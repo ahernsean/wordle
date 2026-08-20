@@ -150,7 +150,7 @@ produce the same response pattern to a given guess). Do not call them
 "subgroups" — that was old vocabulary for what is now "branch."
 
 **A longer spine is not a "nested" one.** A spine is a sequence of (guess,
-pattern) pairs; how many it holds is its `guess_depth`. `PENIS -y--- LUBES` is
+pattern) pairs; how many it holds is its `guess_depth`. `SCOPE -y--- LUBES` is
 a spine at guess_depth 2, not a word nested inside a spine — nothing is
 contained in anything. Say "a spine of more than one guess", "a deeper spine",
 or name the `guess_depth` outright.

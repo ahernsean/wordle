@@ -1434,7 +1434,7 @@ class SourceReportTest(unittest.TestCase):
 
     def test_source_offset_pages_through_the_words(self):
         self._queue_words(*[(word, 5, 1) for word in
-                            ("salet", "crane", "nurdy", "khaki", "penis")])
+                            ("salet", "crane", "nurdy", "khaki", "scope")])
 
         pages = [
             self._source_words(sort="word", limit=2, source_offset=offset)
@@ -1443,7 +1443,7 @@ class SourceReportTest(unittest.TestCase):
 
         self.assertEqual(
             [[row["source_word"] for row in page["summary"]] for page in pages],
-            [["crane", "khaki"], ["nurdy", "penis"], ["salet"], []],
+            [["crane", "khaki"], ["nurdy", "salet"], ["scope"], []],
         )
         # Every page reports the same matched total and its own start, which
         # is what lets a client know it has more to page through.

@@ -1179,9 +1179,9 @@ class TestClaimNext(_TmpQueue):
     def test_clear_removes_source_work_before_readding_shared_root(self):
         self.q.add_pending_many([(self.key, len(WORDS), 999, "audio", 0)])
         self.q.clear()
-        self.q.add_pending_many([(self.key, len(WORDS), 1, "penis", 0)])
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "scope", 0)])
         claimed = self.q.claim_next("worker-0")
-        self.assertEqual(claimed["source_word"], "penis")
+        self.assertEqual(claimed["source_word"], "scope")
         self.assertEqual(claimed["priority"], 1)
 
     def test_remove_pending_removes_source_work_membership(self):

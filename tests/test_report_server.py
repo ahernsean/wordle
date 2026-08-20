@@ -509,9 +509,9 @@ class SourcesRequestTest(unittest.TestCase):
 class RootProgressRequestTest(unittest.TestCase):
     def test_bare_word_target_is_accepted(self):
         request = parse_report_request(
-            "/api/view/root-progress", "branch_target=PENIS")
+            "/api/view/root-progress", "branch_target=SCOPE")
         self.assertEqual(request.report_kind, "root_progress")
-        self.assertEqual(request.branch_target.trailing_word, "penis")
+        self.assertEqual(request.branch_target.trailing_word, "scope")
         self.assertEqual(request.branch_target.steps, ())
 
     def test_spine_with_more_than_one_guess_is_accepted(self):
@@ -537,9 +537,9 @@ class RootProgressRequestTest(unittest.TestCase):
         # so a forwarded parameter fails the whole panel rather than being
         # dropped.
         for query in (
-            "branch_target=PENIS&group_by=worker_presence",
-            "branch_target=PENIS&by=nodes",
-            "branch_target=PENIS&worker=worker-1",
+            "branch_target=SCOPE&group_by=worker_presence",
+            "branch_target=SCOPE&by=nodes",
+            "branch_target=SCOPE&worker=worker-1",
         ):
             with self.subTest(query=query):
                 with self.assertRaises(InvalidRequest):

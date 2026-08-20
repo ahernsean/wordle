@@ -562,7 +562,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_root_progress_headline_omits_states_with_no_groups(self):
         # A zero is noise on a phone, and its absence already says the state is
-        # empty.  PENIS currently has nothing waiting.
+        # empty.  SCOPE currently has nothing waiting.
         text = self.page.evaluate("""() => renderRootProgressHeadline({
           totals:{state_counts:{working:79, solved:38}},
           work_started_at:1785575213, estimate:null,
@@ -621,7 +621,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             branch_target = (
                 tile.get_attribute("aria-label")
                 .removeprefix("Open ").removesuffix(" branch report"))
-            self.assertEqual(branch_target, "SALET ----- CRANE -y---")
+            self.assertEqual(branch_target, "SALET ----- CRANE ----y")
             tile.click()
             self.page.wait_for_selector("text=branch report")
             self.assertEqual(
@@ -705,7 +705,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # fixture server ignores query parameters, so this asserts on the URL
         # the client builds; test_report_server pins the server side.
         url = self.page.evaluate("""() => rootProgressURL({
-          branch_target:'PENIS', kind:'auto', tree:false,
+          branch_target:'SCOPE', kind:'auto', tree:false,
           group_by:'worker_presence', sort:'size', limit:25,
           branch_status:['active'], branch_phase:['evaluating'],
           minimum_answer_count:5, maximum_answer_count:500, budget:5,
@@ -713,7 +713,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           worker_id:'worker-1', finalization_cursor:'abc', tree_cursor:'def',
           answers:true, claims:true, epoch:null,
         })""")
-        self.assertEqual(url, "/api/view/root-progress?branch_target=PENIS")
+        self.assertEqual(url, "/api/view/root-progress?branch_target=SCOPE")
 
     def test_root_progress_panel_shows_open_groups_as_started(self):
         # A group whose first branch is still open is being worked right now.

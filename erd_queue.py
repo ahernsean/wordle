@@ -4131,7 +4131,7 @@ class ERDQueue:
         """Per-response-group work totals for one spine, plus live rates.
 
         `spine_prefix` is any spine ending in a word: a bare root word such as
-        `PENIS`, or a deeper one such as `PENIS -y--- LUBES`.  Rolls up
+        `SCOPE`, or a deeper one such as `SCOPE -y--- LUBES`.  Rolls up
         telemetry.branch_finalize_log by the response pattern that follows the
         prefix, so every descendant's cost is attributed to the group it sits
         under.  The rollup is a scan over the epoch's rows
