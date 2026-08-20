@@ -3008,7 +3008,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def open_sources(self):
         self.page.locator("[data-kind=sources]").click()
-        self.page.wait_for_selector("text=sources report")
+        self.page.wait_for_selector("#report h1:text-is('sources report')")
 
     def test_sources_view_collapses_every_word_to_one_card(self):
         # The report's unit is the source word: three queued roots owning 1,376
