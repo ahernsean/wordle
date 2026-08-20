@@ -129,10 +129,11 @@ GROUP_BY_STRATEGIES = (
 SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
 SOURCE_SORT_FIELDS = (
     "default", "word", "priority", "branches", "open", "done", "workers", "age",
+    "completed", "erd", "requested",
 )
 # Sorts that only a source report can serve, so another report asking for one
 # is rejected rather than quietly sorted some other way.
-SOURCE_ONLY_SORT_FIELDS = ("word", "branches", "open", "done")
+SOURCE_ONLY_SORT_FIELDS = ("word", "branches", "open", "done", "completed", "erd", "requested")
 _SOURCE_STATE_GROUP_ORDER = {"active": 0, "queued": 1, "complete": 2}
 _STATUS_GROUP_ORDER = {"active": 0, "pending": 1, "done": 2, "unqueued": 3}
 _ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
@@ -2732,9 +2733,11 @@ def _source_summary_payload(row, rollup):
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
+        "_completed_at": _row_value(row, "completed_at"),
         "request_count": row["request_count"] or 0,
         "state": _merged_source_state(row),
         "direct_branch_count": row["direct_branch_count"] or 0,
+        "direct_done_branch_count": row["direct_done_branch_count"] or 0,
         "branch_count": branch_count,
         "open_branch_count": open_branch_count,
         "done_branch_count": max(0, branch_count - open_branch_count),
@@ -2764,7 +2767,25 @@ _SOURCE_SORT_KEYS = {
     # Oldest request first: the word that has been waiting longest leads.
     "age": lambda row: (row["requested_at"] if row["requested_at"] is not None
                         else float("inf"), row["source_word"] or ""),
+    "completed": lambda row: (-(row["_completed_at"] or 0)
+                               if row["_completed_at"] is not None else float("inf"),
+                               row["source_word"] or ""),
+    "requested": lambda row: (-(row["requested_at"] or 0)
+                               if row["requested_at"] is not None else float("inf"),
+                               row["source_word"] or ""),
+    "erd": lambda row: _source_erd_sort_key(row),
 }
+
+
+def _source_erd_sort_key(row):
+    summary = row.get("erd_summary")
+    if not summary:
+        return (3, float("inf"), row["source_word"] or "")
+    if summary["state"] == "complete":
+        return (0, summary["erd"], row["source_word"] or "")
+    if summary["state"] == "pending":
+        return (1, float("inf"), row["source_word"] or "")
+    return (2, float("inf"), row["source_word"] or "")
 
 
 def _sorted_source_words(rows, sort):
@@ -2995,6 +3016,12 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             )
             for row in summary_rows
         ]
+        if request.filters.sort == "erd":
+            erd_summaries = _source_word_erd_summaries(
+                sources, [row["source_word"] for row in collapsed], report
+            )
+            for row in collapsed:
+                row["erd_summary"] = erd_summaries.get(row["source_word"])
         data["total_source_word_count"] = len(collapsed)
         source_states = request.filters.source_states
         if source_states:
@@ -3034,16 +3061,19 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             else collapsed[offset:]
         )
         # Folded for the page only, and attached to the rows it describes.
-        erd_summaries = _source_word_erd_summaries(
-            sources, [row["source_word"] for row in data["summary"]], report
-        )
-        for row in data["summary"]:
-            row["erd_summary"] = erd_summaries.get(row["source_word"])
+        if request.filters.sort != "erd":
+            erd_summaries = _source_word_erd_summaries(
+                sources, [row["source_word"] for row in data["summary"]], report
+            )
+            for row in data["summary"]:
+                row["erd_summary"] = erd_summaries.get(row["source_word"])
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_source_words(
                 data["summary"], group_by, branch_totals
             )
+        for row in collapsed:
+            row.pop("_completed_at", None)
 
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they

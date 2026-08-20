@@ -44,6 +44,7 @@
         "done_branch_count": 37,
         "worker_count": 3,
         "direct_branch_count": 12,
+        "direct_done_branch_count": 3,
         "erd_summary": {
           "state": "pending",
           "erd": null,

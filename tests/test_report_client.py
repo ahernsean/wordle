@@ -3043,11 +3043,34 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("37 done", request_text)
         self.assertIn("12 direct", request_text)
         self.assertIn("3 workers", request_text)
-        self.assertIn("Pick a word to list the branches it owns.",
-                      self.page.locator("#report").inner_text())
         # A word queued more than once is still one card, and says so rather
         # than splitting into a card per request.
         self.assertIn("2 requests", request_text)
+
+    def test_sources_progress_separates_no_work_from_completed_work(self):
+        self.open_sources()
+        progress = self.page.locator(".card.source-word .source-group-progress").first
+        segments = self.page.eval_on_selector_all(
+                ".card.source-word .source-group-progress:first-of-type > span",
+                "spans => spans.map(span => ({className: span.className, width: Number.parseFloat(span.style.width)}))",
+            )[:2]
+        self.assertEqual([segment["className"] for segment in segments],
+                         ["no-work", ""])
+        self.assertAlmostEqual(segments[0]["width"], 100 * 136 / 148, places=4)
+        self.assertAlmostEqual(segments[1]["width"], 100 * 3 / 148, places=4)
+        segment_boxes = self.page.locator(
+            ".card.source-word .source-group-progress:first-of-type > span"
+        ).evaluate_all("spans => spans.slice(0, 2).map(span => { const box = span.getBoundingClientRect(); return {left: box.left, top: box.top, width: box.width}; })")
+        self.assertEqual(segment_boxes[0]["top"], segment_boxes[1]["top"])
+        self.assertAlmostEqual(
+            segment_boxes[0]["left"] + segment_boxes[0]["width"],
+            segment_boxes[1]["left"],
+            places=2,
+        )
+        self.assertEqual(
+            progress.get_attribute("title"),
+            "136 response groups need no work; 3 of 12 work groups completed",
+        )
 
     def test_sources_controls_offer_source_axes_not_branch_ones(self):
         self.open_sources()
@@ -3071,10 +3094,15 @@ class ReportClientBrowserTest(unittest.TestCase):
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")
+        self.assertIn(
+            "sorted by priority (highest to lowest)",
+            self.page.locator("#report").inner_text(),
+        )
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
-            ["", "word", "branches", "open", "done", "workers", "age"])
+            ["", "completed", "erd", "requested", "word", "branches",
+             "open", "done", "workers", "age"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):
         result = self.page.evaluate("""() => ({
@@ -3289,12 +3317,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = " ".join(self.page.locator("#report").inner_text().split())
         self.assertIn("SALET owns no live branches", text)
         self.assertNotIn("Pick a word", text)
-        # Unpicked still points the way in.  Waited for rather than asserted
-        # outright: the applied payload above already rendered a sources
-        # report, so "sources report" is on screen before the refetch lands.
+        # The unfiltered view no longer carries a prompt for an action that is
+        # not required to understand the source-word cards.
         self.open_sources()
-        self.page.wait_for_selector(
-            "text=Pick a word to list the branches it owns.")
+        self.assertNotIn(
+            "Pick a word", self.page.locator("#report").inner_text())
 
     def test_sources_metrics_count_a_branch_two_words_own_once(self):
         # The totals come from the model, which counts each branch once; the

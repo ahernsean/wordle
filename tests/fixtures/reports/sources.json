@@ -44,6 +44,7 @@
         "done_branch_count": 37,
         "worker_count": 3,
         "direct_branch_count": 12,
+        "direct_done_branch_count": 3,
         "erd_summary": {
           "state": "pending",
           "erd": null,
@@ -64,6 +65,7 @@
         "done_branch_count": 88,
         "worker_count": 1,
         "direct_branch_count": 4,
+        "direct_done_branch_count": 4,
         "erd_summary": {
           "state": "complete",
           "erd": 3.4207,
@@ -84,6 +86,7 @@
         "done_branch_count": 40,
         "worker_count": 0,
         "direct_branch_count": 2,
+        "direct_done_branch_count": 2,
         "erd_summary": {
           "state": "complete",
           "erd": 3.3891,
@@ -109,6 +112,7 @@
             "done_branch_count": 37,
             "worker_count": 3,
             "direct_branch_count": 12,
+            "direct_done_branch_count": 3,
             "erd_summary": {
               "state": "pending",
               "erd": null,
@@ -129,6 +133,7 @@
             "done_branch_count": 88,
             "worker_count": 1,
             "direct_branch_count": 4,
+            "direct_done_branch_count": 4,
             "erd_summary": {
               "state": "complete",
               "erd": 3.4207,
@@ -161,6 +166,7 @@
             "done_branch_count": 40,
             "worker_count": 0,
             "direct_branch_count": 2,
+            "direct_done_branch_count": 2,
             "erd_summary": {
               "state": "complete",
               "erd": 3.3891,

@@ -1335,6 +1335,14 @@ class SourceReportTest(unittest.TestCase):
 
     def test_source_sorts_order_by_the_column_named(self):
         self._queue_words(("salet", 5, 3), ("crane", 9, 1), ("nurdy", 1, 7))
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE source_work SET requested_at = CASE source_word "
+            "WHEN 'salet' THEN 100 WHEN 'crane' THEN 300 "
+            "WHEN 'nurdy' THEN 200 END"
+        )
+        queue._conn.commit()
+        queue.close()
 
         # The default is the order the queue serves them in: priority first.
         self.assertEqual(
@@ -1352,6 +1360,10 @@ class SourceReportTest(unittest.TestCase):
             [row["source_word"] for row in
              self._source_words(sort="open")["summary"]],
             ["nurdy", "salet", "crane"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="requested")["summary"]],
+            ["crane", "nurdy", "salet"])
 
     def test_each_source_word_carries_its_own_erd(self):
         # A word's ERD is why it was queued.  It is derived from the word's

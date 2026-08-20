@@ -4844,6 +4844,7 @@ class ERDQueue:
             SELECT s.source_word,
                    MIN(s.requested_at) AS requested_at,
                    MAX(s.requested_priority) AS requested_priority,
+                   MAX(COALESCE(m.resolved_at, p.completed_at)) AS completed_at,
                    COUNT(DISTINCT s.source_work_id) AS request_count,
                    MAX(s.state = 'active') AS has_active_request,
                    MAX(s.state != 'complete') AS has_incomplete_request,
@@ -4851,9 +4852,14 @@ class ERDQueue:
                    COUNT(DISTINCT CASE WHEN m.parent_branch_id IS NULL
                                        THEN m.branch_id END)
                        AS direct_branch_count
+                   ,COUNT(DISTINCT CASE
+                       WHEN m.parent_branch_id IS NULL
+                        AND p.status = 'done'
+                       THEN m.branch_id END) AS direct_done_branch_count
             FROM source_work s
             LEFT JOIN branch_source_work m
               ON m.source_work_id = s.source_work_id
+            LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
             GROUP BY s.source_word
             ORDER BY MAX(s.requested_priority) DESC, s.source_word
         """).fetchall()
