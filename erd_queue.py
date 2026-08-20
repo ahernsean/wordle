@@ -1859,15 +1859,17 @@ class ERDQueue:
             active = self._conn.execute(
                 "SELECT 1 FROM active_branches WHERE branch_id = ?",
                 (branch_id,)).fetchone()
-            if active is None:
-                self._resolve_branch_memberships(branch_id)
+            completed_words = ([] if active is not None
+                               else self._resolve_branch_memberships(branch_id))
             self._conn.execute("COMMIT")
+            return completed_words
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
     def _complete_finished_source_work(self):
         """Mark source requests terminal once every owned branch is complete."""
+        before = self._conn.execute("SELECT source_work_id, source_word FROM source_work WHERE state != 'complete'").fetchall()
         self._conn.execute("""
             UPDATE source_work AS s SET state = 'complete'
             WHERE state != 'complete'
@@ -1880,6 +1882,10 @@ class ERDQueue:
                     AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
               )
         """)
+        words = {row["source_word"] for row in before if self._conn.execute(
+            "SELECT state FROM source_work WHERE source_work_id = ?", (row["source_work_id"],)
+        ).fetchone()["state"] == "complete"}
+        return list(words)
 
     def _resolve_branch_memberships(self, branch_id: int = None,
                                     withdraw: bool = False):
@@ -1898,8 +1904,22 @@ class ERDQueue:
                 "UPDATE branch_source_work SET resolved_at = ? "
                 "WHERE resolved_at IS NULL" + branch_condition,
                 (int(time.time()), *parameters))
-        self._complete_finished_source_work()
+        completed_words = self._complete_finished_source_work()
         self._demote_orphaned_owned_branches()
+        return completed_words
+
+    def completed_source_timing(self, source_word):
+        return self._conn.execute("""
+            SELECT MIN(log.created_at) AS first_created_at,
+                   MAX(log.finalized_at) AS completed_at,
+                   SUM(COALESCE(log.total_bundle_wall_millis, 0)) AS worker_millis
+            FROM (SELECT DISTINCT membership.branch_id
+                  FROM branch_source_work AS membership
+                  JOIN source_work AS source USING (source_work_id)
+                  WHERE source.source_word = ?) AS owned
+            JOIN branches AS branch USING (branch_id)
+            JOIN telemetry.branch_finalize_log AS log ON log.branch_key = branch.branch_key
+        """, (source_word,)).fetchone()
 
     def _demote_orphaned_owned_branches(self) -> list[int]:
         """Demote open branches whose only source ownership has been lost.

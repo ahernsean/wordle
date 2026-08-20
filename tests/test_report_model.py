@@ -1384,6 +1384,10 @@ class SourceReportTest(unittest.TestCase):
             total_bundle_wall_millis=5_000,
         )
         queue.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write_completed_source_summary("salet", ERD_ALL, 40, 30_000, 2_000)
+        cache.write_completed_source_summary("crane", ERD_ALL, 30, 10_000, 5_000)
+        cache.close()
 
         rows = {row["source_word"]: row for row in self._source_words()["summary"]}
         self.assertEqual(rows["salet"]["elapsed_millis"], 30_000)

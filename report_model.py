@@ -3020,23 +3020,17 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         # each word's own totals are complete whichever word is in scope.
         all_membership_rows = queue.source_membership_rows()
         rollups = _source_rollups(all_membership_rows)
-        timing_rows = queue.source_word_timing_rows()
-        timings = {}
-        for timing_row in timing_rows:
-            first_created_at = timing_row["first_created_at"]
-            if first_created_at is None:
-                elapsed_millis = None
-            else:
-                latest_at = (generated_at if timing_row["open_branch_count"]
-                             else timing_row["last_finalized_at"])
-                elapsed_millis = (
-                    (latest_at - first_created_at) * 1000
-                    if latest_at is not None else None
-                )
-            timings[(timing_row["source_word"] or "").lower() or None] = {
-                "elapsed_millis": elapsed_millis,
-                "worker_millis": timing_row["worker_millis"],
-            }
+        timing_cache = None
+        try:
+            all_answers = load_word_list(sources.answer_list_path)
+            timing_cache = ScoreCache(sources.cache_path, all_answers,
+                                      checkpoint_on_close=False)
+            timings = timing_cache.completed_source_summary_map(ERD_ALL)
+        except (sqlite3.Error, OSError):
+            timings = {}
+        finally:
+            if timing_cache is not None:
+                timing_cache.close()
         collapsed = [
             _source_summary_payload(
                 row, rollups[(_row_value(row, "source_word") or "").lower() or None],
