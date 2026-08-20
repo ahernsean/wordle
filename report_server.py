@@ -20,6 +20,7 @@ from report_model import (
     GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
     SOURCE_GROUP_BY_STRATEGIES,
+    SOURCE_SORT_FIELDS,
     SOURCE_STATES,
     ReportFilters,
     ReportRequest,
@@ -66,10 +67,7 @@ FINALIZATION_CURSOR_PATTERN = re.compile(r"(after|before):(\d+):(\d+)")
 ALLOWED_PARAMETERS = SCALAR_PARAMETERS
 SORT_FIELDS = {
     "default", "age", "size", "workers", "priority", "nodes", "slowest",
-    # Source reports order by their own columns; validate_report_request
-    # rejects these for every other kind rather than ignoring them.
-    "word", "branches", "open", "done", "completed", "erd", "requested",
-    "elapsed", "worker_time",
+    *SOURCE_SORT_FIELDS,
 }
 HOTSPOT_FIELDS = {
     "nodes", "age", "size", "workers", "priority", "slowest",
