@@ -1856,15 +1856,30 @@ class ERDQueue:
             active = self._conn.execute(
                 "SELECT 1 FROM active_branches WHERE branch_id = ?",
                 (branch_id,)).fetchone()
-            if active is None:
-                self._resolve_branch_memberships(branch_id)
+            completed_words = ([] if active is not None
+                               else self._resolve_branch_memberships(branch_id))
             self._conn.execute("COMMIT")
+            return completed_words
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
     def _complete_finished_source_work(self):
         """Mark source requests terminal once every owned branch is complete."""
+        completed_rows = self._conn.execute("""
+            SELECT source_word FROM source_work AS s
+            WHERE state != 'complete'
+              AND NOT EXISTS (
+                  SELECT 1 FROM branch_source_work m
+                  LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
+                  LEFT JOIN active_branches a ON a.branch_id = m.branch_id
+                  WHERE m.source_work_id = s.source_work_id
+                    AND m.resolved_at IS NULL
+                    AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
+              )
+        """).fetchall()
+        if not completed_rows:
+            return []
         self._conn.execute("""
             UPDATE source_work AS s SET state = 'complete'
             WHERE state != 'complete'
@@ -1877,6 +1892,7 @@ class ERDQueue:
                     AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
               )
         """)
+        return list({row["source_word"] for row in completed_rows})
 
     def _resolve_branch_memberships(self, branch_id: int = None,
                                     withdraw: bool = False):
@@ -1895,8 +1911,27 @@ class ERDQueue:
                 "UPDATE branch_source_work SET resolved_at = ? "
                 "WHERE resolved_at IS NULL" + branch_condition,
                 (int(time.time()), *parameters))
-        self._complete_finished_source_work()
+        completed_words = self._complete_finished_source_work()
         self._demote_orphaned_owned_branches()
+        return completed_words
+
+    def completed_source_timing(self, source_word):
+        """Return timing recorded for spines opened by one source word.
+
+        Source ownership can attach a request to an already-existing branch.
+        Its finalization record predates that request, so ownership joins are
+        not a source timing boundary.  The opener in each recorded spine is.
+        """
+        return self._conn.execute("""
+            SELECT MIN(log.created_at) AS first_created_at,
+                   MAX(log.finalized_at) AS completed_at,
+                   SUM(COALESCE(log.total_bundle_wall_millis, 0)) AS worker_millis
+            FROM telemetry.branch_finalize_log AS log
+            WHERE lower(substr(log.spine, 1, 5)) = lower(?)
+              AND log.epoch = ?
+              AND log.created_at IS NOT NULL
+              AND log.finalized_at IS NOT NULL
+        """, (source_word, self.epoch)).fetchone()
 
     def _demote_orphaned_owned_branches(self) -> list[int]:
         """Demote open branches whose only source ownership has been lost.
@@ -3245,6 +3280,7 @@ class ERDQueue:
         try:
             branch_id = self._intern_branch(branch_key)
             n_claims = n_republish = 0
+            completed_words = []
             if branch_id is not None:
                 self._conn.execute(
                     "DELETE FROM candidate_claims WHERE branch_id = ?", (branch_id,))
@@ -3267,7 +3303,7 @@ class ERDQueue:
                     WHERE branch_id = ? AND status IN ('pending', 'in_progress')
                 """, (branch_id,)).fetchone()
                 if unresolved_pending is None:
-                    self._resolve_branch_memberships(branch_id)
+                    completed_words = self._resolve_branch_memberships(branch_id)
             self._conn.execute("COMMIT")
             self._tally_wal_traffic(
                 'candidate_claims/delete-branch', n_claims,
@@ -3275,6 +3311,7 @@ class ERDQueue:
             self._tally_wal_traffic(
                 'candidate_republish/delete-branch', n_republish,
                 n_republish * _CLAIM_ROW_WAL_BYTES)
+            return completed_words
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
@@ -4844,6 +4881,7 @@ class ERDQueue:
             SELECT s.source_word,
                    MIN(s.requested_at) AS requested_at,
                    MAX(s.requested_priority) AS requested_priority,
+                   MAX(m.resolved_at) AS completed_at,
                    COUNT(DISTINCT s.source_work_id) AS request_count,
                    MAX(s.state = 'active') AS has_active_request,
                    MAX(s.state != 'complete') AS has_incomplete_request,
@@ -4851,9 +4889,14 @@ class ERDQueue:
                    COUNT(DISTINCT CASE WHEN m.parent_branch_id IS NULL
                                        THEN m.branch_id END)
                        AS direct_branch_count
+                   ,COUNT(DISTINCT CASE
+                       WHEN m.parent_branch_id IS NULL
+                        AND p.status = 'done'
+                       THEN m.branch_id END) AS direct_done_branch_count
             FROM source_work s
             LEFT JOIN branch_source_work m
               ON m.source_work_id = s.source_work_id
+            LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
             GROUP BY s.source_word
             ORDER BY MAX(s.requested_priority) DESC, s.source_word
         """).fetchall()

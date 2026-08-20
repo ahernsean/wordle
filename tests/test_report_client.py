@@ -3008,7 +3008,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def open_sources(self):
         self.page.locator("[data-kind=sources]").click()
-        self.page.wait_for_selector("text=sources report")
+        self.page.wait_for_selector("#report h1:text-is('sources report')")
 
     def test_sources_view_collapses_every_word_to_one_card(self):
         # The report's unit is the source word: three queued roots owning 1,376
@@ -3043,11 +3043,54 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("37 done", request_text)
         self.assertIn("12 direct", request_text)
         self.assertIn("3 workers", request_text)
-        self.assertIn("Pick a word to list the branches it owns.",
-                      self.page.locator("#report").inner_text())
         # A word queued more than once is still one card, and says so rather
         # than splitting into a card per request.
         self.assertIn("2 requests", request_text)
+        complete_text = " ".join(
+            requests.filter(has_text="CRANE").inner_text().split())
+        self.assertIn("completed 8m ago", complete_text)
+        self.assertNotIn("priority 1", complete_text)
+        self.assertNotIn("0 open", complete_text)
+
+    def test_sources_progress_separates_no_work_from_completed_work(self):
+        self.open_sources()
+        progress = self.page.locator(".card.source-word .source-group-progress").first
+        segments = self.page.eval_on_selector_all(
+                ".card.source-word .source-group-progress:first-of-type > span",
+                "spans => spans.map(span => ({className: span.className, width: Number.parseFloat(span.style.width)}))",
+            )[:2]
+        self.assertEqual([segment["className"] for segment in segments],
+                         ["no-work work-boundary", ""])
+        self.assertEqual(
+            progress.locator("span.no-work").evaluate(
+                "span => getComputedStyle(span).borderRightWidth"),
+            "1px",
+        )
+        self.assertAlmostEqual(segments[0]["width"], 100 * 136 / 148, places=4)
+        self.assertAlmostEqual(segments[1]["width"], 100 * 3 / 148, places=4)
+        segment_boxes = self.page.locator(
+            ".card.source-word .source-group-progress:first-of-type > span"
+        ).evaluate_all("spans => spans.slice(0, 2).map(span => { const box = span.getBoundingClientRect(); return {left: box.left, top: box.top, width: box.width}; })")
+        self.assertEqual(segment_boxes[0]["top"], segment_boxes[1]["top"])
+        self.assertAlmostEqual(
+            segment_boxes[0]["left"] + segment_boxes[0]["width"],
+            segment_boxes[1]["left"],
+            places=2,
+        )
+        self.assertEqual(
+            progress.get_attribute("title"),
+            "136 response groups need no work; 3 of 12 work groups completed",
+        )
+
+    def test_sources_progress_marks_no_work_before_unfinished_work(self):
+        self.open_sources()
+        class_name = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          report.data.summary[0].direct_done_branch_count = 0;
+          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          return document.querySelector('.source-group-progress > span').className;
+        }""")
+        self.assertEqual(class_name, "no-work work-boundary")
 
     def test_sources_controls_offer_source_axes_not_branch_ones(self):
         self.open_sources()
@@ -3067,14 +3110,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#group-by option", "options => options.map(o => o.value)"),
-            ["state", "worker_presence", "priority", "none"])
+            ["state", "completed", "elapsed", "worker_time", "requested",
+             "worker_presence", "priority", "none"])
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")
+        self.assertIn(
+            "sorted by ERD (lowest first)",
+            self.page.locator("#report").inner_text(),
+        )
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
-            ["", "word", "branches", "open", "done", "workers", "age"])
+            ["", "completed", "elapsed", "worker_time", "priority",
+             "requested", "age", "word", "branches", "open", "done", "workers"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):
         result = self.page.evaluate("""() => ({
@@ -3100,6 +3149,40 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["branchSort"], "/api/view/sources?group_by=state")
         self.assertEqual(result["branchGroup"], "/api/view/sources?group_by=state")
         self.assertEqual(result["elsewhere"], "/api/view/queue")
+
+    def test_sources_grouping_marks_visible_cards_as_stale_while_regrouping(self):
+        self.open_sources()
+        result = self.page.evaluate("""async () => {
+          const originalFetch=window.fetch.bind(window);
+          const replacement=await (await originalFetch('/api/view/sources')).json();
+          let release;
+          window.fetch=(url, options)=>String(url).includes('group_by=elapsed')
+            ? new Promise(resolve=>{release=()=>resolve(new Response(JSON.stringify(replacement),{status:200,headers:{'Content-Type':'application/json'}}));})
+            : originalFetch(url, options);
+          const groupBy=document.querySelector('#group-by');
+          groupBy.value='elapsed';
+          groupBy.dispatchEvent(new Event('change',{bubbles:true}));
+          await new Promise(resolve=>setTimeout(resolve,20));
+          const pending={
+            status:document.querySelector('#report-status').textContent,
+            hidden:document.querySelector('#report-status').hidden,
+            groupBy:groupBy.value,
+            oldGroups:[...document.querySelectorAll('.source-word-groups > details > summary strong')].map(node=>node.textContent),
+          };
+          release();
+          await new Promise(resolve=>setTimeout(resolve,20));
+          const settled=document.querySelector('#report-status').hidden;
+          window.fetch=originalFetch;
+          return {pending,settled};
+        }""")
+        self.assertEqual(result["pending"]["groupBy"], "elapsed")
+        self.assertFalse(result["pending"]["hidden"])
+        self.assertEqual(
+            result["pending"]["status"],
+            "Showing groups by state (default) while regrouping by elapsed time…",
+        )
+        self.assertEqual(result["pending"]["oldGroups"], ["queued", "complete"])
+        self.assertTrue(result["settled"])
 
     def test_sources_pager_walks_the_word_list(self):
         # The page size is the "Words per page" control; without a pager a
@@ -3289,12 +3372,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = " ".join(self.page.locator("#report").inner_text().split())
         self.assertIn("SALET owns no live branches", text)
         self.assertNotIn("Pick a word", text)
-        # Unpicked still points the way in.  Waited for rather than asserted
-        # outright: the applied payload above already rendered a sources
-        # report, so "sources report" is on screen before the refetch lands.
+        # The unfiltered view no longer carries a prompt for an action that is
+        # not required to understand the source-word cards.
         self.open_sources()
-        self.page.wait_for_selector(
-            "text=Pick a word to list the branches it owns.")
+        self.assertNotIn(
+            "Pick a word", self.page.locator("#report").inner_text())
 
     def test_sources_metrics_count_a_branch_two_words_own_once(self):
         # The totals come from the model, which counts each branch once; the

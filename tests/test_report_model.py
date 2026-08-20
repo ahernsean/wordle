@@ -6,17 +6,20 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue
 import erd_search
+import report_model
 from report_model import (
     ReportFilters,
     ReportRequest,
     ReportSources,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
+    _source_word_group_key,
     _resolved_candidate_erd,
     _grouped_response_groups,
     _response_group_key,
@@ -1335,10 +1338,28 @@ class SourceReportTest(unittest.TestCase):
 
     def test_source_sorts_order_by_the_column_named(self):
         self._queue_words(("salet", 5, 3), ("crane", 9, 1), ("nurdy", 1, 7))
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE source_work SET requested_at = CASE source_word "
+            "WHEN 'salet' THEN 100 WHEN 'crane' THEN 300 "
+            "WHEN 'nurdy' THEN 200 END"
+        )
+        queue._conn.commit()
+        queue.close()
 
-        # The default is the order the queue serves them in: priority first.
+        # The default is the explicit ERD ordering.
         self.assertEqual(
             [row["source_word"] for row in self._source_words()["summary"]],
+            [row["source_word"] for row in
+             self._source_words(sort="erd")["summary"]])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="default")["summary"]],
+            [row["source_word"] for row in
+             self._source_words(sort="erd")["summary"]])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="priority")["summary"]],
             ["crane", "salet", "nurdy"])
         self.assertEqual(
             [row["source_word"] for row in
@@ -1352,6 +1373,104 @@ class SourceReportTest(unittest.TestCase):
             [row["source_word"] for row in
              self._source_words(sort="open")["summary"]],
             ["nurdy", "salet", "crane"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="requested")["summary"]],
+            ["crane", "nurdy", "salet"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="age")["summary"]],
+            ["salet", "nurdy", "crane"])
+
+    def test_source_timing_fields_and_sorts_roll_up_finalized_branches(self):
+        self._queue_words(("salet", 5, 1), ("crane", 3, 1), ("nurdy", 1, 1))
+        queue = self._open_queue()
+        salet_key = ScoreCache.encode_subset(ANSWERS[:2] + ["salet0000"])
+        crane_key = ScoreCache.encode_subset(ANSWERS[:2] + ["crane0000"])
+        queue.add_branch_finalize_log(
+            salet_key, "SALET -----", 3, 3, 10, 40, 100, 1,
+            total_bundle_wall_millis=2_000,
+        )
+        queue.add_branch_finalize_log(
+            crane_key, "CRANE -----", 3, 3, 20, 30, 100, 1,
+            total_bundle_wall_millis=5_000,
+        )
+        queue.mark_done(salet_key)
+        queue.mark_done(crane_key)
+        queue.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write_completed_source_summary("salet", ERD_ALL, 40, 30_000, 2_000)
+        cache.write_completed_source_summary("crane", ERD_ALL, 30, 10_000, 5_000)
+        cache.close()
+
+        rows = {row["source_word"]: row for row in self._source_words()["summary"]}
+        self.assertEqual(rows["salet"]["elapsed_millis"], 30_000)
+        self.assertEqual(rows["salet"]["worker_millis"], 2_000)
+        self.assertEqual(rows["crane"]["elapsed_millis"], 10_000)
+        self.assertEqual(rows["crane"]["worker_millis"], 5_000)
+        self.assertEqual(rows["crane"]["completed_at"], 30)
+        self.assertIsNone(rows["nurdy"]["elapsed_millis"])
+        self.assertIsNone(rows["nurdy"]["worker_millis"])
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="elapsed")["summary"]],
+            ["salet", "crane", "nurdy"],
+        )
+        self.assertEqual(
+            [row["source_word"] for row in
+             self._source_words(sort="worker_time")["summary"]],
+            ["crane", "salet", "nurdy"],
+        )
+
+    def test_source_report_keeps_erd_summary_shape_when_cache_unavailable(self):
+        self._queue_words(("salet", 5, 1))
+        unavailable_sources = replace(
+            self.sources, answer_list_path="unused-answers"
+        )
+
+        report = collect_source_report(
+            unavailable_sources, ReportRequest(report_kind="sources")
+        )
+
+        self.assertIn("error", report["sources"]["cache"])
+        self.assertIn("erd_summary", report["data"]["summary"][0])
+        self.assertIsNone(report["data"]["summary"][0]["erd_summary"])
+
+    def test_requeued_source_hides_completed_run_timing(self):
+        self._queue_words(("salet", 5, 1))
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write_completed_source_summary("salet", ERD_ALL, 160, 60_000, 2_000)
+        cache.close()
+
+        row = self._source_words()["summary"][0]
+
+        self.assertEqual(row["state"], "queued")
+        self.assertIsNone(row["completed_at"])
+        self.assertIsNone(row["elapsed_millis"])
+        self.assertIsNone(row["worker_millis"])
+
+    def test_source_erd_summary_cache_invalidates_for_wal_writes(self):
+        self.addCleanup(report_model._SOURCE_ERD_SUMMARY_CACHE.clear)
+        self._queue_words(("nurdy", 5, 1))
+        first = self._source_words()["summary"][0]["erd_summary"]
+        self.assertEqual(first["state"], "pending")
+
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        response_cache = ResponseCache(ANSWERS, score_cache=None)
+        for _pattern_code, words in response_cache.group_words(
+                "nurdy", ANSWERS).items():
+            if words:
+                cache.write(
+                    ScoreCache.encode_subset(words), ERD_ALL, "salet", 1.0,
+                    max_depth=1, solve_budget=GAME_GUESSES - 1,
+                )
+        cache._conn.commit()
+
+        second = self._source_words()["summary"][0]["erd_summary"]
+
+        self.assertEqual(second["state"], "complete")
+        self.assertNotEqual(first, second)
+        cache.close()
 
     def test_each_source_word_carries_its_own_erd(self):
         # A word's ERD is why it was queued.  It is derived from the word's
@@ -1526,6 +1645,46 @@ class SourceReportTest(unittest.TestCase):
             sum(len(group["rows"]) for group in groups),
             len(self._source_words()["summary"]))
 
+    def test_source_time_grouping_boundaries(self):
+        generated_at = 1_787_270_400  # 20 Aug 2026, noon local time
+        base_row = {"state": "complete", "worker_count": 0,
+                    "requested_priority": 0, "completed_at": generated_at,
+                    "elapsed_millis": 0, "worker_millis": 0,
+                    "requested_at": generated_at}
+        completed = lambda seconds_ago: _source_word_group_key(
+            {**base_row, "completed_at": generated_at - seconds_ago},
+            "completed", generated_at)[1]
+        duration = lambda field, millis: _source_word_group_key(
+            {**base_row, field: millis},
+            "elapsed" if field == "elapsed_millis" else "worker_time",
+            generated_at)[1]
+
+        self.assertEqual(completed(0), "today")
+        self.assertEqual(completed(24 * 60 * 60), "earlier this week")
+        self.assertEqual(completed(7 * 24 * 60 * 60), "earlier this month")
+        self.assertEqual(completed(31 * 24 * 60 * 60), "earlier this year")
+        self.assertEqual(completed(366 * 24 * 60 * 60), "older")
+        self.assertEqual(
+            [duration("elapsed_millis", millis) for millis in
+             (0, 60 * 60 * 1000, 24 * 60 * 60 * 1000,
+              7 * 24 * 60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000)],
+            ["[0, 1 hour)", "[1 hour, 1 day)", "[1 day, 1 week)",
+             "[1 week, 1 month)", "[1 month, ∞)"],
+        )
+        self.assertEqual(
+            _source_word_group_key(
+                {**base_row, "requested_at": generated_at - 24 * 60 * 60},
+                "requested", generated_at)[1],
+            "[1 day, 1 week)",
+        )
+        self.assertEqual(
+            _source_word_group_key(
+                {**base_row, "completed_at": None, "elapsed_millis": None,
+                 "worker_millis": None},
+                "completed", generated_at)[1],
+            "not completed",
+        )
+
     def test_source_only_filters_and_sorts_are_rejected_elsewhere(self):
         for filters, message in (
             ({"source_states": ("queued",)}, "source_state requires"),
@@ -1539,6 +1698,12 @@ class SourceReportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source reports must be"):
             validate_report_request(ReportRequest(
                 report_kind="sources", filters=ReportFilters(sort="nodes")))
+        validate_report_request(ReportRequest(
+            report_kind="sources", filters=ReportFilters(sort="age")))
+        for group_by in ("completed", "elapsed", "worker_time", "requested"):
+            with self.subTest(group_by=group_by):
+                validate_report_request(ReportRequest(
+                    report_kind="sources", filters=ReportFilters(group_by=group_by)))
         with self.assertRaisesRegex(ValueError, "source reports must be"):
             validate_report_request(ReportRequest(
                 report_kind="sources",

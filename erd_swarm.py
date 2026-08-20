@@ -1564,6 +1564,20 @@ class _BranchWorker:
                             wall_t0, censored=False)
         return True
 
+    def _snapshot_completed_sources(self, source_words):
+        for source_word in source_words or ():
+            try:
+                timing = self.queue.completed_source_timing(source_word)
+                if timing["completed_at"] is None:
+                    continue
+                self.score_cache.write_completed_source_summary(
+                    source_word, ERD_ALL, timing["completed_at"],
+                    (timing["completed_at"] - timing["first_created_at"]) * 1000,
+                    timing["worker_millis"] or 0)
+            except Exception:
+                logger.exception("%s could not snapshot completed source %s",
+                                 self.name, source_word)
+
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
                        censored):
         """Record a completed/censored bundle's actual cost, if this claim
@@ -1745,7 +1759,7 @@ class _BranchWorker:
             except Exception:
                 logger.exception('%s could not requeue branch %s', self.name,
                                  branch_key[:25])
-        self.queue.delete_branch(branch_key)    # drop transient coordination
+        self._snapshot_completed_sources(self.queue.delete_branch(branch_key))
         self._packing_stats_cache.pop(branch_key, None)
         # Restart the coordination window past this finalize.  evaluate_claim
         # telescopes coordination_millis from the previous claim's completion,
@@ -2230,7 +2244,7 @@ class _BranchWorker:
                 budget)
             if reuse is None:
                 break
-            self.queue.mark_done(claimed['branch_key'])
+            self._snapshot_completed_sources(self.queue.mark_done(claimed['branch_key']))
 
         n_words = claimed['n_words']
         self.queue.create_branch(

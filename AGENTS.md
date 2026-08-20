@@ -339,6 +339,15 @@ pip install -r requirements.txt       # runtime only (numpy)
   browser tests silently skip. Run with `python3.13` to actually exercise
   `tests/test_report_client.py`.
 
+  **Codex sandbox note:** Codex's default command sandbox may deny the browser
+  fixture server's bind to `127.0.0.1:0` with
+  `PermissionError: [Errno 1] Operation not permitted`. This is a sandbox
+  networking restriction, not evidence of a product or browser-test failure.
+  Rerun the same focused browser test command with approved elevated
+  execution so it has loopback access, then judge the real test result. This
+  note is Codex-specific; other coding harnesses may have different sandbox
+  policies.
+
 **Claude Code on the web** starts from a bare image with neither dependency
 installed. `.claude/hooks/session-start.sh` installs them into `python3.13`
 and sets `REQUIRE_PLAYWRIGHT_BROWSER=1`, so the browser tests fail loudly

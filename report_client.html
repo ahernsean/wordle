@@ -69,6 +69,8 @@
     .refresh-pop .cap { color:var(--dim); font-size:.8rem; }
     .refresh-pop input { width:4.5rem; text-align:right; }
     .conn-wrap.open .refresh-pop { opacity:1; visibility:visible; transform:none; }
+    .report-status { margin:.35rem 0 0; padding:.25rem .45rem; border-left:3px solid var(--amber); background:#fff9e8; color:#6f5a13; }
+    .report-status[hidden] { display:none; }
     /* Where the pointer can hover, opening on hover is layered on top of the
        tap-toggle; a transparent bridge spans the gap so crossing to the panel
        does not dismiss it. */
@@ -186,6 +188,11 @@
     .progress-line { margin:.25rem 0; }
     .progress { height:.3rem; border-radius:999px; background:var(--border); overflow:hidden; }
     .progress > span { display:block; height:100%; background:var(--green); }
+    .source-group-progress { display:flex; }
+    .source-group-progress > span { flex:0 0 auto; }
+    .progress > span.no-work { background:var(--green-complete); }
+    .progress > span.work-boundary { border-right:1px solid var(--text); }
+    .source-word .stat-line > span:first-child { white-space:normal; min-width:0; overflow-wrap:anywhere; }
     /* Facts pack onto a wrapping row separated by a drawn middot rather than
        literal " · " text, at a smaller size than the panel's identity line.
        Each fact is its own nowrap span, so a number never breaks mid-digit and
@@ -295,12 +302,13 @@
         </div>
       </div>
     </details>
+    <p id="report-status" class="report-status" role="status" aria-live="polite" hidden></p>
   </header>
   <main id="report"><p class="empty">Loading report…</p></main>
   <script>
   (() => {
     "use strict";
-    const SCHEMA_VERSION=3, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000, SLOW_REQUEST_MILLIS=2000;
+    const SCHEMA_VERSION=3, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000;
     const branchStatusNames=["active","pending","done","unqueued"];
     const branchPhaseNames=["queued","evaluating","finalizing","complete"];
     // A source word's lifecycle, which is not a branch's: queued until a
@@ -311,14 +319,14 @@
     // DOM rather than toggled — an absent option can't appear in any picker.
     const SORT_OPTIONS_DEFAULT=[["","default"],["age","age"],["size","size"],["workers","workers"],["priority","priority"],["nodes","nodes"],["slowest","slowest"]];
     const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
-    const SORT_OPTIONS_SOURCES=[["","priority (default)"],["word","word"],["branches","branches"],["open","open"],["done","done"],["workers","workers"],["age","age"]];
+    const SORT_OPTIONS_SOURCES=[["","ERD (lowest first)"],["completed","most recently completed"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
-    const GROUP_BY_OPTIONS_SOURCES=[["state","state (default)"],["worker_presence","worker"],["priority","priority"],["none","none"]];
+    const GROUP_BY_OPTIONS_SOURCES=[["state","state (default)"],["completed","most recently completed"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","date requested"],["worker_presence","worker"],["priority","priority"],["none","none"]];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","sources"]);
     const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
-    let currentState, lastReport=null, lastContext=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,slowRequestTimer=null,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
+    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
     const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
@@ -466,8 +474,13 @@
       return endpoint+(query.size?"?"+query.toString():"");
     }
     function contextKey(state){return buildAPIURL(state);}
-    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}clearSlowRequestNotice();}
-    function clearSlowRequestNotice(){if(slowRequestTimer){clearTimeout(slowRequestTimer);slowRequestTimer=null;}}
+    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}}
+    function groupByLabel(state){const options=state.kind==="sources"?GROUP_BY_OPTIONS_SOURCES:GROUP_BY_OPTIONS_WORD;return options.find(([value])=>value===state.group_by)?.[1]||"none";}
+    function setReportStatus(message){const status=byId("report-status");status.hidden=!message;status.textContent=message||"";}
+    function pendingReportStatus(state){
+      if(displayedState?.kind==="sources"&&state.kind==="sources"&&displayedState.group_by!==state.group_by)return "Showing groups by "+groupByLabel(displayedState)+" while regrouping by "+groupByLabel(state)+"…";
+      return "Computing "+(state.kind==="sources"?"sources report":state.kind==="leaderboard"?"leaderboard":"report")+"…";
+    }
     function setState(next,push=true){
       abortActiveRequest();
       const previousGroupBy=currentState?.group_by;
@@ -630,6 +643,16 @@
     // a rendered object rather than only text.
     function labeledFacts(values){const node=element("div","labeled-facts");for(const [key,value] of values){if(value===null||value===undefined||value==="")continue;const fact=element("span","fact"),cell=element("span","");if(value instanceof Node)cell.append(value);else cell.textContent=valueOrDash(value);fact.append(element("span","fact-label",key)," ",cell);node.append(fact);}return node;}
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
+    function sourceGroupProgress(row,summary){
+      if(!summary||!summary.response_group_count)return null;
+      const total=summary.response_group_count,workCount=Math.min(total,row.direct_branch_count||0);
+      const noWork=total-workCount,resolved=Math.min(workCount,row.direct_done_branch_count||0);
+      const node=element("div","progress source-group-progress");
+      node.title=numText(noWork)+" response groups need no work; "+numText(resolved)+" of "+numText(workCount)+" work groups completed";
+      if(noWork){const noWorkBar=element("span","no-work work-boundary");noWorkBar.style.width=100*noWork/total+"%";node.append(noWorkBar);}
+      if(resolved){const doneBar=element("span","");doneBar.style.width=100*resolved/total+"%";node.append(doneBar);}
+      return node;
+    }
     // The canonical spine language, the same one the branch target box parses:
     // a word, then its response, alternating, space separated.  A word with no
     // response contributes only itself, which is a legal trailing token.
@@ -777,10 +800,17 @@
       for(const details of byId("report").querySelectorAll("details[open]"))details.open=false;
       treePageHistory.clear();treeGroupPages.clear();abortActiveRequest();fetchReport();
     }
+    function activeSortLabel(state){
+      const wordReport=isInferredWordState(state.kind,state.branch_target);
+      const options=state.kind==="sources"?SORT_OPTIONS_SOURCES:wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT;
+      const value=state.sort||options[0]?.[0]||"";
+      return options.find(([optionValue])=>optionValue===value)?.[1]||value||"default";
+    }
     function reportHeader(report,state){
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"));
       if(report.report_kind!=="branch"||report.tree)meta.append(element("span","dim",state.branch_target||"root"));
+      meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       if(report.tree){meta.append(element("span","dim","snapshot "+absoluteTime(report.generated_at)));const refreshButton=element("button","","Refresh tree");refreshButton.addEventListener("click",refreshTreeSnapshot);meta.append(refreshButton);}
       if(!(report.tree&&report.report_kind==="queue")){const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.open=sourcePathsOpen;details.addEventListener("toggle",()=>{sourcePathsOpen=details.open;});details.append(summary);for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);}return meta;
     }
@@ -1342,26 +1372,28 @@
       if(isFiltered)card.classList.add("filtered");
       const title=element("div","card-title");
       title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)));
-      // A word usually holds one request; the count is shown only where the
-      // word was queued more than once and its rows are merged.
-      if(row.request_count>1)title.append(element("span","chip",numText(row.request_count)+" requests"));
       // The branch list is the other thing this card leads to, so it gets its
       // own control rather than taking the card's own click.
       const branchesButton=element("button","",isFiltered?"Hide branches":"Branches");
       branchesButton.addEventListener("click",event=>{event.stopPropagation();setState({...state,kind:"sources",branch_target:isFiltered?"":word});});
       title.append(branchesButton);
       card.append(title);
-      // How far along the word is, as one bar: every branch it has ever
-      // owned, against those that have finished.
-      if(row.branch_count){const line=element("div","progress-line");line.append(progress(row.done_branch_count,row.branch_count));card.append(line);}
+      // The source's response groups separate work that was unnecessary from
+      // direct groups whose search completion is still meaningful progress.
+      if(row.branch_count){const line=element("div","progress-line");line.append(sourceGroupProgress(row,row.erd_summary)||progress(row.done_branch_count,row.branch_count));card.append(line);}
       card.append(statLine([
         sourceWordErdText(row.erd_summary),
-        "priority "+valueOrDash(row.requested_priority),
+        // A word usually holds one request; show the count only when merged.
+        row.request_count>1?numText(row.request_count)+" requests":null,
+        row.state==="complete"?null:"priority "+valueOrDash(row.requested_priority),
         numText(row.branch_count)+(row.branch_count===1?" branch":" branches"),
-        numText(row.open_branch_count)+" open",
+        row.open_branch_count?numText(row.open_branch_count)+" open":null,
         numText(row.done_branch_count)+" done",
         numText(row.direct_branch_count)+" direct",
         row.worker_count?numText(row.worker_count)+(row.worker_count===1?" worker":" workers"):null,
+        row.elapsed_millis===null||row.elapsed_millis===undefined?null:"elapsed "+formatDuration(row.elapsed_millis/1000),
+        row.worker_millis===null||row.worker_millis===undefined?null:"worker time "+formatDuration(row.worker_millis/1000),
+        row.completed_at===null||row.completed_at===undefined?null:"completed "+relativeAge(row.completed_at,generatedAt),
         row.requested_at===null||row.requested_at===undefined?null:"requested "+relativeAge(row.requested_at,generatedAt),
       ]));
       card.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:word,tree:false,claims:false,answers:false,finalization_cursor:""}));
@@ -1437,11 +1469,9 @@
       const namedWord=(state.branch_target||"").trim();
       if(!sourceWords.length)fragment.append(element("p","empty",totalWords?"No source word matches this state filter":"No source-work requests"));
       // A named word with no rows owns no live branch — its work has finished
-      // and released its ownership — which is a different thing from not
-      // having picked a word yet.
-      else if(!rows.length)fragment.append(element("p","dim",namedWord
-        ?namedWord.toUpperCase()+" owns no live branches: its work has finished and released them."
-        :"Pick a word to list the branches it owns."));
+      // and released its ownership.
+      else if(!rows.length&&namedWord)fragment.append(element("p","dim",
+        namedWord.toUpperCase()+" owns no live branches: its work has finished and released them."));
       const previousWords=previousBy(previous,"summary","source_word");
       const wordCard=row=>sourceWordCard(row,previousWords.get(String(row.source_word)),state,report.generated_at);
       if(data.summary_groups){
@@ -1771,12 +1801,11 @@
       }
       const state=normalizeState(currentState),context=contextKey(state),generation=++requestGeneration,controller=new AbortController();
       activeRequestController=controller;activeRequestStartedAt=Date.now();
-      // On a view switch (new context), a slow report — the leaderboard folds
-      // every candidate — would otherwise leave a blank pane; show a notice if
-      // it has not arrived within SLOW_REQUEST_MILLIS.  Same-context polls keep
-      // the current data on screen and never show it.
-      clearSlowRequestNotice();
-      if(context!==lastContext){slowRequestTimer=setTimeout(()=>{if(generation===requestGeneration)byId("report").replaceChildren(element("p","dim","Computing "+(state.kind==="leaderboard"?"leaderboard":"report")+"…"));},SLOW_REQUEST_MILLIS);}
+      // A new context can require a slow report, especially when a source sort
+      // also folds ERD summaries.  Keep the current report visible while the
+      // replacement is being computed, but make the work visible immediately.
+      // Same-context polls keep the current data on screen and never show it.
+      if(context!==lastContext)setReportStatus(pendingReportStatus(state));
       try{
         const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});
         if(generation!==requestGeneration)return;
@@ -1786,7 +1815,9 @@
         // A same-view poll may rebuild the report unless an interaction would
         // be destroyed: native controls have no DOM state to restore after
         // replacement, and replaceChildren collapses an active text selection.
-        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection()))applyReport(report,previous,state);
+        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection())){
+          applyReport(report,previous,state);displayedState=state;
+        }
         lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }
@@ -1800,7 +1831,7 @@
           if(navigated||!lastReport)byId("report").replaceChildren(element("p","error",error.message));
         }
       }
-      finally{clearSlowRequestNotice();if(activeRequestController===controller)activeRequestController=null;}
+      finally{if(activeRequestController===controller){setReportStatus("");activeRequestController=null;}}
     }
     function pinBranchToSpine(report,state){
       // A spine remains the preferred URL because it resolves from the answer

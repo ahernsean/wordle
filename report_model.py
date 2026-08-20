@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import collections
+import datetime
 import os
 import re
 import sqlite3
@@ -35,6 +36,10 @@ from wordle_ui import fmt_pattern, parse_pattern
 SCHEMA_VERSION = 3
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
+
+# Source ERD summaries are immutable until the score cache changes.  The
+# Sources view polls frequently, so retain the completed folds between polls.
+_SOURCE_ERD_SUMMARY_CACHE = {}
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
@@ -126,13 +131,20 @@ SOURCE_STATES = ("queued", "active", "complete")
 GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
-SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
+SOURCE_GROUP_BY_STRATEGIES = (
+    "none", "state", "worker_presence", "priority", "completed", "elapsed",
+    "worker_time", "requested",
+)
 SOURCE_SORT_FIELDS = (
-    "default", "word", "priority", "branches", "open", "done", "workers", "age",
+    "default", "age", "word", "priority", "branches", "open", "done", "workers",
+    "completed", "erd", "requested", "elapsed", "worker_time",
 )
 # Sorts that only a source report can serve, so another report asking for one
 # is rejected rather than quietly sorted some other way.
-SOURCE_ONLY_SORT_FIELDS = ("word", "branches", "open", "done")
+SOURCE_ONLY_SORT_FIELDS = (
+    "word", "branches", "open", "done", "completed", "erd", "requested",
+    "elapsed", "worker_time",
+)
 _SOURCE_STATE_GROUP_ORDER = {"active": 0, "queued": 1, "complete": 2}
 _STATUS_GROUP_ORDER = {"active": 0, "pending": 1, "done": 2, "unqueued": 3}
 _ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
@@ -2711,7 +2723,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
-def _source_summary_payload(row, rollup):
+def _source_summary_payload(row, rollup, timing):
     """One source word, with its requests and branches rolled up.
 
     This is the report's unit: a word that spawned a thousand branches is one
@@ -2728,17 +2740,30 @@ def _source_summary_payload(row, rollup):
     source_word = _row_value(row, "source_word")
     branch_count = row["branch_count"] or 0
     open_branch_count = rollup["open_branch_count"]
+    state = _merged_source_state(row)
+    completed_at = None
+    elapsed_millis = worker_millis = None
+    if state == "complete":
+        completed_at = timing["completed_at"]
+        if completed_at is None:
+            completed_at = _row_value(row, "completed_at")
+        elapsed_millis = timing["elapsed_millis"]
+        worker_millis = timing["worker_millis"]
     return {
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
+        "completed_at": completed_at,
         "request_count": row["request_count"] or 0,
-        "state": _merged_source_state(row),
+        "state": state,
         "direct_branch_count": row["direct_branch_count"] or 0,
+        "direct_done_branch_count": row["direct_done_branch_count"] or 0,
         "branch_count": branch_count,
         "open_branch_count": open_branch_count,
         "done_branch_count": max(0, branch_count - open_branch_count),
         "worker_count": rollup["worker_count"],
+        "elapsed_millis": elapsed_millis,
+        "worker_millis": worker_millis,
     }
 
 
@@ -2752,8 +2777,21 @@ def _merged_source_state(row):
         return "complete"
     return "active" if _row_value(row, "has_active_request", 0) else "queued"
 
+def _source_erd_sort_key(row):
+    summary = row.get("erd_summary")
+    if not summary:
+        return (3, float("inf"), row["source_word"] or "")
+    if summary["state"] == "complete":
+        return (0, summary["erd"], row["source_word"] or "")
+    if summary["state"] == "pending":
+        return (1, float("inf"), row["source_word"] or "")
+    return (2, float("inf"), row["source_word"] or "")
+
 
 _SOURCE_SORT_KEYS = {
+    "default": _source_erd_sort_key,
+    "age": lambda row: (row["requested_at"] or float("inf"),
+                        row["source_word"] or ""),
     "word": lambda row: (row["source_word"] or "",),
     "priority": lambda row: (-(row["requested_priority"] or 0),
                              row["source_word"] or ""),
@@ -2761,20 +2799,62 @@ _SOURCE_SORT_KEYS = {
     "open": lambda row: (-row["open_branch_count"], row["source_word"] or ""),
     "done": lambda row: (-row["done_branch_count"], row["source_word"] or ""),
     "workers": lambda row: (-row["worker_count"], row["source_word"] or ""),
-    # Oldest request first: the word that has been waiting longest leads.
-    "age": lambda row: (row["requested_at"] if row["requested_at"] is not None
-                        else float("inf"), row["source_word"] or ""),
+    "completed": lambda row: (-(row["completed_at"] or 0)
+                               if row["completed_at"] is not None else float("inf"),
+                               row["source_word"] or ""),
+    "requested": lambda row: (-(row["requested_at"] or 0)
+                               if row["requested_at"] is not None else float("inf"),
+                               row["source_word"] or ""),
+    "erd": _source_erd_sort_key,
+    "elapsed": lambda row: (-(row["elapsed_millis"] or 0)
+                            if row["elapsed_millis"] is not None else float("inf"),
+                            row["source_word"] or ""),
+    "worker_time": lambda row: (-(row["worker_millis"] or 0)
+                                if row["worker_millis"] is not None else float("inf"),
+                                row["source_word"] or ""),
 }
 
 
 def _sorted_source_words(rows, sort):
-    """Order the collapsed rows.  The default is the queue's own order:
-    highest requested priority first, which is the order they are served in."""
+    """Order collapsed source-word rows by the requested source-report field."""
     key = _SOURCE_SORT_KEYS.get(sort or "default")
     return sorted(rows, key=key) if key is not None else rows
 
 
-def _source_word_group_key(row, group_by):
+def _duration_group_key(duration_millis, missing_label):
+    """Bucket a non-negative duration into the Sources report's time ranges."""
+    if duration_millis is None:
+        return 5, missing_label
+    for index, (maximum_millis, label) in enumerate((
+        (60 * 60 * 1000, "[0, 1 hour)"),
+        (24 * 60 * 60 * 1000, "[1 hour, 1 day)"),
+        (7 * 24 * 60 * 60 * 1000, "[1 day, 1 week)"),
+        (30 * 24 * 60 * 60 * 1000, "[1 week, 1 month)"),
+    )):
+        if duration_millis < maximum_millis:
+            return index, label
+    return 4, "[1 month, ∞)"
+
+
+def _completed_at_group_key(completed_at, generated_at):
+    """Bucket a completion timestamp by its local calendar date."""
+    if completed_at is None:
+        return 5, "not completed"
+    today = datetime.datetime.fromtimestamp(generated_at).date()
+    completed_date = datetime.datetime.fromtimestamp(completed_at).date()
+    if completed_date >= today:
+        return 0, "today"
+    week_start = today - datetime.timedelta(days=today.weekday())
+    if completed_date >= week_start:
+        return 1, "earlier this week"
+    if completed_date.year == today.year and completed_date.month == today.month:
+        return 2, "earlier this month"
+    if completed_date.year == today.year:
+        return 3, "earlier this year"
+    return 4, "older"
+
+
+def _source_word_group_key(row, group_by, generated_at):
     """Map a collapsed source row to (sort_key, label) for the strategy."""
     if group_by == "state":
         state = row["state"]
@@ -2782,11 +2862,24 @@ def _source_word_group_key(row, group_by):
     if group_by == "worker_presence":
         return ((0, "with workers") if row["worker_count"]
                 else (1, "no workers"))
+    if group_by == "completed":
+        return _completed_at_group_key(row["completed_at"], generated_at)
+    if group_by == "elapsed":
+        return _duration_group_key(row["elapsed_millis"], "not completed")
+    if group_by == "worker_time":
+        return _duration_group_key(row["worker_millis"], "not completed")
+    if group_by == "requested":
+        requested_at = row["requested_at"]
+        duration_millis = (
+            max(0, generated_at - requested_at) * 1000
+            if requested_at is not None else None
+        )
+        return _duration_group_key(duration_millis, "not requested")
     priority = row["requested_priority"]
     return (-(priority or 0), f"priority {priority}")
 
 
-def _grouped_source_words(rows, group_by, branch_totals):
+def _grouped_source_words(rows, group_by, branch_totals, generated_at):
     """Bucket the collapsed rows, each group carrying its own rollup.
 
     A group's branch totals are counted distinctly over the words in it, for
@@ -2795,7 +2888,7 @@ def _grouped_source_words(rows, group_by, branch_totals):
     """
     grouped = {}
     for row in rows:
-        sort_key, label = _source_word_group_key(row, group_by)
+        sort_key, label = _source_word_group_key(row, group_by, generated_at)
         group = grouped.setdefault(
             (sort_key, label),
             {"label": label, "rows": [],
@@ -2819,27 +2912,31 @@ def _grouped_source_words(rows, group_by, branch_totals):
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _source_word_erd_summaries(sources, source_words, report):
-    """Resolve each word's own ERD, folding it only when it is not stored.
+def _source_word_erd_summaries(sources, source_words, report, cache,
+                               all_answers):
+    """Resolve each word's own ERD, reusing folds until the cache changes.
 
     A source word's ERD is the whole point of queueing it.  It is derived from
     the cached result of each of the word's response groups, the same way the
     word report derives it for one word, and a word whose whole tree is solved
     keeps its folded value in `candidate_erd_by_policy` so later pages read one
-    row instead of re-folding ~150 groups.  Only the words on the page are
-    resolved, so the cost is bounded by the page size rather than by how much
-    is queued.
+    row instead of re-folding ~150 groups.  ERD order requires every visible
+    source word's summary; unchanged cache files reuse the previous fold.
     """
     summaries = {}
     if not source_words:
         return summaries
-    cache = None
     try:
-        all_answers = load_word_list(sources.answer_list_path)
         response_cache = ResponseCache(all_answers, score_cache=None)
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
+        cache_version = _score_cache_file_signature(sources.cache_path)
+        cache_identity = (sources.cache_path, cache.answer_list_id)
+        cached_version, cached_summaries = _SOURCE_ERD_SUMMARY_CACHE.get(
+            cache_identity, (None, {})
         )
+        if cached_version != cache_version:
+            cached_summaries = {}
+            _SOURCE_ERD_SUMMARY_CACHE[cache_identity] = (
+                cache_version, cached_summaries)
         # A root word spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
         # Source words are always openers, so every one folds against the same
@@ -2847,6 +2944,10 @@ def _source_word_erd_summaries(sources, source_words, report):
         root_branch_key = ScoreCache.encode_subset(all_answers)
         for word in source_words:
             if word is None:
+                continue
+            cached_summary = cached_summaries.get(word)
+            if cached_summary is not None:
+                summaries[word] = cached_summary
                 continue
             groups = response_cache.group_words(word, all_answers)
             group_rows = []
@@ -2864,7 +2965,7 @@ def _source_word_erd_summaries(sources, source_words, report):
             states = cache.report_branch_states(
                 branch_keys, ERD_ALL, group_budget
             )
-            summaries[word] = _resolved_candidate_erd(
+            summary = _resolved_candidate_erd(
                 cache, root_branch_key, word, ERD_ALL,
                 [
                     {
@@ -2880,13 +2981,24 @@ def _source_word_erd_summaries(sources, source_words, report):
                 ],
                 group_budget,
             )
+            cached_summaries[word] = summary
+            summaries[word] = summary
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
-    finally:
-        if cache is not None:
-            cache.close()
     return summaries
+
+
+def _score_cache_file_signature(cache_path):
+    """Identify the cache generation, including uncheckpointed WAL writes."""
+    def file_signature(path):
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            return None
+        return stat_result.st_mtime_ns, stat_result.st_size
+
+    return file_signature(cache_path), file_signature(cache_path + "-wal")
 
 
 def _source_rollups(membership_rows):
@@ -2975,6 +3087,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         "sources", sources, request.branch_target, generated_at, data, request
     )
     queue = None
+    timing_cache = None
     try:
         queue = _open_report_queue(sources)
         source_word = (
@@ -2989,18 +3102,42 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
         # each word's own totals are complete whichever word is in scope.
         all_membership_rows = queue.source_membership_rows()
         rollups = _source_rollups(all_membership_rows)
+        all_answers = None
+        try:
+            all_answers = load_word_list(sources.answer_list_path)
+            timing_cache = ScoreCache(sources.cache_path, all_answers,
+                                      checkpoint_on_close=False)
+            timings = timing_cache.completed_source_summary_map(ERD_ALL)
+        except (sqlite3.Error, OSError) as error:
+            timings = {}
+            report["sources"]["cache"]["error"] = str(error)
         collapsed = [
             _source_summary_payload(
-                row, rollups[(_row_value(row, "source_word") or "").lower() or None]
+                row, rollups[(_row_value(row, "source_word") or "").lower() or None],
+                timings.get(
+                    (_row_value(row, "source_word") or "").lower() or None,
+                    {"completed_at": None, "elapsed_millis": None,
+                     "worker_millis": None},
+                ),
             )
             for row in summary_rows
         ]
+        source_sort = request.filters.sort or "erd"
         data["total_source_word_count"] = len(collapsed)
         source_states = request.filters.source_states
         if source_states:
             collapsed = [row for row in collapsed
                          if row["state"] in source_states]
-        collapsed = _sorted_source_words(collapsed, request.filters.sort)
+        if source_sort in ("default", "erd"):
+            erd_summaries = (
+                _source_word_erd_summaries(
+                    sources, [row["source_word"] for row in collapsed], report,
+                    timing_cache, all_answers,
+                ) if timing_cache is not None else {}
+            )
+            for row in collapsed:
+                row["erd_summary"] = erd_summaries.get(row["source_word"])
+        collapsed = _sorted_source_words(collapsed, source_sort)
         data["matched_source_word_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
         # branch, so summing their per-word counts double-counts precisely the
@@ -3034,17 +3171,20 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             else collapsed[offset:]
         )
         # Folded for the page only, and attached to the rows it describes.
-        erd_summaries = _source_word_erd_summaries(
-            sources, [row["source_word"] for row in data["summary"]], report
-        )
-        for row in data["summary"]:
-            row["erd_summary"] = erd_summaries.get(row["source_word"])
+        if source_sort not in ("default", "erd"):
+            erd_summaries = (
+                _source_word_erd_summaries(
+                    sources, [row["source_word"] for row in data["summary"]], report,
+                    timing_cache, all_answers,
+                ) if timing_cache is not None else {}
+            )
+            for row in data["summary"]:
+                row["erd_summary"] = erd_summaries.get(row["source_word"])
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_source_words(
-                data["summary"], group_by, branch_totals
+                data["summary"], group_by, branch_totals, generated_at
             )
-
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they
         # spawned, which is the explosion this report exists to roll up.
@@ -3080,6 +3220,8 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     except (sqlite3.Error, OSError) as error:
         _mark_queue_source_error(report, error)
     finally:
+        if timing_cache is not None:
+            timing_cache.close()
         if queue is not None:
             queue.close()
     return report
