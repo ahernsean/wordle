@@ -1909,16 +1909,20 @@ class ERDQueue:
         return completed_words
 
     def completed_source_timing(self, source_word):
+        """Return timing recorded for spines opened by one source word.
+
+        Source ownership can attach a request to an already-existing branch.
+        Its finalization record predates that request, so ownership joins are
+        not a source timing boundary.  The opener in each recorded spine is.
+        """
         return self._conn.execute("""
             SELECT MIN(log.created_at) AS first_created_at,
                    MAX(log.finalized_at) AS completed_at,
                    SUM(COALESCE(log.total_bundle_wall_millis, 0)) AS worker_millis
-            FROM (SELECT DISTINCT membership.branch_id
-                  FROM branch_source_work AS membership
-                  JOIN source_work AS source USING (source_work_id)
-                  WHERE source.source_word = ?) AS owned
-            JOIN branches AS branch USING (branch_id)
-            JOIN telemetry.branch_finalize_log AS log ON log.branch_key = branch.branch_key
+            FROM telemetry.branch_finalize_log AS log
+            WHERE lower(substr(log.spine, 1, 5)) = lower(?)
+              AND log.created_at IS NOT NULL
+              AND log.finalized_at IS NOT NULL
         """, (source_word,)).fetchone()
 
     def _demote_orphaned_owned_branches(self) -> list[int]:

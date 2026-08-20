@@ -1728,6 +1728,25 @@ class TestCeilingTelemetry(_TmpQueue):
         self.assertEqual(row["best_guess"], "crane")
         self.assertAlmostEqual(row["best_erd"], 1.75)
 
+    def test_completed_source_timing_uses_the_spine_opener(self):
+        old_branch_key = ScoreCache.encode_subset(["crane", "slate"])
+        source_branch_key = ScoreCache.encode_subset(["trace", "stale"])
+        self.q.add_pending_many([
+            (old_branch_key, 2, 0, "trace", "-----"),
+        ])
+        self.q.add_branch_finalize_log(
+            old_branch_key, "SALET -----", 2, 4, 100, 200, 10, 1,
+            total_bundle_wall_millis=1_000)
+        self.q.add_branch_finalize_log(
+            source_branch_key, "TRACE -----", 2, 4, 120, 180, 10, 1,
+            total_bundle_wall_millis=2_000)
+
+        timing = self.q.completed_source_timing("trace")
+
+        self.assertEqual(timing["first_created_at"], 120)
+        self.assertEqual(timing["completed_at"], 180)
+        self.assertEqual(timing["worker_millis"], 2_000)
+
     def test_cut_reuse_miss_row(self):
         self.q.set_epoch(7)
         self.q.add_cut_reuse_miss(self.key, len(WORDS), 4,
