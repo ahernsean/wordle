@@ -1558,6 +1558,9 @@ class SourceReportTest(unittest.TestCase):
                 report_kind="sources", filters=ReportFilters(sort="nodes")))
         with self.assertRaisesRegex(ValueError, "source reports must be"):
             validate_report_request(ReportRequest(
+                report_kind="sources", filters=ReportFilters(sort="age")))
+        with self.assertRaisesRegex(ValueError, "source reports must be"):
+            validate_report_request(ReportRequest(
                 report_kind="sources",
                 filters=ReportFilters(group_by="cache_state")))
 

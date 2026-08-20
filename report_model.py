@@ -128,7 +128,7 @@ GROUP_BY_STRATEGIES = (
 )
 SOURCE_GROUP_BY_STRATEGIES = ("none", "state", "worker_presence", "priority")
 SOURCE_SORT_FIELDS = (
-    "default", "word", "priority", "branches", "open", "done", "workers", "age",
+    "default", "word", "priority", "branches", "open", "done", "workers",
     "completed", "erd", "requested",
 )
 # Sorts that only a source report can serve, so another report asking for one
@@ -2764,9 +2764,6 @@ _SOURCE_SORT_KEYS = {
     "open": lambda row: (-row["open_branch_count"], row["source_word"] or ""),
     "done": lambda row: (-row["done_branch_count"], row["source_word"] or ""),
     "workers": lambda row: (-row["worker_count"], row["source_word"] or ""),
-    # Oldest request first: the word that has been waiting longest leads.
-    "age": lambda row: (row["requested_at"] if row["requested_at"] is not None
-                        else float("inf"), row["source_word"] or ""),
     "completed": lambda row: (-(row["_completed_at"] or 0)
                                if row["_completed_at"] is not None else float("inf"),
                                row["source_word"] or ""),
