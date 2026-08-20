@@ -1747,6 +1747,21 @@ class TestCeilingTelemetry(_TmpQueue):
         self.assertEqual(timing["completed_at"], 180)
         self.assertEqual(timing["worker_millis"], 2_000)
 
+    def test_completed_source_timing_uses_only_the_active_epoch(self):
+        self.q.add_branch_finalize_log(
+            self.key, "TRACE -----", 2, 4, 10, 20, 10, 1,
+            total_bundle_wall_millis=1_000)
+        self.q.set_epoch(1)
+        self.q.add_branch_finalize_log(
+            self.key, "TRACE -----", 2, 4, 100, 160, 10, 1,
+            total_bundle_wall_millis=2_000)
+
+        timing = self.q.completed_source_timing("trace")
+
+        self.assertEqual(timing["first_created_at"], 100)
+        self.assertEqual(timing["completed_at"], 160)
+        self.assertEqual(timing["worker_millis"], 2_000)
+
     def test_cut_reuse_miss_row(self):
         self.q.set_epoch(7)
         self.q.add_cut_reuse_miss(self.key, len(WORDS), 4,

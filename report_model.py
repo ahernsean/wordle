@@ -2738,10 +2738,13 @@ def _source_summary_payload(row, rollup, timing):
     open_branch_count = rollup["open_branch_count"]
     state = _merged_source_state(row)
     completed_at = None
+    elapsed_millis = worker_millis = None
     if state == "complete":
         completed_at = timing["completed_at"]
         if completed_at is None:
             completed_at = _row_value(row, "completed_at")
+        elapsed_millis = timing["elapsed_millis"]
+        worker_millis = timing["worker_millis"]
     return {
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
@@ -2755,8 +2758,8 @@ def _source_summary_payload(row, rollup, timing):
         "open_branch_count": open_branch_count,
         "done_branch_count": max(0, branch_count - open_branch_count),
         "worker_count": rollup["worker_count"],
-        "elapsed_millis": timing["elapsed_millis"],
-        "worker_millis": timing["worker_millis"],
+        "elapsed_millis": elapsed_millis,
+        "worker_millis": worker_millis,
     }
 
 
@@ -2770,9 +2773,19 @@ def _merged_source_state(row):
         return "complete"
     return "active" if _row_value(row, "has_active_request", 0) else "queued"
 
+def _source_erd_sort_key(row):
+    summary = row.get("erd_summary")
+    if not summary:
+        return (3, float("inf"), row["source_word"] or "")
+    if summary["state"] == "complete":
+        return (0, summary["erd"], row["source_word"] or "")
+    if summary["state"] == "pending":
+        return (1, float("inf"), row["source_word"] or "")
+    return (2, float("inf"), row["source_word"] or "")
+
 
 _SOURCE_SORT_KEYS = {
-    "default": lambda row: _source_erd_sort_key(row),
+    "default": _source_erd_sort_key,
     "age": lambda row: (row["requested_at"] or float("inf"),
                         row["source_word"] or ""),
     "word": lambda row: (row["source_word"] or "",),
@@ -2788,7 +2801,7 @@ _SOURCE_SORT_KEYS = {
     "requested": lambda row: (-(row["requested_at"] or 0)
                                if row["requested_at"] is not None else float("inf"),
                                row["source_word"] or ""),
-    "erd": lambda row: _source_erd_sort_key(row),
+    "erd": _source_erd_sort_key,
     "elapsed": lambda row: (-(row["elapsed_millis"] or 0)
                             if row["elapsed_millis"] is not None else float("inf"),
                             row["source_word"] or ""),
@@ -2796,17 +2809,6 @@ _SOURCE_SORT_KEYS = {
                                 if row["worker_millis"] is not None else float("inf"),
                                 row["source_word"] or ""),
 }
-
-
-def _source_erd_sort_key(row):
-    summary = row.get("erd_summary")
-    if not summary:
-        return (3, float("inf"), row["source_word"] or "")
-    if summary["state"] == "complete":
-        return (0, summary["erd"], row["source_word"] or "")
-    if summary["state"] == "pending":
-        return (1, float("inf"), row["source_word"] or "")
-    return (2, float("inf"), row["source_word"] or "")
 
 
 def _sorted_source_words(rows, sort):
@@ -2877,12 +2879,13 @@ def _source_word_erd_summaries(sources, source_words, report, cache,
     try:
         response_cache = ResponseCache(all_answers, score_cache=None)
         cache_version = _score_cache_file_signature(sources.cache_path)
+        cache_identity = (sources.cache_path, cache.answer_list_id)
         cached_version, cached_summaries = _SOURCE_ERD_SUMMARY_CACHE.get(
-            sources.cache_path, (None, {})
+            cache_identity, (None, {})
         )
         if cached_version != cache_version:
             cached_summaries = {}
-            _SOURCE_ERD_SUMMARY_CACHE[sources.cache_path] = (
+            _SOURCE_ERD_SUMMARY_CACHE[cache_identity] = (
                 cache_version, cached_summaries)
         # A root word spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
@@ -2941,7 +2944,7 @@ def _score_cache_file_signature(cache_path):
     def file_signature(path):
         try:
             stat_result = os.stat(path)
-        except FileNotFoundError:
+        except OSError:
             return None
         return stat_result.st_mtime_ns, stat_result.st_size
 

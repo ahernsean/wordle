@@ -3200,6 +3200,14 @@ class TestCompletedSourceSnapshots(unittest.TestCase):
         worker.score_cache.write_completed_source_summary.assert_called_once_with(
             "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000)
 
+    def test_snapshot_failure_does_not_abort_the_worker(self):
+        worker = _bare_worker()
+        worker.queue.completed_source_timing.side_effect = RuntimeError("locked")
+
+        worker._snapshot_completed_sources(["salet"])
+
+        worker.score_cache.write_completed_source_summary.assert_not_called()
+
 
 class TestSubbranchSolverForwardsCeiling(unittest.TestCase):
     """_subbranch_solver passes the frame's ceiling through to

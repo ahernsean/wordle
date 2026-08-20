@@ -1394,6 +1394,7 @@ class SourceReportTest(unittest.TestCase):
             crane_key, "CRANE -----", 3, 3, 20, 30, 100, 1,
             total_bundle_wall_millis=5_000,
         )
+        queue.mark_done(salet_key)
         queue.mark_done(crane_key)
         queue.close()
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
@@ -1434,6 +1435,19 @@ class SourceReportTest(unittest.TestCase):
         self.assertIn("erd_summary", report["data"]["summary"][0])
         self.assertIsNone(report["data"]["summary"][0]["erd_summary"])
 
+    def test_requeued_source_hides_completed_run_timing(self):
+        self._queue_words(("salet", 5, 1))
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write_completed_source_summary("salet", ERD_ALL, 160, 60_000, 2_000)
+        cache.close()
+
+        row = self._source_words()["summary"][0]
+
+        self.assertEqual(row["state"], "queued")
+        self.assertIsNone(row["completed_at"])
+        self.assertIsNone(row["elapsed_millis"])
+        self.assertIsNone(row["worker_millis"])
+
     def test_source_erd_summary_cache_invalidates_for_wal_writes(self):
         self._queue_words(("nurdy", 5, 1))
         first = self._source_words()["summary"][0]["erd_summary"]
@@ -1455,7 +1469,9 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(second["state"], "complete")
         self.assertNotEqual(first, second)
         self.assertEqual(
-            report_model._SOURCE_ERD_SUMMARY_CACHE[self.cache_path][1],
+            report_model._SOURCE_ERD_SUMMARY_CACHE[
+                (self.cache_path, cache.answer_list_id)
+            ][1],
             {"nurdy": second},
         )
         cache.close()

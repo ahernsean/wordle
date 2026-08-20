@@ -471,8 +471,8 @@
       return endpoint+(query.size?"?"+query.toString():"");
     }
     function contextKey(state){return buildAPIURL(state);}
-    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}clearSlowRequestNotice();}
-    function clearSlowRequestNotice(){computingNotice?.remove();computingNotice=null;}
+    function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}removeComputingNotice();}
+    function removeComputingNotice(){computingNotice?.remove();computingNotice=null;}
     function setState(next,push=true){
       abortActiveRequest();
       const previousGroupBy=currentState?.group_by;
@@ -1797,7 +1797,7 @@
       // also folds ERD summaries.  Keep the current report visible while the
       // replacement is being computed, but make the work visible immediately.
       // Same-context polls keep the current data on screen and never show it.
-      clearSlowRequestNotice();
+      removeComputingNotice();
       if(context!==lastContext){
         computingNotice=element("p","dim","Computing "+(
           state.kind==="sources"?"sources report":
@@ -1827,7 +1827,7 @@
           if(navigated||!lastReport)byId("report").replaceChildren(element("p","error",error.message));
         }
       }
-      finally{clearSlowRequestNotice();if(activeRequestController===controller)activeRequestController=null;}
+      finally{removeComputingNotice();if(activeRequestController===controller)activeRequestController=null;}
     }
     function pinBranchToSpine(report,state){
       // A spine remains the preferred URL because it resolves from the answer

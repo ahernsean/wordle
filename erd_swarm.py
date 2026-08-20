@@ -1566,13 +1566,17 @@ class _BranchWorker:
 
     def _snapshot_completed_sources(self, source_words):
         for source_word in source_words or ():
-            timing = self.queue.completed_source_timing(source_word)
-            if timing["completed_at"] is None:
-                continue
-            self.score_cache.write_completed_source_summary(
-                source_word, ERD_ALL, timing["completed_at"],
-                (timing["completed_at"] - timing["first_created_at"]) * 1000,
-                timing["worker_millis"] or 0)
+            try:
+                timing = self.queue.completed_source_timing(source_word)
+                if timing["completed_at"] is None:
+                    continue
+                self.score_cache.write_completed_source_summary(
+                    source_word, ERD_ALL, timing["completed_at"],
+                    (timing["completed_at"] - timing["first_created_at"]) * 1000,
+                    timing["worker_millis"] or 0)
+            except Exception:
+                logger.exception("%s could not snapshot completed source %s",
+                                 self.name, source_word)
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
                        censored):

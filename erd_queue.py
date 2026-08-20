@@ -1866,10 +1866,19 @@ class ERDQueue:
 
     def _complete_finished_source_work(self):
         """Mark source requests terminal once every owned branch is complete."""
-        unfinished_rows = self._conn.execute("""
-            SELECT source_work_id FROM source_work WHERE state != 'complete'
+        completed_rows = self._conn.execute("""
+            SELECT source_word FROM source_work AS s
+            WHERE state != 'complete'
+              AND NOT EXISTS (
+                  SELECT 1 FROM branch_source_work m
+                  LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
+                  LEFT JOIN active_branches a ON a.branch_id = m.branch_id
+                  WHERE m.source_work_id = s.source_work_id
+                    AND m.resolved_at IS NULL
+                    AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
+              )
         """).fetchall()
-        if not unfinished_rows:
+        if not completed_rows:
             return []
         self._conn.execute("""
             UPDATE source_work AS s SET state = 'complete'
@@ -1883,13 +1892,7 @@ class ERDQueue:
                     AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
               )
         """)
-        source_work_ids = [row["source_work_id"] for row in unfinished_rows]
-        placeholders = ",".join("?" for _ in source_work_ids)
-        completed = self._conn.execute(f"""
-            SELECT source_word FROM source_work
-            WHERE state = 'complete' AND source_work_id IN ({placeholders})
-        """, source_work_ids).fetchall()
-        return list({row["source_word"] for row in completed})
+        return list({row["source_word"] for row in completed_rows})
 
     def _resolve_branch_memberships(self, branch_id: int = None,
                                     withdraw: bool = False):
@@ -1925,9 +1928,10 @@ class ERDQueue:
                    SUM(COALESCE(log.total_bundle_wall_millis, 0)) AS worker_millis
             FROM telemetry.branch_finalize_log AS log
             WHERE lower(substr(log.spine, 1, 5)) = lower(?)
+              AND log.epoch = ?
               AND log.created_at IS NOT NULL
               AND log.finalized_at IS NOT NULL
-        """, (source_word,)).fetchone()
+        """, (source_word, self.epoch)).fetchone()
 
     def _demote_orphaned_owned_branches(self) -> list[int]:
         """Demote open branches whose only source ownership has been lost.
