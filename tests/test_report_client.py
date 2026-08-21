@@ -926,7 +926,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
-          let leaderboard, changed = false;
+          let leaderboard, allowChangedReport = false;
+          window.__changeLeaderboardReport = () => { allowChangedReport = true; };
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             if (!leaderboard) {
@@ -939,8 +940,7 @@ class ReportClientBrowserTest(unittest.TestCase):
               leaderboard.data.counts.complete = leaderboard.data.rows.length;
             }
             const report = structuredClone(leaderboard);
-            if (changed) report.data.rows[0].erd = 9.876;
-            changed = true;
+            if (allowChangedReport) report.data.rows[0].erd = 9.876;
             return new Response(JSON.stringify(report), {
               status: 200, headers: {'Content-Type': 'application/json'},
             });
@@ -953,7 +953,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         card = cards.nth(8)
         card.scroll_into_view_if_needed()
         before = card.evaluate("(node) => { window.scrollBy(0, 40); return node.getBoundingClientRect().top; }")
-        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); await Promise.resolve(); }")
+        self.page.evaluate("async () => { window.__changeLeaderboardReport(); await window.__reportClient.fetchReport(); await new Promise(requestAnimationFrame); }")
         self.assertAlmostEqual(
             card.evaluate("(node) => node.getBoundingClientRect().top"), before, delta=1
         )
