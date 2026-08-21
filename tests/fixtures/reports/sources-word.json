@@ -36,7 +36,8 @@
       {
         "source_word": "salet",
         "requested_priority": 5,
-        "requested_at": 400,
+      "requested_at": 400,
+      "started_at": null,
         "completed_at": null,
         "request_count": 2,
         "state": "queued",

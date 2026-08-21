@@ -548,6 +548,25 @@ class ReportClientBrowserTest(unittest.TestCase):
 
         self.assertIn("~1.0h remaining (provisional)", headline)
 
+    def test_completed_root_progress_replaces_an_inapplicable_estimate(self):
+        def completed_progress(route):
+            response = route.fetch()
+            progress = response.json()
+            progress["data"]["estimate"] = None
+            progress["data"]["completed_at"] = 1785575213
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/root-progress**", completed_progress)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.root-progress")
+            text = self.page.locator(".root-progress-panel").inner_text()
+        finally:
+            self.page.unroute("**/api/view/root-progress**")
+
+        self.assertIn("Completed", text)
+        self.assertNotIn("No completion estimate", text)
+
     def test_root_progress_headline_states_no_coverage_percentage(self):
         # Cost concentrates so hard that breadth of coverage reads as
         # percent-complete: 98.8% of answers reached beside ~12d remaining
@@ -3274,14 +3293,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")
-        self.assertIn(
-            "sorted by ERD (lowest first)",
-            self.page.locator("#report").inner_text(),
-        )
+        self.assertEqual(self.page.locator("#sort").input_value(), "completed")
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
-            ["", "completed", "elapsed", "worker_time", "priority",
+            ["completed", "", "elapsed", "worker_time", "priority",
              "requested", "age", "word", "branches", "open", "done", "workers"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):
@@ -3463,6 +3479,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("ERD 3.389 · max 4", cards["CRANE"])
         # Still searching: how much of it is solved, not a number that moves.
         self.assertIn("ERD pending · 96/148 groups solved", cards["SALET"])
+
+    def test_active_source_card_shows_elapsed_work_time(self):
+        text = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          const row = report.data.summary[0];
+          row.state = 'active';
+          row.elapsed_millis = 30000;
+          row.worker_millis = null;
+          delete report.data.summary_groups;
+          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          return document.querySelector('.card.source-word').innerText;
+        }""")
+
+        self.assertIn("elapsed 30s", text)
 
     def test_sources_branch_cards_appear_only_for_the_named_word(self):
         self.open_sources()

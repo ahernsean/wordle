@@ -249,6 +249,7 @@ CREATE TABLE IF NOT EXISTS source_work (
     source_word        TEXT,
     requested_priority INTEGER NOT NULL,
     requested_at       INTEGER NOT NULL,
+    started_at         INTEGER,
     state              TEXT    NOT NULL DEFAULT 'queued'
 );
 
@@ -1338,6 +1339,21 @@ class ERDQueue:
             "root_pattern": "INTEGER",
             "resolved_at": "INTEGER",
         })
+        self._add_columns("source_work", {"started_at": "INTEGER"})
+        if "claimed_at" in pending_columns:
+            self._conn.execute("""
+                UPDATE source_work AS source
+                SET started_at = (
+                    SELECT MIN(pending.claimed_at)
+                    FROM branch_source_work AS membership
+                    JOIN pending_branches AS pending
+                      ON pending.branch_id = membership.branch_id
+                    WHERE membership.source_work_id = source.source_work_id
+                      AND membership.resolved_at IS NULL
+                      AND pending.claimed_at IS NOT NULL
+                )
+                WHERE source.state = 'active' AND source.started_at IS NULL
+            """)
         self._add_columns("active_branches", {
             "requires_source_membership": "INTEGER NOT NULL DEFAULT 0",
         })
@@ -1848,9 +1864,11 @@ class ERDQueue:
                 SET status = 'in_progress', claimed_by = ?, claimed_at = ?
                 WHERE branch_id = ?
             """, (worker_id, now, row["branch_id"]))
-            self._conn.execute(
-                "UPDATE source_work SET state = 'active' WHERE source_work_id = ?",
-                (source_work_id,))
+            self._conn.execute("""
+                UPDATE source_work
+                SET state = 'active', started_at = COALESCE(started_at, ?)
+                WHERE source_work_id = ?
+            """, (now, source_work_id))
             self._conn.execute("COMMIT")
             return {
                 'branch_key': bytes(row["branch_key"]),
@@ -4426,9 +4444,15 @@ class ERDQueue:
         roots until workers reach it.
         """
         rows = self._conn.execute("""
-            SELECT source_work_id, requested_priority, requested_at, state
-            FROM source_work WHERE source_word = ?
-            ORDER BY requested_at, source_work_id
+            SELECT source.source_work_id, source.requested_priority,
+                   source.requested_at, source.state,
+                   MAX(membership.resolved_at) AS completed_at
+            FROM source_work AS source
+            LEFT JOIN branch_source_work AS membership
+              ON membership.source_work_id = source.source_work_id
+            WHERE source.source_word = ?
+            GROUP BY source.source_work_id
+            ORDER BY source.requested_at, source.source_work_id
         """, (word.lower(),)).fetchall()
         return [dict(row) for row in rows]
 
@@ -4979,9 +5003,18 @@ class ERDQueue:
         directly; a branch acquired later by promotion carries a
         parent_branch_id and is counted only in branch_count.
         """
-        return self._conn.execute("""
+        source_columns = {
+            row["name"] for row in self._conn.execute(
+                "PRAGMA table_info(source_work)")
+        }
+        started_at = (
+            "MIN(CASE WHEN s.state != 'complete' THEN s.started_at END)"
+            if "started_at" in source_columns else "NULL"
+        )
+        return self._conn.execute(f"""
             SELECT s.source_word,
                    MIN(s.requested_at) AS requested_at,
+                   {started_at} AS started_at,
                    MAX(s.requested_priority) AS requested_priority,
                    MAX(m.resolved_at) AS completed_at,
                    COUNT(DISTINCT s.source_work_id) AS request_count,

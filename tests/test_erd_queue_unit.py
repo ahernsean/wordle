@@ -391,6 +391,16 @@ class TestBranchLifecycle(_TmpQueue):
         finally:
             reopened.close()
 
+    def test_first_claim_records_source_work_start_time(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
+
+        claimed = self.q.claim_next("worker-0")
+
+        source = self.q.source_work_rows()[0]
+        self.assertEqual(source["source_work_id"], claimed["source_work_id"])
+        self.assertEqual(source["state"], "active")
+        self.assertIsNotNone(source["started_at"])
+
     def test_view_migration_rebuilds_drifted_views_without_rewriting_current_views(self):
         expected_views = {
             row["name"]: row["sql"]

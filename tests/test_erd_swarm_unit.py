@@ -3539,6 +3539,18 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         self.assertEqual(log_kwargs["outcome"], "exact")
         self.assertAlmostEqual(log_kwargs["ceiling"], 2.5)
 
+    def test_exact_direct_completion_is_snapshotted_before_branch_cleanup(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker(("crane", 1.8, 2, False, 4, None, False))
+        w.queue.mark_done.return_value = ["salet"]
+        w.queue.delete_branch.return_value = []
+        w._snapshot_completed_sources = mock.MagicMock()
+
+        with mock.patch.object(erd_swarm, "cache_all_scores"):
+            w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+
+        w._snapshot_completed_sources.assert_called_once_with(["salet"])
+
 
 class TestMidLoopPublisherCeiling(unittest.TestCase):
     """check()'s ceiling handling on overrun handoff: a frame still riding its

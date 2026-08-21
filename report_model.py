@@ -1624,6 +1624,17 @@ def collect_root_progress_report(sources: ReportSources,
     data["epoch"] = progress["epoch"]
     data["work_started_at"] = progress["work_started_at"]
     data["work_latest_at"] = progress["work_latest_at"]
+    root_is_complete = (
+        progress["open_branch_count"] == 0
+        and all(row["state"] in ("solved", "loss") for row in rows)
+    )
+    data["completed_at"] = progress["work_latest_at"] if root_is_complete else None
+    if root_is_complete and not resolved.steps:
+        data["completed_at"] = max(
+            (entry["completed_at"] for entry in requests
+             if entry["completed_at"] is not None),
+            default=data["completed_at"],
+        )
     data["estimate"] = _root_progress_estimate(
         progress["active_branches"],
         progress["recent_window_seconds"], generated_at)
@@ -2723,7 +2734,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
-def _source_summary_payload(row, rollup, timing):
+def _source_summary_payload(row, rollup, timing, generated_at):
     """One source word, with its requests and branches rolled up.
 
     This is the report's unit: a word that spawned a thousand branches is one
@@ -2749,10 +2760,15 @@ def _source_summary_payload(row, rollup, timing):
             completed_at = _row_value(row, "completed_at")
         elapsed_millis = timing["elapsed_millis"]
         worker_millis = timing["worker_millis"]
+    elif state == "active":
+        started_at = _row_value(row, "started_at")
+        if started_at is not None:
+            elapsed_millis = max(0, generated_at - started_at) * 1000
     return {
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
+        "started_at": _row_value(row, "started_at"),
         "completed_at": completed_at,
         "request_count": row["request_count"] or 0,
         "state": state,
@@ -3115,10 +3131,11 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                     {"completed_at": None, "elapsed_millis": None,
                      "worker_millis": None},
                 ),
+                generated_at,
             )
             for row in summary_rows
         ]
-        source_sort = request.filters.sort or "erd"
+        source_sort = request.filters.sort or "completed"
         data["total_source_word_count"] = len(collapsed)
         source_states = request.filters.source_states
         if source_states:

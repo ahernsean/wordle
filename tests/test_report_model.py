@@ -1347,11 +1347,8 @@ class SourceReportTest(unittest.TestCase):
         queue._conn.commit()
         queue.close()
 
-        # The default is the explicit ERD ordering.
-        self.assertEqual(
-            [row["source_word"] for row in self._source_words()["summary"]],
-            [row["source_word"] for row in
-             self._source_words(sort="erd")["summary"]])
+        # The default shows the newest completed work first.  With no
+        # completed sources, its word tie-breaker gives a stable order.
         self.assertEqual(
             [row["source_word"] for row in
              self._source_words(sort="default")["summary"]],
@@ -1421,6 +1418,27 @@ class SourceReportTest(unittest.TestCase):
              self._source_words(sort="worker_time")["summary"]],
             ["crane", "salet", "nurdy"],
         )
+        self.assertEqual(
+            [row["source_word"] for row in self._source_words()["summary"]],
+            ["salet", "crane", "nurdy"],
+        )
+
+    def test_active_source_elapsed_time_starts_when_work_is_claimed(self):
+        self._queue_words(("salet", 5, 1))
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE source_work SET state = 'active', started_at = 100 "
+            "WHERE source_word = 'salet'"
+        )
+        queue._conn.commit()
+        queue.close()
+
+        with patch("report_model.time.time", return_value=130):
+            row = self._source_words()["summary"][0]
+
+        self.assertEqual(row["started_at"], 100)
+        self.assertEqual(row["elapsed_millis"], 30_000)
+        self.assertIsNone(row["worker_millis"])
 
     def test_source_report_keeps_erd_summary_shape_when_cache_unavailable(self):
         self._queue_words(("salet", 5, 1))
@@ -1907,6 +1925,34 @@ class RootProgressReportTest(unittest.TestCase):
                    if row["pattern"] == "-y---")
         self.assertEqual(row["elapsed_millis"], 100_000)
         self.assertEqual(row["wall_millis"], 400_000)
+
+    def test_completed_root_reports_its_finalization_time(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 5, 1_000, 100, 200)
+        queue.close()
+
+        with patch("report_model._root_progress_group_state",
+                   return_value="solved"):
+            data = collect_report(self.sources, self._request())["data"]
+
+        self.assertEqual(data["completed_at"], 200)
+        self.assertIsNone(data["estimate"])
+
+    def test_completed_root_keeps_its_completion_time_across_epoch_rollover(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        with patch("erd_queue.time.time", return_value=300):
+            queue.mark_done(branch_key)
+        queue.set_epoch(1)
+        queue.close()
+
+        with patch("report_model._root_progress_group_state",
+                   return_value="solved"):
+            data = collect_report(self.sources, self._request(epoch=1))["data"]
+
+        self.assertIsNone(data["work_latest_at"])
+        self.assertEqual(data["completed_at"], 300)
 
     def test_rollup_is_fenced_by_epoch(self):
         queue = self._open_queue()
