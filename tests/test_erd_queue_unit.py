@@ -1549,13 +1549,15 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(row['nodes_spent'], 150)
 
     def test_add_claim_telemetry_inserts_row(self):
-        self.q.add_claim_telemetry(10, 5000, 300, 4)
+        self.q.add_claim_telemetry(
+            10, 5000, 300, 4, candidate_evaluation_millis=1200)
         row = self.q._conn.execute(
             "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row['n_words'], 10)
         self.assertEqual(row['coordination_millis'], 5000)
+        self.assertEqual(row['candidate_evaluation_millis'], 1200)
         self.assertEqual(row['work_nodes'], 300)
         self.assertEqual(row['worker_count'], 4)
         # Branch/bundle attribution and the phase breakdown are all optional

@@ -1381,7 +1381,8 @@ class _BranchWorker:
                 spine=self._work_context.spine, worker_id=self.name,
                 bundle_id=bundle_id, idx=idx,
                 bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
-                scheduling_millis=scheduling_millis)
+                scheduling_millis=scheduling_millis,
+                candidate_evaluation_millis=round(cand_elapsed * 1e3))
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.

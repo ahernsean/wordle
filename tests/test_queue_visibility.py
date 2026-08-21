@@ -160,10 +160,11 @@ class QueueVisibilityTests(unittest.TestCase):
         """, (branch_id, branch_id))
         self.q._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
-                (n_words, coordination_millis, work_nodes, branch_id, epoch,
+                (n_words, coordination_millis, candidate_evaluation_millis,
+                 work_nodes, branch_id, epoch,
                  recorded_at)
-            VALUES (5, 900, 1, ?, 0, 850),
-                   (5, 1100, 1, ?, 0, 950)
+            VALUES (5, 900, 9000, 1, ?, 0, 850),
+                   (5, 1100, 11000, 1, ?, 0, 950)
         """, (branch_id, branch_id))
 
         sample = self.q.branch_candidate_eta_sample(
@@ -174,7 +175,7 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(sample["pruned_candidate_count"], 7)
         self.assertEqual(sample["inspection_worker_millis"], 1000)
         self.assertEqual(sample["evaluated_candidate_count"], 1)
-        self.assertEqual(sample["evaluation_worker_millis"], 1100)
+        self.assertEqual(sample["evaluation_worker_millis"], 11000)
 
     def test_branch_report_telemetry_after_cursor_pages_past_the_first_window(self):
         self.q.create_branch(self.user_key, len(WORDS), 10)

@@ -1127,12 +1127,14 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
 
         q = ERDQueue(self.queue_path)
         rows = q._conn.execute(
-            "SELECT coordination_millis, claim_transaction_millis, "
+            "SELECT coordination_millis, candidate_evaluation_millis, "
+            "claim_transaction_millis, "
             "claim_commit_millis, busy_wait_millis, scheduling_millis, "
             "idle_millis FROM claim_telemetry ORDER BY id").fetchall()
         q.close()
         self.assertTrue(rows)
         for row in rows:
+            self.assertIsNotNone(row["candidate_evaluation_millis"])
             self.assertEqual(
                 row["claim_transaction_millis"] + row["claim_commit_millis"]
                 + row["busy_wait_millis"] + row["scheduling_millis"]

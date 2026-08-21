@@ -612,7 +612,8 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- idle_millis means genuinely unaccounted wait -- scheduling work is called
 -- out separately so a large idle_millis cannot be misread as starved workers
 -- when it is really scan cost.  All five span time BETWEEN candidate
--- evaluations, which is what coordination_millis covers: queue work done
+-- evaluations.  candidate_evaluation_millis is the elapsed solver work for this
+-- candidate.  Queue work done
 -- during a candidate's own evaluation (sub-branch promotion taking the write
 -- lock) sits inside the evaluation span that coordination_millis excludes and
 -- is deliberately not counted, since counting it would make the parts exceed
@@ -624,6 +625,7 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     id                        INTEGER PRIMARY KEY AUTOINCREMENT,
     n_words                   INTEGER NOT NULL,
     coordination_millis       INTEGER NOT NULL,
+    candidate_evaluation_millis INTEGER,
     work_nodes                INTEGER NOT NULL,
     claim_retries             INTEGER,
     busy_wait_millis          INTEGER,
@@ -1098,6 +1100,7 @@ class ERDQueue:
         # lands on branch_finalize_log, since it belongs to a branch rather
         # than to any single claim.
         self._add_columns("claim_telemetry", {
+            "candidate_evaluation_millis": "INTEGER",
             "branch_id": "INTEGER",
             "spine": "TEXT",
             "worker_id": "TEXT",
@@ -4385,12 +4388,12 @@ class ERDQueue:
                   AND recorded_at >= ? AND recorded_at <= ?
             """, (branch_id, branch_row["best_erd"], since, now)).fetchone()
             evaluation_row = self._conn.execute("""
-            SELECT COUNT(*) AS evaluated_candidate_count,
-                   COALESCE(SUM(coordination_millis), 0)
+            SELECT COUNT(candidate_evaluation_millis) AS evaluated_candidate_count,
+                   COALESCE(SUM(candidate_evaluation_millis), 0)
                        AS evaluation_worker_millis,
-                   CASE WHEN SUM(coordination_millis) > 0
-                        THEN SUM(worker_count * coordination_millis) * 1.0
-                             / SUM(coordination_millis) END
+                   CASE WHEN SUM(candidate_evaluation_millis) > 0
+                        THEN SUM(worker_count * candidate_evaluation_millis) * 1.0
+                             / SUM(candidate_evaluation_millis) END
                        AS evaluation_worker_count,
                    MIN(worker_count) AS evaluation_worker_count_min,
                    MAX(worker_count) AS evaluation_worker_count_max
@@ -5651,7 +5654,8 @@ class ERDQueue:
                             worker_id: str = None, bundle_id: str = None,
                             idx: int = None, bundle_start_idx: int = None,
                             bundle_end_idx: int = None,
-                            scheduling_millis: int = 0):
+                            scheduling_millis: int = 0,
+                            candidate_evaluation_millis: int = None):
         """Append a claim coordination record to claim_telemetry for offline analysis.
 
         claim_retries / busy_wait_millis / claim_transaction_millis /
@@ -5672,6 +5676,11 @@ class ERDQueue:
         bundle_start_idx/bundle_end_idx identify which worker evaluated which
         candidate of which bundle (all default to NULL for a caller with no
         branch/bundle context).
+        candidate_evaluation_millis is the elapsed solver work for this
+        candidate.  It
+        is separate from coordination_millis, which spans only the gap between
+        candidates.
+
         scheduling_millis is the caller's work-selection scan for this claim
         (source-work ordering, pending promotion, joining an in-progress
         branch), already net of any lock wait and claim transaction it
@@ -5705,13 +5714,15 @@ class ERDQueue:
                           - scheduling_millis)
         self._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
-                (n_words, coordination_millis, work_nodes, claim_retries,
+                (n_words, coordination_millis, candidate_evaluation_millis,
+                 work_nodes, claim_retries,
                  busy_wait_millis, worker_count, branch_id, spine, worker_id,
                  bundle_id, idx, bundle_start_idx, bundle_end_idx,
                  claim_transaction_millis, claim_commit_millis,
                  scheduling_millis, idle_millis, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (n_words, coordination_millis, work_nodes, self._last_claim_retries,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (n_words, coordination_millis, candidate_evaluation_millis, work_nodes,
+              self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, branch_id, spine,
               worker_id, bundle_id, idx, bundle_start_idx, bundle_end_idx,
               self._last_claim_transaction_millis, self._last_claim_commit_millis,
