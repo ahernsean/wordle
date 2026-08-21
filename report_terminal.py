@@ -1185,21 +1185,14 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     else:
         worker_lines.append("  none")
 
-    detail_lines = ["Candidate state"]
+    detail_lines = ["Candidate detail"]
     detail_lines.append(
         f"  republished candidates: {len(data['republished_candidates'])}"
     )
     claim_summary = data.get("claim_summary") or {}
     if claim_summary.get("total_claim_count"):
-        one_level_erd_prunes = claim_summary.get(
-            "one_level_erd_pruned_count",
-            claim_summary.get("bulk_eliminated_count", 0),
-        )
         completion_fields = [
-            f"{claim_summary['done_count']:,} done",
             f"{claim_summary['evaluated_count']:,} evaluated",
-            f"{one_level_erd_prunes:,} one-level ERD prunes",
-            f"{claim_summary.get('two_level_erd_pruned_count', 0):,} two-level ERD prunes",
         ]
         if claim_summary.get("provenance_unknown_count"):
             completion_fields.append(
@@ -1213,24 +1206,29 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         contributions = claim_summary.get("worker_contributions") or []
         if contributions:
             worker_fields = [
-                f"{_worker_number_label(row['worker_id'])} {row['done_count']:,}"
+                f"{_worker_number_label(row['worker_id'])}:{row['done_count']:,}"
                 for row in contributions
             ]
-            detail_lines.extend(_inline_section("  by worker:", worker_fields, width))
+            detail_lines.extend(_inline_section(
+                "  Claims completed:", worker_fields, width
+            ))
     telemetry_lines = ["Telemetry"]
     bundle_summary = data.get("bundle_summary")
     if bundle_summary:
         bundle_labels = {
             "bundle_count": "bundles",
-            "node_count": "nodes",
-            "wall_millis": "wall ms",
-            "censored_unit_count": "censored units",
+            "wall_millis": "wall time",
+            "censored_unit_count": "capped bundles",
             "maximum_bundle_node_count": "max bundle nodes",
         }
         bundle_fields = [
             bundle_labels.get(key, key.replace("_", " "))
             + " "
-            + (f"{value:,}" if isinstance(value, int) else str(value))
+            + (
+                _abbreviate_duration(value / 1000)
+                if key == "wall_millis"
+                else f"{value:,}" if isinstance(value, int) else str(value)
+            )
             for key, value in bundle_summary.items()
         ]
         telemetry_lines.extend(

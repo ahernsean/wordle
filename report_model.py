@@ -1758,7 +1758,11 @@ def _summarize_claims(normalized_claims):
             {"worker_id": worker_id, "done_count": count}
             for worker_id, count in done_by_worker.items()
         ),
-        key=lambda item: (-item["done_count"], item["worker_id"]),
+        key=lambda item: (
+            (0, int(_worker_number(item["worker_id"])), item["worker_id"])
+            if _worker_number(item["worker_id"]).isdigit()
+            else (1, item["worker_id"])
+        ),
     )
     return {
         "total_claim_count": len(normalized_claims),

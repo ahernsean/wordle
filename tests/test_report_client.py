@@ -1300,12 +1300,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = self.page.locator("section:has-text('Candidate detail')").inner_text()
         # A summary of provenance and per-worker contribution, never a row per
         # candidate — the branch holds far more claims than a browser can render.
-        self.assertIn("12,819 done", text)
-        self.assertIn("11,200 evaluated", text)
-        self.assertIn("1,500 one-level ERD prunes", text)
-        self.assertIn("119 two-level ERD prunes", text)
-        self.assertIn("5 in flight", text)
-        self.assertIn("w0 6,484", text)
+        self.assertNotIn("12,819 done", text)
+        self.assertIn("evaluated 11,200", text)
+        self.assertNotIn("1,500 one-level ERD prunes", text)
+        self.assertNotIn("119 two-level ERD prunes", text)
+        self.assertIn("in flight 5", text)
+        self.assertIn("Claims completed w0:6,484 w2:6,335", text)
         # Nothing fetches the raw per-candidate list, and no per-candidate rows
         # are rendered.
         self.assertFalse(any("claims=1" in url for url in requested))
@@ -1498,7 +1498,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("4,900 candidates completed first", text)
         self.assertIn("weakest of them ranked 7,795", text)
         self.assertIn("winner republished 1\u00d7", text)
-        self.assertIn("5,305 candidates republished (up to 3\u00d7 each)", text)
+        self.assertIn("5,305 (up to 3\u00d7 each)", text)
 
     def test_finalization_omits_scheduling_evidence_when_unrecorded(self):
         text = self.page.evaluate("""async () => {
@@ -1527,7 +1527,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("12 candidates republished", text)
+        self.assertIn("12 (up to", text)
         self.assertNotIn("candidates completed first", text)
         self.assertNotIn("weakest of them ranked", text)
 

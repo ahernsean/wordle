@@ -227,6 +227,7 @@
     .labeled-facts { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .labeled-facts .fact { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .labeled-facts .fact-label { color:var(--dim); }
+    .candidate-detail .fact-label { color:var(--text); font-weight:700; }
     /* The base words sit flush at the page margin; a rail is drawn only where
        it separates siblings from the guess they branch off. */
     .tree { list-style:none; margin:0; padding:0; }
@@ -1268,19 +1269,19 @@
         }
         fragment.append(section("Cut-reuse misses",misses));
       }
-      const bundleLabels={bundle_count:"bundles",node_count:"nodes",wall_millis:"wall ms",censored_unit_count:"censored units",maximum_bundle_node_count:"max bundle nodes"};
-      const bundlePairs=Object.entries(data.bundle_summary||{}).map(([key,value])=>[bundleLabels[key]||label(key),value]);
+      const bundleLabels={bundle_count:"bundles",wall_millis:"wall time",censored_unit_count:"capped bundles",maximum_bundle_node_count:"max bundle nodes"};
+      const bundlePairs=Object.entries(data.bundle_summary||{}).filter(([key])=>key!=="node_count").map(([key,value])=>[bundleLabels[key]||label(key),key==="wall_millis"?formatDuration(value/1000):value]);
       const republishedList=data.republished_candidates||[];
-      const republishedSummary=republishedList.length?numText(republishedList.length)+(republishedList.length===1?" candidate":" candidates")+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)":null;
+      const republishedSummary=republishedList.length?numText(republishedList.length)+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)":null;
       if(bundlePairs.length||republishedSummary)fragment.append(section("Bundle and republish",labeledFacts([...bundlePairs,["candidates re-queued",republishedSummary]])));
       const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words ("+numText(branch.answer_count)+")"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
       const claimSummary=data.claim_summary;
       if(claimSummary&&claimSummary.total_claim_count){
-        const completion=[numText(claimSummary.done_count)+" done",numText(claimSummary.evaluated_count)+" evaluated",numText(claimSummary.one_level_erd_pruned_count??claimSummary.bulk_eliminated_count??0)+" one-level ERD prunes",numText(claimSummary.two_level_erd_pruned_count??0)+" two-level ERD prunes"];
+        const completion=[numText(claimSummary.evaluated_count)+" evaluated"];
         if(claimSummary.provenance_unknown_count)completion.push(numText(claimSummary.provenance_unknown_count)+" unattributed");
         if(claimSummary.in_flight_count)completion.push(numText(claimSummary.in_flight_count)+" in flight");
-        const detail=element("section","section");detail.append(element("h2","","Candidate detail"),statLine(completion));
-        if(claimSummary.worker_contributions&&claimSummary.worker_contributions.length)detail.append(statLine(claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+" "+numText(row.done_count))));
+        const detail=element("section","section candidate-detail");detail.append(element("h2","","Candidate detail"),labeledFacts([["evaluated",numText(claimSummary.evaluated_count)],...(claimSummary.provenance_unknown_count?[["unattributed",numText(claimSummary.provenance_unknown_count)]]:[]),...(claimSummary.in_flight_count?[["in flight",numText(claimSummary.in_flight_count)]]:[])]));
+        if(claimSummary.worker_contributions&&claimSummary.worker_contributions.length)detail.append(labeledFacts([["Claims completed",claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+":"+numText(row.done_count)).join(" ")]]));
         fragment.append(detail);
       }
       return fragment;
