@@ -1624,12 +1624,17 @@ def collect_root_progress_report(sources: ReportSources,
     data["epoch"] = progress["epoch"]
     data["work_started_at"] = progress["work_started_at"]
     data["work_latest_at"] = progress["work_latest_at"]
-    data["completed_at"] = (
-        progress["work_latest_at"]
-        if (progress["open_branch_count"] == 0
-            and all(row["state"] in ("solved", "loss") for row in rows))
-        else None
+    root_is_complete = (
+        progress["open_branch_count"] == 0
+        and all(row["state"] in ("solved", "loss") for row in rows)
     )
+    data["completed_at"] = progress["work_latest_at"] if root_is_complete else None
+    if root_is_complete and not resolved.steps:
+        data["completed_at"] = max(
+            (entry["completed_at"] for entry in requests
+             if entry["completed_at"] is not None),
+            default=data["completed_at"],
+        )
     data["estimate"] = _root_progress_estimate(
         progress["active_branches"],
         progress["recent_window_seconds"], generated_at)

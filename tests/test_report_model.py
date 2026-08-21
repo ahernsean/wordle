@@ -1938,6 +1938,22 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(data["completed_at"], 200)
         self.assertIsNone(data["estimate"])
 
+    def test_completed_root_keeps_its_completion_time_across_epoch_rollover(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS[:2])
+        queue = self._open_queue()
+        queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
+        with patch("erd_queue.time.time", return_value=300):
+            queue.mark_done(branch_key)
+        queue.set_epoch(1)
+        queue.close()
+
+        with patch("report_model._root_progress_group_state",
+                   return_value="solved"):
+            data = collect_report(self.sources, self._request(epoch=1))["data"]
+
+        self.assertIsNone(data["work_latest_at"])
+        self.assertEqual(data["completed_at"], 300)
+
     def test_rollup_is_fenced_by_epoch(self):
         queue = self._open_queue()
         self._finalize(queue, "SALET -y---", 1, 100, 10, 10, 20, epoch=0)

@@ -4443,9 +4443,15 @@ class ERDQueue:
         roots until workers reach it.
         """
         rows = self._conn.execute("""
-            SELECT source_work_id, requested_priority, requested_at, state
-            FROM source_work WHERE source_word = ?
-            ORDER BY requested_at, source_work_id
+            SELECT source.source_work_id, source.requested_priority,
+                   source.requested_at, source.state,
+                   MAX(membership.resolved_at) AS completed_at
+            FROM source_work AS source
+            LEFT JOIN branch_source_work AS membership
+              ON membership.source_work_id = source.source_work_id
+            WHERE source.source_word = ?
+            GROUP BY source.source_work_id
+            ORDER BY source.requested_at, source.source_work_id
         """, (word.lower(),)).fetchall()
         return [dict(row) for row in rows]
 

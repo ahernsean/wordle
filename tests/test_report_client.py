@@ -3294,13 +3294,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")
         self.assertIn(
-            "sorted by ERD (lowest first)",
+            "sorted by most recently completed",
             self.page.locator("#report").inner_text(),
         )
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
-            ["", "completed", "elapsed", "worker_time", "priority",
+            ["completed", "", "elapsed", "worker_time", "priority",
              "requested", "age", "word", "branches", "open", "done", "workers"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):
