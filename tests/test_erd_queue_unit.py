@@ -267,6 +267,72 @@ class TestBranchLifecycle(_TmpQueue):
             expected_source_priority=1))
         self.assertEqual(self.q.claims_for_branch(self.key), [])
 
+    def test_exact_direct_root_retires_only_its_descendants(self):
+        other_root_key = ScoreCache.encode_subset(WORDS[:4])
+        descendant_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 1, "crane", 7),
+            (other_root_key, 4, 1, "crane", 42),
+        ])
+        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            source_work_id=source_work_id, source_pattern=7)
+        self.q.create_branch(
+            descendant_key, 3, N_CANDIDATES, budget=4,
+            source_work_id=source_work_id, source_pattern=7,
+            parent_branch_key=self.key)
+        self._claim_one_idx(descendant_key, expected_source_work_id=source_work_id)
+
+        self.q.try_finalize_branch(self.key)
+        self.q.mark_done(self.key)
+
+        self.assertIsNone(self.q.get_active_branch(descendant_key))
+        self.assertEqual(self.q.claims_for_branch(descendant_key), [])
+        self.assertFalse(self.q.create_branch(
+            descendant_key, 3, N_CANDIDATES, budget=4,
+            source_work_id=source_work_id, source_pattern=7,
+            parent_branch_key=self.key))
+        other_root = self.q.get_pending_branch(other_root_key)
+        self.assertEqual(other_root["status"], "pending")
+        live_memberships = self.q.source_membership_rows(source_work_id)
+        self.assertEqual(
+            [(row["branch_id"], row["root_pattern"])
+             for row in live_memberships],
+            [(self.q._intern_branch(other_root_key), 42)])
+
+    def test_exact_direct_root_preserves_descendant_with_another_owner(self):
+        other_root_key = ScoreCache.encode_subset(WORDS[:4])
+        descendant_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 1, "crane", 7),
+            (other_root_key, 4, 1, "slate", 42),
+        ])
+        sources = {row["source_word"]: row
+                   for row in self.q.source_work_rows()}
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            source_work_id=sources["crane"]["source_work_id"], source_pattern=7)
+        self.q.create_branch(
+            descendant_key, 3, N_CANDIDATES, budget=4,
+            source_work_id=sources["crane"]["source_work_id"], source_pattern=7,
+            parent_branch_key=self.key)
+        self.assertTrue(self.q.attach_branch_source_work(
+            descendant_key, sources["slate"]["source_work_id"], budget=4,
+            ceiling=None, n_words=3, source_pattern=42,
+            parent_branch_key=other_root_key))
+
+        self.q.try_finalize_branch(self.key)
+        self.q.mark_done(self.key)
+
+        self.assertIsNotNone(self.q.get_active_branch(descendant_key))
+        live_memberships = self.q.source_membership_rows()
+        descendant_memberships = [row for row in live_memberships
+                                  if row["branch_id"]
+                                  == self.q._intern_branch(descendant_key)]
+        self.assertEqual(len(descendant_memberships), 1)
+        self.assertEqual(descendant_memberships[0]["source_word"], "slate")
+
     def test_malformed_pending_schema_reports_schema_drift(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
         queue_path = self.queue_path

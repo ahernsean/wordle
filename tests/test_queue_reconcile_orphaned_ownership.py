@@ -2,11 +2,11 @@
 supervisor's periodic check_source_work_invariants() sweep (issue #215).
 
 Exercises the CLI surface for ERDQueue.reconcile_orphaned_branch_ownership():
-demoting a stranded open source-owned branch -- both the membership-resolved
-shape and the create_branch-race-against-an-already-complete-source shape --
-and verifying the demoted branch is genuinely claimable afterward, not just
-visible. Also covers erd_search._check_source_work_invariants, the helper the
-supervisor loop's periodic sweep calls.
+demoting a stranded open source-owned branch and verifying the demoted branch
+is genuinely claimable afterward, not just visible. Also covers rejection of
+an attempted source-owned branch creation after the response group completed,
+and erd_search._check_source_work_invariants, the helper the supervisor loop's
+periodic sweep calls.
 """
 import contextlib
 import io
@@ -100,13 +100,7 @@ class TestQueueReconcileOrphanedOwnership(unittest.TestCase):
             _ZERO_LOWER_BOUND))
         queue.close()
 
-    def test_demotes_a_membership_created_after_its_source_completed(self):
-        # create_branch attaches source_work_id without checking the request
-        # is still live (unlike attach_branch_source_work, which gates on
-        # source.state != 'complete') -- a worker's in-flight sub-branch
-        # promotion can land moments after the request it belongs to already
-        # completed, leaving an unresolved membership to a dead request
-        # rather than a resolved membership on a still-open branch.
+    def test_rejects_branch_created_after_source_response_group_completed(self):
         queue = ERDQueue(self.queue_path)
         root_key = ScoreCache.encode_subset(WORDS)
         queue.add_pending_many([(root_key, len(WORDS), 9, 'crane', 7)])
@@ -123,28 +117,14 @@ class TestQueueReconcileOrphanedOwnership(unittest.TestCase):
             (crane['source_work_id'],)).fetchone()[0], 'complete')
 
         late_key = ScoreCache.encode_subset(WORDS[:4])
-        queue.create_branch(
+        self.assertFalse(queue.create_branch(
             late_key, 4, N_CANDIDATES, budget=4,
             priority=crane['priority'], source_word=crane['source_word'],
             source_pattern=crane['source_pattern'],
-            source_work_id=crane['source_work_id'])
-        late_branch_id = queue._intern_branch(late_key)
-
+            source_work_id=crane['source_work_id']))
         self.assertEqual(queue.direct_branches_in_progress(), [])
-        self.assertTrue(queue.check_source_work_invariants())
-        queue.close()
-
-        output = self._run(_make_args(self.queue_path))
-        self.assertIn(str(late_branch_id), output)
-
-        queue = ERDQueue(self.queue_path)
-        self.assertEqual(
-            queue.get_active_branch(late_key)['requires_source_membership'],
-            0)
+        self.assertIsNone(queue.get_active_branch(late_key))
         self.assertEqual(queue.check_source_work_invariants(), [])
-        self.assertIsNotNone(queue.claim_next_bundle(
-            late_key, 'worker-1', N_CANDIDATES, list(range(N_CANDIDATES)),
-            _ZERO_LOWER_BOUND))
         queue.close()
 
 
