@@ -1292,12 +1292,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["letters"], ["N", "U", "R", "D", "Y"])
         self.assertTrue(result["wordFitsWithinCard"], result)
 
-    def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
+    def test_candidates_panel_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
         self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("text=Candidate detail")
-        text = self.page.locator("section:has-text('Candidate detail')").inner_text()
+        self.page.wait_for_selector("section:has-text('Candidates')")
+        text = self.page.locator("section:has-text('Candidates')").first.inner_text()
         # A summary of provenance and per-worker contribution, never a row per
         # candidate — the branch holds far more claims than a browser can render.
         self.assertNotIn("12,819 done", text)
@@ -1305,11 +1305,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("1,500 one-level ERD prunes", text)
         self.assertNotIn("119 two-level ERD prunes", text)
         self.assertIn("in flight 5", text)
-        self.assertIn("Claims completed w0:6,484 w2:6,335", text)
+        self.assertIn("Per-worker completions w0:6,484 w2:6,335", text)
         # Nothing fetches the raw per-candidate list, and no per-candidate rows
         # are rendered.
         self.assertFalse(any("claims=1" in url for url in requested))
-        self.assertLess(self.page.locator("section:has-text('Candidate detail') .card").count(), 1)
+        self.assertLess(self.page.locator("section:has-text('Candidates') .card").count(), 1)
 
     def test_branch_ownership_stays_visible_and_names_off_branch_claim_holders(self):
         text = self.page.evaluate("""async () => {
@@ -1449,7 +1449,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_branch_queue_shows_both_erd_prune_metrics(self):
         self.apply_branch_target("RAISE .....")
         facts = self.page.locator(
-            "section:has-text('Queue') .labeled-facts").first
+            "section:has-text('Candidates') .labeled-facts").first
         text = facts.inner_text()
         self.assertIn("one-level ERD prunes", text)
         self.assertIn("two-level ERD prunes", text)
@@ -2414,7 +2414,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("text=Bundle and republish")
+        self.page.wait_for_selector("text=Bundles")
         text = self.page.locator("#report").inner_text()
         self.assertIn("re-queued", text)
         self.assertIn("candidates re-queued", text)

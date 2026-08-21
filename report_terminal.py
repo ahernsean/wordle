@@ -1109,46 +1109,106 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     if branch.get("answer_words"):
         header.append(_fit("  answers: " + " ".join(branch["answer_words"]), width))
     queue = data["queue"]
+    bundle_summary = data.get("bundle_summary") or {}
     if queue is None:
         queue_lines = ["Queue", "  unqueued"]
     else:
-        progress = "—"
-        if queue["candidate_count"] is not None:
-            completed = queue["completed_candidate_count"]
-            progress = f"{completed}/{queue['candidate_count']}"
+        queue_facts = (
+            f"status={queue['branch_status']} phase={queue['branch_phase']}  "
+            f"priority={queue['priority']} budget={queue.get('budget', '—')}  "
+            f"best={queue['best_guess'] or '—'} "
+            f"nodes={_abbreviate_number(queue['search_node_count'])}"
+        )
+        if bundle_summary.get("wall_millis"):
+            queue_facts += (
+                f" wall-time={_abbreviate_duration(
+                    bundle_summary['wall_millis'] / 1000)}"
+            )
+        queue_lines = [
+            "Queue",
+            _fit("  " + queue_facts, width),
+        ]
+    candidate_lines = ["Candidates"]
+    claim_summary = data.get("claim_summary") or {}
+    if queue is None or queue["candidate_count"] is None:
+        if claim_summary.get("total_claim_count"):
+            candidate_fields = [
+                f"{claim_summary.get('evaluated_count', 0):,} evaluated",
+            ]
+            if claim_summary.get("provenance_unknown_count"):
+                candidate_fields.append(
+                    f"{claim_summary['provenance_unknown_count']:,} unattributed"
+                )
+            if claim_summary.get("in_flight_count"):
+                candidate_fields.append(
+                    f"{claim_summary['in_flight_count']:,} in flight"
+                )
+            contributions = claim_summary.get("worker_contributions") or []
+            if contributions:
+                candidate_fields.append(
+                    "Per-worker completions: "
+                    + " ".join(
+                        f"{_worker_number_label(row['worker_id'])}:{row['done_count']:,}"
+                        for row in contributions
+                    )
+                )
+            candidate_lines.extend(
+                _inline_section("  progress:", candidate_fields, width)
+            )
+        else:
+            candidate_lines.append("  none")
+    else:
+        candidate_count = queue["candidate_count"]
+        completed = queue["completed_candidate_count"]
         one_level_erd_prunes = queue.get(
             "one_level_erd_pruned_candidate_count",
             queue["bulk_completed_candidate_count"],
         )
         two_level_erd_prunes = queue.get(
             "two_level_erd_pruned_candidate_count", 0)
-        queue_lines = [
-            "Queue",
-            _fit(
-                f"  status={queue['branch_status']} phase={queue['branch_phase']}  "
-                f"priority={queue['priority']}  "
-                f"progress={progress}  "
-                f"one-level-ERD-prunes={one_level_erd_prunes:,}  "
-                f"two-level-ERD-prunes={two_level_erd_prunes:,}  "
-                f"best={queue['best_guess'] or '—'}  nodes={_abbreviate_number(queue['search_node_count'])}",
-                width,
-            ),
+        candidate_fields = [
+            f"{completed:,}/{candidate_count:,} completed",
+            f"{claim_summary.get('evaluated_count', 0):,} evaluated",
+            f"{one_level_erd_prunes:,} one-level ERD prunes",
+            f"{two_level_erd_prunes:,} two-level ERD prunes",
         ]
-        candidate_count = queue["candidate_count"]
-        if candidate_count:
-            worker_positions = [
-                (worker.get("candidate_index"), worker["worker_number"])
-                for worker in data["workers"]
-                if worker["is_live"] and worker.get("candidate_index") is not None
-            ]
-            sweep = candidate_sweep_bar(
-                candidate_count,
-                data.get("completed_candidate_indexes") or (),
-                worker_positions,
-                width=max(10, min(40, width - 4)),
+        if claim_summary.get("provenance_unknown_count"):
+            candidate_fields.append(
+                f"{claim_summary['provenance_unknown_count']:,} unattributed"
             )
-            if sweep.strip():
-                queue_lines.append(_fit(f"  [{sweep}]", width))
+        if claim_summary.get("in_flight_count"):
+            candidate_fields.append(
+                f"{claim_summary['in_flight_count']:,} in flight"
+            )
+        republished = data.get("republished_candidates") or []
+        if republished:
+            candidate_fields.append(
+                f"{len(republished):,} re-queued "
+                f"(up to {max(row['republish_count'] for row in republished):,}x each)"
+            )
+        contributions = claim_summary.get("worker_contributions") or []
+        if contributions:
+            candidate_fields.append(
+                "Per-worker completions: "
+                + " ".join(
+                    f"{_worker_number_label(row['worker_id'])}:{row['done_count']:,}"
+                    for row in contributions
+                )
+            )
+        candidate_lines.extend(_inline_section("  progress:", candidate_fields, width))
+        worker_positions = [
+            (worker.get("candidate_index"), worker["worker_number"])
+            for worker in data["workers"]
+            if worker["is_live"] and worker.get("candidate_index") is not None
+        ]
+        sweep = candidate_sweep_bar(
+            candidate_count,
+            data.get("completed_candidate_indexes") or (),
+            worker_positions,
+            width=max(10, min(40, width - 4)),
+        )
+        if sweep.strip():
+            candidate_lines.append(_fit(f"  [{sweep}]", width))
     cache = data["cache"]
     cache_line = f"  {cache['cache_state']}"
     if cache.get("best_guess"):
@@ -1185,55 +1245,24 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     else:
         worker_lines.append("  none")
 
-    detail_lines = ["Candidate detail"]
-    detail_lines.append(
-        f"  republished candidates: {len(data['republished_candidates'])}"
-    )
-    claim_summary = data.get("claim_summary") or {}
-    if claim_summary.get("total_claim_count"):
-        completion_fields = [
-            f"{claim_summary['evaluated_count']:,} evaluated",
-        ]
-        if claim_summary.get("provenance_unknown_count"):
-            completion_fields.append(
-                f"{claim_summary['provenance_unknown_count']:,} unattributed"
-            )
-        if claim_summary.get("in_flight_count"):
-            completion_fields.append(
-                f"{claim_summary['in_flight_count']:,} in flight"
-            )
-        detail_lines.extend(_inline_section("  completion:", completion_fields, width))
-        contributions = claim_summary.get("worker_contributions") or []
-        if contributions:
-            worker_fields = [
-                f"{_worker_number_label(row['worker_id'])}:{row['done_count']:,}"
-                for row in contributions
-            ]
-            detail_lines.extend(_inline_section(
-                "  Claims completed:", worker_fields, width
-            ))
-    telemetry_lines = ["Telemetry"]
-    bundle_summary = data.get("bundle_summary")
+    bundle_lines = ["Bundles"]
     if bundle_summary:
         bundle_labels = {
             "bundle_count": "bundles",
-            "wall_millis": "wall time",
             "censored_unit_count": "capped bundles",
             "maximum_bundle_node_count": "max bundle nodes",
         }
         bundle_fields = [
             bundle_labels.get(key, key.replace("_", " "))
             + " "
-            + (
-                _abbreviate_duration(value / 1000)
-                if key == "wall_millis"
-                else f"{value:,}" if isinstance(value, int) else str(value)
-            )
+            + (f"{value:,}" if isinstance(value, int) else str(value))
             for key, value in bundle_summary.items()
+            if key not in ("node_count", "wall_millis")
         ]
-        telemetry_lines.extend(
-            _inline_section("  active bundles:", bundle_fields, width)
-        )
+        bundle_lines.extend(_inline_section("  summary:", bundle_fields, width))
+    else:
+        bundle_lines.append("  none")
+    telemetry_lines = ["Telemetry"]
     finalizations = data.get("recent_finalizations", [])
     for finalization in finalizations:
         spine = finalization.get("spine") or "(spine unknown)"
@@ -1275,8 +1304,9 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     if len(telemetry_lines) == 1:
         telemetry_lines.append("  none")
     return [
-        ("header", header), ("queue", queue_lines), ("cache", cache_lines),
-        ("workers", worker_lines), ("candidate_state", detail_lines),
+        ("header", header), ("queue", queue_lines),
+        ("candidates", candidate_lines), ("bundles", bundle_lines),
+        ("cache", cache_lines), ("workers", worker_lines),
         ("telemetry", telemetry_lines),
     ]
 
