@@ -887,6 +887,157 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
         self.assertIn("9.876", self.page.locator("#report").inner_text())
 
+    def test_unchanged_leaderboard_poll_keeps_the_reading_position(self):
+        self.page.set_viewport_size({"width": 834, "height": 1112})
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          let leaderboard;
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/leaderboard')) return response;
+            if (!leaderboard) {
+              leaderboard = await response.json();
+              const row = leaderboard.data.rows[0];
+              leaderboard.data.rows = Array.from({length: 12}, (_, index) => ({
+                ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
+              }));
+              leaderboard.data.total_rows = leaderboard.data.rows.length;
+              leaderboard.data.counts.complete = leaderboard.data.rows.length;
+            }
+            return new Response(JSON.stringify(leaderboard), {
+              status: 200, headers: {'Content-Type': 'application/json'},
+            });
+          });
+        }""")
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card")
+        cards = self.page.locator(".leaderboard-card")
+        self.assertEqual(cards.count(), 12)
+        card = cards.nth(8)
+        card.scroll_into_view_if_needed()
+        before = card.evaluate("(node) => { window.scrollBy(0, 40); return node.getBoundingClientRect().top; }")
+        card.evaluate("(node) => node.dataset.testMarker = 'still-here'")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(card.get_attribute("data-test-marker"), "still-here")
+        self.assertAlmostEqual(
+            card.evaluate("(node) => node.getBoundingClientRect().top"), before, delta=1
+        )
+
+    def test_leaderboard_count_only_poll_keeps_its_cards(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card")
+        card = self.page.locator(".leaderboard-card").first
+        card.evaluate("(node) => node.dataset.testMarker = 'still-here'")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/leaderboard')) return response;
+            const report = await response.json();
+            report.data.counts.pending = 123;
+            return new Response(JSON.stringify(report), {
+              status: 200, headers: {'Content-Type': 'application/json'},
+            });
+          });
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(card.get_attribute("data-test-marker"), "still-here")
+        self.assertEqual(
+            self.page.locator("h2 + .metrics .metric", has_text="pending").locator("strong").inner_text(),
+            "123",
+        )
+
+    def test_changed_leaderboard_poll_keeps_the_visible_word_in_place(self):
+        self.page.set_viewport_size({"width": 834, "height": 1112})
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          let leaderboard, allowChangedReport = false;
+          window.__changeLeaderboardReport = () => { allowChangedReport = true; };
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/leaderboard')) return response;
+            if (!leaderboard) {
+              leaderboard = await response.json();
+              const row = leaderboard.data.rows[0];
+              leaderboard.data.rows = Array.from({length: 12}, (_, index) => ({
+                ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
+              }));
+              leaderboard.data.total_rows = leaderboard.data.rows.length;
+              leaderboard.data.counts.complete = leaderboard.data.rows.length;
+            }
+            const report = structuredClone(leaderboard);
+            if (allowChangedReport) report.data.rows[0].erd = 9.876;
+            return new Response(JSON.stringify(report), {
+              status: 200, headers: {'Content-Type': 'application/json'},
+            });
+          });
+        }""")
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card")
+        cards = self.page.locator(".leaderboard-card")
+        self.assertEqual(cards.count(), 12)
+        card = cards.nth(8)
+        card.scroll_into_view_if_needed()
+        before = card.evaluate("(node) => { window.scrollBy(0, 40); return node.getBoundingClientRect().top; }")
+        self.page.evaluate("async () => { window.__changeLeaderboardReport(); await window.__reportClient.fetchReport(); await new Promise(requestAnimationFrame); }")
+        self.assertAlmostEqual(
+            card.evaluate("(node) => node.getBoundingClientRect().top"), before, delta=1
+        )
+
+    def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
+        self.page.set_viewport_size({"width": 834, "height": 1112})
+        distances = self.page.evaluate("""async () => {
+          const base = await (await fetch('/api/view/leaderboard')).json();
+          const state = {...__reportClient.getState(), kind: 'leaderboard'};
+          const leaderboard = count => {
+            const report = structuredClone(base), row = report.data.rows[0];
+            report.data.rows = Array.from({length: count}, (_, index) => ({
+              ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
+            }));
+            report.data.total_rows = count;
+            report.data.counts.complete = count;
+            return report;
+          };
+          const before = leaderboard(12), after = leaderboard(15), later = leaderboard(18);
+          applyReport(before, null, state);
+          await new Promise(requestAnimationFrame);
+          scrollTo(0, document.documentElement.scrollHeight);
+          applyReport(after, before, state);
+          await new Promise(requestAnimationFrame);
+          const bottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
+          scrollBy(0, -160);
+          const nearBottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
+          applyReport(later, after, state);
+          await new Promise(requestAnimationFrame);
+          return {bottomDistance, nearBottomDistance,
+                  restoredNearBottomDistance: document.documentElement.scrollHeight - (scrollY + innerHeight)};
+        }""")
+        self.assertLessEqual(distances["bottomDistance"], 1)
+        self.assertAlmostEqual(
+            distances["restoredNearBottomDistance"], distances["nearBottomDistance"], delta=1
+        )
+
+    def test_leaderboard_selection_survives_a_changed_poll(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card")
+        card = self.page.locator(".leaderboard-card").first
+        card.evaluate("(node) => node.dataset.testMarker = 'still-here'")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/leaderboard')) return response;
+            const report = await response.json();
+            report.data.rows[0].erd = 9.876;
+            return new Response(JSON.stringify(report), {
+              status: 200, headers: {'Content-Type': 'application/json'},
+            });
+          });
+          const range = document.createRange();
+          range.selectNodeContents(document.querySelector('.leaderboard-card .word'));
+          const selection = getSelection();
+          selection.removeAllRanges(); selection.addRange(range);
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(card.get_attribute("data-test-marker"), "still-here")
+        self.assertFalse(self.page.evaluate("() => getSelection().isCollapsed"))
+
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request
         # timer fires on the view switch (the fold can take several seconds).
