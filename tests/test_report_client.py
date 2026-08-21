@@ -888,7 +888,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("9.876", self.page.locator("#report").inner_text())
 
     def test_unchanged_leaderboard_poll_keeps_the_reading_position(self):
-        self.page.set_viewport_size({"width": 1200, "height": 800})
+        self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           let leaderboard;
@@ -909,6 +909,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           });
         }""")
         self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card")
         cards = self.page.locator(".leaderboard-card")
         self.assertEqual(cards.count(), 12)
         card = cards.nth(8)
@@ -922,7 +923,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
 
     def test_changed_leaderboard_poll_keeps_the_visible_word_in_place(self):
-        self.page.set_viewport_size({"width": 1200, "height": 800})
+        self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           let leaderboard, changed = false;
@@ -946,6 +947,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           });
         }""")
         self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card")
         cards = self.page.locator(".leaderboard-card")
         self.assertEqual(cards.count(), 12)
         card = cards.nth(8)

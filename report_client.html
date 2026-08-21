@@ -1790,7 +1790,7 @@
       else scrollTo(readingPosition.left,readingPosition.top);
     }
     function leaderboardReportChanged(report,previousReport){
-      return JSON.stringify(semanticProjection(report))!==JSON.stringify(semanticProjection(previousReport));
+      return JSON.stringify(semanticProjection(report.data))!==JSON.stringify(semanticProjection(previousReport.data));
     }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
