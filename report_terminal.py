@@ -1168,7 +1168,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             "two_level_erd_pruned_candidate_count", 0)
         candidate_fields = [
             f"candidates {completed:,}/{candidate_count:,} =",
-            f"+ evaluated {claim_summary.get('evaluated_count', 0):,}",
+            f"evaluated {claim_summary.get('evaluated_count', 0):,}",
             f"+ one-level ERD prunes {one_level_erd_prunes:,}",
             f"+ two-level ERD prunes {two_level_erd_prunes:,}",
         ]

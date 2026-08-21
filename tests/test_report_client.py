@@ -1301,6 +1301,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # A summary of provenance and per-worker contribution, never a row per
         # candidate — the branch holds far more claims than a browser can render.
         self.assertNotIn("12,819 done", text)
+        self.assertNotIn("= + evaluated", text)
         self.assertIn("evaluated 11,200", text)
         self.assertNotIn("1,500 one-level ERD prunes", text)
         self.assertNotIn("119 two-level ERD prunes", text)
