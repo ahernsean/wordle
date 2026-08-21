@@ -36,6 +36,9 @@ from wordle_ui import fmt_pattern, parse_pattern
 SCHEMA_VERSION = 3
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
+BRANCH_ETA_WINDOW_SECONDS = 10 * 60
+BRANCH_ETA_MINIMUM_SAMPLE_SECONDS = 2 * 60
+BRANCH_ETA_MINIMUM_WORK_UNITS = 100
 
 # Source ERD summaries are immutable until the score cache changes.  The
 # Sources view polls frequently, so retain the completed folds between polls.
@@ -1776,6 +1779,68 @@ def _summarize_claims(normalized_claims):
     }
 
 
+def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
+    """Estimate active-branch wall time from recent post-bound worker time."""
+    if (queue_payload is None or live_worker_count <= 0
+            or eta_sample is None or eta_sample["best_updated_at"] is None):
+        return None
+    sample_started_at = eta_sample["window_started_at"]
+    sample_duration_seconds = max(0, now - sample_started_at)
+    inspected = eta_sample["inspected_candidate_count"]
+    pruned = eta_sample["pruned_candidate_count"]
+    evaluated = eta_sample["evaluated_candidate_count"]
+    inspection_millis = eta_sample["inspection_worker_millis"]
+    evaluation_millis = eta_sample["evaluation_worker_millis"]
+    observed_work_units = inspected + evaluated
+    result = {
+        "state": "learning",
+        "sample_duration_seconds": sample_duration_seconds,
+        "observed_work_units": observed_work_units,
+    }
+    if (sample_duration_seconds < BRANCH_ETA_MINIMUM_SAMPLE_SECONDS
+            or observed_work_units < BRANCH_ETA_MINIMUM_WORK_UNITS):
+        return result
+    remaining = max(0, queue_payload["candidate_count"]
+                    - queue_payload["completed_candidate_count"])
+    if remaining == 0:
+        return None
+    if inspected:
+        if inspection_millis <= 0:
+            return result
+        surviving_fraction = max(0, inspected - pruned) / inspected
+        remaining_inspections = remaining
+        expected_full_evaluations = remaining * surviving_fraction
+        inspection_worker_seconds = (
+            remaining_inspections * inspection_millis / inspected / 1000
+        )
+        if expected_full_evaluations:
+            if evaluated == 0 or evaluation_millis <= 0:
+                return result
+            evaluation_worker_seconds = (
+                expected_full_evaluations * evaluation_millis / evaluated / 1000
+            )
+        else:
+            evaluation_worker_seconds = 0
+    else:
+        if evaluated == 0 or evaluation_millis <= 0:
+            return result
+        remaining_inspections = 0
+        expected_full_evaluations = remaining
+        inspection_worker_seconds = 0
+        evaluation_worker_seconds = (
+            remaining * evaluation_millis / evaluated / 1000
+        )
+    result.update({
+        "state": "ready",
+        "estimated_seconds": (
+            inspection_worker_seconds + evaluation_worker_seconds
+        ) / live_worker_count,
+        "remaining_inspection_count": remaining_inspections,
+        "expected_full_evaluation_count": round(expected_full_evaluations),
+    })
+    return result
+
+
 def _normalize_claim(row, republish_count):
     claimed_by = _row_value(row, "claimed_by")
     done = bool(row["done"])
@@ -1824,6 +1889,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         "finalization_total_count": 0,
         "cut_reuse_misses": [],
     }
+    candidate_eta_sample = None
     queue_error = None
     referenced_row = None
     cache = None
@@ -1884,6 +1950,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             }
             for row in branch_telemetry["recent_finalizations"]
         ]
+        candidate_eta_sample = queue.branch_candidate_eta_sample(
+            branch_key, BRANCH_ETA_WINDOW_SECONDS, generated_at)
     except (sqlite3.Error, OSError) as error:
         queue_error = error
         if request.branch_target.kind == "branch_reference":
@@ -1976,6 +2044,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             "finalized_at": _row_value(active_row, "finalized_at"),
             "completed_at": _row_value(pending_row, "completed_at"),
         }
+    candidate_eta = _candidate_eta(
+        queue_payload, candidate_eta_sample, live_worker_count, generated_at)
     republish_by_index = {row["idx"]: row["count"] for row in republish_rows}
     normalized_claims = [
         _normalize_claim(row, republish_by_index.get(row["idx"], 0))
@@ -2006,6 +2076,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ),
         "claims": normalized_claims if request.include_claims else None,
         "claim_summary": _summarize_claims(normalized_claims),
+        "candidate_eta": candidate_eta,
         "branch_ownership": ownership,
         "provenance_unknown": provenance_unknown,
         **branch_telemetry,

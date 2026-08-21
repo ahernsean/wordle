@@ -19,6 +19,7 @@ from report_model import (
     ReportSources,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
+    _candidate_eta,
     _source_word_group_key,
     _resolved_candidate_erd,
     _grouped_response_groups,
@@ -69,6 +70,43 @@ class ReportModelTest(unittest.TestCase):
 
     def _open_queue(self):
         return ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+
+    def test_candidate_eta_estimates_prune_checks_and_full_evaluations(self):
+        eta = _candidate_eta(
+            {"candidate_count": 1_000, "completed_candidate_count": 400},
+            {
+                "best_updated_at": 900,
+                "window_started_at": 900,
+                "inspected_candidate_count": 200,
+                "pruned_candidate_count": 150,
+                "inspection_worker_millis": 20_000,
+                "evaluated_candidate_count": 50,
+                "evaluation_worker_millis": 50_000,
+            },
+            live_worker_count=2,
+            now=1_100,
+        )
+        self.assertEqual(eta["state"], "ready")
+        self.assertEqual(eta["remaining_inspection_count"], 600)
+        self.assertEqual(eta["expected_full_evaluation_count"], 150)
+        self.assertEqual(eta["estimated_seconds"], 105)
+
+    def test_candidate_eta_learns_after_a_new_best_erd(self):
+        eta = _candidate_eta(
+            {"candidate_count": 1_000, "completed_candidate_count": 400},
+            {
+                "best_updated_at": 1_000,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 99,
+                "pruned_candidate_count": 99,
+                "inspection_worker_millis": 9_900,
+                "evaluated_candidate_count": 0,
+                "evaluation_worker_millis": 0,
+            },
+            live_worker_count=2,
+            now=1_119,
+        )
+        self.assertEqual(eta["state"], "learning")
 
     @staticmethod
     def _group(pattern, answer_count, best_erd, max_remaining_depth,

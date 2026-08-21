@@ -143,6 +143,39 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertIsNone(loss["best_erd"])
         self.assertEqual(len(telemetry["cut_reuse_misses"]), 1)
 
+    def test_branch_candidate_eta_sample_starts_at_latest_best_erd(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches
+            SET best_erd = 3.0, best_updated_at = 900
+            WHERE branch_id = ?
+        """, (branch_id,))
+        self.q._conn.execute("""
+            INSERT INTO telemetry.two_level_prune_telemetry
+                (branch_id, inspected_candidate_count, pruned_candidate_count,
+                 bound_erd, wall_millis, epoch, recorded_at)
+            VALUES (?, 8, 6, 2.5, 800, 0, 850),
+                   (?, 10, 7, 3.0, 1000, 0, 950)
+        """, (branch_id, branch_id))
+        self.q._conn.execute("""
+            INSERT INTO telemetry.claim_telemetry
+                (n_words, coordination_millis, work_nodes, branch_id, epoch,
+                 recorded_at)
+            VALUES (5, 900, 1, ?, 0, 850),
+                   (5, 1100, 1, ?, 0, 950)
+        """, (branch_id, branch_id))
+
+        sample = self.q.branch_candidate_eta_sample(
+            self.user_key, window_seconds=600, now=1_000)
+
+        self.assertEqual(sample["window_started_at"], 900)
+        self.assertEqual(sample["inspected_candidate_count"], 10)
+        self.assertEqual(sample["pruned_candidate_count"], 7)
+        self.assertEqual(sample["inspection_worker_millis"], 1000)
+        self.assertEqual(sample["evaluated_candidate_count"], 1)
+        self.assertEqual(sample["evaluation_worker_millis"], 1100)
+
     def test_branch_report_telemetry_after_cursor_pages_past_the_first_window(self):
         self.q.create_branch(self.user_key, len(WORDS), 10)
         for outcome in ("exact", "cut", "loss"):

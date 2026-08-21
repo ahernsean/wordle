@@ -1438,6 +1438,7 @@ class _BranchWorker:
 
         branch_indices = self.pattern_matrix.answer_indices(words)
         claim_started_at = int(time.time())
+        prune_started_at = time.time()
         pruned_candidate_indices = []
         inspected_candidate_count = 0
         cancelled = False
@@ -1462,7 +1463,9 @@ class _BranchWorker:
         if inspected_candidate_count:
             self.queue.complete_bundle_two_level_erd_prunes(
                 branch_key, bundle_id, pruned_candidate_indices,
-                nodes_spent=inspected_candidate_count)
+                nodes_spent=inspected_candidate_count,
+                wall_millis=int((time.time() - prune_started_at) * 1000),
+                bound_erd=bound_erd)
         return frozenset(pruned_candidate_indices), cancelled
 
     def evaluate_bundle(self, branch_key, words, n_words, bundle_id, indices,

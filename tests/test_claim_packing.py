@@ -220,7 +220,8 @@ class TestSchemaMigration(unittest.TestCase):
         self.assertEqual(names, {
             "bundle_stats", "cost_samples", "claim_telemetry",
             "branch_finalize_log", "candidate_accuracy",
-            "backstop_telemetry", "cut_reuse_misses"})
+            "backstop_telemetry", "cut_reuse_misses",
+            "two_level_prune_telemetry"})
 
 
 N_CANDIDATES = 40
@@ -490,6 +491,12 @@ class TestTwoLevelERDPruneCompletion(_TmpQueue):
             self.q.branch_erd_pruned_candidate_counts(self.key), (0, 3))
         self.assertEqual(
             self.q.get_branch(self.key)["nodes_spent"], len(candidate_indices))
+        telemetry_row = self.q._conn.execute("""
+            SELECT inspected_candidate_count, pruned_candidate_count, bound_erd,
+                   wall_millis
+            FROM telemetry.two_level_prune_telemetry
+        """).fetchone()
+        self.assertEqual(tuple(telemetry_row), (len(candidate_indices), 3, None, 0))
 
     def test_stale_bundle_cannot_complete_a_new_owners_claims(self):
         old_bundle_id, candidate_indices, _forced = self._claim_bundle()

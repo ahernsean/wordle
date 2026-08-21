@@ -369,6 +369,9 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- Tightest branch bound against which every candidate slot received a
     -- one-level ERD-prune sweep.  NULL means no finite bound has been swept.
     bulk_done_bound REAL,
+    -- Timestamp of the current best ERD.  ETA samples start here because a
+    -- tighter best changes the two-level prune/survivor mix.
+    best_updated_at INTEGER,
     -- claim_next_bundle's forward cursor: count of best-first positions that
     -- have been covered or packed into a bundle at least once.  Positions
     -- [0, pack_cursor) may hold holes (reclaimed/republished, no current
@@ -546,6 +549,23 @@ CREATE TABLE IF NOT EXISTS telemetry.bundle_stats (
     censored     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (branch_key, bundle_id)
 );
+
+-- One row per worker-side two-level ERD-prune scan.  inspected_candidate_count
+-- includes survivors that proceed to ordinary evaluation; pruned_candidate_count
+-- counts only the candidates completed by the bound.  The wall span measures
+-- the bound checks themselves, before their SQLite completion transaction.
+CREATE TABLE IF NOT EXISTS telemetry.two_level_prune_telemetry (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_id                 INTEGER NOT NULL,
+    inspected_candidate_count INTEGER NOT NULL,
+    pruned_candidate_count    INTEGER NOT NULL,
+    bound_erd                 REAL,
+    wall_millis               INTEGER NOT NULL,
+    epoch                     INTEGER NOT NULL DEFAULT 0,
+    recorded_at               INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS telemetry.idx_two_level_prune_telemetry_branch_time
+    ON two_level_prune_telemetry(branch_id, recorded_at);
 
 -- Raw per-solve samples for offline distribution analysis and threshold tuning.
 -- censored = 1 marks a sample whose unit was handed off at the node/wall cap
@@ -1033,6 +1053,7 @@ class ERDQueue:
             "one_level_erd_pruned_candidates": "INTEGER NOT NULL DEFAULT 0",
             "two_level_erd_pruned_candidates": "INTEGER NOT NULL DEFAULT 0",
             "bulk_done_bound": "REAL",
+            "best_updated_at": "INTEGER",
         })
         self._add_columns("branch_finalize_log", {
             "ceiling": "REAL",
@@ -1042,6 +1063,9 @@ class ERDQueue:
             "two_level_erd_pruned_candidates": "INTEGER",
             "best_guess": "TEXT",
             "best_erd": "REAL",
+        }, schema="telemetry")
+        self._add_columns("two_level_prune_telemetry", {
+            "bound_erd": "REAL",
         }, schema="telemetry")
         # Every persisted aggregate predating the provenance split came from
         # the one-level candidate bound; worker-side two-level pruning did not
@@ -3012,7 +3036,8 @@ class ERDQueue:
             'candidate_claims/complete', n, n * _CLAIM_ROW_WAL_BYTES)
 
     def complete_bundle_two_level_erd_prunes(self, branch_key, bundle_id,
-                                             candidate_indices, nodes_spent=0):
+                                             candidate_indices, nodes_spent=0,
+                                             wall_millis=0, bound_erd=None):
         """Complete claimed candidates pruned by the two-level ERD bound.
 
         The worker computes the bounds before entering this transaction.  A
@@ -3069,6 +3094,15 @@ class ERDQueue:
                       max(0, nodes_spent), branch_id))
                 updated_branch_count = self._conn.execute(
                     "SELECT changes()").fetchone()[0]
+            if nodes_spent > 0 and updated_branch_count:
+                self._conn.execute("""
+                    INSERT INTO telemetry.two_level_prune_telemetry
+                        (branch_id, inspected_candidate_count,
+                         pruned_candidate_count, bound_erd, wall_millis, epoch,
+                         recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (branch_id, nodes_spent, completed_candidate_count,
+                      bound_erd, max(0, wall_millis), self.epoch, now))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -3093,10 +3127,12 @@ class ERDQueue:
         branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("""
             UPDATE active_branches
-            SET best_erd = ?, best_guess = ?, best_max_depth = ?
+            SET best_erd = ?, best_guess = ?, best_max_depth = ?,
+                best_updated_at = ?
             WHERE branch_id = ?
               AND (best_erd IS NULL OR ? < best_erd)
-        """, (best_erd, best_guess, max_depth, branch_id, best_erd))
+        """, (best_erd, best_guess, max_depth, int(time.time()), branch_id,
+              best_erd))
 
     def read_branch_best(self, branch_key):
         """Return (best_guess, best_erd, ceiling) or (None, None, None).
@@ -4280,6 +4316,70 @@ class ERDQueue:
             "recent_finalizations": finalizations,
             "finalization_total_count": finalization_total_count,
             "cut_reuse_misses": cut_reuse_misses,
+        }
+
+    def branch_candidate_eta_sample(self, branch_key, window_seconds, now=None):
+        """Return recent post-bound worker-time measurements for one branch.
+
+        A best-ERD improvement changes which candidates survive the two-level
+        bound, so the sample begins at that improvement even when it is newer
+        than the trailing report window.  Bound-tagged scans from an older
+        concurrent worker are excluded.  All durations are aggregate worker
+        time; the report converts them to wall time using live worker count.
+        """
+        now = int(time.time()) if now is None else now
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return None
+        try:
+            branch_row = self._conn.execute("""
+                SELECT best_erd, best_updated_at
+                FROM active_branches
+                WHERE branch_id = ? AND status = 'open'
+            """, (branch_id,)).fetchone()
+        except sqlite3.OperationalError:
+            # Read-only report processes can briefly run before a worker opens
+            # the queue and applies this additive telemetry migration.
+            return None
+        if branch_row is None or branch_row["best_erd"] is None:
+            return None
+        best_updated_at = branch_row["best_updated_at"]
+        if best_updated_at is None:
+            return {
+                "best_updated_at": None,
+                "window_started_at": None,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_millis": 0,
+                "evaluated_candidate_count": 0,
+                "evaluation_worker_millis": 0,
+            }
+        since = max(now - window_seconds, best_updated_at)
+        try:
+            prune_row = self._conn.execute("""
+                SELECT COALESCE(SUM(inspected_candidate_count), 0)
+                           AS inspected_candidate_count,
+                       COALESCE(SUM(pruned_candidate_count), 0)
+                           AS pruned_candidate_count,
+                       COALESCE(SUM(wall_millis), 0) AS inspection_worker_millis
+                FROM telemetry.two_level_prune_telemetry
+                WHERE branch_id = ? AND bound_erd = ?
+                  AND recorded_at >= ? AND recorded_at <= ?
+            """, (branch_id, branch_row["best_erd"], since, now)).fetchone()
+            evaluation_row = self._conn.execute("""
+                SELECT COUNT(*) AS evaluated_candidate_count,
+                       COALESCE(SUM(coordination_millis), 0)
+                           AS evaluation_worker_millis
+                FROM telemetry.claim_telemetry
+                WHERE branch_id = ? AND recorded_at >= ? AND recorded_at <= ?
+            """, (branch_id, since, now)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return {
+            "best_updated_at": best_updated_at,
+            "window_started_at": since,
+            **dict(prune_row),
+            **dict(evaluation_row),
         }
 
     def report_root_progress(self, spine_prefix, epoch, recent_window_seconds,
