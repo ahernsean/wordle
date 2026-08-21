@@ -164,7 +164,7 @@ def _format_branch_erd(value, answer_count, *, ceiling=False):
     text = f"{value:.3f}"
     numerator = erd_display_numerator(value, answer_count, ceiling=ceiling)
     if numerator is not None:
-        text += f" {numerator}/{answer_count}"
+        text += f" {numerator:,}/{answer_count:,}"
     return text
 
 

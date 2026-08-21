@@ -1388,7 +1388,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("ERD ceiling", text)
-        self.assertIn("0.001 3/3209", text)
+        self.assertIn("0.001 3/3,209", text)
 
     def test_cut_reuse_facts_wrap_between_complete_metrics(self):
         self.page.set_viewport_size({"width": 375, "height": 800})
@@ -2927,7 +2927,7 @@ class ReportClientBrowserTest(unittest.TestCase):
                 pairText: pair.textContent,
               };
             }""")
-            self.assertIn("1572/502", measured["text"])
+            self.assertIn("1,572/502", measured["text"])
             self.assertLessEqual(
                 measured["overflow"], 0.5,
                 f"the ERD left the card at {width}px: {measured}")
