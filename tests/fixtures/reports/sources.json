@@ -36,7 +36,8 @@
       {
         "source_word": "salet",
         "requested_priority": 5,
-        "requested_at": 400,
+      "requested_at": 400,
+      "started_at": null,
         "completed_at": null,
         "request_count": 2,
         "state": "queued",
@@ -60,7 +61,8 @@
       {
         "source_word": "raise",
         "requested_priority": 3,
-        "requested_at": 200,
+      "requested_at": 200,
+      "started_at": null,
         "completed_at": null,
         "request_count": 1,
         "state": "queued",
@@ -84,7 +86,8 @@
       {
         "source_word": "crane",
         "requested_priority": 1,
-        "requested_at": 100,
+      "requested_at": 100,
+      "started_at": null,
         "request_count": 1,
         "state": "complete",
         "completed_at": 490,

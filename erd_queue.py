@@ -1340,19 +1340,20 @@ class ERDQueue:
             "resolved_at": "INTEGER",
         })
         self._add_columns("source_work", {"started_at": "INTEGER"})
-        self._conn.execute("""
-            UPDATE source_work AS source
-            SET started_at = (
-                SELECT MIN(pending.claimed_at)
-                FROM branch_source_work AS membership
-                JOIN pending_branches AS pending
-                  ON pending.branch_id = membership.branch_id
-                WHERE membership.source_work_id = source.source_work_id
-                  AND membership.resolved_at IS NULL
-                  AND pending.claimed_at IS NOT NULL
-            )
-            WHERE source.state = 'active' AND source.started_at IS NULL
-        """)
+        if "claimed_at" in pending_columns:
+            self._conn.execute("""
+                UPDATE source_work AS source
+                SET started_at = (
+                    SELECT MIN(pending.claimed_at)
+                    FROM branch_source_work AS membership
+                    JOIN pending_branches AS pending
+                      ON pending.branch_id = membership.branch_id
+                    WHERE membership.source_work_id = source.source_work_id
+                      AND membership.resolved_at IS NULL
+                      AND pending.claimed_at IS NOT NULL
+                )
+                WHERE source.state = 'active' AND source.started_at IS NULL
+            """)
         self._add_columns("active_branches", {
             "requires_source_membership": "INTEGER NOT NULL DEFAULT 0",
         })
