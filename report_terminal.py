@@ -1252,18 +1252,15 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     if bundle_summary:
         bundle_labels = {
             "bundle_count": "bundles",
-            "average_bundle_candidate_count": "avg words/bundle",
             "censored_unit_count": "capped bundles",
             "maximum_bundle_node_count": "max bundle nodes",
         }
         bundle_fields = [
             bundle_labels.get(key, key.replace("_", " "))
             + " "
-            + (f"{value:,}" if isinstance(value, int)
-               else f"{value:.1f}" if key == "average_bundle_candidate_count"
-               else str(value))
+            + (f"{value:,}" if isinstance(value, int) else str(value))
             for key, value in bundle_summary.items()
-            if key not in ("node_count", "wall_millis") and value is not None
+            if key not in ("node_count", "wall_millis")
         ]
         bundle_lines.extend(_inline_section("  summary:", bundle_fields, width))
     else:

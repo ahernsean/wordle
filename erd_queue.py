@@ -541,7 +541,6 @@ PRAGMA telemetry.journal_size_limit=524288000;
 CREATE TABLE IF NOT EXISTS telemetry.bundle_stats (
     branch_key   BLOB    NOT NULL,
     bundle_id    TEXT    NOT NULL,
-    candidate_count INTEGER,
     nodes        INTEGER NOT NULL,
     wall_millis  INTEGER NOT NULL,
     censored     INTEGER NOT NULL DEFAULT 0,
@@ -1044,10 +1043,6 @@ class ERDQueue:
             "best_guess": "TEXT",
             "best_erd": "REAL",
         }, schema="telemetry")
-        self._add_columns("bundle_stats", {
-            "candidate_count": "INTEGER",
-        }, schema="telemetry")
-
         # Every persisted aggregate predating the provenance split came from
         # the one-level candidate bound; worker-side two-level pruning did not
         # yet exist.  Keep bulk_done_candidates as the legacy combined count.
@@ -2941,8 +2936,8 @@ class ERDQueue:
             self._conn.execute("ROLLBACK")
             raise
 
-    def record_bundle_stats(self, branch_key, bundle_id, candidate_count,
-                            nodes, wall_millis=None, censored=False):
+    def record_bundle_stats(self, branch_key, bundle_id, nodes, wall_millis,
+                            censored=False):
         """Record one bundle's actual node cost and evaluation wall span.
 
         wall_millis is the bundle's own evaluation wall time (straggler/
@@ -2968,23 +2963,16 @@ class ERDQueue:
         never read by any control path — and rare enough that finalize/
         delete cleanup keeps the table bounded in practice.
         """
-        if wall_millis is None:
-            # Preserve the pre-size-telemetry call shape for diagnostic tools
-            # writing rows without a candidate-count measurement.
-            wall_millis = nodes
-            nodes = candidate_count
-            candidate_count = None
         # bundle_stats lives in the telemetry file and keeps branch_key so the
         # telemetry database stays self-describing for standalone analysis; only
         # the active_branches existence guard uses branch_id.
         branch_id = self._intern_branch(branch_key)
         self._conn.execute("""
             INSERT OR REPLACE INTO telemetry.bundle_stats
-                (branch_key, bundle_id, candidate_count, nodes, wall_millis,
-                 censored)
-            SELECT ?, ?, ?, ?, ?, ?
+                (branch_key, bundle_id, nodes, wall_millis, censored)
+            SELECT ?, ?, ?, ?, ?
             WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_id = ?)
-        """, (branch_key, bundle_id, candidate_count, nodes, wall_millis,
+        """, (branch_key, bundle_id, nodes, wall_millis,
               1 if censored else 0, branch_id))
 
     def finalize_bundle_stats(self, branch_key):
@@ -4194,7 +4182,6 @@ class ERDQueue:
         """
         bundle_row = self._conn.execute("""
             SELECT COUNT(*) AS bundle_count,
-                   AVG(candidate_count) AS average_bundle_candidate_count,
                    SUM(nodes) AS node_count,
                    SUM(wall_millis) AS wall_millis,
                    SUM(censored) AS censored_unit_count,
