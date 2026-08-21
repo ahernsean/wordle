@@ -958,6 +958,30 @@ class ReportClientBrowserTest(unittest.TestCase):
             card.evaluate("(node) => node.getBoundingClientRect().top"), before, delta=1
         )
 
+    def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
+        self.page.set_viewport_size({"width": 834, "height": 1112})
+        remaining = self.page.evaluate("""async () => {
+          const base = await (await fetch('/api/view/leaderboard')).json();
+          const state = {...__reportClient.getState(), kind: 'leaderboard'};
+          const leaderboard = count => {
+            const report = structuredClone(base), row = report.data.rows[0];
+            report.data.rows = Array.from({length: count}, (_, index) => ({
+              ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
+            }));
+            report.data.total_rows = count;
+            report.data.counts.complete = count;
+            return report;
+          };
+          const before = leaderboard(12), after = leaderboard(15);
+          applyReport(before, null, state);
+          await new Promise(requestAnimationFrame);
+          scrollTo(0, document.documentElement.scrollHeight);
+          applyReport(after, before, state);
+          await new Promise(requestAnimationFrame);
+          return document.documentElement.scrollHeight - (scrollY + innerHeight);
+        }""")
+        self.assertLessEqual(remaining, 1)
+
     def test_leaderboard_selection_survives_a_changed_poll(self):
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector(".leaderboard-card")

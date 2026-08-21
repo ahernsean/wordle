@@ -326,7 +326,7 @@
     const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
-    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true;
+    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true,leaderboardReportWidth=null;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
     const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
@@ -1778,12 +1778,14 @@
     }
     function captureReadingPosition(root){
       const identityNodes=[...root.querySelectorAll("[data-identity]")];
+      const isAtBottom=scrollY+innerHeight>=document.documentElement.scrollHeight-2;
       const readingAnchorIndex=identityNodes.findIndex(node=>node.getBoundingClientRect().bottom>0);
-      if(readingAnchorIndex<0)return {left:scrollX,top:scrollY};
+      if(readingAnchorIndex<0)return {left:scrollX,top:scrollY,isAtBottom};
       const readingAnchor=identityNodes[readingAnchorIndex],identity=readingAnchor.dataset.identity;
-      return {left:scrollX,top:scrollY,identity,occurrence:identityNodes.slice(0,readingAnchorIndex).filter(node=>node.dataset.identity===identity).length,anchorTop:readingAnchor.getBoundingClientRect().top};
+      return {left:scrollX,top:scrollY,isAtBottom,identity,occurrence:identityNodes.slice(0,readingAnchorIndex).filter(node=>node.dataset.identity===identity).length,anchorTop:readingAnchor.getBoundingClientRect().top};
     }
     function restoreReadingPosition(root,readingPosition){
+      if(readingPosition.isAtBottom){scrollTo(readingPosition.left,document.documentElement.scrollHeight);return;}
       if(readingPosition.identity===undefined){scrollTo(readingPosition.left,readingPosition.top);return;}
       const readingAnchor=[...root.querySelectorAll("[data-identity]")].filter(node=>node.dataset.identity===readingPosition.identity)[readingPosition.occurrence];
       if(readingAnchor)scrollBy(0,readingAnchor.getBoundingClientRect().top-readingPosition.anchorTop);
@@ -1802,7 +1804,7 @@
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree,readingPosition=sameView?captureReadingPosition(root):null;
-      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
@@ -1891,7 +1893,7 @@
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
-      addEventListener("resize",()=>{layoutSpines(byId("report"));if(currentState?.kind==="leaderboard"&&lastReport)applyReport(lastReport,null,currentState);});
+      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
