@@ -1778,21 +1778,26 @@
     }
     function captureReadingPosition(root){
       const identityNodes=[...root.querySelectorAll("[data-identity]")];
-      const isAtBottom=scrollY+innerHeight>=document.documentElement.scrollHeight-2;
+      const bottomDistance=Math.max(0,document.documentElement.scrollHeight-(scrollY+innerHeight));
+      const preservedBottomDistance=bottomDistance<=innerHeight?bottomDistance:null;
       const readingAnchorIndex=identityNodes.findIndex(node=>node.getBoundingClientRect().bottom>0);
-      if(readingAnchorIndex<0)return {left:scrollX,top:scrollY,isAtBottom};
+      if(readingAnchorIndex<0)return {left:scrollX,top:scrollY,preservedBottomDistance};
       const readingAnchor=identityNodes[readingAnchorIndex],identity=readingAnchor.dataset.identity;
-      return {left:scrollX,top:scrollY,isAtBottom,identity,occurrence:identityNodes.slice(0,readingAnchorIndex).filter(node=>node.dataset.identity===identity).length,anchorTop:readingAnchor.getBoundingClientRect().top};
+      return {left:scrollX,top:scrollY,preservedBottomDistance,identity,occurrence:identityNodes.slice(0,readingAnchorIndex).filter(node=>node.dataset.identity===identity).length,anchorTop:readingAnchor.getBoundingClientRect().top};
     }
     function restoreReadingPosition(root,readingPosition){
-      if(readingPosition.isAtBottom){scrollTo(readingPosition.left,document.documentElement.scrollHeight);return;}
+      if(readingPosition.preservedBottomDistance!==null){scrollTo(readingPosition.left,document.documentElement.scrollHeight-innerHeight-readingPosition.preservedBottomDistance);return;}
       if(readingPosition.identity===undefined){scrollTo(readingPosition.left,readingPosition.top);return;}
       const readingAnchor=[...root.querySelectorAll("[data-identity]")].filter(node=>node.dataset.identity===readingPosition.identity)[readingPosition.occurrence];
       if(readingAnchor)scrollBy(0,readingAnchor.getBoundingClientRect().top-readingPosition.anchorTop);
       else scrollTo(readingPosition.left,readingPosition.top);
     }
-    function leaderboardReportChanged(report,previousReport){
-      return JSON.stringify(semanticProjection(report.data))!==JSON.stringify(semanticProjection(previousReport.data));
+    function leaderboardRowsChanged(report,previousReport){
+      return JSON.stringify(semanticProjection({rows:report.data.rows,total_rows:report.data.total_rows}))!==JSON.stringify(semanticProjection({rows:previousReport.data.rows,total_rows:previousReport.data.total_rows}));
+    }
+    function refreshLeaderboardMetrics(report){
+      const counts=report.data.counts||{},values=[counts.complete,counts.pending,counts.infeasible,report.data.candidate_count];
+      byId("report").querySelectorAll("h2 + .metrics .metric strong").forEach((node,index)=>{node.textContent=valueOrDash(values[index]);});
     }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
@@ -1833,10 +1838,10 @@
         // A same-view poll may rebuild the report unless an interaction would
         // be destroyed: native controls have no DOM state to restore after
         // replacement, and replaceChildren collapses an active text selection.
-        const unchangedLeaderboard=sameView&&report.report_kind==="leaderboard"&&!leaderboardReportChanged(report,lastReport);
+        const unchangedLeaderboard=sameView&&report.report_kind==="leaderboard"&&!leaderboardRowsChanged(report,lastReport);
         if(!sameView||(!unchangedLeaderboard&&!reportHasFocusedControl()&&!reportHasActiveSelection())){
           applyReport(report,previous,state);displayedState=state;
-        }
+        }else if(unchangedLeaderboard&&!reportHasActiveSelection())refreshLeaderboardMetrics(report);
         lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }

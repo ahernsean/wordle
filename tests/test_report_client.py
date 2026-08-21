@@ -922,6 +922,29 @@ class ReportClientBrowserTest(unittest.TestCase):
             card.evaluate("(node) => node.getBoundingClientRect().top"), before, delta=1
         )
 
+    def test_leaderboard_count_only_poll_keeps_its_cards(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card")
+        card = self.page.locator(".leaderboard-card").first
+        card.evaluate("(node) => node.dataset.testMarker = 'still-here'")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/leaderboard')) return response;
+            const report = await response.json();
+            report.data.counts.pending = 123;
+            return new Response(JSON.stringify(report), {
+              status: 200, headers: {'Content-Type': 'application/json'},
+            });
+          });
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(card.get_attribute("data-test-marker"), "still-here")
+        self.assertEqual(
+            self.page.locator("h2 + .metrics .metric", has_text="pending").locator("strong").inner_text(),
+            "123",
+        )
+
     def test_changed_leaderboard_poll_keeps_the_visible_word_in_place(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
@@ -960,7 +983,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
-        remaining = self.page.evaluate("""async () => {
+        distances = self.page.evaluate("""async () => {
           const base = await (await fetch('/api/view/leaderboard')).json();
           const state = {...__reportClient.getState(), kind: 'leaderboard'};
           const leaderboard = count => {
@@ -972,15 +995,24 @@ class ReportClientBrowserTest(unittest.TestCase):
             report.data.counts.complete = count;
             return report;
           };
-          const before = leaderboard(12), after = leaderboard(15);
+          const before = leaderboard(12), after = leaderboard(15), later = leaderboard(18);
           applyReport(before, null, state);
           await new Promise(requestAnimationFrame);
           scrollTo(0, document.documentElement.scrollHeight);
           applyReport(after, before, state);
           await new Promise(requestAnimationFrame);
-          return document.documentElement.scrollHeight - (scrollY + innerHeight);
+          const bottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
+          scrollBy(0, -160);
+          const nearBottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
+          applyReport(later, after, state);
+          await new Promise(requestAnimationFrame);
+          return {bottomDistance, nearBottomDistance,
+                  restoredNearBottomDistance: document.documentElement.scrollHeight - (scrollY + innerHeight)};
         }""")
-        self.assertLessEqual(remaining, 1)
+        self.assertLessEqual(distances["bottomDistance"], 1)
+        self.assertAlmostEqual(
+            distances["restoredNearBottomDistance"], distances["nearBottomDistance"], delta=1
+        )
 
     def test_leaderboard_selection_survives_a_changed_poll(self):
         self.page.locator("[data-kind=leaderboard]").click()
