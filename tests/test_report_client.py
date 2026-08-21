@@ -3293,10 +3293,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")
-        self.assertIn(
-            "sorted by most recently completed",
-            self.page.locator("#report").inner_text(),
-        )
+        self.assertEqual(self.page.locator("#sort").input_value(), "completed")
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
