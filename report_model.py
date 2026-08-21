@@ -1585,7 +1585,7 @@ def collect_root_progress_report(sources: ReportSources,
         )
         cache_states = cache.report_branch_states(
             list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
-        if not resolved.steps:
+        if not resolved.steps and request.epoch is None:
             for pattern, summary in cache.root_response_group_summary_map(
                     word, ERD_ALL).items():
                 progress["groups"][pattern] = {
@@ -1641,15 +1641,21 @@ def collect_root_progress_report(sources: ReportSources,
                                     if node_total else 0.0)
     data["response_groups"] = rows
     data["epoch"] = active_epoch
-    data["telemetry_epochs"] = progress["telemetry_epochs"]
+    data["telemetry_epochs"] = sorted({
+        epoch for row in rows for epoch in row["telemetry_epochs"]
+    })
     data["selected_telemetry_epoch"] = progress["epoch"]
-    data["work_started_at"] = progress["work_started_at"]
-    data["work_latest_at"] = progress["work_latest_at"]
+    data["work_started_at"] = min(
+        (row["first_created_at"] for row in rows
+         if row["first_created_at"] is not None), default=None)
+    data["work_latest_at"] = max(
+        (row["last_finalized_at"] for row in rows
+         if row["last_finalized_at"] is not None), default=None)
     root_is_complete = (
         progress["open_branch_count"] == 0
         and all(row["state"] in ("solved", "loss") for row in rows)
     )
-    data["completed_at"] = progress["work_latest_at"] if root_is_complete else None
+    data["completed_at"] = data["work_latest_at"] if root_is_complete else None
     if root_is_complete and not resolved.steps:
         data["completed_at"] = max(
             (entry["completed_at"] for entry in requests
@@ -3142,11 +3148,11 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                                       checkpoint_on_close=False)
             timings = timing_cache.completed_source_summary_map(ERD_ALL)
             for row in summary_rows:
-                source_word = (_row_value(row, "source_word") or "").lower()
-                if (not source_word or source_word in timings
+                summary_source_word = (_row_value(row, "source_word") or "").lower()
+                if (not summary_source_word or summary_source_word in timings
                         or _merged_source_state(row) != "complete"):
                     continue
-                timing = queue.completed_source_timing(source_word)
+                timing = queue.completed_source_timing(summary_source_word)
                 if timing["completed_at"] is None:
                     continue
                 telemetry_epochs = tuple(
@@ -3155,10 +3161,10 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                 elapsed_millis = (
                     (timing["completed_at"] - timing["first_created_at"]) * 1000)
                 timing_cache.write_completed_source_summary(
-                    source_word, ERD_ALL, timing["completed_at"],
+                    summary_source_word, ERD_ALL, timing["completed_at"],
                     elapsed_millis, timing["worker_millis"] or 0,
                     telemetry_epochs)
-                timings[source_word] = {
+                timings[summary_source_word] = {
                     "completed_at": timing["completed_at"],
                     "elapsed_millis": elapsed_millis,
                     "worker_millis": timing["worker_millis"] or 0,
