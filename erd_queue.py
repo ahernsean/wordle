@@ -1781,6 +1781,29 @@ class ERDQueue:
         return self._conn.execute(
             "SELECT EXISTS(SELECT 1 FROM source_work)").fetchone()[0] == 1
 
+    def _source_response_group_is_live(self, source_work_id, root_pattern):
+        """Whether a source request still needs work below one direct response group."""
+        if root_pattern is None:
+            return self._conn.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM source_work
+                    WHERE source_work_id = ? AND state != 'complete'
+                )
+            """, (source_work_id,)).fetchone()[0] == 1
+        return self._conn.execute("""
+            SELECT EXISTS(
+                SELECT 1
+                FROM branch_source_work AS membership
+                JOIN source_work AS source
+                  ON source.source_work_id = membership.source_work_id
+                WHERE membership.source_work_id = ?
+                  AND membership.root_pattern = ?
+                  AND membership.parent_branch_id IS NULL
+                  AND membership.resolved_at IS NULL
+                  AND source.state != 'complete'
+            )
+        """, (source_work_id, root_pattern)).fetchone()[0] == 1
+
     def claim_next(self, worker_id: str, source_work_id: int = None):
         """Atomically claim the highest-priority / largest pending branch.
 
@@ -1856,10 +1879,12 @@ class ERDQueue:
             active = self._conn.execute(
                 "SELECT 1 FROM active_branches WHERE branch_id = ?",
                 (branch_id,)).fetchone()
-            completed_words = ([] if active is not None
-                               else self._resolve_branch_memberships(branch_id))
+            completed_words = self._retire_exact_direct_response_groups(branch_id)
+            if active is None:
+                completed_words.extend(
+                    self._resolve_branch_memberships(branch_id))
             self._conn.execute("COMMIT")
-            return completed_words
+            return list(dict.fromkeys(completed_words))
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
@@ -1909,6 +1934,84 @@ class ERDQueue:
         completed_words = self._complete_finished_source_work()
         self._demote_orphaned_owned_branches()
         return completed_words
+
+    def _retire_exact_direct_response_groups(self, branch_id: int) -> list[str]:
+        """Retire work below direct response groups whose exact result is done.
+
+        A source request needs each direct response group once.  Once one of
+        those roots has an exact result, descendant candidate searches under
+        that same root cannot change it.  Other direct response groups, and
+        branches still owned by another live request, remain runnable.
+
+        The caller holds the queue transaction.  Removing exclusive active
+        rows before resolving their source memberships prevents the normal
+        orphan reconciliation from reclassifying cancelled descendant work as
+        direct work.
+        """
+        direct_groups = self._conn.execute("""
+            SELECT source_work_id, root_pattern
+            FROM branch_source_work
+            WHERE branch_id = ?
+              AND parent_branch_id IS NULL
+              AND resolved_at IS NULL
+        """, (branch_id,)).fetchall()
+        if not direct_groups:
+            return []
+
+        target_branch_ids = set()
+        for group in direct_groups:
+            target_branch_ids.update(row[0] for row in self._conn.execute("""
+                SELECT branch_id
+                FROM branch_source_work
+                WHERE source_work_id = ?
+                  AND root_pattern IS ?
+                  AND resolved_at IS NULL
+            """, (group["source_work_id"], group["root_pattern"])))
+
+        now = int(time.time())
+        for group in direct_groups:
+            self._conn.execute("""
+                UPDATE branch_source_work
+                SET resolved_at = ?
+                WHERE source_work_id = ?
+                  AND root_pattern IS ?
+                  AND resolved_at IS NULL
+            """, (now, group["source_work_id"], group["root_pattern"]))
+
+        descendant_ids = sorted(target_branch_ids - {branch_id})
+        if descendant_ids:
+            placeholders = ",".join("?" for _ in descendant_ids)
+            exclusive_active = self._conn.execute(f"""
+                SELECT active.branch_id, branch.branch_key
+                FROM active_branches AS active
+                JOIN branches AS branch USING (branch_id)
+                WHERE active.status = 'open'
+                  AND active.branch_id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM live_branch_source_rows AS owner
+                      WHERE owner.branch_id = active.branch_id
+                  )
+            """, descendant_ids).fetchall()
+            active_ids = [row["branch_id"] for row in exclusive_active]
+            if active_ids:
+                active_placeholders = ",".join("?" for _ in active_ids)
+                self._conn.execute(
+                    f"DELETE FROM candidate_claims WHERE branch_id IN ({active_placeholders})",
+                    active_ids)
+                self._conn.execute(
+                    f"DELETE FROM candidate_republish WHERE branch_id IN ({active_placeholders})",
+                    active_ids)
+                self._conn.execute(
+                    f"DELETE FROM candidate_holes WHERE branch_id IN ({active_placeholders})",
+                    active_ids)
+                self._conn.executemany(
+                    "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
+                    [(row["branch_key"],) for row in exclusive_active])
+                self._conn.execute(
+                    f"DELETE FROM active_branches WHERE branch_id IN ({active_placeholders})",
+                    active_ids)
+
+        return self._complete_finished_source_work()
 
     def completed_source_timing(self, source_word):
         """Return timing recorded for spines opened by one source word.
@@ -2204,6 +2307,11 @@ class ERDQueue:
         branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            if (source_work_id is not None
+                    and not self._source_response_group_is_live(
+                        source_work_id, source_pattern)):
+                self._conn.execute("COMMIT")
+                return False
             cur = self._conn.execute("""
                 INSERT OR IGNORE INTO active_branches
                     (branch_id, n_words, n_candidates,
@@ -2245,11 +2353,10 @@ class ERDQueue:
                 "SELECT budget, ceiling FROM active_branches "
                 "WHERE branch_id = ? AND status = 'open'",
                 (branch_id,)).fetchone()
-            source_is_live = self._conn.execute("""
-                SELECT 1 FROM source_work
-                WHERE source_work_id = ? AND state != 'complete'
-            """, (source_work_id,)).fetchone() is not None
-            if (not active or not source_is_live or active["budget"] != budget
+            source_response_group_is_live = self._source_response_group_is_live(
+                source_work_id, source_pattern)
+            if (not active or not source_response_group_is_live
+                    or active["budget"] != budget
                     or (active["ceiling"] is not None
                         and (ceiling is None
                              or not erd_ge(active["ceiling"], ceiling, n_words)))):
