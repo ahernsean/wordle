@@ -1774,7 +1774,23 @@
     function reportHasActiveSelection(){
       const selection=getSelection();
       if(!selection||selection.isCollapsed||!selection.rangeCount)return false;
-      return byId("report").contains(selection.getRangeAt(0).commonAncestorContainer);
+      return selection.getRangeAt(0).intersectsNode(byId("report"));
+    }
+    function captureReadingPosition(root){
+      const identityNodes=[...root.querySelectorAll("[data-identity]")];
+      const readingAnchorIndex=identityNodes.findIndex(node=>node.getBoundingClientRect().bottom>0);
+      if(readingAnchorIndex<0)return {left:scrollX,top:scrollY};
+      const readingAnchor=identityNodes[readingAnchorIndex],identity=readingAnchor.dataset.identity;
+      return {left:scrollX,top:scrollY,identity,occurrence:identityNodes.slice(0,readingAnchorIndex).filter(node=>node.dataset.identity===identity).length,anchorTop:readingAnchor.getBoundingClientRect().top};
+    }
+    function restoreReadingPosition(root,readingPosition){
+      if(readingPosition.identity===undefined){scrollTo(readingPosition.left,readingPosition.top);return;}
+      const readingAnchor=[...root.querySelectorAll("[data-identity]")].filter(node=>node.dataset.identity===readingPosition.identity)[readingPosition.occurrence];
+      if(readingAnchor)scrollBy(0,readingAnchor.getBoundingClientRect().top-readingPosition.anchorTop);
+      else scrollTo(readingPosition.left,readingPosition.top);
+    }
+    function leaderboardReportChanged(report,previousReport){
+      return JSON.stringify(semanticProjection(report))!==JSON.stringify(semanticProjection(previousReport));
     }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
@@ -1785,8 +1801,8 @@
       if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else if(report.report_kind==="sources")content.append(renderSources(report,previousReport,state));else throw new Error("Unknown report kind");
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
-      const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree;
-      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree,readingPosition=sameView?captureReadingPosition(root):null;
+      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
@@ -1815,7 +1831,8 @@
         // A same-view poll may rebuild the report unless an interaction would
         // be destroyed: native controls have no DOM state to restore after
         // replacement, and replaceChildren collapses an active text selection.
-        if(!sameView||!(reportHasFocusedControl()||reportHasActiveSelection())){
+        const unchangedLeaderboard=sameView&&report.report_kind==="leaderboard"&&!leaderboardReportChanged(report,lastReport);
+        if(!sameView||(!unchangedLeaderboard&&!reportHasFocusedControl()&&!reportHasActiveSelection())){
           applyReport(report,previous,state);displayedState=state;
         }
         lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
