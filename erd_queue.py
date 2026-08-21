@@ -560,6 +560,7 @@ CREATE TABLE IF NOT EXISTS telemetry.two_level_prune_telemetry (
     inspected_candidate_count INTEGER NOT NULL,
     pruned_candidate_count    INTEGER NOT NULL,
     bound_erd                 REAL,
+    worker_count              INTEGER,
     wall_millis               INTEGER NOT NULL,
     epoch                     INTEGER NOT NULL DEFAULT 0,
     recorded_at               INTEGER NOT NULL
@@ -1066,6 +1067,7 @@ class ERDQueue:
         }, schema="telemetry")
         self._add_columns("two_level_prune_telemetry", {
             "bound_erd": "REAL",
+            "worker_count": "INTEGER",
         }, schema="telemetry")
         # Every persisted aggregate predating the provenance split came from
         # the one-level candidate bound; worker-side two-level pruning did not
@@ -3039,7 +3041,8 @@ class ERDQueue:
 
     def complete_bundle_two_level_erd_prunes(self, branch_key, bundle_id,
                                              candidate_indices, nodes_spent=0,
-                                             wall_millis=0, bound_erd=None):
+                                             wall_millis=0, bound_erd=None,
+                                             worker_count=None):
         """Complete claimed candidates pruned by the two-level ERD bound.
 
         The worker computes the bounds before entering this transaction.  A
@@ -3100,11 +3103,12 @@ class ERDQueue:
                 self._conn.execute("""
                     INSERT INTO telemetry.two_level_prune_telemetry
                         (branch_id, inspected_candidate_count,
-                         pruned_candidate_count, bound_erd, wall_millis, epoch,
-                         recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         pruned_candidate_count, bound_erd, worker_count,
+                         wall_millis, epoch, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (branch_id, nodes_spent, completed_candidate_count,
-                      bound_erd, max(0, wall_millis), self.epoch, now))
+                      bound_erd, worker_count, max(0, wall_millis), self.epoch,
+                      now))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -4353,8 +4357,14 @@ class ERDQueue:
                 "inspected_candidate_count": 0,
                 "pruned_candidate_count": 0,
                 "inspection_worker_millis": 0,
+                "inspection_worker_count": None,
+                "inspection_worker_count_min": None,
+                "inspection_worker_count_max": None,
                 "evaluated_candidate_count": 0,
                 "evaluation_worker_millis": 0,
+                "evaluation_worker_count": None,
+                "evaluation_worker_count_min": None,
+                "evaluation_worker_count_max": None,
             }
         since = max(now - window_seconds, best_updated_at)
         try:
@@ -4363,15 +4373,27 @@ class ERDQueue:
                            AS inspected_candidate_count,
                        COALESCE(SUM(pruned_candidate_count), 0)
                            AS pruned_candidate_count,
-                       COALESCE(SUM(wall_millis), 0) AS inspection_worker_millis
+                       COALESCE(SUM(wall_millis), 0) AS inspection_worker_millis,
+                       CASE WHEN SUM(wall_millis) > 0
+                            THEN SUM(worker_count * wall_millis) * 1.0
+                                 / SUM(wall_millis) END
+                           AS inspection_worker_count,
+                       MIN(worker_count) AS inspection_worker_count_min,
+                       MAX(worker_count) AS inspection_worker_count_max
                 FROM telemetry.two_level_prune_telemetry
                 WHERE branch_id = ? AND bound_erd = ?
                   AND recorded_at >= ? AND recorded_at <= ?
             """, (branch_id, branch_row["best_erd"], since, now)).fetchone()
             evaluation_row = self._conn.execute("""
-                SELECT COUNT(*) AS evaluated_candidate_count,
-                       COALESCE(SUM(coordination_millis), 0)
-                           AS evaluation_worker_millis
+            SELECT COUNT(*) AS evaluated_candidate_count,
+                   COALESCE(SUM(coordination_millis), 0)
+                       AS evaluation_worker_millis,
+                   CASE WHEN SUM(coordination_millis) > 0
+                        THEN SUM(worker_count * coordination_millis) * 1.0
+                             / SUM(coordination_millis) END
+                       AS evaluation_worker_count,
+                   MIN(worker_count) AS evaluation_worker_count_min,
+                   MAX(worker_count) AS evaluation_worker_count_max
                 FROM telemetry.claim_telemetry
                 WHERE branch_id = ? AND recorded_at >= ? AND recorded_at <= ?
             """, (branch_id, since, now)).fetchone()

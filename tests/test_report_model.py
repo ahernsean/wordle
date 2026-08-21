@@ -108,6 +108,29 @@ class ReportModelTest(unittest.TestCase):
         )
         self.assertEqual(eta["state"], "learning")
 
+    def test_candidate_eta_scales_a_rough_sample_to_new_workers(self):
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 0},
+            {
+                "best_updated_at": 1_000,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_millis": 0,
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_millis": 24_000,
+                "evaluation_worker_count": 1,
+                "evaluation_worker_count_min": 1,
+                "evaluation_worker_count_max": 1,
+            },
+            live_worker_count=4,
+            now=1_200,
+        )
+        self.assertEqual(eta["state"], "rough")
+        self.assertAlmostEqual(eta["estimated_seconds"], 240 / 1.97)
+        self.assertTrue(eta["worker_count_changed"])
+        self.assertEqual(eta["sample_worker_count"], 1)
+
     @staticmethod
     def _group(pattern, answer_count, best_erd, max_remaining_depth,
                cache_state="exact"):

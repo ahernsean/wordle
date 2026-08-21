@@ -2521,7 +2521,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
             "clart", bound_erd, None)
         worker.queue.complete_bundle_two_level_erd_prunes.side_effect = (
             lambda _branch_key, _bundle_id, candidate_indices, nodes_spent=0,
-            wall_millis=0, bound_erd=None:
+            wall_millis=0, bound_erd=None, worker_count=None:
                 len(candidate_indices))
 
         def count_heartbeat(*_args, **_kwargs):
@@ -2547,7 +2547,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", candidate_indices,
             nodes_spent=len(candidate_indices), wall_millis=mock.ANY,
-            bound_erd=3.1)
+            bound_erd=3.1, worker_count=1)
         worker.queue.add_nodes_spent.assert_not_called()
         worker._evaluate_bundle_member.assert_not_called()
         worker.queue.record_bundle_stats.assert_called_once()
@@ -2568,7 +2568,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", [0, 2],
             nodes_spent=len(candidate_indices), wall_millis=mock.ANY,
-            bound_erd=3.1)
+            bound_erd=3.1, worker_count=1)
         self.assertEqual(worker._evaluate_bundle_member.call_count, 1)
         self.assertEqual(worker._evaluate_bundle_member.call_args.args[3], 1)
 
@@ -2614,7 +2614,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertTrue(cancelled)
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", [0], nodes_spent=1,
-            wall_millis=mock.ANY, bound_erd=3.1)
+            wall_millis=mock.ANY, bound_erd=3.1, worker_count=1)
 
 
 class TestMidLoopPublisher(unittest.TestCase):

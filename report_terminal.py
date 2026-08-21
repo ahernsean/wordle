@@ -1183,9 +1183,15 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             )
         candidate_eta = data.get("candidate_eta")
         if candidate_eta and candidate_eta["state"] in ("ready", "rough"):
+            eta_scaling = (
+                f"; scaling {candidate_eta['sample_worker_count']}→"
+                f"{candidate_eta['current_worker_count']} workers"
+                if candidate_eta["worker_count_changed"] else ""
+            )
             candidate_status_fields.extend([
                 ("rough ETA" if candidate_eta["state"] == "rough" else "ETA")
-                + f" ({round(candidate_eta['sample_duration_seconds'] / 60)} min data) "
+                + f" ({round(candidate_eta['sample_duration_seconds'] / 60)} min data"
+                + eta_scaling + ") "
                 f"~{_abbreviate_duration(candidate_eta['estimated_seconds'])}",
                 "ETA work "
                 f"checks {candidate_eta['remaining_inspection_count']:,} "

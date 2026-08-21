@@ -39,6 +39,7 @@ DEFAULT_TREE_PAGE_SIZE = 10
 BRANCH_ETA_WINDOW_SECONDS = 10 * 60
 BRANCH_ETA_ROUGH_SAMPLE_SECONDS = 3 * 60
 BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
+BRANCH_ETA_SPEEDUP = {1: 1.0, 2: 1.64, 3: 1.97, 4: 1.97}
 
 # Source ERD summaries are immutable until the score cache changes.  The
 # Sources view polls frequently, so retain the completed folds between polls.
@@ -1791,6 +1792,8 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
     evaluated = eta_sample["evaluated_candidate_count"]
     inspection_millis = eta_sample["inspection_worker_millis"]
     evaluation_millis = eta_sample["evaluation_worker_millis"]
+    inspection_workers = eta_sample.get("inspection_worker_count")
+    evaluation_workers = eta_sample.get("evaluation_worker_count")
     observed_work_units = inspected + evaluated
     result = {
         "state": "learning",
@@ -1829,16 +1832,47 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
         evaluation_worker_seconds = (
             remaining * evaluation_millis / evaluated / 1000
         )
+    def speedup(worker_count):
+        worker_count = max(1, round(worker_count))
+        return BRANCH_ETA_SPEEDUP.get(
+            worker_count, BRANCH_ETA_SPEEDUP[max(BRANCH_ETA_SPEEDUP)])
+
+    inspection_sample_workers = inspection_workers or live_worker_count
+    evaluation_sample_workers = evaluation_workers or live_worker_count
+    current_speedup = speedup(live_worker_count)
+    estimated_seconds = (
+        inspection_worker_seconds * speedup(inspection_sample_workers)
+        / inspection_sample_workers
+        + evaluation_worker_seconds * speedup(evaluation_sample_workers)
+        / evaluation_sample_workers
+    ) / current_speedup
+    sampled_worker_counts = [count for count in (
+        eta_sample.get("inspection_worker_count_min"),
+        eta_sample.get("inspection_worker_count_max"),
+        eta_sample.get("evaluation_worker_count_min"),
+        eta_sample.get("evaluation_worker_count_max"),
+    ) if count is not None]
+    worker_count_changed = any(
+        round(count) != live_worker_count for count in sampled_worker_counts)
+    component_worker_counts = []
+    if inspection_worker_seconds:
+        component_worker_counts.append(inspection_sample_workers)
+    if evaluation_worker_seconds:
+        component_worker_counts.append(evaluation_sample_workers)
     result.update({
         "state": (
-            "ready" if sample_duration_seconds >= BRANCH_ETA_STABLE_SAMPLE_SECONDS
+            "ready" if (sample_duration_seconds >= BRANCH_ETA_STABLE_SAMPLE_SECONDS
+                         and not worker_count_changed)
             else "rough"
         ),
-        "estimated_seconds": (
-            inspection_worker_seconds + evaluation_worker_seconds
-        ) / live_worker_count,
+        "estimated_seconds": estimated_seconds,
         "remaining_inspection_count": remaining_inspections,
         "expected_full_evaluation_count": round(expected_full_evaluations),
+        "sample_worker_count": round(
+            sum(component_worker_counts) / len(component_worker_counts)
+        ),
+        "current_worker_count": live_worker_count,
+        "worker_count_changed": worker_count_changed,
     })
     return result
 
