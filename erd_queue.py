@@ -249,6 +249,7 @@ CREATE TABLE IF NOT EXISTS source_work (
     source_word        TEXT,
     requested_priority INTEGER NOT NULL,
     requested_at       INTEGER NOT NULL,
+    started_at         INTEGER,
     state              TEXT    NOT NULL DEFAULT 'queued'
 );
 
@@ -1338,6 +1339,20 @@ class ERDQueue:
             "root_pattern": "INTEGER",
             "resolved_at": "INTEGER",
         })
+        self._add_columns("source_work", {"started_at": "INTEGER"})
+        self._conn.execute("""
+            UPDATE source_work AS source
+            SET started_at = (
+                SELECT MIN(pending.claimed_at)
+                FROM branch_source_work AS membership
+                JOIN pending_branches AS pending
+                  ON pending.branch_id = membership.branch_id
+                WHERE membership.source_work_id = source.source_work_id
+                  AND membership.resolved_at IS NULL
+                  AND pending.claimed_at IS NOT NULL
+            )
+            WHERE source.state = 'active' AND source.started_at IS NULL
+        """)
         self._add_columns("active_branches", {
             "requires_source_membership": "INTEGER NOT NULL DEFAULT 0",
         })
@@ -1848,9 +1863,11 @@ class ERDQueue:
                 SET status = 'in_progress', claimed_by = ?, claimed_at = ?
                 WHERE branch_id = ?
             """, (worker_id, now, row["branch_id"]))
-            self._conn.execute(
-                "UPDATE source_work SET state = 'active' WHERE source_work_id = ?",
-                (source_work_id,))
+            self._conn.execute("""
+                UPDATE source_work
+                SET state = 'active', started_at = COALESCE(started_at, ?)
+                WHERE source_work_id = ?
+            """, (now, source_work_id))
             self._conn.execute("COMMIT")
             return {
                 'branch_key': bytes(row["branch_key"]),
@@ -4982,6 +4999,8 @@ class ERDQueue:
         return self._conn.execute("""
             SELECT s.source_word,
                    MIN(s.requested_at) AS requested_at,
+                   MIN(CASE WHEN s.state != 'complete' THEN s.started_at END)
+                       AS started_at,
                    MAX(s.requested_priority) AS requested_priority,
                    MAX(m.resolved_at) AS completed_at,
                    COUNT(DISTINCT s.source_work_id) AS request_count,

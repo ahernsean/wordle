@@ -2729,7 +2729,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
-def _source_summary_payload(row, rollup, timing):
+def _source_summary_payload(row, rollup, timing, generated_at):
     """One source word, with its requests and branches rolled up.
 
     This is the report's unit: a word that spawned a thousand branches is one
@@ -2755,10 +2755,15 @@ def _source_summary_payload(row, rollup, timing):
             completed_at = _row_value(row, "completed_at")
         elapsed_millis = timing["elapsed_millis"]
         worker_millis = timing["worker_millis"]
+    elif state == "active":
+        started_at = _row_value(row, "started_at")
+        if started_at is not None:
+            elapsed_millis = max(0, generated_at - started_at) * 1000
     return {
         "source_word": source_word.lower() if source_word else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
+        "started_at": _row_value(row, "started_at"),
         "completed_at": completed_at,
         "request_count": row["request_count"] or 0,
         "state": state,
@@ -3121,6 +3126,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                     {"completed_at": None, "elapsed_millis": None,
                      "worker_millis": None},
                 ),
+                generated_at,
             )
             for row in summary_rows
         ]

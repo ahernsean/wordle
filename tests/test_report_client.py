@@ -3483,6 +3483,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         # Still searching: how much of it is solved, not a number that moves.
         self.assertIn("ERD pending · 96/148 groups solved", cards["SALET"])
 
+    def test_active_source_card_shows_elapsed_work_time(self):
+        text = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/sources')).json();
+          const row = report.data.summary[0];
+          row.state = 'active';
+          row.elapsed_millis = 30000;
+          row.worker_millis = null;
+          delete report.data.summary_groups;
+          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          return document.querySelector('.card.source-word').innerText;
+        }""")
+
+        self.assertIn("elapsed 30s", text)
+
     def test_sources_branch_cards_appear_only_for_the_named_word(self):
         self.open_sources()
         self.page.locator(".card.source-word").first.locator(

@@ -1423,6 +1423,23 @@ class SourceReportTest(unittest.TestCase):
             ["salet", "crane", "nurdy"],
         )
 
+    def test_active_source_elapsed_time_starts_when_work_is_claimed(self):
+        self._queue_words(("salet", 5, 1))
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE source_work SET state = 'active', started_at = 100 "
+            "WHERE source_word = 'salet'"
+        )
+        queue._conn.commit()
+        queue.close()
+
+        with patch("report_model.time.time", return_value=130):
+            row = self._source_words()["summary"][0]
+
+        self.assertEqual(row["started_at"], 100)
+        self.assertEqual(row["elapsed_millis"], 30_000)
+        self.assertIsNone(row["worker_millis"])
+
     def test_source_report_keeps_erd_summary_shape_when_cache_unavailable(self):
         self._queue_words(("salet", 5, 1))
         unavailable_sources = replace(
