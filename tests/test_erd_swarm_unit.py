@@ -3193,26 +3193,27 @@ class TestCompletedSourceSnapshots(unittest.TestCase):
             "first_created_at": 100,
             "completed_at": 160,
             "worker_millis": 2_000,
+            "telemetry_epochs": "3",
         }
 
         worker._snapshot_completed_sources(["SALET"])
 
         worker.score_cache.write_completed_source_summary.assert_called_once_with(
-            "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000)
+            "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
 
     def test_snapshot_failure_does_not_abort_the_worker(self):
         worker = _bare_worker()
         worker.queue.completed_source_timing.side_effect = [
             RuntimeError("locked"),
             {"first_created_at": 100, "completed_at": 160,
-             "worker_millis": 2_000},
+             "worker_millis": 2_000, "telemetry_epochs": "3"},
         ]
 
         with self.assertLogs("wordle", level="ERROR"):
             worker._snapshot_completed_sources(["salet", "crane"])
 
         worker.score_cache.write_completed_source_summary.assert_called_once_with(
-            "crane", erd_swarm.ERD_ALL, 160, 60_000, 2_000)
+            "crane", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
 
 
 class TestSubbranchSolverForwardsCeiling(unittest.TestCase):

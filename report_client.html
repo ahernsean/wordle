@@ -1008,10 +1008,14 @@
       // as though the work had started before it was asked for.
       const times=[];
       if(totals.requested_at!==null&&totals.requested_at!==undefined)times.push("requested "+absoluteTime(totals.requested_at));
+      const telemetryEpochs=data.telemetry_epochs||[];
+      const telemetryEpochText=data.selected_telemetry_epoch!==null&&data.selected_telemetry_epoch!==undefined
+        ?"telemetry epoch "+data.selected_telemetry_epoch
+        :telemetryEpochs.length?"telemetry epochs "+telemetryEpochs.join(", "):"no recorded telemetry";
       times.push("work began "+absoluteTime(data.work_started_at),
                  "latest "+absoluteTime(data.work_latest_at),
                  data.completed_at===null||data.completed_at===undefined?null:"completed "+absoluteTime(data.completed_at),
-                 "epoch "+data.epoch);
+                 "active epoch "+data.epoch,telemetryEpochText);
       fragment.append(statLine(times));
       const estimate=data.estimate;
       if(estimate){
@@ -1058,7 +1062,7 @@
       // top-left mid-read.
       scroller.addEventListener("scroll",()=>rootProgressScroll.set(url,{left:scroller.scrollLeft,top:scroller.scrollTop}));
       fragment.append(scroller);
-      fragment.append(element("p","dim","Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock. Counts cover epoch "+data.epoch+"."));
+      fragment.append(element("p","dim","Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock. Counts cover "+telemetryEpochText+"."));
       return fragment;
     }
     function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state){

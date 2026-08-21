@@ -44,13 +44,12 @@ def _make_args(tmp_dir, **overrides):
 
 
 SummaryCounts = namedtuple(
-    'SummaryCounts', ['new', 'new_cached', 'already_queued',
-                       'already_queued_cached', 'total'])
+    'SummaryCounts', ['new', 'already_queued', 'already_solved', 'total'])
 
 _SUMMARY_LINE_RE = re.compile(
-    r'branch\(es\) processed across [\d,]+ word\(s\): '
-    r'([\d,]+) new \(([\d,]+) of which already cached\), '
-    r'([\d,]+) already queued \(([\d,]+) of which already cached\)\.\s+'
+    r'branch\(es\) queued across [\d,]+ word\(s\): '
+    r'([\d,]+) new, ([\d,]+) already queued, '
+    r'([\d,]+) already solved\.\s+'
     r'Queue total: ([\d,]+)')
 
 
@@ -184,10 +183,8 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         self.assertEqual(second_summary.new, 0)
         self.assertEqual(second_summary.already_queued, first_summary.new)
 
-    def test_already_cached_branch_is_reported_as_new_and_cached(self):
-        # Pre-cached but never queued: falls in the "new" bucket, with the
-        # cached count as a sub-count of it -- new/already_queued stay a
-        # true partition of the branch total (issue found in PR review).
+    def test_already_cached_branch_is_not_queued(self):
+        # A reusable result is terminal work, not a new queue request.
         branch_key = self._all_gray_branch_key()
         args = _make_args(self._tmp.name)
 
@@ -203,9 +200,36 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
             erd_search.cmd_queue_add(args)
 
         summary = _parse_summary_counts(output.getvalue())
-        self.assertEqual(summary.new_cached, 1)
-        self.assertEqual(summary.already_queued_cached, 0)
+        self.assertEqual(summary.already_solved, 1)
         self.assertEqual(summary.new + summary.already_queued, summary.total)
+        queue = ERDQueue(args.queue)
+        self.addCleanup(queue.close)
+        self.assertIsNone(queue.get_pending_branch(branch_key))
+
+    def test_fully_cached_word_reports_already_solved_without_source_work(self):
+        branch_key = self._all_gray_branch_key()
+        args = _make_args(self._tmp.name, pattern='-----')
+
+        all_answers = load_word_list(erd_search.ANSWER_FILE)
+        score_cache = ScoreCache(args.cache, all_answers)
+        score_cache.write(branch_key, ERD_ALL, 'salet', 3.5,
+                          max_depth=GAME_GUESSES - 2, solve_budget=None)
+        score_cache.checkpoint()
+        score_cache.close()
+
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(args)
+
+        self.assertIn(
+            f'{LARGE_BRANCH_WORD.upper()}: already solved — 1 response '
+            'group already cached; nothing queued.', output.getvalue())
+        summary = _parse_summary_counts(output.getvalue())
+        self.assertEqual(summary, SummaryCounts(0, 0, 1, 0))
+        queue = ERDQueue(args.queue)
+        self.addCleanup(queue.close)
+        self.assertEqual(queue.total_branches(), 0)
+        self.assertEqual(queue.source_work_rows(), [])
 
 
 if __name__ == '__main__':

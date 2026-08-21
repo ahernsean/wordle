@@ -27,9 +27,10 @@ queue add       Add branches for one or more words to the work queue.
                 is upgraded if the new request is higher.  With --words-file,
                 --priority-words marks a subset of the file's words as
                 higher priority.  --delete-erd-cache forces a recompute of
-                branches that are already cached.  Reports how many branches
-                are new versus already queued, and how many of each are
-                already cached.
+                branches that are already cached.  Otherwise, branches with
+                reusable cached results are not queued.  Reports how many
+                branches are new versus already queued, and how many were
+                already solved.
 
 queue clear     Wipe all queue state (pending branches, active state, candidate
                 claims, heartbeats).  Does not touch the ERD cache.
@@ -169,10 +170,10 @@ def cmd_queue_add(args):
     at 0.
 
     Already-queued branches are never duplicated; their priority is upgraded
-    if the new request is higher.  For each word, reports how many of its
-    branches are new versus already queued (a true partition of the branch
-    total), and how many of each are already resolved in the ERD cache (so a
-    worker will resolve them instantly without doing any search).
+    if the new request is higher.  Branches with reusable cached results are
+    already solved and are not queued, unless --delete-erd-cache is given.
+    For each word, reports how many unresolved branches are new versus already
+    queued, and how many response groups were already solved.
     --delete-erd-cache deletes each queued branch's existing ERD cache entry
     first, so it gets recomputed instead of being claimed and immediately
     marked done as already-cached.
@@ -215,9 +216,8 @@ def cmd_queue_add(args):
     branch_budget = GAME_GUESSES - 1
 
     n_new = 0
-    n_new_cached = 0
     n_already_queued = 0
-    n_already_queued_cached = 0
+    n_already_solved = 0
     try:
         for word in words_to_process:
             priority = (args.priority if (not priority_words
@@ -250,8 +250,6 @@ def cmd_queue_add(args):
                 ]
             if rows:
                 branch_keys = [branch_key for branch_key, *_rest in rows]
-                already_queued_keys = set(
-                    queue.status_by_branch_keys(branch_keys))
                 cache_states = score_cache.report_branch_states(
                     branch_keys, ERD_ALL, budget=branch_budget)
                 already_cached_keys = {
@@ -261,35 +259,45 @@ def cmd_queue_add(args):
                 if args.delete_erd_cache:
                     for branch_key in branch_keys:
                         score_cache.delete(branch_key, ERD_ALL)
-                queue.add_pending_many(rows)
+                    rows_to_queue = rows
+                    already_solved_keys = set()
+                else:
+                    rows_to_queue = [
+                        row for row in rows
+                        if row[0] not in already_cached_keys]
+                    already_solved_keys = already_cached_keys
 
-                # already_cached_keys is a cross-cutting subset: a branch
-                # can be new-to-the-queue *and* already resolved in the
-                # cache from earlier work.  new/already_queued stay a true
-                # partition of the branch total; already-cached is reported
-                # as a sub-count of whichever bucket each branch falls in.
+                already_queued_keys = set(
+                    queue.status_by_branch_keys(
+                        [branch_key for branch_key, *_rest in rows_to_queue]))
+                if rows_to_queue:
+                    queue.add_pending_many(rows_to_queue)
+
                 word_already_queued = len(already_queued_keys)
-                word_new = len(rows) - word_already_queued
-                word_new_cached = len(already_cached_keys - already_queued_keys)
-                word_already_queued_cached = len(
-                    already_cached_keys & already_queued_keys)
+                word_new = len(rows_to_queue) - word_already_queued
+                word_already_solved = len(already_solved_keys)
                 n_new += word_new
-                n_new_cached += word_new_cached
                 n_already_queued += word_already_queued
-                n_already_queued_cached += word_already_queued_cached
-                print(f'{word.upper()}: {len(rows):,} branch(es) — '
-                      f'{word_new:,} new ({word_new_cached:,} of which '
-                      f'already cached), {word_already_queued:,} already '
-                      f'queued ({word_already_queued_cached:,} of which '
-                      f'already cached).')
+                n_already_solved += word_already_solved
+                if not rows_to_queue:
+                    response_group_label = (
+                        'response group' if word_already_solved == 1
+                        else 'response groups')
+                    print(f'{word.upper()}: already solved — '
+                          f'{word_already_solved:,} {response_group_label} already '
+                          f'cached; nothing queued.')
+                else:
+                    print(f'{word.upper()}: {len(rows_to_queue):,} branch(es) '
+                          f'— {word_new:,} new, '
+                          f'{word_already_queued:,} already queued, '
+                          f'{word_already_solved:,} already solved.')
 
         total = queue.total_branches()
         n_added = n_new + n_already_queued
-        print(f'\n{n_added:,} branch(es) processed across '
-              f'{len(words_to_process):,} word(s): {n_new:,} new '
-              f'({n_new_cached:,} of which already cached), '
-              f'{n_already_queued:,} already queued '
-              f'({n_already_queued_cached:,} of which already cached).  '
+        print(f'\n{n_added:,} branch(es) queued across '
+              f'{len(words_to_process):,} word(s): {n_new:,} new, '
+              f'{n_already_queued:,} already queued, '
+              f'{n_already_solved:,} already solved.  '
               f'Queue total: {total:,}.')
 
     except KeyboardInterrupt:

@@ -1709,8 +1709,18 @@ def _render_root_progress_sections(report, width, display_order):
     spine_prefix = data.get("spine_prefix")
     subject = (spine_prefix + ("*" if data["word_is_answer"] else "")
                if spine_prefix else word)
+    selected_epoch = data.get("selected_telemetry_epoch")
+    telemetry_epochs = data.get("telemetry_epochs", [])
+    telemetry_scope = (
+        f"telemetry-epoch={selected_epoch}"
+        if selected_epoch is not None
+        else ("telemetry-epochs=" + ",".join(str(epoch) for epoch in telemetry_epochs)
+              if telemetry_epochs else "telemetry-epochs=none")
+    )
     header = _semantic_header(
-        report, f"Root progress {subject}  epoch={data['epoch']}", width
+        report,
+        f"Root progress {subject}  active-epoch={data['epoch']}  {telemetry_scope}",
+        width,
     )
     requested_at = totals["requested_at"]
     started_at = data["work_started_at"]

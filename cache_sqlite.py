@@ -295,7 +295,24 @@ class ScoreCache:
                 source_word TEXT NOT NULL, policy TEXT NOT NULL,
                 answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
                 elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                telemetry_epochs TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (source_word, policy, answer_list_id)
+            )
+        """)
+        summary_columns = {row["name"] for row in self._conn.execute(
+            "PRAGMA table_info(completed_source_summaries)")}
+        if "telemetry_epochs" not in summary_columns:
+            self._conn.execute(
+                "ALTER TABLE completed_source_summaries "
+                "ADD COLUMN telemetry_epochs TEXT NOT NULL DEFAULT ''")
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS root_response_group_summaries (
+                source_word TEXT NOT NULL, response_pattern TEXT NOT NULL,
+                policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
+                branch_count INTEGER NOT NULL, search_node_count INTEGER NOT NULL,
+                worker_millis INTEGER NOT NULL, first_created_at INTEGER,
+                last_finalized_at INTEGER, telemetry_epochs TEXT NOT NULL,
+                PRIMARY KEY (source_word, response_pattern, policy, answer_list_id)
             )
         """)
         # 'subset_blob' was renamed to 'subset_key' — same encoding, cleaner
@@ -940,26 +957,65 @@ class ScoreCache:
 
     def completed_source_summary_map(self, policy):
         return {row["source_word"].lower(): dict(row) for row in self._conn.execute("""
-            SELECT source_word, completed_at, elapsed_millis, worker_millis
+            SELECT source_word, completed_at, elapsed_millis, worker_millis,
+                   telemetry_epochs
             FROM completed_source_summaries
             WHERE policy = ? AND answer_list_id = ?
         """, (policy, self.answer_list_id))}
 
     def write_completed_source_summary(self, source_word, policy, completed_at,
-                                       elapsed_millis, worker_millis):
+                                       elapsed_millis, worker_millis,
+                                       telemetry_epochs=()):
         try:
             self._conn.execute("""
                 INSERT OR REPLACE INTO completed_source_summaries
                     (source_word, policy, answer_list_id, completed_at,
-                     elapsed_millis, worker_millis)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     elapsed_millis, worker_millis, telemetry_epochs)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (source_word.lower(), policy, self.answer_list_id, completed_at,
-                  elapsed_millis, worker_millis))
+                  elapsed_millis, worker_millis,
+                  ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
         except sqlite3.OperationalError as exc:
             if not _is_disk_io_error(exc):
                 raise
             logger.warning("write_completed_source_summary(%s, %s) failed: %s",
                            source_word, policy, exc)
+
+    def add_root_response_group_summary(self, source_word, response_pattern,
+                                        policy, nodes, worker_millis,
+                                        created_at, finalized_at, epoch):
+        row = self._conn.execute("""
+            SELECT telemetry_epochs FROM root_response_group_summaries
+            WHERE source_word = ? AND response_pattern = ? AND policy = ?
+              AND answer_list_id = ?
+        """, (source_word.lower(), response_pattern, policy,
+              self.answer_list_id)).fetchone()
+        epochs = {str(epoch)}
+        if row is not None:
+            epochs.update(filter(None, row["telemetry_epochs"].split(",")))
+        self._conn.execute("""
+            INSERT INTO root_response_group_summaries
+                (source_word, response_pattern, policy, answer_list_id,
+                 branch_count, search_node_count, worker_millis,
+                 first_created_at, last_finalized_at, telemetry_epochs)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_word, response_pattern, policy, answer_list_id)
+            DO UPDATE SET branch_count = branch_count + 1,
+                search_node_count = search_node_count + excluded.search_node_count,
+                worker_millis = worker_millis + excluded.worker_millis,
+                first_created_at = MIN(first_created_at, excluded.first_created_at),
+                last_finalized_at = MAX(last_finalized_at, excluded.last_finalized_at),
+                telemetry_epochs = excluded.telemetry_epochs
+        """, (source_word.lower(), response_pattern, policy, self.answer_list_id,
+              nodes, worker_millis or 0, created_at, finalized_at,
+              ",".join(sorted(epochs, key=int))))
+
+    def root_response_group_summary_map(self, source_word, policy):
+        rows = self._conn.execute("""
+            SELECT * FROM root_response_group_summaries
+            WHERE source_word = ? AND policy = ? AND answer_list_id = ?
+        """, (source_word.lower(), policy, self.answer_list_id)).fetchall()
+        return {row["response_pattern"]: dict(row) for row in rows}
 
     def last_write_ts(self):
         """Return the unix timestamp of the most recent ERD write, or None."""

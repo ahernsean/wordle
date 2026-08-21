@@ -1489,7 +1489,7 @@ def _root_progress_group_state(row, cache_state, group_budget):
 
     Queue state decides only the two remaining cases.  The cache is the
     authority on whether work is finished, because a group can be solved with
-    no branch open and no finalization in this epoch.
+    no branch open and no recorded finalization.
     """
     if cache_state is not None:
         if (cache_state["best_erd"] is not None
@@ -1557,9 +1557,9 @@ def collect_root_progress_report(sources: ReportSources,
     queue = None
     try:
         queue = _open_report_queue(sources)
-        epoch = queue.epoch if request.epoch is None else request.epoch
+        active_epoch = queue.epoch
         progress = queue.report_root_progress(
-            spine_prefix, epoch, ROOT_PROGRESS_RECENT_WINDOW_SECONDS,
+            spine_prefix, request.epoch, ROOT_PROGRESS_RECENT_WINDOW_SECONDS,
             now=generated_at)
         # Work under a deeper spine is still requested under its root, so the
         # request time is the root's however deep the target sits.
@@ -1585,6 +1585,24 @@ def collect_root_progress_report(sources: ReportSources,
         )
         cache_states = cache.report_branch_states(
             list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
+        if not resolved.steps:
+            for pattern, summary in cache.root_response_group_summary_map(
+                    word, ERD_ALL).items():
+                progress["groups"][pattern] = {
+                    "branch_count": summary["branch_count"],
+                    "open_branch_count": 0,
+                    "search_node_count": summary["search_node_count"],
+                    "wall_millis": summary["worker_millis"],
+                    "first_created_at": summary["first_created_at"],
+                    "last_finalized_at": summary["last_finalized_at"],
+                    "telemetry_epochs": [int(epoch) for epoch in
+                                         summary["telemetry_epochs"].split(",")
+                                         if epoch],
+                    "elapsed_millis": (
+                        (summary["last_finalized_at"] - summary["first_created_at"]) * 1000
+                        if summary["first_created_at"] is not None
+                        and summary["last_finalized_at"] is not None else None),
+                }
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
@@ -1610,6 +1628,7 @@ def collect_root_progress_report(sources: ReportSources,
             "first_created_at": totals["first_created_at"] if totals else None,
             "last_finalized_at": (totals["last_finalized_at"]
                                   if totals else None),
+            "telemetry_epochs": totals["telemetry_epochs"] if totals else [],
         }
         row["state"] = _root_progress_group_state(
             row, cache_states.get(branch_keys_by_pattern[pattern]),
@@ -1621,7 +1640,9 @@ def collect_root_progress_report(sources: ReportSources,
         row["search_node_share"] = (row["search_node_count"] / node_total
                                     if node_total else 0.0)
     data["response_groups"] = rows
-    data["epoch"] = progress["epoch"]
+    data["epoch"] = active_epoch
+    data["telemetry_epochs"] = progress["telemetry_epochs"]
+    data["selected_telemetry_epoch"] = progress["epoch"]
     data["work_started_at"] = progress["work_started_at"]
     data["work_latest_at"] = progress["work_latest_at"]
     root_is_complete = (
@@ -3120,6 +3141,30 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             timing_cache = ScoreCache(sources.cache_path, all_answers,
                                       checkpoint_on_close=False)
             timings = timing_cache.completed_source_summary_map(ERD_ALL)
+            for row in summary_rows:
+                source_word = (_row_value(row, "source_word") or "").lower()
+                if (not source_word or source_word in timings
+                        or _merged_source_state(row) != "complete"):
+                    continue
+                timing = queue.completed_source_timing(source_word)
+                if timing["completed_at"] is None:
+                    continue
+                telemetry_epochs = tuple(
+                    int(epoch) for epoch in (timing["telemetry_epochs"] or "").split(",")
+                    if epoch)
+                elapsed_millis = (
+                    (timing["completed_at"] - timing["first_created_at"]) * 1000)
+                timing_cache.write_completed_source_summary(
+                    source_word, ERD_ALL, timing["completed_at"],
+                    elapsed_millis, timing["worker_millis"] or 0,
+                    telemetry_epochs)
+                timings[source_word] = {
+                    "completed_at": timing["completed_at"],
+                    "elapsed_millis": elapsed_millis,
+                    "worker_millis": timing["worker_millis"] or 0,
+                    "telemetry_epochs": ",".join(
+                        str(epoch) for epoch in telemetry_epochs),
+                }
         except (sqlite3.Error, OSError) as error:
             timings = {}
             report["sources"]["cache"]["error"] = str(error)
