@@ -1944,6 +1944,8 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000):
             "spine_prefix": "SCOPE",
             "context": {"spine": []},
             "epoch": 11,
+            "selected_telemetry_epoch": None,
+            "telemetry_epochs": [9, 11],
             "work_started_at": 1_799_000_000,
             "work_latest_at": 1_799_900_000,
             "estimate": estimate,
@@ -1992,6 +1994,7 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000):
 class RootProgressRendererTest(unittest.TestCase):
     def test_reports_request_time_and_work_start_as_separate_facts(self):
         output = render_report(root_progress_report(), width=120)
+        self.assertIn("active-epoch=11  telemetry-epochs=9,11", output)
         self.assertIn("Requested", output)
         self.assertIn("work began", output)
         # The two differ by ~11 days here; collapsing them would report the

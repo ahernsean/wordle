@@ -723,7 +723,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = self.page.locator("details.root-progress-panel").inner_text()
         self.assertNotIn("requested", text)
         self.assertIn("work began", text)
-        self.assertIn("epoch", text)
+        self.assertIn("active epoch", text)
+        self.assertIn("no recorded telemetry", text)
 
     def test_root_progress_url_carries_only_parameters_the_report_accepts(self):
         # The word view's own display state — group_by, sort, limit, branch

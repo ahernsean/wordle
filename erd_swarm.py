@@ -1570,10 +1570,13 @@ class _BranchWorker:
                 timing = self.queue.completed_source_timing(source_word)
                 if timing["completed_at"] is None:
                     continue
+                telemetry_epochs = tuple(
+                    int(epoch) for epoch in (timing["telemetry_epochs"] or "").split(",")
+                    if epoch)
                 self.score_cache.write_completed_source_summary(
                     source_word, ERD_ALL, timing["completed_at"],
                     (timing["completed_at"] - timing["first_created_at"]) * 1000,
-                    timing["worker_millis"] or 0)
+                    timing["worker_millis"] or 0, telemetry_epochs)
             except Exception:
                 logger.exception("%s could not snapshot completed source %s",
                                  self.name, source_word)
@@ -1737,6 +1740,12 @@ class _BranchWorker:
                 schedule_diagnostics=schedule_diagnostics,
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
+            spine_tokens = (spine or "").split()
+            if len(spine_tokens) >= 2:
+                self.score_cache.add_root_response_group_summary(
+                    spine_tokens[0], spine_tokens[1], ERD_ALL, nodes_spent,
+                    total_bundle_wall_millis, created_at, finalized_at,
+                    self.queue.epoch)
         except Exception:
             logger.exception(
                 '%s finalize telemetry failed for branch %s -- result '

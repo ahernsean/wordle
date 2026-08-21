@@ -2032,7 +2032,7 @@ class ERDQueue:
         return self._complete_finished_source_work()
 
     def completed_source_timing(self, source_word):
-        """Return timing recorded for spines opened by one source word.
+        """Return durable-source timing from every telemetry epoch.
 
         Source ownership can attach a request to an already-existing branch.
         Its finalization record predates that request, so ownership joins are
@@ -2041,13 +2041,13 @@ class ERDQueue:
         return self._conn.execute("""
             SELECT MIN(log.created_at) AS first_created_at,
                    MAX(log.finalized_at) AS completed_at,
-                   SUM(COALESCE(log.total_bundle_wall_millis, 0)) AS worker_millis
+                   SUM(COALESCE(log.total_bundle_wall_millis, 0)) AS worker_millis,
+                   GROUP_CONCAT(DISTINCT log.epoch) AS telemetry_epochs
             FROM telemetry.branch_finalize_log AS log
             WHERE lower(substr(log.spine, 1, 5)) = lower(?)
-              AND log.epoch = ?
               AND log.created_at IS NOT NULL
               AND log.finalized_at IS NOT NULL
-        """, (source_word, self.epoch)).fetchone()
+        """, (source_word,)).fetchone()
 
     def _demote_orphaned_owned_branches(self) -> list[int]:
         """Demote open branches whose only source ownership has been lost.
@@ -4291,7 +4291,9 @@ class ERDQueue:
         `SCOPE`, or a deeper one such as `SCOPE -y--- LUBES`.  Rolls up
         telemetry.branch_finalize_log by the response pattern that follows the
         prefix, so every descendant's cost is attributed to the group it sits
-        under.  The rollup is a scan over the epoch's rows
+        under.  With an explicit epoch, the rollup is limited to that epoch;
+        otherwise it includes historical telemetry from every epoch.  The
+        rollup is a scan over the selected rows
         (branch_finalize_log carries no spine index), so callers should treat
         it as a seconds-scale query.
 
@@ -4314,8 +4316,8 @@ class ERDQueue:
         is when the swarm first opened work under the prefix -- a different
         question from when the root was requested, which can precede it by days
         while higher-priority roots hold the queue.  A branch created before the
-        current epoch keeps its original creation time, so this can predate the
-        epoch whose finalizations are being counted.
+        selected telemetry keeps its original creation time, so this can
+        predate the epoch that produced a later finalization.
 
         Two distinct time bases are reported per group, and they answer
         different questions:
@@ -4339,22 +4341,28 @@ class ERDQueue:
         # The response pattern follows one space past the prefix.
         pattern_start = len(spine_prefix) + 2
         descendants = spine_prefix + " %"
-        group_rows = self._conn.execute("""
+        epoch_condition = "AND epoch = ?" if epoch is not None else ""
+        group_rows = self._conn.execute(f"""
             SELECT SUBSTR(spine, ?, 5) AS pattern,
                    COUNT(*) AS branch_count,
                    SUM(nodes_spent) AS search_node_count,
                    SUM(total_bundle_wall_millis) AS wall_millis,
                    MIN(created_at) AS first_created_at,
-                   MAX(finalized_at) AS last_finalized_at
+                   MAX(finalized_at) AS last_finalized_at,
+                   GROUP_CONCAT(DISTINCT epoch) AS telemetry_epochs
             FROM telemetry.branch_finalize_log
-            WHERE epoch = ? AND spine LIKE ?
+            WHERE spine LIKE ? {epoch_condition}
             GROUP BY pattern
-        """, (pattern_start, epoch, descendants)).fetchall()
+        """, (pattern_start, descendants, *(() if epoch is None else (epoch,)))).fetchall()
         groups = {}
+        telemetry_epochs = set()
         work_started_at = None
         work_latest_at = None
         for row in group_rows:
             first, last = row["first_created_at"], row["last_finalized_at"]
+            group_telemetry_epochs = sorted(
+                int(value) for value in row["telemetry_epochs"].split(","))
+            telemetry_epochs.update(group_telemetry_epochs)
             groups[row["pattern"]] = {
                 "branch_count": row["branch_count"],
                 "open_branch_count": 0,
@@ -4362,6 +4370,7 @@ class ERDQueue:
                 "wall_millis": row["wall_millis"] or 0,
                 "first_created_at": first,
                 "last_finalized_at": last,
+                "telemetry_epochs": group_telemetry_epochs,
                 "elapsed_millis": (last - first) * 1000
                                   if first is not None and last is not None
                                   else None,
@@ -4393,6 +4402,7 @@ class ERDQueue:
                     "wall_millis": 0,
                     "first_created_at": first,
                     "last_finalized_at": None,
+                    "telemetry_epochs": [],
                     "elapsed_millis": None,
                 }
             group["open_branch_count"] = row["open_branch_count"]
@@ -4434,6 +4444,7 @@ class ERDQueue:
             "work_latest_at": work_latest_at,
             "recent_window_seconds": recent_window_seconds,
             "epoch": epoch,
+            "telemetry_epochs": sorted(telemetry_epochs),
         }
 
     def source_work_requests_for_word(self, word) -> list:

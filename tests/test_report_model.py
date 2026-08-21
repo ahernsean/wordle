@@ -1954,7 +1954,7 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertIsNone(data["work_latest_at"])
         self.assertEqual(data["completed_at"], 300)
 
-    def test_rollup_is_fenced_by_epoch(self):
+    def test_rollup_can_be_fenced_to_an_explicit_epoch(self):
         queue = self._open_queue()
         self._finalize(queue, "SALET -y---", 1, 100, 10, 10, 20, epoch=0)
         self._finalize(queue, "SALET -----", 1, 500, 10, 10, 20, epoch=1)
@@ -1965,6 +1965,25 @@ class RootProgressReportTest(unittest.TestCase):
                                   self._request(epoch=1))["data"]["response_groups"]}
         self.assertTrue(rows["-----"]["started"])
         self.assertFalse(rows["-y---"]["started"])
+
+    def test_default_rollup_includes_prior_epochs_and_records_them(self):
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 100, 10, 10, 20, epoch=0)
+        self._finalize(queue, "SALET -----", 1, 500, 10, 10, 20, epoch=1)
+        queue.set_epoch(2)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+        rows = {row["pattern"]: row for row in data["response_groups"]}
+
+        self.assertEqual(data["epoch"], 2)
+        self.assertIsNone(data["selected_telemetry_epoch"])
+        self.assertEqual(data["telemetry_epochs"], [0, 1])
+        self.assertTrue(rows["-y---"]["started"])
+        self.assertEqual(rows["-y---"]["search_node_count"], 100)
+        self.assertEqual(rows["-y---"]["telemetry_epochs"], [0])
+        self.assertEqual(rows["-----"]["search_node_count"], 500)
+        self.assertEqual(rows["-----"]["telemetry_epochs"], [1])
 
     def test_work_started_is_distinct_from_when_the_word_was_requested(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
