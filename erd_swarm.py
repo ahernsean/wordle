@@ -1743,6 +1743,7 @@ class _BranchWorker:
                 'already published; continuing to cleanup', self.name,
                 branch_key[:25])
         loss = best_guess is None and (not cut or ceiling_proves_loss)
+        completed_source_words = []
         try:
             if loss:
                 self.queue.complete_pending_for_loss(
@@ -1750,7 +1751,8 @@ class _BranchWorker:
             elif cut:
                 self.queue.requeue_pending(branch_key)
             else:
-                self.queue.mark_done(branch_key)
+                completed_source_words.extend(
+                    self.queue.mark_done(branch_key) or [])
         except Exception:
             logger.exception('%s pending completion failed for branch %s; '
                              'retaining queued work', self.name, branch_key[:25])
@@ -1759,7 +1761,8 @@ class _BranchWorker:
             except Exception:
                 logger.exception('%s could not requeue branch %s', self.name,
                                  branch_key[:25])
-        self._snapshot_completed_sources(self.queue.delete_branch(branch_key))
+        completed_source_words.extend(self.queue.delete_branch(branch_key) or [])
+        self._snapshot_completed_sources(completed_source_words)
         self._packing_stats_cache.pop(branch_key, None)
         # Restart the coordination window past this finalize.  evaluate_claim
         # telescopes coordination_millis from the previous claim's completion,

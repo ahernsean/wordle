@@ -548,6 +548,25 @@ class ReportClientBrowserTest(unittest.TestCase):
 
         self.assertIn("~1.0h remaining (provisional)", headline)
 
+    def test_completed_root_progress_replaces_an_inapplicable_estimate(self):
+        def completed_progress(route):
+            response = route.fetch()
+            progress = response.json()
+            progress["data"]["estimate"] = None
+            progress["data"]["completed_at"] = 1785575213
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/root-progress**", completed_progress)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.root-progress")
+            text = self.page.locator(".root-progress-panel").inner_text()
+        finally:
+            self.page.unroute("**/api/view/root-progress**")
+
+        self.assertIn("Completed", text)
+        self.assertNotIn("No completion estimate", text)
+
     def test_root_progress_headline_states_no_coverage_percentage(self):
         # Cost concentrates so hard that breadth of coverage reads as
         # percent-complete: 98.8% of answers reached beside ~12d remaining

@@ -1624,6 +1624,12 @@ def collect_root_progress_report(sources: ReportSources,
     data["epoch"] = progress["epoch"]
     data["work_started_at"] = progress["work_started_at"]
     data["work_latest_at"] = progress["work_latest_at"]
+    data["completed_at"] = (
+        progress["work_latest_at"]
+        if (progress["open_branch_count"] == 0
+            and all(row["state"] in ("solved", "loss") for row in rows))
+        else None
+    )
     data["estimate"] = _root_progress_estimate(
         progress["active_branches"],
         progress["recent_window_seconds"], generated_at)
@@ -3118,7 +3124,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             )
             for row in summary_rows
         ]
-        source_sort = request.filters.sort or "erd"
+        source_sort = request.filters.sort or "completed"
         data["total_source_word_count"] = len(collapsed)
         source_states = request.filters.source_states
         if source_states:
