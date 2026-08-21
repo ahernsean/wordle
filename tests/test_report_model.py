@@ -84,7 +84,7 @@ class ReportModelTest(unittest.TestCase):
                 "evaluation_worker_millis": 50_000,
             },
             live_worker_count=2,
-            now=1_100,
+            now=1_600,
         )
         self.assertEqual(eta["state"], "ready")
         self.assertEqual(eta["remaining_inspection_count"], 600)

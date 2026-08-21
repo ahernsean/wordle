@@ -1182,9 +1182,10 @@ def _render_branch_sections(report, previous_report, color, width, display_order
                 f"in flight {claim_summary['in_flight_count']:,}"
             )
         candidate_eta = data.get("candidate_eta")
-        if candidate_eta and candidate_eta["state"] == "ready":
+        if candidate_eta and candidate_eta["state"] in ("ready", "rough"):
             candidate_status_fields.extend([
-                "ETA at current rate "
+                ("rough ETA" if candidate_eta["state"] == "rough" else "ETA")
+                + f" ({round(candidate_eta['sample_duration_seconds'] / 60)} min data) "
                 f"~{_abbreviate_duration(candidate_eta['estimated_seconds'])}",
                 "ETA work "
                 f"checks {candidate_eta['remaining_inspection_count']:,} "
@@ -1192,7 +1193,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             ])
         elif candidate_eta and candidate_eta["state"] == "learning":
             candidate_status_fields.append(
-                f"ETA learning {candidate_eta['observed_work_units']:,}/100 completions"
+                "ETA learning first 3 min after best ERD"
             )
         republished = data.get("republished_candidates") or []
         if republished:

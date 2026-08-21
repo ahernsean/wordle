@@ -1273,6 +1273,7 @@ class ERDQueue:
                     one_level_erd_pruned_candidates INTEGER NOT NULL DEFAULT 0,
                     two_level_erd_pruned_candidates INTEGER NOT NULL DEFAULT 0,
                     bulk_done_bound REAL,
+                    best_updated_at INTEGER,
                     pack_cursor    INTEGER NOT NULL DEFAULT 0
                 );
                 INSERT INTO active_branches_norm
@@ -1285,6 +1286,7 @@ class ERDQueue:
                            a.one_level_erd_pruned_candidates,
                            a.two_level_erd_pruned_candidates,
                            a.bulk_done_bound,
+                           a.best_updated_at,
                            a.pack_cursor
                     FROM active_branches a
                     JOIN branches b ON b.branch_key = a.branch_key;

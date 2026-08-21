@@ -37,8 +37,8 @@ SCHEMA_VERSION = 3
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
 BRANCH_ETA_WINDOW_SECONDS = 10 * 60
-BRANCH_ETA_MINIMUM_SAMPLE_SECONDS = 2 * 60
-BRANCH_ETA_MINIMUM_WORK_UNITS = 100
+BRANCH_ETA_ROUGH_SAMPLE_SECONDS = 3 * 60
+BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
 
 # Source ERD summaries are immutable until the score cache changes.  The
 # Sources view polls frequently, so retain the completed folds between polls.
@@ -1797,8 +1797,7 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
         "sample_duration_seconds": sample_duration_seconds,
         "observed_work_units": observed_work_units,
     }
-    if (sample_duration_seconds < BRANCH_ETA_MINIMUM_SAMPLE_SECONDS
-            or observed_work_units < BRANCH_ETA_MINIMUM_WORK_UNITS):
+    if sample_duration_seconds < BRANCH_ETA_ROUGH_SAMPLE_SECONDS:
         return result
     remaining = max(0, queue_payload["candidate_count"]
                     - queue_payload["completed_candidate_count"])
@@ -1831,7 +1830,10 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
             remaining * evaluation_millis / evaluated / 1000
         )
     result.update({
-        "state": "ready",
+        "state": (
+            "ready" if sample_duration_seconds >= BRANCH_ETA_STABLE_SAMPLE_SECONDS
+            else "rough"
+        ),
         "estimated_seconds": (
             inspection_worker_seconds + evaluation_worker_seconds
         ) / live_worker_count,
