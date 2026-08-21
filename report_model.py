@@ -3152,8 +3152,10 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                                       checkpoint_on_close=False)
             timings = timing_cache.completed_source_summary_map(ERD_ALL)
             for row in summary_rows:
-                summary_source_word = (_row_value(row, "source_word") or "").lower()
-                if (not summary_source_word or summary_source_word in timings
+                summary_source_word = (
+                    _row_value(row, "source_word") or "").lower()
+                if (not summary_source_word
+                        or summary_source_word in timings
                         or _merged_source_state(row) != "complete"):
                     continue
                 timing = queue.completed_source_timing(summary_source_word)
