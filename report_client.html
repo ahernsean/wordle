@@ -1108,7 +1108,7 @@
       const responseSummary=data.response_group_summary;
       if(responseSummary){
         const summary=element("div","metrics");
-        summary.append(metric("branches",responseSummary.branch_count),metric("answers",responseSummary.answer_count),metric("trivial",responseSummary.trivial_count),metric("exact",responseSummary.exact_count),metric("loss",responseSummary.loss_count),metric("missing",responseSummary.missing_count));
+        summary.append(metric("branches",responseSummary.branch_count),metric("answers",responseSummary.answer_count),metric("trivial",responseSummary.trivial_count),metric("exact",responseSummary.exact_count),metric("loss",responseSummary.loss_count),metric("not cached",responseSummary.missing_count));
         fragment.append(summary);
       }
       const progressURL=rootProgressURL(state),progressDetails=element("details","root-progress-panel");
@@ -1128,7 +1128,7 @@
       const responseGroupCard=row=>{
         const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;
         const title=element("div","card-title");title.append(wordTiles(data.word,row.pattern,data.word_is_answer,"word-md"),...statusChips(row));card.append(title);
-        const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+valueOrDash(row.cache_state)];
+        const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+(row.cache_state==="missing"?"not cached":valueOrDash(row.cache_state))];
         const best=bestText(row);if(best)parts.push(best);
         if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)parts.push("max remaining depth "+row.max_remaining_depth);
         if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));
@@ -1146,7 +1146,7 @@
           details.addEventListener("toggle",()=>details.open?collapsedResponseGroups.delete(groupKey):collapsedResponseGroups.add(groupKey));
           const percentage=responseSummary?.answer_count?Math.round(100*group.rollup.answer_count/responseSummary.answer_count):0;
           const summaryEl=element("summary","clickable");
-          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(group.rollup.branch_count)+(group.rollup.branch_count===1?" branch":" branches")+" · "+numText(group.rollup.answer_count)+(group.rollup.answer_count===1?" answer":" answers")+" ("+percentage+"%) · trivial "+numText(group.rollup.trivial_count)+" · exact "+numText(group.rollup.exact_count)+" · loss "+numText(group.rollup.loss_count)+" · missing "+numText(group.rollup.missing_count)));
+          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(group.rollup.branch_count)+(group.rollup.branch_count===1?" branch":" branches")+" · "+numText(group.rollup.answer_count)+(group.rollup.answer_count===1?" answer":" answers")+" ("+percentage+"%) · trivial "+numText(group.rollup.trivial_count)+" · exact "+numText(group.rollup.exact_count)+" · loss "+numText(group.rollup.loss_count)+" · not cached "+numText(group.rollup.missing_count)));
           const grid=gridElement("response-groups/"+group.label);
           for(const row of ordered(group.rows,"branch_key_hex","response-groups/"+group.label,state))grid.append(responseGroupCard(row));
           details.append(summaryEl,grid);
@@ -1171,11 +1171,12 @@
       const queueFacts=data.queue?[["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count],...(bundleSummary.wall_millis?[['wall time',formatDuration(bundleSummary.wall_millis/1000)]]:[])]:null;
       fragment.append(section("Queue",queueFacts?labeledFacts(queueFacts):element("p","empty","No current queue state")));
       const claimSummary=data.claim_summary||{};
-      if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);const candidateFacts=[["candidates",formatInteger(data.queue.completed_candidate_count)+"/"+formatInteger(data.queue.candidate_count)],["evaluated",claimSummary.evaluated_count||0],["one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],...(claimSummary.provenance_unknown_count?[["unattributed",claimSummary.provenance_unknown_count]]:[]),...(claimSummary.in_flight_count?[["in flight",claimSummary.in_flight_count]]:[])];const republishedList=data.republished_candidates||[];if(republishedList.length)candidateFacts.push(["candidates re-queued",numText(republishedList.length)+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)"]);if(claimSummary.worker_contributions?.length)candidateFacts.push(["Per-worker completions",claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+":"+numText(row.done_count)).join(" ")]);const candidates=element("div");candidates.append(sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id")),labeledFacts(candidateFacts));fragment.append(section("Candidates",candidates));}
-      const bundleLabels={bundle_count:"bundles",censored_unit_count:"capped bundles",maximum_bundle_node_count:"max bundle nodes"};
-      const bundlePairs=Object.entries(bundleSummary).filter(([key])=>key!=="node_count"&&key!=="wall_millis").map(([key,value])=>[bundleLabels[key]||label(key),value]);
+      if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);const candidateFacts=[["candidates",formatInteger(data.queue.completed_candidate_count)+"/"+formatInteger(data.queue.candidate_count)+" ="],["+ evaluated",claimSummary.evaluated_count||0],["+ one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["+ two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],...(claimSummary.provenance_unknown_count?[["+ unattributed",claimSummary.provenance_unknown_count]]:[])];const candidateStatusFacts=[...(claimSummary.in_flight_count?[["in flight",claimSummary.in_flight_count]]:[])];const republishedList=data.republished_candidates||[];if(republishedList.length)candidateStatusFacts.push(["candidates re-queued",numText(republishedList.length)+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)"]);if(claimSummary.worker_contributions?.length)candidateStatusFacts.push(["worker evals",claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+":"+numText(row.done_count)).join(" ")]);const candidates=element("div");candidates.append(sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id")),labeledFacts(candidateFacts));if(candidateStatusFacts.length)candidates.append(labeledFacts(candidateStatusFacts));fragment.append(section("Candidates",candidates));}
+      const bundleLabels={bundle_count:"bundles",average_bundle_candidate_count:"avg words/bundle",censored_unit_count:"capped bundles",maximum_bundle_node_count:"max bundle nodes"};
+      const bundlePairs=Object.entries(bundleSummary).filter(([key])=>key!=="node_count"&&key!=="wall_millis").map(([key,value])=>[bundleLabels[key]||label(key),key==="average_bundle_candidate_count"?Number(value).toFixed(1):value]);
       if(bundlePairs.length)fragment.append(section("Bundles",labeledFacts(bundlePairs)));
-      fragment.append(section("Cache",labeledFacts(candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at))));
+      const cacheEntries=candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at).map(([key,value])=>[key,value==="missing"?"not cached":value]);
+      fragment.append(section("Cache",labeledFacts(cacheEntries)));
       const ownership=data.branch_ownership||{};
       const ownershipSection=element("section","section");
       ownershipSection.append(

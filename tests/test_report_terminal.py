@@ -638,7 +638,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertNotIn("1,500 one-level ERD prunes", output)
         self.assertNotIn("119 two-level ERD prunes", output)
         self.assertIn("5 in flight", output)
-        self.assertIn("Per-worker completions: w0:6,484 w2:6,335", output)
+        self.assertIn("worker evals w0:6,484 w2:6,335", output)
         self.assertNotIn("idx=", output)
 
     def test_selected_branch_detail_survives_parent_status_filter(self):

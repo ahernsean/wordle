@@ -1305,7 +1305,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("1,500 one-level ERD prunes", text)
         self.assertNotIn("119 two-level ERD prunes", text)
         self.assertIn("in flight 5", text)
-        self.assertIn("Per-worker completions w0:6,484 w2:6,335", text)
+        self.assertIn("worker evals w0:6,484 w2:6,335", text)
         # Nothing fetches the raw per-candidate list, and no per-candidate rows
         # are rendered.
         self.assertFalse(any("claims=1" in url for url in requested))

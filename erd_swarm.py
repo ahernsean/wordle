@@ -1392,21 +1392,22 @@ class _BranchWorker:
     # -- evaluate a packer-issued bundle of candidate claims -----------------
 
     def _evaluate_bundle_member(self, branch_key, words, n_words, idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0,
+                                bundle_id, candidate_count,
+                                nodes_at_bundle_start, wall_t0,
                                 bundle_start_idx=None, bundle_end_idx=None):
         """evaluate_claim for one bundle member; on cancellation/abort,
         records the bundle as censored.  Returns True to keep going, False
         for the caller to abort evaluate_bundle immediately."""
         if self.cancel():
-            self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
-                                wall_t0, censored=True)
+            self._finish_bundle(branch_key, bundle_id, candidate_count,
+                                nodes_at_bundle_start, wall_t0, censored=True)
             return False
         if not self.evaluate_claim(branch_key, words, n_words, idx,
                                    budget=budget, bundle_id=bundle_id,
                                    bundle_start_idx=bundle_start_idx,
                                    bundle_end_idx=bundle_end_idx):
-            self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
-                                wall_t0, censored=True)
+            self._finish_bundle(branch_key, bundle_id, candidate_count,
+                                nodes_at_bundle_start, wall_t0, censored=True)
             return False
         return True
 
@@ -1513,14 +1514,15 @@ class _BranchWorker:
                 branch_key, words, n_words, bundle_id,
                 claimed_candidate_indices))
         if cancelled:
-            self._finish_bundle(branch_key, bundle_id, prune_nodes_at_start,
-                                prune_wall_t0, censored=True)
+            self._finish_bundle(branch_key, bundle_id,
+                                len(claimed_candidate_indices),
+                                prune_nodes_at_start, prune_wall_t0, censored=True)
             return False
         indices = [candidate_index for candidate_index in claimed_candidate_indices
                    if candidate_index not in pruned_candidate_indices]
         if not indices:
-            self._finish_bundle(branch_key, bundle_id, prune_nodes_at_start,
-                                prune_wall_t0, censored=False)
+            self._finish_bundle(branch_key, bundle_id, len(claimed_candidate_indices),
+                                prune_nodes_at_start, prune_wall_t0, censored=False)
             return True
 
         nodes_at_bundle_start = prune_nodes_at_start
@@ -1532,6 +1534,7 @@ class _BranchWorker:
         for pos, idx in enumerate(indices):
             if not self._evaluate_bundle_member(
                     branch_key, words, n_words, idx, budget, bundle_id,
+                    len(claimed_candidate_indices),
                     nodes_at_bundle_start, wall_t0,
                     bundle_start_idx=bundle_start_idx,
                     bundle_end_idx=bundle_end_idx):
@@ -1549,7 +1552,8 @@ class _BranchWorker:
                     if later_idx in forced:
                         if not self._evaluate_bundle_member(
                                 branch_key, words, n_words, later_idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0,
+                                bundle_id, len(claimed_candidate_indices),
+                                nodes_at_bundle_start, wall_t0,
                                 bundle_start_idx=bundle_start_idx,
                                 bundle_end_idx=bundle_end_idx):
                             return False
@@ -1557,11 +1561,13 @@ class _BranchWorker:
                         remainder.append(later_idx)
                 if remainder:
                     self.queue.republish_remainder(branch_key, bundle_id, remainder)
-                self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
-                                    wall_t0, censored=bool(remainder))
+                self._finish_bundle(branch_key, bundle_id,
+                                    len(claimed_candidate_indices),
+                                    nodes_at_bundle_start, wall_t0,
+                                    censored=bool(remainder))
                 return True
-        self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
-                            wall_t0, censored=False)
+        self._finish_bundle(branch_key, bundle_id, len(claimed_candidate_indices),
+                            nodes_at_bundle_start, wall_t0, censored=False)
         return True
 
     def _snapshot_completed_sources(self, source_words):
@@ -1581,8 +1587,8 @@ class _BranchWorker:
                 logger.exception("%s could not snapshot completed source %s",
                                  self.name, source_word)
 
-    def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
-                       censored):
+    def _finish_bundle(self, branch_key, bundle_id, candidate_count,
+                       nodes_at_start, wall_t0, censored):
         """Record a completed/censored bundle's actual cost, if this claim
         went through the packer (bundle_id is None for a bare evaluate_claim
         call outside the bundle path).
@@ -1597,8 +1603,9 @@ class _BranchWorker:
             return
         nodes = self._nodes - nodes_at_start
         wall_millis = int((time.time() - wall_t0) * 1000)
-        self.queue.record_bundle_stats(branch_key, bundle_id, nodes,
-                                       wall_millis, censored=censored)
+        self.queue.record_bundle_stats(
+            branch_key, bundle_id, candidate_count, nodes, wall_millis,
+            censored=censored)
 
     # -- finalize -----------------------------------------------------------
 

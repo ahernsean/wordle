@@ -1017,7 +1017,7 @@ def _render_word_sections(report, previous_report, color, width, display_order):
             f"active {counts['active_response_group_count']}  "
             f"exact {counts['exact_response_group_count']}  "
             f"loss {counts['loss_response_group_count']}  "
-            f"missing {counts['missing_response_group_count']}",
+            f"not cached {counts['missing_response_group_count']}",
             width,
         ),
     ]
@@ -1029,7 +1029,7 @@ def _render_word_sections(report, previous_report, color, width, display_order):
             f"{hotkey:<{hotkey_width}}"
             f"{group['pattern']:<7}  {group['answer_count']:>7}  "
             f"{group['branch_status']:<8}  {str(group['branch_phase'] or '—'):<10}  "
-            f"{group['cache_state']:<14}  "
+            f"{('not cached' if group['cache_state'] == 'missing' else group['cache_state']):<14}  "
             f"{_display_best(group):<10}  @{_display_reference(group['branch_reference'])}"
         )
 
@@ -1146,7 +1146,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             contributions = claim_summary.get("worker_contributions") or []
             if contributions:
                 candidate_fields.append(
-                    "Per-worker completions: "
+                    "worker evals "
                     + " ".join(
                         f"{_worker_number_label(row['worker_id'])}:{row['done_count']:,}"
                         for row in contributions
@@ -1167,18 +1167,19 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         two_level_erd_prunes = queue.get(
             "two_level_erd_pruned_candidate_count", 0)
         candidate_fields = [
-            f"{completed:,}/{candidate_count:,} completed",
-            f"{claim_summary.get('evaluated_count', 0):,} evaluated",
-            f"{one_level_erd_prunes:,} one-level ERD prunes",
-            f"{two_level_erd_prunes:,} two-level ERD prunes",
+            f"candidates {completed:,}/{candidate_count:,} =",
+            f"+ evaluated {claim_summary.get('evaluated_count', 0):,}",
+            f"+ one-level ERD prunes {one_level_erd_prunes:,}",
+            f"+ two-level ERD prunes {two_level_erd_prunes:,}",
         ]
         if claim_summary.get("provenance_unknown_count"):
             candidate_fields.append(
-                f"{claim_summary['provenance_unknown_count']:,} unattributed"
+                f"+ unattributed {claim_summary['provenance_unknown_count']:,}"
             )
+        candidate_status_fields = []
         if claim_summary.get("in_flight_count"):
-            candidate_fields.append(
-                f"{claim_summary['in_flight_count']:,} in flight"
+            candidate_status_fields.append(
+                f"in flight {claim_summary['in_flight_count']:,}"
             )
         republished = data.get("republished_candidates") or []
         if republished:
@@ -1189,13 +1190,15 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         contributions = claim_summary.get("worker_contributions") or []
         if contributions:
             candidate_fields.append(
-                "Per-worker completions: "
+                "worker evals "
                 + " ".join(
                     f"{_worker_number_label(row['worker_id'])}:{row['done_count']:,}"
                     for row in contributions
                 )
             )
         candidate_lines.extend(_inline_section("  progress:", candidate_fields, width))
+        if candidate_status_fields:
+            candidate_lines.extend(_inline_section("  ", candidate_status_fields, width))
         worker_positions = [
             (worker.get("candidate_index"), worker["worker_number"])
             for worker in data["workers"]
@@ -1210,7 +1213,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         if sweep.strip():
             candidate_lines.append(_fit(f"  [{sweep}]", width))
     cache = data["cache"]
-    cache_line = f"  {cache['cache_state']}"
+    cache_line = f"  {'not cached' if cache['cache_state'] == 'missing' else cache['cache_state']}"
     if cache.get("best_guess"):
         cache_line += (
             f"  best={cache['best_guess'].upper()}/ERD "
@@ -1249,15 +1252,18 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     if bundle_summary:
         bundle_labels = {
             "bundle_count": "bundles",
+            "average_bundle_candidate_count": "avg words/bundle",
             "censored_unit_count": "capped bundles",
             "maximum_bundle_node_count": "max bundle nodes",
         }
         bundle_fields = [
             bundle_labels.get(key, key.replace("_", " "))
             + " "
-            + (f"{value:,}" if isinstance(value, int) else str(value))
+            + (f"{value:,}" if isinstance(value, int)
+               else f"{value:.1f}" if key == "average_bundle_candidate_count"
+               else str(value))
             for key, value in bundle_summary.items()
-            if key not in ("node_count", "wall_millis")
+            if key not in ("node_count", "wall_millis") and value is not None
         ]
         bundle_lines.extend(_inline_section("  summary:", bundle_fields, width))
     else:
@@ -1491,13 +1497,13 @@ def _render_cache_collection_sections(report, width, display_order):
             hotkey_prefix = f"{hotkey} " if hotkey else ""
             lines.append(_fit(
                 f"  {hotkey_prefix}{row['pattern']} n={row['answer_count']} "
-                f"{row['cache_state']} @{_display_reference(row['branch_reference'])}",
+                f"{('not cached' if row['cache_state'] == 'missing' else row['cache_state'])} @{_display_reference(row['branch_reference'])}",
                 width,
             ))
     elif "cache" in data:
         lines.append(_fit(
             f"  @{_display_reference(data['branch_reference'])} "
-            f"{data['cache']['cache_state']}",
+            f"{'not cached' if data['cache']['cache_state'] == 'missing' else data['cache']['cache_state']}",
             width,
         ))
     return [("header", header), ("cache_rows", lines)]
