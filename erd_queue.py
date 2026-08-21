@@ -4996,11 +4996,18 @@ class ERDQueue:
         directly; a branch acquired later by promotion carries a
         parent_branch_id and is counted only in branch_count.
         """
-        return self._conn.execute("""
+        source_columns = {
+            row["name"] for row in self._conn.execute(
+                "PRAGMA table_info(source_work)")
+        }
+        started_at = (
+            "MIN(CASE WHEN s.state != 'complete' THEN s.started_at END)"
+            if "started_at" in source_columns else "NULL"
+        )
+        return self._conn.execute(f"""
             SELECT s.source_word,
                    MIN(s.requested_at) AS requested_at,
-                   MIN(CASE WHEN s.state != 'complete' THEN s.started_at END)
-                       AS started_at,
+                   {started_at} AS started_at,
                    MAX(s.requested_priority) AS requested_priority,
                    MAX(m.resolved_at) AS completed_at,
                    COUNT(DISTINCT s.source_work_id) AS request_count,
