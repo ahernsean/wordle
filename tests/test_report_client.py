@@ -1478,7 +1478,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         facts = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.recent_finalizations[0]={
-            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,
+            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,wall_millis:374529,
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const card=document.querySelector('[data-grid-key="finalizations"] .card');
@@ -1486,6 +1486,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertIn("ERD lower bound 3.250 26/8", facts)
         self.assertIn("exceeds budget 3", facts)
+        self.assertIn("6m", facts)
+        self.assertNotIn("374,529 ms", facts)
         self.page.set_viewport_size({"width": 375, "height": 800})
         self.assertLessEqual(*self.page.evaluate(
             "() => [document.documentElement.scrollWidth,"
