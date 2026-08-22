@@ -1200,7 +1200,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             ])
         elif candidate_eta and candidate_eta["state"] == "learning":
             candidate_eta_fields.append(
-                "ETA learning first 3 min after best ERD"
+                "ETA learning first 3 min of current work sample"
             )
         republished = data.get("republished_candidates") or []
         if republished:

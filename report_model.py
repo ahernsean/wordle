@@ -1783,7 +1783,7 @@ def _summarize_claims(normalized_claims):
 def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
     """Estimate active-branch wall time from recent post-bound worker time."""
     if (queue_payload is None or live_worker_count <= 0
-            or eta_sample is None or eta_sample["best_updated_at"] is None):
+            or eta_sample is None or eta_sample["window_started_at"] is None):
         return None
     sample_started_at = eta_sample["window_started_at"]
     sample_duration_seconds = max(0, now - sample_started_at)

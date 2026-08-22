@@ -108,6 +108,26 @@ class ReportModelTest(unittest.TestCase):
         )
         self.assertEqual(eta["state"], "learning")
 
+    def test_candidate_eta_estimates_without_a_best_erd(self):
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 10},
+            {
+                "best_updated_at": None,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_millis": 0,
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_millis": 20_000,
+            },
+            live_worker_count=2,
+            now=1_200,
+        )
+        self.assertEqual(eta["state"], "rough")
+        self.assertEqual(eta["remaining_inspection_count"], 0)
+        self.assertEqual(eta["expected_full_evaluation_count"], 90)
+        self.assertEqual(eta["estimated_seconds"], 90)
+
     def test_candidate_eta_scales_a_rough_sample_to_new_workers(self):
         eta = _candidate_eta(
             {"candidate_count": 100, "completed_candidate_count": 0},

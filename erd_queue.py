@@ -4336,13 +4336,15 @@ class ERDQueue:
         }
 
     def branch_candidate_eta_sample(self, branch_key, window_seconds, now=None):
-        """Return recent post-bound worker-time measurements for one branch.
+        """Return recent candidate-work measurements for one branch.
 
         A best-ERD improvement changes which candidates survive the two-level
-        bound, so the sample begins at that improvement even when it is newer
-        than the trailing report window.  Bound-tagged scans from an older
-        concurrent worker are excluded.  All durations are aggregate worker
-        time; the report converts them to wall time using live worker count.
+        bound, so that sample begins at the improvement even when it is newer
+        than the trailing report window.  Without a best ERD, the sample begins
+        at branch creation.  Bound-tagged scans from an older concurrent worker
+        are excluded only once a current best exists.  All durations are
+        aggregate worker time; the report converts them to wall time using live
+        worker count.
         """
         now = int(time.time()) if now is None else now
         branch_id = self._intern_branch(branch_key)
@@ -4350,7 +4352,7 @@ class ERDQueue:
             return None
         try:
             branch_row = self._conn.execute("""
-                SELECT best_erd, best_updated_at
+                SELECT best_erd, best_updated_at, created_at
                 FROM active_branches
                 WHERE branch_id = ? AND status = 'open'
             """, (branch_id,)).fetchone()
@@ -4358,26 +4360,11 @@ class ERDQueue:
             # Read-only report processes can briefly run before a worker opens
             # the queue and applies this additive telemetry migration.
             return None
-        if branch_row is None or branch_row["best_erd"] is None:
+        if branch_row is None:
             return None
         best_updated_at = branch_row["best_updated_at"]
-        if best_updated_at is None:
-            return {
-                "best_updated_at": None,
-                "window_started_at": None,
-                "inspected_candidate_count": 0,
-                "pruned_candidate_count": 0,
-                "inspection_worker_millis": 0,
-                "inspection_worker_count": None,
-                "inspection_worker_count_min": None,
-                "inspection_worker_count_max": None,
-                "evaluated_candidate_count": 0,
-                "evaluation_worker_millis": 0,
-                "evaluation_worker_count": None,
-                "evaluation_worker_count_min": None,
-                "evaluation_worker_count_max": None,
-            }
-        since = max(now - window_seconds, best_updated_at)
+        sample_started_at = best_updated_at or branch_row["created_at"]
+        since = max(now - window_seconds, sample_started_at or now - window_seconds)
         try:
             prune_row = self._conn.execute("""
                 SELECT COALESCE(SUM(inspected_candidate_count), 0)
@@ -4392,9 +4379,11 @@ class ERDQueue:
                        MIN(worker_count) AS inspection_worker_count_min,
                        MAX(worker_count) AS inspection_worker_count_max
                 FROM telemetry.two_level_prune_telemetry
-                WHERE branch_id = ? AND bound_erd = ?
+                WHERE branch_id = ?
+                  AND (bound_erd = ? OR ? IS NULL)
                   AND recorded_at >= ? AND recorded_at <= ?
-            """, (branch_id, branch_row["best_erd"], since, now)).fetchone()
+            """, (branch_id, branch_row["best_erd"], branch_row["best_erd"],
+                  since, now)).fetchone()
             evaluation_row = self._conn.execute("""
             SELECT COUNT(candidate_evaluation_millis) AS evaluated_candidate_count,
                    COALESCE(SUM(candidate_evaluation_millis), 0)

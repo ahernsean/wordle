@@ -177,6 +177,27 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(sample["evaluated_candidate_count"], 1)
         self.assertEqual(sample["evaluation_worker_millis"], 11000)
 
+    def test_branch_candidate_eta_sample_without_best_erd_starts_at_creation(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches SET created_at = 900 WHERE branch_id = ?
+        """, (branch_id,))
+        self.q._conn.execute("""
+            INSERT INTO telemetry.claim_telemetry
+                (n_words, coordination_millis, candidate_evaluation_millis,
+                 work_nodes, branch_id, epoch, recorded_at)
+            VALUES (5, 1, 11000, 1, ?, 0, 950)
+        """, (branch_id,))
+
+        sample = self.q.branch_candidate_eta_sample(
+            self.user_key, window_seconds=600, now=1_000)
+
+        self.assertIsNone(sample["best_updated_at"])
+        self.assertEqual(sample["window_started_at"], 900)
+        self.assertEqual(sample["evaluated_candidate_count"], 1)
+        self.assertEqual(sample["evaluation_worker_millis"], 11000)
+
     def test_eta_migration_starts_existing_incumbent_sample_once(self):
         self.q.create_branch(self.user_key, 100, 10)
         branch_id = self.q._intern_branch(self.user_key)
