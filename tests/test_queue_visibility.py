@@ -161,10 +161,10 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, candidate_evaluation_millis,
-                 work_nodes, branch_id, epoch,
+                 evaluation_bound_erd, work_nodes, branch_id, epoch,
                  recorded_at)
-            VALUES (5, 900, 9000, 1, ?, 0, 850),
-                   (5, 1100, 11000, 1, ?, 0, 950)
+            VALUES (5, 900, 9000, 2.5, 1, ?, 0, 850),
+                   (5, 1100, 11000, 3.0, 1, ?, 0, 950)
         """, (branch_id, branch_id))
 
         sample = self.q.branch_candidate_eta_sample(
@@ -186,8 +186,8 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, candidate_evaluation_millis,
-                 work_nodes, branch_id, epoch, recorded_at)
-            VALUES (5, 1, 11000, 1, ?, 0, 950)
+                 evaluation_bound_erd, work_nodes, branch_id, epoch, recorded_at)
+            VALUES (5, 1, 11000, NULL, 1, ?, 0, 950)
         """, (branch_id,))
 
         sample = self.q.branch_candidate_eta_sample(

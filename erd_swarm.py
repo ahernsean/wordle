@@ -1252,6 +1252,8 @@ class _BranchWorker:
         self._heartbeat(branch_key, n_words, idx, claim_started,
                         local_candidate, local_best, bound_erd=_eff_bound())
 
+        evaluation_bound_erd = _eff_bound()
+
         if self.cancel():
             return False
 
@@ -1375,7 +1377,8 @@ class _BranchWorker:
             bundle_id=bundle_id, idx=idx,
             bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
             scheduling_millis=scheduling_millis,
-            candidate_evaluation_millis=round(cand_elapsed * 1e3))
+            candidate_evaluation_millis=round(cand_elapsed * 1e3),
+            evaluation_bound_erd=evaluation_bound_erd)
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.

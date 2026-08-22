@@ -632,6 +632,7 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     busy_wait_millis          INTEGER,
     worker_count              INTEGER,
     branch_worker_count       INTEGER,
+    evaluation_bound_erd      REAL,
     branch_id                 INTEGER,
     spine                     TEXT,
     worker_id                 TEXT,
@@ -1124,6 +1125,7 @@ class ERDQueue:
             "scheduling_millis": "INTEGER",
             "idle_millis": "INTEGER",
             "branch_worker_count": "INTEGER",
+            "evaluation_bound_erd": "REAL",
         }, schema="telemetry")
         self._add_columns("branch_finalize_log", {
             "cache_write_millis": "INTEGER",
@@ -4421,8 +4423,11 @@ class ERDQueue:
                             THEN 1 ELSE 0 END)
                        AS evaluation_unknown_worker_count
                 FROM telemetry.claim_telemetry
-                WHERE branch_id = ? AND recorded_at >= ? AND recorded_at <= ?
-            """, (branch_id, since, now)).fetchone()
+                WHERE branch_id = ?
+                  AND (evaluation_bound_erd = ? OR ? IS NULL)
+                  AND recorded_at >= ? AND recorded_at <= ?
+            """, (branch_id, branch_row["best_erd"], branch_row["best_erd"],
+                  since, now)).fetchone()
         except sqlite3.OperationalError:
             return None
         return {
@@ -5678,7 +5683,8 @@ class ERDQueue:
                             idx: int = None, bundle_start_idx: int = None,
                             bundle_end_idx: int = None,
                             scheduling_millis: int = 0,
-                            candidate_evaluation_millis: int = None):
+                            candidate_evaluation_millis: int = None,
+                            evaluation_bound_erd: float = None):
         """Append a claim coordination record to claim_telemetry for offline analysis.
 
         claim_retries / busy_wait_millis / claim_transaction_millis /
@@ -5743,15 +5749,15 @@ class ERDQueue:
                 (n_words, coordination_millis, candidate_evaluation_millis,
                  work_nodes, claim_retries,
                  busy_wait_millis, worker_count, branch_id, spine, worker_id,
-                 branch_worker_count, bundle_id, idx, bundle_start_idx,
+                 branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
                  bundle_end_idx,
                  claim_transaction_millis, claim_commit_millis,
                  scheduling_millis, idle_millis, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, candidate_evaluation_millis, work_nodes,
               self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, branch_id, spine,
-              worker_id, branch_worker_count, bundle_id, idx, bundle_start_idx,
+              worker_id, branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
               bundle_end_idx,
               self._last_claim_transaction_millis, self._last_claim_commit_millis,
               scheduling_millis, idle_millis, self.epoch, now))

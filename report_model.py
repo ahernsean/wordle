@@ -1589,7 +1589,8 @@ def collect_root_progress_report(sources: ReportSources,
         )
         cache_states = cache.report_branch_states(
             list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
-        if not resolved.steps and request.epoch is None:
+        if (not progress["groups"] and not resolved.steps
+                and request.epoch is None):
             for pattern, summary in cache.root_response_group_summary_map(
                     word, ERD_ALL).items():
                 progress["groups"][pattern] = {
