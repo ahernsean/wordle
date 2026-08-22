@@ -1193,7 +1193,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
                 + f" ({round(candidate_eta['sample_duration_seconds'] / 60)} min data"
                 + eta_scaling + ") "
                 f"~{_abbreviate_duration(candidate_eta['estimated_seconds'])}",
-                "ETA work "
+                "ETA work remaining "
                 f"checks {candidate_eta['remaining_inspection_count']:,} "
                 f"full evals ~{candidate_eta['expected_full_evaluation_count']:,}",
             ])

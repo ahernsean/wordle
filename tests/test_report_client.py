@@ -1455,6 +1455,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("one-level ERD prunes", text)
         self.assertIn("two-level ERD prunes", text)
 
+    def test_candidate_eta_labels_projected_work_as_remaining(self):
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          report.data.candidate_eta={state:'rough',sample_duration_seconds:300,
+            estimated_seconds:13,remaining_inspection_count:0,
+            expected_full_evaluation_count:8393,worker_count_changed:false};
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return [...document.querySelectorAll('section')].find(
+            section=>section.querySelector('h2')?.textContent==='Candidates'
+          ).innerText;
+        }""")
+        self.assertIn("ETA work remaining", text)
+        self.assertIn("checks 0 · full evals ~8,393", text)
+
     def test_ceiling_proven_loss_explains_its_proof(self):
         text = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
