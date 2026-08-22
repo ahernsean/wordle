@@ -1058,6 +1058,14 @@ class ERDQueue:
             "bulk_done_bound": "REAL",
             "best_updated_at": "INTEGER",
         })
+        # An existing incumbent predates its bound timestamp.  Begin its ETA
+        # sample now instead of using work measured against an unknown bound.
+        self._conn.execute("""
+            UPDATE active_branches
+            SET best_updated_at = ?
+            WHERE status = 'open' AND best_erd IS NOT NULL
+              AND best_updated_at IS NULL
+        """, (int(time.time()),))
         self._add_columns("branch_finalize_log", {
             "ceiling": "REAL",
             "outcome": "TEXT",

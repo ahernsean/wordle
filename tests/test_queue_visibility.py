@@ -177,6 +177,28 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(sample["evaluated_candidate_count"], 1)
         self.assertEqual(sample["evaluation_worker_millis"], 11000)
 
+    def test_eta_migration_starts_existing_incumbent_sample_once(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches
+            SET best_erd = 3.0, best_updated_at = NULL
+            WHERE branch_id = ?
+        """, (branch_id,))
+
+        before = int(time.time())
+        self.q._migrate()
+        first_timestamp = self.q._conn.execute("""
+            SELECT best_updated_at FROM active_branches WHERE branch_id = ?
+        """, (branch_id,)).fetchone()["best_updated_at"]
+        self.assertGreaterEqual(first_timestamp, before)
+
+        self.q._migrate()
+        second_timestamp = self.q._conn.execute("""
+            SELECT best_updated_at FROM active_branches WHERE branch_id = ?
+        """, (branch_id,)).fetchone()["best_updated_at"]
+        self.assertEqual(second_timestamp, first_timestamp)
+
     def test_branch_report_telemetry_after_cursor_pages_past_the_first_window(self):
         self.q.create_branch(self.user_key, len(WORDS), 10)
         for outcome in ("exact", "cut", "loss"):
