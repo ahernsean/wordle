@@ -1209,7 +1209,7 @@
               facts.push("solution not recorded");
             }
           }
-          if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdValue(row.ceiling,row.answer_count,{ceiling:true})+" exceeds budget "+valueOrDash(row.budget));
+          if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdValue(row.ceiling,row.answer_count,{ceiling:true}),"exceeds budget "+valueOrDash(row.budget));
           else if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
           facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.one_level_erd_pruned_candidate_count??row.bulk_completed_candidate_count)+" one-level ERD prunes",numText(row.two_level_erd_pruned_candidate_count??0)+" two-level ERD prunes",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");

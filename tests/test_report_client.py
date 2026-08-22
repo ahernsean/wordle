@@ -1475,15 +1475,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("checks 0 · full evals ~8,393", eta_work)
 
     def test_ceiling_proven_loss_explains_its_proof(self):
-        text = self.page.evaluate("""async () => {
+        facts = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.recent_finalizations[0]={
             ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
-          return document.querySelector('#report').innerText;
+          const card=document.querySelector('[data-grid-key="finalizations"] .card');
+          return [...card.querySelectorAll('.stat-line > span')].map(span=>span.innerText);
         }""")
-        self.assertIn("ERD lower bound 3.250 26/8 exceeds budget 3", text)
+        self.assertIn("ERD lower bound 3.250 26/8", facts)
+        self.assertIn("exceeds budget 3", facts)
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        self.assertLessEqual(*self.page.evaluate(
+            "() => [document.documentElement.scrollWidth,"
+            "document.documentElement.clientWidth]"))
 
     def test_exact_finalization_shows_recorded_solution(self):
         text = self.page.evaluate("""async () => {
