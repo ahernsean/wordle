@@ -1177,6 +1177,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
                 f"+ unattributed {claim_summary['provenance_unknown_count']:,}"
             )
         candidate_status_fields = []
+        candidate_eta_fields = []
         if claim_summary.get("in_flight_count"):
             candidate_status_fields.append(
                 f"in flight {claim_summary['in_flight_count']:,}"
@@ -1188,8 +1189,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
                 f"{candidate_eta['current_worker_count']} workers"
                 if candidate_eta["worker_count_changed"] else ""
             )
-            candidate_status_fields.extend([
-                ("rough ETA" if candidate_eta["state"] == "rough" else "ETA")
+            candidate_eta_fields.extend([
+                ("Rough ETA" if candidate_eta["state"] == "rough" else "ETA")
                 + f" ({round(candidate_eta['sample_duration_seconds'] / 60)} min data"
                 + eta_scaling + ") "
                 f"~{_abbreviate_duration(candidate_eta['estimated_seconds'])}",
@@ -1198,7 +1199,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
                 f"full evals ~{candidate_eta['expected_full_evaluation_count']:,}",
             ])
         elif candidate_eta and candidate_eta["state"] == "learning":
-            candidate_status_fields.append(
+            candidate_eta_fields.append(
                 "ETA learning first 3 min after best ERD"
             )
         republished = data.get("republished_candidates") or []
@@ -1219,6 +1220,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         candidate_lines.extend(_inline_section("  progress:", candidate_fields, width))
         if candidate_status_fields:
             candidate_lines.extend(_inline_section("  ", candidate_status_fields, width))
+        for candidate_eta_field in candidate_eta_fields:
+            candidate_lines.extend(_inline_section("  ", [candidate_eta_field], width))
         worker_positions = [
             (worker.get("candidate_index"), worker["worker_number"])
             for worker in data["workers"]

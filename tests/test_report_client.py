@@ -1462,12 +1462,17 @@ class ReportClientBrowserTest(unittest.TestCase):
             estimated_seconds:13,remaining_inspection_count:0,
             expected_full_evaluation_count:8393,worker_count_changed:false};
           applyReport(report,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
-          return [...document.querySelectorAll('section')].find(
+          const section=[...document.querySelectorAll('section')].find(
             section=>section.querySelector('h2')?.textContent==='Candidates'
-          ).innerText;
+          );
+          return [...section.querySelectorAll('.labeled-facts')].map(
+            facts=>facts.innerText
+          );
         }""")
-        self.assertIn("ETA work remaining", text)
-        self.assertIn("checks 0 · full evals ~8,393", text)
+        rough_eta = next(line for line in text if line.startswith("Rough ETA"))
+        self.assertNotIn("ETA work", rough_eta)
+        eta_work = next(line for line in text if line.startswith("ETA work remaining"))
+        self.assertIn("checks 0 · full evals ~8,393", eta_work)
 
     def test_ceiling_proven_loss_explains_its_proof(self):
         text = self.page.evaluate("""async () => {
