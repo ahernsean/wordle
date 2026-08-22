@@ -36,6 +36,10 @@ from wordle_ui import fmt_pattern, parse_pattern
 SCHEMA_VERSION = 3
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
+BRANCH_ETA_WINDOW_SECONDS = 10 * 60
+BRANCH_ETA_ROUGH_SAMPLE_SECONDS = 3 * 60
+BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
+BRANCH_ETA_SPEEDUP = {1: 1.0, 2: 1.64, 3: 1.97, 4: 1.97}
 
 # Source ERD summaries are immutable until the score cache changes.  The
 # Sources view polls frequently, so retain the completed folds between polls.
@@ -1585,7 +1589,8 @@ def collect_root_progress_report(sources: ReportSources,
         )
         cache_states = cache.report_branch_states(
             list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
-        if not resolved.steps and request.epoch is None:
+        if (not progress["groups"] and not resolved.steps
+                and request.epoch is None):
             for pattern, summary in cache.root_response_group_summary_map(
                     word, ERD_ALL).items():
                 progress["groups"][pattern] = {
@@ -1758,7 +1763,11 @@ def _summarize_claims(normalized_claims):
             {"worker_id": worker_id, "done_count": count}
             for worker_id, count in done_by_worker.items()
         ),
-        key=lambda item: (-item["done_count"], item["worker_id"]),
+        key=lambda item: (
+            (0, int(_worker_number(item["worker_id"])), item["worker_id"])
+            if _worker_number(item["worker_id"]).isdigit()
+            else (1, item["worker_id"])
+        ),
     )
     return {
         "total_claim_count": len(normalized_claims),
@@ -1770,6 +1779,115 @@ def _summarize_claims(normalized_claims):
         "provenance_unknown_count": provenance_unknown_count,
         "worker_contributions": worker_contributions,
     }
+
+
+def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
+    """Estimate active-branch wall time from recent post-bound worker time."""
+    if (queue_payload is None or live_worker_count <= 0
+            or eta_sample is None or eta_sample["window_started_at"] is None):
+        return None
+    sample_started_at = eta_sample["window_started_at"]
+    sample_duration_seconds = max(0, now - sample_started_at)
+    inspected = eta_sample["inspected_candidate_count"]
+    pruned = eta_sample["pruned_candidate_count"]
+    evaluated = eta_sample["evaluated_candidate_count"]
+    inspection_millis = eta_sample["inspection_worker_millis"]
+    evaluation_millis = eta_sample["evaluation_worker_millis"]
+    inspection_workers = eta_sample.get("inspection_worker_count")
+    evaluation_workers = eta_sample.get("evaluation_worker_count")
+    inspection_worker_count_known = not eta_sample.get(
+        "inspection_unknown_worker_count", 0)
+    evaluation_worker_count_known = not eta_sample.get(
+        "evaluation_unknown_worker_count", 0)
+    worker_count_sample_complete = (
+        inspection_worker_count_known and evaluation_worker_count_known)
+    observed_work_units = inspected + evaluated
+    result = {
+        "state": "learning",
+        "sample_duration_seconds": sample_duration_seconds,
+        "observed_work_units": observed_work_units,
+    }
+    if sample_duration_seconds < BRANCH_ETA_ROUGH_SAMPLE_SECONDS:
+        return result
+    remaining = max(0, queue_payload["candidate_count"]
+                    - queue_payload["completed_candidate_count"])
+    if remaining == 0:
+        return None
+    if inspected:
+        if inspection_millis <= 0:
+            return result
+        surviving_fraction = max(0, inspected - pruned) / inspected
+        remaining_inspections = remaining
+        expected_full_evaluations = remaining * surviving_fraction
+        inspection_worker_seconds = (
+            remaining_inspections * inspection_millis / inspected / 1000
+        )
+        if expected_full_evaluations:
+            if evaluated == 0 or evaluation_millis <= 0:
+                return result
+            evaluation_worker_seconds = (
+                expected_full_evaluations * evaluation_millis / evaluated / 1000
+            )
+        else:
+            evaluation_worker_seconds = 0
+    else:
+        if evaluated == 0 or evaluation_millis <= 0:
+            return result
+        remaining_inspections = 0
+        expected_full_evaluations = remaining
+        inspection_worker_seconds = 0
+        evaluation_worker_seconds = (
+            remaining * evaluation_millis / evaluated / 1000
+        )
+    def speedup(worker_count):
+        worker_count = max(1, round(worker_count))
+        return BRANCH_ETA_SPEEDUP.get(
+            worker_count, BRANCH_ETA_SPEEDUP[max(BRANCH_ETA_SPEEDUP)])
+
+    inspection_sample_workers = (
+        inspection_workers if inspection_worker_count_known and inspection_workers
+        else live_worker_count)
+    evaluation_sample_workers = (
+        evaluation_workers if evaluation_worker_count_known and evaluation_workers
+        else live_worker_count)
+    current_speedup = speedup(live_worker_count)
+    estimated_seconds = (
+        inspection_worker_seconds * speedup(inspection_sample_workers)
+        / inspection_sample_workers
+        + evaluation_worker_seconds * speedup(evaluation_sample_workers)
+        / evaluation_sample_workers
+    ) / current_speedup
+    sampled_worker_counts = [count for count in (
+        eta_sample.get("inspection_worker_count_min"),
+        eta_sample.get("inspection_worker_count_max"),
+        eta_sample.get("evaluation_worker_count_min"),
+        eta_sample.get("evaluation_worker_count_max"),
+    ) if count is not None]
+    worker_count_changed = worker_count_sample_complete and any(
+        round(count) != live_worker_count for count in sampled_worker_counts)
+    component_worker_counts = []
+    if inspection_worker_seconds:
+        component_worker_counts.append(inspection_sample_workers)
+    if evaluation_worker_seconds:
+        component_worker_counts.append(evaluation_sample_workers)
+    result.update({
+        "state": (
+            "ready" if (sample_duration_seconds >= BRANCH_ETA_STABLE_SAMPLE_SECONDS
+                         and worker_count_sample_complete
+                         and not worker_count_changed)
+            else "rough"
+        ),
+        "estimated_seconds": estimated_seconds,
+        "remaining_inspection_count": remaining_inspections,
+        "expected_full_evaluation_count": round(expected_full_evaluations),
+        "sample_worker_count": round(
+            sum(component_worker_counts) / len(component_worker_counts)
+        ),
+        "current_worker_count": live_worker_count,
+        "worker_count_changed": worker_count_changed,
+        "worker_count_sample_complete": worker_count_sample_complete,
+    })
+    return result
 
 
 def _normalize_claim(row, republish_count):
@@ -1820,6 +1938,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         "finalization_total_count": 0,
         "cut_reuse_misses": [],
     }
+    candidate_eta_sample = None
     queue_error = None
     referenced_row = None
     cache = None
@@ -1880,6 +1999,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             }
             for row in branch_telemetry["recent_finalizations"]
         ]
+        candidate_eta_sample = queue.branch_candidate_eta_sample(
+            branch_key, BRANCH_ETA_WINDOW_SECONDS, generated_at)
     except (sqlite3.Error, OSError) as error:
         queue_error = error
         if request.branch_target.kind == "branch_reference":
@@ -1972,6 +2093,8 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
             "finalized_at": _row_value(active_row, "finalized_at"),
             "completed_at": _row_value(pending_row, "completed_at"),
         }
+    candidate_eta = _candidate_eta(
+        queue_payload, candidate_eta_sample, live_worker_count, generated_at)
     republish_by_index = {row["idx"]: row["count"] for row in republish_rows}
     normalized_claims = [
         _normalize_claim(row, republish_by_index.get(row["idx"], 0))
@@ -2002,6 +2125,7 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         ),
         "claims": normalized_claims if request.include_claims else None,
         "claim_summary": _summarize_claims(normalized_claims),
+        "candidate_eta": candidate_eta,
         "branch_ownership": ownership,
         "provenance_unknown": provenance_unknown,
         **branch_telemetry,
@@ -3148,8 +3272,10 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                                       checkpoint_on_close=False)
             timings = timing_cache.completed_source_summary_map(ERD_ALL)
             for row in summary_rows:
-                summary_source_word = (_row_value(row, "source_word") or "").lower()
-                if (not summary_source_word or summary_source_word in timings
+                summary_source_word = (
+                    _row_value(row, "source_word") or "").lower()
+                if (not summary_source_word
+                        or summary_source_word in timings
                         or _merged_source_state(row) != "complete"):
                     continue
                 timing = queue.completed_source_timing(summary_source_word)

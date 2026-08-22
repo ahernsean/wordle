@@ -611,7 +611,15 @@ class OverviewRendererTest(unittest.TestCase):
                 "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
                 "branch_status": "active", "branch_phase": "evaluating",
             },
-            "queue": None,
+            "queue": {
+                "branch_status": "active", "branch_phase": "evaluating",
+                "priority": 0, "budget": 6, "best_guess": None,
+                "ceiling": None, "search_node_count": 0,
+                "candidate_count": 3, "completed_candidate_count": 0,
+                "bulk_completed_candidate_count": 0,
+                "one_level_erd_pruned_candidate_count": 0,
+                "two_level_erd_pruned_candidate_count": 0,
+            },
             "cache": {
                 "cache_state": "missing", "best_guess": None,
                 "best_erd": None, "max_remaining_depth": None,
@@ -633,11 +641,14 @@ class OverviewRendererTest(unittest.TestCase):
             "provenance_unknown": False,
         }
         output = render_report(report, width=100)
-        self.assertIn("12,819 done", output)
-        self.assertIn("1,500 one-level ERD prunes", output)
-        self.assertIn("119 two-level ERD prunes", output)
-        self.assertIn("5 in flight", output)
-        self.assertIn("by worker: w0 6,484", output)
+        self.assertNotIn("12,819 done", output)
+        self.assertIn("candidates 0/3 =", output)
+        self.assertNotIn("=  + evaluated", output)
+        self.assertIn("evaluated 11,200", output)
+        self.assertNotIn("1,500 one-level ERD prunes", output)
+        self.assertNotIn("119 two-level ERD prunes", output)
+        self.assertIn("in flight 5", output)
+        self.assertIn("worker evals w0:6,484 w2:6,335", output)
         self.assertNotIn("idx=", output)
 
     def test_selected_branch_detail_survives_parent_status_filter(self):

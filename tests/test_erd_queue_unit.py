@@ -1549,15 +1549,18 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(row['nodes_spent'], 150)
 
     def test_add_claim_telemetry_inserts_row(self):
-        self.q.add_claim_telemetry(10, 5000, 300, 4)
+        self.q.add_claim_telemetry(
+            10, 5000, 300, 4, candidate_evaluation_millis=1200)
         row = self.q._conn.execute(
             "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row['n_words'], 10)
         self.assertEqual(row['coordination_millis'], 5000)
+        self.assertEqual(row['candidate_evaluation_millis'], 1200)
         self.assertEqual(row['work_nodes'], 300)
         self.assertEqual(row['worker_count'], 4)
+        self.assertIsNone(row['branch_worker_count'])
         # Branch/bundle attribution and the phase breakdown are all optional
         # keyword arguments: an old-style positional-only call still inserts
         # a row, with every new column defaulting to NULL/0.
@@ -1593,6 +1596,7 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(resolved['branch_key'], self.key)
         self.assertEqual(row['spine'], 'CRANE 12')
         self.assertEqual(row['worker_id'], 'worker-3')
+        self.assertEqual(row['branch_worker_count'], 1)
         self.assertEqual(row['bundle_id'], 'worker-3:123:0')
         self.assertEqual(row['idx'], 7)
         self.assertEqual(row['bundle_start_idx'], 0)

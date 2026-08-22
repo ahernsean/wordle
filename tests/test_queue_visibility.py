@@ -143,6 +143,108 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertIsNone(loss["best_erd"])
         self.assertEqual(len(telemetry["cut_reuse_misses"]), 1)
 
+    def test_branch_candidate_eta_sample_starts_at_latest_best_erd(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches
+            SET best_erd = 3.0, best_updated_at = 900
+            WHERE branch_id = ?
+        """, (branch_id,))
+        self.q._conn.execute("""
+            INSERT INTO telemetry.two_level_prune_telemetry
+                (branch_id, inspected_candidate_count, pruned_candidate_count,
+                 bound_erd, wall_millis, epoch, recorded_at)
+            VALUES (?, 8, 6, 2.5, 800, 0, 850),
+                   (?, 10, 7, 3.0, 1000, 0, 950)
+        """, (branch_id, branch_id))
+        self.q._conn.execute("""
+            INSERT INTO telemetry.claim_telemetry
+                (n_words, coordination_millis, candidate_evaluation_millis,
+                 evaluation_bound_erd, work_nodes, branch_id, epoch,
+                 recorded_at)
+            VALUES (5, 900, 9000, 2.5, 1, ?, 0, 850),
+                   (5, 1100, 11000, 3.0, 1, ?, 0, 950)
+        """, (branch_id, branch_id))
+
+        sample = self.q.branch_candidate_eta_sample(
+            self.user_key, window_seconds=600, now=1_000)
+
+        self.assertEqual(sample["window_started_at"], 900)
+        self.assertEqual(sample["inspected_candidate_count"], 10)
+        self.assertEqual(sample["pruned_candidate_count"], 7)
+        self.assertEqual(sample["inspection_worker_millis"], 1000)
+        self.assertEqual(sample["evaluated_candidate_count"], 1)
+        self.assertEqual(sample["evaluation_worker_millis"], 11000)
+
+    def test_branch_candidate_eta_sample_without_best_erd_starts_at_creation(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches SET created_at = 900 WHERE branch_id = ?
+        """, (branch_id,))
+        self.q._conn.execute("""
+            INSERT INTO telemetry.claim_telemetry
+                (n_words, coordination_millis, candidate_evaluation_millis,
+                 evaluation_bound_erd, work_nodes, branch_id, epoch, recorded_at)
+            VALUES (5, 1, 11000, NULL, 1, ?, 0, 950)
+        """, (branch_id,))
+
+        sample = self.q.branch_candidate_eta_sample(
+            self.user_key, window_seconds=600, now=1_000)
+
+        self.assertIsNone(sample["best_updated_at"])
+        self.assertEqual(sample["window_started_at"], 900)
+        self.assertEqual(sample["evaluated_candidate_count"], 1)
+        self.assertEqual(sample["evaluation_worker_millis"], 11000)
+
+    def test_candidate_eta_sample_counts_only_workers_on_its_branch(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        self.q.create_branch(self.coop_key, 100, 10)
+        now = int(time.time())
+        for worker_id, branch_key in (
+                ("worker-0", self.user_key), ("worker-1", self.user_key),
+                ("worker-2", self.coop_key)):
+            self.q.heartbeat(
+                worker_id, 1, branch_key, 100, now, 0)
+        self.q.add_claim_telemetry(
+            100, 1, 1, 6, branch_key=self.user_key,
+            worker_id="worker-0", candidate_evaluation_millis=1)
+
+        row = self.q._conn.execute("""
+            SELECT worker_count, branch_worker_count
+            FROM telemetry.claim_telemetry
+        """).fetchone()
+        self.assertEqual(row["worker_count"], 6)
+        self.assertEqual(row["branch_worker_count"], 2)
+        sample = self.q.branch_candidate_eta_sample(
+            self.user_key, window_seconds=60, now=now)
+        self.assertEqual(sample["evaluation_worker_count"], 2)
+        self.assertEqual(sample["evaluation_worker_count_min"], 2)
+        self.assertEqual(sample["evaluation_worker_count_max"], 2)
+
+    def test_eta_migration_starts_existing_incumbent_sample_once(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches
+            SET best_erd = 3.0, best_updated_at = NULL
+            WHERE branch_id = ?
+        """, (branch_id,))
+
+        before = int(time.time())
+        self.q._migrate()
+        first_timestamp = self.q._conn.execute("""
+            SELECT best_updated_at FROM active_branches WHERE branch_id = ?
+        """, (branch_id,)).fetchone()["best_updated_at"]
+        self.assertGreaterEqual(first_timestamp, before)
+
+        self.q._migrate()
+        second_timestamp = self.q._conn.execute("""
+            SELECT best_updated_at FROM active_branches WHERE branch_id = ?
+        """, (branch_id,)).fetchone()["best_updated_at"]
+        self.assertEqual(second_timestamp, first_timestamp)
+
     def test_branch_report_telemetry_after_cursor_pages_past_the_first_window(self):
         self.q.create_branch(self.user_key, len(WORDS), 10)
         for outcome in ("exact", "cut", "loss"):

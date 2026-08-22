@@ -497,6 +497,19 @@ class TestEvaluateClaimPatternMatrix(unittest.TestCase):
         self.assertTrue(result)
         self.assertIsNone(mock_eval.call_args.kwargs['pattern_matrix'])
 
+    def test_nonadaptive_worker_records_candidate_eta_telemetry(self):
+        w = _bare_worker()
+        w._adaptive = False
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        with mock.patch('erd_swarm.evaluate_candidate',
+                        return_value=(SOLVED, 1.5, 1, False)):
+            result = w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
+        self.assertTrue(result)
+        w.queue.add_claim_telemetry.assert_called_once()
+        self.assertGreaterEqual(
+            w.queue.add_claim_telemetry.call_args.kwargs[
+                'candidate_evaluation_millis'], 0)
+
 
 class TestSubbranchSolver(unittest.TestCase):
     """_subbranch_solver returns None for small/unbudgeted branches (inline);
@@ -1127,12 +1140,14 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
 
         q = ERDQueue(self.queue_path)
         rows = q._conn.execute(
-            "SELECT coordination_millis, claim_transaction_millis, "
+            "SELECT coordination_millis, candidate_evaluation_millis, "
+            "claim_transaction_millis, "
             "claim_commit_millis, busy_wait_millis, scheduling_millis, "
             "idle_millis FROM claim_telemetry ORDER BY id").fetchall()
         q.close()
         self.assertTrue(rows)
         for row in rows:
+            self.assertIsNotNone(row["candidate_evaluation_millis"])
             self.assertEqual(
                 row["claim_transaction_millis"] + row["claim_commit_millis"]
                 + row["busy_wait_millis"] + row["scheduling_millis"]
@@ -2520,7 +2535,8 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         worker.queue.read_branch_best.return_value = (
             "clart", bound_erd, None)
         worker.queue.complete_bundle_two_level_erd_prunes.side_effect = (
-            lambda _branch_key, _bundle_id, candidate_indices, nodes_spent=0:
+            lambda _branch_key, _bundle_id, candidate_indices, nodes_spent=0,
+            wall_millis=0, bound_erd=None, worker_count=None, worker_id=None:
                 len(candidate_indices))
 
         def count_heartbeat(*_args, **_kwargs):
@@ -2545,7 +2561,8 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertEqual(lower_bound.call_count, len(candidate_indices))
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", candidate_indices,
-            nodes_spent=len(candidate_indices))
+            nodes_spent=len(candidate_indices), wall_millis=mock.ANY,
+            bound_erd=3.1, worker_count=1, worker_id=worker.name)
         worker.queue.add_nodes_spent.assert_not_called()
         worker._evaluate_bundle_member.assert_not_called()
         worker.queue.record_bundle_stats.assert_called_once()
@@ -2565,7 +2582,8 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertTrue(completed)
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", [0, 2],
-            nodes_spent=len(candidate_indices))
+            nodes_spent=len(candidate_indices), wall_millis=mock.ANY,
+            bound_erd=3.1, worker_count=1, worker_id=worker.name)
         self.assertEqual(worker._evaluate_bundle_member.call_count, 1)
         self.assertEqual(worker._evaluate_bundle_member.call_args.args[3], 1)
 
@@ -2610,7 +2628,9 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertEqual(pruned, frozenset({0}))
         self.assertTrue(cancelled)
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
-            b"branch", "bundle-1", [0], nodes_spent=1)
+            b"branch", "bundle-1", [0], nodes_spent=1,
+            wall_millis=mock.ANY, bound_erd=3.1, worker_count=1,
+            worker_id=worker.name)
 
 
 class TestMidLoopPublisher(unittest.TestCase):

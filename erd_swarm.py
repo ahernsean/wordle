@@ -1252,6 +1252,8 @@ class _BranchWorker:
         self._heartbeat(branch_key, n_words, idx, claim_started,
                         local_candidate, local_best, bound_erd=_eff_bound())
 
+        evaluation_bound_erd = _eff_bound()
+
         if self.cancel():
             return False
 
@@ -1338,21 +1340,14 @@ class _BranchWorker:
 
         elapsed = time.time() - t0
         self.queue.complete_candidate(branch_key, idx)
+        # The outbound claim telemetry is required for branch ETA reporting,
+        # regardless of whether this worker uses adaptive decomposition.
+        now_complete = time.time()
+        full_coord_seconds = max(
+            0.0, (now_complete - self._last_claim_complete) - cand_elapsed)
+        self._last_claim_complete = now_complete
         if self._adaptive:
             coord_seconds = max(0.0, elapsed - cand_elapsed)
-            # The in-memory estimators feed the adaptive publish threshold and use
-            # the narrow in-evaluate_claim coordination window (the ratio is
-            # unit-free).  The outbound claim_telemetry row instead telescopes from
-            # the previous claim's completion, so its coordination figure also
-            # includes claim acquisition (claim_next_bundle's packer transaction,
-            # paid once per bundle rather than once per candidate — a candidate
-            # evaluated mid-bundle sees this figure collapse to ~0) and any
-            # inter-claim overhead; this is the offline-diagnostic span and is not
-            # fed back into control.
-            now_complete = time.time()
-            full_coord_seconds = max(
-                0.0, (now_complete - self._last_claim_complete) - cand_elapsed)
-            self._last_claim_complete = now_complete
             self._coord_ema.add(coord_seconds)
             if nodes_delta > 0 and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
@@ -1373,15 +1368,17 @@ class _BranchWorker:
                         metric['erd_lower_bound_pruned'],
                         nodes_delta, group_sizes=metric['group_sizes'],
                         source_word=self._work_context.source_word)
-            scheduling_millis = self._pending_scheduling_millis
-            self._pending_scheduling_millis = 0
-            self.queue.add_claim_telemetry(
-                n_words, int(full_coord_seconds * 1e3), nodes_delta,
-                self.n_workers, branch_key=branch_key,
-                spine=self._work_context.spine, worker_id=self.name,
-                bundle_id=bundle_id, idx=idx,
-                bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
-                scheduling_millis=scheduling_millis)
+        scheduling_millis = self._pending_scheduling_millis
+        self._pending_scheduling_millis = 0
+        self.queue.add_claim_telemetry(
+            n_words, int(full_coord_seconds * 1e3), nodes_delta,
+            self.n_workers, branch_key=branch_key,
+            spine=self._work_context.spine, worker_id=self.name,
+            bundle_id=bundle_id, idx=idx,
+            bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
+            scheduling_millis=scheduling_millis,
+            candidate_evaluation_millis=round(cand_elapsed * 1e3),
+            evaluation_bound_erd=evaluation_bound_erd)
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.
@@ -1438,6 +1435,7 @@ class _BranchWorker:
 
         branch_indices = self.pattern_matrix.answer_indices(words)
         claim_started_at = int(time.time())
+        prune_started_at = time.time()
         pruned_candidate_indices = []
         inspected_candidate_count = 0
         cancelled = False
@@ -1462,7 +1460,10 @@ class _BranchWorker:
         if inspected_candidate_count:
             self.queue.complete_bundle_two_level_erd_prunes(
                 branch_key, bundle_id, pruned_candidate_indices,
-                nodes_spent=inspected_candidate_count)
+                nodes_spent=inspected_candidate_count,
+                wall_millis=int((time.time() - prune_started_at) * 1000),
+                bound_erd=bound_erd, worker_count=self.n_workers,
+                worker_id=self.name)
         return frozenset(pruned_candidate_indices), cancelled
 
     def evaluate_bundle(self, branch_key, words, n_words, bundle_id, indices,

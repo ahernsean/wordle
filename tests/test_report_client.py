@@ -1292,24 +1292,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["letters"], ["N", "U", "R", "D", "Y"])
         self.assertTrue(result["wordFitsWithinCard"], result)
 
-    def test_candidate_detail_is_a_bounded_summary_not_per_candidate_rows(self):
+    def test_candidates_panel_is_a_bounded_summary_not_per_candidate_rows(self):
         requested = []
         self.page.on("request", lambda request: requested.append(request.url))
         self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("text=Candidate detail")
-        text = self.page.locator("section:has-text('Candidate detail')").inner_text()
+        self.page.wait_for_selector("section:has-text('Candidates')")
+        text = self.page.locator("section:has-text('Candidates')").first.inner_text()
         # A summary of provenance and per-worker contribution, never a row per
         # candidate — the branch holds far more claims than a browser can render.
-        self.assertIn("12,819 done", text)
-        self.assertIn("11,200 evaluated", text)
-        self.assertIn("1,500 one-level ERD prunes", text)
-        self.assertIn("119 two-level ERD prunes", text)
-        self.assertIn("5 in flight", text)
-        self.assertIn("w0 6,484", text)
+        self.assertNotIn("12,819 done", text)
+        self.assertNotIn("= + evaluated", text)
+        self.assertIn("evaluated 11,200", text)
+        self.assertNotIn("1,500 one-level ERD prunes", text)
+        self.assertNotIn("119 two-level ERD prunes", text)
+        self.assertIn("in flight 5", text)
+        self.assertIn("worker evals w0:6,484 w2:6,335", text)
         # Nothing fetches the raw per-candidate list, and no per-candidate rows
         # are rendered.
         self.assertFalse(any("claims=1" in url for url in requested))
-        self.assertLess(self.page.locator("section:has-text('Candidate detail') .card").count(), 1)
+        self.assertLess(self.page.locator("section:has-text('Candidates') .card").count(), 1)
 
     def test_branch_ownership_stays_visible_and_names_off_branch_claim_holders(self):
         text = self.page.evaluate("""async () => {
@@ -1388,7 +1389,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("ERD ceiling", text)
-        self.assertIn("0.001 3/3209", text)
+        self.assertIn("0.001 3/3,209", text)
 
     def test_cut_reuse_facts_wrap_between_complete_metrics(self):
         self.page.set_viewport_size({"width": 375, "height": 800})
@@ -1449,21 +1450,48 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_branch_queue_shows_both_erd_prune_metrics(self):
         self.apply_branch_target("RAISE .....")
         facts = self.page.locator(
-            "section:has-text('Queue') .labeled-facts").first
+            "section:has-text('Candidates') .labeled-facts").first
         text = facts.inner_text()
         self.assertIn("one-level ERD prunes", text)
         self.assertIn("two-level ERD prunes", text)
 
-    def test_ceiling_proven_loss_explains_its_proof(self):
+    def test_candidate_eta_labels_projected_work_as_remaining(self):
         text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          report.data.candidate_eta={state:'rough',sample_duration_seconds:300,
+            estimated_seconds:13,remaining_inspection_count:0,
+            expected_full_evaluation_count:8393,worker_count_changed:false};
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          const section=[...document.querySelectorAll('section')].find(
+            section=>section.querySelector('h2')?.textContent==='Candidates'
+          );
+          return [...section.querySelectorAll('.labeled-facts')].map(
+            facts=>facts.innerText
+          );
+        }""")
+        rough_eta = next(line for line in text if line.startswith("Rough ETA"))
+        self.assertNotIn("ETA work", rough_eta)
+        eta_work = next(line for line in text if line.startswith("ETA work remaining"))
+        self.assertIn("checks 0 · full evals ~8,393", eta_work)
+
+    def test_ceiling_proven_loss_explains_its_proof(self):
+        facts = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.recent_finalizations[0]={
-            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,
+            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,wall_millis:374529,
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
-          return document.querySelector('#report').innerText;
+          const card=document.querySelector('[data-grid-key="finalizations"] .card');
+          return [...card.querySelectorAll('.stat-line > span')].map(span=>span.innerText);
         }""")
-        self.assertIn("ERD lower bound 3.250 26/8 exceeds budget 3", text)
+        self.assertIn("ERD lower bound 3.250 26/8", facts)
+        self.assertIn("exceeds budget 3", facts)
+        self.assertIn("6m", facts)
+        self.assertNotIn("374,529 ms", facts)
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        self.assertLessEqual(*self.page.evaluate(
+            "() => [document.documentElement.scrollWidth,"
+            "document.documentElement.clientWidth]"))
 
     def test_exact_finalization_shows_recorded_solution(self):
         text = self.page.evaluate("""async () => {
@@ -1498,7 +1526,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("4,900 candidates completed first", text)
         self.assertIn("weakest of them ranked 7,795", text)
         self.assertIn("winner republished 1\u00d7", text)
-        self.assertIn("5,305 candidates republished (up to 3\u00d7 each)", text)
+        self.assertIn("5,305 (up to 3\u00d7 each)", text)
 
     def test_finalization_omits_scheduling_evidence_when_unrecorded(self):
         text = self.page.evaluate("""async () => {
@@ -1527,7 +1555,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("12 candidates republished", text)
+        self.assertIn("12 (up to", text)
         self.assertNotIn("candidates completed first", text)
         self.assertNotIn("weakest of them ranked", text)
 
@@ -2414,7 +2442,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("text=Bundle and republish")
+        self.page.wait_for_selector("text=Bundles")
         text = self.page.locator("#report").inner_text()
         self.assertIn("re-queued", text)
         self.assertIn("candidates re-queued", text)
@@ -2927,7 +2955,7 @@ class ReportClientBrowserTest(unittest.TestCase):
                 pairText: pair.textContent,
               };
             }""")
-            self.assertIn("1572/502", measured["text"])
+            self.assertIn("1,572/502", measured["text"])
             self.assertLessEqual(
                 measured["overflow"], 0.5,
                 f"the ERD left the card at {width}px: {measured}")

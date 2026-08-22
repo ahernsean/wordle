@@ -341,7 +341,7 @@
     const erdValue=(value,answerCount,{ceiling=false}={})=>{
       const decimal=fixed(value);if(decimal===null||!Number.isFinite(Number(value))||!Number.isInteger(answerCount)||answerCount<=0)return decimal;
       const scaled=Number(value)*answerCount,numerator=Math.round(scaled),allowance=ERD_LATTICE_NOISE_MARGIN+(ceiling?answerCount*CEILING_EPS:0);
-      return Math.abs(scaled-numerator)<allowance?decimal+" "+numerator+"/"+answerCount:decimal;
+      return Math.abs(scaled-numerator)<allowance?decimal+" "+numText(numerator)+"/"+numText(answerCount):decimal;
     };
     const displayValue=(key,value)=>boundFields.has(key)&&typeof value==="number"?fixed(value):value;
     const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
@@ -1108,7 +1108,7 @@
       const responseSummary=data.response_group_summary;
       if(responseSummary){
         const summary=element("div","metrics");
-        summary.append(metric("branches",responseSummary.branch_count),metric("answers",responseSummary.answer_count),metric("trivial",responseSummary.trivial_count),metric("exact",responseSummary.exact_count),metric("loss",responseSummary.loss_count),metric("missing",responseSummary.missing_count));
+        summary.append(metric("branches",responseSummary.branch_count),metric("answers",responseSummary.answer_count),metric("trivial",responseSummary.trivial_count),metric("exact",responseSummary.exact_count),metric("loss",responseSummary.loss_count),metric("not cached",responseSummary.missing_count));
         fragment.append(summary);
       }
       const progressURL=rootProgressURL(state),progressDetails=element("details","root-progress-panel");
@@ -1128,7 +1128,7 @@
       const responseGroupCard=row=>{
         const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;
         const title=element("div","card-title");title.append(wordTiles(data.word,row.pattern,data.word_is_answer,"word-md"),...statusChips(row));card.append(title);
-        const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+valueOrDash(row.cache_state)];
+        const parts=[numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),"cache "+(row.cache_state==="missing"?"not cached":valueOrDash(row.cache_state))];
         const best=bestText(row);if(best)parts.push(best);
         if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)parts.push("max remaining depth "+row.max_remaining_depth);
         if(row.worker_count)parts.push(numText(row.worker_count)+(row.worker_count===1?" worker":" workers"));
@@ -1146,7 +1146,7 @@
           details.addEventListener("toggle",()=>details.open?collapsedResponseGroups.delete(groupKey):collapsedResponseGroups.add(groupKey));
           const percentage=responseSummary?.answer_count?Math.round(100*group.rollup.answer_count/responseSummary.answer_count):0;
           const summaryEl=element("summary","clickable");
-          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(group.rollup.branch_count)+(group.rollup.branch_count===1?" branch":" branches")+" · "+numText(group.rollup.answer_count)+(group.rollup.answer_count===1?" answer":" answers")+" ("+percentage+"%) · trivial "+numText(group.rollup.trivial_count)+" · exact "+numText(group.rollup.exact_count)+" · loss "+numText(group.rollup.loss_count)+" · missing "+numText(group.rollup.missing_count)));
+          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(group.rollup.branch_count)+(group.rollup.branch_count===1?" branch":" branches")+" · "+numText(group.rollup.answer_count)+(group.rollup.answer_count===1?" answer":" answers")+" ("+percentage+"%) · trivial "+numText(group.rollup.trivial_count)+" · exact "+numText(group.rollup.exact_count)+" · loss "+numText(group.rollup.loss_count)+" · not cached "+numText(group.rollup.missing_count)));
           const grid=gridElement("response-groups/"+group.label);
           for(const row of ordered(group.rows,"branch_key_hex","response-groups/"+group.label,state))grid.append(responseGroupCard(row));
           details.append(summaryEl,grid);
@@ -1167,9 +1167,16 @@
       identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
       fragment.append(section("Identity",identityMetrics));
       if(branch.spine?.length){const spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine"),spineTargetText=spineText(branch.spine);copyButton.addEventListener("click",()=>copyText(spineTargetText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));spineSection.append(copyButton);fragment.append(spineSection);}
-      fragment.append(section("Queue",data.queue?labeledFacts([["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["candidates",formatInteger(data.queue.completed_candidate_count)+" / "+formatInteger(data.queue.candidate_count)],["one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count]]):element("p","empty","No current queue state")));
-      if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);fragment.append(section("Candidate sweep",sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id"))));}
-      fragment.append(section("Cache",labeledFacts(candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at))));
+      const bundleSummary=data.bundle_summary||{};
+      const queueFacts=data.queue?[["status",data.queue.branch_status],["phase",data.queue.branch_phase],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count],...(bundleSummary.wall_millis?[['wall time',formatDuration(bundleSummary.wall_millis/1000)]]:[])]:null;
+      fragment.append(section("Queue",queueFacts?labeledFacts(queueFacts):element("p","empty","No current queue state")));
+      const claimSummary=data.claim_summary||{};
+      if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);const candidateFacts=[["candidates",formatInteger(data.queue.completed_candidate_count)+"/"+formatInteger(data.queue.candidate_count)+" ="],["evaluated",claimSummary.evaluated_count||0],["+ one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["+ two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],...(claimSummary.provenance_unknown_count?[["+ unattributed",claimSummary.provenance_unknown_count]]:[])];const candidateStatusFacts=[...(claimSummary.in_flight_count?[["in flight",claimSummary.in_flight_count]]:[])],candidateETAFacts=[];const candidateETA=data.candidate_eta;if(candidateETA?.state==="ready"||candidateETA?.state==="rough"){const etaDataMinutes=Math.round(candidateETA.sample_duration_seconds/60),etaWorkers=candidateETA.worker_count_changed?"; scaling "+candidateETA.sample_worker_count+"→"+candidateETA.current_worker_count+" workers":"";candidateETAFacts.push([(candidateETA.state==="rough"?"Rough ETA":"ETA")+" ("+etaDataMinutes+" min data"+etaWorkers+")","~"+formatDuration(candidateETA.estimated_seconds)]);candidateETAFacts.push(["ETA work remaining","checks "+numText(candidateETA.remaining_inspection_count)+" · full evals ~"+numText(candidateETA.expected_full_evaluation_count)]);}else if(candidateETA?.state==="learning")candidateETAFacts.push(["ETA","learning: first 3 min of current work sample"]);const republishedList=data.republished_candidates||[];if(republishedList.length)candidateStatusFacts.push(["candidates re-queued",numText(republishedList.length)+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)"]);if(claimSummary.worker_contributions?.length)candidateStatusFacts.push(["worker evals",claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+":"+numText(row.done_count)).join(" ")]);const candidates=element("div");candidates.append(sweepStrip(data.queue.candidate_count,data.completed_candidate_indexes,liveWorkers,previousBy(previous,"workers","worker_id")),labeledFacts(candidateFacts));if(candidateStatusFacts.length)candidates.append(labeledFacts(candidateStatusFacts));for(const fact of candidateETAFacts)candidates.append(labeledFacts([fact]));fragment.append(section("Candidates",candidates));}
+      const bundleLabels={bundle_count:"bundles",censored_unit_count:"capped bundles",maximum_bundle_node_count:"max bundle nodes"};
+      const bundlePairs=Object.entries(bundleSummary).filter(([key])=>key!=="node_count"&&key!=="wall_millis").map(([key,value])=>[bundleLabels[key]||label(key),value]);
+      if(bundlePairs.length)fragment.append(section("Bundles",labeledFacts(bundlePairs)));
+      const cacheEntries=candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at).map(([key,value])=>[key,value==="missing"?"not cached":value]);
+      fragment.append(section("Cache",labeledFacts(cacheEntries)));
       const ownership=data.branch_ownership||{};
       const ownershipSection=element("section","section");
       ownershipSection.append(
@@ -1202,11 +1209,11 @@
               facts.push("solution not recorded");
             }
           }
-          if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdValue(row.ceiling,row.answer_count,{ceiling:true})+" exceeds budget "+valueOrDash(row.budget));
+          if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdValue(row.ceiling,row.answer_count,{ceiling:true}),"exceeds budget "+valueOrDash(row.budget));
           else if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
           facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.one_level_erd_pruned_candidate_count??row.bulk_completed_candidate_count)+" one-level ERD prunes",numText(row.two_level_erd_pruned_candidate_count??0)+" two-level ERD prunes",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
-          if(row.wall_millis)facts.push(numText(row.wall_millis)+" ms");
+          if(row.wall_millis)facts.push(formatDuration(row.wall_millis/1000));
           card.append(statLine(facts));
           const scheduleFacts=[];
           if(row.winner_best_first_rank!==null&&row.winner_best_first_rank!==undefined){
@@ -1215,7 +1222,7 @@
             if(row.weakest_best_first_rank_before_winner!==null&&row.weakest_best_first_rank_before_winner!==undefined)scheduleFacts.push("weakest of them ranked "+numText(row.weakest_best_first_rank_before_winner));
           }
           if(row.winner_republish_count)scheduleFacts.push("winner republished "+numText(row.winner_republish_count)+"\u00d7");
-          if(row.republished_candidate_count)scheduleFacts.push(numText(row.republished_candidate_count)+" candidates republished (up to "+numText(row.max_candidate_republish_count||0)+"\u00d7 each)");
+          if(row.republished_candidate_count)scheduleFacts.push(numText(row.republished_candidate_count)+" (up to "+numText(row.max_candidate_republish_count||0)+"\u00d7 each)");
           if(scheduleFacts.length)card.append(statLine(scheduleFacts));
           finalizations.append(card);
         }
@@ -1268,21 +1275,7 @@
         }
         fragment.append(section("Cut-reuse misses",misses));
       }
-      const bundleLabels={bundle_count:"bundles",node_count:"nodes",wall_millis:"wall ms",censored_unit_count:"censored units",maximum_bundle_node_count:"max bundle nodes"};
-      const bundlePairs=Object.entries(data.bundle_summary||{}).map(([key,value])=>[bundleLabels[key]||label(key),value]);
-      const republishedList=data.republished_candidates||[];
-      const republishedSummary=republishedList.length?numText(republishedList.length)+(republishedList.length===1?" candidate":" candidates")+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)":null;
-      if(bundlePairs.length||republishedSummary)fragment.append(section("Bundle and republish",labeledFacts([...bundlePairs,["candidates re-queued",republishedSummary]])));
       const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words ("+numText(branch.answer_count)+")"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
-      const claimSummary=data.claim_summary;
-      if(claimSummary&&claimSummary.total_claim_count){
-        const completion=[numText(claimSummary.done_count)+" done",numText(claimSummary.evaluated_count)+" evaluated",numText(claimSummary.one_level_erd_pruned_count??claimSummary.bulk_eliminated_count??0)+" one-level ERD prunes",numText(claimSummary.two_level_erd_pruned_count??0)+" two-level ERD prunes"];
-        if(claimSummary.provenance_unknown_count)completion.push(numText(claimSummary.provenance_unknown_count)+" unattributed");
-        if(claimSummary.in_flight_count)completion.push(numText(claimSummary.in_flight_count)+" in flight");
-        const detail=element("section","section");detail.append(element("h2","","Candidate detail"),statLine(completion));
-        if(claimSummary.worker_contributions&&claimSummary.worker_contributions.length)detail.append(statLine(claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+" "+numText(row.done_count))));
-        fragment.append(detail);
-      }
       return fragment;
     }
     function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=gridElement("branch-reference-matches");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}

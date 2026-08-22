@@ -19,6 +19,7 @@ from report_model import (
     ReportSources,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
+    _candidate_eta,
     _source_word_group_key,
     _resolved_candidate_erd,
     _grouped_response_groups,
@@ -69,6 +70,106 @@ class ReportModelTest(unittest.TestCase):
 
     def _open_queue(self):
         return ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+
+    def test_candidate_eta_estimates_prune_checks_and_full_evaluations(self):
+        eta = _candidate_eta(
+            {"candidate_count": 1_000, "completed_candidate_count": 400},
+            {
+                "best_updated_at": 900,
+                "window_started_at": 900,
+                "inspected_candidate_count": 200,
+                "pruned_candidate_count": 150,
+                "inspection_worker_millis": 20_000,
+                "evaluated_candidate_count": 50,
+                "evaluation_worker_millis": 50_000,
+            },
+            live_worker_count=2,
+            now=1_600,
+        )
+        self.assertEqual(eta["state"], "ready")
+        self.assertEqual(eta["remaining_inspection_count"], 600)
+        self.assertEqual(eta["expected_full_evaluation_count"], 150)
+        self.assertEqual(eta["estimated_seconds"], 105)
+
+    def test_candidate_eta_learns_after_a_new_best_erd(self):
+        eta = _candidate_eta(
+            {"candidate_count": 1_000, "completed_candidate_count": 400},
+            {
+                "best_updated_at": 1_000,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 99,
+                "pruned_candidate_count": 99,
+                "inspection_worker_millis": 9_900,
+                "evaluated_candidate_count": 0,
+                "evaluation_worker_millis": 0,
+            },
+            live_worker_count=2,
+            now=1_119,
+        )
+        self.assertEqual(eta["state"], "learning")
+
+    def test_candidate_eta_estimates_without_a_best_erd(self):
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 10},
+            {
+                "best_updated_at": None,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_millis": 0,
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_millis": 20_000,
+            },
+            live_worker_count=2,
+            now=1_200,
+        )
+        self.assertEqual(eta["state"], "rough")
+        self.assertEqual(eta["remaining_inspection_count"], 0)
+        self.assertEqual(eta["expected_full_evaluation_count"], 90)
+        self.assertEqual(eta["estimated_seconds"], 90)
+
+    def test_candidate_eta_scales_a_rough_sample_to_new_workers(self):
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 0},
+            {
+                "best_updated_at": 1_000,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_millis": 0,
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_millis": 24_000,
+                "evaluation_worker_count": 1,
+                "evaluation_worker_count_min": 1,
+                "evaluation_worker_count_max": 1,
+            },
+            live_worker_count=4,
+            now=1_200,
+        )
+        self.assertEqual(eta["state"], "rough")
+        self.assertAlmostEqual(eta["estimated_seconds"], 240 / 1.97)
+        self.assertTrue(eta["worker_count_changed"])
+        self.assertEqual(eta["sample_worker_count"], 1)
+
+    def test_candidate_eta_does_not_scale_legacy_global_worker_counts(self):
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 0},
+            {
+                "best_updated_at": None,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_millis": 0,
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_millis": 24_000,
+                "evaluation_unknown_worker_count": 10,
+            },
+            live_worker_count=2,
+            now=1_700,
+        )
+        self.assertEqual(eta["state"], "rough")
+        self.assertFalse(eta["worker_count_changed"])
+        self.assertFalse(eta["worker_count_sample_complete"])
 
     @staticmethod
     def _group(pattern, answer_count, best_erd, max_remaining_depth,
@@ -1984,6 +2085,35 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(rows["-y---"]["telemetry_epochs"], [0])
         self.assertEqual(rows["-----"]["search_node_count"], 500)
         self.assertEqual(rows["-----"]["telemetry_epochs"], [1])
+
+    def test_root_progress_prefers_queue_telemetry_to_cached_summary(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.add_root_response_group_summary(
+            "salet", "-y---", ERD_ALL, 900, 9_000, 1, 2, 0)
+        cache.close()
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 100, 1_000, 10, 20)
+        queue.close()
+
+        rows = {row["pattern"]: row for row in
+                collect_report(self.sources, self._request())["data"]["response_groups"]}
+        self.assertEqual(rows["-y---"]["branch_count"], 1)
+        self.assertEqual(rows["-y---"]["search_node_count"], 100)
+        self.assertEqual(rows["-y---"]["open_branch_count"], 0)
+
+    def test_root_progress_uses_cached_summary_without_queue_telemetry(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.add_root_response_group_summary(
+            "salet", "-y---", ERD_ALL, 100, 1_000, 10, 20, 0)
+        cache.add_root_response_group_summary(
+            "salet", "-y---", ERD_ALL, 900, 9_000, 12, 30, 1)
+        cache.close()
+
+        rows = {row["pattern"]: row for row in
+                collect_report(self.sources, self._request())["data"]["response_groups"]}
+        self.assertEqual(rows["-y---"]["branch_count"], 2)
+        self.assertEqual(rows["-y---"]["search_node_count"], 1_000)
+        self.assertEqual(rows["-y---"]["telemetry_epochs"], [0, 1])
 
     def test_work_started_is_distinct_from_when_the_word_was_requested(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
