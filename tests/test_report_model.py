@@ -151,6 +151,26 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(eta["worker_count_changed"])
         self.assertEqual(eta["sample_worker_count"], 1)
 
+    def test_candidate_eta_does_not_scale_legacy_global_worker_counts(self):
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 0},
+            {
+                "best_updated_at": None,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_millis": 0,
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_millis": 24_000,
+                "evaluation_unknown_worker_count": 10,
+            },
+            live_worker_count=2,
+            now=1_700,
+        )
+        self.assertEqual(eta["state"], "rough")
+        self.assertFalse(eta["worker_count_changed"])
+        self.assertFalse(eta["worker_count_sample_complete"])
+
     @staticmethod
     def _group(pattern, answer_count, best_erd, max_remaining_depth,
                cache_state="exact"):

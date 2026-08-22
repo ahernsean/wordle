@@ -198,6 +198,31 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(sample["evaluated_candidate_count"], 1)
         self.assertEqual(sample["evaluation_worker_millis"], 11000)
 
+    def test_candidate_eta_sample_counts_only_workers_on_its_branch(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        self.q.create_branch(self.coop_key, 100, 10)
+        now = int(time.time())
+        for worker_id, branch_key in (
+                ("worker-0", self.user_key), ("worker-1", self.user_key),
+                ("worker-2", self.coop_key)):
+            self.q.heartbeat(
+                worker_id, 1, branch_key, 100, now, 0)
+        self.q.add_claim_telemetry(
+            100, 1, 1, 6, branch_key=self.user_key,
+            worker_id="worker-0", candidate_evaluation_millis=1)
+
+        row = self.q._conn.execute("""
+            SELECT worker_count, branch_worker_count
+            FROM telemetry.claim_telemetry
+        """).fetchone()
+        self.assertEqual(row["worker_count"], 6)
+        self.assertEqual(row["branch_worker_count"], 2)
+        sample = self.q.branch_candidate_eta_sample(
+            self.user_key, window_seconds=60, now=now)
+        self.assertEqual(sample["evaluation_worker_count"], 2)
+        self.assertEqual(sample["evaluation_worker_count_min"], 2)
+        self.assertEqual(sample["evaluation_worker_count_max"], 2)
+
     def test_eta_migration_starts_existing_incumbent_sample_once(self):
         self.q.create_branch(self.user_key, 100, 10)
         branch_id = self.q._intern_branch(self.user_key)

@@ -1794,6 +1794,12 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
     evaluation_millis = eta_sample["evaluation_worker_millis"]
     inspection_workers = eta_sample.get("inspection_worker_count")
     evaluation_workers = eta_sample.get("evaluation_worker_count")
+    inspection_worker_count_known = not eta_sample.get(
+        "inspection_unknown_worker_count", 0)
+    evaluation_worker_count_known = not eta_sample.get(
+        "evaluation_unknown_worker_count", 0)
+    worker_count_sample_complete = (
+        inspection_worker_count_known and evaluation_worker_count_known)
     observed_work_units = inspected + evaluated
     result = {
         "state": "learning",
@@ -1837,8 +1843,12 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
         return BRANCH_ETA_SPEEDUP.get(
             worker_count, BRANCH_ETA_SPEEDUP[max(BRANCH_ETA_SPEEDUP)])
 
-    inspection_sample_workers = inspection_workers or live_worker_count
-    evaluation_sample_workers = evaluation_workers or live_worker_count
+    inspection_sample_workers = (
+        inspection_workers if inspection_worker_count_known and inspection_workers
+        else live_worker_count)
+    evaluation_sample_workers = (
+        evaluation_workers if evaluation_worker_count_known and evaluation_workers
+        else live_worker_count)
     current_speedup = speedup(live_worker_count)
     estimated_seconds = (
         inspection_worker_seconds * speedup(inspection_sample_workers)
@@ -1852,7 +1862,7 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
         eta_sample.get("evaluation_worker_count_min"),
         eta_sample.get("evaluation_worker_count_max"),
     ) if count is not None]
-    worker_count_changed = any(
+    worker_count_changed = worker_count_sample_complete and any(
         round(count) != live_worker_count for count in sampled_worker_counts)
     component_worker_counts = []
     if inspection_worker_seconds:
@@ -1862,6 +1872,7 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
     result.update({
         "state": (
             "ready" if (sample_duration_seconds >= BRANCH_ETA_STABLE_SAMPLE_SECONDS
+                         and worker_count_sample_complete
                          and not worker_count_changed)
             else "rough"
         ),
@@ -1873,6 +1884,7 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
         ),
         "current_worker_count": live_worker_count,
         "worker_count_changed": worker_count_changed,
+        "worker_count_sample_complete": worker_count_sample_complete,
     })
     return result
 

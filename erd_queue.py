@@ -561,6 +561,7 @@ CREATE TABLE IF NOT EXISTS telemetry.two_level_prune_telemetry (
     pruned_candidate_count    INTEGER NOT NULL,
     bound_erd                 REAL,
     worker_count              INTEGER,
+    branch_worker_count       INTEGER,
     wall_millis               INTEGER NOT NULL,
     epoch                     INTEGER NOT NULL DEFAULT 0,
     recorded_at               INTEGER NOT NULL
@@ -630,6 +631,7 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     claim_retries             INTEGER,
     busy_wait_millis          INTEGER,
     worker_count              INTEGER,
+    branch_worker_count       INTEGER,
     branch_id                 INTEGER,
     spine                     TEXT,
     worker_id                 TEXT,
@@ -1078,6 +1080,7 @@ class ERDQueue:
         self._add_columns("two_level_prune_telemetry", {
             "bound_erd": "REAL",
             "worker_count": "INTEGER",
+            "branch_worker_count": "INTEGER",
         }, schema="telemetry")
         # Every persisted aggregate predating the provenance split came from
         # the one-level candidate bound; worker-side two-level pruning did not
@@ -1120,6 +1123,7 @@ class ERDQueue:
             "claim_commit_millis": "INTEGER",
             "scheduling_millis": "INTEGER",
             "idle_millis": "INTEGER",
+            "branch_worker_count": "INTEGER",
         }, schema="telemetry")
         self._add_columns("branch_finalize_log", {
             "cache_write_millis": "INTEGER",
@@ -3053,7 +3057,7 @@ class ERDQueue:
     def complete_bundle_two_level_erd_prunes(self, branch_key, bundle_id,
                                              candidate_indices, nodes_spent=0,
                                              wall_millis=0, bound_erd=None,
-                                             worker_count=None):
+                                             worker_count=None, worker_id=None):
         """Complete claimed candidates pruned by the two-level ERD bound.
 
         The worker computes the bounds before entering this transaction.  A
@@ -3076,6 +3080,8 @@ class ERDQueue:
             return 0
         placeholders = ",".join("?" for _ in candidate_indices)
         now = int(time.time())
+        branch_worker_count = self._branch_worker_count(
+            branch_id, worker_id, now)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             if candidate_indices:
@@ -3115,11 +3121,11 @@ class ERDQueue:
                     INSERT INTO telemetry.two_level_prune_telemetry
                         (branch_id, inspected_candidate_count,
                          pruned_candidate_count, bound_erd, worker_count,
-                         wall_millis, epoch, recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         branch_worker_count, wall_millis, epoch, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (branch_id, nodes_spent, completed_candidate_count,
-                      bound_erd, worker_count, max(0, wall_millis), self.epoch,
-                      now))
+                      bound_erd, worker_count, branch_worker_count,
+                      max(0, wall_millis), self.epoch, now))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -3645,6 +3651,18 @@ class ERDQueue:
             GROUP BY h.current_branch_id
         """, (cutoff,)).fetchall()
         return {bytes(r["k"]): r["c"] for r in rows}
+
+    def _branch_worker_count(self, branch_id, worker_id, now):
+        """Count live workers assigned to a branch, including the recorder."""
+        if worker_id is None:
+            return None
+        row = self._conn.execute("""
+            SELECT COUNT(*) AS worker_count,
+                   MAX(worker_id = ?) AS recorder_is_counted
+            FROM worker_heartbeat
+            WHERE current_branch_id = ? AND updated_at > ?
+        """, (worker_id, branch_id, now - WORKER_LIVENESS_SECONDS)).fetchone()
+        return row["worker_count"] + (0 if row["recorder_is_counted"] else 1)
 
     def _branch_row_dict(self, pending=None, active=None) -> dict:
         """Normalize pending/active branch state for queue visibility commands."""
@@ -4373,11 +4391,15 @@ class ERDQueue:
                            AS pruned_candidate_count,
                        COALESCE(SUM(wall_millis), 0) AS inspection_worker_millis,
                        CASE WHEN SUM(wall_millis) > 0
-                            THEN SUM(worker_count * wall_millis) * 1.0
+                            THEN SUM(branch_worker_count * wall_millis) * 1.0
                                  / SUM(wall_millis) END
                            AS inspection_worker_count,
-                       MIN(worker_count) AS inspection_worker_count_min,
-                       MAX(worker_count) AS inspection_worker_count_max
+                       MIN(branch_worker_count) AS inspection_worker_count_min,
+                       MAX(branch_worker_count) AS inspection_worker_count_max,
+                       SUM(CASE WHEN wall_millis > 0
+                                     AND branch_worker_count IS NULL
+                                THEN 1 ELSE 0 END)
+                           AS inspection_unknown_worker_count
                 FROM telemetry.two_level_prune_telemetry
                 WHERE branch_id = ?
                   AND (bound_erd = ? OR ? IS NULL)
@@ -4389,11 +4411,15 @@ class ERDQueue:
                    COALESCE(SUM(candidate_evaluation_millis), 0)
                        AS evaluation_worker_millis,
                    CASE WHEN SUM(candidate_evaluation_millis) > 0
-                        THEN SUM(worker_count * candidate_evaluation_millis) * 1.0
+                        THEN SUM(branch_worker_count * candidate_evaluation_millis) * 1.0
                              / SUM(candidate_evaluation_millis) END
                        AS evaluation_worker_count,
-                   MIN(worker_count) AS evaluation_worker_count_min,
-                   MAX(worker_count) AS evaluation_worker_count_max
+                   MIN(branch_worker_count) AS evaluation_worker_count_min,
+                   MAX(branch_worker_count) AS evaluation_worker_count_max,
+                   SUM(CASE WHEN candidate_evaluation_millis IS NOT NULL
+                                 AND branch_worker_count IS NULL
+                            THEN 1 ELSE 0 END)
+                       AS evaluation_unknown_worker_count
                 FROM telemetry.claim_telemetry
                 WHERE branch_id = ? AND recorded_at >= ? AND recorded_at <= ?
             """, (branch_id, since, now)).fetchone()
@@ -5704,6 +5730,9 @@ class ERDQueue:
         now = int(time.time())
         branch_id = (None if branch_key is None
                     else self._intern_branch(branch_key))
+        branch_worker_count = (None if branch_id is None else
+                               self._branch_worker_count(
+                                   branch_id, worker_id, now))
         idle_millis = max(0, coordination_millis
                           - self._last_claim_transaction_millis
                           - self._last_claim_commit_millis
@@ -5714,14 +5743,16 @@ class ERDQueue:
                 (n_words, coordination_millis, candidate_evaluation_millis,
                  work_nodes, claim_retries,
                  busy_wait_millis, worker_count, branch_id, spine, worker_id,
-                 bundle_id, idx, bundle_start_idx, bundle_end_idx,
+                 branch_worker_count, bundle_id, idx, bundle_start_idx,
+                 bundle_end_idx,
                  claim_transaction_millis, claim_commit_millis,
                  scheduling_millis, idle_millis, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, candidate_evaluation_millis, work_nodes,
               self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, branch_id, spine,
-              worker_id, bundle_id, idx, bundle_start_idx, bundle_end_idx,
+              worker_id, branch_worker_count, bundle_id, idx, bundle_start_idx,
+              bundle_end_idx,
               self._last_claim_transaction_millis, self._last_claim_commit_millis,
               scheduling_millis, idle_millis, self.epoch, now))
         self._last_claim_retries = 0
