@@ -497,6 +497,19 @@ class TestEvaluateClaimPatternMatrix(unittest.TestCase):
         self.assertTrue(result)
         self.assertIsNone(mock_eval.call_args.kwargs['pattern_matrix'])
 
+    def test_nonadaptive_worker_records_candidate_eta_telemetry(self):
+        w = _bare_worker()
+        w._adaptive = False
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        with mock.patch('erd_swarm.evaluate_candidate',
+                        return_value=(SOLVED, 1.5, 1, False)):
+            result = w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
+        self.assertTrue(result)
+        w.queue.add_claim_telemetry.assert_called_once()
+        self.assertGreaterEqual(
+            w.queue.add_claim_telemetry.call_args.kwargs[
+                'candidate_evaluation_millis'], 0)
+
 
 class TestSubbranchSolver(unittest.TestCase):
     """_subbranch_solver returns None for small/unbudgeted branches (inline);
