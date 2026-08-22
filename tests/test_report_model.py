@@ -2101,6 +2101,20 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(rows["-y---"]["search_node_count"], 100)
         self.assertEqual(rows["-y---"]["open_branch_count"], 0)
 
+    def test_root_progress_uses_cached_summary_without_queue_telemetry(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.add_root_response_group_summary(
+            "salet", "-y---", ERD_ALL, 100, 1_000, 10, 20, 0)
+        cache.add_root_response_group_summary(
+            "salet", "-y---", ERD_ALL, 900, 9_000, 12, 30, 1)
+        cache.close()
+
+        rows = {row["pattern"]: row for row in
+                collect_report(self.sources, self._request())["data"]["response_groups"]}
+        self.assertEqual(rows["-y---"]["branch_count"], 2)
+        self.assertEqual(rows["-y---"]["search_node_count"], 1_000)
+        self.assertEqual(rows["-y---"]["telemetry_epochs"], [0, 1])
+
     def test_work_started_is_distinct_from_when_the_word_was_requested(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()
