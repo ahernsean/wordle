@@ -432,7 +432,7 @@ python3.13 erd_search.py queue add --word salet --pattern .....
 # to bound a bulk run):
 python3.13 erd_search.py queue add --words-file all_candidates.txt
 
-# All words in a file, with a subset prioritized (others queued at 0):
+# All words in a file, with a subset laddered above the rest (others at 0):
 python3.13 erd_search.py queue add --words-file all_candidates.txt \
     --priority-words salet crane --priority 1
 
@@ -450,6 +450,34 @@ a high priority on a large branch makes every idle worker in the running
 swarm converge on it: `claim_one` prefers joining any in-progress branch
 before promoting a new one, and both the pending and in-progress branch lists
 are ordered by priority — there is no separate "dedicated worker" mechanism.
+
+### The priority ladder
+
+Words are queued on a descending ladder in the order given: the first word
+gets the highest priority and each subsequent word drops by `--priority-step`
+(default 5).  The gap leaves room to reorder one word later with `queue
+source-priority` without disturbing its neighbours.
+
+The ladder exists because words tied at one priority all become eligible at
+once.  A worker that blocks on a dependency looks for useful work elsewhere,
+and it prefers starting a source with no branch open yet over opening another
+branch of the source already running — so a flat batch of N words fans out
+into N simultaneously-active words, one per blocking event, each served by a
+single branch.  Distinct priorities break every tie, holding the swarm on one
+word until that word has no claimable work left.
+
+```bash
+# Ladder 3 words 20 apart: salet=40, crane=20, raise=0
+python3.13 erd_search.py queue add --word salet crane raise --priority-step 20
+
+# Flat batch (every word starts at once) -- the pre-ladder behaviour:
+python3.13 erd_search.py queue add --word salet crane raise --priority-step 0
+```
+
+A list too long to seat on distinct rungs below 999 gives them to the leading
+words and settles the remainder on `--priority`; `queue add` says so when that
+happens.  The tail is undifferentiated but still ranks below every laddered
+word, and can be re-laddered later with `queue source-priority`.
 
 Pattern syntax: `g`=green, `y`=yellow, `-` or `.`=gray.  Use dots (not
 dashes) for patterns that start with a gray position to avoid the shell/argparse
