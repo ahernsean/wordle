@@ -538,7 +538,7 @@ def cmd_queue_priority(args):
     """Set the priority of a queued branch.
 
     Priority is an integer; higher numbers are worked sooner.  User-settable
-    values in the range 0–999 are reserved for normal use: 0 = default,
+    values in the range 0–999,999 are reserved for normal use: 0 = default,
     higher = sooner.
     """
     if getattr(args, 'source_word', None):
@@ -1453,7 +1453,7 @@ def main():
                       help='Response pattern (5 chars: g=green y=yellow -=gray)')
     p_qp.add_argument('--priority', required=True, type=int, metavar='N',
                       help='New priority (higher = worked sooner; '
-                           'use values 0–999 for normal work)')
+                           'use values 0–999,999 for normal work)')
     p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
@@ -1464,7 +1464,7 @@ def main():
     p_qsp.add_argument('--word', required=True, metavar='WORD')
     p_qsp.add_argument('--priority', required=True, type=int, metavar='N',
                        help='New requested priority (higher = worked sooner; '
-                            'use values 0–999)')
+                            'use values 0–999,999)')
     p_qsp.add_argument('--source-work-id', type=int, default=None, metavar='N',
                        help='source_work_id to disambiguate, when --word '
                             'owns more than one open request')

@@ -83,8 +83,13 @@ DEFAULT_REPUBLISH_LIMIT = 3
 # writer of source_work.requested_priority enforces it and
 # check_source_work_invariants reports a row outside it as a violation, so a
 # priority a queue can hold is exactly a priority a caller may ask for.
+#
+# The range seats one rung per source word: every candidate word laddered at a
+# distinct priority, with room left to append further batches beneath and to
+# insert above.  The full candidate list is ~15,000 words, so it runs to just
+# below LEGACY_PROMOTED_PRIORITY_MIN rather than stopping at a round hundred.
 SOURCE_PRIORITY_MIN = 0
-SOURCE_PRIORITY_MAX = 999
+SOURCE_PRIORITY_MAX = 999_999
 
 # Priorities at or above this bound are never allowed to preempt requested work.
 LEGACY_PROMOTED_PRIORITY_MIN = 1_000_000

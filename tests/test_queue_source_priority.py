@@ -15,7 +15,11 @@ import unittest
 
 import erd_search
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue
+from erd_queue import (
+    SOURCE_PRIORITY_MAX,
+    SOURCE_PRIORITY_MIN,
+    ERDQueue,
+)
 
 WORDS_A = ["crane", "slate", "trace", "stale", "tales"]
 WORDS_B = ["crane", "slate", "trace", "stale"]
@@ -108,8 +112,10 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.add_pending_many([(key, len(WORDS_A), 0, 'salet', 0)])
         queue.close()
 
-        output = self._run(_make_args(self.queue_path, priority=1000))
-        self.assertIn('between 0 and 999', output)
+        output = self._run(_make_args(
+            self.queue_path, priority=SOURCE_PRIORITY_MAX + 1))
+        self.assertIn(
+            f'between {SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)

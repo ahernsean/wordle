@@ -509,7 +509,12 @@ dashes) for patterns that start with a gray position to avoid the shell/argparse
 leading-dash trap (e.g. `--pattern .....` for all-gray, `--pattern =-y-g-` or
 `--pattern=.y.g.`).
 
-Priority values: 0 = default; 1 = high; use 0–999 for normal work.
+Priority values: 0–999,999 for requested work.  The range seats one rung per
+source word with room to spare — the full candidate list is ~15,000 words, so
+a ladder of every candidate at the default step of 5 occupies 75,000 of the
+million values and leaves the rest for appending beneath and inserting above.
+Priorities at or above 1,000,000 are the legacy promoted band and never
+preempt requested work.
 
 ### Change priority
 

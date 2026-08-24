@@ -274,6 +274,19 @@ class TestPriorityLadder(unittest.TestCase):
         self.assertEqual(ladder, {'a': 20, 'b': 15, 'c': 10, 'd': 5,
                                   'e': 0, 'f': 0, 'g': 0})
 
+    def test_range_seats_every_candidate_word_on_its_own_rung(self):
+        # The sweep's end state: every candidate laddered at the default step,
+        # each on a distinct rung, with room left below to append more.
+        candidate_words = load_word_list(erd_search.WORDS_FILE)
+        self.assertGreater(len(candidate_words), 14_000)
+
+        ladder = erd_search.priority_ladder(
+            candidate_words, SOURCE_PRIORITY_MAX,
+            erd_search.DEFAULT_PRIORITY_STEP)
+
+        self.assertEqual(len(set(ladder.values())), len(candidate_words))
+        self.assertGreater(min(ladder.values()), 0)
+
     def test_top_below_one_full_step_ties_the_tail_on_the_minimum(self):
         ladder = erd_search.priority_ladder(['a', 'b', 'c'], 2, 5)
 
