@@ -466,17 +466,42 @@ into N simultaneously-active words, one per blocking event, each served by a
 single branch.  Distinct priorities break every tie, holding the swarm on one
 word until that word has no claimable work left.
 
+`queue add` **appends**.  With no `--priority`, a batch descends from just
+below the lowest priority the queue still owes work, so adding words never
+preempts words already queued:
+
 ```bash
-# Ladder 3 words 20 apart: salet=40, crane=20, raise=0
+# Into an empty queue -- takes the top of the range:
+python3.13 erd_search.py queue add --word salet crane raise
+#   salet=999  crane=994  raise=989
+
+# A later batch lands underneath, untouched by the first:
+python3.13 erd_search.py queue add --word tulip video
+#   tulip=988  video=983
+
+# Ladder 20 apart instead of 5:
 python3.13 erd_search.py queue add --word salet crane raise --priority-step 20
 
 # Flat batch (every word starts at once) -- the pre-ladder behaviour:
 python3.13 erd_search.py queue add --word salet crane raise --priority-step 0
 ```
 
-A list too long to seat on distinct rungs below 999 gives them to the leading
-words and settles the remainder on `--priority`; `queue add` says so when that
-happens.  The tail is undifferentiated but still ranks below every laddered
+Ladders run downward from the top of the range rather than upward from its
+floor; that is what leaves room beneath each batch for the next one to append
+into.  `queue add` reports the rungs it took and the priority it queued behind.
+
+Naming `--priority` opts out of appending: it fixes the *last* word's rung, so
+the batch is placed wherever you ask — including ahead of queued work.  That is
+the way to jump a word to the front:
+
+```bash
+# Slot a word in above everything below priority 995:
+python3.13 erd_search.py queue add --word rocky --priority 995
+```
+
+A list too long to seat on distinct rungs above 0 gives them to the leading
+words and ties the remainder on the minimum; `queue add` says so when that
+happens.  The tail is undifferentiated but still ranks below every seated
 word, and can be re-laddered later with `queue source-priority`.
 
 Pattern syntax: `g`=green, `y`=yellow, `-` or `.`=gray.  Use dots (not

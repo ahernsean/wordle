@@ -1841,6 +1841,18 @@ class ERDQueue:
         return self._conn.execute(
             "SELECT EXISTS(SELECT 1 FROM source_work)").fetchone()[0] == 1
 
+    def lowest_unfinished_source_priority(self):
+        """The lowest requested priority still owed work, or None if none is.
+
+        A request that has not completed is still owed work whether or not it
+        has started, so a caller adding work behind everything already queued
+        ranks it below this.
+        """
+        return self._conn.execute("""
+            SELECT MIN(requested_priority) FROM source_work
+            WHERE state != 'complete'
+        """).fetchone()[0]
+
     def _source_response_group_is_live(self, source_work_id, root_pattern):
         """Whether a source request still needs work below one direct response group."""
         if root_pattern is None:
