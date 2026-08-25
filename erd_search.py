@@ -224,6 +224,29 @@ def ladder_top_priority(lowest_queued, explicit_priority, step, n_words):
     return max(SOURCE_PRIORITY_MIN, lowest_queued - 1)
 
 
+def reset_completed_branches(queue, branch_keys):
+    """Clear the queue-side state of every already-completed branch.
+
+    A branch the queue finished keeps a `done` pending row, an
+    `active_branches` row, and its candidate claims.  Re-adding it leaves all
+    three in place — `add_pending_many` carries priority forward but not
+    status, `create_branch` ignores an existing `active_branches` row, and
+    claims already marked done finalize the branch again without any work.
+    Recomputing it therefore needs the residue gone, not just the ERD cache
+    entry.
+
+    An `in_progress` branch is left alone: a worker owns it, and clearing its
+    claims underneath would let a second worker claim the same branch.
+
+    Returns how many branches were reset.
+    """
+    statuses = queue.status_by_branch_keys(branch_keys)
+    completed = [key for key, row in statuses.items() if row['status'] == 'done']
+    for branch_key in completed:
+        queue.cancel_active_branch(branch_key, remove_from_queue=True)
+    return len(completed)
+
+
 def cmd_queue_add(args):
     """Add branches for one or more words (or a words-file) to the queue.
 
@@ -340,6 +363,7 @@ def cmd_queue_add(args):
     n_new = 0
     n_already_queued = 0
     n_already_solved = 0
+    n_reset = 0
     try:
         for word in words_to_process:
             priority = ladder.get(word, SOURCE_PRIORITY_MIN)
@@ -379,6 +403,7 @@ def cmd_queue_add(args):
                 if args.delete_erd_cache:
                     for branch_key in branch_keys:
                         score_cache.delete(branch_key, ERD_ALL)
+                    n_reset += reset_completed_branches(queue, branch_keys)
                     rows_to_queue = rows
                     already_solved_keys = set()
                 else:
@@ -414,6 +439,9 @@ def cmd_queue_add(args):
 
         total = queue.total_branches()
         n_added = n_new + n_already_queued
+        if n_reset:
+            print(f'\n{n_reset:,} completed branch(es) cleared for recompute '
+                  f'(claims and active state discarded with the cache entry).')
         print(f'\n{n_added:,} branch(es) queued across '
               f'{len(words_to_process):,} word(s): {n_new:,} new, '
               f'{n_already_queued:,} already queued, '

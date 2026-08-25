@@ -240,6 +240,140 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         self.assertEqual(queue.source_work_rows(), [])
 
 
+class TestQueueAddDeleteErdCache(unittest.TestCase):
+    """--delete-erd-cache must leave a completed branch genuinely recomputable.
+
+    Deleting the cache entry alone strands it: the pending row stays `done`,
+    the active_branches row survives create_branch's INSERT OR IGNORE, and
+    claims already marked done finalize it again without work.  The branch
+    ends up neither cached nor scheduled.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.args = _make_args(self._tmp.name, pattern='g----')
+
+    def _first_branch_key(self, queue):
+        return bytes(queue._conn.execute(
+            'SELECT branch_key FROM branches LIMIT 1').fetchone()[0])
+
+    def _queue_one_completed_branch(self):
+        """Add a branch and drive it to done through the real claim path."""
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(self.args)
+        queue = ERDQueue(self.args.queue)
+        branch_key = self._first_branch_key(queue)
+        n_words = queue._conn.execute(
+            'SELECT n_words FROM pending_branches').fetchone()[0]
+        claimed = queue.claim_next('worker-0')
+        queue.create_branch(branch_key, n_words, 12,
+                            priority=claimed['priority'],
+                            source_work_id=claimed['source_work_id'])
+        queue.mark_done(branch_key)
+        return queue, branch_key
+
+    def test_completed_branch_is_claimable_again_after_delete_erd_cache(self):
+        queue, branch_key = self._queue_one_completed_branch()
+        self.assertEqual(
+            queue._conn.execute(
+                'SELECT status FROM pending_branches').fetchone()[0], 'done')
+        self.assertIsNone(queue.claim_next('worker-1'))
+        queue.close()
+
+        self.args.delete_erd_cache = True
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(self.args)
+
+        queue = ERDQueue(self.args.queue)
+        self.addCleanup(queue.close)
+        self.assertEqual(
+            queue._conn.execute(
+                'SELECT status FROM pending_branches').fetchone()[0], 'pending')
+        self.assertIsNotNone(queue.claim_next('worker-1'))
+
+    def test_stale_active_row_and_claims_are_cleared(self):
+        queue, branch_key = self._queue_one_completed_branch()
+        self.assertEqual(queue._conn.execute(
+            'SELECT COUNT(*) FROM active_branches').fetchone()[0], 1)
+        queue.close()
+
+        self.args.delete_erd_cache = True
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(self.args)
+
+        queue = ERDQueue(self.args.queue)
+        self.addCleanup(queue.close)
+        # create_branch uses INSERT OR IGNORE, so a surviving row would block
+        # promotion; claims marked done would finalize it without any work.
+        self.assertEqual(queue._conn.execute(
+            'SELECT COUNT(*) FROM active_branches').fetchone()[0], 0)
+        self.assertEqual(queue._conn.execute(
+            'SELECT COUNT(*) FROM candidate_claims').fetchone()[0], 0)
+
+    def test_reset_is_reported(self):
+        queue, _ = self._queue_one_completed_branch()
+        queue.close()
+
+        self.args.delete_erd_cache = True
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(self.args)
+
+        self.assertIn('1 completed branch(es) cleared for recompute',
+                      output.getvalue())
+
+    def test_in_progress_branch_is_not_reset_underneath_its_worker(self):
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(self.args)
+        queue = ERDQueue(self.args.queue)
+        claimed = queue.claim_next('worker-0')
+        self.assertIsNotNone(claimed)
+        self.assertEqual(
+            queue._conn.execute(
+                'SELECT status FROM pending_branches').fetchone()[0],
+            'in_progress')
+        queue.close()
+
+        self.args.delete_erd_cache = True
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(self.args)
+
+        queue = ERDQueue(self.args.queue)
+        self.addCleanup(queue.close)
+        # Still owned by worker-0; clearing it would let a second worker take
+        # the same branch.
+        self.assertEqual(
+            queue._conn.execute(
+                'SELECT status FROM pending_branches').fetchone()[0],
+            'in_progress')
+        self.assertIsNone(queue.claim_next('worker-1'))
+
+    def test_without_the_flag_a_completed_branch_stays_done(self):
+        queue, _ = self._queue_one_completed_branch()
+        queue.close()
+
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(self.args)
+
+        queue = ERDQueue(self.args.queue)
+        self.addCleanup(queue.close)
+        self.assertEqual(
+            queue._conn.execute(
+                'SELECT status FROM pending_branches').fetchone()[0], 'done')
+
+    def test_reset_ignores_branches_that_were_never_queued(self):
+        self.args.delete_erd_cache = True
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(self.args)
+
+        queue = ERDQueue(self.args.queue)
+        self.addCleanup(queue.close)
+        self.assertEqual(
+            queue._conn.execute(
+                'SELECT status FROM pending_branches').fetchone()[0], 'pending')
+
+
 class TestPriorityLadder(unittest.TestCase):
     """priority_ladder's rung assignment, independent of the queue."""
 
