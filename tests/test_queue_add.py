@@ -16,7 +16,12 @@ from io import StringIO
 from unittest.mock import patch
 
 import erd_search
-from erd_queue import SOURCE_PRIORITY_MAX, ERDQueue, encode_subset
+from erd_queue import (
+    SOURCE_PRIORITY_MAX,
+    SOURCE_PRIORITY_MIN,
+    ERDQueue,
+    encode_subset,
+)
 from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
 from cache_sqlite import ScoreCache
 
@@ -375,9 +380,9 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
         self.assertIn('across 2 word(s)', output.getvalue())
 
     def test_overflowing_ladder_warns_that_the_tail_starts_together(self):
-        # A top of 5 with step 5 seats only two words above the minimum.
-        args = _make_args(self._tmp.name, pattern='-----', priority=0,
-                          priority_step=5,
+        # An empty queue tops the append out at 5, which seats only one word
+        # above the minimum and clamps the other two onto it.
+        args = _make_args(self._tmp.name, pattern='-----', priority_step=5,
                           word=[LARGE_BRANCH_WORD, SECOND_WORD, 'crane'])
 
         output = StringIO()
@@ -390,6 +395,8 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             {LARGE_BRANCH_WORD: 5, SECOND_WORD: 0, 'crane': 0})
         self.assertIn('do not fit on a ladder', output.getvalue())
         self.assertIn('the last 2 share priority 0', output.getvalue())
+        self.assertIn('Raise the queued work with queue source-priority',
+                      output.getvalue())
 
     def test_fitting_ladder_does_not_warn(self):
         args = _make_args(self._tmp.name, pattern='-----',
@@ -509,6 +516,82 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             self._requested_priority_by_word(args.queue),
             {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
              SECOND_WORD: SOURCE_PRIORITY_MAX - 5})
+
+    def test_explicit_priority_past_the_range_is_refused_not_clamped(self):
+        # Seating the batch lower would hand back a last rung below the one
+        # --priority names, and tie it with whatever already sits up there.
+        args = _make_args(
+            self._tmp.name, pattern='-----', priority=SOURCE_PRIORITY_MAX - 5,
+            word=[LARGE_BRANCH_WORD, SECOND_WORD, 'crane'])
+
+        with self.assertRaisesRegex(ValueError, 'above the maximum'):
+            erd_search.cmd_queue_add(args)
+
+        self.assertEqual(
+            self._requested_priority_by_word(args.queue), {})
+
+    def test_explicit_priority_that_exactly_fits_is_accepted(self):
+        args = _make_args(
+            self._tmp.name, pattern='-----',
+            priority=SOURCE_PRIORITY_MAX - 10,
+            word=[LARGE_BRANCH_WORD, SECOND_WORD, 'crane'])
+
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(args)
+
+        self.assertEqual(
+            self._requested_priority_by_word(args.queue),
+            {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
+             SECOND_WORD: SOURCE_PRIORITY_MAX - 5,
+             'crane': SOURCE_PRIORITY_MAX - 10})
+
+    def test_appending_onto_floor_priority_reports_a_tie_not_an_order(self):
+        first = _make_args(self._tmp.name, pattern='-----',
+                           priority=SOURCE_PRIORITY_MIN,
+                           word=[LARGE_BRANCH_WORD])
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(first)
+
+        second = _make_args(self._tmp.name, pattern='-----',
+                            word=['crane', 'irate'],
+                            cache=first.cache, queue=first.queue)
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(second)
+
+        text = output.getvalue()
+        self.assertIn('TIED WITH queued work at priority 0', text)
+        self.assertNotIn('behind queued work', text)
+        # And the advice names a remedy that can actually work at the floor.
+        self.assertIn('Raise the queued work with queue source-priority', text)
+        self.assertNotIn('smaller --priority-step', text)
+
+    def test_ladder_top_priority_is_a_pure_function_of_its_arguments(self):
+        # Taking lowest_queued as a value rather than re-querying keeps the
+        # figure reported to the user and the one the ladder uses identical.
+        self.assertEqual(
+            erd_search.ladder_top_priority(None, None, 5, 3),
+            SOURCE_PRIORITY_MAX)
+        self.assertEqual(erd_search.ladder_top_priority(900, None, 5, 3), 899)
+        self.assertEqual(erd_search.ladder_top_priority(0, None, 5, 3),
+                         SOURCE_PRIORITY_MIN)
+        self.assertEqual(erd_search.ladder_top_priority(900, 100, 5, 3), 110)
+
+    def test_queue_add_queries_the_lowest_priority_once(self):
+        args = _make_args(self._tmp.name, pattern='-----',
+                          word=[LARGE_BRANCH_WORD, SECOND_WORD])
+        calls = []
+        original = ERDQueue.lowest_unfinished_source_priority
+
+        def counting(self):
+            calls.append(1)
+            return original(self)
+
+        with patch.object(ERDQueue, 'lowest_unfinished_source_priority',
+                          counting), redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(args)
+
+        self.assertEqual(len(calls), 1)
 
     def test_cli_default_step_ladders_words_given_to_the_word_flag(self):
         args = _make_args(self._tmp.name)

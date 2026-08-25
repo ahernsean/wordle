@@ -191,24 +191,34 @@ def priority_ladder(words, top_priority, step):
             for index, word in enumerate(words)}
 
 
-def ladder_top_priority(queue, explicit_priority, step, n_words):
+def ladder_top_priority(lowest_queued, explicit_priority, step, n_words):
     """The rung a batch's first word takes.
 
     `queue add` appends: with no --priority the batch descends from just
-    below every request the queue still owes work, so it preempts nothing
-    already queued and leaves the space beneath it for the next batch.
-    Ladders therefore run downward from the top of the range rather than
-    upward from its floor, which is what keeps repeated appends from
-    exhausting the space.
+    below `lowest_queued`, the lowest priority the queue still owes work, so
+    it preempts nothing already queued and leaves the space beneath it for
+    the next batch.  Ladders therefore run downward from the top of the range
+    rather than upward from its floor, which is what keeps repeated appends
+    from exhausting the space.  `lowest_queued` is None when nothing is owed,
+    and the batch takes the top of the range.
 
     An explicit --priority names the *last* word's rung instead, and the
     batch is seated high enough for the ladder to land on it — that is how a
-    batch is deliberately placed ahead of queued work.
+    batch is deliberately placed ahead of queued work.  Raises ValueError if
+    the range cannot hold a ladder whose last rung is the one named: silently
+    seating the batch lower would hand back something other than the priority
+    the caller asked for.
     """
     if explicit_priority is not None:
-        return min(SOURCE_PRIORITY_MAX,
-                   explicit_priority + step * max(0, n_words - 1))
-    lowest_queued = queue.lowest_unfinished_source_priority()
+        top_priority = explicit_priority + step * max(0, n_words - 1)
+        if top_priority > SOURCE_PRIORITY_MAX:
+            raise ValueError(
+                f'--priority {explicit_priority:,} needs a ladder reaching '
+                f'{top_priority:,} for {n_words:,} words at step {step:,}, '
+                f'above the maximum {SOURCE_PRIORITY_MAX:,}.  Lower '
+                f'--priority, use a smaller --priority-step, or add fewer '
+                f'words at a time.')
+        return top_priority
     if lowest_queued is None:
         return SOURCE_PRIORITY_MAX
     return max(SOURCE_PRIORITY_MIN, lowest_queued - 1)
@@ -289,12 +299,22 @@ def cmd_queue_add(args):
                       if not priority_words or word in priority_words]
     lowest_queued = queue.lowest_unfinished_source_priority()
     top_priority = ladder_top_priority(
-        queue, args.priority, args.priority_step, len(laddered_words))
+        lowest_queued, args.priority, args.priority_step, len(laddered_words))
     ladder = priority_ladder(laddered_words, top_priority, args.priority_step)
     if laddered_words:
-        placement = ('' if args.priority is not None or lowest_queued is None
-                     else f', behind queued work down to priority '
-                          f'{lowest_queued:,}')
+        appended = args.priority is None and lowest_queued is not None
+        # An append whose top rung is the incumbent's own priority had no room
+        # below it, so the batch ties with queued work rather than ranking
+        # under it.  Saying "behind" there would misreport a tie as an order.
+        ties_incumbent = appended and top_priority >= lowest_queued
+        if not appended:
+            placement = ''
+        elif ties_incumbent:
+            placement = (f', TIED WITH queued work at priority '
+                         f'{lowest_queued:,} — nothing below it to append into')
+        else:
+            placement = (f', behind queued work down to priority '
+                         f'{lowest_queued:,}')
         print(f'{laddered_words[0].upper()} first at priority '
               f'{ladder[laddered_words[0]]:,}, '
               f'{laddered_words[-1].upper()} last at '
@@ -302,12 +322,16 @@ def cmd_queue_add(args):
         floor = min(ladder.values())
         on_floor = sum(1 for word in laddered_words if ladder[word] == floor)
         if args.priority_step and on_floor > 1:
+            # Distinct rungs only collide once the ladder clamps, so a tie here
+            # always sits on SOURCE_PRIORITY_MIN with nothing beneath it.  A
+            # smaller step cannot divide headroom that does not exist; raising
+            # the incumbent or naming a priority is what actually works.
             print(f'Warning: {len(laddered_words):,} words do not fit on a '
                   f'ladder of step {args.priority_step:,} below priority '
                   f'{top_priority:,}; the last {on_floor:,} share priority '
-                  f'{floor:,} and will start together.  Re-ladder them with '
-                  f'queue source-priority, or pass a smaller '
-                  f'--priority-step.')
+                  f'{floor:,} and will start together.  Raise the queued work '
+                  f'with queue source-priority, or pass --priority to place '
+                  f'this batch deliberately.')
 
     # A branch reached by --word has guess_depth 1 (one guess played), so it
     # is solved at ROOT_BUDGET - 1 == GAME_GUESSES - 1.
