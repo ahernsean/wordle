@@ -30,11 +30,14 @@ queue add       Add branches for one or more words to the work queue.
                 appended below every word the queue still owes work unless
                 --priority names a rung outright.  With --words-file,
                 --priority-words restricts the ladder to a subset of the file's
-                words.  --delete-erd-cache forces a recompute of
-                branches that are already cached.  Otherwise, branches with
-                reusable cached results are not queued.  Reports how many
-                branches are new versus already queued, and how many were
-                already solved.
+                words.  --delete-erd-cache forces a recompute of branches that
+                are already cached, discarding both the cache entry and the
+                queue-side work state of any branch already completed (its
+                claims, bundle stats and active-branch row) so it is claimable
+                again; a branch a worker is still solving is left alone.
+                Otherwise, branches with reusable cached results are not
+                queued.  Reports how many branches are new versus already
+                queued, and how many were already solved.
 
 queue clear     Wipe all queue state (pending branches, active state, candidate
                 claims, heartbeats).  Does not touch the ERD cache.
@@ -224,27 +227,36 @@ def ladder_top_priority(lowest_queued, explicit_priority, step, n_words):
     return max(SOURCE_PRIORITY_MIN, lowest_queued - 1)
 
 
-def reset_completed_branches(queue, branch_keys):
-    """Clear the queue-side state of every already-completed branch.
+def invalidate_branches_for_recompute(queue, score_cache, branch_keys):
+    """Drop each branch's cached result and the work state that would keep it
+    unclaimable, so it is genuinely recomputed.
 
-    A branch the queue finished keeps a `done` pending row, an
-    `active_branches` row, and its candidate claims.  Re-adding it leaves all
-    three in place — `add_pending_many` carries priority forward but not
+    A branch the queue finished keeps a `done` pending row, and can still
+    hold candidate claims and an `active_branches` row.  Re-adding it leaves
+    all three in place — `add_pending_many` carries priority forward but not
     status, `create_branch` ignores an existing `active_branches` row, and
-    claims already marked done finalize the branch again without any work.
-    Recomputing it therefore needs the residue gone, not just the ERD cache
-    entry.
+    claims already marked done finalize the branch again without evaluating
+    anything.
 
-    An `in_progress` branch is left alone: a worker owns it, and clearing its
-    claims underneath would let a second worker claim the same branch.
+    A branch carrying an *open* active_branches row is left entirely alone,
+    cache entry included.  A worker is solving it, and the two halves have to
+    agree: deleting the cached result while refusing to requeue would leave
+    exactly the branch this function exists to prevent — no cached answer and
+    a `done` row no worker will claim.
 
-    Returns how many branches were reset.
+    Returns (reset_count, busy_count).
     """
-    statuses = queue.status_by_branch_keys(branch_keys)
-    completed = [key for key, row in statuses.items() if row['status'] == 'done']
-    for branch_key in completed:
-        queue.cancel_active_branch(branch_key, remove_from_queue=True)
-    return len(completed)
+    reset_count = 0
+    busy_count = 0
+    for branch_key in branch_keys:
+        active = queue.get_active_branch(branch_key)
+        if active is not None and active['status'] == 'open':
+            busy_count += 1
+            continue
+        score_cache.delete(branch_key, ERD_ALL)
+        if queue.requeue_completed_branch(branch_key):
+            reset_count += 1
+    return reset_count, busy_count
 
 
 def cmd_queue_add(args):
@@ -276,7 +288,11 @@ def cmd_queue_add(args):
     queued, and how many response groups were already solved.
     --delete-erd-cache deletes each queued branch's existing ERD cache entry
     first, so it gets recomputed instead of being claimed and immediately
-    marked done as already-cached.
+    marked done as already-cached.  For branches the queue already completed
+    it also discards the work state that would otherwise keep them
+    unclaimable — candidate claims, republish and hole rows, bundle stats,
+    and the active-branch row — and returns them to 'pending'.  A branch a
+    worker is still solving is skipped rather than pulled out from under it.
     """
     from wordle_ui import parse_pattern, fmt_pattern
 
@@ -364,6 +380,7 @@ def cmd_queue_add(args):
     n_already_queued = 0
     n_already_solved = 0
     n_reset = 0
+    n_busy = 0
     try:
         for word in words_to_process:
             priority = ladder.get(word, SOURCE_PRIORITY_MIN)
@@ -401,9 +418,10 @@ def cmd_queue_add(args):
                     if state['cache_state'] in ('exact', 'loss')}
 
                 if args.delete_erd_cache:
-                    for branch_key in branch_keys:
-                        score_cache.delete(branch_key, ERD_ALL)
-                    n_reset += reset_completed_branches(queue, branch_keys)
+                    word_reset, word_busy = invalidate_branches_for_recompute(
+                        queue, score_cache, branch_keys)
+                    n_reset += word_reset
+                    n_busy += word_busy
                     rows_to_queue = rows
                     already_solved_keys = set()
                 else:
@@ -442,6 +460,10 @@ def cmd_queue_add(args):
         if n_reset:
             print(f'\n{n_reset:,} completed branch(es) cleared for recompute '
                   f'(claims and active state discarded with the cache entry).')
+        if n_busy:
+            print(f'{n_busy:,} branch(es) are being solved right now and were '
+                  f'left untouched, cache entry included.  Re-run once they '
+                  f'finish to recompute them.')
         print(f'\n{n_added:,} branch(es) queued across '
               f'{len(words_to_process):,} word(s): {n_new:,} new, '
               f'{n_already_queued:,} already queued, '
@@ -1470,7 +1492,12 @@ def main():
     p_qa.add_argument('--delete-erd-cache', action='store_true',
                       help='Delete any existing ERD cache entry for each '
                            'queued branch first, so it is recomputed instead '
-                           'of being skipped as already-cached')
+                           'of being skipped as already-cached.  Also discards '
+                           'the queue-side work state of branches already '
+                           'completed — their candidate claims, bundle stats '
+                           'and active-branch row — so they are claimable '
+                           'again.  Branches a worker is still solving are '
+                           'left alone.')
     p_qa.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qa.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 

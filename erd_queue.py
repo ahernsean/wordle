@@ -5090,6 +5090,77 @@ class ERDQueue:
             self._conn.execute("ROLLBACK")
             raise
 
+    def requeue_completed_branch(self, branch_key: bytes) -> bool:
+        """Return a finished branch to 'pending' so it is worked again.
+
+        Clears what a completed branch leaves behind — its candidate claims,
+        republish and hole rows, its bundle_stats, and any active_branches row
+        — and flips the pending row back to 'pending', all in one transaction.
+        Returns True if the branch was reset.
+
+        The pending row is updated in place, never removed.  has_pending_row
+        is what tells a worker a branch has an exact-result consumer and so
+        must not be solved under a ceiling, and create_branch records a
+        ceiling immutably: a row that blinked out could be re-created under
+        one and finalize as a cut, which is never cached, leaving the caller
+        with neither an exact result nor a queued request to produce one.
+
+        Refuses, returning False, unless the branch is genuinely finished:
+
+        - 'in_progress' in the queue means a worker holds its claims.
+        - an *open* active_branches row means a worker is solving it now.
+          create_branch takes any branch key regardless of pending status, so
+          a branch finished for one request can be re-promoted as another
+          request's descendant while its pending row still reads 'done'.  The
+          two tables are therefore checked independently; neither implies the
+          other.
+
+        Membership is left to the caller: this clears the branch's work state
+        but does not revive branch_source_work, because reviving it blindly
+        would attach live membership to requests that have since completed.
+        add_pending_many's UPSERT re-establishes membership for the request
+        being queued, and is what makes the reset branch claimable again.
+        """
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return False
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            pending = self._conn.execute(
+                "SELECT status FROM pending_branches WHERE branch_id = ?",
+                (branch_id,)).fetchone()
+            open_active = self._conn.execute(
+                "SELECT 1 FROM active_branches "
+                "WHERE branch_id = ? AND status = 'open'",
+                (branch_id,)).fetchone()
+            if (pending is None or pending["status"] != 'done'
+                    or open_active is not None):
+                self._conn.execute("COMMIT")
+                return False
+            self._conn.execute(
+                "DELETE FROM candidate_claims WHERE branch_id = ?", (branch_id,))
+            self._conn.execute(
+                "DELETE FROM candidate_republish WHERE branch_id = ?",
+                (branch_id,))
+            self._conn.execute(
+                "DELETE FROM candidate_holes WHERE branch_id = ?", (branch_id,))
+            self._conn.execute(
+                "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
+                (branch_key,))
+            self._conn.execute(
+                "DELETE FROM active_branches WHERE branch_id = ?", (branch_id,))
+            self._conn.execute("""
+                UPDATE pending_branches
+                SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
+                    completed_at = NULL
+                WHERE branch_id = ?
+            """, (branch_id,))
+            self._conn.execute("COMMIT")
+            return True
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
+
     def set_priority(self, branch_key: bytes, priority: int) -> bool:
         """Update the priority of a pending branch.
 
