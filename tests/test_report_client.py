@@ -3048,6 +3048,24 @@ class ReportClientBrowserTest(unittest.TestCase):
         finally:
             context.close()
 
+    def test_leaderboard_card_clips_a_stray_bucket_legend_position(self):
+        # layoutResponseBucketLegend positions each legend label in pixels
+        # computed from the card's width at the time it last ran; a label left
+        # over from a wider layout (see issue #261, where a WebKit resize
+        # left one stale) must never widen the page, whatever pixel value it
+        # was last given.
+        self.page.goto(self.base_url + "?kind=leaderboard")
+        self.page.wait_for_selector(".response-bucket-legend > span")
+        measured = self.page.evaluate("""() => {
+          const span = document.querySelector('.response-bucket-legend > span');
+          span.style.left = '5000px';
+          return {
+            scroll: document.documentElement.scrollWidth,
+            client: document.documentElement.clientWidth,
+          };
+        }""")
+        self.assertLessEqual(measured["scroll"], measured["client"], measured)
+
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();

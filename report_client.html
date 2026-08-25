@@ -164,7 +164,16 @@
        slash, and the pair never breaks across a line. */
     .word-erd { white-space:normal; }
     .word-erd > .word-erd-pair { white-space:nowrap; }
-    .leaderboard-card { padding:.65rem .75rem; }
+    /* The bucket legend below positions its labels with an absolute left in
+       pixels computed for the card's width at the time it last laid out; a
+       width change the app hasn't yet re-laid out for (a resize event that
+       hasn't fired, or fired but not yet handled) can leave a label positioned
+       past the card's new, narrower edge.  Clipping horizontally here keeps
+       that transient state from ever widening the page -- the legend's own
+       svg leader lines still escape its box vertically into the margin
+       reserved above it, comfortably inside the card's own height, so this
+       does not clip them. */
+    .leaderboard-card { padding:.65rem .75rem; overflow-x:hidden; }
     .leaderboard-card .card-title { font-size:1.05rem; gap:.55rem; }
     .leaderboard-rank { color:var(--dim); }
     .response-visual-key { display:flex; flex-wrap:wrap; align-items:center; gap:.35rem .45rem; margin:.35rem 0 .45rem; font-size:.8rem; color:var(--dim); }
