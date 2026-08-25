@@ -30,6 +30,65 @@ Queue mutations remain grouped under `erd_search.py queue`: `add`, `remove`,
 `reconcile-orphaned-ownership`. The `queue` group has no read-only dashboard
 commands.
 
+### Priority ladders, and the fan-out they prevent
+
+**Openers tied at one priority all become eligible at once, and the swarm
+spreads across every one of them.** When a worker blocks on a dependency,
+`_help_other_branch` prefers *starting an opener with no branch open yet* over
+*joining a branch of the opener it is already on*: its first loop skips any
+opener that already holds a joinable open branch and promotes a fresh one. The
+guard that would stop this is a strict `priority < fallback_priority`
+comparison, and ties are let through deliberately (issue #214 — a worker
+blocked on an opener's only branch must be able to widen that opener). So a
+flat batch of N openers becomes N simultaneously-active openers, one recruited
+per blocking event, each left with a single open branch and the rest of its
+response groups still pending. The signature in `view --queue` is many active
+openers each showing `open=1` with dozens pending behind them.
+
+`queue add` therefore lays openers on a **descending priority ladder**,
+`--priority-step` apart (default 5), which breaks every tie so the guard fires
+and the swarm finishes one opener before starting the next.
+
+`queue add` **appends**: with no `--priority`, a batch descends from just below
+the lowest priority the queue still owes work, so new work never preempts
+queued work. Ladders run downward from the top of the range — that is what
+leaves room beneath each batch for the next to append into. Only work still
+*owed* holds the ceiling down, so a drained queue returns the full range.
+`--priority` names the *last* opener's rung and is the deliberate way to jump
+the queue; a request the range cannot hold is refused rather than quietly
+seated lower.
+
+`SOURCE_PRIORITY_MIN`/`SOURCE_PRIORITY_MAX` bound requested priorities at
+0–999,999 — one rung per opener with room to spare, since the full candidate
+list at step 5 occupies 75,000 values. Priorities at or above
+`LEGACY_PROMOTED_PRIORITY_MIN` (1,000,000) are the legacy promoted band and
+never preempt requested work.
+
+**The scan cost is linear in queued openers.** Both work-selection paths walk
+every unfinished request on each claim, and `_help_other_branch` additionally
+issues one query per request. Measured on rocky: 0.6 ms per claim at 64
+openers, 157 ms at 15,000. Invisible at today's batch sizes and fatal at the
+scale of a full sweep — see the open issue before queueing thousands.
+
+### Completed work has two records, and they can disagree
+
+"Already solved" is answered by the **permanent cache**
+(`ScoreCache.report_branch_states`, budget-aware), never by the queue and never
+by telemetry. The queue is consulted only to report new-versus-already-queued.
+
+But the queue keeps its own record: a finished branch holds a `done`
+`pending_branches` row, and `add_pending_many`'s UPSERT carries priority
+forward without touching `status`. A branch can therefore be absent from the
+cache and still unclaimable, which is the seam any "recompute this" operation
+has to close on **both** sides.
+
+**Liveness lives in `active_branches` + `candidate_claims`, not in
+`pending_branches.status`.** `create_branch` accepts any branch key regardless
+of pending status, so a branch finished for one request can be re-promoted as
+another request's descendant and hold live claims while its pending row still
+reads `done`. Any guard deciding "is a worker using this?" must read the active
+row; the queue status alone will delete claims out from under their owner.
+
 ### ERD-prune provenance
 
 Use **one-level ERD prune** for a candidate completed by the vectorized
@@ -63,6 +122,28 @@ by a (guess, pattern) pair at each level. |
 one *path* to it, not the branch itself. The same branch — its remaining answer
 set — can be reached by multiple spines, and those spines may be of different
 lengths. |
+| **opener** | A candidate word selected as the first guess of the game. Every
+word the swarm sweeps is queued as an opener. |
+| **opener work** | A queued request to solve one opener's whole tree at a
+priority, and the ownership every branch in that tree inherits. Keyed by
+(opener, priority), so one opener may own several. It answers "who asked for
+this branch?", never "where is it?" — position is the spine's job. |
+
+**An opener is an opener by construction, not by convention.** `queue add` is
+the only path that creates a top-level request, and it hardcodes `branch_budget
+= GAME_GUESSES - 1`; with the invariant `budget + guess_depth = GAME_GUESSES`
+that fixes `guess_depth = 1`. There is no `--spine` flag. A word queued at any
+other depth is not an unused-but-valid state — it is unrepresentable, because
+the recorded budget would assert a `guess_depth` the spine contradicts.
+
+A descendant inherits its opener and the opener's response pattern from its
+parent unchanged, so a branch four levels deep still names the opener that
+requested it; the guess at the root of *that* branch appears only in the spine.
+
+**Legacy naming.** Storage and most identifiers still spell this `source_work`
+/ `source_word` / `source_pattern`, and `branch_source_work.root_pattern` is
+the same value as `source_pattern` under a second name. Read all of them as
+opener terms. Do not introduce new `source_*` names.
 
 The phase boundary between candidate and guess is explicit in the code:
 ```python
@@ -392,9 +473,24 @@ the changed behavior and its related paths. Use `python3.13`; for example:
 python3.13 -m unittest tests.test_report_model tests.test_report_terminal
 ```
 
-Write tests for every new or changed executable path. Run the full suite when
-the change has broad cross-layer risk, when targeted tests do not provide
-enough confidence, or when the user asks for it:
+Write tests for every new or changed executable path.
+
+**Prove a new test can fail.** Disable the fix — stub the function to a no-op,
+or patch the constant back — and confirm the tests that are supposed to catch
+the bug do. A test that passes both ways proves nothing, and the failure mode
+is quiet: a fixture that never reaches the state it asserts about will report
+`0 == 0` forever. Where a guard has a second, *over-eager* way to be wrong,
+check that shape too — a predicate that is necessary but not sufficient passes
+every test written against the necessary half.
+
+**Build fixtures in the shape production actually leaves behind.** Stopping a
+setup helper one call short of what the code does yields a state the system
+never reaches, and every assertion built on it is then testing fiction. Follow
+the real call sequence when constructing "already finished" or "already
+failed" states.
+
+Run the full suite when the change has broad cross-layer risk, when targeted
+tests do not provide enough confidence, or when the user asks for it:
 
 ```
 python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
@@ -419,6 +515,13 @@ as is; do not fix unrelated pre-existing failures to clear the gate. If the
 diff touches code at all — including test files, build configuration, or a code
 snippet embedded in a doc that the suite executes — the rule above applies in
 full.
+
+**`SWARM.md`'s command examples are executable.**
+`test_every_swarm_guide_command_example_parses` extracts each one and feeds it
+to the CLI parser as argv, so a shell-only construct — a pipe, a redirect, a
+`$(…)` — fails the suite even though the change is "just prose". Editing that
+file is a code change; run
+`python3.13 -m unittest tests.test_report_terminal` after touching it.
 
 **Stage files explicitly, by path.  `git add -A`, `git add .`, `git add -u`,
 and `git commit -a` are prohibited — no exceptions.**  The working tree
@@ -497,7 +600,29 @@ app. Any schema change must:
 3. Never require manual SQL — migrations run automatically on first open
 
 The queue (`runtime/erd_queue.sqlite3`) is Linux-only; its migrations live in
-`ERDQueue._migrate()`.
+`ERDQueue._migrate()`. A queue migration needs no coordination — but workers
+fork from the supervisor, so **merging does not deploy**. Stop the swarm, pull,
+migrate, then start. A worker running pre-migration code against a migrated
+database fails on a column that no longer exists, and the symptom is `view`
+erroring on a column the migration "already ran". Stopping costs nothing here:
+precache work has no deadline, `stop` drains cleanly, and in-progress claims
+survive a restart.
+
+**Only five tables cross between Linux and the phone.** `export_cache.py`'s
+`EXPORT_TABLES` and `import_cache.py`'s `TABLES` both move `answer_list`,
+`response_decomposition`, `branch_best_by_policy`, `candidate_scores` and
+`candidate_erd_by_policy`. A cache table outside that list — the per-opener
+summaries, for instance — is written locally on each machine and never travels,
+so changing its shape cannot produce a file the other side fails to read.
+
+`import_cache.py` migrates the target itself: `main()` calls
+`_bootstrap_target_schema` before merging a single row, which opens the target
+through `ScoreCache` so `_ensure_schema` runs first. A phone cache is therefore
+brought current by the import, with no separate migration step to sequence. The
+import is run from Pythonista with **no arguments**, so its defaults are part of
+the contract: source `wordle_erd_export.sqlite3` in the working directory,
+target `runtime/wordle_cache.sqlite3`, and the source file is deleted after a
+successful merge unless `--keep-source` is given.
 
 Swarm telemetry lives in a **separate** Linux-only file,
 `runtime/erd_queue_telemetry.sqlite3` (`<stem>_telemetry<ext>`, computed by
@@ -509,6 +634,25 @@ attached-schema tables do not appear in the main file's `sqlite_master`, running
 `.tables` on `runtime/erd_queue.sqlite3` shows no telemetry tables; open the
 telemetry file directly (or query through a live `ERDQueue`) to inspect them. Rows
 are fenced by the active telemetry epoch (`erd_search.py epoch show`).
+
+### Disk: measure free pages before reclaiming any
+
+Only the queue accumulates free pages, because only it deletes rows in bulk;
+the telemetry and cache files are append-mostly and sit at 0%. Check before
+assuming a large file has anything to give back:
+
+```
+PRAGMA page_size; PRAGMA page_count; PRAGMA freelist_count;
+```
+
+`VACUUM` rewrites the file, so it needs the swarm stopped and free space for a
+full copy. Back up first. Row-count-per-table and `PRAGMA integrity_check`
+before and after are what confirm it only moved bytes.
+
+A completed branch costs almost nothing: `pending_branches` is a few thousand
+rows. The queue's bulk is the append-only `branches` registry — millions of
+`branch_key` blobs that everything else references by `branch_id`, so it cannot
+be trimmed without breaking those references.
 
 ---
 
