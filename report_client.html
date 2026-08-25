@@ -26,7 +26,7 @@
     * { box-sizing:border-box; }
     html, body { margin:0; min-width:0; background:var(--bg); color:var(--text); font:13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
     body { overflow-x:hidden; }
-    button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:var(--panel); color:var(--text); font:inherit; padding:.25rem .5rem; }
+    button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text); font:inherit; padding:.25rem .5rem; }
     button { cursor:pointer; }
     button:disabled { cursor:default; opacity:.45; }
     button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:var(--hover-tint); }
@@ -82,7 +82,7 @@
     #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
     #connection:focus-visible { outline:2px solid var(--green); outline-offset:1px; }
     .conn-wrap.open #connection:not(.disconnected) { background:var(--hover-tint); }
-    .refresh-pop { position:absolute; top:100%; right:0; z-index:20; margin-top:.2rem; padding:.35rem .5rem; background:var(--panel); border:1px solid var(--border); border-radius:6px; box-shadow:var(--popover-shadow); display:flex; align-items:center; gap:.4rem; white-space:nowrap; color:var(--text); opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .12s ease, transform .12s ease, visibility .12s; }
+    .refresh-pop { position:absolute; top:100%; right:0; z-index:20; margin-top:.2rem; padding:.35rem .5rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; box-shadow:var(--popover-shadow); display:flex; align-items:center; gap:.4rem; white-space:nowrap; color:var(--text); opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .12s ease, transform .12s ease, visibility .12s; }
     .refresh-pop .cap { color:var(--dim); font-size:.8rem; }
     .refresh-pop input { width:4.5rem; text-align:right; }
     .conn-wrap.open .refresh-pop { opacity:1; visibility:visible; transform:none; }
@@ -133,7 +133,7 @@
     .chip.exact, .outcome-exact { border-color:var(--green); color:var(--chip-exact-text); }
     .chip.cut, .outcome-cut { border-color:var(--amber); color:var(--chip-cut-text); }
     .chip.loss, .outcome-loss { border-color:var(--red); color:var(--chip-loss-text); }
-    .chip.historical { border-color:var(--dim); color:var(--dim); background:var(--panel); }
+    .chip.historical { border-color:var(--dim); color:var(--dim); background:var(--bg); }
     .card.historical { border-style:dashed; background:var(--card-historical-bg); }
     /* A spine is one row of guesses or a column of them, never a ragged mix:
        it lays out on a single row, and layoutSpines drops the whole spine to a
@@ -914,13 +914,17 @@
       const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));
       const cellLeft=cell=>`calc((100% - ${cellCount-1}px) * ${cell} / ${cellCount} + ${cell}px)`;
       const animate=comparisonAvailable&&!matchMedia("(prefers-reduced-motion: reduce)").matches;
+      // Read once per strip, not once per worker: the halo/fill colors are the
+      // same for every marker in this render pass.
+      const rootStyle=workers?.length?getComputedStyle(document.documentElement):null;
+      const markerHalo=rootStyle?.getPropertyValue("--panel").trim(),markerInk=rootStyle?.getPropertyValue("--text").trim();
       for(const worker of workers||[]){
         if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
         const cell=cellFor(worker.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
         const marker=element("span","sweep-marker");
         marker.dataset.workerNumber=workerNumber;
         marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
-        marker.style.backgroundImage=workerMarkerImage(workerNumber);
+        marker.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
         const previous=previousWorkersById?.get(String(worker.worker_id));
         const previousIndex=previous&&previous.branch_key_hex===worker.branch_key_hex?previous.candidate_index:null;
         if(animate&&previousIndex!==null&&previousIndex!==undefined){
@@ -1828,10 +1832,7 @@
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree,readingPosition=sameView?captureReadingPosition(root):null;
       centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
-    function workerMarkerImage(workerNumber){
-      // The halo/fill pair is read live from --panel/--text rather than baked
-      // in, so the marker follows a color-scheme flip with no reload.
-      const style=getComputedStyle(document.documentElement),halo=style.getPropertyValue("--panel").trim(),ink=style.getPropertyValue("--text").trim();
+    function workerMarkerImage(workerNumber,halo,ink){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="'+halo+'" stroke-width="2.5" stroke-linejoin="round" fill="'+ink+'">'+workerNumber+'</text></svg>';
       return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
     }
