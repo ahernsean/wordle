@@ -2761,7 +2761,7 @@ class ERDSolver(threading.Thread):
         self.root_best = None     # (word, erd) — best candidate found so far
         self.culled = 0           # top-level candidates pruned without recursing
         self.word_stats = []      # [(rank, word, wall_s, cpu_s, hits, misses), ...]
-        # Live mid-word progress: a single root word can take far longer than
+        # Live mid-word progress: a single opener can take far longer than
         # the gap between progress_callback firings (it recurses through its
         # whole branch tree before reporting). These let the status line
         # and the periodic report show that work is happening *during* that
@@ -2902,7 +2902,7 @@ class ERDSolver(threading.Thread):
         score_cache.reset_read_counters()
 
     def current_word_tag(self):
-        """(word, elapsed_s, hits, misses) for the root word currently being
+        """(word, elapsed_s, hits, misses) for the opener currently being
         evaluated, or None if nothing is in progress — see
         _current_candidate_tag."""
         return _current_candidate_tag(self._score_cache, self.current_word,

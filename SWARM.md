@@ -129,13 +129,13 @@ python3.13 erd_search.py view --cache
 python3.13 erd_search.py view --cache CRANE
 python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
-python3.13 erd_search.py view --sources
-python3.13 erd_search.py view --sources CRANE
+python3.13 erd_search.py view --openers
+python3.13 erd_search.py view --openers CRANE
 python3.13 erd_search.py view --root-progress CRANE
 python3.13 erd_search.py view --root-progress CRANE --epoch 10
 ```
 
-`--root-progress` reports one root word's work: every response group with the
+`--root-progress` reports one opener's work: every response group with the
 branches, search nodes, and node share spent under it, which groups have not
 been opened at all, when work actually began on it, and a completion estimate.
 It is the report that answers "why is
@@ -194,7 +194,7 @@ The rollup scans the epoch's `branch_finalize_log` rows, which carry no spine
 index, so it takes seconds. The web client fetches it after the word report
 renders and caches it per target; the terminal report pays it on each run.
 
-`--sources` reports one row per source word — ten queued root words are ten
+`--openers` reports one row per opener — ten queued openers are ten
 rows, whatever the branch count underneath them. Each row carries the word's
 requested priority, its state, its own ERD, how many branches it has ever
 owned, how many of those are still open versus done, the live workers on them,
@@ -213,24 +213,24 @@ control is what lists the branches it owns. `Direct` counts the branches the wor
 sub-branches promoted during the search are included too, and the two are
 equal until promotion starts.
 
-Source work is keyed by (word, priority), so queueing one word twice at
+Opener work is keyed by (word, priority), so queueing one word twice at
 different priorities makes two requests. They merge into that word's single
 row: a `Reqs` column appears, the priority shown is the highest (the one that
 schedules), and a branch both requests own is counted once.
 
-`--source-state` narrows to `queued`, `active`, `complete`, or `all` — a
+`--opener-state` narrows to `queued`, `active`, `complete`, or `all` — a
 word's own lifecycle, not a branch's, so it is a separate filter from
-`--branch-status`. When it hides anything the count reads `Source words: 3 of
+`--branch-status`. When it hides anything the count reads `Openers: 3 of
 10`, so a filtered report never looks like the whole queue. `--sort` takes
 `word`, `priority` (the default, and the order the swarm serves them in),
-`branches`, `open`, `done`, `workers`, or `age`; those four source-only sorts
+`branches`, `open`, `done`, `workers`, or `age`; those four opener-only sorts
 are rejected for other reports rather than silently ignored. `--limit` caps
-the rows the terminal prints, and the count says so (`Source words: 3 of 10`).
+the rows the terminal prints, and the count says so (`Openers: 3 of 10`).
 
-Grouping and paging are browser-only. The Sources tab groups by state out of
+Grouping and paging are browser-only. The Openers tab groups by state out of
 the box — what is running, what is waiting, what is finished — and can group by
 worker presence or priority instead, or not at all; each group collapses under
-a rollup of the words it holds. There, `limit` is a page size rather than a cap: with `source_offset`
+a rollup of the words it holds. There, `limit` is a page size rather than a cap: with `opener_offset`
 it pages the word list (`Showing 6–10 of 12 words`), so the words past the
 first page stay reachable. Changing a filter, the sort or the grouping returns
 to the first page, since page 3 of one ordering is not page 3 of another.
@@ -246,7 +246,7 @@ for every word buries the words themselves.
 Each worker's own report row shows whether it is serving its preferred
 (highest-priority eligible) source or fallback work claimed because the
 preferred source had no claimable bundle. The browser report serves the same
-view under its Sources tab — one card per source word, and clicking one opens
+view under its Openers tab — one card per opener, and clicking one opens
 that word's branches — and names the same scheduling role on every worker
 card.
 
@@ -456,12 +456,12 @@ are ordered by priority — there is no separate "dedicated worker" mechanism.
 Words are queued on a descending ladder in the order given: the first word
 gets the highest priority and each subsequent word drops by `--priority-step`
 (default 5).  The gap leaves room to reorder one word later with `queue
-source-priority` without disturbing its neighbours.
+opener-priority` without disturbing its neighbours.
 
 The ladder exists because words tied at one priority all become eligible at
 once.  A worker that blocks on a dependency looks for useful work elsewhere,
-and it prefers starting a source with no branch open yet over opening another
-branch of the source already running — so a flat batch of N words fans out
+and it prefers starting an opener with no branch open yet over opening another
+branch of the opener already running — so a flat batch of N words fans out
 into N simultaneously-active words, one per blocking event, each served by a
 single branch.  Distinct priorities break every tie, holding the swarm on one
 word until that word has no claimable work left.
@@ -513,7 +513,7 @@ naming the rung it would have needed, not a silent demotion.
 A list too long to seat on distinct rungs above 0 gives them to the leading
 words and ties the remainder on the minimum; `queue add` says so when that
 happens.  The tail is undifferentiated but still ranks below every seated
-word, and can be re-laddered later with `queue source-priority`.  Appending
+word, and can be re-laddered later with `queue opener-priority`.  Appending
 onto queued work that already sits at priority 0 has nowhere to go at all: the
 batch ties with it, and `queue add` reports the tie rather than claiming to
 rank below it.
@@ -524,7 +524,7 @@ leading-dash trap (e.g. `--pattern .....` for all-gray, `--pattern =-y-g-` or
 `--pattern=.y.g.`).
 
 Priority values: 0–999,999 for requested work.  The range seats one rung per
-source word with room to spare — the full candidate list is ~15,000 words, so
+opener with room to spare — the full candidate list is ~15,000 words, so
 a ladder of every candidate at the default step of 5 occupies 75,000 of the
 million values and leaves the rest for appending beneath and inserting above.
 Priorities at or above 1,000,000 are the legacy promoted band and never
@@ -535,35 +535,35 @@ preempt requested work.
 ```bash
 python3.13 erd_search.py queue priority --word salet --pattern ..... --priority 1
 
-# Repair open branches with no live source-work membership for one source word:
+# Repair open branches with no live opener-work membership for one opener:
 python3.13 erd_search.py queue priority --source-word salet --priority 1
 ```
 
 The `--word`/`--pattern` form affects only branches with status `pending`.
-The `--source-word` form affects only open branches without a live source-work
+The `--source-word` form affects only open branches without a live opener-work
 membership, including active branches left by older queue data. It never changes
-branches owned by a live request; use `queue source-priority` for those.
+branches owned by a live request; use `queue opener-priority` for those.
 
-### Change a source-work request's priority
+### Change an opener-work request's priority
 
 ```bash
-python3.13 erd_search.py queue source-priority --word salet --priority 1
+python3.13 erd_search.py queue opener-priority --word salet --priority 1
 
 # Disambiguate when the word owns more than one open request:
-python3.13 erd_search.py queue source-priority --word salet --source-work-id 7 --priority 1
+python3.13 erd_search.py queue opener-priority --word salet --opener-work-id 7 --priority 1
 ```
 
-Unlike `queue priority`, which changes one branch, this changes a
-source-work *request* — the whole `queue add --word salet` request that
+Unlike `queue priority`, which changes one branch, this changes an
+opener-work *request* — the whole `queue add --word salet` request that
 covers all of `salet`'s branches. The new requested priority takes effect
 immediately for both the request's still-pending roots and its
 already-active/promoted descendants. A branch owned by more than one live
 request keeps the higher of their requested priorities, so lowering one
 request's priority does not necessarily lower a branch it shares with a
-higher-priority request. A word that owns more than one open source-work
+higher-priority request. A word that owns more than one open opener-work
 request is ambiguous; the command lists the candidate ids with enough detail
 (priority, state, root/branch counts, request time) to choose, and
-`--source-work-id` picks one — it can also name a completed request
+`--opener-work-id` picks one — it can also name a completed request
 directly, which is reported as such. A completed request cannot be
 reprioritized.
 
@@ -604,7 +604,7 @@ stopped and you want to inspect or requeue before restarting.
 python3.13 erd_search.py queue reconcile-orphaned-ownership
 ```
 
-A branch promoted under a source-work request can lose every membership that
+A branch promoted under an opener-work request can lose every membership that
 justified `requires_source_membership`, while itself staying `open`: bulk
 elimination retracts the in-flight candidate that promoted it, or the request
 completes moments before a racing `create_branch` call attaches it.  Either

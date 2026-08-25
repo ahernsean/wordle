@@ -47,18 +47,18 @@ FIXTURE_FILENAMES = (
     "hotspots.json",
     "leaderboard.json",
     "root_progress.json",
-    "sources.json",
-    "sources-word.json",
+    "openers.json",
+    "openers-word.json",
 )
 BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
 INTEGER_PARAMETERS = {
     "minimum_answer_count", "maximum_answer_count", "budget", "priority",
-    "limit", "epoch", "since_seconds", "sample_size", "source_offset",
+    "limit", "epoch", "since_seconds", "sample_size", "opener_offset",
     "branch_row_offset",
 }
 SCALAR_PARAMETERS = {
     "branch_target", "sort", "group_by", "by", "worker", "branch_status",
-    "branch_phase", "source_state", "finalization_cursor", "tree_parent",
+    "branch_phase", "opener_state", "finalization_cursor", "tree_parent",
     "tree_cursor",
     *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
@@ -134,7 +134,7 @@ def parse_report_request(path, query):
         "/api/view/cache": "cache",
         "/api/view/hotspots": "hotspots",
         "/api/view/leaderboard": "leaderboard",
-        "/api/view/sources": "sources",
+        "/api/view/openers": "openers",
         "/api/view/root-progress": "root_progress",
     }.get(path)
     if explicit_kind is None:
@@ -172,7 +172,7 @@ def parse_report_request(path, query):
         raise InvalidRequest("tree_cursor must be a five-letter word")
     branch_status_value = _single_value(parameters, "branch_status")
     branch_phase_value = _single_value(parameters, "branch_phase")
-    source_state_value = _single_value(parameters, "source_state")
+    source_state_value = _single_value(parameters, "opener_state")
     try:
         branch_statuses = (
             parse_branch_filter(
@@ -190,7 +190,7 @@ def parse_report_request(path, query):
             if branch_phase_value is not None else ()
         )
         source_states = (
-            parse_branch_filter(source_state_value, "source state", SOURCE_STATES)
+            parse_branch_filter(source_state_value, "opener state", SOURCE_STATES)
             if source_state_value is not None else ()
         )
     except ValueError as error:
@@ -252,7 +252,7 @@ def parse_report_request(path, query):
     if hotspot_field is not None and hotspot_field not in HOTSPOT_FIELDS:
         raise InvalidRequest(f"invalid hotspot field {hotspot_field!r}")
     hotspot_field = hotspot_field or ("nodes" if explicit_kind == "hotspots" else None)
-    if tree and explicit_kind in ("cache", "hotspots", "leaderboard", "sources"):
+    if tree and explicit_kind in ("cache", "hotspots", "leaderboard", "openers"):
         raise InvalidRequest(f"tree cannot be used with {explicit_kind}")
     worker_id = _single_value(parameters, "worker")
     if worker_id is not None and explicit_kind != "workers":
@@ -281,7 +281,7 @@ def parse_report_request(path, query):
         sort=sort,
         group_by=group_by,
         source_states=source_states,
-        source_offset=integer_values["source_offset"],
+        source_offset=integer_values["opener_offset"],
         branch_row_offset=integer_values["branch_row_offset"],
         limit=limit,
         finalization_cursor_direction=finalization_cursor_direction,
@@ -323,10 +323,10 @@ def fixture_name_for_request(path, request):
     kind = request.report_kind
     if request.tree:
         return f"{kind}-tree.json"
-    # The source report lists a request's branches only once that request is
+    # The opener report lists a request's branches only once that request is
     # named, so the two shapes need two fixtures.
-    if kind == "sources" and request.branch_target.kind == "word":
-        return "sources-word.json"
+    if kind == "openers" and request.branch_target.kind == "word":
+        return "openers-word.json"
     return f"{kind}.json"
 
 

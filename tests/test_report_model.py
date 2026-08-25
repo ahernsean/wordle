@@ -1360,7 +1360,7 @@ class SourceReportTest(unittest.TestCase):
 
     def _source_rows_for(self, word):
         report = collect_report(self.sources, ReportRequest(
-            report_kind="sources",
+            report_kind="openers",
             branch_target=parse_report_branch_target([word]),
         ))
         return {row["source_word"]: row for row in report["data"]["rows"]}
@@ -1383,7 +1383,7 @@ class SourceReportTest(unittest.TestCase):
         queue.close()
 
         report = collect_report(
-            self.sources, ReportRequest(report_kind="sources"))
+            self.sources, ReportRequest(report_kind="openers"))
 
         data = report["data"]
         self.assertEqual(len(data["summary"]), 2)
@@ -1410,7 +1410,7 @@ class SourceReportTest(unittest.TestCase):
 
     def _source_words(self, **filters):
         report = collect_report(self.sources, ReportRequest(
-            report_kind="sources", filters=ReportFilters(**filters)))
+            report_kind="openers", filters=ReportFilters(**filters)))
         return report["data"]
 
     def test_source_state_filter_narrows_and_reports_what_it_hid(self):
@@ -1548,7 +1548,7 @@ class SourceReportTest(unittest.TestCase):
         )
 
         report = collect_source_report(
-            unavailable_sources, ReportRequest(report_kind="sources")
+            unavailable_sources, ReportRequest(report_kind="openers")
         )
 
         self.assertIn("error", report["sources"]["cache"])
@@ -1727,7 +1727,7 @@ class SourceReportTest(unittest.TestCase):
 
         pages = [
             collect_report(self.sources, ReportRequest(
-                report_kind="sources", branch_target=salet,
+                report_kind="openers", branch_target=salet,
                 filters=ReportFilters(limit=2, branch_row_offset=offset),
             ))["data"]
             for offset in (0, 2, 4, 6)
@@ -1806,26 +1806,26 @@ class SourceReportTest(unittest.TestCase):
 
     def test_source_only_filters_and_sorts_are_rejected_elsewhere(self):
         for filters, message in (
-            ({"source_states": ("queued",)}, "source_state requires"),
+            ({"source_states": ("queued",)}, "opener_state requires"),
             ({"source_offset": 2}, "source_offset requires"),
-            ({"sort": "branches"}, "requires a source report"),
+            ({"sort": "branches"}, "requires an opener report"),
         ):
             with self.subTest(filters=filters):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_report_request(ReportRequest(
                         report_kind="queue", filters=ReportFilters(**filters)))
-        with self.assertRaisesRegex(ValueError, "source reports must be"):
+        with self.assertRaisesRegex(ValueError, "opener reports must be"):
             validate_report_request(ReportRequest(
-                report_kind="sources", filters=ReportFilters(sort="nodes")))
+                report_kind="openers", filters=ReportFilters(sort="nodes")))
         validate_report_request(ReportRequest(
-            report_kind="sources", filters=ReportFilters(sort="age")))
+            report_kind="openers", filters=ReportFilters(sort="age")))
         for group_by in ("completed", "elapsed", "worker_time", "requested"):
             with self.subTest(group_by=group_by):
                 validate_report_request(ReportRequest(
-                    report_kind="sources", filters=ReportFilters(group_by=group_by)))
-        with self.assertRaisesRegex(ValueError, "source reports must be"):
+                    report_kind="openers", filters=ReportFilters(group_by=group_by)))
+        with self.assertRaisesRegex(ValueError, "opener reports must be"):
             validate_report_request(ReportRequest(
-                report_kind="sources",
+                report_kind="openers",
                 filters=ReportFilters(group_by="cache_state")))
 
     def test_one_word_queued_twice_merges_into_one_row(self):
@@ -1842,7 +1842,7 @@ class SourceReportTest(unittest.TestCase):
         queue.close()
 
         report = collect_report(
-            self.sources, ReportRequest(report_kind="sources"))
+            self.sources, ReportRequest(report_kind="openers"))
 
         self.assertEqual(len(report["data"]["summary"]), 1)
         row = report["data"]["summary"][0]
@@ -1861,7 +1861,7 @@ class SourceReportTest(unittest.TestCase):
         queue.close()
 
         report = collect_report(
-            self.sources, ReportRequest(report_kind="sources"))
+            self.sources, ReportRequest(report_kind="openers"))
 
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertEqual(len(report["data"]["summary"]), 2)
@@ -1893,7 +1893,7 @@ class SourceReportTest(unittest.TestCase):
         report = collect_source_report(
             self.sources,
             ReportRequest(
-                report_kind="sources",
+                report_kind="openers",
                 branch_target=parse_report_branch_target(["salet"]),
             ),
         )
@@ -1922,12 +1922,12 @@ class SourceReportTest(unittest.TestCase):
         queue.close()
 
         salet = ReportRequest(
-            report_kind="sources",
+            report_kind="openers",
             branch_target=parse_report_branch_target(["salet"]),
         )
         full = collect_report(self.sources, salet)
         limited = collect_report(self.sources, ReportRequest(
-            report_kind="sources", branch_target=salet.branch_target,
+            report_kind="openers", branch_target=salet.branch_target,
             filters=ReportFilters(limit=1),
         ))
 

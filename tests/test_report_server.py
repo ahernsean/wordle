@@ -195,7 +195,7 @@ class ReportServerTest(unittest.TestCase):
 
     def test_every_explicit_endpoint_returns_its_kind(self):
         with running_server(fixture_configuration()) as base_url:
-            for kind in ("queue", "workers", "cache", "hotspots", "sources"):
+            for kind in ("queue", "workers", "cache", "hotspots", "openers"):
                 with self.subTest(kind=kind):
                     status, _headers, body = request(base_url, f"/api/view/{kind}")
                     self.assertEqual(status, 200)
@@ -433,30 +433,30 @@ class ReportServerMainTest(unittest.TestCase):
 
 class SourcesRequestTest(unittest.TestCase):
     def test_bare_endpoint_and_word_target_are_accepted(self):
-        rooted = parse_report_request("/api/view/sources", "")
-        worded = parse_report_request("/api/view/sources", "branch_target=SALET")
-        self.assertEqual(rooted.report_kind, "sources")
+        rooted = parse_report_request("/api/view/openers", "")
+        worded = parse_report_request("/api/view/openers", "branch_target=SALET")
+        self.assertEqual(rooted.report_kind, "openers")
         self.assertEqual(rooted.branch_target.kind, "root")
-        self.assertEqual(worded.report_kind, "sources")
+        self.assertEqual(worded.report_kind, "openers")
         self.assertEqual(worded.branch_target.trailing_word, "salet")
 
     def test_limit_reaches_the_filters(self):
-        request = parse_report_request("/api/view/sources", "limit=2")
+        request = parse_report_request("/api/view/openers", "limit=2")
         self.assertEqual(request.filters.limit, 2)
 
     def test_branch_target_and_tree_are_rejected(self):
         # A membership row names a branch already; a spine ending in a pattern
-        # selects one branch, which the source report has no view of, and there
+        # selects one branch, which the opener report has no view of, and there
         # is no topology to lay out as a tree.
         for query, message in (
             ("branch_target=RAISE+-----", "trailing word"),
-            ("tree=1", "tree cannot be used with sources"),
+            ("tree=1", "tree cannot be used with openers"),
             ("worker=worker-1", "worker requires the workers endpoint"),
             ("answers=1", "answers requires"),
         ):
             with self.subTest(query=query):
                 with self.assertRaisesRegex(InvalidRequest, message):
-                    parse_report_request("/api/view/sources", query)
+                    parse_report_request("/api/view/openers", query)
 
     def test_fixture_shapes_match_a_live_source_report(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -474,14 +474,14 @@ class SourcesRequestTest(unittest.TestCase):
             # request, which groups by state, so the live comparison must ask
             # for the same shape.
             live = collect_report(
-                sources, parse_report_request("/api/view/sources", "group_by=state")
+                sources, parse_report_request("/api/view/openers", "group_by=state")
             )
             live_word = collect_report(
                 sources,
-                parse_report_request("/api/view/sources", "branch_target=SALET"),
+                parse_report_request("/api/view/openers", "branch_target=SALET"),
             )
         fixtures = load_fixtures(FIXTURE_DIRECTORY)
-        collapsed, worded = fixtures["sources.json"], fixtures["sources-word.json"]
+        collapsed, worded = fixtures["openers.json"], fixtures["openers-word.json"]
         self.assertEqual(set(collapsed["data"]), set(live["data"]))
         self.assertEqual(
             set(collapsed["data"]["summary"][0]), set(live["data"]["summary"][0])
@@ -498,9 +498,9 @@ class SourcesRequestTest(unittest.TestCase):
 
     def test_word_target_selects_the_word_scoped_fixture(self):
         with running_server(fixture_configuration()) as base_url:
-            collapsed = json.loads(request(base_url, "/api/view/sources")[2])
+            collapsed = json.loads(request(base_url, "/api/view/openers")[2])
             worded = json.loads(
-                request(base_url, "/api/view/sources?branch_target=SALET")[2]
+                request(base_url, "/api/view/openers?branch_target=SALET")[2]
             )
         self.assertEqual(collapsed["data"]["rows"], [])
         self.assertTrue(worded["data"]["rows"])

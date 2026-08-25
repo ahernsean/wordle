@@ -683,7 +683,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             {LARGE_BRANCH_WORD: 5, SECOND_WORD: 0, 'crane': 0})
         self.assertIn('do not fit on a ladder', output.getvalue())
         self.assertIn('the last 2 share priority 0', output.getvalue())
-        self.assertIn('Raise the queued work with queue source-priority',
+        self.assertIn('Raise the queued work with queue opener-priority',
                       output.getvalue())
 
     def test_fitting_ladder_does_not_warn(self):
@@ -851,7 +851,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
         self.assertIn('TIED WITH queued work at priority 0', text)
         self.assertNotIn('behind queued work', text)
         # And the advice names a remedy that can actually work at the floor.
-        self.assertIn('Raise the queued work with queue source-priority', text)
+        self.assertIn('Raise the queued work with queue opener-priority', text)
         self.assertNotIn('smaller --priority-step', text)
 
     def test_ladder_top_priority_is_a_pure_function_of_its_arguments(self):

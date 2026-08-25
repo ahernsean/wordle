@@ -49,8 +49,8 @@ queue remove    Remove a pending branch from the queue.  Use --force to also
 queue priority  Change the priority of a queued branch.  Higher numbers are
                 worked sooner; 0 is the default.
 
-queue source-priority
-                Change the requested priority of a source-work request by
+queue opener-priority
+                Change the requested priority of an opener-work request by
                 word.  Takes effect immediately for both its pending roots
                 and its active/promoted descendants.
 
@@ -61,7 +61,7 @@ queue set-disk-stop
                 Keep the swarm down across reboots and systemd restarts.
 
 queue reconcile-orphaned-ownership
-                Demote open owned branches whose source-work membership was
+                Demote open owned branches whose opener-work membership was
                 lost while they were still open (see check_source_work_
                 invariants' "source-owned open branch_id ... has no live
                 membership"), making them claimable again.  The run loop
@@ -153,7 +153,7 @@ def _branch_phase_filter(value):
 
 
 def _source_state_filter(value):
-    return _comma_separated_filter(value, "source state", SOURCE_STATES)
+    return _comma_separated_filter(value, "opener state", SOURCE_STATES)
 
 
 def cmd_view(args):
@@ -179,7 +179,7 @@ def priority_ladder(words, top_priority, step):
     until that word runs out of claimable work.
 
     Adjacent words differ by `step`, leaving unused values between rungs so
-    a word can be reordered later with `queue source-priority` without
+    a word can be reordered later with `queue opener-priority` without
     disturbing its neighbours.  A step of 0 puts every word on
     `top_priority`.
 
@@ -369,7 +369,7 @@ def cmd_queue_add(args):
                   f'ladder of step {args.priority_step:,} below priority '
                   f'{top_priority:,}; the last {on_floor:,} share priority '
                   f'{floor:,} and will start together.  Raise the queued work '
-                  f'with queue source-priority, or pass --priority to place '
+                  f'with queue opener-priority, or pass --priority to place '
                   f'this batch deliberately.')
 
     # A branch reached by --word has guess_depth 1 (one guess played), so it
@@ -659,11 +659,11 @@ def cmd_queue_priority(args):
 
 
 # ---------------------------------------------------------------------------
-# queue source-priority
+# queue opener-priority
 # ---------------------------------------------------------------------------
 
 def cmd_queue_source_priority(args):
-    """Set the requested priority of a source-work request, by word.
+    """Set the requested priority of an opener-work request, by word.
 
     Resolves the word to an open (non-complete) source_work_id via
     ERDQueue.source_work_candidates() and defers to
@@ -674,8 +674,8 @@ def cmd_queue_source_priority(args):
     level), so lowering one request's priority does not necessarily lower a
     branch it shares with a higher-priority request.
 
-    A word with more than one open request is ambiguous; --source-work-id
-    picks one.  --source-work-id may also name a completed request directly,
+    A word with more than one open request is ambiguous; --opener-work-id
+    picks one.  --opener-work-id may also name a completed request directly,
     which is reported as such rather than as "not found".  A word whose
     requests are all complete is reported distinctly from a word with none.
     """
@@ -693,12 +693,12 @@ def cmd_queue_source_priority(args):
                     for row in queue.source_work_rows()
                     if row['source_word'] == word}
 
-        if args.source_work_id is not None:
-            if args.source_work_id not in all_rows:
-                print(f'{word.upper()}: no source-work request with id '
-                      f'{args.source_work_id}.')
+        if args.opener_work_id is not None:
+            if args.opener_work_id not in all_rows:
+                print(f'{word.upper()}: no opener-work request with id '
+                      f'{args.opener_work_id}.')
                 return
-            source_work_id = args.source_work_id
+            source_work_id = args.opener_work_id
         else:
             open_ids = [row['source_work_id']
                         for row in queue.source_work_candidates()
@@ -706,14 +706,14 @@ def cmd_queue_source_priority(args):
             if not open_ids:
                 if all_rows:
                     print(f'{word.upper()}: all {len(all_rows)} '
-                          f'source-work request(s) are complete.')
+                          f'opener-work request(s) are complete.')
                 else:
-                    print(f'{word.upper()}: no source-work request found.')
+                    print(f'{word.upper()}: no opener-work request found.')
                 return
             if len(open_ids) > 1:
                 print(f'{word.upper()}: ambiguous, {len(open_ids)} open '
-                      f'source-work requests match.  '
-                      f'Use --source-work-id to disambiguate.')
+                      f'opener-work requests match.  '
+                      f'Use --opener-work-id to disambiguate.')
                 for candidate_id in sorted(open_ids):
                     row = all_rows[candidate_id]
                     requested_at = datetime.fromtimestamp(
@@ -1415,12 +1415,12 @@ def main():
     view_kind.add_argument('--hotspots', action='store_true')
     view_kind.add_argument('--leaderboard', action='store_true')
     view_kind.add_argument(
-        '--sources', action='store_true',
-        help='Show source-work requests and branch ownership/lineage')
+        '--openers', action='store_true',
+        help='Show opener-work requests and branch ownership/lineage')
     view_kind.add_argument(
         '--root-progress', dest='root_progress', action='store_true',
         help='Show per-response-group work totals and a completion estimate '
-             'for one root word')
+             'for one opener')
     p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
         help='Comma-separated active,pending,done,unqueued, or all')
@@ -1428,8 +1428,8 @@ def main():
         '--branch-phase', type=_branch_phase_filter, metavar='PHASES',
         help='Comma-separated queued,evaluating,finalizing,complete, or all')
     p_view.add_argument(
-        '--source-state', type=_source_state_filter, metavar='STATES',
-        help='Comma-separated queued,active,complete, or all (--sources only)')
+        '--opener-state', type=_source_state_filter, metavar='STATES',
+        help='Comma-separated queued,active,complete, or all (--openers only)')
     p_view.add_argument('--minimum-answer-count', type=int, metavar='N')
     p_view.add_argument('--maximum-answer-count', type=int, metavar='N')
     p_view.add_argument('--budget', type=int, metavar='N')
@@ -1536,16 +1536,16 @@ def main():
     p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
-    # -- queue source-priority --
+    # -- queue opener-priority --
     p_qsp = qsub.add_parser(
-        'source-priority',
-        help='Set the requested priority of a source-work request')
+        'opener-priority',
+        help='Set the requested priority of an opener-work request')
     p_qsp.add_argument('--word', required=True, metavar='WORD')
     p_qsp.add_argument('--priority', required=True, type=int, metavar='N',
                        help='New requested priority (higher = worked sooner; '
                             'use values 0–999,999)')
-    p_qsp.add_argument('--source-work-id', type=int, default=None, metavar='N',
-                       help='source_work_id to disambiguate, when --word '
+    p_qsp.add_argument('--opener-work-id', type=int, default=None, metavar='N',
+                       help='opener_work_id to disambiguate, when --word '
                             'owns more than one open request')
     p_qsp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
@@ -1578,7 +1578,7 @@ def main():
     # -- queue reconcile-orphaned-ownership --
     p_qro = qsub.add_parser(
         'reconcile-orphaned-ownership',
-        help='Demote open owned branches whose source-work membership was '
+        help='Demote open owned branches whose opener-work membership was '
              'lost while they were still open, making them claimable again')
     p_qro.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
@@ -1647,7 +1647,7 @@ def main():
             'cache' if args.view_cache else
             'hotspots' if args.hotspots else
             'leaderboard' if args.leaderboard else
-            'sources' if args.sources else
+            'openers' if args.openers else
             'root_progress' if args.root_progress else 'auto'
         )
         if args.by is not None and not args.hotspots:
@@ -1681,7 +1681,7 @@ def main():
             budget=args.budget,
             priority=args.priority,
             sort=args.sort,
-            source_states=args.source_state or (),
+            source_states=args.opener_state or (),
             limit=args.limit,
         )
         args.hotspot_field = hotspot_field if args.hotspots else None
@@ -1712,7 +1712,7 @@ def main():
             'clear': cmd_queue_clear,
             'remove': cmd_queue_remove,
             'priority': cmd_queue_priority,
-            'source-priority': cmd_queue_source_priority,
+            'opener-priority': cmd_queue_source_priority,
             'reset-stale': cmd_reset_stale,
             'reconcile-orphaned-ownership': cmd_queue_reconcile_orphaned_ownership,
             'clear-disk-stop': cmd_queue_clear_disk_stop,
