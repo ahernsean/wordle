@@ -432,7 +432,7 @@ python3.13 erd_search.py queue add --word salet --pattern .....
 # to bound a bulk run):
 python3.13 erd_search.py queue add --words-file all_candidates.txt
 
-# All words in a file, with a subset prioritized (others queued at 0):
+# All words in a file, with a subset laddered above the rest (others at 0):
 python3.13 erd_search.py queue add --words-file all_candidates.txt \
     --priority-words salet crane --priority 1
 
@@ -451,12 +451,84 @@ swarm converge on it: `claim_one` prefers joining any in-progress branch
 before promoting a new one, and both the pending and in-progress branch lists
 are ordered by priority — there is no separate "dedicated worker" mechanism.
 
+### The priority ladder
+
+Words are queued on a descending ladder in the order given: the first word
+gets the highest priority and each subsequent word drops by `--priority-step`
+(default 5).  The gap leaves room to reorder one word later with `queue
+source-priority` without disturbing its neighbours.
+
+The ladder exists because words tied at one priority all become eligible at
+once.  A worker that blocks on a dependency looks for useful work elsewhere,
+and it prefers starting a source with no branch open yet over opening another
+branch of the source already running — so a flat batch of N words fans out
+into N simultaneously-active words, one per blocking event, each served by a
+single branch.  Distinct priorities break every tie, holding the swarm on one
+word until that word has no claimable work left.
+
+`queue add` **appends**.  With no `--priority`, a batch descends from just
+below the lowest priority the queue still owes work, so adding words never
+preempts words already queued:
+
+```bash
+# Into an empty queue -- takes the top of the range:
+python3.13 erd_search.py queue add --word salet crane raise
+#   salet=999,999  crane=999,994  raise=999,989
+
+# A later batch lands underneath, untouched by the first:
+python3.13 erd_search.py queue add --word tulip video
+#   tulip=999,988  video=999,983
+
+# Ladder 20 apart instead of 5:
+python3.13 erd_search.py queue add --word salet crane raise --priority-step 20
+
+# Flat batch (every word starts at once) -- the pre-ladder behaviour:
+python3.13 erd_search.py queue add --word salet crane raise --priority-step 0
+```
+
+Ladders run downward from the top of the range rather than upward from its
+floor; that is what leaves room beneath each batch for the next one to append
+into.  `queue add` reports the rungs it took and the priority it queued behind.
+
+The append ceiling is `lowest_unfinished_source_priority() - 1`, so it
+**ratchets downward** as batches accumulate and only returns to the top of the
+range once the queue fully drains.  A long-running sweep therefore works from
+whatever the last batch left, not from 999,999 — `queue add` reports the
+priority it queued behind, so check that line before queueing a large batch.
+
+Naming `--priority` opts out of appending: it fixes the *last* word's rung, so
+the batch is placed wherever you ask — including ahead of queued work.  To jump
+a word to the front, name a priority above whatever the current top rung is
+(there is no headroom above a batch that took `SOURCE_PRIORITY_MAX` itself):
+
+```bash
+# With queued work topping out at 999,983, this runs ahead of all of it:
+python3.13 erd_search.py queue add --word rocky --priority 999990
+```
+
+`--priority` is honoured exactly: `queue add` refuses rather than seating the
+batch lower, so a request whose ladder would run past 999,999 is an error
+naming the rung it would have needed, not a silent demotion.
+
+A list too long to seat on distinct rungs above 0 gives them to the leading
+words and ties the remainder on the minimum; `queue add` says so when that
+happens.  The tail is undifferentiated but still ranks below every seated
+word, and can be re-laddered later with `queue source-priority`.  Appending
+onto queued work that already sits at priority 0 has nowhere to go at all: the
+batch ties with it, and `queue add` reports the tie rather than claiming to
+rank below it.
+
 Pattern syntax: `g`=green, `y`=yellow, `-` or `.`=gray.  Use dots (not
 dashes) for patterns that start with a gray position to avoid the shell/argparse
 leading-dash trap (e.g. `--pattern .....` for all-gray, `--pattern =-y-g-` or
 `--pattern=.y.g.`).
 
-Priority values: 0 = default; 1 = high; use 0–999 for normal work.
+Priority values: 0–999,999 for requested work.  The range seats one rung per
+source word with room to spare — the full candidate list is ~15,000 words, so
+a ladder of every candidate at the default step of 5 occupies 75,000 of the
+million values and leaves the rest for appending beneath and inserting above.
+Priorities at or above 1,000,000 are the legacy promoted band and never
+preempt requested work.
 
 ### Change priority
 

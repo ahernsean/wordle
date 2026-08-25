@@ -22,7 +22,12 @@ from unittest import mock
 
 import erd_queue
 from cache_sqlite import ScoreCache
-from erd_queue import ERDQueue as ProductionERDQueue, cost_size_bucket
+from erd_queue import (
+    SOURCE_PRIORITY_MAX,
+    SOURCE_PRIORITY_MIN,
+    ERDQueue as ProductionERDQueue,
+    cost_size_bucket,
+)
 from tests.queue_invariants import SourceWorkInvariantCheckMixin
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
@@ -924,7 +929,7 @@ class TestClaimNext(_TmpQueue):
             self.key, len(WORDS), N_CANDIDATES,
             priority=claimed["priority"], source_work_id=claimed["source_work_id"])
         self.q.create_branch(
-            direct_key, 3, N_CANDIDATES, priority=1000)
+            direct_key, 3, N_CANDIDATES, priority=SOURCE_PRIORITY_MIN - 1)
         self.q._conn.execute(
             "DELETE FROM branch_source_work WHERE source_work_id = ?",
             (sources["crane"]["source_work_id"],))
@@ -952,8 +957,15 @@ class TestClaimNext(_TmpQueue):
         self.assertIn("complete source_work_id", joined)
         self.assertIn("unfinished source_work_id", joined)
         self.assertIn("source-owned open branch_id", joined)
-        self.assertIn("requested priority -1 outside 0..999", joined)
-        self.assertIn("effective priority 1000 outside 0..999", joined)
+        self.assertIn(
+            f"requested priority -1 outside "
+            f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}", joined)
+        # Below the range rather than above it: SOURCE_PRIORITY_MAX + 1 is
+        # exactly LEGACY_PROMOTED_PRIORITY_MIN, which the legacy-band check
+        # claims first.
+        self.assertIn(
+            f"effective priority {SOURCE_PRIORITY_MIN - 1} outside "
+            f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}", joined)
         self.assertIn("that the same request does not own", joined)
         self.assertNotIn(
             self.key,
@@ -1127,8 +1139,10 @@ class TestClaimNext(_TmpQueue):
     def test_source_priority_rejects_invalid_and_completed_requests(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
         source_work_id = self.q.source_work_rows()[0]["source_work_id"]
-        for priority in (-1, 1000):
-            with self.assertRaisesRegex(ValueError, "between 0 and 999"):
+        for priority in (-1, SOURCE_PRIORITY_MAX + 1):
+            with self.assertRaisesRegex(
+                    ValueError,
+                    f"between {SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}"):
                 self.q.set_source_work_priority(source_work_id, priority)
         self.assertEqual(
             self.q.source_work_rows()[0]["requested_priority"], 1)
@@ -1141,8 +1155,10 @@ class TestClaimNext(_TmpQueue):
 
     def test_add_pending_many_rejects_priority_outside_range(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
-        for priority in (-1, 1000):
-            with self.assertRaisesRegex(ValueError, "between 0 and 999"):
+        for priority in (-1, SOURCE_PRIORITY_MAX + 1):
+            with self.assertRaisesRegex(
+                    ValueError,
+                    f"between {SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}"):
                 self.q.add_pending_many([
                     (self.key, len(WORDS), 1, "crane", 0),
                     (other_key, 4, priority, "slate", 0),

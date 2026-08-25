@@ -83,8 +83,13 @@ DEFAULT_REPUBLISH_LIMIT = 3
 # writer of source_work.requested_priority enforces it and
 # check_source_work_invariants reports a row outside it as a violation, so a
 # priority a queue can hold is exactly a priority a caller may ask for.
+#
+# The range seats one rung per source word: every candidate word laddered at a
+# distinct priority, with room left to append further batches beneath and to
+# insert above.  The full candidate list is ~15,000 words, so it runs to just
+# below LEGACY_PROMOTED_PRIORITY_MIN rather than stopping at a round hundred.
 SOURCE_PRIORITY_MIN = 0
-SOURCE_PRIORITY_MAX = 999
+SOURCE_PRIORITY_MAX = 999_999
 
 # Priorities at or above this bound are never allowed to preempt requested work.
 LEGACY_PROMOTED_PRIORITY_MIN = 1_000_000
@@ -1840,6 +1845,18 @@ class ERDQueue:
         """Whether this queue has source-aware scheduling provenance."""
         return self._conn.execute(
             "SELECT EXISTS(SELECT 1 FROM source_work)").fetchone()[0] == 1
+
+    def lowest_unfinished_source_priority(self):
+        """The lowest requested priority still owed work, or None if none is.
+
+        A request that has not completed is still owed work whether or not it
+        has started, so a caller adding work behind everything already queued
+        ranks it below this.
+        """
+        return self._conn.execute("""
+            SELECT MIN(requested_priority) FROM source_work
+            WHERE state != 'complete'
+        """).fetchone()[0]
 
     def _source_response_group_is_live(self, source_work_id, root_pattern):
         """Whether a source request still needs work below one direct response group."""

@@ -24,9 +24,13 @@ run             Start the supervisor directly (without systemd), for
 queue           Queue mutation operations.
 queue add       Add branches for one or more words to the work queue.
                 Idempotent: existing branches are never duplicated; priority
-                is upgraded if the new request is higher.  With --words-file,
-                --priority-words marks a subset of the file's words as
-                higher priority.  --delete-erd-cache forces a recompute of
+                is upgraded if the new request is higher.  Words are queued on
+                a descending priority ladder in the order given, --priority-step
+                apart, so the swarm works them one at a time, and the batch is
+                appended below every word the queue still owes work unless
+                --priority names a rung outright.  With --words-file,
+                --priority-words restricts the ladder to a subset of the file's
+                words.  --delete-erd-cache forces a recompute of
                 branches that are already cached.  Otherwise, branches with
                 reusable cached results are not queued.  Reports how many
                 branches are new versus already queued, and how many were
@@ -107,6 +111,8 @@ from erd_queue import (
     DISK_STOP_FRACTION,
     ERDQueue,
     QUEUE_WAL_HARD_CEILING_BYTES,
+    SOURCE_PRIORITY_MAX,
+    SOURCE_PRIORITY_MIN,
     check_source_priority_range,
     disk_stats,
     encode_subset,
@@ -157,6 +163,67 @@ def cmd_view(args):
 # queue add
 # ---------------------------------------------------------------------------
 
+DEFAULT_PRIORITY_STEP = 5
+
+
+def priority_ladder(words, top_priority, step):
+    """Map words to descending source priorities, first word highest.
+
+    Words tied at one priority are all eligible to start at once, so a
+    blocked worker widens the batch by starting whichever of them has no
+    branch open yet rather than opening another branch of the word already
+    running.  A ladder breaks every tie, which keeps the swarm on one word
+    until that word runs out of claimable work.
+
+    Adjacent words differ by `step`, leaving unused values between rungs so
+    a word can be reordered later with `queue source-priority` without
+    disturbing its neighbours.  A step of 0 puts every word on
+    `top_priority`.
+
+    Rungs below SOURCE_PRIORITY_MIN clamp onto it, so a list too long to seat
+    on distinct rungs gives them to the leading words and ties the remainder
+    on the minimum.  The tail is undifferentiated but still ranks below every
+    seated word.
+    """
+    if step <= 0:
+        return {word: top_priority for word in words}
+    return {word: max(SOURCE_PRIORITY_MIN, top_priority - step * index)
+            for index, word in enumerate(words)}
+
+
+def ladder_top_priority(lowest_queued, explicit_priority, step, n_words):
+    """The rung a batch's first word takes.
+
+    `queue add` appends: with no --priority the batch descends from just
+    below `lowest_queued`, the lowest priority the queue still owes work, so
+    it preempts nothing already queued and leaves the space beneath it for
+    the next batch.  Ladders therefore run downward from the top of the range
+    rather than upward from its floor, which is what keeps repeated appends
+    from exhausting the space.  `lowest_queued` is None when nothing is owed,
+    and the batch takes the top of the range.
+
+    An explicit --priority names the *last* word's rung instead, and the
+    batch is seated high enough for the ladder to land on it — that is how a
+    batch is deliberately placed ahead of queued work.  Raises ValueError if
+    the range cannot hold a ladder whose last rung is the one named: silently
+    seating the batch lower would hand back something other than the priority
+    the caller asked for.
+    """
+    if explicit_priority is not None:
+        top_priority = explicit_priority + step * max(0, n_words - 1)
+        if top_priority > SOURCE_PRIORITY_MAX:
+            raise ValueError(
+                f'--priority {explicit_priority:,} needs a ladder reaching '
+                f'{top_priority:,} for {n_words:,} words at step {step:,}, '
+                f'above the maximum {SOURCE_PRIORITY_MAX:,}.  Lower '
+                f'--priority, use a smaller --priority-step, or add fewer '
+                f'words at a time.')
+        return top_priority
+    if lowest_queued is None:
+        return SOURCE_PRIORITY_MAX
+    return max(SOURCE_PRIORITY_MIN, lowest_queued - 1)
+
+
 def cmd_queue_add(args):
     """Add branches for one or more words (or a words-file) to the queue.
 
@@ -168,6 +235,16 @@ def cmd_queue_add(args):
     that file's contents.  --priority-words marks a subset of those words as
     higher priority: they are queued at --priority while the rest are queued
     at 0.
+
+    Words are queued on a descending priority ladder in the order given, so
+    the swarm works them one at a time rather than starting all of them at
+    once; --priority-step sets the gap between rungs.  Without --priority the
+    whole ladder sits below every request the queue still owes work, so a new
+    batch never preempts one already queued; --priority names the last rung
+    outright and is how a batch is put ahead of queued work.  With
+    --priority-words, the ladder covers that subset and the rest stay flat at
+    the minimum.  A word repeated in the input takes its first position and is
+    queued once.
 
     Already-queued branches are never duplicated; their priority is upgraded
     if the new request is higher.  Branches with reusable cached results are
@@ -186,6 +263,7 @@ def cmd_queue_add(args):
     else:
         words_to_process = [word.strip().lower()
                             for word in load_word_list(args.words_file)]
+    words_to_process = list(dict.fromkeys(words_to_process))
 
     candidate_words = set(load_word_list(WORDS_FILE))
     invalid_words = [word for word in words_to_process
@@ -202,6 +280,12 @@ def cmd_queue_add(args):
               'ignoring it.  Use --priority directly with --word.')
         priority_words = set()
 
+    base_priority = (SOURCE_PRIORITY_MIN if args.priority is None
+                     else args.priority)
+    check_source_priority_range(base_priority)
+    if args.priority_step < 0:
+        raise ValueError('--priority-step must not be negative')
+
     score_cache = ScoreCache(args.cache, all_answers)
     rcache = ResponseCache(all_answers, score_cache)
     queue = ERDQueue(args.queue)
@@ -210,6 +294,44 @@ def cmd_queue_add(args):
     if unknown:
         print(f'Warning: priority words not in the word list: '
               f'{", ".join(sorted(unknown))}')
+
+    laddered_words = [word for word in words_to_process
+                      if not priority_words or word in priority_words]
+    lowest_queued = queue.lowest_unfinished_source_priority()
+    top_priority = ladder_top_priority(
+        lowest_queued, args.priority, args.priority_step, len(laddered_words))
+    ladder = priority_ladder(laddered_words, top_priority, args.priority_step)
+    if laddered_words:
+        appended = args.priority is None and lowest_queued is not None
+        # An append whose top rung is the incumbent's own priority had no room
+        # below it, so the batch ties with queued work rather than ranking
+        # under it.  Saying "behind" there would misreport a tie as an order.
+        ties_incumbent = appended and top_priority >= lowest_queued
+        if not appended:
+            placement = ''
+        elif ties_incumbent:
+            placement = (f', TIED WITH queued work at priority '
+                         f'{lowest_queued:,} — nothing below it to append into')
+        else:
+            placement = (f', behind queued work down to priority '
+                         f'{lowest_queued:,}')
+        print(f'{laddered_words[0].upper()} first at priority '
+              f'{ladder[laddered_words[0]]:,}, '
+              f'{laddered_words[-1].upper()} last at '
+              f'{ladder[laddered_words[-1]]:,}{placement}.')
+        floor = min(ladder.values())
+        on_floor = sum(1 for word in laddered_words if ladder[word] == floor)
+        if args.priority_step and on_floor > 1:
+            # Distinct rungs only collide once the ladder clamps, so a tie here
+            # always sits on SOURCE_PRIORITY_MIN with nothing beneath it.  A
+            # smaller step cannot divide headroom that does not exist; raising
+            # the incumbent or naming a priority is what actually works.
+            print(f'Warning: {len(laddered_words):,} words do not fit on a '
+                  f'ladder of step {args.priority_step:,} below priority '
+                  f'{top_priority:,}; the last {on_floor:,} share priority '
+                  f'{floor:,} and will start together.  Raise the queued work '
+                  f'with queue source-priority, or pass --priority to place '
+                  f'this batch deliberately.')
 
     # A branch reached by --word has guess_depth 1 (one guess played), so it
     # is solved at ROOT_BUDGET - 1 == GAME_GUESSES - 1.
@@ -220,9 +342,7 @@ def cmd_queue_add(args):
     n_already_solved = 0
     try:
         for word in words_to_process:
-            priority = (args.priority if (not priority_words
-                                           or word in priority_words)
-                        else 0)
+            priority = ladder.get(word, SOURCE_PRIORITY_MIN)
             if args.pattern:
                 code = parse_pattern(args.pattern)
                 groups = rcache.group_words(word, all_answers)
@@ -442,7 +562,7 @@ def cmd_queue_priority(args):
     """Set the priority of a queued branch.
 
     Priority is an integer; higher numbers are worked sooner.  User-settable
-    values in the range 0–999 are reserved for normal use: 0 = default,
+    values in the range 0–999,999 are reserved for normal use: 0 = default,
     higher = sooner.
     """
     if getattr(args, 'source_word', None):
@@ -1299,12 +1419,22 @@ def main():
                       help='Only add this specific response pattern for --word '
                            '(5 chars: g=green y=yellow -=gray).  '
                            'Omit to add all patterns for the word(s).')
-    p_qa.add_argument('--priority', type=int, default=0, metavar='N',
-                      help='Priority for queued branches (default: 0).  '
-                           'Higher numbers are worked sooner.')
+    p_qa.add_argument('--priority', type=int, default=None, metavar='N',
+                      help='Priority of the last word on the ladder.  Higher '
+                           'numbers are worked sooner.  Omit to append the '
+                           'batch below every word the queue still owes work, '
+                           'so it preempts nothing already queued; name a '
+                           'value to preempt deliberately.')
+    p_qa.add_argument('--priority-step', type=int,
+                      default=DEFAULT_PRIORITY_STEP, metavar='N',
+                      help=f'Gap between adjacent words on the priority '
+                           f'ladder (default: {DEFAULT_PRIORITY_STEP}), so the '
+                           f'swarm finishes one word before starting the next.  '
+                           f'0 queues every word at --priority, letting them '
+                           f'all start at once.')
     p_qa.add_argument('--priority-words', nargs='+', metavar='WORD',
-                      help='With --words-file: only these words are queued at '
-                           '--priority, the rest at 0 (e.g. '
+                      help='With --words-file: only these words are laddered '
+                           'from --priority, the rest queued flat at 0 (e.g. '
                            '--priority-words salet crane)')
     p_qa.add_argument('--max-branch-size', type=int, default=None, metavar='N',
                       help='Skip branches with more than N answer words '
@@ -1347,7 +1477,7 @@ def main():
                       help='Response pattern (5 chars: g=green y=yellow -=gray)')
     p_qp.add_argument('--priority', required=True, type=int, metavar='N',
                       help='New priority (higher = worked sooner; '
-                           'use values 0–999 for normal work)')
+                           'use values 0–999,999 for normal work)')
     p_qp.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
     p_qp.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
@@ -1358,7 +1488,7 @@ def main():
     p_qsp.add_argument('--word', required=True, metavar='WORD')
     p_qsp.add_argument('--priority', required=True, type=int, metavar='N',
                        help='New requested priority (higher = worked sooner; '
-                            'use values 0–999)')
+                            'use values 0–999,999)')
     p_qsp.add_argument('--source-work-id', type=int, default=None, metavar='N',
                        help='source_work_id to disambiguate, when --word '
                             'owns more than one open request')
