@@ -1571,7 +1571,7 @@
     const TAPPABLE_SEGMENT_PIXELS=20;
     function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
-      strip.setAttribute("aria-label","Answer probability by first-response group for "+String(row.word||"").toUpperCase());
+      strip.setAttribute("aria-label","Answer probability by response group for "+String(row.word||"").toUpperCase());
       for(const [index,group] of groups.entries()){
         const probability=answerCount?group.answer_count/answerCount:0,segment=element("span","answer-segment");
         if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);segment.dataset.answerCount=numText(group.answer_count);}
