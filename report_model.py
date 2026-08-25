@@ -1409,6 +1409,16 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
     data["response_groups"] = displayed_response_groups
+    # The word's whole decomposition, largest group first, in the shape the
+    # leaderboard's graph reads.  Filters and the row limit narrow the rows
+    # listed below the graph, never the decomposition the graph draws.
+    data["response_group_breakdown"] = [
+        {"pattern": row["pattern"], "answer_count": row["answer_count"]}
+        for row in sorted(
+            all_response_groups,
+            key=lambda row: (-row["answer_count"], row["pattern"]),
+        )
+    ]
     return report
 
 

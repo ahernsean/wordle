@@ -170,10 +170,14 @@
     .response-visual-key { display:flex; flex-wrap:wrap; align-items:center; gap:.35rem .45rem; margin:.35rem 0 .45rem; font-size:.8rem; color:var(--dim); }
     .response-color-gradient { flex:0 1 10rem; min-width:5rem; height:.55rem; border-radius:999px; background:linear-gradient(90deg,hsl(320 70% 42%),hsl(0 62% 43%),hsl(62 62% 43%),hsl(125 62% 43%),hsl(210 62% 43%)); }
     .response-visual-label { margin:.4rem 0 .15rem; color:var(--dim); font-size:.8rem; }
+    .response-group-breakdown { margin:.5rem 0 1rem; }
     .answer-strip { display:flex; width:100%; height:2.25rem; overflow:hidden; border:1px solid var(--border); border-radius:4px; background:var(--border); }
     .answer-segment { display:flex; align-items:center; justify-content:center; min-width:0; overflow:hidden; color:#ffffff; font-size:.72rem; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.65); box-shadow:inset -1px 0 rgba(255,255,255,.5); }
     .answer-segment-label, .response-count-segment-label { display:block; text-align:center; line-height:.9rem; white-space:nowrap; }
     .answer-segment:last-child { box-shadow:none; }
+    .answer-segment.tappable-group { cursor:pointer; }
+    .answer-segment.tappable-group:hover { filter:brightness(1.2); }
+    .answer-segment.tappable-group:focus-visible { outline:2px solid var(--text); outline-offset:-2px; }
     .response-group-bridge { position:relative; z-index:2; display:block; width:100%; height:3rem; margin-bottom:-8px; overflow:visible; pointer-events:none; }
     .response-count-track { position:relative; z-index:1; display:flex; justify-content:center; width:100%; height:1.6rem; }
     .response-count-fill { display:flex; height:100%; overflow:hidden; border:1px solid var(--border); border-radius:4px; }
@@ -1105,6 +1109,14 @@
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading,renderSpine(data.context?.spine));
       const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+numText(erd.infeasible_group_count)+" of "+numText(erd.response_group_count)+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+numText(erd.resolved_group_count)+" of "+numText(erd.response_group_count)+" response groups solved"));}}
+      const breakdown=data.response_group_breakdown;
+      if(breakdown?.length){
+        const panel=element("div","response-group-breakdown");
+        panel.append(responseVisualKey(),renderResponseGroupBreakdown(
+          {word:data.word,word_is_answer:data.word_is_answer,response_groups:breakdown},
+          {selection:{branchTargetPrefix:state.branch_target,open:branchTarget=>setState({...state,kind:"auto",branch_target:branchTarget,tree:false,finalization_cursor:""})}}));
+        fragment.append(panel);
+      }
       const responseSummary=data.response_group_summary;
       if(responseSummary){
         const summary=element("div","metrics");
@@ -1553,7 +1565,11 @@
     ];
     function responseGroupBuckets(groups){return RESPONSE_GROUP_BUCKETS.map(bucket=>{const bucketGroups=groups.filter(group=>group.answer_count>=bucket.minimumAnswerCount&&group.answer_count<=bucket.maximumAnswerCount),responseGroupCount=bucketGroups.length,answerCount=bucketGroups.reduce((total,group)=>total+group.answer_count,0);return {...bucket,groups:bucketGroups,responseGroupCount,answerCount,color:answerGroupColor(Number.isFinite(bucket.maximumAnswerCount)?bucket.maximumAnswerCount:512)};});}
     function svgElement(name){return document.createElementNS("http://www.w3.org/2000/svg",name);}
-    function renderAnswerStrip(row){
+    // A pointer cannot reliably hit a segment narrower than this, so only wider
+    // ones become a way into their branch; the rest stay decoration.  Width is
+    // known only once the strip has been laid out, hence the measuring pass.
+    const TAPPABLE_SEGMENT_PIXELS=20;
+    function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
       strip.setAttribute("aria-label","Answer probability by first-response group for "+String(row.word||"").toUpperCase());
       for(const [index,group] of groups.entries()){
@@ -1563,11 +1579,39 @@
         segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability";
         strip.append(segment);
       }
+      if(selection)requestAnimationFrame(()=>{
+        [...strip.children].forEach((segment,index)=>{
+          if(segment.clientWidth<TAPPABLE_SEGMENT_PIXELS)return;
+          const branchTarget=(selection.branchTargetPrefix+" "+groups[index].pattern).trim(),open=()=>selection.open(branchTarget);
+          segment.classList.add("tappable-group");segment.setAttribute("role","button");segment.setAttribute("tabindex","0");
+          segment.setAttribute("aria-label","Open "+branchTarget+" branch report");
+          segment.addEventListener("click",open);
+          segment.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();open();}});
+        });
+      });
       return strip;
     }
+    function responseVisualKey(){
+      const key=element("div","response-visual-key");
+      key.append(element("span","","Response-group size:"),element("span","","512+ answers"),element("span","response-color-gradient"),element("span","","1 answer"));
+      return key;
+    }
+    // The leaderboard card and the word report draw the same picture of one
+    // word's first-level response groups: a strip of answer-probability
+    // segments bridged into a histogram of those groups' sizes.
+    // `maximumResponseGroupCount` scales the histogram against the whole
+    // vocabulary's widest split; without one it scales to the word's own group
+    // count and the histogram simply spans the track.  `selection` makes a
+    // segment wide enough to hit open its branch report.
+    function renderResponseGroupBreakdown(row,{maximumResponseGroupCount=null,selection=null}={}){
+      const fragment=document.createDocumentFragment(),groups=row.response_groups||[],[histogram,legend]=renderResponseCountHistogram(row,maximumResponseGroupCount);
+      fragment.append(element("div","response-visual-label",numText(groups.length)+" answer groups (more groups = better)"),
+        renderAnswerStrip(row,selection),renderResponseGroupBridge(row,maximumResponseGroupCount),histogram,legend,responseGroupFacts(row));
+      return fragment;
+    }
     function renderResponseCountHistogram(row,maximumResponseGroupCount){
-      const groups=row.response_groups||[],track=element("div","response-count-track"),fill=element("div","response-count-fill"),buckets=responseGroupBuckets(groups),legend=element("div","response-bucket-legend"),fillWidth=maximumResponseGroupCount?groups.length/maximumResponseGroupCount:0;
-      fill.style.width=(maximumResponseGroupCount?100*groups.length/maximumResponseGroupCount:0)+"%";let responseGroupPosition=0;
+      const groups=row.response_groups||[],track=element("div","response-count-track"),fill=element("div","response-count-fill"),buckets=responseGroupBuckets(groups),legend=element("div","response-bucket-legend"),scale=maximumResponseGroupCount||groups.length,fillWidth=scale?groups.length/scale:0;
+      fill.style.width=100*fillWidth+"%";let responseGroupPosition=0;
       for(const bucket of buckets){
         if(bucket.responseGroupCount){
           const countText=numText(bucket.responseGroupCount),segment=element("span","response-count-segment"),label=element("span","response-count-segment-label"),wordLabel=bucket.labelText+(bucket.labelText==="1"?" word:":" words:");label.append(wordLabel,document.createElement("br"),countText+" groups");segment.append(label);
@@ -1578,7 +1622,7 @@
           const legendItem=element("span","",bucket.labelText+(bucket.labelText==="1"?" word: ":" words: ")+countText),segmentCenter=(responseGroupPosition+bucket.responseGroupCount/2)/groups.length;legendItem.style.setProperty("--bucket-color",bucket.color);legendItem.dataset.segmentCenter=String((1-fillWidth)/2+fillWidth*segmentCenter);legendItem.dataset.bucketColor=bucket.color;legend.append(legendItem);segment.dataset.legendIndex=String(legend.children.length-1);responseGroupPosition+=bucket.responseGroupCount;
         }
       }
-      track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+" out of a vocabulary maximum of "+numText(maximumResponseGroupCount));
+      track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+(maximumResponseGroupCount?" out of a vocabulary maximum of "+numText(maximumResponseGroupCount):""));
       track.append(fill);requestAnimationFrame(()=>{if(matchMedia("(max-width: 600px)").matches){for(const segment of fill.children)segment.replaceChildren();const legendItems=[...legend.children],leftColumnSize=Math.ceil(legendItems.length/2),mobileOrder=[];for(let index=0;index<leftColumnSize;index++){mobileOrder.push(legendItems[index]);if(legendItems[index+leftColumnSize])mobileOrder.push(legendItems[index+leftColumnSize]);}legend.append(...mobileOrder);return;}for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(legend.children.length)layoutResponseBucketLegend(legend);else legend.remove();});return [track,legend];
     }
     function layoutResponseBucketLegend(legend){
@@ -1613,11 +1657,11 @@
       legend.prepend(leaders);
     }
     function renderResponseGroupBridge(row,maximumResponseGroupCount){
-      const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),buckets=responseGroupBuckets(groups),svg=svgElement("svg"),viewWidth=1000,viewHeight=48,bottomBarTop=viewHeight-8,fillWidth=maximumResponseGroupCount?viewWidth*groups.length/maximumResponseGroupCount:0,lowerPosition=(viewWidth-fillWidth)/2;
+      const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),buckets=responseGroupBuckets(groups),svg=svgElement("svg"),viewWidth=1000,viewHeight=48,bottomBarTop=viewHeight-8,scale=maximumResponseGroupCount||groups.length,fillWidth=scale?viewWidth*groups.length/scale:0,lowerPosition=(viewWidth-fillWidth)/2;
       svg.setAttribute("class","response-group-bridge");svg.setAttribute("viewBox","0 0 "+viewWidth+" "+viewHeight);svg.setAttribute("preserveAspectRatio","none");svg.setAttribute("aria-hidden","true");
       let topPosition=0,bottomPosition=lowerPosition;
       for(const bucket of buckets){
-        const topWidth=answerCount?viewWidth*bucket.answerCount/answerCount:0,bottomWidth=maximumResponseGroupCount?viewWidth*bucket.responseGroupCount/maximumResponseGroupCount:0;
+        const topWidth=answerCount?viewWidth*bucket.answerCount/answerCount:0,bottomWidth=scale?viewWidth*bucket.responseGroupCount/scale:0;
         if(bucket.responseGroupCount){
           const topCenter=topPosition+topWidth/2,bottomCenter=bottomPosition+bottomWidth/2,path=svgElement("path");
           if(bucket.responseGroupCount===1||topWidth<20){const connectorStartDepth=16,middleDepth=bottomBarTop-12;path.setAttribute("d","M "+topCenter+" 0 L "+topCenter+" "+connectorStartDepth+" C "+topCenter+" "+middleDepth+" "+bottomCenter+" "+middleDepth+" "+bottomCenter+" "+bottomBarTop);}else{const curveDepth=Math.min(16,Math.max(9,topWidth/7)),edgeInset=Math.min(18,topWidth/4),centerInset=Math.min(28,topWidth/3),middleDepth=Math.max(curveDepth+6,bottomBarTop-12);path.setAttribute("d","M "+topPosition+" 0 C "+(topPosition+edgeInset)+" "+curveDepth+" "+(topCenter-centerInset)+" 0 "+topCenter+" "+curveDepth+" C "+(topCenter+centerInset)+" 0 "+(topPosition+topWidth-edgeInset)+" "+curveDepth+" "+(topPosition+topWidth)+" 0 M "+topCenter+" "+curveDepth+" C "+topCenter+" "+middleDepth+" "+bottomCenter+" "+middleDepth+" "+bottomCenter+" "+bottomBarTop);}
@@ -1642,9 +1686,9 @@
       const rows=data.rows||[];
       fragment.append(element("p","dim","Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete"));
       if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
-      const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243,key=element("div","response-visual-key");key.append(element("span","","Response-group size:"),element("span","","512+ answers"),element("span","response-color-gradient"),element("span","","1 answer"));fragment.append(key);
+      const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;fragment.append(responseVisualKey());
       const grid=element("div","grid leaderboard"),previousRows=previousBy(previous,"rows","word");
-      for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd"),[histogram,legend]=renderResponseCountHistogram(row,maximumResponseGroupCount),responseGroupCount=(row.response_groups||[]).length;entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,element("div","response-visual-label",numText(responseGroupCount)+" answer groups (more groups = better)"),renderAnswerStrip(row),renderResponseGroupBridge(row,maximumResponseGroupCount),histogram,legend,responseGroupFacts(row),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
+      for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd");entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,renderResponseGroupBreakdown(row,{maximumResponseGroupCount}),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
       fragment.append(grid);return fragment;
     }
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=gridElement("cache"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}

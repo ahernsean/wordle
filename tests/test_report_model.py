@@ -574,6 +574,51 @@ class ReportModelTest(unittest.TestCase):
             len(data["response_groups"]),
         )
 
+    def test_response_group_breakdown_covers_every_group_largest_first(self):
+        # AUDIO's groups arrive in pattern order as 1, 2, 1, so a breakdown
+        # that merely echoed the row order would not lead with the largest.
+        data = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("audio"),
+        ))["data"]
+        breakdown = data["response_group_breakdown"]
+        self.assertEqual(len(breakdown), data["total_rows"])
+        self.assertEqual(
+            [set(entry) for entry in breakdown],
+            [{"pattern", "answer_count"}] * len(breakdown),
+        )
+        self.assertEqual(
+            [entry["answer_count"] for entry in breakdown], [2, 1, 1]
+        )
+        self.assertEqual(
+            [entry["pattern"] for entry in breakdown],
+            ["y----", "-gy--", "y--y-"],
+        )
+        self.assertEqual(
+            {(entry["pattern"], entry["answer_count"]) for entry in breakdown},
+            {
+                (row["pattern"], row["answer_count"])
+                for row in data["response_groups"]
+            },
+        )
+
+    def test_response_group_breakdown_ignores_filters_and_the_display_limit(self):
+        # The graph draws the whole decomposition; narrowing the rows listed
+        # beneath it must not redraw the picture of the word.
+        target = parse_report_branch_target("audio")
+        unfiltered = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_group_breakdown"]
+        limited = collect_report(self.sources, ReportRequest(
+            branch_target=target, filters=ReportFilters(limit=1),
+        ))["data"]
+        self.assertEqual(len(limited["response_groups"]), 1)
+        self.assertEqual(limited["response_group_breakdown"], unfiltered)
+        excluded = collect_report(self.sources, ReportRequest(
+            branch_target=target, filters=ReportFilters(minimum_answer_count=3),
+        ))["data"]
+        self.assertEqual(excluded["response_groups"], [])
+        self.assertEqual(excluded["response_group_breakdown"], unfiltered)
+
     def test_response_group_groups_respect_display_limit(self):
         # response_group_groups must be built from the same limited set as
         # the flat response_groups list — otherwise the card grid renders

@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import copy
+import itertools
 import json
 from http.server import ThreadingHTTPServer
 from html.parser import HTMLParser
@@ -852,6 +853,84 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIsNone(
             self.page.locator("details.response-group").first.get_attribute("open")
         )
+
+    def test_word_report_draws_the_group_breakdown_above_the_detail(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".response-group-breakdown")
+        breakdown = self.page.locator(".response-group-breakdown")
+        self.assertIn("4 answer groups (more groups = better)",
+                      breakdown.inner_text())
+        self.assertEqual(breakdown.locator(".response-visual-key").count(), 1)
+        self.assertEqual(breakdown.locator(".response-count-track").count(), 1)
+        segments = breakdown.locator(".answer-segment")
+        self.assertEqual(segments.count(), 4)
+        widths = [segments.nth(index).bounding_box()["width"]
+                  for index in range(4)]
+        self.assertAlmostEqual(widths[0] / widths[1], 8 / 5, delta=0.02)
+        self.assertAlmostEqual(widths[3] / widths[0], 1 / 8, delta=0.02)
+        # High up: above the root-progress panel and the per-group cards.
+        top = breakdown.bounding_box()["y"]
+        self.assertLess(
+            top, self.page.locator(".root-progress-panel").bounding_box()["y"])
+        self.assertLess(
+            top,
+            self.page.locator(".grid > [data-identity]").first.bounding_box()["y"])
+
+    def test_word_report_breakdown_group_opens_its_branch_report(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(
+            ".response-group-breakdown .answer-segment.tappable-group")
+        segment = self.page.locator(".response-group-breakdown .answer-segment").first
+        self.assertEqual(segment.get_attribute("aria-label"),
+                         "Open SALET ----- branch report")
+        segment.click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "SALET -----")
+
+    def _apply_many_group_word_report(self):
+        # A word that splits its branch 201 ways: every segment but the first
+        # is a couple of pixels wide at any viewport this suite uses.
+        self.page.route("**/api/view**", lambda route: route.abort())
+        report = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["word.json"])
+        patterns = ["".join(letters)
+                    for letters in itertools.product("gy-", repeat=5)]
+        report["data"]["response_group_breakdown"] = (
+            [{"pattern": patterns[0], "answer_count": 400}]
+            + [{"pattern": pattern, "answer_count": 1}
+               for pattern in patterns[1:201]]
+        )
+        report["data"]["total_rows"] = 201
+        self.page.evaluate("""(report) => {
+          applyReport(report, null,
+            {...__reportClient.getState(), branch_target:'SALET'});
+        }""", report)
+        self.page.wait_for_selector(
+            ".response-group-breakdown .answer-segment.tappable-group")
+
+    def test_word_report_breakdown_only_opens_groups_wide_enough_to_tap(self):
+        self._apply_many_group_word_report()
+        segments = self.page.eval_on_selector_all(
+            ".response-group-breakdown .answer-segment",
+            """nodes => nodes.map(node => [node.clientWidth,
+                 node.classList.contains('tappable-group'),
+                 node.getAttribute('role')])""")
+        self.assertEqual(len(segments), 201)
+        for width, tappable, role in segments:
+            self.assertEqual(tappable, width >= 20, f"{width}px segment")
+            self.assertEqual(role, "button" if tappable else None)
+        self.assertTrue(any(tappable for _, tappable, _ in segments))
+        self.assertTrue(any(not tappable for _, tappable, _ in segments))
+
+    def test_word_report_breakdown_ignores_taps_on_narrow_groups(self):
+        self._apply_many_group_word_report()
+        narrow = self.page.locator(
+            ".response-group-breakdown .answer-segment:not(.tappable-group)").last
+        self.assertLess(narrow.bounding_box()["width"], 20)
+        narrow.click(force=True)
+        self.page.wait_for_timeout(100)
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "")
 
     def test_leaderboard_tab_ranks_openers_and_rounds_erd(self):
         self.page.locator("[data-kind=leaderboard]").click()
