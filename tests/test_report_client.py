@@ -3646,7 +3646,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=branch report")
 
     def test_sources_state_keeps_only_the_word_and_limit_the_report_reads(self):
-        # The sources report reads a trailing word and a row limit, and rejects
+        # The opener report reads a trailing word and a row limit, and rejects
         # a target naming no word rather than ignoring it, so the client must
         # not forward a branch spine or a branch filter it happens to be
         # carrying from the view the operator came from.  A spine that does

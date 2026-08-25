@@ -5293,7 +5293,7 @@ class ERDQueue:
         """Count the branches owned by these source words, each branch once.
 
         Two words can own the same branch, so summing their branch counts
-        double-counts exactly the shared ownership the source report exists to
+        double-counts exactly the shared ownership the opener report exists to
         show.  Counted over every membership, resolved or not, to match the
         per-word branch_count in source_word_rows().
         """

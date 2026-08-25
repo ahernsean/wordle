@@ -1541,7 +1541,7 @@ def collect_root_progress_report(sources: ReportSources,
                      for pattern, answer_words in group_answer_words.items()}
     # No branch context here: a root target's branch_key_hex encodes the whole
     # answer subset, which is tens of kilobytes the panel never reads.  Request
-    # detail likewise stays in the sources report; only the earliest request
+    # detail likewise stays in the opener report; only the earliest request
     # time is carried, in totals.
     data = {
         "word": word,
