@@ -240,6 +240,294 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         self.assertEqual(queue.source_work_rows(), [])
 
 
+class TestQueueAddDeleteErdCache(unittest.TestCase):
+    """--delete-erd-cache must leave a completed branch genuinely recomputable.
+
+    Deleting the cache entry alone strands it: the pending row stays `done`,
+    a surviving active_branches row defeats create_branch's INSERT OR IGNORE,
+    and claims already marked done finalize it again without work.  The
+    branch ends up neither cached nor scheduled.
+    """
+
+    N_CANDIDATES = 12
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.args = _make_args(self._tmp.name, pattern='g----')
+
+    def _open_queue(self):
+        queue = ERDQueue(self.args.queue)
+        self.addCleanup(queue.close)
+        return queue
+
+    def _add(self, delete_erd_cache=False):
+        self.args.delete_erd_cache = delete_erd_cache
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(self.args)
+        return output.getvalue()
+
+    def _promote(self, queue, worker='worker-0'):
+        """Claim the queued branch and register it as an open active branch."""
+        branch_key = bytes(queue._conn.execute(
+            'SELECT branch_key FROM branches LIMIT 1').fetchone()[0])
+        n_words = queue._conn.execute(
+            'SELECT n_words FROM pending_branches').fetchone()[0]
+        claimed = queue.claim_next(worker)
+        queue.create_branch(branch_key, n_words, self.N_CANDIDATES,
+                            priority=claimed['priority'],
+                            source_work_id=claimed['source_work_id'])
+        return branch_key, claimed
+
+    def _claim_a_bundle(self, queue, branch_key, worker='worker-0',
+                        claimed=None):
+        """Claim real candidate slots, so claim counts have something to prove.
+
+        A source-owned branch refuses a bundle whose expected_source_work_id
+        does not match its owner, so the claim row from _promote has to be
+        carried through; a branch promoted without source ownership passes
+        None for both.
+        """
+        return queue.claim_next_bundle(
+            branch_key, worker, self.N_CANDIDATES,
+            list(range(self.N_CANDIDATES)), [0.0] * self.N_CANDIDATES,
+            expected_source_work_id=(
+                claimed['source_work_id'] if claimed else None),
+            expected_source_priority=(
+                claimed['priority'] if claimed else None))
+
+    def _status(self, queue):
+        return queue._conn.execute(
+            'SELECT status FROM pending_branches').fetchone()[0]
+
+    def _counts(self, queue):
+        one = lambda sql: queue._conn.execute(sql).fetchone()[0]
+        return {
+            'open_active': one("SELECT COUNT(*) FROM active_branches "
+                               "WHERE status = 'open'"),
+            'active': one('SELECT COUNT(*) FROM active_branches'),
+            'claims': one('SELECT COUNT(*) FROM candidate_claims'),
+        }
+
+    def _finalize_as_the_swarm_does(self):
+        """Drive a branch to the shape a real finalize leaves behind.
+
+        BranchWorker calls mark_done and then delete_branch, so a completed
+        branch carries no active row and no claims -- the state #277 is
+        actually about.
+        """
+        self._add()
+        queue = self._open_queue()
+        branch_key, claimed = self._promote(queue)
+        assert self._claim_a_bundle(queue, branch_key, claimed=claimed)
+        queue.mark_done(branch_key)
+        queue.delete_branch(branch_key)
+        return queue, branch_key
+
+    # -- the case #277 is about ------------------------------------------
+
+    def test_branch_finalized_the_way_the_swarm_does_is_claimable_again(self):
+        queue, _ = self._finalize_as_the_swarm_does()
+        self.assertEqual(self._status(queue), 'done')
+        self.assertEqual(self._counts(queue),
+                         {'open_active': 0, 'active': 0, 'claims': 0})
+        self.assertIsNone(queue.claim_next('worker-1'))
+
+        self._add(delete_erd_cache=True)
+
+        self.assertEqual(self._status(queue), 'pending')
+        self.assertIsNotNone(queue.claim_next('worker-1'))
+
+    def test_pending_row_is_reset_in_place_never_removed(self):
+        queue, branch_key = self._finalize_as_the_swarm_does()
+
+        self._add(delete_erd_cache=True)
+
+        # has_pending_row is what suppresses the alpha-beta ceiling for a
+        # user-queued branch.  A row that blinked out could be re-created
+        # under an immutable ceiling and finalize as an uncacheable cut.
+        self.assertTrue(queue.has_pending_row(branch_key))
+        self.assertEqual(queue._conn.execute(
+            'SELECT COUNT(*) FROM pending_branches').fetchone()[0], 1)
+
+    # -- residue left by a crash between mark_done and delete_branch -------
+
+    def test_branch_still_open_after_mark_done_is_left_entirely_alone(self):
+        """mark_done without delete_branch leaves the branch open.
+
+        Whether that is a crashed finalize or a live descendant solve cannot
+        be told apart from these tables, so the branch is skipped -- and its
+        cache entry is kept, because deleting the result while refusing to
+        requeue would strand it exactly the way #277 describes.
+        """
+        self._add()
+        queue = self._open_queue()
+        branch_key, claimed = self._promote(queue)
+        self.assertIsNotNone(
+            self._claim_a_bundle(queue, branch_key, claimed=claimed))
+        queue.mark_done(branch_key)          # no delete_branch
+        before = self._counts(queue)
+        self.assertEqual(self._status(queue), 'done')
+        self.assertGreater(before['claims'], 0)
+        self.assertEqual(before['open_active'], 1)
+
+        output = self._add(delete_erd_cache=True)
+
+        self.assertEqual(self._counts(queue), before)
+        self.assertEqual(self._status(queue), 'done')
+        self.assertNotIn('cleared for recompute', output)
+        self.assertIn('being solved right now', output)
+
+    def test_a_busy_branch_keeps_its_cache_entry(self):
+        """The cache delete and the requeue are one decision, not two."""
+        self._add()
+        queue = self._open_queue()
+        branch_key, claimed = self._promote(queue)
+        self._claim_a_bundle(queue, branch_key, claimed=claimed)
+        queue.mark_done(branch_key)
+
+        all_answers = load_word_list(erd_search.ANSWER_FILE)
+        score_cache = ScoreCache(self.args.cache, all_answers)
+        score_cache.write(branch_key, ERD_ALL, 'salet', 3.5,
+                          max_depth=GAME_GUESSES - 2, solve_budget=None)
+        score_cache.checkpoint()
+        score_cache.close()
+
+        self._add(delete_erd_cache=True)
+
+        score_cache = ScoreCache(self.args.cache, all_answers)
+        self.addCleanup(score_cache.close)
+        # Skipping the requeue but dropping the result would leave the branch
+        # with neither -- the state the whole change exists to remove.
+        self.assertIsNotNone(score_cache.read(branch_key, ERD_ALL))
+
+    # -- branches a worker is still solving --------------------------------
+
+    def test_in_progress_branch_is_not_reset_underneath_its_worker(self):
+        self._add()
+        queue = self._open_queue()
+        self.assertIsNotNone(queue.claim_next('worker-0'))
+        self.assertEqual(self._status(queue), 'in_progress')
+
+        output = self._add(delete_erd_cache=True)
+
+        self.assertEqual(self._status(queue), 'in_progress')
+        self.assertIsNone(queue.claim_next('worker-1'))
+        self.assertNotIn('cleared for recompute', output)
+
+    def test_branch_re_promoted_as_a_descendant_is_not_reset(self):
+        """A `done` pending row does not mean the branch is idle.
+
+        create_branch takes any branch key regardless of pending status, so a
+        branch finished for one request can be re-promoted as another
+        request's descendant and hold live claims while its pending row still
+        reads `done`.  Reading only pending_branches would delete an open
+        active row and live claims out from under the worker holding them.
+        """
+        queue, branch_key = self._finalize_as_the_swarm_does()
+        queue.create_branch(
+            branch_key,
+            queue._conn.execute(
+                'SELECT n_words FROM pending_branches').fetchone()[0],
+            self.N_CANDIDATES, priority=0)
+        self.assertIsNotNone(self._claim_a_bundle(queue, branch_key, 'worker-9'))
+        before = self._counts(queue)
+        self.assertEqual(before['open_active'], 1)
+        self.assertGreater(before['claims'], 0)
+        self.assertEqual(self._status(queue), 'done')
+
+        output = self._add(delete_erd_cache=True)
+
+        self.assertEqual(self._counts(queue), before)
+        self.assertEqual(self._status(queue), 'done')
+        self.assertNotIn('cleared for recompute', output)
+
+    # -- accounting and non-targets ----------------------------------------
+
+    def test_reset_is_reported(self):
+        self._finalize_as_the_swarm_does()
+
+        output = self._add(delete_erd_cache=True)
+
+        self.assertIn('1 completed branch(es) cleared for recompute', output)
+
+    def test_without_the_flag_a_completed_branch_stays_done(self):
+        queue, _ = self._finalize_as_the_swarm_does()
+
+        output = self._add()
+
+        self.assertEqual(self._status(queue), 'done')
+        self.assertNotIn('cleared for recompute', output)
+
+    def test_reset_ignores_branches_that_were_never_queued(self):
+        output = self._add(delete_erd_cache=True)
+
+        queue = self._open_queue()
+        self.assertEqual(self._status(queue), 'pending')
+        # A fresh branch reaches 'pending' whether it was ignored or reset and
+        # re-added; only the count distinguishes them.
+        self.assertNotIn('cleared for recompute', output)
+
+
+class TestRequeueCompletedBranch(unittest.TestCase):
+    """ERDQueue.requeue_completed_branch's refusal contract."""
+
+    N_CANDIDATES = 8
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue = ERDQueue(os.path.join(self._tmp.name, 'q.sqlite3'))
+        self.addCleanup(self.queue.close)
+        self.branch_key = encode_subset(
+            load_word_list(erd_search.ANSWER_FILE)[:6])
+        self.queue.add_pending_many(
+            [(self.branch_key, 6, 0, 'salet', 0)])
+
+    def test_unknown_branch_is_refused(self):
+        self.assertFalse(self.queue.requeue_completed_branch(b'nosuchbranch'))
+
+    def test_pending_branch_is_refused(self):
+        self.assertFalse(
+            self.queue.requeue_completed_branch(self.branch_key))
+
+    def test_in_progress_branch_is_refused(self):
+        self.queue.claim_next('worker-0')
+        self.assertFalse(
+            self.queue.requeue_completed_branch(self.branch_key))
+
+    def test_done_branch_with_an_open_active_row_is_refused(self):
+        claimed = self.queue.claim_next('worker-0')
+        self.queue.create_branch(self.branch_key, 6, self.N_CANDIDATES,
+                                 priority=claimed['priority'],
+                                 source_work_id=claimed['source_work_id'])
+        self.queue.mark_done(self.branch_key)
+        self.assertEqual(self.queue._conn.execute(
+            "SELECT COUNT(*) FROM active_branches WHERE status = 'open'"
+        ).fetchone()[0], 1)
+
+        self.assertFalse(
+            self.queue.requeue_completed_branch(self.branch_key))
+        self.assertEqual(self.queue._conn.execute(
+            'SELECT status FROM pending_branches').fetchone()[0], 'done')
+
+    def test_done_branch_with_no_open_row_is_reset(self):
+        claimed = self.queue.claim_next('worker-0')
+        self.queue.create_branch(self.branch_key, 6, self.N_CANDIDATES,
+                                 priority=claimed['priority'],
+                                 source_work_id=claimed['source_work_id'])
+        self.queue.mark_done(self.branch_key)
+        self.queue.delete_branch(self.branch_key)
+
+        self.assertTrue(
+            self.queue.requeue_completed_branch(self.branch_key))
+        self.assertEqual(self.queue._conn.execute(
+            'SELECT status, claimed_by, claimed_at, completed_at '
+            'FROM pending_branches').fetchone()[:],
+            ('pending', None, None, None))
+
+
 class TestPriorityLadder(unittest.TestCase):
     """priority_ladder's rung assignment, independent of the queue."""
 
