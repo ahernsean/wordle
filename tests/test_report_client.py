@@ -2580,7 +2580,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(finalizing,null,state);await settled();
           applyReport(empty,finalizing,state);
           const card=()=>document.querySelector('[data-identity="complete"]');
-          const held={className:card().className,background:getComputedStyle(card()).backgroundColor,outline:getComputedStyle(card()).boxShadow,text:card().innerText};
+          const held={className:card().className,background:getComputedStyle(card()).backgroundColor,borderWidth:getComputedStyle(card()).borderWidth,text:card().innerText};
           const realNow=Date.now;Date.now=()=>realNow()+5001;
           applyReport(empty,empty,state);Date.now=realNow;
           await settled();
@@ -2591,7 +2591,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         """))
         self.assertIn("recently-completed", result["held"]["className"])
         self.assertEqual(result["held"]["background"], "rgb(234, 242, 252)")
-        self.assertIn("2px", result["held"]["outline"])
+        self.assertEqual(result["held"]["borderWidth"], "3px")
         self.assertIn("done", result["held"]["text"])
         self.assertFalse(result["remaining"])
         self.assertNotIn("recently-completed", result["ordinaryClass"])
