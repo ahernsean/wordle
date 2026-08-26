@@ -1893,9 +1893,13 @@
         {opacity:1,clipPath:"inset(0 0 0 0)",offset:1},
       ],{duration:total,fill:"backwards"});
     }
+    // An open group menu counts: it lives inside the report, so a poll that
+    // re-rendered would delete it out from under the finger reaching for it.
+    // Keyed on the menu rather than on a focused BUTTON, because focus rests on
+    // a button after any click in a report and that would stall every refresh.
     function reportHasFocusedControl(){
       const active=document.activeElement;
-      return (!!active&&["SELECT","INPUT","TEXTAREA","SUMMARY"].includes(active.tagName)&&byId("report").contains(active))||!!byId("report").querySelector("details.tree-branch[open]");
+      return !!openGroupMenuNode||(!!active&&["SELECT","INPUT","TEXTAREA","SUMMARY"].includes(active.tagName)&&byId("report").contains(active))||!!byId("report").querySelector("details.tree-branch[open]");
     }
     function reportHasActiveSelection(){
       const selection=getSelection();
@@ -1935,6 +1939,9 @@
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree,readingPosition=sameView?captureReadingPosition(root):null;
+      // A render the guard let through takes the menu's node with the old
+      // report, so the handle to it goes too rather than being left dangling.
+      openGroupMenuNode=null;
       centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber,halo,ink){

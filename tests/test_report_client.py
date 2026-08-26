@@ -926,6 +926,44 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "SALET")
 
+    def test_word_report_group_menu_survives_a_poll(self):
+        # The menu lives inside the report, so a refresh that re-rendered would
+        # delete it out from under the finger reaching for it.  Every other
+        # menu test acts within milliseconds and never sees a poll land.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+        self.page.locator(
+            ".response-group-breakdown .answer-segment").first.click()
+        self.page.wait_for_selector(".group-menu")
+        self.page.wait_for_timeout(int(CLIENT_POLL_MILLIS * 2.5))
+        self.assertEqual(self._menu().count(), 1,
+                         "a poll took the menu away")
+        # Still wired to its group, not merely still on screen.
+        self._menu().locator("button", has_text="Open branch report").click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "SALET -----")
+
+    def test_word_report_keeps_refreshing_once_the_menu_closes(self):
+        # The guard must lift with the menu: a report frozen by a dismissed
+        # menu would look identical to a dead connection.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+        self.page.locator(
+            ".response-group-breakdown .answer-segment").first.click()
+        self.page.wait_for_selector(".group-menu")
+        self.page.keyboard.press("Escape")
+        self.page.wait_for_selector(".group-menu", state="detached")
+        rendered = self.page.evaluate("""() => new Promise(resolve => {
+          const root = document.querySelector('#report');
+          const observer = new MutationObserver(() => {
+            observer.disconnect(); resolve(true);
+          });
+          observer.observe(root, {childList: true});
+          setTimeout(() => { observer.disconnect(); resolve(false); }, 6000);
+        })""")
+        self.assertTrue(rendered, "the report stopped refreshing after a dismissal")
+
     def _apply_many_group_word_report(self):
         # A word that splits its branch 201 ways: every segment but the first
         # is a couple of pixels wide at any viewport this suite uses.
