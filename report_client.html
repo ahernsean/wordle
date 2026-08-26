@@ -260,6 +260,17 @@
       .answer-segment, .response-count-segment { font-size:0; }
       .answer-segment[data-answer-count]::after { content:attr(data-answer-count); font-size:.66rem; }
       .response-count-segment[data-response-group-count]::after { content:attr(data-response-group-count); font-size:.66rem; }
+    }
+    /* layoutResponseBucketLegend packs labels for the card width it runs at;
+       a narrower width it hasn't repacked for can seat two labels over the
+       same span, since only their target position (not the packer's row
+       assignment) scales with the container.  Below this width the grid
+       flow it falls back to lays labels out natively, so it stays free of
+       overlaps -- and stale ones -- at any width down to it without needing
+       that repack to run.  A separate, wider threshold than the segment
+       rules above: those only hide count labels behind ::after content,
+       which stays legible however narrow the segment gets. */
+    @media (max-width:800px) {
       .response-bucket-legend { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem .55rem; min-height:0; margin-top:.4rem; }
       .response-bucket-legend > svg { display:none; }
       .response-bucket-legend > span { position:static; transform:none; font-size:.72rem; }

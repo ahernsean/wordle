@@ -3067,6 +3067,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertLessEqual(measured["scroll"], measured["client"], measured)
 
+    def test_leaderboard_legend_labels_never_overlap_after_an_unhandled_resize(self):
+        # layoutResponseBucketLegend packs labels for the card width it runs
+        # at, and only their target position -- not the packer's row
+        # assignment -- rescales with the container afterward.  A width the
+        # app hasn't repacked for (setUp's page is already 1200px wide; drop
+        # straight to 800 with no wait, so nothing gets a chance to re-render
+        # first) must fall back to a plain flow instead of seating two labels
+        # over the same span.
+        self.page.goto(self.base_url + "?kind=leaderboard")
+        self.page.wait_for_selector(".response-bucket-legend > span")
+        self.page.set_viewport_size({"width": 800, "height": 800})
+        overlaps = self.page.evaluate("""() => {
+          const overlaps = [];
+          for (const legend of document.querySelectorAll('.response-bucket-legend')) {
+            const spans = [...legend.querySelectorAll(':scope > span')]
+              .map(span => span.getBoundingClientRect());
+            for (let i = 0; i < spans.length; i++) {
+              for (let j = i + 1; j < spans.length; j++) {
+                const a = spans[i], b = spans[j];
+                if (a.left < b.right && b.left < a.right &&
+                    a.top < b.bottom && b.top < a.bottom) {
+                  overlaps.push([i, j]);
+                }
+              }
+            }
+          }
+          return overlaps;
+        }""")
+        self.assertEqual(overlaps, [], overlaps)
+
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
