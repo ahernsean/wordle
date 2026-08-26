@@ -1442,7 +1442,7 @@ class ViewSessionTest(unittest.TestCase):
 
 
 class SourcesCommandEndToEndTest(unittest.TestCase):
-    """`view --sources` end to end against a real temp queue.  An earlier
+    """`view --openers` end to end against a real temp queue.  An earlier
     `--sources` attempt raised TypeError on every invocation and was backed
     out during #203 review because no test ever actually ran it."""
 
@@ -1467,7 +1467,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         output = io.StringIO()
         with (
             patch("sys.argv", [
-                "erd_search.py", "view", "--sources",
+                "erd_search.py", "view", "--openers",
                 "--queue-path", self.queue_path,
                 "--cache-path", self.cache_path,
                 *args,
@@ -1487,12 +1487,12 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
             line for line in text.splitlines()
             if line.startswith("  ") and line.split()[0] in ("SLATE", "RAISE")
         ]), 2)
-        self.assertIn("Source words: 2", text)
+        self.assertIn("Openers: 2", text)
         self.assertIn("requests: 2", text)
         # The branch rows are not printed until a word is named, and the report
         # says which command opens them.
         self.assertNotIn("Ownership:", text)
-        self.assertIn("view --sources", text)
+        self.assertIn("view --openers", text)
 
     def test_a_word_queued_twice_is_one_row_counting_its_branches_once(self):
         # Source work is keyed by (word, priority), so queueing RAISE again at
@@ -1527,12 +1527,12 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         text = self._run("slate")
 
         self.assertIn("SLATE owns no live branches", text)
-        self.assertNotIn("view --sources SLATE", text)
+        self.assertNotIn("view --openers SLATE", text)
         # The unnamed report still points the way in.
-        self.assertIn("Name a source word", self._run())
+        self.assertIn("Name an opener", self._run())
 
     def test_source_state_filter_and_sort_reach_the_rendered_table(self):
-        # --source-state and --sort are the terminal's half of the same
+        # --opener-state and --sort are the terminal's half of the same
         # filtering the browser gets; grouping is browser-only.
         sorted_by_word = self._run("--sort", "word")
         rows = [line.split()[0] for line in sorted_by_word.splitlines()
@@ -1542,10 +1542,10 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         # Nothing is complete yet, so filtering to complete empties the table
         # and says so against the unfiltered total rather than reading as an
         # empty queue.
-        complete = self._run("--source-state", "complete")
-        self.assertIn("Source words: 0 of 2", complete)
+        complete = self._run("--opener-state", "complete")
+        self.assertIn("Openers: 0 of 2", complete)
         self.assertNotIn("SLATE", complete)
-        self.assertIn("Source words: 2", self._run("--source-state", "queued"))
+        self.assertIn("Openers: 2", self._run("--opener-state", "queued"))
 
     def test_naming_a_word_opens_that_request_s_branches(self):
         text = self._run("raise")
@@ -1555,7 +1555,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
 
     def test_json_output_round_trips_the_rolled_up_summary(self):
         report = json.loads(self._run("--format", "json"))
-        self.assertEqual(report["report_kind"], "sources")
+        self.assertEqual(report["report_kind"], "openers")
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertEqual(report["data"]["rows"], [])
         rollups = {row["source_word"]: row for row in report["data"]["summary"]}
@@ -1568,7 +1568,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         text = self._run("--format", "jsonl")
         lines = text.splitlines()
         self.assertEqual(len(lines), 1)
-        self.assertEqual(json.loads(lines[0])["report_kind"], "sources")
+        self.assertEqual(json.loads(lines[0])["report_kind"], "openers")
 
     def test_word_filter_narrows_to_the_matching_request(self):
         report = json.loads(self._run("slate", "--format", "json"))
@@ -1582,7 +1582,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
     def test_mutually_exclusive_with_other_view_kinds(self):
         with (
             patch("sys.argv", [
-                "erd_search.py", "view", "--sources", "--workers",
+                "erd_search.py", "view", "--openers", "--workers",
                 "--queue-path", self.queue_path,
                 "--cache-path", self.cache_path,
             ]),
@@ -1871,8 +1871,8 @@ class ViewParserTest(unittest.TestCase):
             ["erd_search.py", "view", "--epoch", "2"],
             ["erd_search.py", "view", "RAISE -----", "--tree", "--claims"],
             ["erd_search.py", "view", "RAISE", "--sort", "nodes"],
-            ["erd_search.py", "view", "--sources", "RAISE", "-----"],
-            ["erd_search.py", "view", "--sources", "@abcd"],
+            ["erd_search.py", "view", "--openers", "RAISE", "-----"],
+            ["erd_search.py", "view", "--openers", "@abcd"],
         ]
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):

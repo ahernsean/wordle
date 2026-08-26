@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "report_kind": "sources",
+  "report_kind": "openers",
   "generated_at": 1000,
   "branch_target": {
     "kind": "root",

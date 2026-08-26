@@ -2,7 +2,7 @@
 
 Exercises the CLI surface for ERDQueue.set_source_work_priority(): word ->
 source_work_id resolution restricted to open (non-complete) requests, the
---source-work-id disambiguation and direct-completed-request targeting, the
+--opener-work-id disambiguation and direct-completed-request targeting, the
 MAX(owner_priority) branch-sharing behaviour, and the distinct out-of-range /
 unknown-word / all-complete / ambiguous / complete-request messages.
 """
@@ -29,9 +29,9 @@ WORDS_C = ["crane", "slate", "trace"]
 def _make_args(queue_path, **overrides):
     args = types.SimpleNamespace(
         word="salet",
-        source_word=None,
+        opener_word=None,
         priority=1,
-        source_work_id=None,
+        opener_work_id=None,
         queue=queue_path,
     )
     for key, value in overrides.items():
@@ -141,7 +141,7 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run_branch_priority(_make_args(
-            self.queue_path, source_word='salet', priority=9))
+            self.queue_path, opener_word='salet', priority=9))
 
         self.assertIn('1 ownerless open branch(es)', output)
         self.assertIn('ownerless', output)
@@ -156,7 +156,7 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path, word='zzzzz'))
-        self.assertIn('no source-work request found', output)
+        self.assertIn('no opener-work request found', output)
 
     def test_all_requests_complete_reported_distinctly_from_unknown_word(self):
         queue = ERDQueue(self.queue_path)
@@ -168,8 +168,8 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=2))
-        self.assertIn('all 1 source-work request(s) are complete', output)
-        self.assertNotIn('no source-work request found', output)
+        self.assertIn('all 1 opener-work request(s) are complete', output)
+        self.assertNotIn('no opener-work request found', output)
 
     def test_completed_request_does_not_make_later_request_ambiguous(self):
         # Regression for issue #206 review finding 1: a word's first request
@@ -212,7 +212,7 @@ class TestQueueSourcePriority(unittest.TestCase):
 
         output = self._run(_make_args(self.queue_path, priority=5))
         self.assertIn('ambiguous', output)
-        self.assertIn('--source-work-id', output)
+        self.assertIn('--opener-work-id', output)
         for source_work_id in ids:
             self.assertIn(f'id {source_work_id}', output)
         self.assertIn('direct', output)
@@ -226,7 +226,7 @@ class TestQueueSourcePriority(unittest.TestCase):
         self.assertEqual(priorities, [0, 1])
 
         output = self._run(_make_args(self.queue_path, priority=5,
-                                       source_work_id=ids[0]))
+                                       opener_work_id=ids[0]))
         self.assertIn('requested priority set to 5', output)
 
     def test_source_work_id_disambiguates(self):
@@ -241,7 +241,7 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=7,
-                                       source_work_id=target_id))
+                                       opener_work_id=target_id))
         self.assertIn('requested priority set to 7', output)
 
         queue = ERDQueue(self.queue_path)
@@ -260,8 +260,8 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path,
-                                       source_work_id=bogus_id))
-        self.assertIn(f'no source-work request with id {bogus_id}', output)
+                                       opener_work_id=bogus_id))
+        self.assertIn(f'no opener-work request with id {bogus_id}', output)
 
     def test_source_work_id_can_target_completed_request_directly(self):
         # A completed id named explicitly is resolved (it belongs to the
@@ -275,9 +275,9 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=2,
-                                       source_work_id=source_work_id))
+                                       opener_work_id=source_work_id))
         self.assertIn('request is complete, cannot reprioritize', output)
-        self.assertNotIn('no source-work request with id', output)
+        self.assertNotIn('no opener-work request with id', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)

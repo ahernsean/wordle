@@ -1639,7 +1639,7 @@ def _render_source_sections(report, width, display_order):
     """
     data = report["data"]
     generated_at = report["generated_at"]
-    header = _semantic_header(report, "Source-work report", width)
+    header = _semantic_header(report, "Openers report", width)
     summary = data.get("summary", [])
     request_count = sum(row.get("request_count", 1) for row in summary)
     total_words = data.get("total_source_word_count", len(summary))
@@ -1647,7 +1647,7 @@ def _render_source_sections(report, width, display_order):
         f"{len(summary):,}" if len(summary) == total_words
         else f"{len(summary):,} of {total_words:,}"
     )
-    counts = f"Source words: {shown_words}   requests: {request_count:,}"
+    counts = f"Openers: {shown_words}   requests: {request_count:,}"
     if data.get("rows"):
         counts += f"   memberships: {data.get('matched_rows', 0):,} matched"
     lines = [counts]
@@ -1667,7 +1667,7 @@ def _render_source_sections(report, width, display_order):
             f"  {named_word.upper()} owns no live branches: its work has "
             "finished and released them."
             if named_word else
-            "  Name a source word for its branches: view --sources "
+            "  Name an opener for its branches: view --openers "
             f"{(summary[0]['source_word'] or 'WORD').upper()}",
             width,
         ))
@@ -1894,7 +1894,7 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_hotspot_sections(report, width, display_order)
     if report["report_kind"] == "leaderboard":
         return _render_leaderboard_sections(report, width)
-    if report["report_kind"] == "sources":
+    if report["report_kind"] == "openers":
         return _render_source_sections(report, width, display_order)
     if report["report_kind"] == "root_progress":
         return _render_root_progress_sections(report, width, display_order)

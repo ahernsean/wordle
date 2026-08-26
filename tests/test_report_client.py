@@ -2292,9 +2292,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The source view keeps the filter group for its own state filter and
         # drops the branch-shaped half of it; which controls it offers is
         # pinned by test_sources_controls_offer_source_axes_not_branch_ones.
-        self.page.locator("[data-kind=sources]").click()
+        self.page.locator("[data-kind=openers]").click()
         self.page.wait_for_function(
-            "() => __reportClient.getState().kind === 'sources'"
+            "() => __reportClient.getState().kind === 'openers'"
         )
         self.assertFalse(self.page.locator("#filters-group").is_hidden())
         self.assertTrue(self.page.locator("#branch-filters").is_hidden())
@@ -2773,6 +2773,90 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(colors["y"], "rgb(201, 180, 88)")
         self.assertEqual(colors["gray"], "rgb(120, 124, 126)")
 
+    def sample_theme_colors(self):
+        """--bg and the unplayed-tile background under the page's current
+        color-scheme preference, read live with no reload in between."""
+        return self.page.evaluate("""() => {
+          const word=document.createElement('span');word.className='word word-sm';
+          const node=document.createElement('span');node.className='letter blank';
+          word.append(node);document.body.append(word);
+          const result={
+            bg:getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
+            blankTile:getComputedStyle(node).backgroundColor,
+          };
+          word.remove();
+          return result;
+        }""")
+
+    def test_dark_mode_follows_os_color_scheme_live(self):
+        # Default emulation is light; the unplayed tile matches the page
+        # background, which is white.
+        light = self.sample_theme_colors()
+        self.assertEqual(light["bg"], "#ffffff")
+        self.assertEqual(light["blankTile"], "rgb(255, 255, 255)")
+
+        # Flipping the OS/browser preference repaints every themed color
+        # immediately -- no reload, no in-page toggle -- because every color
+        # in report_client.html reads a custom property rather than a literal.
+        self.page.emulate_media(color_scheme="dark")
+        dark = self.sample_theme_colors()
+        self.assertNotEqual(dark["bg"], light["bg"])
+        self.assertNotEqual(dark["blankTile"], light["blankTile"])
+        # The unplayed tile still tracks the page background in dark mode.
+        self.assertEqual(dark["blankTile"], "rgb(18, 18, 19)")
+
+        # Flipping back is just as live.
+        self.page.emulate_media(color_scheme="light")
+        restored = self.sample_theme_colors()
+        self.assertEqual(restored["bg"], light["bg"])
+        self.assertEqual(restored["blankTile"], light["blankTile"])
+
+    def render_sweep_marker(self):
+        """Render a branch report with one live worker; the marker persists
+        in the DOM afterward for a subsequent theme check with no rerender."""
+        self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.completed_candidate_indexes=[...Array(50).keys()];
+          branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+
+    def sweep_marker_background_image(self):
+        """The decoded SVG data URI currently behind the .sweep-marker."""
+        return self.page.evaluate("""() => {
+          const marker=document.querySelector('.sweep-marker');
+          const raw=marker.style.backgroundImage;
+          const uri=raw.slice('url("'.length,-'")'.length);
+          return decodeURIComponent(uri);
+        }""")
+
+    def test_worker_marker_halo_tracks_theme_with_no_rerender(self):
+        # The worker-marker digit is baked into an SVG data URI at render
+        # time, so it must be actively refreshed on a color-scheme change --
+        # reading --panel/--text live only fixes the *next* render.  This
+        # never calls applyReport a second time: every other themed color
+        # repaints on the OS/browser preference alone, and the marker must
+        # keep up the same way, not wait for the next poll to replace it.
+        self.render_sweep_marker()
+        # The background poll (default every 2s) would otherwise call
+        # fetchReport()/applyReport() again on its own schedule and rebuild
+        # the marker from scratch with live colors, which would mask a
+        # missing live-refresh path.  Blocking it means only the
+        # media-query listener under test can update the marker already
+        # on screen.
+        self.page.route("**/api/view*", lambda route: route.abort())
+        light_svg = self.sweep_marker_background_image()
+        self.assertIn('stroke="#f8f9fa"', light_svg)
+        self.assertIn('fill="#1a1a1b"', light_svg)
+
+        self.page.emulate_media(color_scheme="dark")
+        self.page.wait_for_function(
+            "document.querySelector('.sweep-marker').style.backgroundImage.includes('%231c1c1e')"
+        )
+        dark_svg = self.sweep_marker_background_image()
+        self.assertIn('stroke="#1c1c1e"', dark_svg)
+        self.assertIn('fill="#e4e6eb"', dark_svg)
+
     def test_notch_is_drawn_in_the_letter_colour(self):
         # The one test with an opinion about notch colour: it must equal the
         # letter colour of the tile it sits on, which is what currentColor buys
@@ -3182,7 +3266,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # reached phone widths overflowing because it was never measured here.
         for path in (
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
-            "?kind=leaderboard", "?kind=sources", "?kind=queue&tree=1",
+            "?kind=leaderboard", "?kind=openers", "?kind=queue&tree=1",
             "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
             # The word view carries the root-progress table, which is wider
@@ -3420,8 +3504,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotIn("branch_key_hex", cache_text)
 
     def open_sources(self):
-        self.page.locator("[data-kind=sources]").click()
-        self.page.wait_for_selector("#report h1:text-is('sources report')")
+        self.page.locator("[data-kind=openers]").click()
+        self.page.wait_for_selector("#report h1:text-is('openers report')")
 
     def test_sources_view_collapses_every_word_to_one_card(self):
         # The report's unit is the source word: three queued roots owning 1,376
@@ -3446,7 +3530,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         metrics = " ".join(
             self.page.locator("#report .metrics").first.inner_text().split()
         )
-        self.assertIn("3 source words", metrics)
+        self.assertIn("3 openers", metrics)
         self.assertIn("1,376 branches", metrics)
         self.assertIn("1,211 open", metrics)
         request_text = " ".join(requests.first.inner_text().split())
@@ -3498,9 +3582,9 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_sources_progress_marks_no_work_before_unfinished_work(self):
         self.open_sources()
         class_name = self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources')).json();
+          const report = await (await fetch('/api/view/openers')).json();
           report.data.summary[0].direct_done_branch_count = 0;
-          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          applyReport(report, null, parsePageState({search:'?kind=openers'}));
           return document.querySelector('.source-group-progress > span').className;
         }""")
         self.assertEqual(class_name, "no-work work-boundary")
@@ -3510,7 +3594,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("details.filters").evaluate("node => node.open = true")
         # A source word has its own state; branch status, phase, answer count,
         # budget and priority all describe one branch, so they stay hidden.
-        self.assertFalse(self.page.locator("#source-state-filters").is_hidden())
+        self.assertFalse(self.page.locator("#opener-state-filters").is_hidden())
         self.assertTrue(self.page.locator("#branch-filters").is_hidden())
         self.assertFalse(self.page.locator("#sort-field").is_hidden())
         self.assertFalse(self.page.locator("#group-by-field").is_hidden())
@@ -3545,34 +3629,34 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_sources_state_filter_and_sort_reach_the_request(self):
         result = self.page.evaluate("""() => ({
-          filtered: buildAPIURL(parsePageState({search:'?kind=sources&source_state=queued,active'})),
-          sorted: buildAPIURL(parsePageState({search:'?kind=sources&sort=branches'})),
-          grouped: buildAPIURL(parsePageState({search:'?kind=sources&group_by=state'})),
-          branchSort: buildAPIURL(parsePageState({search:'?kind=sources&sort=nodes'})),
-          branchGroup: buildAPIURL(parsePageState({search:'?kind=sources&group_by=cache_state'})),
-          ungrouped: buildAPIURL(parsePageState({search:'?kind=sources&group_by=none'})),
-          elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&source_state=queued'}))
+          filtered: buildAPIURL(parsePageState({search:'?kind=openers&opener_state=queued,active'})),
+          sorted: buildAPIURL(parsePageState({search:'?kind=openers&sort=branches'})),
+          grouped: buildAPIURL(parsePageState({search:'?kind=openers&group_by=state'})),
+          branchSort: buildAPIURL(parsePageState({search:'?kind=openers&sort=nodes'})),
+          branchGroup: buildAPIURL(parsePageState({search:'?kind=openers&group_by=cache_state'})),
+          ungrouped: buildAPIURL(parsePageState({search:'?kind=openers&group_by=none'})),
+          elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&opener_state=queued'}))
         })""")
-        self.assertEqual(result["ungrouped"], "/api/view/sources?group_by=none")
+        self.assertEqual(result["ungrouped"], "/api/view/openers?group_by=none")
         # URLSearchParams percent-encodes the separator; the server decodes it.
         self.assertEqual(
             result["filtered"],
-            "/api/view/sources?source_state=queued%2Cactive&group_by=state")
+            "/api/view/openers?opener_state=queued%2Cactive&group_by=state")
         self.assertEqual(result["sorted"],
-                         "/api/view/sources?sort=branches&group_by=state")
-        self.assertEqual(result["grouped"], "/api/view/sources?group_by=state")
+                         "/api/view/openers?sort=branches&group_by=state")
+        self.assertEqual(result["grouped"], "/api/view/openers?group_by=state")
         # A sort or grouping this report cannot serve falls back to the
         # default rather than being sent to be rejected, and the source filter
         # never leaks to a report that would reject it.
-        self.assertEqual(result["branchSort"], "/api/view/sources?group_by=state")
-        self.assertEqual(result["branchGroup"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["branchSort"], "/api/view/openers?group_by=state")
+        self.assertEqual(result["branchGroup"], "/api/view/openers?group_by=state")
         self.assertEqual(result["elsewhere"], "/api/view/queue")
 
     def test_sources_grouping_marks_visible_cards_as_stale_while_regrouping(self):
         self.open_sources()
         result = self.page.evaluate("""async () => {
           const originalFetch=window.fetch.bind(window);
-          const replacement=await (await originalFetch('/api/view/sources')).json();
+          const replacement=await (await originalFetch('/api/view/openers')).json();
           let release;
           window.fetch=(url, options)=>String(url).includes('group_by=elapsed')
             ? new Promise(resolve=>{release=()=>resolve(new Response(JSON.stringify(replacement),{status:200,headers:{'Content-Type':'application/json'}}));})
@@ -3609,13 +3693,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         # applied directly -- the pager is what is under test.
         def apply_page(offset, shown):
             self.page.evaluate("""async ([offset, shown]) => {
-              const report = await (await fetch('/api/view/sources')).json();
+              const report = await (await fetch('/api/view/openers')).json();
               report.data.matched_source_word_count = 12;
               report.data.total_source_word_count = 12;
               report.data.source_word_offset = offset;
               report.data.summary = report.data.summary.slice(0, shown);
               applyReport(report, null,
-                parsePageState({search:'?kind=sources&limit=3'}));
+                parsePageState({search:'?kind=openers&limit=3'}));
             }""", [offset, shown])
         apply_page(0, 3)
         pager = self.page.locator(".source-word-pager")
@@ -3637,12 +3721,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         # hundreds of branches, and a page size that truncated them with no
         # way to the rest is the defect the word pager already fixed.
         self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          const report = await (await fetch('/api/view/openers?branch_target=SALET')).json();
           report.data.matched_rows = 40;
           report.data.branch_row_offset = 4;
           report.data.rows = report.data.rows.slice(0, 4);
           applyReport(report, null,
-            parsePageState({search:'?kind=sources&branch_target=SALET&limit=4'}));
+            parsePageState({search:'?kind=openers&branch_target=SALET&limit=4'}));
         }""")
         pager = self.page.locator(".branch-row-pager")
         self.assertIn("Showing 5–8 of 40 branch rows",
@@ -3656,7 +3740,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.open_sources()
         self.assertEqual(self.page.locator(".source-word-pager").count(), 0)
         self.assertEqual(
-            self.page.evaluate("() => __reportClient.getState().source_offset"),
+            self.page.evaluate("() => __reportClient.getState().opener_offset"),
             None)
         self.assertEqual(self.page.locator(".branch-row-pager").count(), 0)
 
@@ -3664,7 +3748,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The fixture server ignores query parameters, so the grouped payload
         # is applied directly -- the renderer is what is under test.
         self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources')).json();
+          const report = await (await fetch('/api/view/openers')).json();
           const rows = report.data.summary;
           const bucket = state => rows.filter(row => row.state === state);
           const rollup = group => ({
@@ -3678,7 +3762,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             label: state, rows: bucket(state), rollup: rollup(bucket(state)),
           }));
           applyReport(report, null,
-            parsePageState({search:'?kind=sources&group_by=state'}));
+            parsePageState({search:'?kind=openers&group_by=state'}));
         }""")
         groups = self.page.locator(".source-word-groups > details")
         self.assertEqual(groups.count(), 2)
@@ -3705,7 +3789,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator(".card.source-word").first.click()
         self.page.wait_for_selector("text=word report")
         self.assertIn("branch_target=SALET", self.page.url)
-        self.assertNotIn("kind=sources", self.page.url)
+        self.assertNotIn("kind=openers", self.page.url)
         # The source-only grouping cannot be served by a word report, so it
         # must not ride along into a request that would be rejected.
         self.assertNotIn("group_by", self.page.url)
@@ -3725,13 +3809,13 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_active_source_card_shows_elapsed_work_time(self):
         text = self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources')).json();
+          const report = await (await fetch('/api/view/openers')).json();
           const row = report.data.summary[0];
           row.state = 'active';
           row.elapsed_millis = 30000;
           row.worker_millis = null;
           delete report.data.summary_groups;
-          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          applyReport(report, null, parsePageState({search:'?kind=openers'}));
           return document.querySelector('.card.source-word').innerText;
         }""")
 
@@ -3780,10 +3864,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         # silently shrink the metric beside it.  The fixture server ignores
         # limit, so the truncated payload is applied directly.
         self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          const report = await (await fetch('/api/view/openers?branch_target=SALET')).json();
           report.data.rows = report.data.rows.filter(row => !row.is_shared);
           applyReport(report, null,
-            parsePageState({search:'?kind=sources&branch_target=SALET'}));
+            parsePageState({search:'?kind=openers&branch_target=SALET'}));
         }""")
         shown = self.page.locator("[data-grid-key=source-memberships] > .card")
         self.assertEqual(shown.count(), 2)
@@ -3795,11 +3879,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         # An empty row list means two different things, and telling a reader
         # to pick a word they have already picked is the wrong one.
         self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources?branch_target=SALET')).json();
+          const report = await (await fetch('/api/view/openers?branch_target=SALET')).json();
           report.data.rows = [];
           report.data.matched_rows = 0;
           applyReport(report, null,
-            parsePageState({search:'?kind=sources&branch_target=SALET'}));
+            parsePageState({search:'?kind=openers&branch_target=SALET'}));
         }""")
         text = " ".join(self.page.locator("#report").inner_text().split())
         self.assertIn("SALET owns no live branches", text)
@@ -3814,10 +3898,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The totals come from the model, which counts each branch once; the
         # client must not re-derive them by summing the per-word counts.
         metrics = self.page.evaluate("""async () => {
-          const report = await (await fetch('/api/view/sources')).json();
+          const report = await (await fetch('/api/view/openers')).json();
           report.data.matched_branch_count = 900;
           report.data.matched_open_branch_count = 700;
-          applyReport(report, null, parsePageState({search:'?kind=sources'}));
+          applyReport(report, null, parsePageState({search:'?kind=openers'}));
           return document.querySelector('#report .metrics').innerText;
         }""")
         metrics = " ".join(metrics.split())
@@ -3839,7 +3923,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_function(
             "() => __reportClient.getState().branch_target === 'SALET'"
         )
-        self.assertIn("kind=sources", self.page.url)
+        self.assertIn("kind=openers", self.page.url)
         self.assertIn("branch_target=SALET", self.page.url)
         # The card that set the filter is the one that clears it, and is drawn
         # as the filter in force while it is -- otherwise nothing in the view
@@ -3860,7 +3944,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=branch report")
 
     def test_sources_state_keeps_only_the_word_and_limit_the_report_reads(self):
-        # The sources report reads a trailing word and a row limit, and rejects
+        # The opener report reads a trailing word and a row limit, and rejects
         # a target naming no word rather than ignoring it, so the client must
         # not forward a branch spine or a branch filter it happens to be
         # carrying from the view the operator came from.  A spine that does
@@ -3868,36 +3952,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         # trailing word alone -- so the prefix is dropped here rather than
         # displayed as though it had narrowed the answer.
         result = self.page.evaluate("""() => ({
-          explicit: buildAPIURL(parsePageState({search:'?kind=sources'})),
-          word: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=SALET'})),
-          spineToWord: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=SALET+-y---+CRANE'})),
-          branch: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=RAISE+-----'})),
-          reference: buildAPIURL(parsePageState({search:'?kind=sources&branch_target=%40222222222222'})),
-          filtered: buildAPIURL(parsePageState({search:'?kind=sources&branch_status=active&priority=3&sort=size&tree=1'})),
-          limited: buildAPIURL(parsePageState({search:'?kind=sources&limit=2'}))
+          explicit: buildAPIURL(parsePageState({search:'?kind=openers'})),
+          word: buildAPIURL(parsePageState({search:'?kind=openers&branch_target=SALET'})),
+          spineToWord: buildAPIURL(parsePageState({search:'?kind=openers&branch_target=SALET+-y---+CRANE'})),
+          branch: buildAPIURL(parsePageState({search:'?kind=openers&branch_target=RAISE+-----'})),
+          reference: buildAPIURL(parsePageState({search:'?kind=openers&branch_target=%40222222222222'})),
+          filtered: buildAPIURL(parsePageState({search:'?kind=openers&branch_status=active&priority=3&sort=size&tree=1'})),
+          limited: buildAPIURL(parsePageState({search:'?kind=openers&limit=2'}))
         })""")
         # Grouping by state is the default, and the request says so rather
         # than leaving the server to guess: a pasted URL reproduces the view.
-        self.assertEqual(result["explicit"], "/api/view/sources?group_by=state")
+        self.assertEqual(result["explicit"], "/api/view/openers?group_by=state")
         self.assertEqual(result["word"],
-                         "/api/view/sources?branch_target=SALET&group_by=state")
+                         "/api/view/openers?branch_target=SALET&group_by=state")
         self.assertEqual(result["spineToWord"],
-                         "/api/view/sources?branch_target=CRANE&group_by=state")
-        self.assertEqual(result["branch"], "/api/view/sources?group_by=state")
-        self.assertEqual(result["reference"], "/api/view/sources?group_by=state")
-        self.assertEqual(result["filtered"], "/api/view/sources?group_by=state")
+                         "/api/view/openers?branch_target=CRANE&group_by=state")
+        self.assertEqual(result["branch"], "/api/view/openers?group_by=state")
+        self.assertEqual(result["reference"], "/api/view/openers?group_by=state")
+        self.assertEqual(result["filtered"], "/api/view/openers?group_by=state")
         self.assertEqual(result["limited"],
-                         "/api/view/sources?group_by=state&limit=2")
+                         "/api/view/openers?group_by=state&limit=2")
 
     def test_worker_cards_name_the_scheduling_role_and_why(self):
         preferred = self.page.locator('.card.worker[data-identity="worker-0"]')
         # The visible text carries the noun: "preferred" alone would not say
         # preferred what, and a tooltip cannot supply it on a touch screen.
-        self.assertIn("preferred source", preferred.inner_text())
-        reason = preferred.get_by_title("serving its preferred source work")
+        self.assertIn("preferred opener", preferred.inner_text())
+        reason = preferred.get_by_title("serving its preferred opener work")
         self.assertEqual(reason.count(), 1)
         fallback = self.page.locator('.card.worker[data-identity="worker-3"]')
-        self.assertIn("fallback source", fallback.inner_text())
+        self.assertIn("fallback opener", fallback.inner_text())
         self.assertIn(
             "no claimable bundle",
             fallback.get_by_title(re.compile("fallback")).get_attribute("title"),
@@ -3915,7 +3999,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertTrue(toggle.is_visible())
         # Cache, hotspots, leaderboard, and sources have no branch topology, so
         # the layout switch is hidden entirely rather than shown-but-inert.
-        for treeless in ("cache", "hotspots", "leaderboard", "sources"):
+        for treeless in ("cache", "hotspots", "leaderboard", "openers"):
             self.page.locator(f"[data-kind={treeless}]").click()
             self.page.wait_for_selector(f"text={treeless} report")
             self.assertFalse(toggle.is_visible())

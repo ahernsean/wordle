@@ -5,14 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ERD swarm reports</title>
   <style>
-    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; }
+    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; }
+    /* The OS/browser's own color-scheme preference drives the palette live --
+       no toggle, no stored setting.  Every color elsewhere in this file reads
+       one of these custom properties rather than a literal, so flipping the
+       preference repaints the whole report without a reload. */
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg:#121213; --panel:#1c1c1e; --text:#e4e6eb; --dim:#9aa0a6;
+        --green:#538d4e; --green-complete:#3f6b3c; --yellow:#b59f3b; --gray:#3a3a3c;
+        --border:#3a3a3c; --sweep-empty:#3a3a3c; --red:#e0575a; --amber:#d4bb55;
+        --hover-tint:#1f2e1d; --popover-shadow:0 5px 16px rgba(0,0,0,.55);
+        --header-bg:rgba(18,18,19,.97); --status-amber-bg:#3a3016; --status-amber-text:#e8cf7a;
+        --status-red-bg:#3a1e1e; --card-historical-bg:#232326; --tile-blank-outline:#565758;
+        --chip-exact-text:#7fc47a; --chip-cut-text:#d9c069; --chip-loss-text:#e07a7a;
+        --flash-improved-bg:#22371f; --flash-changed-bg:#3a1e1e;
+      }
+    }
     * { box-sizing:border-box; }
     html, body { margin:0; min-width:0; background:var(--bg); color:var(--text); font:13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
     body { overflow-x:hidden; }
-    button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:#ffffff; color:var(--text); font:inherit; padding:.25rem .5rem; }
+    button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text); font:inherit; padding:.25rem .5rem; }
     button { cursor:pointer; }
     button:disabled { cursor:default; opacity:.45; }
-    button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:#edf5ec; }
+    button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:var(--hover-tint); }
     .layout-toggle { display:inline-flex; align-items:center; gap:.35rem; margin-left:.25rem; padding-left:.6rem; border-left:1px solid var(--border); }
     .layout-toggle[hidden] { display:none; }
     .layout-toggle .cap { color:var(--dim); font-size:.8rem; white-space:nowrap; }
@@ -21,7 +38,7 @@
     .layout-toggle .seg button:first-child { border-radius:5px 0 0 5px; }
     .layout-toggle .seg button:last-child { border-radius:0 5px 5px 0; margin-left:-1px; }
     input[type="checkbox"] { min-height:auto; accent-color:var(--green); }
-    header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
+    header { position:sticky; top:0; z-index:5; background:var(--header-bg); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
     .nav, .branch-target, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
     .branch-target { margin-top:.35rem; flex-wrap:nowrap; }
     #branch-target-input { flex:1 1 8rem; min-width:6rem; }
@@ -64,19 +81,19 @@
     #connection { color:var(--green); padding:.1rem .3rem; white-space:nowrap; cursor:pointer; border-radius:4px; user-select:none; }
     #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
     #connection:focus-visible { outline:2px solid var(--green); outline-offset:1px; }
-    .conn-wrap.open #connection:not(.disconnected) { background:#edf5ec; }
-    .refresh-pop { position:absolute; top:100%; right:0; z-index:20; margin-top:.2rem; padding:.35rem .5rem; background:#ffffff; border:1px solid var(--border); border-radius:6px; box-shadow:0 5px 16px rgba(0,0,0,.14); display:flex; align-items:center; gap:.4rem; white-space:nowrap; color:var(--text); opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .12s ease, transform .12s ease, visibility .12s; }
+    .conn-wrap.open #connection:not(.disconnected) { background:var(--hover-tint); }
+    .refresh-pop { position:absolute; top:100%; right:0; z-index:20; margin-top:.2rem; padding:.35rem .5rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; box-shadow:var(--popover-shadow); display:flex; align-items:center; gap:.4rem; white-space:nowrap; color:var(--text); opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .12s ease, transform .12s ease, visibility .12s; }
     .refresh-pop .cap { color:var(--dim); font-size:.8rem; }
     .refresh-pop input { width:4.5rem; text-align:right; }
     .conn-wrap.open .refresh-pop { opacity:1; visibility:visible; transform:none; }
-    .report-status { margin:.35rem 0 0; padding:.25rem .45rem; border-left:3px solid var(--amber); background:#fff9e8; color:#6f5a13; }
+    .report-status { margin:.35rem 0 0; padding:.25rem .45rem; border-left:3px solid var(--amber); background:var(--status-amber-bg); color:var(--status-amber-text); }
     .report-status[hidden] { display:none; }
     /* Where the pointer can hover, opening on hover is layered on top of the
        tap-toggle; a transparent bridge spans the gap so crossing to the panel
        does not dismiss it. */
     @media (hover:hover) and (pointer:fine) {
       .refresh-pop::before { content:""; position:absolute; left:0; right:0; top:-.4rem; height:.4rem; }
-      .conn-wrap:hover #connection:not(.disconnected) { background:#edf5ec; }
+      .conn-wrap:hover #connection:not(.disconnected) { background:var(--hover-tint); }
       .conn-wrap:hover .refresh-pop, .refresh-pop:hover { opacity:1; visibility:visible; transform:none; }
     }
     main { width:min(1200px,100%); margin:auto; padding:.5rem clamp(.5rem,1.5vw,1rem) 2rem; }
@@ -90,7 +107,7 @@
     h2 { font-size:.95rem; }
     h3 { font-size:.9rem; margin:0; }
     .dim, .source, .empty { color:var(--dim); }
-    .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:#fff1f1; }
+    .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:var(--status-red-bg); }
     .metrics { margin:.3rem 0; gap:.15rem 1rem; }
     .metric { display:inline-flex; gap:.35rem; align-items:baseline; min-width:0; flex:0 1 auto; }
     .metric strong { overflow-wrap:anywhere; }
@@ -100,7 +117,7 @@
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
     .section { margin:.45rem 0; }
     .card.active, .card.filtered { border-color:var(--green); }
-    .card.filtered { background:#edf5ec; }
+    .card.filtered { background:var(--hover-tint); }
     .card.finalizing, .stale { border-color:var(--amber); }
     .card.transitioning { border-color:var(--dim); }
     .dead { border-color:var(--red); }
@@ -113,11 +130,11 @@
        that inherited rule breaks these items internally instead of wrapping the row. */
     .worker .card-title > * { flex:0 0 auto; white-space:nowrap; overflow-wrap:normal; }
     .chip { display:inline-block; border:1px solid var(--border); border-radius:999px; padding:.05rem .4rem; color:var(--dim); font-size:.85em; }
-    .chip.exact, .outcome-exact { border-color:var(--green); color:#3e7c3a; }
-    .chip.cut, .outcome-cut { border-color:var(--amber); color:#7d6812; }
-    .chip.loss, .outcome-loss { border-color:var(--red); color:#a32c2c; }
-    .chip.historical { border-color:var(--dim); color:var(--dim); background:#ffffff; }
-    .card.historical { border-style:dashed; background:#f3f4f6; }
+    .chip.exact, .outcome-exact { border-color:var(--green); color:var(--chip-exact-text); }
+    .chip.cut, .outcome-cut { border-color:var(--amber); color:var(--chip-cut-text); }
+    .chip.loss, .outcome-loss { border-color:var(--red); color:var(--chip-loss-text); }
+    .chip.historical { border-color:var(--dim); color:var(--dim); background:var(--bg); }
+    .card.historical { border-style:dashed; background:var(--card-historical-bg); }
     /* A spine is one row of guesses or a column of them, never a ragged mix:
        it lays out on a single row, and layoutSpines drops the whole spine to a
        column when that row will not fit.  Guesses are separated by well more
@@ -148,10 +165,10 @@
     .word > .letter { position:relative; display:inline-block; text-align:center; width:var(--tile); height:var(--tile); line-height:var(--tile); padding-top:var(--letter-shift,0px); margin-right:calc(var(--tile) * var(--tile-gap-ratio)); font-family:"Helvetica Neue",Helvetica,Arial,sans-serif; font-size:calc(var(--tile) * var(--tile-font-ratio)); font-weight:700; color:#ffffff; background:var(--gray); text-transform:uppercase; }
     .word > .letter:nth-child(5) { margin-right:0; }
     .word > .letter.g { background:var(--green); } .word > .letter.y { background:var(--yellow); }
-    /* A guess with no response is the unplayed tile: white, gray outline, dark
-       letters.  The outline is inset so the tile keeps the same outer box as a
-       colored one and rows of both sit on a shared grid. */
-    .word > .letter.blank { background:#ffffff; color:var(--text); box-shadow:inset 0 0 0 max(1px,calc(var(--tile) * var(--tile-outline-ratio))) #878a8c; }
+    /* A guess with no response is the unplayed tile: page-background fill, gray
+       outline, page-foreground letters.  The outline is inset so the tile keeps
+       the same outer box as a colored one and rows of both sit on a shared grid. */
+    .word > .letter.blank { background:var(--bg); color:var(--text); box-shadow:inset 0 0 0 max(1px,calc(var(--tile) * var(--tile-outline-ratio))) var(--tile-blank-outline); }
     .tile-button { border:0; padding:0; background:transparent; line-height:0; }
     .tile-button:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
     /* A guess that is itself a possible answer is notched at the corner of its
@@ -247,8 +264,8 @@
     .badge { background:var(--red); color:white; border-radius:4px; padding:.1rem .35rem; }
     .flash-added { animation:added 1.5s; } .flash-improved { animation:improved 1.5s; } .flash-changed { animation:changed 1.5s; }
     @keyframes added { from { box-shadow:0 0 0 3px var(--green); } }
-    @keyframes improved { from { border-color:var(--green); background:#e8f4e7; } }
-    @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
+    @keyframes improved { from { border-color:var(--green); background:var(--flash-improved-bg); } }
+    @keyframes changed { from { border-color:var(--red); background:var(--flash-changed-bg); } }
     @media (max-width:600px), (hover:none) and (pointer:coarse) {
       header { position:static; }
     }
@@ -265,7 +282,7 @@
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="sources">Sources</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="openers">Openers</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
       <span class="conn-wrap">
         <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
@@ -282,7 +299,7 @@
     <details class="filters"><summary>Filters &amp; view</summary>
       <div class="control-group" id="filters-group">
         <div class="group-head"><span class="gname">Filters:</span><span class="ghint">narrow what's listed — applied as you change them</span></div>
-        <div class="status-line" id="source-state-filters"><span class="label">Source state</span><span class="statuses" id="source-states"></span></div>
+        <div class="status-line" id="opener-state-filters"><span class="label">Opener state</span><span class="statuses" id="source-states"></span></div>
         <div id="branch-filters">
           <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
           <div class="status-line"><span class="label">Branch phase</span><span class="statuses" id="branch-phases"></span></div>
@@ -324,11 +341,11 @@
     // DOM rather than toggled — an absent option can't appear in any picker.
     const SORT_OPTIONS_DEFAULT=[["","default"],["age","age"],["size","size"],["workers","workers"],["priority","priority"],["nodes","nodes"],["slowest","slowest"]];
     const SORT_OPTIONS_WORD=[["size","size (default)"],["workers","workers"],["priority","priority"]];
-    const SORT_OPTIONS_SOURCES=[["completed","most recently completed"],["","ERD (lowest first)"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
+    const SORT_OPTIONS_OPENERS=[["completed","most recently completed"],["","ERD (lowest first)"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
-    const GROUP_BY_OPTIONS_SOURCES=[["state","state (default)"],["completed","completion date"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","time since request"],["worker_presence","worker"],["priority","priority"],["none","none"]];
-    const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","sources"]);
-    const treelessKinds=new Set(["cache","hotspots","leaderboard","sources"]);
+    const GROUP_BY_OPTIONS_OPENERS=[["state","state (default)"],["completed","completion date"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","time since request"],["worker_presence","worker"],["priority","priority"],["none","none"]];
+    const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","openers"]);
+    const treelessKinds=new Set(["cache","hotspots","leaderboard","openers"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
     let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true,leaderboardReportWidth=null;
@@ -414,14 +431,14 @@
     const isInferredWordState=(kind,branchTarget)=>kind==="auto"&&isWordTarget(branchTarget);
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),source_state:branchValues(state.source_state,sourceStateNames)||[],source_offset:intOrNull(state.source_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_phase:branchValues(state.branch_phase,branchPhaseNames),opener_state:branchValues(state.opener_state,sourceStateNames)||[],opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
       if(normalized.branch_status===undefined)normalized.branch_status=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree?["active"]:[];
       if(normalized.branch_phase===undefined)normalized.branch_phase=[];
-      if(normalized.source_state===undefined)normalized.source_state=[];
-      if(normalized.kind!=="sources")normalized.source_state=[];
+      if(normalized.opener_state===undefined)normalized.opener_state=[];
+      if(normalized.kind!=="openers")normalized.opener_state=[];
       // Paging is meaningless without a page size, and only this report pages.
-      if(normalized.kind!=="sources"||normalized.limit===null||!normalized.source_offset)normalized.source_offset=null;
-      if(normalized.kind!=="sources"||normalized.limit===null||!normalized.branch_row_offset)normalized.branch_row_offset=null;
+      if(normalized.kind!=="openers"||normalized.limit===null||!normalized.opener_offset)normalized.opener_offset=null;
+      if(normalized.kind!=="openers"||normalized.limit===null||!normalized.branch_row_offset)normalized.branch_row_offset=null;
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
@@ -431,13 +448,13 @@
       // names no word is dropped, and one that reaches a word through a spine
       // keeps only that word: the report reads the trailing word alone, so a
       // displayed spine prefix would promise a narrower answer than it gives.
-      if(normalized.kind==="sources"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.claims=false;normalized.answers=false;
-        if(!SORT_OPTIONS_SOURCES.some(([value])=>value===normalized.sort))normalized.sort="";
+      if(normalized.kind==="openers"){normalized.branch_status=[];normalized.branch_phase=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.budget=null;normalized.priority=null;normalized.claims=false;normalized.answers=false;
+        if(!SORT_OPTIONS_OPENERS.some(([value])=>value===normalized.sort))normalized.sort="";
         // Grouped by state unless asked otherwise: the states partition the
         // words into what is running, what is waiting, and what is finished,
         // which is the first cut an operator makes by eye anyway.  "none" is
         // an explicit choice rather than the absence of one.
-        if(!GROUP_BY_OPTIONS_SOURCES.some(([value])=>value===normalized.group_by))normalized.group_by="state";normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
+        if(!GROUP_BY_OPTIONS_OPENERS.some(([value])=>value===normalized.group_by))normalized.group_by="state";normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
       if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_phase=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
@@ -449,13 +466,13 @@
       const inferredWord=isInferredWordState(normalized.kind,normalized.branch_target);
       if(inferredWord&&!['size','workers','priority'].includes(normalized.sort))normalized.sort="size";
       if(inferredWord&&!GROUP_BY_OPTIONS_WORD.some(([value])=>value===normalized.group_by))normalized.group_by="";
-      if(!inferredWord&&normalized.kind!=="sources")normalized.group_by="";
+      if(!inferredWord&&normalized.kind!=="openers")normalized.group_by="";
       return normalized;
     }
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),source_state:parseFilter("source_state"),source_offset:query.get("source_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_phase:parseFilter("branch_phase"),opener_state:parseFilter("opener_state"),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -465,8 +482,8 @@
       const addBranchFilter=(name,values,defaults)=>{if(JSON.stringify(values)===JSON.stringify(defaults))return;query.set(name,values.length?values.join(","):"all");};
       addBranchFilter("branch_status",state.branch_status,defaultStatuses);
       addBranchFilter("branch_phase",state.branch_phase,[]);
-      addBranchFilter("source_state",state.source_state,[]);
-      for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","group_by","limit","source_offset","branch_row_offset","by","epoch","since_seconds","sample_size"])if(state[name]!==null&&state[name]!=="")query.set(name,String(state[name]));
+      addBranchFilter("opener_state",state.opener_state,[]);
+      for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","group_by","limit","opener_offset","branch_row_offset","by","epoch","since_seconds","sample_size"])if(state[name]!==null&&state[name]!=="")query.set(name,String(state[name]));
       if(state.worker_id)query.set("worker",state.worker_id);
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
       if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
@@ -480,11 +497,11 @@
     }
     function contextKey(state){return buildAPIURL(state);}
     function abortActiveRequest(){if(activeRequestController){activeRequestController.abort();activeRequestController=null;}}
-    function groupByLabel(state){const options=state.kind==="sources"?GROUP_BY_OPTIONS_SOURCES:GROUP_BY_OPTIONS_WORD;return options.find(([value])=>value===state.group_by)?.[1]||"none";}
+    function groupByLabel(state){const options=state.kind==="openers"?GROUP_BY_OPTIONS_OPENERS:GROUP_BY_OPTIONS_WORD;return options.find(([value])=>value===state.group_by)?.[1]||"none";}
     function setReportStatus(message){const status=byId("report-status");status.hidden=!message;status.textContent=message||"";}
     function pendingReportStatus(state){
-      if(displayedState?.kind==="sources"&&state.kind==="sources"&&displayedState.group_by!==state.group_by)return "Showing groups by "+groupByLabel(displayedState)+" while regrouping by "+groupByLabel(state)+"…";
-      return "Computing "+(state.kind==="sources"?"sources report":state.kind==="leaderboard"?"leaderboard":"report")+"…";
+      if(displayedState?.kind==="openers"&&state.kind==="openers"&&displayedState.group_by!==state.group_by)return "Showing groups by "+groupByLabel(displayedState)+" while regrouping by "+groupByLabel(state)+"…";
+      return "Computing "+(state.kind==="openers"?"openers report":state.kind==="leaderboard"?"leaderboard":"report")+"…";
     }
     function setState(next,push=true){
       abortActiveRequest();
@@ -504,19 +521,19 @@
       byId("layout-flat").setAttribute("aria-pressed",currentState.tree?"false":"true");
       byId("layout-tree").setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
-      const kind=currentState.kind, isHotspots=kind==="hotspots", isSources=kind==="sources";
+      const kind=currentState.kind, isHotspots=kind==="hotspots", isSources=kind==="openers";
       const wordReport=isInferredWordState(kind,currentState.branch_target);
-      const sortSelect=byId("sort"),sortMode=isSources?"sources":wordReport?"word":"default";
-      const sortOptions=isSources?SORT_OPTIONS_SOURCES:wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT;
+      const sortSelect=byId("sort"),sortMode=isSources?"openers":wordReport?"word":"default";
+      const sortOptions=isSources?SORT_OPTIONS_OPENERS:wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT;
       if(sortSelect.dataset.mode!==sortMode){
         sortSelect.replaceChildren(...sortOptions.map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
         sortSelect.dataset.mode=sortMode;
       }
       // Same rebuild for group-by: its strategies differ per report, and a
       // hidden <option> still shows in iOS Safari's picker.
-      const groupSelect=byId("group-by"),groupMode=isSources?"sources":"word";
+      const groupSelect=byId("group-by"),groupMode=isSources?"openers":"word";
       if(groupSelect.dataset.mode!==groupMode){
-        groupSelect.replaceChildren(...(isSources?GROUP_BY_OPTIONS_SOURCES:GROUP_BY_OPTIONS_WORD).map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
+        groupSelect.replaceChildren(...(isSources?GROUP_BY_OPTIONS_OPENERS:GROUP_BY_OPTIONS_WORD).map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
         groupSelect.dataset.mode=groupMode;
       }
       sortSelect.value=currentState.sort||(isSources?"completed":"");byId("by").value=currentState.by;groupSelect.value=currentState.group_by;
@@ -524,12 +541,12 @@
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
       document.querySelectorAll("[data-branch-phase]").forEach(input=>input.checked=currentState.branch_phase.includes(input.value));
-      document.querySelectorAll("[data-source-state]").forEach(input=>input.checked=currentState.source_state.includes(input.value));
+      document.querySelectorAll("[data-source-state]").forEach(input=>input.checked=currentState.opener_state.includes(input.value));
       const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(currentState.by);
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
       // A source word is filtered by its own state, never by branch status,
       // phase, answer count, budget or priority -- those describe one branch.
-      byId("source-state-filters").hidden=!isSources;
+      byId("opener-state-filters").hidden=!isSources;
       byId("branch-filters").hidden=isSources;
       byId("sort-field").hidden=kind==="cache"||isHotspots;
       byId("group-by-field").hidden=!wordReport&&!isSources;
@@ -537,7 +554,7 @@
       byId("limit-label").textContent=currentState.tree?"Items per page":isSources?"Words per page":kind==="auto"?"Branches shown":"Rows shown";
       byId("limit-field").hidden=currentState.tree;
     }
-    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),source_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,source_offset:null,branch_row_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_phase:[...document.querySelectorAll("[data-branch-phase]:checked")].map(input=>input.value),opener_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,opener_offset:null,branch_row_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -807,7 +824,7 @@
     }
     function activeSortLabel(state){
       const wordReport=isInferredWordState(state.kind,state.branch_target);
-      const options=state.kind==="sources"?SORT_OPTIONS_SOURCES:wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT;
+      const options=state.kind==="openers"?SORT_OPTIONS_OPENERS:wordReport?SORT_OPTIONS_WORD:SORT_OPTIONS_DEFAULT;
       const value=state.sort||options[0]?.[0]||"";
       return options.find(([optionValue])=>optionValue===value)?.[1]||value||"default";
     }
@@ -854,7 +871,7 @@
     // Why this worker is on the branch it is on: the recorded scheduling role,
     // carrying the model's reason text as its tooltip.  A worker between claims
     // has no role recorded and shows none.
-    const SCHEDULING_ROLE_TEXT={preferred:"preferred source",fallback:"fallback source",direct:"direct work"};
+    const SCHEDULING_ROLE_TEXT={preferred:"preferred opener",fallback:"fallback opener",direct:"direct work"};
     function schedulingRoleCell(worker){
       if(!worker.scheduling_role)return null;
       const cell=element("span","",SCHEDULING_ROLE_TEXT[worker.scheduling_role]||worker.scheduling_role);
@@ -902,13 +919,17 @@
       const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));
       const cellLeft=cell=>`calc((100% - ${cellCount-1}px) * ${cell} / ${cellCount} + ${cell}px)`;
       const animate=comparisonAvailable&&!matchMedia("(prefers-reduced-motion: reduce)").matches;
+      // Read once per strip, not once per worker: the halo/fill colors are the
+      // same for every marker in this render pass.
+      const rootStyle=workers?.length?getComputedStyle(document.documentElement):null;
+      const markerHalo=rootStyle?.getPropertyValue("--panel").trim(),markerInk=rootStyle?.getPropertyValue("--text").trim();
       for(const worker of workers||[]){
         if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
         const cell=cellFor(worker.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
         const marker=element("span","sweep-marker");
         marker.dataset.workerNumber=workerNumber;
         marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
-        marker.style.backgroundImage=workerMarkerImage(workerNumber);
+        marker.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
         const previous=previousWorkersById?.get(String(worker.worker_id));
         const previousIndex=previous&&previous.branch_key_hex===worker.branch_key_hex?previous.candidate_index:null;
         if(animate&&previousIndex!==null&&previousIndex!==undefined){
@@ -1359,7 +1380,7 @@
       const best=bestGuessCell(worker,worker.answer_count);
       const search=[["best",best],["effective bound",worker.bound_erd===null||worker.bound_erd===undefined?null:fixed(worker.bound_erd)],["solved",worker.solved_evaluation_count],["ERD cutoffs",worker.erd_cutoff_evaluation_count],["depth prunes",worker.remaining_depth_pruned_evaluation_count]];
       fragment.append(section("Search state",labeledFacts(search)));
-      const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["source work",worker.source_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];
+      const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["opener work",worker.source_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];
       fragment.append(section("Cumulative worker counters",labeledFacts(cumulative)));
       return fragment;
     }
@@ -1388,7 +1409,7 @@
       // The branch list is the other thing this card leads to, so it gets its
       // own control rather than taking the card's own click.
       const branchesButton=element("button","",isFiltered?"Hide branches":"Branches");
-      branchesButton.addEventListener("click",event=>{event.stopPropagation();setState({...state,kind:"sources",branch_target:isFiltered?"":word});});
+      branchesButton.addEventListener("click",event=>{event.stopPropagation();setState({...state,kind:"openers",branch_target:isFiltered?"":word});});
       title.append(branchesButton);
       card.append(title);
       // The source's response groups separate work that was unnecessary from
@@ -1423,7 +1444,7 @@
       // so it is drawn as one rather than spelled out as a bare pattern.
       if(row.root_pattern)card.append(renderSpine([{word:row.source_word,pattern:row.root_pattern}],"word-sm"));
       card.append(labeledFacts([
-        ["source","#"+row.source_work_id+" "+String(row.source_word||"-").toUpperCase()],
+        ["opener","#"+row.source_work_id+" "+String(row.source_word||"-").toUpperCase()],
         ["requested priority",row.requested_priority],
         ["effective priority",row.branch_effective_priority],
         ["owners",row.owner_count],
@@ -1476,11 +1497,11 @@
       // The branch totals come from the model, which counts each branch once
       // across the matched words; summing the per-word counts here would
       // double-count a branch two words own.
-      metrics.append(metric("source words",matchedWords),metric("branches",data.matched_branch_count),metric("open",data.matched_open_branch_count));
-      fragment.append(metrics,element("h2","","Source words"));
+      metrics.append(metric("openers",matchedWords),metric("branches",data.matched_branch_count),metric("open",data.matched_open_branch_count));
+      fragment.append(metrics,element("h2","","Openers"));
       if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+numText(totalWords)+" words match this state filter."));
       const namedWord=(state.branch_target||"").trim();
-      if(!sourceWords.length)fragment.append(element("p","empty",totalWords?"No source word matches this state filter":"No source-work requests"));
+      if(!sourceWords.length)fragment.append(element("p","empty",totalWords?"No opener matches this state filter":"No opener requests"));
       // A named word with no rows owns no live branch — its work has finished
       // and released its ownership.
       else if(!rows.length&&namedWord)fragment.append(element("p","dim",
@@ -1511,7 +1532,7 @@
       }
       const wordPager=sourceListPager({
         state,offset:data.source_word_offset??0,shownCount:sourceWords.length,
-        matchedCount:matchedWords,noun:"words",offsetField:"source_offset",
+        matchedCount:matchedWords,noun:"words",offsetField:"opener_offset",
         className:"source-word-pager"});
       if(wordPager)fragment.append(wordPager);
       if(!rows.length)return fragment;
@@ -1876,15 +1897,27 @@
       // measured at rest rather than part-way through somebody else's animation.
       endGridTransitions();
       const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;document.querySelector("details.filters").hidden=report.report_kind==="branch_reference_matches";if(report.report_kind!=="branch_reference_matches")content.append(reportHeader(report,state));
-      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else if(report.report_kind==="sources")content.append(renderSources(report,previousReport,state));else throw new Error("Unknown report kind");
+      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else if(report.report_kind==="openers")content.append(renderSources(report,previousReport,state));else throw new Error("Unknown report kind");
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree,readingPosition=sameView?captureReadingPosition(root):null;
       centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
-    function workerMarkerImage(workerNumber){
-      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
+    function workerMarkerImage(workerNumber,halo,ink){
+      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="'+halo+'" stroke-width="2.5" stroke-linejoin="round" fill="'+ink+'">'+workerNumber+'</text></svg>';
       return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
+    }
+    // The marker's halo/fill are baked into a static SVG at render time, so a
+    // color-scheme flip between polls -- which repaints every other themed
+    // color immediately, since those all read the custom property live --
+    // would otherwise leave markers already on screen showing the old theme
+    // until the next report replaces them.  Refresh every marker currently in
+    // the document whenever the preference changes, independent of polling.
+    function refreshWorkerMarkerColors(){
+      const markers=document.querySelectorAll(".sweep-marker");
+      if(!markers.length)return;
+      const style=getComputedStyle(document.documentElement),halo=style.getPropertyValue("--panel").trim(),ink=style.getPropertyValue("--text").trim();
+      for(const marker of markers)marker.style.backgroundImage=workerMarkerImage(marker.dataset.workerNumber,halo,ink);
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     async function fetchReport(){
@@ -1969,6 +2002,7 @@
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
+      matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
       addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }

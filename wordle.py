@@ -1260,7 +1260,7 @@ def _format_scan_progress(root_done, root_total, root_best, culled,
     counts.
 
     Shared by the pre-prompt status block, ERDSolver's periodic "Targeted
-    scan" report, and BranchPrecacheSolver's periodic "Root-word scan"
+    scan" report, and BranchPrecacheSolver's periodic "Opener scan"
     report. current_tag is (word, elapsed_s, hits, misses) or None — see
     _current_candidate_tag. Every line is prefixed with `indent` spaces;
     the candidate line gets two more.
@@ -2761,7 +2761,7 @@ class ERDSolver(threading.Thread):
         self.root_best = None     # (word, erd) — best candidate found so far
         self.culled = 0           # top-level candidates pruned without recursing
         self.word_stats = []      # [(rank, word, wall_s, cpu_s, hits, misses), ...]
-        # Live mid-word progress: a single root word can take far longer than
+        # Live mid-word progress: a single opener can take far longer than
         # the gap between progress_callback firings (it recurses through its
         # whole branch tree before reporting). These let the status line
         # and the periodic report show that work is happening *during* that
@@ -2893,7 +2893,7 @@ class ERDSolver(threading.Thread):
         self.root_best = (best_guess, best_erd)
 
     def _start_word(self, score_cache, ranked_guesses, done):
-        """Mark the start of root-word ranked_guesses[done] for live progress
+        """Mark the start of opener ranked_guesses[done] for live progress
         (current_word_tag below) — separate from word_stats, which only
         records *completed* words. Resets the cache's read counters so
         current_word_tag's hit/miss counts describe only this candidate."""
@@ -2902,7 +2902,7 @@ class ERDSolver(threading.Thread):
         score_cache.reset_read_counters()
 
     def current_word_tag(self):
-        """(word, elapsed_s, hits, misses) for the root word currently being
+        """(word, elapsed_s, hits, misses) for the opener currently being
         evaluated, or None if nothing is in progress — see
         _current_candidate_tag."""
         return _current_candidate_tag(self._score_cache, self.current_word,
@@ -2950,7 +2950,7 @@ class ERDSolver(threading.Thread):
             word_cpu  = [_cpu_now()]  # None if thread_time unavailable
 
             # Periodic "Targeted scan" report — same shape and 30s cadence
-            # as BranchPrecacheSolver's "Root-word scan" report, for the one
+            # as BranchPrecacheSolver's "Opener scan" report, for the one
             # position this solver is scanning. Only prints if last_guess
             # was supplied (always true from main(); some tests omit it).
             last_print = [time.time()]
@@ -3179,7 +3179,7 @@ class BranchPrecacheSolver(threading.Thread):
 
         def _title():
             return (f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} '
-                    f'Root-word scan of {self.guess_word.upper()}')
+                    f'Opener scan of {self.guess_word.upper()}')
 
         try:
             if self._cancel.is_set():
@@ -3235,7 +3235,7 @@ class BranchPrecacheSolver(threading.Thread):
                         return
                     last_print[0] = now
                     logger.info(
-                        "Root-word scan of %s, branch %s (%d words): "
+                        "Opener scan of %s, branch %s (%d words): "
                         "%d/%d done, %d culled, best=%s, candidate=%s",
                         self.guess_word.upper(), format_response(response_pat),
                         self.current_branch_size, self.root_done, self.root_total,
