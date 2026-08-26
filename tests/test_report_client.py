@@ -3133,17 +3133,11 @@ class ReportClientBrowserTest(unittest.TestCase):
             context.close()
 
     def test_leaderboard_legend_labels_never_overlap_after_an_unhandled_resize(self):
-        # The bucket legend lays its labels out with plain CSS grid flow (see
-        # issue #261, where a width-dependent absolute-positioning scheme --
-        # even a percentage-based one -- could still seat two labels over the
-        # same span at a width it hadn't repacked for, and a single fixed
-        # breakpoint below the render width just moved the same collision to
-        # wherever the breakpoint stopped covering, e.g. 801px carrying
-        # 1200px-computed positions one CSS pixel above an 800px cutoff).
-        # Flow can't collide at any width, so this holds with no chance for a
-        # re-render at every width between the two: setUp's page is already
-        # 1200px wide, and each width below drops straight to it with no
-        # wait, so nothing gets a chance to run first.
+        # The bucket legend lays its labels out with plain CSS grid flow, so
+        # no two labels can overlap regardless of the card's width or
+        # whether a render has ever run at that width. setUp's page is
+        # already 1200px wide; each width below drops straight to it with no
+        # wait, so nothing gets a chance to re-render first.
         self.page.goto(self.base_url + "?kind=leaderboard")
         self.page.wait_for_selector(".response-bucket-legend > span")
         for width in (375, 480, 600, 700, 800, 801, 900, 1000, 1100, 1199, 1200):

@@ -201,13 +201,8 @@
     .response-count-segment { display:flex; align-items:center; justify-content:center; min-width:0; overflow:hidden; color:#ffffff; font-size:.68rem; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.65); box-shadow:inset -1px 0 rgba(255,255,255,.5); }
     .response-count-segment-label { flex:0 0 auto; line-height:.62rem; }
     .response-count-segment:last-child { box-shadow:none; }
-    /* A grid, not the leader-line-and-absolute-position layout this once
-       was: that positioned each label in pixels for the card's width at the
-       time it ran, and only the label's own target point (not the row it
-       shared with its neighbors) rescaled on a width change the app hadn't
-       repacked for, so two labels could still end up sharing a row that no
-       longer fit them both.  Plain grid flow can't collide, at any width,
-       whether or not a repack ever runs. */
+    /* Plain grid flow: every label stays in normal document flow, so none
+       can overlap another regardless of the card's width. */
     .response-bucket-legend { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem .55rem; margin-top:.4rem; color:var(--dim); font-size:.72rem; }
     .response-bucket-legend > span::before { content:""; display:inline-block; width:.55rem; height:.55rem; margin-right:.16rem; border-radius:1px; vertical-align:-.08rem; background:var(--bucket-color); }
     .leaderboard-worst-case { margin-top:.15rem; font-size:.8rem; }
