@@ -164,15 +164,15 @@
        slash, and the pair never breaks across a line. */
     .word-erd { white-space:normal; }
     .word-erd > .word-erd-pair { white-space:nowrap; }
-    /* The bucket legend below positions its labels with an absolute left in
-       pixels computed for the card's width at the time it last laid out; a
-       width change the app hasn't yet re-laid out for (a resize event that
-       hasn't fired, or fired but not yet handled) can leave a label positioned
-       past the card's new, narrower edge.  Clipping horizontally here keeps
-       that transient state from ever widening the page -- the legend's own
-       svg leader lines still escape its box vertically into the margin
-       reserved above it, comfortably inside the card's own height, so this
-       does not clip them. */
+    /* The bucket legend's labels rescale with the card via a percentage left
+       (see layoutResponseBucketLegend), so an ordinary width change keeps
+       them in bounds without needing a resize handler to run first.  That
+       guarantee is only as good as the packing math behind it, though, so
+       this clips horizontally as a backstop against whatever a future change
+       (or a width collapse more extreme than the packer was built for) gets
+       wrong -- the legend's own svg leader lines still escape its box
+       vertically into the margin reserved above it, comfortably inside the
+       card's own height, so this does not clip them. */
     .leaderboard-card { padding:.65rem .75rem; overflow-x:hidden; }
     .leaderboard-card .card-title { font-size:1.05rem; gap:.55rem; }
     .leaderboard-rank { color:var(--dim); }
@@ -1615,7 +1615,12 @@
         search(0,-1);
       }
       const placements=best?.placements||pack(itemData.map((_,index)=>index))||[];
-      for(const placement of placements){placement.item.style.left=placement.x+"px";placement.item.style.top=((placement.top-leaderGap))+"px";}
+      // A percentage, not a pixel, so a width change the app hasn't relaid
+      // out for yet (a resize event that hasn't fired) rescales the label
+      // with its container instead of holding the old absolute offset --
+      // the same reason the leader-line svg below is driven by a viewBox
+      // rather than pixel coordinates.
+      for(const placement of placements){placement.item.style.left=(placement.x/width*100)+"%";placement.item.style.top=((placement.top-leaderGap))+"px";}
       legend.style.minHeight=Math.max(laneHeight,...placements.map(placement=>placement.top-leaderGap+placement.height))+"px";
       const leaders=svgElement("svg");leaders.setAttribute("viewBox","0 0 "+width+" "+(legend.offsetHeight+leaderGap));leaders.setAttribute("preserveAspectRatio","none");
       for(const placement of placements){const routeY=Math.max(7,placement.top-3),path=svgElement("path");path.setAttribute("d","M "+placement.sourceX+" 0 C "+placement.sourceX+" "+routeY+" "+placement.x+" "+routeY+" "+placement.x+" "+placement.top);path.setAttribute("fill","none");path.setAttribute("stroke",placement.item.dataset.bucketColor);path.setAttribute("stroke-width","1.5");path.setAttribute("stroke-linecap","round");path.setAttribute("opacity",".82");leaders.append(path);}

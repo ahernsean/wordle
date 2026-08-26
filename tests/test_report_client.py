@@ -3049,11 +3049,12 @@ class ReportClientBrowserTest(unittest.TestCase):
             context.close()
 
     def test_leaderboard_card_clips_a_stray_bucket_legend_position(self):
-        # layoutResponseBucketLegend positions each legend label in pixels
-        # computed from the card's width at the time it last ran; a label left
-        # over from a wider layout (see issue #261, where a WebKit resize
-        # left one stale) must never widen the page, whatever pixel value it
-        # was last given.
+        # layoutResponseBucketLegend positions each legend label with a
+        # percentage left so it rescales with the card on an ordinary width
+        # change (see issue #261), but that guarantee is only as good as the
+        # packing math behind it.  Whatever gets a label to a bad position --
+        # this test forces the pathological case directly -- must never widen
+        # the page.
         self.page.goto(self.base_url + "?kind=leaderboard")
         self.page.wait_for_selector(".response-bucket-legend > span")
         measured = self.page.evaluate("""() => {
