@@ -286,6 +286,24 @@ class ReportModelTest(unittest.TestCase):
         self.assertIsNone(cache.read_candidate_erd(branch_key, "nurdy", ERD_ALL))
         cache.close()
 
+    def test_delete_candidate_erd_drops_only_the_named_fold(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        other_key = ScoreCache.encode_subset(ANSWERS[:2])
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        cache.write_candidate_erd(branch_key, "crane", ERD_ALL, 1.80, 1, 4)
+        cache.write_candidate_erd(other_key, "salet", ERD_ALL, 1.50, 1, 2)
+
+        cache.delete_candidate_erd(branch_key, "salet", ERD_ALL)
+
+        self.assertIsNone(cache.read_candidate_erd(branch_key, "salet", ERD_ALL))
+        self.assertIsNotNone(cache.read_candidate_erd(branch_key, "crane", ERD_ALL))
+        self.assertIsNotNone(cache.read_candidate_erd(other_key, "salet", ERD_ALL))
+        # Deleting a fold that was never stored is a no-op, not an error: the
+        # recompute path drops the row whether or not one was ever written.
+        cache.delete_candidate_erd(branch_key, "nurdy", ERD_ALL)
+        cache.close()
+
     def test_resolved_candidate_erd_reads_the_stored_row_without_refolding(self):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         branch_key = ScoreCache.encode_subset(ANSWERS)
@@ -672,6 +690,65 @@ class ReportModelTest(unittest.TestCase):
              "answer_count": 9, "pattern": "-----"},
             5,
         ))
+
+    def test_response_group_breakdown_agrees_with_the_erd_line_after_a_recompute(self):
+        """The stored fold must not outlive the branch rows it folded.
+
+        `_resolved_candidate_erd` trusts a matching `candidate_erd_by_policy`
+        row without re-reading the branches behind it, so before
+        `invalidate_branches_for_recompute` dropped that row a recomputed word
+        reported `complete` with every group resolved while each group's own
+        row was gone -- the ERD line counting groups the graph drew as unsolved.
+        """
+        target = parse_report_branch_target("bebop")
+        groups = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        branch_keys = [
+            bytes.fromhex(row["branch_key_hex"]) for row in groups
+        ]
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        for branch_key in branch_keys:
+            cache.write(branch_key, ERD_ALL, "salet", 1.5,
+                        max_depth=2, solve_budget=None)
+        cache.close()
+
+        complete = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]
+        self.assertEqual(complete["erd_summary"]["state"], "complete")
+        self.assertTrue(all(entry["solved"]
+                            for entry in complete["response_group_breakdown"]))
+        root_branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        self.assertIsNotNone(
+            cache.read_candidate_erd(root_branch_key, "bebop", ERD_ALL),
+            "the fold must be stored, or this proves nothing about dropping it",
+        )
+        cache.close()
+
+        # The real recompute sequence, not a hand-made approximation of it.
+        queue = self._open_queue()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        erd_search.invalidate_branches_for_recompute(
+            queue, cache, branch_keys, root_branch_key, "bebop")
+        self.assertIsNone(
+            cache.read_candidate_erd(root_branch_key, "bebop", ERD_ALL))
+        cache.close()
+        queue.close()
+
+        recomputing = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]
+        solved = [entry["solved"]
+                  for entry in recomputing["response_group_breakdown"]]
+        self.assertEqual(solved, [False, False])
+        self.assertEqual(recomputing["erd_summary"]["state"], "pending")
+        self.assertEqual(
+            sum(solved),
+            recomputing["erd_summary"]["resolved_group_count"],
+            "the ERD line and the outlined groups must count the same groups",
+        )
 
     def test_response_group_breakdown_ignores_filters_and_the_display_limit(self):
         # The graph draws the whole decomposition; narrowing the rows listed
