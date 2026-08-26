@@ -2569,6 +2569,32 @@ class ReportClientBrowserTest(unittest.TestCase):
             [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]],
         )
 
+    def test_overview_holds_completed_branch_before_its_departure(self):
+        """A completed branch stays visible long enough to explain its exit."""
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const finalizing=namedBranches(base,['complete']);
+          finalizing.data.branches[0].branch_phase='finalizing';
+          const empty=namedBranches(base,[]);
+          applyReport(finalizing,null,state);await settled();
+          applyReport(empty,finalizing,state);
+          const card=()=>document.querySelector('[data-identity="complete"]');
+          const held={className:card().className,background:getComputedStyle(card()).backgroundColor,text:card().innerText};
+          const realNow=Date.now;Date.now=()=>realNow()+5001;
+          applyReport(empty,empty,state);Date.now=realNow;
+          await settled();
+          const ordinary=namedBranches(base,['ordinary']);
+          applyReport(ordinary,null,state);await settled();
+          applyReport(empty,ordinary,state);
+          return {held,remaining:!!card(),ordinaryClass:document.querySelector('[data-identity="ordinary"]').className};
+        """))
+        self.assertIn("recently-completed", result["held"]["className"])
+        self.assertEqual(result["held"]["background"], "rgb(234, 242, 252)")
+        self.assertIn("done", result["held"]["text"])
+        self.assertFalse(result["remaining"])
+        self.assertNotIn("recently-completed", result["ordinaryClass"])
+
     def test_grid_transition_moves_the_page_below_it_monotonically(self):
         """The content under the grid must never reverse direction mid-flight.
 

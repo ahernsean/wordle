@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ERD swarm reports</title>
   <style>
-    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; }
+    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --blue:#5f89c2; --completed-bg:#eaf2fc; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; }
     /* The OS/browser's own color-scheme preference drives the palette live --
        no toggle, no stored setting.  Every color elsewhere in this file reads
        one of these custom properties rather than a literal, so flipping the
@@ -14,7 +14,7 @@
       :root {
         color-scheme: dark;
         --bg:#121213; --panel:#1c1c1e; --text:#e4e6eb; --dim:#9aa0a6;
-        --green:#538d4e; --green-complete:#3f6b3c; --yellow:#b59f3b; --gray:#3a3a3c;
+        --green:#538d4e; --green-complete:#3f6b3c; --blue:#6f9ed7; --completed-bg:#1d3048; --yellow:#b59f3b; --gray:#3a3a3c;
         --border:#3a3a3c; --sweep-empty:#3a3a3c; --red:#e0575a; --amber:#d4bb55;
         --hover-tint:#1f2e1d; --popover-shadow:0 5px 16px rgba(0,0,0,.55);
         --header-bg:rgba(18,18,19,.97); --status-amber-bg:#3a3016; --status-amber-text:#e8cf7a;
@@ -118,6 +118,7 @@
     .section { margin:.45rem 0; }
     .card.active, .card.filtered { border-color:var(--green); }
     .card.filtered { background:var(--hover-tint); }
+    .card.recently-completed { border-color:var(--blue); background:var(--completed-bg); }
     .card.finalizing, .stale { border-color:var(--amber); }
     .card.transitioning { border-color:var(--dim); }
     .dead { border-color:var(--red); }
@@ -355,6 +356,9 @@
     const treelessKinds=new Set(["cache","hotspots","leaderboard","openers"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
+    const COMPLETED_BRANCH_HOLD_MILLIS=5000;
+    const recentOverviewCompletionRows=new Map();
+    let completionExpiryTimer=null;
     let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true,leaderboardReportWidth=null;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
@@ -644,6 +648,32 @@
           getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length);
     }
     function previousBy(report,collection,identity){return new Map((((report||{}).data||{})[collection]||[]).map(row=>[String(row[identity]),row]));}
+    function completedOverviewBranch(row){
+      return row.branch_phase==="finalizing"||
+        (row.candidate_count>0&&row.completed_candidate_count>=row.candidate_count);
+    }
+    function scheduleCompletedBranchExpiry(){
+      clearTimeout(completionExpiryTimer);
+      const now=Date.now(),nextExpiry=Math.min(...[...recentOverviewCompletionRows.values()].map(entry=>entry.expires_at));
+      if(!Number.isFinite(nextExpiry))return;
+      completionExpiryTimer=setTimeout(()=>{
+        if(lastReport&&currentState)applyReport(lastReport,lastReport,currentState);
+      },Math.max(0,nextExpiry-now));
+    }
+    function overviewWithRecentCompletions(report,previous,state){
+      if(report.report_kind!=="overview"||state.branch_status.length!==1||state.branch_status[0]!=="active")return report;
+      const now=Date.now(),context=contextKey(state),rows=report.data.branches||[],present=new Set(rows.map(row=>String(row.branch_key_hex)));
+      for(const [key,entry] of recentOverviewCompletionRows)if(entry.expires_at<=now||entry.context!==context||present.has(entry.identity))recentOverviewCompletionRows.delete(key);
+      for(const row of (previous?.data?.branches||[])){
+        const identity=String(row.branch_key_hex),key=context+"|"+identity;
+        if(!present.has(identity)&&completedOverviewBranch(row)&&!recentOverviewCompletionRows.has(key)){
+          recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+COMPLETED_BRANCH_HOLD_MILLIS,row:{...row,branch_status:"done",branch_phase:"complete",recently_completed:true}});
+        }
+      }
+      const completedRows=[...recentOverviewCompletionRows.values()].filter(entry=>entry.context===context).map(entry=>entry.row);
+      scheduleCompletedBranchExpiry();
+      return completedRows.length?{...report,data:{...report.data,branches:[...rows,...completedRows]}}:report;
+    }
     function semanticProjection(value){
       if(Array.isArray(value))return value.map(semanticProjection);
       if(value&&typeof value==="object"){const result={};for(const [key,item] of Object.entries(value))if(!["generated_at","updated_at"].includes(key))result[key]=semanticProjection(item);return result;}
@@ -853,7 +883,7 @@
       return chips;
     }
     function cardForBranch(row,previous,branchWorkers=[],previousWorkersById=null){
-      const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previous));card.dataset.identity=row.branch_key_hex;
+      const card=element("article","card clickable "+branchClass(row)+(row.recently_completed?" recently-completed":" "+changeClass(row,previous)));card.dataset.identity=row.branch_key_hex;
       const title=element("div","card-title");
       title.append(element("strong","","@"+shortReference(valueOrDash(row.branch_reference))),...statusChips(row));
       card.append(title);
@@ -1933,6 +1963,7 @@
     }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
+      report=overviewWithRecentCompletions(report,previousReport,state);
       // A refresh landing mid-choreography ends it first, so the grid is
       // measured at rest rather than part-way through somebody else's animation.
       endGridTransitions();
