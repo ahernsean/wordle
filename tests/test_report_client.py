@@ -990,6 +990,28 @@ class ReportClientBrowserTest(unittest.TestCase):
                 ".response-group-breakdown .answer-segment").nth(1)
             .get_attribute("aria-label"))
 
+    def test_word_report_group_menu_stays_in_the_viewport_after_a_resize(self):
+        # The menu's position is written as pixels against the strip it was
+        # opened on.  A menu placed at a desktop width and then carried to a
+        # phone would keep that offset and widen the document -- the exact
+        # regression test_no_horizontal_scroll_at_required_widths guards
+        # against, which never sees it because it opens no menu.
+        self._apply_many_group_word_report()
+        self.page.locator(
+            ".response-group-breakdown .answer-segment").last.click(force=True)
+        self.page.wait_for_selector(".group-menu")
+        for width in (375, 390, 480, 800, 1200):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 800})
+                self.page.wait_for_timeout(150)
+                box = self._menu().bounding_box()
+                self.assertGreaterEqual(box["x"], 0)
+                self.assertLessEqual(box["x"] + box["width"], width)
+                scroll, client = self.page.evaluate(
+                    "() => [document.documentElement.scrollWidth,"
+                    " document.documentElement.clientWidth]")
+                self.assertLessEqual(scroll, client, f"document widened at {width}px")
+
     def _apply_graded_word_report(self):
         """A solved decomposition whose segments straddle the outline threshold.
 

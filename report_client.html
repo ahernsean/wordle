@@ -1604,6 +1604,20 @@
     // caught, and dismissing costs one tap.  Jumping directly would strand the
     // reader on a branch they never chose with no way to see which one it was.
     let openGroupMenuNode=null;
+    // Anchored under the segment it belongs to and pulled back from the right
+    // edge, so a group near the end of the strip does not open a menu that runs
+    // off the page.  Both the anchor and the edge move when the window does,
+    // and the position is written as pixels, so this runs again on every
+    // resize: a menu placed at a desktop width would otherwise keep its old
+    // offset on a phone and widen the document.
+    function positionGroupMenu(menu,segment){
+      const strip=segment.parentElement;
+      if(!strip)return;
+      const stripBox=strip.getBoundingClientRect(),segmentBox=segment.getBoundingClientRect();
+      menu.style.top=(strip.offsetTop+strip.offsetHeight+4)+"px";
+      menu.style.left=Math.max(0,Math.min(segmentBox.left-stripBox.left+strip.offsetLeft,
+        strip.offsetLeft+strip.offsetWidth-menu.offsetWidth))+"px";
+    }
     function closeGroupMenu(){
       if(!openGroupMenuNode)return;
       const opener=openGroupMenuNode.opener;
@@ -1627,17 +1641,10 @@
       const copyButton=element("button","","Copy spine");
       copyButton.addEventListener("click",()=>copyText(branchTarget).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));
       menu.append(title,openButton,copyButton);
-      // Anchored to the segment inside the strip's own offset parent, then
-      // pulled back from the right edge: a segment near the end of the strip
-      // would otherwise open a menu that runs off the page.
       const strip=segment.parentElement,host=strip.parentElement;
       host.style.position=host.style.position||"relative";
       host.append(menu);
-      const stripBox=strip.getBoundingClientRect(),segmentBox=segment.getBoundingClientRect();
-      menu.style.top=(strip.offsetTop+strip.offsetHeight+4)+"px";
-      const left=Math.max(0,Math.min(segmentBox.left-stripBox.left+strip.offsetLeft,
-        strip.offsetLeft+strip.offsetWidth-menu.offsetWidth));
-      menu.style.left=left+"px";
+      positionGroupMenu(menu,segment);
       openGroupMenuNode={node:menu,opener:segment};
       openButton.focus();
     }
@@ -2030,7 +2037,7 @@
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
       matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
-      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
+      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
