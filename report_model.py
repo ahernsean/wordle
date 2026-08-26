@@ -143,7 +143,7 @@ SOURCE_SORT_FIELDS = (
     "default", "age", "word", "priority", "branches", "open", "done", "workers",
     "completed", "erd", "requested", "elapsed", "worker_time",
 )
-# Sorts that only a source report can serve, so another report asking for one
+# Sorts that only an opener report can serve, so another report asking for one
 # is rejected rather than quietly sorted some other way.
 SOURCE_ONLY_SORT_FIELDS = (
     "word", "branches", "open", "done", "completed", "erd", "requested",
@@ -219,7 +219,7 @@ def validate_report_request(request: ReportRequest) -> None:
     """Reject report options that have no meaning for the selected report."""
     report_kind = request.report_kind
     branch_target_kind = request.branch_target.kind
-    if request.tree and report_kind in ("cache", "hotspots", "leaderboard", "sources"):
+    if request.tree and report_kind in ("cache", "hotspots", "leaderboard", "openers"):
         raise ValueError(f"--tree cannot be used with --{report_kind}")
     if (request.tree_parent or request.tree_cursor) and not request.tree:
         raise ValueError("tree_parent and tree_cursor require tree")
@@ -231,7 +231,7 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("--claims requires a singular branch target")
     if request.include_answers and (
         request.tree
-        or report_kind in ("queue", "workers", "leaderboard", "sources")
+        or report_kind in ("queue", "workers", "leaderboard", "openers")
         or (report_kind == "auto" and branch_target_kind == "root")
     ):
         raise ValueError(
@@ -246,10 +246,10 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError(
             "--sort for word reports must be default, size, workers, or priority"
         )
-    if request.filters.group_by is not None and report_kind == "sources":
+    if request.filters.group_by is not None and report_kind == "openers":
         if request.filters.group_by not in SOURCE_GROUP_BY_STRATEGIES:
             raise ValueError(
-                "group_by for source reports must be one of "
+                "group_by for opener reports must be one of "
                 + ", ".join(SOURCE_GROUP_BY_STRATEGIES)
             )
     elif request.filters.group_by is not None and (
@@ -258,29 +258,29 @@ def validate_report_request(request: ReportRequest) -> None:
         or request.filters.group_by not in GROUP_BY_STRATEGIES
     ):
         raise ValueError(
-            "group_by requires a word or source report and must be one of "
+            "group_by requires a word or opener report and must be one of "
             + ", ".join(GROUP_BY_STRATEGIES)
         )
-    if request.filters.source_states and report_kind != "sources":
-        raise ValueError("source_state requires a source report")
+    if request.filters.source_states and report_kind != "openers":
+        raise ValueError("opener_state requires an opener report")
     for name in ("source_offset", "branch_row_offset"):
         offset = getattr(request.filters, name)
         if offset is None:
             continue
-        if report_kind != "sources":
-            raise ValueError(f"{name} requires a source report")
+        if report_kind != "openers":
+            raise ValueError(f"{name} requires an opener report")
         if offset < 0:
             raise ValueError(f"{name} cannot be negative")
     if request.filters.sort is not None:
-        if report_kind == "sources":
+        if report_kind == "openers":
             if request.filters.sort not in SOURCE_SORT_FIELDS:
                 raise ValueError(
-                    "--sort for source reports must be one of "
+                    "--sort for opener reports must be one of "
                     + ", ".join(SOURCE_SORT_FIELDS)
                 )
         elif request.filters.sort in SOURCE_ONLY_SORT_FIELDS:
             raise ValueError(
-                f"--sort {request.filters.sort} requires a source report"
+                f"--sort {request.filters.sort} requires an opener report"
             )
     historical_hotspot = request.hotspot_field in (
         "evaluated-candidates", "bulk-completed-candidates",
@@ -307,9 +307,9 @@ def validate_report_request(request: ReportRequest) -> None:
         # that does not end in a word has no response groups to report.
         if branch_target_kind != "word":
             raise ValueError("--root-progress requires a target ending in a word")
-    if report_kind == "sources" and branch_target_kind not in ("root", "word"):
+    if report_kind == "openers" and branch_target_kind not in ("root", "word"):
         raise ValueError(
-            "--sources accepts only a trailing word or no branch target"
+            "--openers accepts only a trailing word or no branch target"
         )
 
 
@@ -640,10 +640,10 @@ def scheduling_role_reason(scheduling_role):
     unattributed rather than guessing.
     """
     return {
-        "preferred": "serving its preferred source work",
-        "fallback": "serving fallback work: preferred source(s) had no "
+        "preferred": "serving its preferred opener work",
+        "fallback": "serving fallback work: preferred opener(s) had no "
                     "claimable bundle at the last claim boundary",
-        "direct": "direct branch work with no live source-work ownership",
+        "direct": "direct branch work with no live opener-work ownership",
     }.get(scheduling_role, "unattributed")
 
 
@@ -1509,7 +1509,7 @@ def _root_progress_group_state(row, cache_state, group_budget):
 
 def collect_root_progress_report(sources: ReportSources,
                                  request: ReportRequest) -> dict:
-    """Work totals and a completion estimate for one root word.
+    """Work totals and a completion estimate for one opener.
 
     Separate from the word report because the telemetry rollup behind it is a
     seconds-scale scan: the word report stays instant and a client fetches
@@ -1541,7 +1541,7 @@ def collect_root_progress_report(sources: ReportSources,
                      for pattern, answer_words in group_answer_words.items()}
     # No branch context here: a root target's branch_key_hex encodes the whole
     # answer subset, which is tens of kilobytes the panel never reads.  Request
-    # detail likewise stays in the sources report; only the earliest request
+    # detail likewise stays in the opener report; only the earliest request
     # time is carried, in totals.
     data = {
         "word": word,
@@ -3100,7 +3100,7 @@ def _source_word_erd_summaries(sources, source_words, report, cache,
             cached_summaries = {}
             _SOURCE_ERD_SUMMARY_CACHE[cache_identity] = (
                 cache_version, cached_summaries)
-        # A root word spends the first guess, leaving the rest for its groups.
+        # An opener spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
         # Source words are always openers, so every one folds against the same
         # branch: the whole answer list, before any guess is played.
@@ -3234,7 +3234,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     """Report every source word with its requests and branches rolled up —
     the reporting half of #200's operator surface.
 
-    One word is one row: ten queued root words report ten rows, whatever the
+    One word is one row: ten queued openers report ten rows, whatever the
     branch count underneath them, and a word requested more than once still
     reports one row.  Naming a word opens that word's branches, and only there
     is a branch with more than one live owner shown as one row per owning
@@ -3247,7 +3247,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             "matched_rows": 0, "shared_branch_count": 0,
             "branch_row_offset": 0, "rows": []}
     report = _semantic_report(
-        "sources", sources, request.branch_target, generated_at, data, request
+        "openers", sources, request.branch_target, generated_at, data, request
     )
     queue = None
     timing_cache = None
@@ -3469,7 +3469,7 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
         return collect_hotspot_report(sources, request)
     if report_kind == "leaderboard":
         return collect_leaderboard_report(sources, request)
-    if report_kind == "sources":
+    if report_kind == "openers":
         return collect_source_report(sources, request)
     if report_kind == "root_progress":
         return collect_root_progress_report(sources, request)

@@ -593,18 +593,18 @@ class TestNoteDepthPromotionSentinel(unittest.TestCase):
 
 
 class TestSpineComposition(unittest.TestCase):
-    """_root_spine / _promoted_spine build the absolute root -> branch path."""
+    """_opener_spine / _promoted_spine build the absolute root -> branch path."""
 
-    def test_root_spine_formats_word_and_pattern(self):
+    def test_opener_spine_formats_word_and_pattern(self):
         from wordle_ui import fmt_pattern
         w = _bare_worker()
-        self.assertEqual(w._root_spine('salet', 0),
+        self.assertEqual(w._opener_spine('salet', 0),
                          f'SALET {fmt_pattern(0)}')
 
-    def test_root_spine_none_without_source(self):
+    def test_opener_spine_none_without_source(self):
         w = _bare_worker()
-        self.assertIsNone(w._root_spine(None, 0))
-        self.assertIsNone(w._root_spine('salet', None))
+        self.assertIsNone(w._opener_spine(None, 0))
+        self.assertIsNone(w._opener_spine('salet', None))
 
     def test_promoted_spine_composes_base_and_descent_edges(self):
         w = _bare_worker()

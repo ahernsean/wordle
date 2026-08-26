@@ -810,7 +810,7 @@ def check_source_priority_range(priority: int) -> None:
     """Raise ValueError unless priority is within the source-work range."""
     if not SOURCE_PRIORITY_MIN <= priority <= SOURCE_PRIORITY_MAX:
         raise ValueError(
-            "source-work priority must be between "
+            "opener-work priority must be between "
             f"{SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}")
 
 
@@ -1761,10 +1761,10 @@ class ERDQueue:
         Uses an UPSERT so that:
         - A row inserted for the first time is added as 'pending'.
         - A row already present has its priority UPGRADED (never downgraded),
-          e.g. a branch first inserted at priority=0 by an earlier root word
+          e.g. a branch first inserted at priority=0 by an earlier opener
           is correctly promoted to priority=1 when a VIP word (SALET) is
           queued later.
-        - source_word / source_pattern record the first root word whose branch
+        - source_word / source_pattern record the first opener whose branch
           produced this entry (kept for display in `status`).
 
         Raises ValueError, before writing anything, if any row's priority lies
@@ -4458,7 +4458,7 @@ class ERDQueue:
                              active_branch_limit=10, now=None) -> dict:
         """Per-response-group work totals for one spine, plus live rates.
 
-        `spine_prefix` is any spine ending in a word: a bare root word such as
+        `spine_prefix` is any spine ending in a word: a bare opener such as
         `SCOPE`, or a deeper one such as `SCOPE -y--- LUBES`.  Rolls up
         telemetry.branch_finalize_log by the response pattern that follows the
         prefix, so every descendant's cost is attributed to the group it sits
@@ -5293,7 +5293,7 @@ class ERDQueue:
         """Count the branches owned by these source words, each branch once.
 
         Two words can own the same branch, so summing their branch counts
-        double-counts exactly the shared ownership the source report exists to
+        double-counts exactly the shared ownership the opener report exists to
         show.  Counted over every membership, resolved or not, to match the
         per-word branch_count in source_word_rows().
         """
