@@ -3679,11 +3679,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         preferred = self.page.locator('.card.worker[data-identity="worker-0"]')
         # The visible text carries the noun: "preferred" alone would not say
         # preferred what, and a tooltip cannot supply it on a touch screen.
-        self.assertIn("preferred source", preferred.inner_text())
-        reason = preferred.get_by_title("serving its preferred source work")
+        self.assertIn("preferred opener", preferred.inner_text())
+        reason = preferred.get_by_title("serving its preferred opener work")
         self.assertEqual(reason.count(), 1)
         fallback = self.page.locator('.card.worker[data-identity="worker-3"]')
-        self.assertIn("fallback source", fallback.inner_text())
+        self.assertIn("fallback opener", fallback.inner_text())
         self.assertIn(
             "no claimable bundle",
             fallback.get_by_title(re.compile("fallback")).get_attribute("title"),

@@ -62,9 +62,9 @@ queue set-disk-stop
 
 queue reconcile-orphaned-ownership
                 Demote open owned branches whose opener-work membership was
-                lost while they were still open (see check_source_work_
-                invariants' "source-owned open branch_id ... has no live
-                membership"), making them claimable again.  The run loop
+                lost while they were still open (its promoting candidate was
+                retracted, or its owning request completed moments before it
+                attached), making them claimable again.  The run loop
                 self-heals this on every membership resolution; this command
                 is for branches stranded before that (e.g. accumulated while
                 the swarm was down).
@@ -615,18 +615,18 @@ def cmd_queue_priority(args):
     values in the range 0–999,999 are reserved for normal use: 0 = default,
     higher = sooner.
     """
-    if getattr(args, 'source_word', None):
+    if getattr(args, 'opener_word', None):
         queue = ERDQueue(args.queue)
         try:
             updated = queue.set_ownerless_active_priority(
-                args.source_word.strip().lower(), args.priority)
+                args.opener_word.strip().lower(), args.priority)
         except ValueError as error:
             print(error)
             return
         finally:
             queue.close()
         print(f'{updated:,} ownerless open branch(es) for '
-              f'{args.source_word.strip().upper()}: priority set to '
+              f'{args.opener_word.strip().upper()}: priority set to '
               f'{args.priority}.')
         return
 
@@ -1525,7 +1525,7 @@ def main():
                             help='Set the priority of a queued branch')
     qp_target = p_qp.add_mutually_exclusive_group(required=True)
     qp_target.add_argument('--word', metavar='WORD')
-    qp_target.add_argument('--source-word', metavar='WORD',
+    qp_target.add_argument('--opener-word', metavar='WORD',
                            help='Set every ownerless open branch attributed '
                                 'to this word')
     p_qp.add_argument('--pattern', metavar='PAT',
@@ -1628,7 +1628,7 @@ def main():
             and args.word is not None and args.pattern is None):
         parser.error('--pattern is required with --word')
     if (args.cmd == 'queue' and args.queue_cmd == 'priority'
-            and args.source_word is not None and args.pattern is not None):
+            and args.opener_word is not None and args.pattern is not None):
         parser.error('--pattern can only be used with --word')
     if args.cmd == 'view':
         try:

@@ -244,8 +244,8 @@ deliberately opt-in: a root can own hundreds of branches, and printing them
 for every word buries the words themselves.
 
 Each worker's own report row shows whether it is serving its preferred
-(highest-priority eligible) source or fallback work claimed because the
-preferred source had no claimable bundle. The browser report serves the same
+(highest-priority eligible) opener or fallback work claimed because the
+preferred opener had no claimable bundle. The browser report serves the same
 view under its Openers tab — one card per opener, and clicking one opens
 that word's branches — and names the same scheduling role on every worker
 card.
@@ -536,11 +536,11 @@ preempt requested work.
 python3.13 erd_search.py queue priority --word salet --pattern ..... --priority 1
 
 # Repair open branches with no live opener-work membership for one opener:
-python3.13 erd_search.py queue priority --source-word salet --priority 1
+python3.13 erd_search.py queue priority --opener-word salet --priority 1
 ```
 
 The `--word`/`--pattern` form affects only branches with status `pending`.
-The `--source-word` form affects only open branches without a live opener-work
+The `--opener-word` form affects only open branches without a live opener-work
 membership, including active branches left by older queue data. It never changes
 branches owned by a live request; use `queue opener-priority` for those.
 
@@ -605,15 +605,15 @@ python3.13 erd_search.py queue reconcile-orphaned-ownership
 ```
 
 A branch promoted under an opener-work request can lose every membership that
-justified `requires_source_membership`, while itself staying `open`: bulk
-elimination retracts the in-flight candidate that promoted it, or the request
-completes moments before a racing `create_branch` call attaches it.  Either
-way the branch becomes invisible to every claim path and is flagged by
-`check_source_work_invariants()` as a "source-owned open branch ... has no
-live membership" violation.  The supervisor self-heals this automatically on
-every membership resolution (see `_resolve_branch_memberships` in
-`erd_queue.py`); use this command only to reconcile branches stranded before
-that existed, or accumulated while the swarm was down.
+justified its promotion, while itself staying `open`: bulk elimination
+retracts the in-flight candidate that promoted it, or the request completes
+moments before a racing `create_branch` call attaches it.  Either way the
+branch becomes invisible to every claim path and is flagged as an
+opener-owned open branch with no live membership.  The supervisor self-heals
+this automatically on every membership resolution (see
+`_resolve_branch_memberships` in `erd_queue.py`); use this command only to
+reconcile branches stranded before that existed, or accumulated while the
+swarm was down.
 
 ---
 

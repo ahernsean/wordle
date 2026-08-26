@@ -29,7 +29,7 @@ WORDS_C = ["crane", "slate", "trace"]
 def _make_args(queue_path, **overrides):
     args = types.SimpleNamespace(
         word="salet",
-        source_word=None,
+        opener_word=None,
         priority=1,
         opener_work_id=None,
         queue=queue_path,
@@ -141,7 +141,7 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run_branch_priority(_make_args(
-            self.queue_path, source_word='salet', priority=9))
+            self.queue_path, opener_word='salet', priority=9))
 
         self.assertIn('1 ownerless open branch(es)', output)
         self.assertIn('ownerless', output)

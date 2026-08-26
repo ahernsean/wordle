@@ -640,10 +640,10 @@ def scheduling_role_reason(scheduling_role):
     unattributed rather than guessing.
     """
     return {
-        "preferred": "serving its preferred source work",
-        "fallback": "serving fallback work: preferred source(s) had no "
+        "preferred": "serving its preferred opener work",
+        "fallback": "serving fallback work: preferred opener(s) had no "
                     "claimable bundle at the last claim boundary",
-        "direct": "direct branch work with no live source-work ownership",
+        "direct": "direct branch work with no live opener-work ownership",
     }.get(scheduling_role, "unattributed")
 
 

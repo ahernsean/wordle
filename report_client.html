@@ -849,7 +849,7 @@
     // Why this worker is on the branch it is on: the recorded scheduling role,
     // carrying the model's reason text as its tooltip.  A worker between claims
     // has no role recorded and shows none.
-    const SCHEDULING_ROLE_TEXT={preferred:"preferred source",fallback:"fallback source",direct:"direct work"};
+    const SCHEDULING_ROLE_TEXT={preferred:"preferred opener",fallback:"fallback opener",direct:"direct work"};
     function schedulingRoleCell(worker){
       if(!worker.scheduling_role)return null;
       const cell=element("span","",SCHEDULING_ROLE_TEXT[worker.scheduling_role]||worker.scheduling_role);
