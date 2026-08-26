@@ -3052,31 +3052,37 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The bucket legend lays its labels out with plain CSS grid flow (see
         # issue #261, where a width-dependent absolute-positioning scheme --
         # even a percentage-based one -- could still seat two labels over the
-        # same span at a width it hadn't repacked for). Flow can't collide
-        # regardless of width, so this holds even with no chance for a
-        # re-render: setUp's page is already 1200px wide; drop straight to
-        # 800 with no wait, so nothing gets a chance to run first.
+        # same span at a width it hadn't repacked for, and a single fixed
+        # breakpoint below the render width just moved the same collision to
+        # wherever the breakpoint stopped covering, e.g. 801px carrying
+        # 1200px-computed positions one CSS pixel above an 800px cutoff).
+        # Flow can't collide at any width, so this holds with no chance for a
+        # re-render at every width between the two: setUp's page is already
+        # 1200px wide, and each width below drops straight to it with no
+        # wait, so nothing gets a chance to run first.
         self.page.goto(self.base_url + "?kind=leaderboard")
         self.page.wait_for_selector(".response-bucket-legend > span")
-        self.page.set_viewport_size({"width": 800, "height": 800})
-        overlaps = self.page.evaluate("""() => {
-          const overlaps = [];
-          for (const legend of document.querySelectorAll('.response-bucket-legend')) {
-            const spans = [...legend.querySelectorAll(':scope > span')]
-              .map(span => span.getBoundingClientRect());
-            for (let i = 0; i < spans.length; i++) {
-              for (let j = i + 1; j < spans.length; j++) {
-                const a = spans[i], b = spans[j];
-                if (a.left < b.right && b.left < a.right &&
-                    a.top < b.bottom && b.top < a.bottom) {
-                  overlaps.push([i, j]);
-                }
-              }
-            }
-          }
-          return overlaps;
-        }""")
-        self.assertEqual(overlaps, [], overlaps)
+        for width in (375, 480, 600, 700, 800, 801, 900, 1000, 1100, 1199, 1200):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 800})
+                overlaps = self.page.evaluate("""() => {
+                  const overlaps = [];
+                  for (const legend of document.querySelectorAll('.response-bucket-legend')) {
+                    const spans = [...legend.querySelectorAll(':scope > span')]
+                      .map(span => span.getBoundingClientRect());
+                    for (let i = 0; i < spans.length; i++) {
+                      for (let j = i + 1; j < spans.length; j++) {
+                        const a = spans[i], b = spans[j];
+                        if (a.left < b.right && b.left < a.right &&
+                            a.top < b.bottom && b.top < a.bottom) {
+                          overlaps.push([i, j]);
+                        }
+                      }
+                    }
+                  }
+                  return overlaps;
+                }""")
+                self.assertEqual(overlaps, [], overlaps)
 
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
