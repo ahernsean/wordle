@@ -3134,7 +3134,7 @@ class TestERDSolverKeepsWorking(unittest.TestCase):
     def test_targeted_scan_periodic_report(self):
         """When constructed with last_guess, _scan must periodically print a
         'Targeted scan of WORD <pattern>' report — same shape as
-        BranchPrecacheSolver's 'Root-word scan' report — driven by the
+        BranchPrecacheSolver's 'Opener scan' report — driven by the
         heartbeat callback, every 30s."""
         words = [self._word(i) for i in range(10)]
 

@@ -797,7 +797,7 @@ class _BranchWorker:
             if d > claimed_guess_depth)
 
     @staticmethod
-    def _root_spine(source_word, source_pattern):
+    def _opener_spine(source_word, source_pattern):
         """Single-guess spine string for a top-level branch: 'SALET -g-g-'."""
         if not source_word or source_pattern is None:
             return None
@@ -1579,7 +1579,7 @@ class _BranchWorker:
                     (timing["completed_at"] - timing["first_created_at"]) * 1000,
                     timing["worker_millis"] or 0, telemetry_epochs)
             except Exception:
-                logger.exception("%s could not snapshot completed source %s",
+                logger.exception("%s could not snapshot completed opener %s",
                                  self.name, source_word)
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
@@ -2249,9 +2249,9 @@ class _BranchWorker:
             claimed = self.queue.claim_next(self.name, source_work_id)
             if claimed is None:
                 return None
-            root_spine = self._root_spine(claimed['source_word'],
+            opener_spine = self._opener_spine(claimed['source_word'],
                                           claimed['source_pattern'])
-            budget = self._spine_budget(root_spine)
+            budget = self._spine_budget(opener_spine)
             reuse = _cache_reuse(
                 self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
                 budget)
@@ -2264,7 +2264,7 @@ class _BranchWorker:
             claimed['branch_key'], n_words, self.n_candidates,
             priority=claimed['priority'], source_word=claimed['source_word'],
             source_pattern=claimed['source_pattern'], budget=budget,
-            spine=root_spine, root_budget=self.root_budget,
+            spine=opener_spine, root_budget=self.root_budget,
             source_work_id=claimed['source_work_id'])
         self._source_work_enabled = True
         words = decode_subset(claimed['branch_key'])
@@ -2282,7 +2282,7 @@ class _BranchWorker:
             'owner_source_word': claimed['source_word'],
             'owner_root_pattern': claimed['source_pattern'],
             'owner_priority': claimed['priority'],
-            'spine': root_spine,
+            'spine': opener_spine,
             'budget': budget,
         }
         context = WorkContext.from_branch_row(branch, scheduling_role)

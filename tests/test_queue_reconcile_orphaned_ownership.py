@@ -86,6 +86,8 @@ class TestQueueReconcileOrphanedOwnership(unittest.TestCase):
 
         output = self._run(_make_args(self.queue_path))
         self.assertIn('Demoted 1 orphaned owned branch(es)', output)
+        self.assertIn('claimable without a live opener-work membership',
+                       output)
         self.assertIn(str(branch_id), output)
 
         queue = ERDQueue(self.queue_path)
