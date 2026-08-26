@@ -3412,6 +3412,36 @@ class ReportClientBrowserTest(unittest.TestCase):
         finally:
             context.close()
 
+    def test_leaderboard_legend_labels_never_overlap_after_an_unhandled_resize(self):
+        # The bucket legend lays its labels out with plain CSS grid flow, so
+        # no two labels can overlap regardless of the card's width or
+        # whether a render has ever run at that width. setUp's page is
+        # already 1200px wide; each width below drops straight to it with no
+        # wait, so nothing gets a chance to re-render first.
+        self.page.goto(self.base_url + "?kind=leaderboard")
+        self.page.wait_for_selector(".response-bucket-legend > span")
+        for width in (375, 480, 600, 700, 800, 801, 900, 1000, 1100, 1199, 1200):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 800})
+                overlaps = self.page.evaluate("""() => {
+                  const overlaps = [];
+                  for (const legend of document.querySelectorAll('.response-bucket-legend')) {
+                    const spans = [...legend.querySelectorAll(':scope > span')]
+                      .map(span => span.getBoundingClientRect());
+                    for (let i = 0; i < spans.length; i++) {
+                      for (let j = i + 1; j < spans.length; j++) {
+                        const a = spans[i], b = spans[j];
+                        if (a.left < b.right && b.left < a.right &&
+                            a.top < b.bottom && b.top < a.bottom) {
+                          overlaps.push([i, j]);
+                        }
+                      }
+                    }
+                  }
+                  return overlaps;
+                }""")
+                self.assertEqual(overlaps, [], overlaps)
+
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
