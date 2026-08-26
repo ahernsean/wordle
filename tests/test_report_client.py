@@ -2597,30 +2597,49 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(restored["bg"], light["bg"])
         self.assertEqual(restored["blankTile"], light["blankTile"])
 
-    def render_sweep_marker_background_image(self):
-        """The decoded SVG data URI behind a rendered .sweep-marker."""
-        return self.page.evaluate("""async () => {
+    def render_sweep_marker(self):
+        """Render a branch report with one live worker; the marker persists
+        in the DOM afterward for a subsequent theme check with no rerender."""
+        self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.completed_candidate_indexes=[...Array(50).keys()];
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+        }""")
+
+    def sweep_marker_background_image(self):
+        """The decoded SVG data URI currently behind the .sweep-marker."""
+        return self.page.evaluate("""() => {
           const marker=document.querySelector('.sweep-marker');
           const raw=marker.style.backgroundImage;
           const uri=raw.slice('url("'.length,-'")'.length);
           return decodeURIComponent(uri);
         }""")
 
-    def test_worker_marker_halo_tracks_theme(self):
+    def test_worker_marker_halo_tracks_theme_with_no_rerender(self):
         # The worker-marker digit is baked into an SVG data URI at render
-        # time; its halo/fill must be read from --panel/--text live rather
-        # than a color baked in for one theme, or the marker goes illegible
-        # (or invisible) when the OS preference doesn't match what was baked.
-        light_svg = self.render_sweep_marker_background_image()
+        # time, so it must be actively refreshed on a color-scheme change --
+        # reading --panel/--text live only fixes the *next* render.  This
+        # never calls applyReport a second time: every other themed color
+        # repaints on the OS/browser preference alone, and the marker must
+        # keep up the same way, not wait for the next poll to replace it.
+        self.render_sweep_marker()
+        # The background poll (default every 2s) would otherwise call
+        # fetchReport()/applyReport() again on its own schedule and rebuild
+        # the marker from scratch with live colors, masking a missing
+        # live-refresh path exactly as it did the first time this was
+        # written.  Block it so only the fix under test can update the
+        # marker already on screen.
+        self.page.route("**/api/view*", lambda route: route.abort())
+        light_svg = self.sweep_marker_background_image()
         self.assertIn('stroke="#f8f9fa"', light_svg)
         self.assertIn('fill="#1a1a1b"', light_svg)
 
         self.page.emulate_media(color_scheme="dark")
-        dark_svg = self.render_sweep_marker_background_image()
+        self.page.wait_for_function(
+            "document.querySelector('.sweep-marker').style.backgroundImage.includes('%231c1c1e')"
+        )
+        dark_svg = self.sweep_marker_background_image()
         self.assertIn('stroke="#1c1c1e"', dark_svg)
         self.assertIn('fill="#e4e6eb"', dark_svg)
 
