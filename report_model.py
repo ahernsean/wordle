@@ -1225,6 +1225,60 @@ def _grouped_response_groups(rows: list, group_by: str) -> list:
     return groups
 
 
+# Keyed on the vocabulary, holding one entry per branch measured.  The best
+# split available on a branch never changes while the word lists do not, and a
+# word report is polled every couple of seconds, so measuring it once per branch
+# is the difference between a free number and 1.5s of NumPy per poll at the root.
+_branch_maximum_group_count_memo = None
+_BRANCH_MAXIMUM_MEMO_LIMIT = 256
+
+
+def _maximum_response_group_count(sources, all_answers, branch_words,
+                                  branch_key, cache):
+    """The most response groups any candidate splits this branch into.
+
+    The scale the breakdown graph is drawn against: this word's group count
+    against the best split available where it is played.  At the root that is
+    the vocabulary's widest split; deeper it falls with the branch, and a
+    branch of five answers cannot be split more than five ways -- so the same
+    measurement answers at every guess_depth, where one global constant would
+    make every deep branch look hopeless.
+
+    Returns None when the pattern matrix is not already on disk.  Building one
+    walks the whole vocabulary and takes minutes, which is not a cost a report
+    request may pay; the graph simply scales to the word's own group count.
+    """
+    global _branch_maximum_group_count_memo
+    if not branch_words:
+        return None
+    memo_key = (
+        sources.answer_list_path, os.path.getmtime(sources.answer_list_path),
+        sources.candidate_list_path,
+        os.path.getmtime(sources.candidate_list_path),
+    )
+    if (_branch_maximum_group_count_memo is None
+            or _branch_maximum_group_count_memo[0] != memo_key):
+        _branch_maximum_group_count_memo = (memo_key, {})
+    measured = _branch_maximum_group_count_memo[1]
+    if branch_key in measured:
+        return measured[branch_key]
+    all_candidates = load_word_list(sources.candidate_list_path)
+    matrix = PatternMatrix.load_if_built(
+        sources.cache_path, all_candidates, all_answers, cache
+    )
+    if matrix is None:
+        return None
+    branch_indices = matrix.answer_indices_or_none(branch_words)
+    if branch_indices is None:
+        return None
+    counts = matrix.counts_for_all_candidates(branch_indices)
+    maximum = int((counts > 0).sum(axis=1).max())
+    if len(measured) >= _BRANCH_MAXIMUM_MEMO_LIMIT:
+        measured.clear()
+    measured[branch_key] = maximum
+    return maximum
+
+
 def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -1311,6 +1365,13 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
             ],
             group_budget,
         )
+        # The scale for the breakdown graph, measured where the word is played.
+        maximum_response_group_count = _maximum_response_group_count(
+            sources, all_answers, list(resolved.answer_words),
+            resolved.branch_key, cache,
+        )
+        if maximum_response_group_count is not None:
+            data["maximum_response_group_count"] = maximum_response_group_count
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)

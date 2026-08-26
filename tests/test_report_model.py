@@ -10,6 +10,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from cache_sqlite import ScoreCache
+from pattern_matrix import PatternMatrix
 from erd_queue import ERDQueue
 import erd_search
 import report_model
@@ -592,6 +593,68 @@ class ReportModelTest(unittest.TestCase):
             data["response_group_summary"]["branch_count"],
             len(data["response_groups"]),
         )
+
+    def _build_pattern_matrix(self):
+        """Put this vocabulary's matrix on disk, as a swarm run would leave it."""
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        PatternMatrix.load_or_build(
+            self.cache_path, ANSWERS + ["raise"], ANSWERS, cache)
+        cache.close()
+
+    def test_word_report_scale_is_the_best_split_available_on_its_branch(self):
+        # Not one constant for the whole vocabulary: a branch of two answers
+        # cannot be split more than two ways, and scaling it against the root's
+        # best would draw every deep branch as a stub.
+        self._build_pattern_matrix()
+        response_cache = ResponseCache(ANSWERS, score_cache=None)
+        best_at_root = max(
+            len([words for words in response_cache.group_words(
+                candidate, list(ANSWERS)).values() if words])
+            for candidate in ANSWERS + ["raise"]
+        )
+        root = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+        ))["data"]
+        self.assertEqual(root["maximum_response_group_count"], best_at_root)
+
+        # BEBOP splits these answers two ways, so its first branch holds two.
+        deeper = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("bebop ----- salet"),
+        ))["data"]
+        self.assertEqual(deeper["context"]["answer_count"], 2)
+        self.assertEqual(deeper["maximum_response_group_count"], 2)
+        self.assertLess(
+            deeper["maximum_response_group_count"],
+            root["maximum_response_group_count"],
+            "the scale must follow the branch, not the vocabulary",
+        )
+
+    def test_word_report_never_builds_a_pattern_matrix(self):
+        # A cold build walks the whole vocabulary and takes minutes.  A report
+        # answers without the scale instead of blocking on one.
+        with patch.object(PatternMatrix, "build") as build:
+            data = collect_report(self.sources, ReportRequest(
+                branch_target=parse_report_branch_target("salet"),
+            ))["data"]
+        build.assert_not_called()
+        self.assertNotIn("maximum_response_group_count", data)
+        self.assertTrue(data["response_group_breakdown"],
+                        "the graph is still drawn, just unscaled")
+
+    def test_word_report_measures_each_branch_scale_once(self):
+        # The root branch costs ~1.5s of NumPy to measure and the report is
+        # polled every couple of seconds.
+        self._build_pattern_matrix()
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"))
+        first = collect_report(self.sources, request)["data"]
+        with patch.object(
+            PatternMatrix, "counts_for_all_candidates"
+        ) as measured:
+            second = collect_report(self.sources, request)["data"]
+        measured.assert_not_called()
+        self.assertEqual(second["maximum_response_group_count"],
+                         first["maximum_response_group_count"])
 
     def test_response_group_breakdown_covers_every_group_largest_first(self):
         # AUDIO's groups arrive in pattern order as 1, 2, 1, so a breakdown

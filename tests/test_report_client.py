@@ -1014,6 +1014,42 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "")
 
+    def test_word_report_histogram_scales_against_the_branch_best(self):
+        # Without a scale the fill spans the track and says nothing about how
+        # good the split is; with one it is this word's groups against the most
+        # any guess achieves on the same branch.
+        self.page.route("**/api/view**", lambda route: route.abort())
+        base = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["word.json"])
+
+        def apply(scale):
+            payload = copy.deepcopy(base)
+            if scale is not None:
+                payload["data"]["maximum_response_group_count"] = scale
+            self.page.evaluate("""(payload) => {
+              applyReport(payload, null,
+                {...__reportClient.getState(), branch_target:'SALET'});
+            }""", payload)
+            self.page.wait_for_selector(".response-group-breakdown")
+            return self.page.evaluate(
+                """() => {
+                  const track = document.querySelector(
+                    '.response-group-breakdown .response-count-track');
+                  return track.querySelector(
+                    '.response-count-fill').getBoundingClientRect().width
+                    / track.getBoundingClientRect().width;
+                }""")
+
+        # The fixture's word splits its branch four ways.
+        self.assertAlmostEqual(apply(None), 1.0, delta=0.02)
+        self.assertAlmostEqual(apply(4), 1.0, delta=0.02)
+        self.assertAlmostEqual(apply(8), 0.5, delta=0.02)
+        self.assertEqual(
+            self.page.locator(
+                ".response-group-breakdown .response-count-track"
+            ).get_attribute("aria-label"),
+            "4 response groups for QUEUE out of the 8 the best guess splits"
+            " this branch into")
+
     def test_word_report_breakdown_outlines_only_groups_wide_enough_to_show_one(self):
         # A 2-px outline on each edge of a sliver is all border and no
         # interior, so a run of finished slivers would read as one black block.

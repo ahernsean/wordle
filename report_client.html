@@ -1136,7 +1136,8 @@
         const panel=element("div","response-group-breakdown");
         panel.append(responseVisualKey(),renderResponseGroupBreakdown(
           {word:data.word,word_is_answer:data.word_is_answer,response_groups:breakdown},
-          {selection:{branchTargetPrefix:state.branch_target,open:branchTarget=>setState({...state,kind:"auto",branch_target:branchTarget,tree:false,finalization_cursor:""})}}));
+          {maximumResponseGroupCount:data.maximum_response_group_count||null,
+           selection:{branchTargetPrefix:state.branch_target,open:branchTarget=>setState({...state,kind:"auto",branch_target:branchTarget,tree:false,finalization_cursor:""})}}));
         fragment.append(panel);
       }
       const responseSummary=data.response_group_summary;
@@ -1670,7 +1671,7 @@
           const legendItem=element("span","",bucket.labelText+(bucket.labelText==="1"?" word: ":" words: ")+countText),segmentCenter=(responseGroupPosition+bucket.responseGroupCount/2)/groups.length;legendItem.style.setProperty("--bucket-color",bucket.color);legendItem.dataset.segmentCenter=String((1-fillWidth)/2+fillWidth*segmentCenter);legendItem.dataset.bucketColor=bucket.color;legend.append(legendItem);segment.dataset.legendIndex=String(legend.children.length-1);responseGroupPosition+=bucket.responseGroupCount;
         }
       }
-      track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+(maximumResponseGroupCount?" out of a vocabulary maximum of "+numText(maximumResponseGroupCount):""));
+      track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+(maximumResponseGroupCount?" out of the "+numText(maximumResponseGroupCount)+" the best guess splits this branch into":""));
       track.append(fill);requestAnimationFrame(()=>{if(matchMedia("(max-width: 600px)").matches){for(const segment of fill.children)segment.replaceChildren();const legendItems=[...legend.children],leftColumnSize=Math.ceil(legendItems.length/2),mobileOrder=[];for(let index=0;index<leftColumnSize;index++){mobileOrder.push(legendItems[index]);if(legendItems[index+leftColumnSize])mobileOrder.push(legendItems[index+leftColumnSize]);}legend.append(...mobileOrder);return;}for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(legend.children.length)layoutResponseBucketLegend(legend);else legend.remove();});return [track,legend];
     }
     function layoutResponseBucketLegend(legend){

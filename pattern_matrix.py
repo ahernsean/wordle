@@ -151,6 +151,26 @@ class PatternMatrix:
         return cls(matrix, guess_words, answer_words)
 
     @classmethod
+    def _matrix_path(cls, cache_path, guess_words, score_cache):
+        """Where this vocabulary's matrix lives, alongside cache_path."""
+        return os.path.join(
+            os.path.dirname(os.path.abspath(cache_path)),
+            _matrix_filename(score_cache.answer_list_id,
+                             _compute_guess_vocabulary_id(guess_words)))
+
+    @classmethod
+    def load_if_built(cls, cache_path, guess_words, answer_words, score_cache):
+        """This vocabulary's matrix if it is already on disk, else None.
+
+        For a caller that must not pay for a build.  A cold build walks the
+        whole vocabulary and takes minutes; a report request answers in
+        milliseconds, so a miss there means "answer without it", never "block
+        until it exists".
+        """
+        return cls.load(cls._matrix_path(cache_path, guess_words, score_cache),
+                        guess_words, answer_words)
+
+    @classmethod
     def load_or_build(cls, cache_path, guess_words, answer_words, score_cache):
         """This process's PatternMatrix: load()ed from disk, or build()+save()d
         on a miss.
@@ -167,12 +187,9 @@ class PatternMatrix:
         only wastes CPU — it can never truncate a file another process
         still has mmap'd, which an in-place save() could.
         """
-        matrix_dir = os.path.dirname(os.path.abspath(cache_path))
-        matrix_path = os.path.join(
-            matrix_dir,
-            _matrix_filename(score_cache.answer_list_id,
-                             _compute_guess_vocabulary_id(guess_words)))
-        matrix = cls.load(matrix_path, guess_words, answer_words)
+        matrix_path = cls._matrix_path(cache_path, guess_words, score_cache)
+        matrix = cls.load_if_built(
+            cache_path, guess_words, answer_words, score_cache)
         if matrix is not None:
             return matrix
         matrix = cls.build(guess_words, answer_words, score_cache=score_cache)
