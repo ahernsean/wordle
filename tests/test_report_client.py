@@ -876,17 +876,55 @@ class ReportClientBrowserTest(unittest.TestCase):
             top,
             self.page.locator(".grid > [data-identity]").first.bounding_box()["y"])
 
-    def test_word_report_breakdown_group_opens_its_branch_report(self):
+    def _menu(self):
+        return self.page.locator(".group-menu")
+
+    def test_word_report_breakdown_group_opens_a_menu_naming_the_group(self):
+        # Which group a tap landed on is a guess until the menu names it, so
+        # the title draws the guess and the response it caught.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector(
-            ".response-group-breakdown .answer-segment.tappable-group")
-        segment = self.page.locator(".response-group-breakdown .answer-segment").first
-        self.assertEqual(segment.get_attribute("aria-label"),
-                         "Open SALET ----- branch report")
-        segment.click()
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+        self.page.locator(
+            ".response-group-breakdown .answer-segment").first.click()
+        self.page.wait_for_selector(".group-menu")
+        tiles = self._menu().locator(".group-menu-title .word")
+        self.assertEqual(tiles.count(), 1)
+        self.assertEqual(tiles.get_attribute("data-spine"), "QUEUE -----")
+        self.assertEqual(tiles.locator(".letter").count(), 5)
+        facts = self._menu().locator(".group-menu-facts").inner_text()
+        self.assertIn("8 answers", facts)
+        self.assertIn("solved", facts)
+
+    def test_word_report_breakdown_menu_opens_the_branch_report(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+        self.page.locator(
+            ".response-group-breakdown .answer-segment").first.click()
+        self.page.wait_for_selector(".group-menu")
+        self._menu().locator("button", has_text="Open branch report").click()
         self.page.wait_for_selector("text=branch report")
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "SALET -----")
+        self.assertEqual(self._menu().count(), 0)
+
+    def test_word_report_breakdown_menu_dismisses_without_navigating(self):
+        # A tap that caught the wrong sliver costs one dismissal, not a trip to
+        # a branch the reader never chose.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+        segments = self.page.locator(".response-group-breakdown .answer-segment")
+        segments.first.click()
+        self.page.wait_for_selector(".group-menu")
+        self.page.locator("h2").first.click()
+        self.page.wait_for_selector(".group-menu", state="detached")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "SALET")
+        segments.first.click()
+        self.page.wait_for_selector(".group-menu")
+        self.page.keyboard.press("Escape")
+        self.page.wait_for_selector(".group-menu", state="detached")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "SALET")
 
     def _apply_many_group_word_report(self):
         # A word that splits its branch 201 ways: every segment but the first
@@ -907,38 +945,56 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(report, null,
             {...__reportClient.getState(), branch_target:'SALET'});
         }""", report)
-        self.page.wait_for_selector(
-            ".response-group-breakdown .answer-segment.tappable-group")
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
 
-    def test_word_report_breakdown_only_opens_groups_wide_enough_to_tap(self):
+    def test_word_report_breakdown_menu_reaches_a_two_pixel_group(self):
+        # The reason every group opens a menu rather than only the wide ones:
+        # a sliver is impossible to identify by sight, and a dead tap on one
+        # reads as the page being broken.
         self._apply_many_group_word_report()
-        segments = self.page.eval_on_selector_all(
-            ".response-group-breakdown .answer-segment",
-            """nodes => nodes.map(node => [node.clientWidth,
-                 node.classList.contains('tappable-group'),
-                 node.getAttribute('role')])""")
-        self.assertEqual(len(segments), 201)
-        for width, tappable, role in segments:
-            self.assertEqual(tappable, width >= 20, f"{width}px segment")
-            self.assertEqual(role, "button" if tappable else None)
-        self.assertTrue(any(tappable for _, tappable, _ in segments))
-        self.assertTrue(any(not tappable for _, tappable, _ in segments))
-
-    def test_word_report_breakdown_ignores_taps_on_narrow_groups(self):
-        self._apply_many_group_word_report()
-        narrow = self.page.locator(
-            ".response-group-breakdown .answer-segment:not(.tappable-group)").last
-        self.assertLess(narrow.bounding_box()["width"], 20)
+        segments = self.page.locator(".response-group-breakdown .answer-segment")
+        self.assertEqual(segments.count(), 201)
+        narrow = segments.last
+        self.assertLess(narrow.bounding_box()["width"], 5)
         narrow.click(force=True)
-        self.page.wait_for_timeout(100)
+        self.page.wait_for_selector(".group-menu")
+        last_pattern = "".join(
+            list(itertools.product("gy-", repeat=5))[200])
         self.assertEqual(
-            self.page.locator("#branch-target-input").input_value(), "")
+            self._menu().locator(".group-menu-title .word").get_attribute(
+                "data-spine"),
+            "QUEUE " + last_pattern)
+        self.assertIn("1 answer", self._menu().locator(
+            ".group-menu-facts").inner_text())
+
+    def test_word_report_breakdown_strip_is_one_tab_stop(self):
+        # 201 groups would otherwise be 201 stops between a reader and the rest
+        # of the page; the arrow keys move within the strip instead.
+        self._apply_many_group_word_report()
+        stops = self.page.eval_on_selector_all(
+            ".response-group-breakdown .answer-segment",
+            "nodes => nodes.map(node => node.tabIndex)")
+        self.assertEqual(stops.count(0), 1)
+        self.assertEqual(stops[0], 0)
+        self.page.locator(".response-group-breakdown .answer-segment").first.focus()
+        self.page.keyboard.press("ArrowRight")
+        moved = self.page.eval_on_selector_all(
+            ".response-group-breakdown .answer-segment",
+            "nodes => nodes.map(node => node.tabIndex)")
+        self.assertEqual(moved.count(0), 1)
+        self.assertEqual(moved[1], 0)
+        self.assertEqual(
+            self.page.evaluate(
+                "() => document.activeElement.getAttribute('aria-label')"),
+            self.page.locator(
+                ".response-group-breakdown .answer-segment").nth(1)
+            .get_attribute("aria-label"))
 
     def _apply_graded_word_report(self):
-        """A solved decomposition whose segments straddle both thresholds.
+        """A solved decomposition whose segments straddle the outline threshold.
 
         Every segment is a fixed share of the strip, so a viewport change moves
-        all of them at once -- the sizes here are graded so that some cross a
+        all of them at once -- the sizes here are graded so that some cross the
         threshold on the way and others stay on their side of it.
         """
         self.page.route("**/api/view**", lambda route: route.abort())
@@ -956,63 +1012,33 @@ class ReportClientBrowserTest(unittest.TestCase):
             {...__reportClient.getState(), branch_target:'SALET'});
         }""", report)
         self.page.wait_for_selector(
-            ".response-group-breakdown .answer-segment.tappable-group")
+            ".response-group-breakdown .answer-segment.solved-group")
 
     def _breakdown_segment_states(self):
         return self.page.eval_on_selector_all(
             ".response-group-breakdown .answer-segment",
             """nodes => nodes.map(node => [node.clientWidth,
-                 node.classList.contains('tappable-group'),
-                 node.classList.contains('solved-group'),
-                 node.getAttribute('role')])""")
+                 node.classList.contains('solved-group')])""")
 
-    def test_word_report_breakdown_remeasures_when_the_window_resizes(self):
+    def test_word_report_breakdown_remeasures_outlines_when_the_window_resizes(self):
         # A segment's width is a share of the strip, so a resize moves it across
-        # a threshold with the report itself unchanged.  The poll is parked, so
-        # only the resize can put this right -- and until it did, a segment
-        # narrowed below the tap threshold stayed a live target, and one widened
-        # past the outline threshold never gained its outline.
+        # the outline threshold with the report itself unchanged.  The poll is
+        # parked, so only the resize can put this right.
         self._apply_graded_word_report()
         wide = self._breakdown_segment_states()
         self.page.set_viewport_size({"width": 375, "height": 800})
         self.page.wait_for_timeout(200)
         narrow = self._breakdown_segment_states()
         self.assertGreater(
-            sum(tappable for _, tappable, _, _ in wide),
-            sum(tappable for _, tappable, _, _ in narrow),
-            "no segment crossed the tap threshold, so this proves nothing")
-        self.assertGreater(
-            sum(outlined for _, _, outlined, _ in wide),
-            sum(outlined for _, _, outlined, _ in narrow),
-            "no segment crossed the outline threshold")
-        for width, tappable, outlined, role in narrow:
-            self.assertEqual(tappable, width >= 20, f"{width}px segment")
+            sum(outlined for _, outlined in wide),
+            sum(outlined for _, outlined in narrow),
+            "no segment crossed the outline threshold, so this proves nothing")
+        for width, outlined in narrow:
             self.assertEqual(outlined, width >= 16, f"{width}px segment")
-            self.assertEqual(role, "button" if tappable else None)
-        # And back: a segment the resize widened regains both.
+        # And back: a segment the resize widened regains its outline.
         self.page.set_viewport_size({"width": 1200, "height": 800})
         self.page.wait_for_timeout(200)
         self.assertEqual(self._breakdown_segment_states(), wide)
-
-    def test_word_report_breakdown_ignores_a_tap_a_resize_narrowed(self):
-        # The listener rides every segment, so the class it defers to is the
-        # only thing standing between a narrowed segment and a navigation.
-        self._apply_graded_word_report()
-        wide = self._breakdown_segment_states()
-        self.page.set_viewport_size({"width": 375, "height": 800})
-        self.page.wait_for_timeout(200)
-        narrow = self._breakdown_segment_states()
-        index = next(
-            index for index, (before, after) in enumerate(zip(wide, narrow))
-            if before[1] and not after[1]
-        )
-        segment = self.page.locator(
-            ".response-group-breakdown .answer-segment").nth(index)
-        self.assertLess(segment.bounding_box()["width"], 20)
-        segment.click(force=True)
-        self.page.wait_for_timeout(100)
-        self.assertEqual(
-            self.page.locator("#branch-target-input").input_value(), "")
 
     def test_word_report_histogram_scales_against_the_branch_best(self):
         # Without a scale the fill spans the track and says nothing about how
@@ -1082,14 +1108,18 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.assertEqual(solved, "solved" in title)
             self.assertEqual(solved, "inset" in shadow and "rgb(0, 0, 0)" in shadow)
 
-    def test_leaderboard_breakdown_group_opens_its_branch_report(self):
+    def test_leaderboard_breakdown_group_opens_a_menu_then_the_branch(self):
+        # The same interaction in both views: a group is never a direct jump in
+        # one place and a menu in the other.
         self.page.locator("[data-kind=leaderboard]").click()
-        self.page.wait_for_selector(".leaderboard-card .answer-segment.tappable-group")
-        segment = self.page.locator(
-            ".leaderboard-card .answer-segment.tappable-group").first
-        self.assertEqual(segment.get_attribute("aria-label"),
-                         "Open SALET ----- branch report")
-        segment.click()
+        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.page.locator(".leaderboard-card .answer-segment").first.click()
+        self.page.wait_for_selector(".group-menu")
+        self.assertEqual(
+            self._menu().locator(".group-menu-title .word").get_attribute(
+                "data-spine"),
+            "SALET -----")
+        self._menu().locator("button", has_text="Open branch report").click()
         self.page.wait_for_selector("text=branch report")
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "SALET -----")

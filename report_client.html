@@ -193,9 +193,14 @@
     .answer-segment-label, .response-count-segment-label { display:block; text-align:center; line-height:.9rem; white-space:nowrap; }
     .answer-segment:last-child { box-shadow:none; }
     .answer-segment.solved-group { box-shadow:inset 0 0 0 2px #000000; }
-    .answer-segment.tappable-group { cursor:pointer; }
-    .answer-segment.tappable-group:hover { filter:brightness(1.2); }
-    .answer-segment.tappable-group:focus-visible { outline:2px solid var(--text); outline-offset:-2px; }
+    .answer-strip[data-selectable] .answer-segment { cursor:pointer; }
+    .answer-strip[data-selectable] .answer-segment:hover { filter:brightness(1.2); }
+    .answer-segment:focus-visible { outline:2px solid var(--text); outline-offset:-2px; }
+    .group-menu { position:absolute; z-index:30; min-width:11rem; max-width:min(20rem,calc(100vw - 1rem)); padding:.4rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; box-shadow:var(--popover-shadow); color:var(--text); }
+    .group-menu-title { display:flex; flex-wrap:wrap; align-items:center; gap:.35rem; padding:.1rem .15rem .35rem; border-bottom:1px solid var(--border); }
+    .group-menu-facts { color:var(--dim); font-size:.78rem; }
+    .group-menu button { display:block; width:100%; margin-top:.3rem; text-align:left; border:0; background:transparent; }
+    .group-menu button:hover, .group-menu button:focus-visible { background:var(--hover-tint); }
     .response-group-bridge { position:relative; z-index:2; display:block; width:100%; height:3rem; margin-bottom:-8px; overflow:visible; pointer-events:none; }
     .response-count-track { position:relative; z-index:1; display:flex; justify-content:center; width:100%; height:1.6rem; }
     .response-count-fill { display:flex; height:100%; overflow:hidden; border:1px solid var(--border); border-radius:4px; }
@@ -1588,14 +1593,58 @@
     ];
     function responseGroupBuckets(groups){return RESPONSE_GROUP_BUCKETS.map(bucket=>{const bucketGroups=groups.filter(group=>group.answer_count>=bucket.minimumAnswerCount&&group.answer_count<=bucket.maximumAnswerCount),responseGroupCount=bucketGroups.length,answerCount=bucketGroups.reduce((total,group)=>total+group.answer_count,0);return {...bucket,groups:bucketGroups,responseGroupCount,answerCount,color:answerGroupColor(Number.isFinite(bucket.maximumAnswerCount)?bucket.maximumAnswerCount:512)};});}
     function svgElement(name){return document.createElementNS("http://www.w3.org/2000/svg",name);}
-    // A pointer cannot reliably hit a segment narrower than this, so only wider
-    // ones become a way into their branch; the rest stay decoration.  Width is
-    // known only once the strip has been laid out, hence the measuring pass.
-    const TAPPABLE_SEGMENT_PIXELS=20;
     // The solved outline is 2px on each edge, so below this a segment is all
     // border and no interior: a run of finished slivers would read as one black
     // block and take the size gradient with it.  Their tooltips still say solved.
     const SOLVED_OUTLINE_SEGMENT_PIXELS=16;
+    // Every group opens a menu rather than jumping straight to its branch.  A
+    // segment can be two pixels wide, so which one a tap landed on is a guess
+    // until the menu names it: the title draws the guess and the response it
+    // caught, and dismissing costs one tap.  Jumping directly would strand the
+    // reader on a branch they never chose with no way to see which one it was.
+    let openGroupMenuNode=null;
+    function closeGroupMenu(){
+      if(!openGroupMenuNode)return;
+      const opener=openGroupMenuNode.opener;
+      openGroupMenuNode.node.remove();openGroupMenuNode=null;
+      if(opener?.isConnected)opener.focus();
+    }
+    function openGroupMenu(segment,group,context){
+      closeGroupMenu();
+      const menu=element("div","group-menu");
+      menu.setAttribute("role","dialog");
+      const branchTarget=(context.branchTargetPrefix+" "+group.pattern).trim();
+      menu.setAttribute("aria-label",branchTarget+" response group");
+      const title=element("div","group-menu-title");
+      title.append(wordTiles(context.word,group.pattern,context.wordIsAnswer,"word-sm"));
+      const facts=[numText(group.answer_count)+(group.answer_count===1?" answer":" answers")];
+      if(context.answerCount)facts.push(fixed(100*group.answer_count/context.answerCount,1)+"%");
+      if(group.solved!==undefined)facts.push(group.solved?"solved":"unsolved");
+      title.append(element("span","group-menu-facts",facts.join(" · ")));
+      const openButton=element("button","","Open branch report");
+      openButton.addEventListener("click",()=>{closeGroupMenu();context.open(branchTarget);});
+      const copyButton=element("button","","Copy spine");
+      copyButton.addEventListener("click",()=>copyText(branchTarget).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));
+      menu.append(title,openButton,copyButton);
+      // Anchored to the segment inside the strip's own offset parent, then
+      // pulled back from the right edge: a segment near the end of the strip
+      // would otherwise open a menu that runs off the page.
+      const strip=segment.parentElement,host=strip.parentElement;
+      host.style.position=host.style.position||"relative";
+      host.append(menu);
+      const stripBox=strip.getBoundingClientRect(),segmentBox=segment.getBoundingClientRect();
+      menu.style.top=(strip.offsetTop+strip.offsetHeight+4)+"px";
+      const left=Math.max(0,Math.min(segmentBox.left-stripBox.left+strip.offsetLeft,
+        strip.offsetLeft+strip.offsetWidth-menu.offsetWidth));
+      menu.style.left=left+"px";
+      openGroupMenuNode={node:menu,opener:segment};
+      openButton.focus();
+    }
+    document.addEventListener("click",event=>{
+      if(openGroupMenuNode&&!openGroupMenuNode.node.contains(event.target)
+         &&event.target!==openGroupMenuNode.opener)closeGroupMenu();
+    });
+    document.addEventListener("keydown",event=>{if(event.key==="Escape")closeGroupMenu();});
     // Both thresholds are properties of the laid-out strip, not of the report,
     // so a segment crosses one when the window resizes and nothing else
     // changes.  Applying them by measurement, and re-applying on every resize,
@@ -1607,18 +1656,15 @@
     function measureAnswerStrip(strip){
       const segments=[...strip.children],widths=segments.map(segment=>segment.clientWidth);
       segments.forEach((segment,index)=>{
-        const width=widths[index],branchTarget=segment.dataset.branchTarget;
         segment.classList.toggle("solved-group",
-          segment.dataset.solved==="1"&&width>=SOLVED_OUTLINE_SEGMENT_PIXELS);
-        const tappable=!!branchTarget&&width>=TAPPABLE_SEGMENT_PIXELS;
-        segment.classList.toggle("tappable-group",tappable);
-        if(tappable){segment.setAttribute("role","button");segment.setAttribute("tabindex","0");segment.setAttribute("aria-label","Open "+branchTarget+" branch report");}
-        else{segment.removeAttribute("role");segment.removeAttribute("tabindex");segment.removeAttribute("aria-label");}
+          segment.dataset.solved==="1"&&widths[index]>=SOLVED_OUTLINE_SEGMENT_PIXELS);
       });
     }
     function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
       strip.setAttribute("aria-label","Answer probability by response group for "+String(row.word||"").toUpperCase());
+      const context=selection&&{...selection,word:row.word,wordIsAnswer:row.word_is_answer,answerCount};
+      if(selection){strip.dataset.selectable="1";strip.setAttribute("role","listbox");}
       for(const [index,group] of groups.entries()){
         const probability=answerCount?group.answer_count/answerCount:0,segment=element("span","answer-segment");
         if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);segment.dataset.answerCount=numText(group.answer_count);}
@@ -1626,14 +1672,24 @@
         segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability"+(group.solved?" · solved":"");
         if(group.solved)segment.dataset.solved="1";
         if(selection){
-          // The listener rides every segment and defers to the class the
-          // measuring pass maintains, so a segment that a resize narrowed stops
-          // opening its branch without a listener having to be taken off it.
-          const branchTarget=(selection.branchTargetPrefix+" "+group.pattern).trim();
-          segment.dataset.branchTarget=branchTarget;
-          const open=()=>{if(segment.classList.contains("tappable-group"))selection.open(branchTarget);};
-          segment.addEventListener("click",open);
-          segment.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();open();}});
+          segment.setAttribute("role","option");
+          segment.setAttribute("aria-label",
+            (selection.branchTargetPrefix+" "+group.pattern).trim()+" · "
+            +numText(group.answer_count)+(group.answer_count===1?" answer":" answers"));
+          // One tab stop for the whole strip, arrows to move within it: 161
+          // groups would otherwise be 161 stops between a reader and the rest
+          // of the page.
+          segment.tabIndex=index?-1:0;
+          segment.addEventListener("click",event=>{event.stopPropagation();openGroupMenu(segment,group,context);});
+          segment.addEventListener("keydown",event=>{
+            if(event.key==="Enter"||event.key===" "){event.preventDefault();openGroupMenu(segment,group,context);return;}
+            const step=event.key==="ArrowRight"?1:event.key==="ArrowLeft"?-1:0;
+            if(!step)return;
+            const next=strip.children[index+step];
+            if(!next)return;
+            event.preventDefault();
+            segment.tabIndex=-1;next.tabIndex=0;next.focus();
+          });
         }
         strip.append(segment);
       }
