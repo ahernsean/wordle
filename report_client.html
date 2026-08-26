@@ -1574,6 +1574,26 @@
     // border and no interior: a run of finished slivers would read as one black
     // block and take the size gradient with it.  Their tooltips still say solved.
     const SOLVED_OUTLINE_SEGMENT_PIXELS=16;
+    // Both thresholds are properties of the laid-out strip, not of the report,
+    // so a segment crosses one when the window resizes and nothing else
+    // changes.  Applying them by measurement, and re-applying on every resize,
+    // is what keeps "wide enough" true of what is on screen rather than of what
+    // was on screen when the strip was built.  Each pass reads every width
+    // before writing the first class: a class lands on a laid-out strip, so
+    // interleaving would force a reflow per segment, and a leaderboard draws
+    // one of these strips per card.
+    function measureAnswerStrip(strip){
+      const segments=[...strip.children],widths=segments.map(segment=>segment.clientWidth);
+      segments.forEach((segment,index)=>{
+        const width=widths[index],branchTarget=segment.dataset.branchTarget;
+        segment.classList.toggle("solved-group",
+          segment.dataset.solved==="1"&&width>=SOLVED_OUTLINE_SEGMENT_PIXELS);
+        const tappable=!!branchTarget&&width>=TAPPABLE_SEGMENT_PIXELS;
+        segment.classList.toggle("tappable-group",tappable);
+        if(tappable){segment.setAttribute("role","button");segment.setAttribute("tabindex","0");segment.setAttribute("aria-label","Open "+branchTarget+" branch report");}
+        else{segment.removeAttribute("role");segment.removeAttribute("tabindex");segment.removeAttribute("aria-label");}
+      });
+    }
     function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
       strip.setAttribute("aria-label","Answer probability by response group for "+String(row.word||"").toUpperCase());
@@ -1582,24 +1602,20 @@
         if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);segment.dataset.answerCount=numText(group.answer_count);}
         segment.style.flexGrow=String(group.answer_count);segment.style.flexBasis="0";segment.style.backgroundColor=answerGroupColor(group.answer_count);
         segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability"+(group.solved?" · solved":"");
-        strip.append(segment);
-      }
-      // Every width is read before the first class is written: a class lands
-      // on a laid-out strip, so interleaving would force a reflow per segment,
-      // and a leaderboard draws one of these strips per card.
-      requestAnimationFrame(()=>{
-        const segments=[...strip.children],widths=segments.map(segment=>segment.clientWidth);
-        segments.forEach((segment,index)=>{
-          const group=groups[index],width=widths[index];
-          if(group.solved&&width>=SOLVED_OUTLINE_SEGMENT_PIXELS)segment.classList.add("solved-group");
-          if(!selection||width<TAPPABLE_SEGMENT_PIXELS)return;
-          const branchTarget=(selection.branchTargetPrefix+" "+group.pattern).trim(),open=()=>selection.open(branchTarget);
-          segment.classList.add("tappable-group");segment.setAttribute("role","button");segment.setAttribute("tabindex","0");
-          segment.setAttribute("aria-label","Open "+branchTarget+" branch report");
+        if(group.solved)segment.dataset.solved="1";
+        if(selection){
+          // The listener rides every segment and defers to the class the
+          // measuring pass maintains, so a segment that a resize narrowed stops
+          // opening its branch without a listener having to be taken off it.
+          const branchTarget=(selection.branchTargetPrefix+" "+group.pattern).trim();
+          segment.dataset.branchTarget=branchTarget;
+          const open=()=>{if(segment.classList.contains("tappable-group"))selection.open(branchTarget);};
           segment.addEventListener("click",open);
           segment.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();open();}});
-        });
-      });
+        }
+        strip.append(segment);
+      }
+      requestAnimationFrame(()=>measureAnswerStrip(strip));
       return strip;
     }
     function responseVisualKey(){
@@ -1953,7 +1969,7 @@
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
-      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
+      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};

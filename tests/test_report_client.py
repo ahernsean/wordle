@@ -934,6 +934,86 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "")
 
+    def _apply_graded_word_report(self):
+        """A solved decomposition whose segments straddle both thresholds.
+
+        Every segment is a fixed share of the strip, so a viewport change moves
+        all of them at once -- the sizes here are graded so that some cross a
+        threshold on the way and others stay on their side of it.
+        """
+        self.page.route("**/api/view**", lambda route: route.abort())
+        report = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["word.json"])
+        patterns = ["".join(letters)
+                    for letters in itertools.product("gy-", repeat=5)]
+        counts = [500, 40, 30, 25, 20, 15, 10, 5, 3, 2, 1]
+        report["data"]["response_group_breakdown"] = [
+            {"pattern": pattern, "answer_count": count, "solved": True}
+            for pattern, count in zip(patterns, counts)
+        ]
+        report["data"]["total_rows"] = len(counts)
+        self.page.evaluate("""(report) => {
+          applyReport(report, null,
+            {...__reportClient.getState(), branch_target:'SALET'});
+        }""", report)
+        self.page.wait_for_selector(
+            ".response-group-breakdown .answer-segment.tappable-group")
+
+    def _breakdown_segment_states(self):
+        return self.page.eval_on_selector_all(
+            ".response-group-breakdown .answer-segment",
+            """nodes => nodes.map(node => [node.clientWidth,
+                 node.classList.contains('tappable-group'),
+                 node.classList.contains('solved-group'),
+                 node.getAttribute('role')])""")
+
+    def test_word_report_breakdown_remeasures_when_the_window_resizes(self):
+        # A segment's width is a share of the strip, so a resize moves it across
+        # a threshold with the report itself unchanged.  The poll is parked, so
+        # only the resize can put this right -- and until it did, a segment
+        # narrowed below the tap threshold stayed a live target, and one widened
+        # past the outline threshold never gained its outline.
+        self._apply_graded_word_report()
+        wide = self._breakdown_segment_states()
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        self.page.wait_for_timeout(200)
+        narrow = self._breakdown_segment_states()
+        self.assertGreater(
+            sum(tappable for _, tappable, _, _ in wide),
+            sum(tappable for _, tappable, _, _ in narrow),
+            "no segment crossed the tap threshold, so this proves nothing")
+        self.assertGreater(
+            sum(outlined for _, _, outlined, _ in wide),
+            sum(outlined for _, _, outlined, _ in narrow),
+            "no segment crossed the outline threshold")
+        for width, tappable, outlined, role in narrow:
+            self.assertEqual(tappable, width >= 20, f"{width}px segment")
+            self.assertEqual(outlined, width >= 16, f"{width}px segment")
+            self.assertEqual(role, "button" if tappable else None)
+        # And back: a segment the resize widened regains both.
+        self.page.set_viewport_size({"width": 1200, "height": 800})
+        self.page.wait_for_timeout(200)
+        self.assertEqual(self._breakdown_segment_states(), wide)
+
+    def test_word_report_breakdown_ignores_a_tap_a_resize_narrowed(self):
+        # The listener rides every segment, so the class it defers to is the
+        # only thing standing between a narrowed segment and a navigation.
+        self._apply_graded_word_report()
+        wide = self._breakdown_segment_states()
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        self.page.wait_for_timeout(200)
+        narrow = self._breakdown_segment_states()
+        index = next(
+            index for index, (before, after) in enumerate(zip(wide, narrow))
+            if before[1] and not after[1]
+        )
+        segment = self.page.locator(
+            ".response-group-breakdown .answer-segment").nth(index)
+        self.assertLess(segment.bounding_box()["width"], 20)
+        segment.click(force=True)
+        self.page.wait_for_timeout(100)
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "")
+
     def test_word_report_breakdown_outlines_only_groups_wide_enough_to_show_one(self):
         # A 2-px outline on each edge of a sliver is all border and no
         # interior, so a run of finished slivers would read as one black block.
