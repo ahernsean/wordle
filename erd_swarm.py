@@ -1579,7 +1579,7 @@ class _BranchWorker:
                     (timing["completed_at"] - timing["first_created_at"]) * 1000,
                     timing["worker_millis"] or 0, telemetry_epochs)
             except Exception:
-                logger.exception("%s could not snapshot completed source %s",
+                logger.exception("%s could not snapshot completed opener %s",
                                  self.name, source_word)
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,

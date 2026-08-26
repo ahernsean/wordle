@@ -944,7 +944,7 @@ def _check_source_work_invariants(queue):
     """Log any check_source_work_invariants() violations found right now."""
     violations = queue.check_source_work_invariants()
     if violations:
-        logger.warning('Source-work invariant check found %d violation(s):',
+        logger.warning('Opener-work invariant check found %d violation(s):',
                        len(violations))
         for violation in violations:
             logger.warning('  %s', violation)
@@ -1126,7 +1126,7 @@ def cmd_run(args):
                 try:
                     _check_source_work_invariants(q)
                 except sqlite3.OperationalError as exc:
-                    logger.warning('Source-work invariant check skipped: %s',
+                    logger.warning('Opener-work invariant check skipped: %s',
                                    exc)
                 last_invariant_check = time.time()
             _maybe_quiesce_truncate(q)
@@ -1255,7 +1255,7 @@ def cmd_queue_reconcile_orphaned_ownership(args):
         print('No orphaned owned branches found.')
         return
     print(f'Demoted {len(branch_ids)} orphaned owned branch(es) to direct '
-          f'(claimable without a live source-work membership): '
+          f'(claimable without a live opener-work membership): '
           f'{", ".join(str(b) for b in branch_ids)}')
 
 

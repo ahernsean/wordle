@@ -705,7 +705,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
     def test_out_of_range_priority_is_rejected_before_any_branch_is_queued(self):
         args = _make_args(self._tmp.name, priority=SOURCE_PRIORITY_MAX + 1)
 
-        with self.assertRaisesRegex(ValueError, 'source-work priority'):
+        with self.assertRaisesRegex(ValueError, 'opener-work priority'):
             erd_search.cmd_queue_add(args)
 
         self.assertEqual(ERDQueue(args.queue).total_branches(), 0)

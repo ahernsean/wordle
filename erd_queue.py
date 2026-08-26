@@ -810,7 +810,7 @@ def check_source_priority_range(priority: int) -> None:
     """Raise ValueError unless priority is within the source-work range."""
     if not SOURCE_PRIORITY_MIN <= priority <= SOURCE_PRIORITY_MAX:
         raise ValueError(
-            "source-work priority must be between "
+            "opener-work priority must be between "
             f"{SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}")
 
 

@@ -372,7 +372,7 @@ explicit `ATTACH 'erd_queue.sqlite3' AS q` first, then join against
 `busy_wait_millis` (write-lock wait, across every claim path taken while
 coordinating — both `claim_next_bundle` and `claim_next`) +
 `scheduling_millis` (the work-selection scan that chose this branch:
-source-work ordering, pending promotion, joining an in-progress branch) +
+opener-work ordering, pending promotion, joining an in-progress branch) +
 `idle_millis` (the remainder); those five sum to `coordination_millis`
 exactly.
 
@@ -384,7 +384,7 @@ deliberately not counted here; folding it in would make the parts exceed
 the whole.
 
 Scheduling is broken out rather than left in the remainder because it is
-real work, and it grows with the number of source-work groups: folded into
+real work, and it grows with the number of opener-work groups: folded into
 `idle_millis` a large value reads as starved workers, when the true cause
 may be that work selection is eating the window.  `idle_millis` therefore
 means genuinely unaccounted wait.  One exception worth knowing: a scan that
