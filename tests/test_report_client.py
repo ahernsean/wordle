@@ -3048,33 +3048,14 @@ class ReportClientBrowserTest(unittest.TestCase):
         finally:
             context.close()
 
-    def test_leaderboard_card_clips_a_stray_bucket_legend_position(self):
-        # layoutResponseBucketLegend positions each legend label with a
-        # percentage left so it rescales with the card on an ordinary width
-        # change (see issue #261), but that guarantee is only as good as the
-        # packing math behind it.  Whatever gets a label to a bad position --
-        # this test forces the pathological case directly -- must never widen
-        # the page.
-        self.page.goto(self.base_url + "?kind=leaderboard")
-        self.page.wait_for_selector(".response-bucket-legend > span")
-        measured = self.page.evaluate("""() => {
-          const span = document.querySelector('.response-bucket-legend > span');
-          span.style.left = '5000px';
-          return {
-            scroll: document.documentElement.scrollWidth,
-            client: document.documentElement.clientWidth,
-          };
-        }""")
-        self.assertLessEqual(measured["scroll"], measured["client"], measured)
-
     def test_leaderboard_legend_labels_never_overlap_after_an_unhandled_resize(self):
-        # layoutResponseBucketLegend packs labels for the card width it runs
-        # at, and only their target position -- not the packer's row
-        # assignment -- rescales with the container afterward.  A width the
-        # app hasn't repacked for (setUp's page is already 1200px wide; drop
-        # straight to 800 with no wait, so nothing gets a chance to re-render
-        # first) must fall back to a plain flow instead of seating two labels
-        # over the same span.
+        # The bucket legend lays its labels out with plain CSS grid flow (see
+        # issue #261, where a width-dependent absolute-positioning scheme --
+        # even a percentage-based one -- could still seat two labels over the
+        # same span at a width it hadn't repacked for). Flow can't collide
+        # regardless of width, so this holds even with no chance for a
+        # re-render: setUp's page is already 1200px wide; drop straight to
+        # 800 with no wait, so nothing gets a chance to run first.
         self.page.goto(self.base_url + "?kind=leaderboard")
         self.page.wait_for_selector(".response-bucket-legend > span")
         self.page.set_viewport_size({"width": 800, "height": 800})

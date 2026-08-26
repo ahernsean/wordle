@@ -164,15 +164,10 @@
        slash, and the pair never breaks across a line. */
     .word-erd { white-space:normal; }
     .word-erd > .word-erd-pair { white-space:nowrap; }
-    /* The bucket legend's labels rescale with the card via a percentage left
-       (see layoutResponseBucketLegend), so an ordinary width change keeps
-       them in bounds without needing a resize handler to run first.  That
-       guarantee is only as good as the packing math behind it, though, so
-       this clips horizontally as a backstop against whatever a future change
-       (or a width collapse more extreme than the packer was built for) gets
-       wrong -- the legend's own svg leader lines still escape its box
-       vertically into the margin reserved above it, comfortably inside the
-       card's own height, so this does not clip them. */
+    /* No child of this card is ever meant to reach past its edge -- the same
+       guarantee body makes for the page as a whole above -- so this is a
+       standing invariant of the card, not insurance against one specific
+       piece of content. */
     .leaderboard-card { padding:.65rem .75rem; overflow-x:hidden; }
     .leaderboard-card .card-title { font-size:1.05rem; gap:.55rem; }
     .leaderboard-rank { color:var(--dim); }
@@ -189,9 +184,14 @@
     .response-count-segment { display:flex; align-items:center; justify-content:center; min-width:0; overflow:hidden; color:#ffffff; font-size:.68rem; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.65); box-shadow:inset -1px 0 rgba(255,255,255,.5); }
     .response-count-segment-label { flex:0 0 auto; line-height:.62rem; }
     .response-count-segment:last-child { box-shadow:none; }
-    .response-bucket-legend { position:relative; min-height:.9rem; margin-top:1rem; color:var(--dim); font-size:.72rem; }
-    .response-bucket-legend > svg { position:absolute; left:0; top:-1rem; width:100%; height:calc(100% + 1rem); overflow:visible; pointer-events:none; }
-    .response-bucket-legend > span { position:absolute; z-index:1; white-space:nowrap; transform:translateX(-50%); }
+    /* A grid, not the leader-line-and-absolute-position layout this once
+       was: that positioned each label in pixels for the card's width at the
+       time it ran, and only the label's own target point (not the row it
+       shared with its neighbors) rescaled on a width change the app hadn't
+       repacked for, so two labels could still end up sharing a row that no
+       longer fit them both.  Plain grid flow can't collide, at any width,
+       whether or not a repack ever runs. */
+    .response-bucket-legend { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem .55rem; margin-top:.4rem; color:var(--dim); font-size:.72rem; }
     .response-bucket-legend > span::before { content:""; display:inline-block; width:.55rem; height:.55rem; margin-right:.16rem; border-radius:1px; vertical-align:-.08rem; background:var(--bucket-color); }
     .leaderboard-worst-case { margin-top:.15rem; font-size:.8rem; }
     .progress-line { margin:.25rem 0; }
@@ -260,20 +260,6 @@
       .answer-segment, .response-count-segment { font-size:0; }
       .answer-segment[data-answer-count]::after { content:attr(data-answer-count); font-size:.66rem; }
       .response-count-segment[data-response-group-count]::after { content:attr(data-response-group-count); font-size:.66rem; }
-    }
-    /* layoutResponseBucketLegend packs labels for the card width it runs at;
-       a narrower width it hasn't repacked for can seat two labels over the
-       same span, since only their target position (not the packer's row
-       assignment) scales with the container.  Below this width the grid
-       flow it falls back to lays labels out natively, so it stays free of
-       overlaps -- and stale ones -- at any width down to it without needing
-       that repack to run.  A separate, wider threshold than the segment
-       rules above: those only hide count labels behind ::after content,
-       which stays legible however narrow the segment gets. */
-    @media (max-width:800px) {
-      .response-bucket-legend { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem .55rem; min-height:0; margin-top:.4rem; }
-      .response-bucket-legend > svg { display:none; }
-      .response-bucket-legend > span { position:static; transform:none; font-size:.72rem; }
     }
   </style>
 </head>
@@ -1586,8 +1572,8 @@
       return strip;
     }
     function renderResponseCountHistogram(row,maximumResponseGroupCount){
-      const groups=row.response_groups||[],track=element("div","response-count-track"),fill=element("div","response-count-fill"),buckets=responseGroupBuckets(groups),legend=element("div","response-bucket-legend"),fillWidth=maximumResponseGroupCount?groups.length/maximumResponseGroupCount:0;
-      fill.style.width=(maximumResponseGroupCount?100*groups.length/maximumResponseGroupCount:0)+"%";let responseGroupPosition=0;
+      const groups=row.response_groups||[],track=element("div","response-count-track"),fill=element("div","response-count-fill"),buckets=responseGroupBuckets(groups),legend=element("div","response-bucket-legend");
+      fill.style.width=(maximumResponseGroupCount?100*groups.length/maximumResponseGroupCount:0)+"%";
       for(const bucket of buckets){
         if(bucket.responseGroupCount){
           const countText=numText(bucket.responseGroupCount),segment=element("span","response-count-segment"),label=element("span","response-count-segment-label"),wordLabel=bucket.labelText+(bucket.labelText==="1"?" word:":" words:");label.append(wordLabel,document.createElement("br"),countText+" groups");segment.append(label);
@@ -1595,47 +1581,11 @@
           if(bucket.responseGroupCount/groups.length>=.06)segment.dataset.responseGroupCount=countText;
           segment.dataset.countText=countText;
           segment.title=bucket.labelText+(bucket.labelText==="1"?" answer":" answers")+" · "+numText(bucket.responseGroupCount)+(bucket.responseGroupCount===1?" response group":" response groups");fill.append(segment);
-          const legendItem=element("span","",bucket.labelText+(bucket.labelText==="1"?" word: ":" words: ")+countText),segmentCenter=(responseGroupPosition+bucket.responseGroupCount/2)/groups.length;legendItem.style.setProperty("--bucket-color",bucket.color);legendItem.dataset.segmentCenter=String((1-fillWidth)/2+fillWidth*segmentCenter);legendItem.dataset.bucketColor=bucket.color;legend.append(legendItem);segment.dataset.legendIndex=String(legend.children.length-1);responseGroupPosition+=bucket.responseGroupCount;
+          const legendItem=element("span","",bucket.labelText+(bucket.labelText==="1"?" word: ":" words: ")+countText);legendItem.style.setProperty("--bucket-color",bucket.color);legend.append(legendItem);segment.dataset.legendIndex=String(legend.children.length-1);
         }
       }
       track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+" out of a vocabulary maximum of "+numText(maximumResponseGroupCount));
-      track.append(fill);requestAnimationFrame(()=>{if(matchMedia("(max-width: 600px)").matches){for(const segment of fill.children)segment.replaceChildren();const legendItems=[...legend.children],leftColumnSize=Math.ceil(legendItems.length/2),mobileOrder=[];for(let index=0;index<leftColumnSize;index++){mobileOrder.push(legendItems[index]);if(legendItems[index+leftColumnSize])mobileOrder.push(legendItems[index+leftColumnSize]);}legend.append(...mobileOrder);return;}for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(legend.children.length)layoutResponseBucketLegend(legend);else legend.remove();});return [track,legend];
-    }
-    function layoutResponseBucketLegend(legend){
-      legend.querySelector(":scope > svg")?.remove();const items=[...legend.querySelectorAll(":scope > span")],width=legend.clientWidth,padding=4,gap=6,leaderGap=16,laneHeight=Math.max(...items.map(item=>item.offsetHeight))+6;
-      const itemData=items.map((item,index)=>({item,index,width:item.offsetWidth,height:item.offsetHeight,sourceX:Number(item.dataset.segmentCenter)*width}));
-      function pack(rows){
-        const placements=[];
-        for(let row=0;row<=Math.max(...rows);row++){
-          const rowItems=itemData.filter(data=>rows[data.index]===row);if(!rowItems.length)continue;
-          const requiredWidth=rowItems.reduce((total,data)=>total+data.width,0)+gap*(rowItems.length-1);if(requiredWidth>width-2*padding)return null;
-          const centers=[];for(let index=0;index<rowItems.length;index++){const data=rowItems[index],minimum=index?centers[index-1]+rowItems[index-1].width/2+data.width/2+gap:data.width/2+padding;centers.push(Math.max(data.sourceX,minimum));}
-          const maximum=width-rowItems.at(-1).width/2-padding;if(centers.at(-1)>maximum){centers[centers.length-1]=maximum;for(let index=centers.length-2;index>=0;index--)centers[index]=Math.min(centers[index],centers[index+1]-rowItems[index].width/2-rowItems[index+1].width/2-gap);}
-          if(centers[0]<rowItems[0].width/2+padding)return null;
-          for(let index=0;index<rowItems.length;index++)placements[rowItems[index].index]={...rowItems[index],x:centers[index],row,top:leaderGap+row*laneHeight};
-        }
-        return placements;
-      }
-      function cubicPoint(placement,progress){const routeY=Math.max(7,placement.top-3),inverse=1-progress,sourceX=placement.sourceX,targetX=placement.x;return {x:inverse**3*sourceX+3*inverse**2*progress*sourceX+3*inverse*progress**2*targetX+progress**3*targetX,y:3*inverse**2*progress*routeY+3*inverse*progress**2*routeY+progress**3*placement.top};}
-      function leaderTouchesLabel(placement,placements){for(let step=1;step<24;step++){const point=cubicPoint(placement,step/24);for(const other of placements){if(other.index===placement.index)continue;const left=other.x-other.width/2-1,right=other.x+other.width/2+1,bottom=other.top+other.height+1;if(point.x>=left&&point.x<=right&&point.y>=other.top-1&&point.y<=bottom)return true;}}return false;}
-      let best=null;
-      function consider(rows){const placements=pack(rows);if(!placements||placements.some(placement=>leaderTouchesLabel(placement,placements)))return;const score=placements.reduce((total,placement)=>total+(placement.x-placement.sourceX)**2/width+placement.row*40,0);if(!best||score<best.score)best={placements,score};}
-      for(let railCount=1;railCount<=4&&!best;railCount++){
-        const rows=[];
-        function search(index,highestRow){if(index===itemData.length){consider(rows);return;}for(let row=0;row<=Math.min(railCount-1,highestRow+1);row++){rows[index]=row;search(index+1,Math.max(highestRow,row));}}
-        search(0,-1);
-      }
-      const placements=best?.placements||pack(itemData.map((_,index)=>index))||[];
-      // A percentage, not a pixel, so a width change the app hasn't relaid
-      // out for yet (a resize event that hasn't fired) rescales the label
-      // with its container instead of holding the old absolute offset --
-      // the same reason the leader-line svg below is driven by a viewBox
-      // rather than pixel coordinates.
-      for(const placement of placements){placement.item.style.left=(placement.x/width*100)+"%";placement.item.style.top=((placement.top-leaderGap))+"px";}
-      legend.style.minHeight=Math.max(laneHeight,...placements.map(placement=>placement.top-leaderGap+placement.height))+"px";
-      const leaders=svgElement("svg");leaders.setAttribute("viewBox","0 0 "+width+" "+(legend.offsetHeight+leaderGap));leaders.setAttribute("preserveAspectRatio","none");
-      for(const placement of placements){const routeY=Math.max(7,placement.top-3),path=svgElement("path");path.setAttribute("d","M "+placement.sourceX+" 0 C "+placement.sourceX+" "+routeY+" "+placement.x+" "+routeY+" "+placement.x+" "+placement.top);path.setAttribute("fill","none");path.setAttribute("stroke",placement.item.dataset.bucketColor);path.setAttribute("stroke-width","1.5");path.setAttribute("stroke-linecap","round");path.setAttribute("opacity",".82");leaders.append(path);}
-      legend.prepend(leaders);
+      track.append(fill);requestAnimationFrame(()=>{if(matchMedia("(max-width: 600px)").matches){for(const segment of fill.children)segment.replaceChildren();const legendItems=[...legend.children],leftColumnSize=Math.ceil(legendItems.length/2),mobileOrder=[];for(let index=0;index<leftColumnSize;index++){mobileOrder.push(legendItems[index]);if(legendItems[index+leftColumnSize])mobileOrder.push(legendItems[index+leftColumnSize]);}legend.append(...mobileOrder);return;}for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(!legend.children.length)legend.remove();});return [track,legend];
     }
     function renderResponseGroupBridge(row,maximumResponseGroupCount){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),buckets=responseGroupBuckets(groups),svg=svgElement("svg"),viewWidth=1000,viewHeight=48,bottomBarTop=viewHeight-8,fillWidth=maximumResponseGroupCount?viewWidth*groups.length/maximumResponseGroupCount:0,lowerPosition=(viewWidth-fillWidth)/2;
