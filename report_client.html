@@ -175,6 +175,7 @@
     .answer-segment { display:flex; align-items:center; justify-content:center; min-width:0; overflow:hidden; color:#ffffff; font-size:.72rem; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.65); box-shadow:inset -1px 0 rgba(255,255,255,.5); }
     .answer-segment-label, .response-count-segment-label { display:block; text-align:center; line-height:.9rem; white-space:nowrap; }
     .answer-segment:last-child { box-shadow:none; }
+    .answer-segment.solved-group { box-shadow:inset 0 0 0 2px #000000; }
     .answer-segment.tappable-group { cursor:pointer; }
     .answer-segment.tappable-group:hover { filter:brightness(1.2); }
     .answer-segment.tappable-group:focus-visible { outline:2px solid var(--text); outline-offset:-2px; }
@@ -1569,6 +1570,10 @@
     // ones become a way into their branch; the rest stay decoration.  Width is
     // known only once the strip has been laid out, hence the measuring pass.
     const TAPPABLE_SEGMENT_PIXELS=20;
+    // The solved outline is 2px on each edge, so below this a segment is all
+    // border and no interior: a run of finished slivers would read as one black
+    // block and take the size gradient with it.  Their tooltips still say solved.
+    const SOLVED_OUTLINE_SEGMENT_PIXELS=16;
     function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
       strip.setAttribute("aria-label","Answer probability by response group for "+String(row.word||"").toUpperCase());
@@ -1576,13 +1581,19 @@
         const probability=answerCount?group.answer_count/answerCount:0,segment=element("span","answer-segment");
         if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);segment.dataset.answerCount=numText(group.answer_count);}
         segment.style.flexGrow=String(group.answer_count);segment.style.flexBasis="0";segment.style.backgroundColor=answerGroupColor(group.answer_count);
-        segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability";
+        segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability"+(group.solved?" · solved":"");
         strip.append(segment);
       }
-      if(selection)requestAnimationFrame(()=>{
-        [...strip.children].forEach((segment,index)=>{
-          if(segment.clientWidth<TAPPABLE_SEGMENT_PIXELS)return;
-          const branchTarget=(selection.branchTargetPrefix+" "+groups[index].pattern).trim(),open=()=>selection.open(branchTarget);
+      // Every width is read before the first class is written: a class lands
+      // on a laid-out strip, so interleaving would force a reflow per segment,
+      // and a leaderboard draws one of these strips per card.
+      requestAnimationFrame(()=>{
+        const segments=[...strip.children],widths=segments.map(segment=>segment.clientWidth);
+        segments.forEach((segment,index)=>{
+          const group=groups[index],width=widths[index];
+          if(group.solved&&width>=SOLVED_OUTLINE_SEGMENT_PIXELS)segment.classList.add("solved-group");
+          if(!selection||width<TAPPABLE_SEGMENT_PIXELS)return;
+          const branchTarget=(selection.branchTargetPrefix+" "+group.pattern).trim(),open=()=>selection.open(branchTarget);
           segment.classList.add("tappable-group");segment.setAttribute("role","button");segment.setAttribute("tabindex","0");
           segment.setAttribute("aria-label","Open "+branchTarget+" branch report");
           segment.addEventListener("click",open);
@@ -1688,7 +1699,7 @@
       if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
       const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;fragment.append(responseVisualKey());
       const grid=element("div","grid leaderboard"),previousRows=previousBy(previous,"rows","word");
-      for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd");entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,renderResponseGroupBreakdown(row,{maximumResponseGroupCount}),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
+      for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd");entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,renderResponseGroupBreakdown(row,{maximumResponseGroupCount,selection:{branchTargetPrefix:String(row.word||"").toUpperCase(),open:branchTarget=>setState({...state,kind:"auto",branch_target:branchTarget,tree:false,finalization_cursor:""})}}),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
       fragment.append(grid);return fragment;
     }
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=gridElement("cache"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}

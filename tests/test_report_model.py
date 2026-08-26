@@ -23,6 +23,7 @@ from report_model import (
     _source_word_group_key,
     _resolved_candidate_erd,
     _grouped_response_groups,
+    _response_group_is_solved,
     _response_group_key,
     _response_group_rollup,
     _root_progress_estimate,
@@ -584,7 +585,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(len(breakdown), data["total_rows"])
         self.assertEqual(
             [set(entry) for entry in breakdown],
-            [{"pattern", "answer_count"}] * len(breakdown),
+            [{"pattern", "answer_count", "solved"}] * len(breakdown),
         )
         self.assertEqual(
             [entry["answer_count"] for entry in breakdown], [2, 1, 1]
@@ -600,6 +601,77 @@ class ReportModelTest(unittest.TestCase):
                 for row in data["response_groups"]
             },
         )
+
+    def test_response_group_breakdown_marks_solved_groups(self):
+        # BEBOP splits these answers into two groups of two, so caching one
+        # branch leaves a matched pair: same size, one solved and one not.
+        target = parse_report_branch_target("bebop")
+        groups = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        cached, uncached = groups[0], groups[1]
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(
+            bytes.fromhex(cached["branch_key_hex"]), ERD_ALL, "salet", 1.5,
+            max_depth=2, solve_budget=None,
+        )
+        cache.close()
+        data = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]
+        solved = {
+            entry["pattern"]: entry["solved"]
+            for entry in data["response_group_breakdown"]
+        }
+        self.assertTrue(solved[cached["pattern"]])
+        self.assertFalse(solved[uncached["pattern"]])
+        self.assertEqual(
+            sum(solved.values()), data["erd_summary"]["resolved_group_count"],
+            "the outlined groups must be the groups the ERD line counts",
+        )
+
+    def test_response_group_breakdown_solves_a_lone_survivor_only_with_budget(self):
+        # A one-answer group is solved by playing the survivor, which costs a
+        # guess -- so at the last guess it is a proven loss, not a solved group.
+        data = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("audio"),
+        ))["data"]
+        solved = {
+            entry["pattern"]: entry["solved"]
+            for entry in data["response_group_breakdown"]
+        }
+        lone = [
+            row for row in data["response_groups"] if row["answer_count"] == 1
+        ]
+        self.assertTrue(lone)
+        self.assertTrue(all(solved[row["pattern"]] for row in lone))
+        self.assertEqual(
+            sum(solved.values()), data["erd_summary"]["resolved_group_count"]
+        )
+        self.assertFalse(_response_group_is_solved(
+            {"best_erd": None, "max_remaining_depth": None,
+             "answer_count": 1, "pattern": "-----"},
+            0,
+        ))
+        self.assertTrue(_response_group_is_solved(
+            {"best_erd": None, "max_remaining_depth": None,
+             "answer_count": 1, "pattern": "ggggg"},
+            0,
+        ))
+
+    def test_response_group_is_solved_requires_a_worst_case_line(self):
+        # An ERD with no proven worst-case line cannot complete the fold, so it
+        # is not a solved group either.
+        self.assertFalse(_response_group_is_solved(
+            {"best_erd": 2.0, "max_remaining_depth": None,
+             "answer_count": 9, "pattern": "-----"},
+            5,
+        ))
+        self.assertTrue(_response_group_is_solved(
+            {"best_erd": 2.0, "max_remaining_depth": 3,
+             "answer_count": 9, "pattern": "-----"},
+            5,
+        ))
 
     def test_response_group_breakdown_ignores_filters_and_the_display_limit(self):
         # The graph draws the whole decomposition; narrowing the rows listed

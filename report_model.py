@@ -1034,6 +1034,24 @@ def _mark_queue_source_error(report, error):
 _ALL_GREEN_PATTERN_TEXT = fmt_pattern(3 ** 5 - 1)
 
 
+def _response_group_is_solved(group, group_budget):
+    """Whether a response group needs no further search.
+
+    The same test `_candidate_erd_summary` applies when it counts a group as
+    resolved, so a report's per-group answer and its "N of M response groups
+    solved" line always agree.  A cached ERD counts only alongside a proven
+    worst-case line; a group of fewer than two answers is solved by playing the
+    survivor, and that guess needs a budget to spend unless the guess already
+    was the answer.
+    """
+    if group["best_erd"] is None:
+        if group["answer_count"] < 2:
+            return (group["pattern"] == _ALL_GREEN_PATTERN_TEXT
+                    or group_budget >= 1)
+        return False
+    return group["max_remaining_depth"] is not None
+
+
 def _candidate_erd_summary(response_groups, group_budget):
     """Fold a candidate's response groups into its own ERD and worst-case line.
 
@@ -1413,7 +1431,11 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
     # leaderboard's graph reads.  Filters and the row limit narrow the rows
     # listed below the graph, never the decomposition the graph draws.
     data["response_group_breakdown"] = [
-        {"pattern": row["pattern"], "answer_count": row["answer_count"]}
+        {
+            "pattern": row["pattern"],
+            "answer_count": row["answer_count"],
+            "solved": _response_group_is_solved(row, group_budget),
+        }
         for row in sorted(
             all_response_groups,
             key=lambda row: (-row["answer_count"], row["pattern"]),

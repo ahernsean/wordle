@@ -21,10 +21,10 @@
       {"pattern": "ggggg", "answer_count": 1, "branch_reference": "444444444444", "branch_key_hex": "04", "branch_status": "done", "branch_phase": "complete", "priority": null, "worker_count": 0, "cache_state": "not_applicable", "best_guess": null, "best_guess_is_answer": false, "best_erd": null, "max_remaining_depth": null, "updated_at": null}
     ],
     "response_group_breakdown": [
-      {"pattern": "-----", "answer_count": 8},
-      {"pattern": "y----", "answer_count": 5},
-      {"pattern": "-y---", "answer_count": 3},
-      {"pattern": "ggggg", "answer_count": 1}
+      {"pattern": "-----", "answer_count": 8, "solved": true},
+      {"pattern": "y----", "answer_count": 5, "solved": false},
+      {"pattern": "-y---", "answer_count": 3, "solved": false},
+      {"pattern": "ggggg", "answer_count": 1, "solved": true}
     ]
   }
 }

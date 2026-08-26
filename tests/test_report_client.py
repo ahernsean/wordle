@@ -895,9 +895,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         report = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["word.json"])
         patterns = ["".join(letters)
                     for letters in itertools.product("gy-", repeat=5)]
+        # Every group solved, so the outline threshold is measured against
+        # segments that all ask for one.
         report["data"]["response_group_breakdown"] = (
-            [{"pattern": patterns[0], "answer_count": 400}]
-            + [{"pattern": pattern, "answer_count": 1}
+            [{"pattern": patterns[0], "answer_count": 400, "solved": True}]
+            + [{"pattern": pattern, "answer_count": 1, "solved": True}
                for pattern in patterns[1:201]]
         )
         report["data"]["total_rows"] = 201
@@ -931,6 +933,59 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_timeout(100)
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "")
+
+    def test_word_report_breakdown_outlines_only_groups_wide_enough_to_show_one(self):
+        # A 2-px outline on each edge of a sliver is all border and no
+        # interior, so a run of finished slivers would read as one black block.
+        self._apply_many_group_word_report()
+        segments = self.page.eval_on_selector_all(
+            ".response-group-breakdown .answer-segment",
+            """nodes => nodes.map(node => [node.clientWidth,
+                 node.classList.contains('solved-group'),
+                 node.title.includes('solved')])""")
+        self.assertEqual(len(segments), 201)
+        for width, outlined, says_solved in segments:
+            self.assertEqual(outlined, width >= 16, f"{width}px segment")
+            self.assertTrue(says_solved)
+        self.assertTrue(any(outlined for _, outlined, _ in segments))
+        self.assertTrue(any(not outlined for _, outlined, _ in segments))
+
+    def test_word_report_breakdown_outlines_solved_groups(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment.solved-group")
+        outlined = self.page.eval_on_selector_all(
+            ".response-group-breakdown .answer-segment",
+            """nodes => nodes.map(node => [
+                 node.classList.contains('solved-group'),
+                 getComputedStyle(node).boxShadow,
+                 node.title])""")
+        # The fixture's decomposition is solved, unsolved, unsolved, solved.
+        self.assertEqual([solved for solved, _, _ in outlined],
+                         [True, False, False, True])
+        for solved, shadow, title in outlined:
+            self.assertEqual(solved, "solved" in title)
+            self.assertEqual(solved, "inset" in shadow and "rgb(0, 0, 0)" in shadow)
+
+    def test_leaderboard_breakdown_group_opens_its_branch_report(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card .answer-segment.tappable-group")
+        segment = self.page.locator(
+            ".leaderboard-card .answer-segment.tappable-group").first
+        self.assertEqual(segment.get_attribute("aria-label"),
+                         "Open SALET ----- branch report")
+        segment.click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "SALET -----")
+
+    def test_leaderboard_breakdown_leaves_solved_groups_unoutlined(self):
+        # Every ranked opener is complete, so outlining there would black out
+        # every segment and say nothing.  The leaderboard sends no solved flag.
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.assertEqual(
+            self.page.locator(".leaderboard-card .answer-segment.solved-group").count(),
+            0)
 
     def test_leaderboard_tab_ranks_openers_and_rounds_erd(self):
         self.page.locator("[data-kind=leaderboard]").click()
