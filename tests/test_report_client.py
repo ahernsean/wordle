@@ -2764,6 +2764,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           const base=await overviewReport();
           const state=__reportClient.getState();
           const many=namedBranches(base,['a','b','c','d','e','f']);
+          for(const row of many.data.branches){
+            row.branch_phase='evaluating';
+            row.completed_candidate_count=Math.min(row.completed_candidate_count,row.candidate_count-1);
+          }
           const few=namedBranches(base,['b','d']);
           applyReport(many,null,state);await settled();
           applyReport(few,many,state);
