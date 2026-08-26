@@ -2626,10 +2626,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.render_sweep_marker()
         # The background poll (default every 2s) would otherwise call
         # fetchReport()/applyReport() again on its own schedule and rebuild
-        # the marker from scratch with live colors, masking a missing
-        # live-refresh path exactly as it did the first time this was
-        # written.  Block it so only the fix under test can update the
-        # marker already on screen.
+        # the marker from scratch with live colors, which would mask a
+        # missing live-refresh path.  Blocking it means only the
+        # media-query listener under test can update the marker already
+        # on screen.
         self.page.route("**/api/view*", lambda route: route.abort())
         light_svg = self.sweep_marker_background_image()
         self.assertIn('stroke="#f8f9fa"', light_svg)
