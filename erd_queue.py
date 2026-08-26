@@ -1155,6 +1155,9 @@ class ERDQueue:
             ("branch_finalize_log", {"epoch", "recorded_at", "id"},
              "idx_branch_finalize_log_epoch_recorded_id",
              "epoch, recorded_at DESC, id DESC"),
+            ("branch_finalize_log", {"finalized_at", "id"},
+             "idx_branch_finalize_log_finalized_at",
+             "finalized_at DESC, id DESC"),
             ("cut_reuse_misses", {"branch_key", "recorded_at"},
              "idx_cut_reuse_misses_branch_recorded_at",
              "branch_key, recorded_at"),
@@ -4256,6 +4259,14 @@ class ERDQueue:
                 and row["ceiling"] > row["budget"]:
             return "ceiling_above_budget"
         return "candidate_infeasibility"
+
+    def recent_finalized_branches(self, earliest_finalized_at: int):
+        """Return finalizations whose completed cards may still be displayed."""
+        return [dict(row) for row in self._conn.execute("""
+            SELECT * FROM telemetry.branch_finalize_log
+            WHERE finalized_at IS NOT NULL AND finalized_at > ?
+            ORDER BY finalized_at DESC, id DESC
+        """, (earliest_finalized_at,))]
 
     def report_branch_telemetry(self, branch_key, limit, after=None, before=None) -> dict:
         """Return bounded current and historical telemetry for one branch.

@@ -2595,6 +2595,24 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertFalse(result["remaining"])
         self.assertNotIn("recently-completed", result["ordinaryClass"])
 
+    def test_overview_holds_finalization_not_seen_in_the_prior_poll(self):
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const completed=structuredClone(base);
+          completed.data.branches=[];
+          const row=structuredClone(base.data.branches[0]);
+          row.branch_key_hex='telemetry';row.branch_reference='telemetry';
+          row.branch_status='done';row.branch_phase='complete';
+          row.recently_completed=true;row.finalized_at=base.generated_at-1;
+          completed.data.recently_completed_branches=[row];
+          applyReport(completed,null,state);
+          const card=document.querySelector('[data-identity="telemetry"]');
+          return {className:card.className,text:card.innerText};
+        """))
+        self.assertIn("recently-completed", result["className"])
+        self.assertIn("done", result["text"])
+
     def test_grid_transition_moves_the_page_below_it_monotonically(self):
         """The content under the grid must never reverse direction mid-flight.
 

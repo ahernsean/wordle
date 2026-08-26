@@ -35,6 +35,7 @@ class QueueVisibilityTests(unittest.TestCase):
         expected = {
             "idx_branch_finalize_log_branch_recorded_at",
             "idx_branch_finalize_log_epoch_recorded_id",
+            "idx_branch_finalize_log_finalized_at",
             "idx_cut_reuse_misses_branch_recorded_at",
             "idx_cut_reuse_misses_epoch_recorded_id",
             "idx_claim_telemetry_epoch_id",

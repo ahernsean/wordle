@@ -459,6 +459,30 @@ class ReportModelTest(unittest.TestCase):
         ]
         self.assertEqual(order, sorted(order))
 
+    def test_overview_includes_recent_finalization_after_active_row_is_gone(self):
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        now = 1_000
+        queue = self._open_queue()
+        with patch("erd_queue.time.time", return_value=now - 1):
+            queue.add_branch_finalize_log(
+                branch_key, "SALET -----", len(ANSWERS), 5,
+                now - 20, now - 1, 123, 4, outcome="exact",
+                best_guess="crane", best_erd=2.5,
+            )
+        queue.close()
+
+        with patch("report_model.time.time", return_value=now):
+            report = collect_overview_report(self.sources)
+
+        self.assertEqual(report["data"]["branches"], [])
+        completed = report["data"]["recently_completed_branches"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["branch_reference"], branch_reference(branch_key))
+        self.assertEqual(completed[0]["branch_status"], "done")
+        self.assertEqual(completed[0]["branch_phase"], "complete")
+        self.assertTrue(completed[0]["recently_completed"])
+        self.assertEqual(completed[0]["finalized_at"], now - 1)
+
     def test_response_group_key_buckets_answer_count(self):
         labels = {
             answer_count: _response_group_key(

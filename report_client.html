@@ -664,6 +664,15 @@
       if(report.report_kind!=="overview"||state.branch_status.length!==1||state.branch_status[0]!=="active")return report;
       const now=Date.now(),context=contextKey(state),rows=report.data.branches||[],present=new Set(rows.map(row=>String(row.branch_key_hex)));
       for(const [key,entry] of recentOverviewCompletionRows)if(entry.expires_at<=now||entry.context!==context||present.has(entry.identity))recentOverviewCompletionRows.delete(key);
+      for(const row of report.data.recently_completed_branches||[]){
+        const identity=String(row.branch_key_hex),key=context+"|"+identity;
+        if(present.has(identity))continue;
+        const finalizedAt=Number(row.finalized_at),generatedAt=Number(report.generated_at);
+        const remainingMillis=Number.isFinite(finalizedAt)&&Number.isFinite(generatedAt)
+          ?Math.max(0,((finalizedAt+COMPLETED_BRANCH_HOLD_MILLIS/1000)-generatedAt)*1000)
+          :COMPLETED_BRANCH_HOLD_MILLIS;
+        recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+remainingMillis,row});
+      }
       for(const row of (previous?.data?.branches||[])){
         const identity=String(row.branch_key_hex),key=context+"|"+identity;
         if(!present.has(identity)&&completedOverviewBranch(row)&&!recentOverviewCompletionRows.has(key)){
