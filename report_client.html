@@ -5,14 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ERD swarm reports</title>
   <style>
-    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; }
+    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; }
+    /* The OS/browser's own color-scheme preference drives the palette live --
+       no toggle, no stored setting.  Every color elsewhere in this file reads
+       one of these custom properties rather than a literal, so flipping the
+       preference repaints the whole report without a reload. */
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg:#121213; --panel:#1c1c1e; --text:#e4e6eb; --dim:#9aa0a6;
+        --green:#538d4e; --green-complete:#3f6b3c; --yellow:#b59f3b; --gray:#3a3a3c;
+        --border:#3a3a3c; --sweep-empty:#3a3a3c; --red:#e0575a; --amber:#d4bb55;
+        --hover-tint:#1f2e1d; --popover-shadow:0 5px 16px rgba(0,0,0,.55);
+        --header-bg:rgba(18,18,19,.97); --status-amber-bg:#3a3016; --status-amber-text:#e8cf7a;
+        --status-red-bg:#3a1e1e; --card-historical-bg:#232326; --tile-blank-outline:#565758;
+        --chip-exact-text:#7fc47a; --chip-cut-text:#d9c069; --chip-loss-text:#e07a7a;
+        --flash-improved-bg:#22371f; --flash-changed-bg:#3a1e1e;
+      }
+    }
     * { box-sizing:border-box; }
     html, body { margin:0; min-width:0; background:var(--bg); color:var(--text); font:13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
     body { overflow-x:hidden; }
-    button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:#ffffff; color:var(--text); font:inherit; padding:.25rem .5rem; }
+    button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text); font:inherit; padding:.25rem .5rem; }
     button { cursor:pointer; }
     button:disabled { cursor:default; opacity:.45; }
-    button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:#edf5ec; }
+    button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:var(--hover-tint); }
     .layout-toggle { display:inline-flex; align-items:center; gap:.35rem; margin-left:.25rem; padding-left:.6rem; border-left:1px solid var(--border); }
     .layout-toggle[hidden] { display:none; }
     .layout-toggle .cap { color:var(--dim); font-size:.8rem; white-space:nowrap; }
@@ -21,7 +38,7 @@
     .layout-toggle .seg button:first-child { border-radius:5px 0 0 5px; }
     .layout-toggle .seg button:last-child { border-radius:0 5px 5px 0; margin-left:-1px; }
     input[type="checkbox"] { min-height:auto; accent-color:var(--green); }
-    header { position:sticky; top:0; z-index:5; background:rgba(255,255,255,.97); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
+    header { position:sticky; top:0; z-index:5; background:var(--header-bg); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
     .nav, .branch-target, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
     .branch-target { margin-top:.35rem; flex-wrap:nowrap; }
     #branch-target-input { flex:1 1 8rem; min-width:6rem; }
@@ -64,19 +81,19 @@
     #connection { color:var(--green); padding:.1rem .3rem; white-space:nowrap; cursor:pointer; border-radius:4px; user-select:none; }
     #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
     #connection:focus-visible { outline:2px solid var(--green); outline-offset:1px; }
-    .conn-wrap.open #connection:not(.disconnected) { background:#edf5ec; }
-    .refresh-pop { position:absolute; top:100%; right:0; z-index:20; margin-top:.2rem; padding:.35rem .5rem; background:#ffffff; border:1px solid var(--border); border-radius:6px; box-shadow:0 5px 16px rgba(0,0,0,.14); display:flex; align-items:center; gap:.4rem; white-space:nowrap; color:var(--text); opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .12s ease, transform .12s ease, visibility .12s; }
+    .conn-wrap.open #connection:not(.disconnected) { background:var(--hover-tint); }
+    .refresh-pop { position:absolute; top:100%; right:0; z-index:20; margin-top:.2rem; padding:.35rem .5rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; box-shadow:var(--popover-shadow); display:flex; align-items:center; gap:.4rem; white-space:nowrap; color:var(--text); opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .12s ease, transform .12s ease, visibility .12s; }
     .refresh-pop .cap { color:var(--dim); font-size:.8rem; }
     .refresh-pop input { width:4.5rem; text-align:right; }
     .conn-wrap.open .refresh-pop { opacity:1; visibility:visible; transform:none; }
-    .report-status { margin:.35rem 0 0; padding:.25rem .45rem; border-left:3px solid var(--amber); background:#fff9e8; color:#6f5a13; }
+    .report-status { margin:.35rem 0 0; padding:.25rem .45rem; border-left:3px solid var(--amber); background:var(--status-amber-bg); color:var(--status-amber-text); }
     .report-status[hidden] { display:none; }
     /* Where the pointer can hover, opening on hover is layered on top of the
        tap-toggle; a transparent bridge spans the gap so crossing to the panel
        does not dismiss it. */
     @media (hover:hover) and (pointer:fine) {
       .refresh-pop::before { content:""; position:absolute; left:0; right:0; top:-.4rem; height:.4rem; }
-      .conn-wrap:hover #connection:not(.disconnected) { background:#edf5ec; }
+      .conn-wrap:hover #connection:not(.disconnected) { background:var(--hover-tint); }
       .conn-wrap:hover .refresh-pop, .refresh-pop:hover { opacity:1; visibility:visible; transform:none; }
     }
     main { width:min(1200px,100%); margin:auto; padding:.5rem clamp(.5rem,1.5vw,1rem) 2rem; }
@@ -90,7 +107,7 @@
     h2 { font-size:.95rem; }
     h3 { font-size:.9rem; margin:0; }
     .dim, .source, .empty { color:var(--dim); }
-    .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:#fff1f1; }
+    .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:var(--status-red-bg); }
     .metrics { margin:.3rem 0; gap:.15rem 1rem; }
     .metric { display:inline-flex; gap:.35rem; align-items:baseline; min-width:0; flex:0 1 auto; }
     .metric strong { overflow-wrap:anywhere; }
@@ -100,7 +117,7 @@
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
     .section { margin:.45rem 0; }
     .card.active, .card.filtered { border-color:var(--green); }
-    .card.filtered { background:#edf5ec; }
+    .card.filtered { background:var(--hover-tint); }
     .card.finalizing, .stale { border-color:var(--amber); }
     .card.transitioning { border-color:var(--dim); }
     .dead { border-color:var(--red); }
@@ -113,11 +130,11 @@
        that inherited rule breaks these items internally instead of wrapping the row. */
     .worker .card-title > * { flex:0 0 auto; white-space:nowrap; overflow-wrap:normal; }
     .chip { display:inline-block; border:1px solid var(--border); border-radius:999px; padding:.05rem .4rem; color:var(--dim); font-size:.85em; }
-    .chip.exact, .outcome-exact { border-color:var(--green); color:#3e7c3a; }
-    .chip.cut, .outcome-cut { border-color:var(--amber); color:#7d6812; }
-    .chip.loss, .outcome-loss { border-color:var(--red); color:#a32c2c; }
-    .chip.historical { border-color:var(--dim); color:var(--dim); background:#ffffff; }
-    .card.historical { border-style:dashed; background:#f3f4f6; }
+    .chip.exact, .outcome-exact { border-color:var(--green); color:var(--chip-exact-text); }
+    .chip.cut, .outcome-cut { border-color:var(--amber); color:var(--chip-cut-text); }
+    .chip.loss, .outcome-loss { border-color:var(--red); color:var(--chip-loss-text); }
+    .chip.historical { border-color:var(--dim); color:var(--dim); background:var(--bg); }
+    .card.historical { border-style:dashed; background:var(--card-historical-bg); }
     /* A spine is one row of guesses or a column of them, never a ragged mix:
        it lays out on a single row, and layoutSpines drops the whole spine to a
        column when that row will not fit.  Guesses are separated by well more
@@ -148,10 +165,10 @@
     .word > .letter { position:relative; display:inline-block; text-align:center; width:var(--tile); height:var(--tile); line-height:var(--tile); padding-top:var(--letter-shift,0px); margin-right:calc(var(--tile) * var(--tile-gap-ratio)); font-family:"Helvetica Neue",Helvetica,Arial,sans-serif; font-size:calc(var(--tile) * var(--tile-font-ratio)); font-weight:700; color:#ffffff; background:var(--gray); text-transform:uppercase; }
     .word > .letter:nth-child(5) { margin-right:0; }
     .word > .letter.g { background:var(--green); } .word > .letter.y { background:var(--yellow); }
-    /* A guess with no response is the unplayed tile: white, gray outline, dark
-       letters.  The outline is inset so the tile keeps the same outer box as a
-       colored one and rows of both sit on a shared grid. */
-    .word > .letter.blank { background:#ffffff; color:var(--text); box-shadow:inset 0 0 0 max(1px,calc(var(--tile) * var(--tile-outline-ratio))) #878a8c; }
+    /* A guess with no response is the unplayed tile: page-background fill, gray
+       outline, page-foreground letters.  The outline is inset so the tile keeps
+       the same outer box as a colored one and rows of both sit on a shared grid. */
+    .word > .letter.blank { background:var(--bg); color:var(--text); box-shadow:inset 0 0 0 max(1px,calc(var(--tile) * var(--tile-outline-ratio))) var(--tile-blank-outline); }
     .tile-button { border:0; padding:0; background:transparent; line-height:0; }
     .tile-button:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
     /* A guess that is itself a possible answer is notched at the corner of its
@@ -242,8 +259,8 @@
     .badge { background:var(--red); color:white; border-radius:4px; padding:.1rem .35rem; }
     .flash-added { animation:added 1.5s; } .flash-improved { animation:improved 1.5s; } .flash-changed { animation:changed 1.5s; }
     @keyframes added { from { box-shadow:0 0 0 3px var(--green); } }
-    @keyframes improved { from { border-color:var(--green); background:#e8f4e7; } }
-    @keyframes changed { from { border-color:var(--red); background:#fff0f0; } }
+    @keyframes improved { from { border-color:var(--green); background:var(--flash-improved-bg); } }
+    @keyframes changed { from { border-color:var(--red); background:var(--flash-changed-bg); } }
     @media (max-width:600px), (hover:none) and (pointer:coarse) {
       header { position:static; }
     }
@@ -897,13 +914,17 @@
       const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));
       const cellLeft=cell=>`calc((100% - ${cellCount-1}px) * ${cell} / ${cellCount} + ${cell}px)`;
       const animate=comparisonAvailable&&!matchMedia("(prefers-reduced-motion: reduce)").matches;
+      // Read once per strip, not once per worker: the halo/fill colors are the
+      // same for every marker in this render pass.
+      const rootStyle=workers?.length?getComputedStyle(document.documentElement):null;
+      const markerHalo=rootStyle?.getPropertyValue("--panel").trim(),markerInk=rootStyle?.getPropertyValue("--text").trim();
       for(const worker of workers||[]){
         if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
         const cell=cellFor(worker.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
         const marker=element("span","sweep-marker");
         marker.dataset.workerNumber=workerNumber;
         marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
-        marker.style.backgroundImage=workerMarkerImage(workerNumber);
+        marker.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
         const previous=previousWorkersById?.get(String(worker.worker_id));
         const previousIndex=previous&&previous.branch_key_hex===worker.branch_key_hex?previous.candidate_index:null;
         if(animate&&previousIndex!==null&&previousIndex!==undefined){
@@ -1811,9 +1832,21 @@
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree,readingPosition=sameView?captureReadingPosition(root):null;
       centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
-    function workerMarkerImage(workerNumber){
-      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="#f8f9fa" stroke-width="2.5" stroke-linejoin="round" fill="#1a1a1b">'+workerNumber+'</text></svg>';
+    function workerMarkerImage(workerNumber,halo,ink){
+      const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="'+halo+'" stroke-width="2.5" stroke-linejoin="round" fill="'+ink+'">'+workerNumber+'</text></svg>';
       return 'url("data:image/svg+xml,'+encodeURIComponent(svg)+'")';
+    }
+    // The marker's halo/fill are baked into a static SVG at render time, so a
+    // color-scheme flip between polls -- which repaints every other themed
+    // color immediately, since those all read the custom property live --
+    // would otherwise leave markers already on screen showing the old theme
+    // until the next report replaces them.  Refresh every marker currently in
+    // the document whenever the preference changes, independent of polling.
+    function refreshWorkerMarkerColors(){
+      const markers=document.querySelectorAll(".sweep-marker");
+      if(!markers.length)return;
+      const style=getComputedStyle(document.documentElement),halo=style.getPropertyValue("--panel").trim(),ink=style.getPropertyValue("--text").trim();
+      for(const marker of markers)marker.style.backgroundImage=workerMarkerImage(marker.dataset.workerNumber,halo,ink);
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     async function fetchReport(){
@@ -1898,6 +1931,7 @@
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?["active"]:currentState.branch_status,branch_phase:overview?[]:currentState.branch_phase,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
+      matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
       addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
