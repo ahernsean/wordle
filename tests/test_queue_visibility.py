@@ -64,6 +64,31 @@ class QueueVisibilityTests(unittest.TestCase):
             )
         self.assertEqual(indexes, indexes_after)
 
+    def test_candidate_accuracy_report_calibrates_and_filters_raw_rows(self):
+        self.q.add_candidate_accuracy(
+            self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 40,
+            source_word="salet", candidate_word="crane", candidate_index=7,
+            bundle_id="w1:1", worker_id="worker-1", outcome="solved",
+            evaluation_millis=12, republish_count=2)
+        self.q.add_candidate_accuracy(
+            self.user_key, 25, 4, 0.0, 3.0, 3.5, True, 0,
+            source_word="salet", candidate_word="slate", candidate_index=8)
+        report = self.q.report_candidate_accuracy(
+            epoch=0, source_word="salet", limit=1)
+        self.assertEqual(report["row_count"], 2)
+        self.assertEqual(report["erd_pruned_row_count"], 1)
+        self.assertEqual(report["non_erd_pruned_row_count"], 1)
+        self.assertEqual(report["no_prediction_row_count"], 1)
+        self.assertEqual(report["sampled_row_count"], 2)
+        self.assertEqual(
+            report["calibration"]["actual_predicted_ratio"]["p50"], 4.0)
+        row = report["rows"][0]
+        self.assertEqual(row["candidate_word"], "slate")
+        self.assertIsNone(row["actual_predicted_ratio"])
+        under_predicted = report["largest_under_predicted"][0]
+        self.assertEqual(under_predicted["candidate_index"], 7)
+        self.assertEqual(under_predicted["republish_count"], 2)
+
     def test_erd_prune_provenance_migration_backfills_legacy_counts_once(self):
         self.q.create_branch(self.user_key, len(WORDS), 10)
         branch_id = self.q._intern_branch(self.user_key)

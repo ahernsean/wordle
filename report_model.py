@@ -214,13 +214,14 @@ class ReportRequest:
     tree_cursor: str | None = None
     since_seconds: int | None = None
     sample_size: int | None = None
+    source_word: str | None = None
 
 
 def validate_report_request(request: ReportRequest) -> None:
     """Reject report options that have no meaning for the selected report."""
     report_kind = request.report_kind
     branch_target_kind = request.branch_target.kind
-    if request.tree and report_kind in ("cache", "hotspots", "leaderboard", "openers"):
+    if request.tree and report_kind in ("cache", "hotspots", "accuracy", "leaderboard", "openers"):
         raise ValueError(f"--tree cannot be used with --{report_kind}")
     if (request.tree_parent or request.tree_cursor) and not request.tree:
         raise ValueError("tree_parent and tree_cursor require tree")
@@ -3031,6 +3032,53 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
     return report
 
 
+def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> dict:
+    """Collect the candidate-work calibration corpus without changing it."""
+    generated_at = int(time.time())
+    data = {"epoch": request.epoch, "row_count": 0,
+            "erd_pruned_row_count": 0, "non_erd_pruned_row_count": 0,
+            "no_prediction_row_count": 0, "sampled_row_count": 0,
+            "calibration": {}, "answer_count_budget_calibration": [],
+            "largest_under_predicted": [], "largest_over_predicted": [],
+            "rows": []}
+    report = _semantic_report(
+        "accuracy", sources, request.branch_target, generated_at, data, request)
+    queue = None
+    try:
+        queue = _open_report_queue(sources)
+        branch_key = None
+        if request.branch_target.kind in ("branch", "branch_reference"):
+            branch_key = resolve_branch_target(
+                request.branch_target, sorted(_decorative_answer_set(sources))).branch_key
+        source_word = request.source_word
+        if source_word is None and request.branch_target.kind == "word":
+            source_word = request.branch_target.trailing_word
+        result = queue.report_candidate_accuracy(
+            epoch=queue.epoch if request.epoch is None else request.epoch,
+            budget=request.filters.budget,
+            minimum_answer_count=request.filters.minimum_answer_count,
+            maximum_answer_count=request.filters.maximum_answer_count,
+            source_word=source_word, branch_key=branch_key,
+            limit=request.filters.limit,
+            sample_size=min(request.sample_size or 50_000, 1_000_000))
+        for collection_name in ("rows", "largest_under_predicted",
+                                "largest_over_predicted"):
+            for row in result[collection_name]:
+                row_branch_key = row.pop("branch_key", None)
+                if row_branch_key is not None:
+                    row["branch_key_hex"] = bytes(row_branch_key).hex()
+                    row["branch_reference"] = branch_reference(
+                        bytes(row_branch_key))
+        data.update(result)
+        _mark_queue_source_ok(report)
+    except (sqlite3.Error, OSError) as error:
+        _mark_queue_source_error(report, error)
+    finally:
+        if queue is not None:
+            queue.close()
+    return report
+
+
 def _source_summary_payload(row, rollup, timing, generated_at):
     """One source word, with its requests and branches rolled up.
 
@@ -3613,6 +3661,8 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
         return collect_cache_report(sources, request)
     if report_kind == "hotspots":
         return collect_hotspot_report(sources, request)
+    if report_kind == "accuracy":
+        return collect_accuracy_report(sources, request)
     if report_kind == "leaderboard":
         return collect_leaderboard_report(sources, request)
     if report_kind == "openers":
