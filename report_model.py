@@ -40,6 +40,7 @@ BRANCH_ETA_WINDOW_SECONDS = 10 * 60
 BRANCH_ETA_ROUGH_SAMPLE_SECONDS = 3 * 60
 BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
 BRANCH_ETA_SPEEDUP = {1: 1.0, 2: 1.64, 3: 1.97, 4: 1.97}
+OVERVIEW_COMPLETION_DISPLAY_SECONDS = 5
 
 # Source ERD summaries are immutable until the score cache changes.  The
 # Sources view polls frequently, so retain the completed folds between polls.
@@ -575,6 +576,50 @@ def _normalize_branch(
     }
 
 
+def _normalize_recent_finalized_branch(row, answer_set):
+    """Build the short-lived Overview card from durable finalization telemetry."""
+    one_level_erd_pruned_candidate_count = _row_value(
+        row, "one_level_erd_pruned_candidates",
+        _row_value(row, "bulk_done_candidates", 0),
+    )
+    two_level_erd_pruned_candidate_count = _row_value(
+        row, "two_level_erd_pruned_candidates", 0,
+    )
+    branch = _normalize_branch({
+        "branch_key": row["branch_key"],
+        "status": "done",
+        "n_words": row["n_words"],
+        "n_candidates": None,
+        "priority": 0,
+        "best_guess": _row_value(row, "best_guess"),
+        "best_erd": _row_value(row, "best_erd"),
+        "budget": _row_value(row, "budget"),
+        "spine": _row_value(row, "spine"),
+        "created_at": _row_value(row, "created_at"),
+        "nodes_spent": _row_value(row, "nodes_spent", 0),
+        "ceiling": _row_value(row, "ceiling"),
+    }, "done", "complete", {
+        "completed_candidate_count": (
+            _row_value(row, "n_claims", 0)
+            + one_level_erd_pruned_candidate_count
+            + two_level_erd_pruned_candidate_count
+        ),
+        "bulk_completed_candidate_count": (
+            one_level_erd_pruned_candidate_count
+            + two_level_erd_pruned_candidate_count
+        ),
+        "one_level_erd_pruned_candidate_count": (
+            one_level_erd_pruned_candidate_count
+        ),
+        "two_level_erd_pruned_candidate_count": (
+            two_level_erd_pruned_candidate_count
+        ),
+    }, 0, answer_set)
+    branch["finalized_at"] = row["finalized_at"]
+    branch["recently_completed"] = True
+    return branch
+
+
 def _worker_number(worker_id):
     return worker_id.rsplit("-", 1)[-1]
 
@@ -750,6 +795,7 @@ def _empty_data():
             "remaining_depth_pruned_evaluation_count": 0,
         },
         "branches": [],
+        "recently_completed_branches": [],
         "workers": [],
     }
 
@@ -865,6 +911,13 @@ def _queue_overview(sources, generated_at, answer_set, report):
         }
         report["data"]["worker_totals"] = worker_totals
         report["data"]["branches"] = normalized_rows
+        if not filters.get("branch_statuses") or filters.get("branch_statuses") == ["active"]:
+            report["data"]["recently_completed_branches"] = [
+                _normalize_recent_finalized_branch(row, answer_set)
+                for row in queue.recent_finalized_branches(
+                    generated_at - OVERVIEW_COMPLETION_DISPLAY_SECONDS
+                )
+            ]
         report["data"]["workers"] = workers
         report["sources"]["queue"].update({
             "ok": True,

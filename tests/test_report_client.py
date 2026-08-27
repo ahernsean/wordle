@@ -2569,6 +2569,51 @@ class ReportClientBrowserTest(unittest.TestCase):
             [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]],
         )
 
+    def test_overview_holds_completed_branch_before_its_departure(self):
+        """A completed branch stays visible long enough to explain its exit."""
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const finalizing=namedBranches(base,['complete']);
+          finalizing.data.branches[0].branch_phase='finalizing';
+          const empty=namedBranches(base,[]);
+          applyReport(finalizing,null,state);await settled();
+          applyReport(empty,finalizing,state);
+          const card=()=>document.querySelector('[data-identity="complete"]');
+          const held={className:card().className,background:getComputedStyle(card()).backgroundColor,borderWidth:getComputedStyle(card()).borderWidth,text:card().innerText};
+          const realNow=Date.now;Date.now=()=>realNow()+5001;
+          applyReport(empty,empty,state);Date.now=realNow;
+          await settled();
+          const ordinary=namedBranches(base,['ordinary']);
+          applyReport(ordinary,null,state);await settled();
+          applyReport(empty,ordinary,state);
+          return {held,remaining:!!card(),ordinaryClass:document.querySelector('[data-identity="ordinary"]').className};
+        """))
+        self.assertIn("recently-completed", result["held"]["className"])
+        self.assertEqual(result["held"]["background"], "rgb(234, 242, 252)")
+        self.assertEqual(result["held"]["borderWidth"], "3px")
+        self.assertIn("done", result["held"]["text"])
+        self.assertFalse(result["remaining"])
+        self.assertNotIn("recently-completed", result["ordinaryClass"])
+
+    def test_overview_holds_finalization_not_seen_in_the_prior_poll(self):
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const completed=structuredClone(base);
+          completed.data.branches=[];
+          const row=structuredClone(base.data.branches[0]);
+          row.branch_key_hex='telemetry';row.branch_reference='telemetry';
+          row.branch_status='done';row.branch_phase='complete';
+          row.recently_completed=true;row.finalized_at=base.generated_at-1;
+          completed.data.recently_completed_branches=[row];
+          applyReport(completed,null,state);
+          const card=document.querySelector('[data-identity="telemetry"]');
+          return {className:card.className,text:card.innerText};
+        """))
+        self.assertIn("recently-completed", result["className"])
+        self.assertIn("done", result["text"])
+
     def test_grid_transition_moves_the_page_below_it_monotonically(self):
         """The content under the grid must never reverse direction mid-flight.
 
@@ -2738,6 +2783,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           const base=await overviewReport();
           const state=__reportClient.getState();
           const many=namedBranches(base,['a','b','c','d','e','f']);
+          for(const row of many.data.branches){
+            row.branch_phase='evaluating';
+            row.completed_candidate_count=Math.min(row.completed_candidate_count,row.candidate_count-1);
+          }
           const few=namedBranches(base,['b','d']);
           applyReport(many,null,state);await settled();
           applyReport(few,many,state);
