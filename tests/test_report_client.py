@@ -3721,6 +3721,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("[data-kind=openers]").click()
         self.page.wait_for_selector("#report h1:text-is('openers report')")
 
+    def test_overview_hides_opener_state_filters(self):
+        self.page.goto(self.base_url)
+        self.page.wait_for_selector("#report h1:text-is('overview report')")
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.assertTrue(self.page.locator("#opener-state-filters").is_hidden())
+
     def test_sources_view_collapses_every_word_to_one_card(self):
         # The report's unit is the source word: three queued roots owning 1,376
         # branches between them read as three cards, and no branch card is
