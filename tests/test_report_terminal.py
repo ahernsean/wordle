@@ -1842,6 +1842,7 @@ class ViewParserTest(unittest.TestCase):
             (["--workers"], "workers", None),
             (["--worker", "2"], "workers", "2"),
             (["--cache"], "cache", None),
+            (["--accuracy"], "accuracy", None),
         ]
         for options, report_kind, worker_id in cases:
             with self.subTest(options=options):

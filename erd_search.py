@@ -1425,6 +1425,8 @@ def main():
     view_kind.add_argument('--worker', metavar='N')
     view_kind.add_argument('--cache', dest='view_cache', action='store_true')
     view_kind.add_argument('--hotspots', action='store_true')
+    view_kind.add_argument('--accuracy', action='store_true',
+                           help='Show predicted-versus-actual candidate work')
     view_kind.add_argument('--leaderboard', action='store_true')
     view_kind.add_argument(
         '--openers', action='store_true',
@@ -1458,6 +1460,8 @@ def main():
             'two-level-erd-prunes',
             'cut-reuse', 'coordination'))
     p_view.add_argument('--epoch', type=int, metavar='N')
+    p_view.add_argument('--source-word', metavar='WORD',
+                        help='Restrict --accuracy to one opener')
     p_view.add_argument('--since-seconds', type=int, metavar='N')
     p_view.add_argument('--sample-size', type=int, metavar='N')
     p_view.add_argument('spine', nargs='*', metavar='SPINE')
@@ -1658,18 +1662,22 @@ def main():
             'workers' if args.workers or args.worker is not None else
             'cache' if args.view_cache else
             'hotspots' if args.hotspots else
+            'accuracy' if args.accuracy else
             'leaderboard' if args.leaderboard else
             'openers' if args.openers else
             'root_progress' if args.root_progress else 'auto'
         )
         if args.by is not None and not args.hotspots:
             parser.error('--by requires --hotspots')
-        if not args.hotspots and any(
+        if not (args.hotspots or args.accuracy) and any(
                 value is not None
                 for value in (args.since_seconds, args.sample_size)):
-            parser.error('--since-seconds and --sample-size require --hotspots')
-        if args.epoch is not None and not (args.hotspots or args.root_progress):
-            parser.error('--epoch requires --hotspots or --root-progress')
+            parser.error('--since-seconds and --sample-size require --hotspots or --accuracy')
+        if args.epoch is not None and not (args.hotspots or args.root_progress
+                                           or args.accuracy):
+            parser.error('--epoch requires --hotspots, --accuracy, or --root-progress')
+        if args.source_word is not None and not args.accuracy:
+            parser.error('--source-word requires --accuracy')
         if args.since_seconds is not None and args.since_seconds < 1:
             parser.error('--since-seconds must be at least 1')
         if args.sample_size is not None and args.sample_size < 1:

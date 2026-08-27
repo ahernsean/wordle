@@ -27,9 +27,8 @@ about efficiency confidence before investing in the packer.
 import argparse
 import math
 import statistics
-import sqlite3
 
-from erd_queue import cost_size_bucket, _COST_MODEL_MIN_WEIGHT, _AGGREGATE_BUDGET
+from erd_queue import ERDQueue, cost_size_bucket, _COST_MODEL_MIN_WEIGHT
 from runtime_paths import DEFAULT_QUEUE_PATH
 from wordle_engine import (ERD_ALL, estimate_candidate_work,
                            estimate_candidate_work_cutoff)
@@ -133,6 +132,10 @@ METRICS = {
     "cutoff": estimate_candidate_work_cutoff,
 }
 
+# Cost-model samples are keyed by remaining-guess budget.  -1 is retained only
+# for pre-rekey rows, which remain readable as a cold fallback.
+_AGGREGATE_BUDGET = -1
+
 
 def evaluate_metric(name, fn, rows, typical, args):
     """rows: non-ERD-pruned (n_words, budget, bound_erd, actual, sizes-list, has_self).
@@ -177,11 +180,11 @@ def estimate_claim_reduction(conn, epoch, small_count, count_cap):
     """
     import math
     total_by = {bytes(r[0]): r[1] for r in conn.execute(
-        "SELECT branch_key, n_claims FROM branch_finalize_log "
+        "SELECT branch_key, n_claims FROM telemetry.branch_finalize_log "
         "WHERE epoch = ? AND n_claims > 0", (epoch,))}
     ng_by = {}
     for bk, cnt in conn.execute(
-        "SELECT branch_key, COUNT(*) FROM candidate_accuracy "
+        "SELECT branch_key, COUNT(*) FROM telemetry.candidate_accuracy "
         "WHERE epoch = ? AND erd_lower_bound_pruned = 0 GROUP BY branch_key",
         (epoch,)):
         ng_by[bytes(bk)] = cnt
@@ -220,12 +223,13 @@ def main():
                     help="claim-count reduction the reframed gate requires (x)")
     args = ap.parse_args()
 
-    conn = sqlite3.connect(f"file:{args.queue}?mode=ro", uri=True)
+    queue = ERDQueue(args.queue, initialize_schema=False)
+    conn = queue._conn
     typical = load_cost_model(conn)
     all_rows = conn.execute("""
         SELECT n_words, budget, bound_erd, erd_lower_bound_pruned, actual_nodes,
                group_sizes, source_word, candidate_cost_lower_bound
-        FROM candidate_accuracy WHERE epoch = ?
+        FROM telemetry.candidate_accuracy WHERE epoch = ?
     """, (args.epoch,)).fetchall()
 
     n = len(all_rows)
@@ -326,7 +330,7 @@ def main():
             print(f"  {small_count:11d}  {agg:9.1f}x  {med:13.1f}x")
     if not reduction_curve:
         print("  (no finalized branches with n_claims)")
-    conn.close()
+    queue.close()
 
     # The design rests on two proven facts, not on the magnitude estimate: exact
     # ERD-lower-bound elimination, and a searched mass that is overwhelmingly cheap.

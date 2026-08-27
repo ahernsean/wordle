@@ -1892,6 +1892,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_cache_collection_sections(report, width, display_order)
     if report["report_kind"] == "hotspots":
         return _render_hotspot_sections(report, width, display_order)
+    if report["report_kind"] == "accuracy":
+        return _render_accuracy_sections(report, width)
     if report["report_kind"] == "leaderboard":
         return _render_leaderboard_sections(report, width)
     if report["report_kind"] == "openers":
@@ -1899,6 +1901,32 @@ def _report_sections(report, previous_report, color, width, display_order):
     if report["report_kind"] == "root_progress":
         return _render_root_progress_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
+
+
+def _render_accuracy_sections(report, width):
+    data = report["data"]
+    calibration = data.get("calibration", {})
+    ratio = calibration.get("actual_predicted_ratio", {})
+    summary = [
+        _fit(f"Candidate-level accuracy  epoch={data.get('epoch')}", width),
+        _fit(f"  rows {data.get('row_count', 0):,}; ERD-pruned "
+             f"{data.get('erd_pruned_row_count', 0):,}; non-ERD-pruned "
+             f"{data.get('non_erd_pruned_row_count', 0):,}", width),
+        _fit(f"  no prediction {data.get('no_prediction_row_count', 0):,}; "
+             f"calibration sample {data.get('sampled_row_count', 0):,}", width),
+        _fit("  actual/predicted ratio " + " ".join(
+            f"{name}={value:.2f}" for name, value in ratio.items()
+            if value is not None), width),
+    ]
+    rows = ["Largest under-predicted  candidate  answers budget predicted actual ratio"]
+    for row in data.get("largest_under_predicted", [])[:5]:
+        ratio_value = row.get("actual_predicted_ratio")
+        ratio_text = "—" if ratio_value is None else f"{ratio_value:.2f}"
+        rows.append(_fit(
+            f"  {row.get('candidate_word') or '—':<9} {row['n_words']:>7,} "
+            f"{row.get('budget') or 0:>6} {row.get('predicted_work') or 0:>9.1f} "
+            f"{row['actual_nodes']:>6,} {ratio_text:>5}", width))
+    return [("header", summary), ("accuracy", rows)]
 
 
 def render_report(
@@ -1957,6 +1985,7 @@ class WatchSession:
             epoch=getattr(self.args, "epoch", None),
             since_seconds=getattr(self.args, "since_seconds", None),
             sample_size=getattr(self.args, "sample_size", None),
+            source_word=getattr(self.args, "source_word", None),
         )
 
     @property
