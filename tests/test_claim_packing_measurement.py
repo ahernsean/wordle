@@ -357,6 +357,82 @@ class TestCandidateAccuracyGroupSizes(_TmpQueue):
             "SELECT source_word FROM candidate_accuracy").fetchone()
         self.assertEqual(row["source_word"], "salet")
 
+    def test_identity_lifecycle_fields_join_to_claim_telemetry(self):
+        branch_key = b"accuracy-branch"
+        branch_id = self.q._intern_branch(branch_key, create=True)
+        self.q._conn.execute(
+            "INSERT INTO candidate_republish (branch_id, idx, count) "
+            "VALUES (?, ?, ?)", (branch_id, 7, 2))
+        self.q.add_candidate_accuracy(
+            branch_key, 30, 4, 820.0, 3.41, 2.9,
+            erd_lower_bound_pruned=False, actual_nodes=771,
+            candidate_word="crane", worker_id="worker-3", bundle_id="3:9:1",
+            idx=7, started_at=123, outcome="exact")
+        row = self.q._conn.execute("""
+            SELECT branch_id, candidate_word, worker_id, bundle_id, idx,
+                   started_at, outcome, republish_count, recorded_at
+            FROM candidate_accuracy
+        """).fetchone()
+        self.assertEqual(row["branch_id"], branch_id)
+        self.assertEqual(row["candidate_word"], "crane")
+        self.assertEqual(row["worker_id"], "worker-3")
+        self.assertEqual(row["bundle_id"], "3:9:1")
+        self.assertEqual(row["idx"], 7)
+        self.assertEqual(row["started_at"], 123)
+        self.assertEqual(row["outcome"], "exact")
+        self.assertEqual(row["republish_count"], 2)
+        self.assertIsNotNone(row["recorded_at"])
+
+
+class TestCandidateAccuracyMigration(unittest.TestCase):
+    def test_pre_migration_row_keeps_unknown_identity_and_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "q.sqlite3")
+            queue = ERDQueue(path)
+            migration = "candidate_accuracy_identity_lifecycle"
+            queue._conn.execute("DROP TABLE telemetry.candidate_accuracy")
+            queue._conn.execute("""
+                CREATE TABLE telemetry.candidate_accuracy (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    branch_key BLOB,
+                    n_words INTEGER NOT NULL,
+                    budget INTEGER,
+                    predicted_work REAL,
+                    bound_erd REAL,
+                    candidate_cost_lower_bound REAL,
+                    erd_lower_bound_pruned INTEGER NOT NULL,
+                    actual_nodes INTEGER NOT NULL,
+                    group_sizes TEXT,
+                    source_word TEXT,
+                    epoch INTEGER NOT NULL DEFAULT 0,
+                    recorded_at INTEGER NOT NULL
+                )
+            """)
+            queue._conn.execute("""
+                INSERT INTO telemetry.candidate_accuracy
+                    (branch_key, n_words, erd_lower_bound_pruned, actual_nodes,
+                     epoch, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (b"old", 30, 0, 771, 0, 100))
+            queue._conn.execute(
+                "DELETE FROM schema_migrations WHERE name = ?", (migration,))
+            queue.close()
+
+            migrated = ERDQueue(path)
+            self.addCleanup(migrated.close)
+            row = migrated._conn.execute("""
+                SELECT candidate_word, worker_id, bundle_id, idx, started_at,
+                       outcome, republish_count, recorded_at
+                FROM candidate_accuracy
+            """).fetchone()
+            self.assertEqual(row["recorded_at"], 100)
+            for field in ("candidate_word", "worker_id", "bundle_id", "idx",
+                          "started_at", "outcome", "republish_count"):
+                self.assertIsNone(row[field])
+            self.assertIsNotNone(migrated._conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?", (migration,)
+            ).fetchone())
+
 
 class TestMetricObserverHook(unittest.TestCase):
     """evaluate_candidate reports the work-metric inputs exactly once per call."""

@@ -745,6 +745,15 @@ CREATE TABLE IF NOT EXISTS telemetry.cut_reuse_misses (
 CREATE TABLE IF NOT EXISTS telemetry.candidate_accuracy (
     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
     branch_key                 BLOB,
+    -- branch_id/worker_id/bundle_id/idx use the same identity names as
+    -- claim_telemetry, so an accuracy point joins to its claim without
+    -- reconstructing transient queue state.  candidate_word preserves the
+    -- candidate identity after its ordering changes.
+    branch_id                  INTEGER,
+    candidate_word             TEXT,
+    worker_id                  TEXT,
+    bundle_id                  TEXT,
+    idx                        INTEGER,
     n_words                    INTEGER NOT NULL,
     budget                     INTEGER,
     predicted_work             REAL,
@@ -754,6 +763,13 @@ CREATE TABLE IF NOT EXISTS telemetry.candidate_accuracy (
     actual_nodes               INTEGER NOT NULL,
     group_sizes                TEXT,
     source_word                TEXT,
+    -- started_at is the beginning of evaluation; recorded_at remains the
+    -- completion time so existing readers retain their timestamp contract.
+    started_at                 INTEGER,
+    -- exact, cut, loss, or cancelled.  NULL means the row predates outcome
+    -- recording rather than any particular outcome.
+    outcome                    TEXT,
+    republish_count            INTEGER,
     epoch                      INTEGER NOT NULL DEFAULT 0,
     recorded_at                INTEGER NOT NULL
 );
@@ -1132,6 +1148,28 @@ class ERDQueue:
             "branch_worker_count": "INTEGER",
             "evaluation_bound_erd": "REAL",
         }, schema="telemetry")
+
+        # Candidate-accuracy identity and lifecycle fields (issue #223).
+        # Existing rows retain NULL for every added field: they record a
+        # calibration point, but cannot identify its candidate or outcome.
+        candidate_accuracy_migration = "candidate_accuracy_identity_lifecycle"
+        if self._conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (candidate_accuracy_migration,)).fetchone() is None:
+            self._add_columns("candidate_accuracy", {
+                "branch_id": "INTEGER",
+                "candidate_word": "TEXT",
+                "worker_id": "TEXT",
+                "bundle_id": "TEXT",
+                "idx": "INTEGER",
+                "started_at": "INTEGER",
+                "outcome": "TEXT",
+                "republish_count": "INTEGER",
+            }, schema="telemetry")
+            self._conn.execute(
+                "INSERT INTO schema_migrations (name, completed_at) "
+                "VALUES (?, ?)",
+                (candidate_accuracy_migration, int(time.time())))
         self._add_columns("branch_finalize_log", {
             "cache_write_millis": "INTEGER",
         }, schema="telemetry")
@@ -6038,7 +6076,10 @@ class ERDQueue:
     def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
                                bound_erd, candidate_cost_lower_bound,
                                erd_lower_bound_pruned, actual_nodes,
-                               group_sizes=None, source_word=None):
+                               group_sizes=None, source_word=None,
+                               candidate_word=None, worker_id=None,
+                               bundle_id=None, idx=None, started_at=None,
+                               outcome=None, republish_count=None):
         """Log one predicted-vs-actual work point for the §10 metric-validation gate.
 
         Under single-candidate claiming a claim is exactly one candidate, so
@@ -6047,18 +6088,30 @@ class ERDQueue:
         metric offline; logged only for non-ERD-pruned rows.  source_word is the
         root opener of the branch's spine, so a multi-day corpus can be
         segmented per opener (different openers reach differently-shaped
-        answer sets).
+        answer sets).  The claim identity fields match claim_telemetry, while
+        candidate_word removes dependence on the candidate order that produced
+        idx.  started_at is the evaluation start; recorded_at is its end.
         """
         now = int(time.time())
+        branch_id = self._intern_branch(branch_key)
+        if republish_count is None and branch_id is not None and idx is not None:
+            republish = self._conn.execute(
+                "SELECT count FROM candidate_republish "
+                "WHERE branch_id = ? AND idx = ?", (branch_id, idx)).fetchone()
+            republish_count = 0 if republish is None else republish["count"]
         self._conn.execute("""
             INSERT INTO telemetry.candidate_accuracy
-                (branch_key, n_words, budget, predicted_work, bound_erd,
+                (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
+                 n_words, budget, predicted_work, bound_erd,
                  candidate_cost_lower_bound, erd_lower_bound_pruned,
-                 actual_nodes, group_sizes, source_word, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (branch_key, n_words, budget, predicted_work, bound_erd,
+                 actual_nodes, group_sizes, source_word, started_at, outcome,
+                 republish_count, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
+              n_words, budget, predicted_work, bound_erd,
               candidate_cost_lower_bound, 1 if erd_lower_bound_pruned else 0,
-              actual_nodes, group_sizes, source_word, self.epoch, now))
+              actual_nodes, group_sizes, source_word, started_at, outcome,
+              republish_count, self.epoch, now))
 
     def set_epoch(self, epoch: int, label: str = None, git_sha: str = None,
                   notes: str = None):
