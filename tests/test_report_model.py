@@ -10,6 +10,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from cache_sqlite import ScoreCache
+from pattern_matrix import PatternMatrix
 from erd_queue import ERDQueue
 import erd_search
 import report_model
@@ -23,6 +24,7 @@ from report_model import (
     _source_word_group_key,
     _resolved_candidate_erd,
     _grouped_response_groups,
+    _response_group_is_solved,
     _response_group_key,
     _response_group_rollup,
     _root_progress_estimate,
@@ -283,6 +285,24 @@ class ReportModelTest(unittest.TestCase):
         )
         self.assertEqual(summary["state"], "pending")
         self.assertIsNone(cache.read_candidate_erd(branch_key, "nurdy", ERD_ALL))
+        cache.close()
+
+    def test_delete_candidate_erd_drops_only_the_named_fold(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        branch_key = ScoreCache.encode_subset(ANSWERS)
+        other_key = ScoreCache.encode_subset(ANSWERS[:2])
+        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
+        cache.write_candidate_erd(branch_key, "crane", ERD_ALL, 1.80, 1, 4)
+        cache.write_candidate_erd(other_key, "salet", ERD_ALL, 1.50, 1, 2)
+
+        cache.delete_candidate_erd(branch_key, "salet", ERD_ALL)
+
+        self.assertIsNone(cache.read_candidate_erd(branch_key, "salet", ERD_ALL))
+        self.assertIsNotNone(cache.read_candidate_erd(branch_key, "crane", ERD_ALL))
+        self.assertIsNotNone(cache.read_candidate_erd(other_key, "salet", ERD_ALL))
+        # Deleting a fold that was never stored is a no-op, not an error: the
+        # recompute path drops the row whether or not one was ever written.
+        cache.delete_candidate_erd(branch_key, "nurdy", ERD_ALL)
         cache.close()
 
     def test_resolved_candidate_erd_reads_the_stored_row_without_refolding(self):
@@ -573,6 +593,243 @@ class ReportModelTest(unittest.TestCase):
             data["response_group_summary"]["branch_count"],
             len(data["response_groups"]),
         )
+
+    def _build_pattern_matrix(self):
+        """Put this vocabulary's matrix on disk, as a swarm run would leave it."""
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        PatternMatrix.load_or_build(
+            self.cache_path, ANSWERS + ["raise"], ANSWERS, cache)
+        cache.close()
+
+    def test_word_report_scale_is_the_best_split_available_on_its_branch(self):
+        # Not one constant for the whole vocabulary: a branch of two answers
+        # cannot be split more than two ways, and scaling it against the root's
+        # best would draw every deep branch as a stub.
+        self._build_pattern_matrix()
+        response_cache = ResponseCache(ANSWERS, score_cache=None)
+        best_at_root = max(
+            len([words for words in response_cache.group_words(
+                candidate, list(ANSWERS)).values() if words])
+            for candidate in ANSWERS + ["raise"]
+        )
+        root = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+        ))["data"]
+        self.assertEqual(root["maximum_response_group_count"], best_at_root)
+
+        # BEBOP splits these answers two ways, so its first branch holds two.
+        deeper = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("bebop ----- salet"),
+        ))["data"]
+        self.assertEqual(deeper["context"]["answer_count"], 2)
+        self.assertEqual(deeper["maximum_response_group_count"], 2)
+        self.assertLess(
+            deeper["maximum_response_group_count"],
+            root["maximum_response_group_count"],
+            "the scale must follow the branch, not the vocabulary",
+        )
+
+    def test_word_report_never_builds_a_pattern_matrix(self):
+        # A cold build walks the whole vocabulary and takes minutes.  A report
+        # answers without the scale instead of blocking on one.
+        with patch.object(PatternMatrix, "build") as build:
+            data = collect_report(self.sources, ReportRequest(
+                branch_target=parse_report_branch_target("salet"),
+            ))["data"]
+        build.assert_not_called()
+        self.assertNotIn("maximum_response_group_count", data)
+        self.assertTrue(data["response_group_breakdown"],
+                        "the graph is still drawn, just unscaled")
+
+    def test_word_report_measures_each_branch_scale_once(self):
+        # The root branch costs ~1.5s of NumPy to measure and the report is
+        # polled every couple of seconds.
+        self._build_pattern_matrix()
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"))
+        first = collect_report(self.sources, request)["data"]
+        with patch.object(
+            PatternMatrix, "counts_for_all_candidates"
+        ) as measured:
+            second = collect_report(self.sources, request)["data"]
+        measured.assert_not_called()
+        self.assertEqual(second["maximum_response_group_count"],
+                         first["maximum_response_group_count"])
+
+    def test_response_group_breakdown_covers_every_group_largest_first(self):
+        # AUDIO's groups arrive in pattern order as 1, 2, 1, so a breakdown
+        # that merely echoed the row order would not lead with the largest.
+        data = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("audio"),
+        ))["data"]
+        breakdown = data["response_group_breakdown"]
+        self.assertEqual(len(breakdown), data["total_rows"])
+        self.assertEqual(
+            [set(entry) for entry in breakdown],
+            [{"pattern", "answer_count", "solved"}] * len(breakdown),
+        )
+        self.assertEqual(
+            [entry["answer_count"] for entry in breakdown], [2, 1, 1]
+        )
+        self.assertEqual(
+            [entry["pattern"] for entry in breakdown],
+            ["y----", "-gy--", "y--y-"],
+        )
+        self.assertEqual(
+            {(entry["pattern"], entry["answer_count"]) for entry in breakdown},
+            {
+                (row["pattern"], row["answer_count"])
+                for row in data["response_groups"]
+            },
+        )
+
+    def test_response_group_breakdown_marks_solved_groups(self):
+        # BEBOP splits these answers into two groups of two, so caching one
+        # branch leaves a matched pair: same size, one solved and one not.
+        target = parse_report_branch_target("bebop")
+        groups = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        cached, uncached = groups[0], groups[1]
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(
+            bytes.fromhex(cached["branch_key_hex"]), ERD_ALL, "salet", 1.5,
+            max_depth=2, solve_budget=None,
+        )
+        cache.close()
+        data = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]
+        solved = {
+            entry["pattern"]: entry["solved"]
+            for entry in data["response_group_breakdown"]
+        }
+        self.assertTrue(solved[cached["pattern"]])
+        self.assertFalse(solved[uncached["pattern"]])
+        self.assertEqual(
+            sum(solved.values()), data["erd_summary"]["resolved_group_count"],
+            "the outlined groups must be the groups the ERD line counts",
+        )
+
+    def test_response_group_breakdown_solves_a_lone_survivor_only_with_budget(self):
+        # A one-answer group is solved by playing the survivor, which costs a
+        # guess -- so at the last guess it is a proven loss, not a solved group.
+        data = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("audio"),
+        ))["data"]
+        solved = {
+            entry["pattern"]: entry["solved"]
+            for entry in data["response_group_breakdown"]
+        }
+        lone = [
+            row for row in data["response_groups"] if row["answer_count"] == 1
+        ]
+        self.assertTrue(lone)
+        self.assertTrue(all(solved[row["pattern"]] for row in lone))
+        self.assertEqual(
+            sum(solved.values()), data["erd_summary"]["resolved_group_count"]
+        )
+        self.assertFalse(_response_group_is_solved(
+            {"best_erd": None, "max_remaining_depth": None,
+             "answer_count": 1, "pattern": "-----"},
+            0,
+        ))
+        self.assertTrue(_response_group_is_solved(
+            {"best_erd": None, "max_remaining_depth": None,
+             "answer_count": 1, "pattern": "ggggg"},
+            0,
+        ))
+
+    def test_response_group_is_solved_requires_a_worst_case_line(self):
+        # An ERD with no proven worst-case line cannot complete the fold, so it
+        # is not a solved group either.
+        self.assertFalse(_response_group_is_solved(
+            {"best_erd": 2.0, "max_remaining_depth": None,
+             "answer_count": 9, "pattern": "-----"},
+            5,
+        ))
+        self.assertTrue(_response_group_is_solved(
+            {"best_erd": 2.0, "max_remaining_depth": 3,
+             "answer_count": 9, "pattern": "-----"},
+            5,
+        ))
+
+    def test_response_group_breakdown_agrees_with_the_erd_line_after_a_recompute(self):
+        """The stored fold must not outlive the branch rows it folded.
+
+        `_resolved_candidate_erd` trusts a matching `candidate_erd_by_policy`
+        row without re-reading the branches behind it, so before
+        `invalidate_branches_for_recompute` dropped that row a recomputed word
+        reported `complete` with every group resolved while each group's own
+        row was gone -- the ERD line counting groups the graph drew as unsolved.
+        """
+        target = parse_report_branch_target("bebop")
+        groups = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        branch_keys = [
+            bytes.fromhex(row["branch_key_hex"]) for row in groups
+        ]
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        for branch_key in branch_keys:
+            cache.write(branch_key, ERD_ALL, "salet", 1.5,
+                        max_depth=2, solve_budget=None)
+        cache.close()
+
+        complete = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]
+        self.assertEqual(complete["erd_summary"]["state"], "complete")
+        self.assertTrue(all(entry["solved"]
+                            for entry in complete["response_group_breakdown"]))
+        root_branch_key = ScoreCache.encode_subset(ANSWERS)
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        self.assertIsNotNone(
+            cache.read_candidate_erd(root_branch_key, "bebop", ERD_ALL),
+            "the fold must be stored, or this proves nothing about dropping it",
+        )
+        cache.close()
+
+        # The real recompute sequence, not a hand-made approximation of it.
+        queue = self._open_queue()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        erd_search.invalidate_branches_for_recompute(
+            queue, cache, branch_keys, root_branch_key, "bebop")
+        self.assertIsNone(
+            cache.read_candidate_erd(root_branch_key, "bebop", ERD_ALL))
+        cache.close()
+        queue.close()
+
+        recomputing = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]
+        solved = [entry["solved"]
+                  for entry in recomputing["response_group_breakdown"]]
+        self.assertEqual(solved, [False, False])
+        self.assertEqual(recomputing["erd_summary"]["state"], "pending")
+        self.assertEqual(
+            sum(solved),
+            recomputing["erd_summary"]["resolved_group_count"],
+            "the ERD line and the outlined groups must count the same groups",
+        )
+
+    def test_response_group_breakdown_ignores_filters_and_the_display_limit(self):
+        # The graph draws the whole decomposition; narrowing the rows listed
+        # beneath it must not redraw the picture of the word.
+        target = parse_report_branch_target("audio")
+        unfiltered = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_group_breakdown"]
+        limited = collect_report(self.sources, ReportRequest(
+            branch_target=target, filters=ReportFilters(limit=1),
+        ))["data"]
+        self.assertEqual(len(limited["response_groups"]), 1)
+        self.assertEqual(limited["response_group_breakdown"], unfiltered)
+        excluded = collect_report(self.sources, ReportRequest(
+            branch_target=target, filters=ReportFilters(minimum_answer_count=3),
+        ))["data"]
+        self.assertEqual(excluded["response_groups"], [])
+        self.assertEqual(excluded["response_group_breakdown"], unfiltered)
 
     def test_response_group_groups_respect_display_limit(self):
         # response_group_groups must be built from the same limited set as

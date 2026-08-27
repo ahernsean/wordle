@@ -929,6 +929,23 @@ class ScoreCache:
         """Look up a candidate's stored ERD in a map from candidate_erd_map."""
         return stored_map.get((self._subset_hash(branch_key), candidate_word))
 
+    def delete_candidate_erd(self, branch_key, candidate_word, policy):
+        """Drop a candidate's folded ERD at a branch.
+
+        The stored fold is a memo whose premise is that every response group
+        behind it is an exact branch_best_by_policy row (see
+        write_candidate_erd), and a reader trusts it without re-checking those
+        rows.  Deleting any of them breaks the premise, so whoever deletes them
+        drops this row in the same breath; the next read folds afresh and
+        persists again once the groups are solved.
+        """
+        self._conn.execute("""
+            DELETE FROM candidate_erd_by_policy
+            WHERE subset_hash = ? AND candidate_word = ? AND policy = ?
+              AND answer_list_id = ?
+        """, (self._subset_hash(branch_key), candidate_word, policy,
+              self.answer_list_id))
+
     def write_candidate_erd(self, branch_key, candidate_word, policy, erd,
                              max_remaining_depth, response_group_count):
         """Persist a candidate's own solved ERD at a branch.
