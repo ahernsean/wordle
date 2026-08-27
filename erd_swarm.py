@@ -1310,7 +1310,37 @@ class _BranchWorker:
         if self._adaptive and nodes_delta > 0:
             self.queue.add_nodes_spent(branch_key, nodes_delta)
 
+        candidate_outcome = {
+            SOLVED: 'exact',
+            OVER_ERD_LIMIT: 'cut',
+            OVER_DEPTH_BUDGET: 'loss',
+        }.get(status, 'cancelled')
+
+        def _record_candidate_accuracy():
+            if not self._adaptive or not metric:
+                return
+            # Log every non-ERD-pruned claim; down-sample the redundant
+            # ERD-pruned mass so a multi-day corpus stays bounded (see
+            # ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY).
+            if metric['erd_lower_bound_pruned']:
+                log_it = (self._erd_lower_bound_pruned_accuracy_n
+                          % ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY) == 0
+                self._erd_lower_bound_pruned_accuracy_n += 1
+            else:
+                log_it = True
+            if log_it:
+                self.queue.add_candidate_accuracy(
+                    branch_key, n_words, budget, metric['predicted'],
+                    metric['bound'], metric['candidate_cost_lower_bound'],
+                    metric['erd_lower_bound_pruned'], nodes_delta,
+                    group_sizes=metric['group_sizes'],
+                    source_word=self._work_context.source_word,
+                    candidate_word=candidate, worker_id=self.name,
+                    bundle_id=bundle_id, idx=idx, started_at=int(cand_t0),
+                    outcome=candidate_outcome)
+
         if status in _ABORT_STATUSES:  # pragma: no cover
+            _record_candidate_accuracy()
             return False
 
         # A candidate excluded by the depth cap (anywhere in its subtree)
@@ -1351,23 +1381,7 @@ class _BranchWorker:
             self._coord_ema.add(coord_seconds)
             if nodes_delta > 0 and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
-            if metric:
-                # Log every non-ERD-pruned claim; down-sample the redundant
-                # ERD-pruned mass so a multi-day corpus stays bounded (see
-                # ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY).
-                if metric['erd_lower_bound_pruned']:
-                    log_it = (self._erd_lower_bound_pruned_accuracy_n
-                             % ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY) == 0
-                    self._erd_lower_bound_pruned_accuracy_n += 1
-                else:
-                    log_it = True
-                if log_it:
-                    self.queue.add_candidate_accuracy(
-                        branch_key, n_words, budget, metric['predicted'],
-                        metric['bound'], metric['candidate_cost_lower_bound'],
-                        metric['erd_lower_bound_pruned'],
-                        nodes_delta, group_sizes=metric['group_sizes'],
-                        source_word=self._work_context.source_word)
+            _record_candidate_accuracy()
         scheduling_millis = self._pending_scheduling_millis
         self._pending_scheduling_millis = 0
         self.queue.add_claim_telemetry(

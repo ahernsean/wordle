@@ -99,6 +99,7 @@ def _bare_worker():
     w._help_recursion_depth = 0
     w._pending_scheduling_millis = 0
     w._adaptive = True
+    w._erd_lower_bound_pruned_accuracy_n = 0
     w._typical_cache = {}
     w._cost_model_buffer = {}
     w._word_idx = {word: i for i, word in enumerate(w.all_words)}
@@ -509,6 +510,30 @@ class TestEvaluateClaimPatternMatrix(unittest.TestCase):
         self.assertGreaterEqual(
             w.queue.add_claim_telemetry.call_args.kwargs[
                 'candidate_evaluation_millis'], 0)
+
+    def test_candidate_accuracy_carries_identity_and_lifecycle_fields(self):
+        w = _bare_worker()
+        w._work_context = _context(source_word="salet")
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        def evaluate_with_metric(*args, **kwargs):
+            kwargs["metric_observer"]([3, 2], False, 2.5, 3.0, False)
+            return (SOLVED, 1.5, 1, False)
+
+        with mock.patch("erd_swarm.evaluate_candidate",
+                        side_effect=evaluate_with_metric):
+            self.assertTrue(w.evaluate_claim(
+                branch_key, BRANCH, len(BRANCH), idx=0,
+                bundle_id="worker-0:99:1", bundle_start_idx=0,
+                bundle_end_idx=3))
+        call = w.queue.add_candidate_accuracy.call_args
+        self.assertEqual(call.kwargs["candidate_word"], CANDIDATES[0])
+        self.assertEqual(call.kwargs["worker_id"], "worker-0")
+        self.assertEqual(call.kwargs["bundle_id"], "worker-0:99:1")
+        self.assertEqual(call.kwargs["idx"], 0)
+        self.assertEqual(call.kwargs["outcome"], "exact")
+        self.assertEqual(call.kwargs["source_word"], "salet")
+        self.assertIsInstance(call.kwargs["started_at"], int)
 
 
 class TestSubbranchSolver(unittest.TestCase):
