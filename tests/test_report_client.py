@@ -1193,6 +1193,15 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.page.locator(".leaderboard-card .answer-segment.solved-group").count(),
             0)
 
+    def test_leaderboard_tab_drops_an_opener_only_sort(self):
+        self.page.locator("[data-kind=openers]").click()
+        self.page.wait_for_selector("text=openers report")
+        self.assertEqual(self.page.locator("#sort").input_value(), "completed")
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        self.assertEqual(self.page.evaluate("__reportClient.getState().sort"), "")
+        self.assertNotIn("sort=completed", self.page.url)
+
     def test_leaderboard_tab_ranks_openers_and_rounds_erd(self):
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector("text=Opener leaderboard")
