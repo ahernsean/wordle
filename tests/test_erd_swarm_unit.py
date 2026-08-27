@@ -534,6 +534,8 @@ class TestEvaluateClaimPatternMatrix(unittest.TestCase):
         self.assertEqual(call.kwargs["outcome"], "exact")
         self.assertEqual(call.kwargs["source_word"], "salet")
         self.assertIsInstance(call.kwargs["started_at"], int)
+        self.assertIsInstance(call.kwargs["evaluation_millis"], int)
+        self.assertGreaterEqual(call.kwargs["evaluation_millis"], 0)
 
 
 class TestSubbranchSolver(unittest.TestCase):

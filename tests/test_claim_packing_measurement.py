@@ -367,10 +367,10 @@ class TestCandidateAccuracyGroupSizes(_TmpQueue):
             branch_key, 30, 4, 820.0, 3.41, 2.9,
             erd_lower_bound_pruned=False, actual_nodes=771,
             candidate_word="crane", worker_id="worker-3", bundle_id="3:9:1",
-            idx=7, started_at=123, outcome="exact")
+            idx=7, started_at=123, evaluation_millis=12, outcome="exact")
         row = self.q._conn.execute("""
             SELECT branch_id, candidate_word, worker_id, bundle_id, idx,
-                   started_at, outcome, republish_count, recorded_at
+                   started_at, evaluation_millis, outcome, republish_count, recorded_at
             FROM candidate_accuracy
         """).fetchone()
         self.assertEqual(row["branch_id"], branch_id)
@@ -379,6 +379,7 @@ class TestCandidateAccuracyGroupSizes(_TmpQueue):
         self.assertEqual(row["bundle_id"], "3:9:1")
         self.assertEqual(row["idx"], 7)
         self.assertEqual(row["started_at"], 123)
+        self.assertEqual(row["evaluation_millis"], 12)
         self.assertEqual(row["outcome"], "exact")
         self.assertEqual(row["republish_count"], 2)
         self.assertIsNotNone(row["recorded_at"])
@@ -422,12 +423,13 @@ class TestCandidateAccuracyMigration(unittest.TestCase):
             self.addCleanup(migrated.close)
             row = migrated._conn.execute("""
                 SELECT candidate_word, worker_id, bundle_id, idx, started_at,
-                       outcome, republish_count, recorded_at
+                       evaluation_millis, outcome, republish_count, recorded_at
                 FROM candidate_accuracy
             """).fetchone()
             self.assertEqual(row["recorded_at"], 100)
             for field in ("candidate_word", "worker_id", "bundle_id", "idx",
-                          "started_at", "outcome", "republish_count"):
+                          "started_at", "evaluation_millis", "outcome",
+                          "republish_count"):
                 self.assertIsNone(row[field])
             self.assertIsNotNone(migrated._conn.execute(
                 "SELECT 1 FROM schema_migrations WHERE name = ?", (migration,)
