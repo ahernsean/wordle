@@ -1337,6 +1337,7 @@ class _BranchWorker:
                     source_word=self._work_context.source_word,
                     candidate_word=candidate, worker_id=self.name,
                     bundle_id=bundle_id, idx=idx, started_at=int(cand_t0),
+                    evaluation_millis=round(cand_elapsed * 1e3),
                     outcome=candidate_outcome)
 
         if status in _ABORT_STATUSES:  # pragma: no cover

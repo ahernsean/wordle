@@ -766,6 +766,7 @@ CREATE TABLE IF NOT EXISTS telemetry.candidate_accuracy (
     -- started_at is the beginning of evaluation; recorded_at remains the
     -- completion time so existing readers retain their timestamp contract.
     started_at                 INTEGER,
+    evaluation_millis          INTEGER,
     -- exact, cut, loss, or cancelled.  NULL means the row predates outcome
     -- recording rather than any particular outcome.
     outcome                    TEXT,
@@ -1163,6 +1164,7 @@ class ERDQueue:
                 "bundle_id": "TEXT",
                 "idx": "INTEGER",
                 "started_at": "INTEGER",
+                "evaluation_millis": "INTEGER",
                 "outcome": "TEXT",
                 "republish_count": "INTEGER",
             }, schema="telemetry")
@@ -6079,7 +6081,8 @@ class ERDQueue:
                                group_sizes=None, source_word=None,
                                candidate_word=None, worker_id=None,
                                bundle_id=None, idx=None, started_at=None,
-                               outcome=None, republish_count=None):
+                               evaluation_millis=None, outcome=None,
+                               republish_count=None):
         """Log one predicted-vs-actual work point for the §10 metric-validation gate.
 
         Under single-candidate claiming a claim is exactly one candidate, so
@@ -6090,7 +6093,8 @@ class ERDQueue:
         segmented per opener (different openers reach differently-shaped
         answer sets).  The claim identity fields match claim_telemetry, while
         candidate_word removes dependence on the candidate order that produced
-        idx.  started_at is the evaluation start; recorded_at is its end.
+        idx.  started_at is the evaluation start; evaluation_millis preserves
+        its subsecond duration while recorded_at remains the completion time.
         """
         now = int(time.time())
         branch_id = self._intern_branch(branch_key)
@@ -6104,14 +6108,14 @@ class ERDQueue:
                 (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
                  n_words, budget, predicted_work, bound_erd,
                  candidate_cost_lower_bound, erd_lower_bound_pruned,
-                 actual_nodes, group_sizes, source_word, started_at, outcome,
-                 republish_count, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 actual_nodes, group_sizes, source_word, started_at,
+                 evaluation_millis, outcome, republish_count, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
               n_words, budget, predicted_work, bound_erd,
               candidate_cost_lower_bound, 1 if erd_lower_bound_pruned else 0,
-              actual_nodes, group_sizes, source_word, started_at, outcome,
-              republish_count, self.epoch, now))
+              actual_nodes, group_sizes, source_word, started_at,
+              evaluation_millis, outcome, republish_count, self.epoch, now))
 
     def set_epoch(self, epoch: int, label: str = None, git_sha: str = None,
                   notes: str = None):
