@@ -1691,6 +1691,8 @@ def main():
         hotspot_field = args.by or 'nodes'
         if args.hotspots and args.limit is None:
             args.limit = 10
+        if args.accuracy and args.limit is None:
+            args.limit = 20
         branch_statuses = args.branch_status
         if branch_statuses is None:
             branch_statuses = (
@@ -1712,7 +1714,8 @@ def main():
         )
         args.hotspot_field = hotspot_field if args.hotspots else None
         args.sample_size = min(args.sample_size or 50_000, 1_000_000)
-        args.since_seconds = args.since_seconds or 3600
+        if args.hotspots:
+            args.since_seconds = args.since_seconds or 3600
         try:
             validate_report_request(ReportRequest(
                 report_kind=args.report_kind,

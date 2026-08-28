@@ -41,10 +41,13 @@ class QueueVisibilityTests(unittest.TestCase):
             "idx_claim_telemetry_epoch_id",
             "idx_claim_telemetry_epoch_recorded_id",
             "idx_claim_telemetry_branch_recorded_at",
+            "idx_candidate_accuracy_epoch_id",
+            "idx_candidate_accuracy_epoch_recorded_id",
         }
         indexes = set()
         for table in (
-            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry"
+            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry",
+            "candidate_accuracy"
         ):
             indexes.update(
                 row["name"] for row in self.q._conn.execute(
@@ -55,7 +58,8 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q._migrate()
         indexes_after = set()
         for table in (
-            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry"
+            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry",
+            "candidate_accuracy"
         ):
             indexes_after.update(
                 row["name"] for row in self.q._conn.execute(
@@ -67,15 +71,15 @@ class QueueVisibilityTests(unittest.TestCase):
     def test_candidate_accuracy_report_calibrates_and_filters_raw_rows(self):
         self.q.add_candidate_accuracy(
             self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 40,
-            source_word="salet", candidate_word="crane", candidate_index=7,
+            source_word="salet", candidate_word="crane", idx=7,
             bundle_id="w1:1", worker_id="worker-1", outcome="solved",
             evaluation_millis=12, republish_count=2)
         self.q.add_candidate_accuracy(
             self.user_key, 25, 4, 0.0, 3.0, 3.5, True, 0,
-            source_word="salet", candidate_word="slate", candidate_index=8)
+            source_word="salet", candidate_word="slate", idx=8)
         self.q.add_candidate_accuracy(
             self.user_key, 25, 4, 0.0, 3.0, 2.0, False, 5,
-            source_word="salet", candidate_word="trace", candidate_index=9)
+            source_word="salet", candidate_word="trace", idx=9)
         report = self.q.report_candidate_accuracy(
             epoch=0, source_word="salet", limit=1)
         self.assertEqual(report["row_count"], 3)
@@ -83,24 +87,24 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(report["non_erd_pruned_row_count"], 2)
         self.assertEqual(report["no_prediction_row_count"], 2)
         self.assertEqual(report["sampled_row_count"], 3)
+        self.assertIsNone(report["population_row_count"])
         self.assertEqual(
             report["calibration"]["actual_predicted_ratio"]["p50"], 4.0)
         row = report["rows"][0]
         self.assertEqual(row["candidate_word"], "trace")
         self.assertIsNone(row["actual_predicted_ratio"])
         under_predicted = report["largest_under_predicted"][0]
-        self.assertEqual(under_predicted["candidate_index"], 7)
+        self.assertEqual(under_predicted["idx"], 7)
         self.assertEqual(under_predicted["republish_count"], 2)
         self.assertNotIn(
             "trace", [row["candidate_word"]
                       for row in report["largest_under_predicted"]])
 
     def test_candidate_accuracy_report_filters_offsets_and_empty_samples(self):
-        for candidate_index, candidate_word in enumerate(("crane", "slate")):
+        for idx, candidate_word in enumerate(("crane", "slate")):
             self.q.add_candidate_accuracy(
                 self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 20,
-                source_word="salet", candidate_word=candidate_word,
-                candidate_index=candidate_index)
+                source_word="salet", candidate_word=candidate_word, idx=idx)
         filtered = self.q.report_candidate_accuracy(
             epoch=0, budget=4, minimum_answer_count=20,
             maximum_answer_count=30, source_word="salet",
@@ -112,15 +116,30 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertIsNone(
             empty["calibration"]["actual_predicted_ratio"]["p99"])
 
+    def test_candidate_accuracy_report_honors_since_without_counting_filter(self):
+        self.q.add_candidate_accuracy(
+            self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 20,
+            source_word="salet", candidate_word="crane")
+        self.q._conn.execute(
+            "UPDATE telemetry.candidate_accuracy SET recorded_at = 100")
+        self.assertEqual(
+            self.q.report_candidate_accuracy(epoch=0, since=101)["row_count"], 0)
+        report = self.q.report_candidate_accuracy(epoch=0, since=100)
+        self.assertEqual(report["row_count"], 1)
+        self.assertEqual(report["population_row_count"], 1)
+
     def test_candidate_republish_count_defaults_to_zero_and_reads_a_republish(self):
         self.q.create_branch(self.user_key, len(WORDS), len(WORDS))
-        self.assertEqual(self.q.candidate_republish_count(self.user_key, 1), 0)
+        self.assertEqual(self.q.candidate_republish_for_branch(self.user_key), [])
         branch_id = self.q._intern_branch(self.user_key)
         self.q._conn.execute("""
             INSERT INTO candidate_republish (branch_id, idx, count)
             VALUES (?, ?, ?)
         """, (branch_id, 1, 3))
-        self.assertEqual(self.q.candidate_republish_count(self.user_key, 1), 3)
+        self.assertEqual(
+            self.q.candidate_republish_for_branch(self.user_key),
+            [{"idx": 1, "count": 3}],
+        )
 
     def test_erd_prune_provenance_migration_backfills_legacy_counts_once(self):
         self.q.create_branch(self.user_key, len(WORDS), 10)

@@ -3043,6 +3043,7 @@ def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> d
     data = {"epoch": request.epoch, "row_count": 0,
             "erd_pruned_row_count": 0, "non_erd_pruned_row_count": 0,
             "no_prediction_row_count": 0, "sampled_row_count": 0,
+            "population_row_count": None,
             "calibration": {}, "answer_count_budget_calibration": [],
             "largest_under_predicted": [], "largest_over_predicted": [],
             "rows": []}
@@ -3064,6 +3065,8 @@ def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> d
             minimum_answer_count=request.filters.minimum_answer_count,
             maximum_answer_count=request.filters.maximum_answer_count,
             source_word=source_word, branch_key=branch_key,
+            since=(generated_at - request.since_seconds
+                   if request.since_seconds is not None else None),
             limit=request.filters.limit,
             sample_size=min(request.sample_size or 50_000, 1_000_000),
             raw_row_offset=request.raw_row_offset)
