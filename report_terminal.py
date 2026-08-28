@@ -1909,7 +1909,9 @@ def _render_accuracy_sections(report, width):
     ratio = calibration.get("actual_predicted_ratio", {})
     summary = [
         _fit(f"Candidate-level accuracy  epoch={data.get('epoch')}", width),
-        _fit(f"  sampled rows {data.get('row_count', 0):,}; ERD-pruned "
+        _fit(f"  population "
+             f"{('not counted' if data.get('population_row_count') is None else format(data['population_row_count'], ','))}; "
+             f"random sample {data.get('row_count', 0):,}; ERD-pruned "
              f"{data.get('erd_pruned_row_count', 0):,}; non-ERD-pruned "
              f"{data.get('non_erd_pruned_row_count', 0):,}", width),
         _fit(f"  no prediction {data.get('no_prediction_row_count', 0):,}; "
@@ -1918,13 +1920,17 @@ def _render_accuracy_sections(report, width):
             f"{name}={value:.2f}" for name, value in ratio.items()
             if value is not None), width),
     ]
-    rows = ["Largest under-predicted  candidate  answers budget predicted actual ratio"]
+    rows = ["Largest under-predicted in sample  candidate  answers budget predicted actual ratio"]
     for row in data.get("largest_under_predicted", [])[:5]:
         ratio_value = row.get("actual_predicted_ratio")
         ratio_text = "—" if ratio_value is None else f"{ratio_value:.2f}"
+        budget = row.get("budget")
+        predicted = row.get("predicted_work")
+        budget_text = "—" if budget is None else str(budget)
+        predicted_text = "—" if predicted is None else f"{predicted:.1f}"
         rows.append(_fit(
             f"  {row.get('candidate_word') or '—':<9} {row['n_words']:>7,} "
-            f"{row.get('budget') or 0:>6} {row.get('predicted_work') or 0:>9.1f} "
+            f"{budget_text:>6} {predicted_text:>9} "
             f"{row['actual_nodes']:>6,} {ratio_text:>5}", width))
     raw_rows = data.get("rows", [])
     if raw_rows:
@@ -1939,7 +1945,7 @@ def _render_accuracy_sections(report, width):
             elapsed = row.get("evaluation_millis")
             elapsed_text = "—" if elapsed is None else f"{elapsed:,}ms"
             rows.append(_fit(
-                f"  {candidate.upper()} idx={row.get('candidate_index', '—')} "
+                f"  {candidate.upper()} idx={row.get('idx', '—')} "
                 f"worker={worker} bundle={bundle} {outcome} "
                 f"elapsed={elapsed_text} republished="
                 f"{row.get('republish_count', '—')}", width))

@@ -21,6 +21,7 @@ import logging
 import hashlib
 import math
 import os
+import random
 import sqlite3
 import time
 from urllib.parse import quote
@@ -1212,6 +1213,11 @@ class ERDQueue:
             ("claim_telemetry", {"branch_id", "recorded_at"},
              "idx_claim_telemetry_branch_recorded_at",
              "branch_id, recorded_at"),
+            ("candidate_accuracy", {"epoch", "id"},
+             "idx_candidate_accuracy_epoch_id", "epoch, id"),
+            ("candidate_accuracy", {"epoch", "recorded_at", "id"},
+             "idx_candidate_accuracy_epoch_recorded_id",
+             "epoch, recorded_at DESC, id DESC"),
         )
         for table, required_columns, index_name, indexed_columns in report_indexes:
             columns = {row["name"] for row in self._conn.execute(
@@ -6116,6 +6122,124 @@ class ERDQueue:
               candidate_cost_lower_bound, 1 if erd_lower_bound_pruned else 0,
               actual_nodes, group_sizes, source_word, started_at,
               evaluation_millis, outcome, republish_count, self.epoch, now))
+
+    @staticmethod
+    def _accuracy_percentiles(values):
+        values = sorted(values)
+        if not values:
+            return {"p50": None, "p90": None, "p99": None}
+        return {
+            f"p{percentile}": values[min(
+                len(values) - 1, int(percentile / 100 * len(values)))]
+            for percentile in (50, 90, 99)
+        }
+
+    def report_candidate_accuracy(self, epoch=None, budget=None,
+                                  minimum_answer_count=None,
+                                  maximum_answer_count=None, source_word=None,
+                                  branch_key=None, since=None, limit=None,
+                                  sample_size=50_000, raw_row_offset=0):
+        """Return a bounded candidate-level calibration sample.
+
+        Candidate telemetry is one row per claim.  Sampling random ids across
+        an epoch avoids both a full aggregate and treating a few recent minutes
+        from one opener as representative of a multi-day epoch.
+        """
+        epoch = self.epoch if epoch is None else epoch
+        where, parameters = ["epoch = ?"], [epoch]
+        for condition, value in (
+                ("budget = ?", budget),
+                ("n_words >= ?", minimum_answer_count),
+                ("n_words <= ?", maximum_answer_count),
+                ("source_word = ?", source_word),
+                ("branch_key = ?", branch_key),
+                ("recorded_at >= ?", since)):
+            if value is not None:
+                where.append(condition)
+                parameters.append(value)
+        condition = " WHERE " + " AND ".join(where)
+        sampling_condition = " WHERE epoch = ?"
+        sampling_parameters = [epoch]
+        if since is not None:
+            sampling_condition += " AND recorded_at >= ?"
+            sampling_parameters.append(since)
+        id_bounds = self._conn.execute(
+            "SELECT MIN(id), MAX(id) FROM telemetry.candidate_accuracy"
+            + sampling_condition, sampling_parameters).fetchone()
+        minimum_id, maximum_id = id_bounds
+        sampled_rows = []
+        if minimum_id is not None:
+            # Candidate-accuracy ids are append-only and dense.  Batched point
+            # lookups keep the random sample bounded by the epoch/id index.
+            sample_ids = random.Random(epoch).sample(
+                range(minimum_id, maximum_id + 1),
+                min(sample_size, maximum_id - minimum_id + 1))
+            for start in range(0, len(sample_ids), 500):
+                batch = sample_ids[start:start + 500]
+                placeholders = ", ".join("?" for _ in batch)
+                sampled_rows.extend(dict(row) for row in self._conn.execute(
+                    "SELECT * FROM telemetry.candidate_accuracy" + condition
+                    + f" AND id IN ({placeholders})", [*parameters, *batch]))
+        raw_rows = []
+        if limit is not None:
+            raw_rows = [dict(row) for row in self._conn.execute(
+                "SELECT * FROM telemetry.candidate_accuracy" + condition
+                + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                [*parameters, limit, raw_row_offset])]
+        for row in sampled_rows + raw_rows:
+            predicted = row["predicted_work"]
+            actual = row["actual_nodes"]
+            row["actual_predicted_ratio"] = (
+                actual / predicted if predicted is not None and predicted > 0
+                else None)
+        non_pruned = [row for row in sampled_rows
+                      if not row["erd_lower_bound_pruned"]]
+
+        def calibration(group_rows):
+            return {
+                "row_count": len(group_rows),
+                "predicted_work": self._accuracy_percentiles(
+                    [row["predicted_work"] for row in group_rows
+                     if row["predicted_work"] is not None]),
+                "actual_nodes": self._accuracy_percentiles(
+                    [row["actual_nodes"] for row in group_rows]),
+                "actual_predicted_ratio": self._accuracy_percentiles(
+                    [row["actual_predicted_ratio"] for row in group_rows
+                     if row["actual_predicted_ratio"] is not None]),
+            }
+
+        buckets = {}
+        for row in non_pruned:
+            buckets.setdefault(
+                (cost_size_bucket(row["n_words"]), row["budget"]), []).append(row)
+        ratio_rows = [row for row in non_pruned
+                      if row["actual_predicted_ratio"] is not None]
+        ordered = sorted(ratio_rows, key=lambda row: row["actual_predicted_ratio"])
+        population_row_count = None
+        if len(where) == 1 or (len(where) == 2 and since is not None):
+            population_row_count = self._conn.execute(
+                "SELECT COUNT(*) FROM telemetry.candidate_accuracy"
+                + sampling_condition, sampling_parameters).fetchone()[0]
+        return {
+            "epoch": epoch, "row_count": len(sampled_rows),
+            "sampled_row_count": len(sampled_rows),
+            "population_row_count": population_row_count,
+            "erd_pruned_row_count": sum(
+                row["erd_lower_bound_pruned"] for row in sampled_rows),
+            "non_erd_pruned_row_count": len(non_pruned),
+            "no_prediction_row_count": sum(
+                row["predicted_work"] is None or row["predicted_work"] <= 0
+                for row in sampled_rows),
+            "raw_row_offset": raw_row_offset,
+            "calibration": calibration(non_pruned),
+            "answer_count_budget_calibration": [
+                {"answer_count_bucket_start": key[0], "budget": key[1],
+                 **calibration(group_rows)}
+                for key, group_rows in sorted(buckets.items())],
+            "largest_over_predicted": ordered[:10],
+            "largest_under_predicted": list(reversed(ordered[-10:])),
+            "rows": raw_rows,
+        }
 
     def set_epoch(self, epoch: int, label: str = None, git_sha: str = None,
                   notes: str = None):
