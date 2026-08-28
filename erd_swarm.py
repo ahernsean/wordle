@@ -1176,12 +1176,12 @@ class _BranchWorker:
         to choose among branches; this is what makes the cap hold when several
         workers pick the same branch before any of them has claimed it.
 
-        Every path that claims work on an EXISTING branch passes the cap,
-        selection and dependency waits alike: a worker refused entry to a
-        branch it depends on falls into the same wait it already takes when
-        every candidate is claimed, and the branch it is waiting on is being
-        worked either way.  A freshly promoted branch is the exception and
-        needs no cap — promotion is atomic, so nobody else is on it yet.
+        Every path that claims work passes a cap — selection, dependency waits
+        and promotion alike.  A worker refused entry to a branch it depends on
+        falls into the same wait it already takes when every candidate is
+        claimed, and the branch it is waiting on is being worked either way.
+        Promotion is not exempt: create_branch commits before the promoter
+        claims, so another worker can take the new branch in between.
 
         Every claim path (top-level loop, helping, deep solving, focused)
         funnels through here, so this is where a quiescing supervisor's pause
@@ -2364,10 +2364,15 @@ class _BranchWorker:
             source_work_id=claimed['source_work_id'])
         self._source_work_enabled = True
         words = decode_subset(claimed['branch_key'])
+        # create_branch has already committed, so the branch has been visible
+        # and unoccupied to every other worker since then.  Creating it is no
+        # exemption from the cap: a worker that got there first holds it, and
+        # this one should open a sibling rather than take a second seat.
         claim = self._claim_bundle(
             claimed['branch_key'], self.n_candidates, words,
             expected_source_work_id=claimed['source_work_id'],
-            expected_source_priority=claimed['priority'])
+            expected_source_priority=claimed['priority'],
+            max_other_workers=0)
         branch = {
             'branch_key': claimed['branch_key'], 'n_words': n_words,
             'n_candidates': self.n_candidates,

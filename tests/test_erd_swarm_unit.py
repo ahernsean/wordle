@@ -4208,6 +4208,45 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         self.assertEqual({b["source_work_id"] for b in open_after},
                          {source_work_id})
 
+    def test_promoter_beaten_to_its_own_branch_does_not_join_it(self):
+        """create_branch commits before the promoter claims, so between the two
+        the branch is visible and unoccupied to every other worker.  Creating a
+        branch is therefore no exemption from the cap: by the time the promoter
+        claims, someone may already be on it, and claiming anyway would seat a
+        second worker on a branch while this one still had a free sibling to
+        open instead.
+
+        Deterministic rather than threaded: the interleaving is forced by
+        claiming from another worker inside create_branch, at exactly the point
+        the real race occurs.
+        """
+        keys = self._queue_source([BRANCH, BRANCH[:3]])
+        w = self._worker(small_count=1, count_cap=1)
+        create_branch = self.queue.create_branch
+        stolen = []
+
+        def create_then_let_a_rival_in(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not stolen:                     # only the first promotion
+                stolen.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        with mock.patch.object(w.queue, "create_branch",
+                               side_effect=create_then_let_a_rival_in):
+            work = w.claim_one()
+
+        self.assertEqual(len(stolen), 1)
+        holders = self.queue.claim_holders_by_branch()
+        self.assertEqual(holders.get(stolen[0]), 1,
+                         "promoter took a second seat on the branch it created")
+        for branch_key, count in holders.items():
+            self.assertLessEqual(count, 1, f"{branch_key!r} has {count} holders")
+        if work is not None:
+            claimed = self._claimed_key(work)
+            self.assertNotEqual(claimed, stolen[0])
+            self.assertIn(claimed, keys)
+
     # -- branches with no source ownership --------------------------------
 
     def _direct_branch(self, words):
