@@ -1305,7 +1305,7 @@ def _current_git_sha():
 
 
 def cmd_epoch_show(args):
-    queue = ERDQueue(args.queue)
+    queue = ERDQueue(args.queue, initialize_schema=False)
     try:
         print(json.dumps(queue.epoch_metadata(), sort_keys=True))
     finally:

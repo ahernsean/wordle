@@ -246,8 +246,14 @@ class EpochCommandTest(unittest.TestCase):
                         notes='fresh measurements')
         queue.close()
 
-        with patch('sys.stdout', io.StringIO()) as output:
+        with (
+            patch('sys.stdout', io.StringIO()) as output,
+            patch.object(erd_search, 'ERDQueue', wraps=ERDQueue) as open_queue,
+        ):
             erd_search.cmd_epoch_show(SimpleNamespace(queue=self.queue_path))
+
+        open_queue.assert_called_once_with(
+            self.queue_path, initialize_schema=False)
 
         self.assertEqual(json.loads(output.getvalue()), {
             'epoch': 8,
