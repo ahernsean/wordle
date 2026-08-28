@@ -41,10 +41,17 @@ command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
 "$PYTHON" -m pip install --quiet --disable-pip-version-check \
     -r requirements-dev.txt coverage
 
-# Chromium is already in the image (PLAYWRIGHT_BROWSERS_PATH); the browser
-# tests find it by path.  Requiring it turns a broken browser into a failure
-# instead of a silent skip, matching CI.
-echo 'export REQUIRE_PLAYWRIGHT_BROWSER=1' >> "${CLAUDE_ENV_FILE:-/dev/null}"
+# Chromium is already in the image (PLAYWRIGHT_BROWSERS_PATH) and the browser
+# tests find it by path; they run by default and fail loudly if it will not
+# start, so nothing needs setting for it.
+#
+# WebKit also runs by default, but it needs a container runtime these images do
+# not always carry.  Opt out explicitly when there is none, so the reason is a
+# line in this hook's output rather than a suite that quietly covers one engine.
+if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+  echo 'export SKIP_WEBKIT_CONTAINER_TESTS=1' >> "${CLAUDE_ENV_FILE:-/dev/null}"
+  echo "No podman or docker: WebKit browser tests are disabled in this session."
+fi
 
 echo "Test dependencies installed for $PYTHON ($("$PYTHON" -V))."
 echo "Run the suite with: $PYTHON -m unittest discover -s tests -t . -p 'test_*.py'"

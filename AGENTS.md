@@ -460,14 +460,15 @@ pip install -r requirements.txt       # runtime only (numpy)
   `PLAYWRIGHT_BROWSERS_PATH`. The browser tests launch the default bundled
   revision when present and otherwise fall back to that pre-installed build by
   path (`_launch_chromium`), so any installed playwright version works without
-  matching browser revisions. Without the package the browser tests skip; set
-  `REQUIRE_PLAYWRIGHT_BROWSER=1` to make them hard-fail instead of skipping.
+  matching browser revisions. A browser that will not start is a **failure**,
+  never a skip.
 
-  **On rocky, playwright is installed only under `python3.13`** (in
-  `~/.local/lib/python3.13/site-packages`). The default `python`/`python3` is
-  3.9, which has numpy but **not** playwright — run the suite under it and the
-  browser tests silently skip. Run with `python3.13` to actually exercise
-  `tests/test_report_client.py`.
+  **The suite refuses to run below Python 3.13.** `tests/__init__.py` raises on
+  import, because on rocky playwright is installed only under `python3.13` (in
+  `~/.local/lib/python3.13/site-packages`) while the default `python`/`python3`
+  is 3.9 — which has numpy but not playwright, so the browser suites would skip
+  themselves and a run that never touched the report client would still report
+  OK. Run everything with `python3.13`.
 
   **Codex sandbox note:** Codex's default command sandbox may deny the browser
   fixture server's bind to `127.0.0.1:0` with
@@ -479,11 +480,11 @@ pip install -r requirements.txt       # runtime only (numpy)
   policies.
 
 **Claude Code on the web** starts from a bare image with neither dependency
-installed. `.claude/hooks/session-start.sh` installs them into `python3.13`
-and sets `REQUIRE_PLAYWRIGHT_BROWSER=1`, so the browser tests fail loudly
-there rather than skipping. It no-ops on a local checkout
-(`CLAUDE_CODE_REMOTE`), which keeps whatever environment the developer set
-up.
+installed. `.claude/hooks/session-start.sh` installs them into `python3.13`.
+Browser tests need nothing set to run; the hook only sets
+`SKIP_WEBKIT_CONTAINER_TESTS=1`, and prints that it did, when the image carries
+neither podman nor docker. It no-ops on a local checkout (`CLAUDE_CODE_REMOTE`),
+which keeps whatever environment the developer set up.
 
 The hook runs asynchronously: the session starts immediately and the install
 lands a few seconds later, so a `ModuleNotFoundError` for numpy or playwright
@@ -506,12 +507,17 @@ or a clear, which keep the same container.
   same version, so the tag is derived from the installed version at run time,
   never pinned.
 
-  Off by default locally (it needs podman or docker, plus a network pull of
-  the container image) — set `RUN_WEBKIT_CONTAINER_TESTS=1` to opt in, or
-  `REQUIRE_WEBKIT_CONTAINER_TESTS=1` to hard-fail instead of skipping when the
-  container can't start (used by CI's `webkit` job). Rocky has `podman`, not
-  `docker`; `tests/webkit_container.py` tries `podman` first and falls back to
-  `docker`.
+  **WebKit runs by default, and a container that will not start fails the
+  suite.** This client is used overwhelmingly from WebKit — Safari and iOS
+  Chrome — so a green run that covered only Chromium would leave the primary
+  engine untested. Rocky has `podman` (not `docker`) and the image pulled;
+  `tests/webkit_container.py` tries `podman` first and falls back to `docker`.
+
+  `SKIP_WEBKIT_CONTAINER_TESTS=1` opts out for a machine with no container
+  runtime, and `SKIP_BROWSER_TESTS=1` opts out of both engines. Setting either
+  is a deliberate statement that the run does not cover that engine — reach for
+  them only when the environment genuinely cannot host the browser, never to
+  get a red suite green.
 
 ## Before committing and pushing
 
@@ -549,12 +555,22 @@ GitHub CI enforces total coverage of at least 98%; run its coverage gate
 locally when running the full suite:
 
 ```
-python3.13 -m coverage run -m unittest discover -s tests -t . -p 'test_*.py'
+rm -f .coverage; find . -maxdepth 1 -name '.coverage.*' -delete
+python3.13 -m coverage run --parallel-mode \
+    -m unittest discover -s tests -t . -p 'test_*.py'
+python3.13 -m coverage combine
 python3.13 -m coverage report --fail-under=98
 ```
 
-Use `python3.13`, not the default `python` (3.9): only 3.13 has playwright, so
-under 3.9 the browser contract tests skip rather than run.
+**`--parallel-mode` and `combine` are required, not optional.** Without them
+every process writes the single `.coverage` path, and the scaling tests fork
+workers that inherit the tracer and overwrite the parent's data when they exit.
+Last writer wins, so the total swings run to run — 98.0% and 93.9% from two
+identical runs, the whole difference being `erd_swarm.py`, the module those
+workers execute. CI already does this because it combines across its jobs; only
+the local single-file invocation was exposed. (Clear the data files with `find
+-delete`: under zsh a `.coverage.*` glob that matches nothing aborts the whole
+command, silently skipping the run chained after it.)
 
 Commits with failing tests must not be pushed.
 

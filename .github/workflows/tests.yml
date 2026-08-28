@@ -59,10 +59,12 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
+      # WebKit has its own job below; skipping it here keeps this one to the
+      # Chromium engine rather than running the same bodies twice.
       - name: Run Chromium browser suite with coverage
         run: coverage run --parallel-mode -m unittest tests.test_report_client
         env:
-          REQUIRE_PLAYWRIGHT_BROWSER: "1"
+          SKIP_WEBKIT_CONTAINER_TESTS: "1"
 
       - name: Upload coverage data
         uses: actions/upload-artifact@v4
@@ -90,8 +92,6 @@ jobs:
       # playwright package's version, so no local WebKit install is needed.
       - name: Run WebKit browser suite with coverage
         run: coverage run --parallel-mode -m unittest tests.test_report_client.ReportClientWebKitBrowserTest
-        env:
-          REQUIRE_WEBKIT_CONTAINER_TESTS: "1"
 
       - name: Upload coverage data
         uses: actions/upload-artifact@v4
