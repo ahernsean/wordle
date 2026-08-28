@@ -1987,6 +1987,15 @@ class _BranchWorker:
             return True
         return False
 
+    def _evaluate_dependency_bundle(self, branch_key, words, n_words, claim,
+                                    budget):
+        """Evaluate one claimed bundle of a branch this worker is waiting on."""
+        bundle_id, indices, forced = claim
+        if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
+                                indices, forced, budget=budget):
+            self.maybe_finalize(branch_key, words, self.n_candidates)
+        self._maybe_checkpoint()                # drain WAL during deep solving
+
     def _subbranch_solver(self, words, budget, ceiling=float('inf')):
         """Engine hook: decide whether to solve a sub-branch cooperatively.
 
@@ -2190,38 +2199,49 @@ class _BranchWorker:
                     if cut is not None:
                         return cut
                     break                       # finalized as a loss + deleted
+                # Sole worker only: a dependency someone else already holds is
+                # being worked, and this worker is worth far more opening a
+                # branch of its own than sitting second on this one.
                 claim = self._claim_bundle(
                     branch_key, self.n_candidates, words,
                     expected_source_work_id=self._work_context.source_work_id,
-                    max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
+                    max_other_workers=0)
                 if claim is not None:
-                    bundle_id, indices, forced = claim
-                    if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
-                                            indices, forced, budget=budget):
-                        self.maybe_finalize(branch_key, words, self.n_candidates)
-                    self._maybe_checkpoint()    # drain WAL during deep solving
+                    self._evaluate_dependency_bundle(
+                        branch_key, words, n_words, claim, budget)
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
                     if not self.maybe_finalize(branch_key, words,
                                                self.n_candidates):
                         self._await_rival_finalize(branch_key, words, n_words,
                                                    self.n_candidates)
-                else:  # pragma: no cover
-                    # No bundle for this worker: either every candidate is
-                    # claimed, or the branch is already at MAX_WORKERS_PER_BRANCH
-                    # and this worker would be the one too many.  Both are
-                    # waits, not failures — the branch is being worked and this
-                    # worker's dependency will be satisfied by whoever holds it.
-                    # Heartbeat first (so THIS worker, which still holds its own
-                    # parent claim up the stack, isn't itself presumed dead while
-                    # it waits), then free any claim whose holder has died so we
-                    # can re-claim it rather than wait forever — there may be no
-                    # supervisor in the standalone solve path.
+                else:
+                    # No bundle: every candidate is claimed, or another worker
+                    # holds the branch.  Heartbeat first (so THIS worker, which
+                    # still holds its own parent claim up the stack, isn't
+                    # itself presumed dead while it waits), then free any claim
+                    # whose holder has died so we can re-claim it rather than
+                    # wait forever — there may be no supervisor in the
+                    # standalone solve path.
                     self._cur_candidate = None  # coordinating, no candidate in flight
                     self._heartbeat(branch_key, n_words, None, None,
                                     None, None, force=True)
                     self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                     if not self._help_other_branch(branch_key):
-                        time.sleep(0.05)        # nothing to claim anywhere; let claims land
+                        # Nothing free or promotable anywhere, so pairing onto
+                        # the dependency is now the best available move rather
+                        # than a shortcut past better work.  Retried from the
+                        # top of this loop every time, so the pair dissolves as
+                        # soon as free work appears.
+                        paired = self._claim_bundle(
+                            branch_key, self.n_candidates, words,
+                            expected_source_work_id=(
+                                self._work_context.source_work_id),
+                            max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
+                        if paired is not None:
+                            self._evaluate_dependency_bundle(
+                                branch_key, words, n_words, paired, budget)
+                        else:
+                            time.sleep(0.05)    # let claims land
 
             if self.cancel():  # pragma: no cover
                 return CANCEL_RECVD

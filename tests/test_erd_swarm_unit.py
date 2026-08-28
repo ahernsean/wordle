@@ -26,7 +26,8 @@ from unittest import mock
 import erd_queue
 import erd_swarm
 from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
-                       PROMOTE_MIN_SIZE, decode_subset)
+                       PROMOTE_MIN_SIZE, MAX_WORKERS_PER_BRANCH,
+                       decode_subset)
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
 from erd_queue import guess_depth_from_spine, SCHEDULING_ROLE_PREFERRED
@@ -3951,6 +3952,20 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         _bundle_id, indices, _forced = claim
         return w, list(indices)
 
+    def _drain_claims(self, branch_key, worker_id):
+        """Claim every remaining candidate of a branch, leaving it with no
+        bundle for anyone else — a branch that is occupied AND offers nothing
+        to fall back on."""
+        w = self._worker(worker_id, small_count=len(CANDIDATES),
+                         count_cap=len(CANDIDATES))
+        owner = self.queue.owner_row_for_branch(branch_key)
+        while w._claim_bundle(
+                branch_key, owner["n_candidates"], decode_subset(branch_key),
+                expected_source_work_id=owner["source_work_id"],
+                expected_source_priority=owner["owner_priority"]) is not None:
+            pass
+        return w
+
     def _claimed_key(self, work):
         self.assertIsNotNone(work)
         return bytes(work[1]["branch_key"])
@@ -4246,6 +4261,117 @@ class TestOneWorkerPerBranch(unittest.TestCase):
             claimed = self._claimed_key(work)
             self.assertNotEqual(claimed, stolen[0])
             self.assertIn(claimed, keys)
+
+    # -- dependency waits obey the same last-resort rule ------------------
+
+    def _wait_on_an_occupied_dependency(self, worker, parent_key, child_words):
+        """Drive cooperative_solve until its wait path decides, with the child
+        branch taken by another worker the instant it is created.
+
+        Shaped the way production reaches this loop: the worker is inside its
+        parent branch's context and asks the engine to solve a sub-branch, so
+        the child is created here rather than pre-built.  A rival claims it in
+        the window between create_branch committing and the solver's own claim
+        — the same window the promoter race lives in.
+
+        Returns the claim attempts made.  What is asserted is the decision
+        (which branch, at which cap, granted or not), not work completed:
+        stopping the worker cancels an in-flight evaluation, so a granted claim
+        can legitimately leave nothing done behind it.
+        """
+        attempts = []
+        claim_bundle = worker._claim_bundle
+        help_other_branch = worker._help_other_branch
+        create_branch = worker.queue.create_branch
+        taken = []
+
+        def create_then_let_a_rival_in(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        def record(branch_key, *args, **kwargs):
+            result = claim_bundle(branch_key, *args, **kwargs)
+            attempts.append({
+                "branch_key": bytes(branch_key),
+                "max_other_workers": kwargs.get("max_other_workers"),
+                "granted": result is not None,
+            })
+            if kwargs.get("max_other_workers") == MAX_WORKERS_PER_BRANCH - 1:
+                worker._stop_requested = True    # the pairing decision is made
+            return result
+
+        def help_then_stop_if_it_worked(*args, **kwargs):
+            did_work = help_other_branch(*args, **kwargs)
+            if did_work:
+                worker._stop_requested = True    # it chose other work
+            return did_work
+
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with worker._entered(context):
+            with mock.patch.object(worker.queue, "create_branch",
+                                   side_effect=create_then_let_a_rival_in):
+                worker._claim_bundle = record
+                worker._help_other_branch = help_then_stop_if_it_worked
+                # budget + guess_depth = GAME_GUESSES, so a child of this
+                # branch sits one below it.
+                worker.cooperative_solve(child_words, owner["budget"] - 1)
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        return attempts, taken[0]
+
+    def test_occupied_dependency_loses_to_a_free_branch(self):
+        """A worker blocked on a dependency another worker holds must take free
+        work rather than seat itself second.  The hard cap alone would permit
+        the pair; the last-resort rule is what forbids it while anything else
+        is claimable."""
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+
+        w = self._worker(small_count=1, count_cap=1)
+        attempts, child_key = self._wait_on_an_occupied_dependency(
+            w, parent_key, BRANCH[:3])
+
+        paired = [a for a in attempts
+                  if a["branch_key"] == child_key
+                  and a["max_other_workers"] == MAX_WORKERS_PER_BRANCH - 1]
+        self.assertEqual(paired, [],
+                         "asked to pair onto the dependency while a branch "
+                         "was free")
+        self.assertEqual(self.queue.claim_holders_by_branch().get(child_key), 1)
+        # The rival holds its claim unfinished throughout, so any completed
+        # candidate on the child could only be this worker's.
+        self.assertEqual(self.queue.branch_done_candidates(child_key), 0,
+                         "worked the occupied dependency anyway")
+        self.assertIsNotNone(self.queue.owner_row_for_branch(free_key))
+
+    def test_dependency_pair_forms_when_nothing_else_is_claimable(self):
+        """The rule is last resort, not never: with no other branch to take,
+        a second worker on the dependency beats idling."""
+        self._queue_source([BRANCH])
+        parent_key, _ = self._promote()
+        # Every candidate of the parent is claimed, so it offers no bundle to
+        # fall back on — occupying it alone would leave a pairing slot open and
+        # the worker would take that instead of ever reaching the child.
+        self._drain_claims(parent_key, 8)
+
+        w = self._worker(small_count=1, count_cap=1)
+        attempts, child_key = self._wait_on_an_occupied_dependency(
+            w, parent_key, BRANCH[:3])
+
+        granted_pair = [a for a in attempts
+                        if a["branch_key"] == child_key
+                        and a["max_other_workers"] == MAX_WORKERS_PER_BRANCH - 1
+                        and a["granted"]]
+        self.assertEqual(len(granted_pair), 1,
+                         "no free work anywhere, yet no pair formed")
+        # And it was tried as the sole worker first, never straight to a pair.
+        child_attempts = [a for a in attempts if a["branch_key"] == child_key]
+        self.assertEqual(child_attempts[0]["max_other_workers"], 0)
 
     # -- branches with no source ownership --------------------------------
 
