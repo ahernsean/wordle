@@ -36,14 +36,20 @@ commands.
 spreads across every one of them.** When a worker blocks on a dependency,
 `_help_other_branch` prefers *starting an opener with no branch open yet* over
 *joining a branch of the opener it is already on*: its first loop skips any
-opener that already holds a joinable open branch and promotes a fresh one. The
-guard that would stop this is a strict `priority < fallback_priority`
+opener that already holds a **joinable** open branch and promotes a fresh one.
+The guard that would stop this is a strict `priority < fallback_priority`
 comparison, and ties are let through deliberately (issue #214 — a worker
 blocked on an opener's only branch must be able to widen that opener). So a
 flat batch of N openers becomes N simultaneously-active openers, one recruited
 per blocking event, each left with a single open branch and the rest of its
 response groups still pending. The signature in `view --queue` is many active
 openers each showing `open=1` with dozens pending behind them.
+
+Joinable means **open and unoccupied**. An opener whose open branches all have
+workers is not covered by the join loop, so it promotes another of its own
+pending branches instead of recruiting a fresh opener — the widening that keeps
+one opener's response groups moving rather than starting the next opener. See
+one worker per branch below.
 
 `queue add` therefore lays openers on a **descending priority ladder**,
 `--priority-step` apart (default 5), which breaks every tie so the guard fires
@@ -69,6 +75,38 @@ every unfinished request on each claim, and `_help_other_branch` additionally
 issues one query per request. Measured on rocky: 0.6 ms per claim at 64
 openers, 157 ms at 15,000. Invisible at today's batch sizes and fatal at the
 scale of a full sweep — see the open issue before queueing thousands.
+
+### One worker per branch
+
+**Two workers on one branch is a loss at production vocabulary, not a gain.**
+They evaluate candidates against a stale `best_erd` ceiling and explore subtrees
+a sequential best-first search prunes. Measured on a 296-word production branch
+at the full candidate list: six workers took 955.4s against 584.9s for one, on
+1.79x the nodes. Spreading the same six one-per-branch drained six real branches
+2.29x faster than ganging them.
+
+The effect is **regime-dependent, and candidate count is the lever** — room to
+run ahead of the ceiling. Below ~3,000 candidates concentration genuinely wins
+(1.82x at 230); above it, it loses (0.79x at 3,062). Production runs at 14,855,
+so a fixture built at test scale will show the opposite sign. That is why
+`TestSingleBranchDoesNotConcentrateWorkers` fixes `_BASE_CANDIDATES` above the
+crossover, and why it asserts structurally rather than on the clock.
+
+Work selection therefore takes an unoccupied branch first, promotes one of the
+current opener's pending branches next, and only pairs a second worker onto an
+occupied branch when nothing anywhere is free. Never a third.
+
+**Occupancy is decided in two places, and both are needed.** The heartbeat map
+(`worker_counts_by_branch`) chooses *between* branches, but heartbeats lag: a
+worker writes one only once it is already evaluating, so at startup every worker
+reads every branch as free. `claim_next_bundle` therefore re-checks inside its
+`BEGIN IMMEDIATE` transaction, counting distinct workers holding `done = 0`
+`candidate_claims` — rows that transaction is itself about to write. Selection
+filters; the transaction decides.
+
+Both signals key on the liveness window, never on branch status. A branch whose
+worker died must become claimable again — sequential hand-off over a branch's
+life is normal, and only *concurrent* occupancy is capped.
 
 ### Completed work has two records, and they can disagree
 

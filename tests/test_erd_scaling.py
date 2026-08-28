@@ -775,3 +775,153 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSingleBranchDoesNotConcentrateWorkers(unittest.TestCase):
+    # -------------------------------------------------------------------------
+    # PURPOSE: the guard for one worker per branch, on the axis every other
+    # timed test here misses.  TestSolveDominatedStrongScaling and
+    # TestCooperativeDrainSmoke both spread workers over DISJOINT branches, so
+    # they measure cross-branch scaling and pass regardless of how many
+    # workers pile onto any one branch.  This drains a SINGLE branch with six
+    # workers.
+    #
+    # Workers sharing a branch evaluate candidates against a stale best_erd
+    # ceiling and explore subtrees a sequential best-first search prunes.
+    # Measured on a production 296-word branch at the full 14,855-candidate
+    # vocabulary, six workers on one branch took 955.4s against 584.9s for one
+    # worker — 0.62x, on 1.79x the nodes.
+    #
+    # CANDIDATE COUNT IS THE REGIME LEVER, and this fixture must stay above
+    # the crossover.  Concentration is a genuine win on a small vocabulary and
+    # only inverts above ~3,000 candidates, because candidate count is the
+    # room a worker has to run ahead of the shared ceiling.  Measured on this
+    # branch shape under the concentrating scheduler:
+    #
+    #     230 candidates   w1 31.52s  w6 17.31s   1.82x  (faster)
+    #   1,077 candidates   w1 25.36s  w6 11.10s   2.28x  (faster)
+    #   3,062 candidates   w1 11.38s  w6 14.33s   0.79x  (slower)
+    #   8,038 candidates   w1 46.70s  w6 65.41s   0.71x  (slower)
+    #
+    # TestSolveDominatedStrongScaling's 150 base candidates sit in the first
+    # regime, which is why the suite had room for this bug.  Do not shrink
+    # _BASE_CANDIDATES here to speed the suite up: below the crossover the
+    # workload cannot express the defect at all.
+    #
+    # THE ASSERTION IS STRUCTURAL, NOT TIMED, and that is a measurement result
+    # rather than a preference.  Six workers on a single branch stay slower
+    # than one worker even when the cap holds — 0.90x here, against 0.79x for
+    # the concentrating scheduler — because six processes pay startup while
+    # only two can ever work, and spreading is impossible on a fixture with
+    # one branch.  A 14% wall-clock margin is not something to assert on, so
+    # this pins the invariant itself.  Cross-branch scaling, where the win
+    # actually shows up, is timed by TestSolveDominatedStrongScaling.
+    # -------------------------------------------------------------------------
+    _BRANCH_SIZE = 80
+    _BASE_CANDIDATES = 3000
+    _BUDGET = 4
+    _WORKERS = 6
+    # One worker per branch caps a branch at two workers, and only as a last
+    # resort when nothing else is claimable — which is this fixture exactly,
+    # since there is one branch and six workers.
+    _MAX_WORKERS_PER_BRANCH = 2
+
+    def setUp(self):
+        shm = '/dev/shm'
+        tmp_dir = shm if (os.path.isdir(shm) and os.access(shm, os.W_OK)) else None
+        self._tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
+        self.addCleanup(self._tmp.cleanup)
+        with open(DEFAULT_ANSWER_LIST_PATH) as f:
+            answers = [l.strip() for l in f if l.strip()]
+        with open(DEFAULT_CANDIDATE_LIST_PATH) as f:
+            guesses = [l.strip() for l in f if l.strip()]
+        self._branches = build_trap_branches(answers, 1, self._BRANCH_SIZE)
+        self._pool = [w for branch in self._branches for w in branch]
+        self._candidates = build_candidates(guesses, self._branches,
+                                            self._BASE_CANDIDATES)
+        answer_file = os.path.join(self._tmp.name, "answers.txt")
+        words_file = os.path.join(self._tmp.name, "words.txt")
+        with open(answer_file, "w") as f:
+            f.write("\n".join(self._pool) + "\n")
+        with open(words_file, "w") as f:
+            f.write("\n".join(self._candidates) + "\n")
+        for attr, path in [("ANSWER_FILE", answer_file),
+                           ("WORDS_FILE", words_file)]:
+            patcher = mock.patch.object(erd_swarm, attr, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _warm_pattern_matrix(self):
+        """Build the matrix once before the workers start.
+
+        It persists as a .npy beside the cache path, which every worker here
+        shares, but a worker builds its own on a miss — so six starting at
+        once against a cold directory run six concurrent builds of the same
+        matrix.  Building it first turns those into six loads.
+        """
+        cache_path = os.path.join(self._tmp.name, "cache_warm.sqlite3")
+        ScoreCache(cache_path, self._pool).close()
+        queue_path = os.path.join(self._tmp.name, "queue_warm.sqlite3")
+        _BranchWorker(0, cache_path, queue_path, None,
+                      root_budget=self._BUDGET).close()
+
+    def _drain(self, n_workers, tag, timeout=600):
+        from erd_swarm import swarm_worker
+        cache_path = os.path.join(self._tmp.name, f"cache_{tag}.sqlite3")
+        queue_path = os.path.join(self._tmp.name, f"queue_{tag}.sqlite3")
+        ScoreCache(cache_path, self._pool).close()
+        seed_cost_model(queue_path)
+        q = ERDQueue(queue_path)
+        q.create_branch(encode_subset(self._branches[0]), self._BRANCH_SIZE,
+                        len(self._candidates), budget=self._BUDGET)
+        q.close()
+
+        stop_event = mp.Event()
+        with mock.patch("erd_swarm._setup_logging", lambda *_: None):
+            procs = [mp.Process(target=swarm_worker,
+                                args=(w, cache_path, queue_path, stop_event,
+                                      n_workers, True))
+                     for w in range(n_workers)]
+            for p in procs:
+                p.start()
+
+        deadline = time.time() + timeout
+        q = ERDQueue(queue_path)
+        try:
+            while time.time() < deadline:
+                if not q.branches_in_progress():
+                    break
+                time.sleep(0.1)
+            drained = not q.branches_in_progress()
+            peak = q._conn.execute(
+                "SELECT MAX(branch_worker_count) FROM telemetry.claim_telemetry"
+            ).fetchone()[0]
+        finally:
+            q.close()
+        stop_event.set()
+        for p in procs:
+            p.join(timeout=15)
+        for p in procs:
+            if p.is_alive():
+                p.kill()
+                p.join()
+        return {'drained': drained, 'peak_workers': peak}
+
+    def test_one_branch_never_holds_more_than_two_workers(self):
+        """The invariant, read back from the telemetry production uses to
+        confirm the same thing: branch_worker_count is recorded on every
+        claim, so a run that concentrated workers cannot hide.
+
+        Structural rather than timed, so it states the rule exactly and does
+        not depend on the machine being idle.
+        """
+        self._warm_pattern_matrix()
+        result = self._drain(self._WORKERS, "occupancy")
+        self.assertTrue(result['drained'],
+                        "fixture did not drain, so it never reached the "
+                        "contended state this asserts about")
+        self.assertIsNotNone(result['peak_workers'],
+                             "no claim telemetry recorded — the guard would "
+                             "pass on an empty table")
+        self.assertLessEqual(result['peak_workers'],
+                             self._MAX_WORKERS_PER_BRANCH)

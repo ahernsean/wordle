@@ -1508,6 +1508,16 @@ class ERDQueue:
             "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
             "ON candidate_claims(branch_id, bundle_id)")
 
+        # Branch occupancy (_other_claim_holders) runs inside every claim
+        # transaction and asks only which workers hold UNFINISHED claims.  The
+        # primary key seeks by branch_id but then walks every claim row the
+        # branch has ever had — 3-4 ms on a branch with 8,475 of them, against
+        # a whole claim costing well under 1 ms.  Partial on done = 0 so the
+        # index holds only work in flight, a handful of rows per branch.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidate_claims_open_by_worker "
+            "ON candidate_claims(branch_id, claimed_by) WHERE done = 0")
+
         # candidate_claims.best_first_position: where the claimed candidate
         # sits in the branch's best-first order,
         # which candidate_holes inherits when the row is freed.  After the
@@ -2699,8 +2709,15 @@ class ERDQueue:
                           count_cap=DEFAULT_COUNT_CAP,
                           republish_limit=DEFAULT_REPUBLISH_LIMIT,
                           expected_source_work_id=None,
-                          expected_source_priority=None):
+                          expected_source_priority=None,
+                          max_other_workers=None):
         """Atomically complete one-level ERD prunes and claim survivors.
+
+        max_other_workers caps how many other workers may hold work on this
+        branch at once, enforced here rather than by the caller because only
+        this transaction can decide it: occupancy is counted from live claims,
+        which this call is about to create, so two workers that both saw an
+        empty branch cannot both pass.  None disables the cap.
 
         Runs the exact-elimination classification from
         adaptive_claim_packing.md §5 inside one BEGIN IMMEDIATE transaction:
@@ -2817,6 +2834,11 @@ class ERDQueue:
                     """, (branch_id, expected_source_work_id,
                           expected_source_priority)).fetchone() is not None
             if not owner_matches:
+                self._commit_claim_transaction(_txn_t0)
+                return None
+            if (max_other_workers is not None
+                    and self._other_claim_holders(branch_id, worker_id)
+                        > max_other_workers):
                 self._commit_claim_transaction(_txn_t0)
                 return None
             # The branch ceiling is a bound like any achieved best: candidates
@@ -3707,18 +3729,54 @@ class ERDQueue:
         return n_branches_resumed, freed
 
     def worker_counts_by_branch(
-        self, timeout_seconds: int = WORKER_LIVENESS_SECONDS
+        self, timeout_seconds: int = WORKER_LIVENESS_SECONDS,
+        exclude_worker_id: str = None,
     ) -> dict:
-        """{branch_key bytes: number of recent workers on it} for status."""
+        """{branch_key bytes: number of recent workers on it}.
+
+        exclude_worker_id drops one worker from the counts.  A worker choosing
+        its next branch passes its own id: its heartbeat still names the branch
+        it is leaving, which would otherwise read as that branch being occupied
+        by someone else.  A branch every counted worker has left is absent from
+        the result rather than present with a count of zero.
+        """
         cutoff = int(time.time()) - timeout_seconds
         rows = self._conn.execute("""
             SELECT b.branch_key AS k, COUNT(*) AS c
             FROM worker_heartbeat h
             JOIN branches b ON b.branch_id = h.current_branch_id
             WHERE h.current_branch_id IS NOT NULL AND h.updated_at > ?
+              AND (? IS NULL OR h.worker_id != ?)
             GROUP BY h.current_branch_id
-        """, (cutoff,)).fetchall()
+        """, (cutoff, exclude_worker_id, exclude_worker_id)).fetchall()
         return {bytes(r["k"]): r["c"] for r in rows}
+
+    def _other_claim_holders(self, branch_id, worker_id):
+        """Workers other than worker_id holding unfinished claims on a branch.
+
+        Occupancy for work selection.  A claim row is written in the same
+        transaction that hands out the work, so this is current the instant a
+        worker takes a bundle — unlike a heartbeat, which a worker writes only
+        after it is already evaluating and which therefore reads as "branch
+        free" during the window every worker would pile in.
+
+        Workers whose heartbeat has aged out do not count: their claims are
+        freed at restart, and until then a crashed worker must not reserve a
+        branch nobody can enter.  A worker with no heartbeat row at all has
+        just started and does count.
+        """
+        return self._conn.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT claim.claimed_by
+                FROM candidate_claims AS claim
+                LEFT JOIN worker_heartbeat AS beat
+                       ON beat.worker_id = claim.claimed_by
+                WHERE claim.branch_id = ? AND claim.done = 0
+                  AND claim.claimed_by IS NOT ?
+                  AND (beat.worker_id IS NULL OR beat.updated_at > ?)
+            )
+        """, (branch_id, worker_id,
+              int(time.time()) - WORKER_LIVENESS_SECONDS)).fetchone()[0]
 
     def _branch_worker_count(self, branch_id, worker_id, now):
         """Count live workers assigned to a branch, including the recorder."""
