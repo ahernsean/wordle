@@ -1909,7 +1909,7 @@ def _render_accuracy_sections(report, width):
     ratio = calibration.get("actual_predicted_ratio", {})
     summary = [
         _fit(f"Candidate-level accuracy  epoch={data.get('epoch')}", width),
-        _fit(f"  rows {data.get('row_count', 0):,}; ERD-pruned "
+        _fit(f"  sampled rows {data.get('row_count', 0):,}; ERD-pruned "
              f"{data.get('erd_pruned_row_count', 0):,}; non-ERD-pruned "
              f"{data.get('non_erd_pruned_row_count', 0):,}", width),
         _fit(f"  no prediction {data.get('no_prediction_row_count', 0):,}; "
@@ -1926,6 +1926,23 @@ def _render_accuracy_sections(report, width):
             f"  {row.get('candidate_word') or '—':<9} {row['n_words']:>7,} "
             f"{row.get('budget') or 0:>6} {row.get('predicted_work') or 0:>9.1f} "
             f"{row['actual_nodes']:>6,} {ratio_text:>5}", width))
+    raw_rows = data.get("rows", [])
+    if raw_rows:
+        raw_offset = data.get("raw_row_offset", 0)
+        rows.append("")
+        rows.append(f"Raw rows (offset {raw_offset:,})")
+        for row in raw_rows:
+            candidate = row.get("candidate_word") or "—"
+            worker = row.get("worker_id") or "—"
+            bundle = row.get("bundle_id") or "—"
+            outcome = row.get("outcome") or "unknown"
+            elapsed = row.get("evaluation_millis")
+            elapsed_text = "—" if elapsed is None else f"{elapsed:,}ms"
+            rows.append(_fit(
+                f"  {candidate.upper()} idx={row.get('candidate_index', '—')} "
+                f"worker={worker} bundle={bundle} {outcome} "
+                f"elapsed={elapsed_text} republished="
+                f"{row.get('republish_count', '—')}", width))
     return [("header", summary), ("accuracy", rows)]
 
 
@@ -1986,6 +2003,7 @@ class WatchSession:
             since_seconds=getattr(self.args, "since_seconds", None),
             sample_size=getattr(self.args, "sample_size", None),
             source_word=getattr(self.args, "source_word", None),
+            raw_row_offset=getattr(self.args, "accuracy_offset", 0),
         )
 
     @property

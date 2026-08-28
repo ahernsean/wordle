@@ -215,6 +215,7 @@ class ReportRequest:
     since_seconds: int | None = None
     sample_size: int | None = None
     source_word: str | None = None
+    raw_row_offset: int = 0
 
 
 def validate_report_request(request: ReportRequest) -> None:
@@ -225,6 +226,10 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError(f"--tree cannot be used with --{report_kind}")
     if (request.tree_parent or request.tree_cursor) and not request.tree:
         raise ValueError("tree_parent and tree_cursor require tree")
+    if request.raw_row_offset and report_kind != "accuracy":
+        raise ValueError("raw_row_offset requires an accuracy report")
+    if request.raw_row_offset < 0:
+        raise ValueError("raw_row_offset cannot be negative")
     if request.include_claims and (
         request.tree
         or report_kind != "auto"
@@ -3060,7 +3065,8 @@ def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> d
             maximum_answer_count=request.filters.maximum_answer_count,
             source_word=source_word, branch_key=branch_key,
             limit=request.filters.limit,
-            sample_size=min(request.sample_size or 50_000, 1_000_000))
+            sample_size=min(request.sample_size or 50_000, 1_000_000),
+            raw_row_offset=request.raw_row_offset)
         for collection_name in ("rows", "largest_under_predicted",
                                 "largest_over_predicted"):
             for row in result[collection_name]:

@@ -1462,6 +1462,8 @@ def main():
     p_view.add_argument('--epoch', type=int, metavar='N')
     p_view.add_argument('--source-word', metavar='WORD',
                         help='Restrict --accuracy to one opener')
+    p_view.add_argument('--accuracy-offset', type=int, default=0, metavar='N',
+                        help='Skip N raw --accuracy rows before --limit')
     p_view.add_argument('--since-seconds', type=int, metavar='N')
     p_view.add_argument('--sample-size', type=int, metavar='N')
     p_view.add_argument('spine', nargs='*', metavar='SPINE')
@@ -1678,6 +1680,10 @@ def main():
             parser.error('--epoch requires --hotspots, --accuracy, or --root-progress')
         if args.source_word is not None and not args.accuracy:
             parser.error('--source-word requires --accuracy')
+        if args.accuracy_offset and not args.accuracy:
+            parser.error('--accuracy-offset requires --accuracy')
+        if args.accuracy_offset < 0:
+            parser.error('--accuracy-offset cannot be negative')
         if args.since_seconds is not None and args.since_seconds < 1:
             parser.error('--since-seconds must be at least 1')
         if args.sample_size is not None and args.sample_size < 1:
@@ -1713,6 +1719,7 @@ def main():
                 branch_target=args.branch_target,
                 include_claims=args.claims,
                 include_answers=args.answers,
+                raw_row_offset=args.accuracy_offset,
                 tree=args.tree,
                 filters=args.filters,
                 worker_id=args.worker,
