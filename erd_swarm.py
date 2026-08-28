@@ -2216,22 +2216,31 @@ class _BranchWorker:
                                                    self.n_candidates)
                 else:
                     # No bundle: every candidate is claimed, or another worker
-                    # holds the branch.  Heartbeat first (so THIS worker, which
-                    # still holds its own parent claim up the stack, isn't
-                    # itself presumed dead while it waits), then free any claim
-                    # whose holder has died so we can re-claim it rather than
-                    # wait forever — there may be no supervisor in the
-                    # standalone solve path.
+                    # holds the branch.  Try free or promotable work first —
+                    # reads, and what gives free work priority over pairing on
+                    # every iteration as it should.  The sole-worker claim
+                    # above fails on every iteration a legitimate pair is
+                    # simply progressing, which makes this the COMMON case, not
+                    # the rare one, so heartbeat and stale-claim reclaim (both
+                    # writes) are reserved for the branch below that finds
+                    # nothing: paying them here on every iteration would add a
+                    # write transaction to a busy pair's steady state, and that
+                    # contends against the very lock every other worker's
+                    # writes need too.
                     self._cur_candidate = None  # coordinating, no candidate in flight
-                    self._heartbeat(branch_key, n_words, None, None,
-                                    None, None, force=True)
-                    self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                     if not self._help_other_branch(branch_key):
-                        # Nothing free or promotable anywhere, so pairing onto
-                        # the dependency is now the best available move rather
-                        # than a shortcut past better work.  Retried from the
-                        # top of this loop every time, so the pair dissolves as
-                        # soon as free work appears.
+                        # Nothing free or promotable anywhere.  Heartbeat (so
+                        # THIS worker, which still holds its own parent claim
+                        # up the stack, isn't itself presumed dead while it
+                        # waits), then free any claim whose holder has died so
+                        # we can re-claim it rather than wait forever — there
+                        # may be no supervisor in the standalone solve path —
+                        # before pairing onto the dependency, the best move
+                        # left.  Retried from the top of this loop every time,
+                        # so the pair dissolves as soon as free work appears.
+                        self._heartbeat(branch_key, n_words, None, None,
+                                        None, None, force=True)
+                        self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                         paired = self._claim_bundle(
                             branch_key, self.n_candidates, words,
                             expected_source_work_id=(

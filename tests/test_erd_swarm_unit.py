@@ -4323,6 +4323,72 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         self.assertEqual(len(taken), 1, "no child branch was created")
         return attempts, taken[0]
 
+    def test_dependency_wait_tries_help_other_branch_before_any_write(self):
+        """The write-heavy liveness backstop (heartbeat force=True, then
+        reclaim_stale_claims) must stay on the RARE path: reached only when
+        _help_other_branch finds nothing, not on every iteration a legitimate
+        pair is simply progressing.  Getting this backwards converts a rare
+        write into a per-iteration one — exactly the regression this pins.
+        """
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+        w = self._worker(small_count=1, count_cap=1)
+
+        calls = []
+        reclaim = w.queue.reclaim_stale_claims
+        help_other_branch = w._help_other_branch
+        claim_bundle = w._claim_bundle
+        create_branch = w.queue.create_branch
+        taken = []
+
+        def create_then_occupy(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        def record_claim(*a, **kw):
+            attempt = claim_bundle(*a, **kw)
+            if kw.get("max_other_workers") == 0 and attempt is None:
+                calls.append("sole_worker_refused")
+            return attempt
+
+        # reclaim_stale_claims has no other legitimate caller anywhere in this
+        # trace, so it is the one unambiguous signal that the write-heavy
+        # fallback ran.  (Ordinary per-candidate heartbeats fire regardless —
+        # evaluating the bundle _help_other_branch finds calls them as part of
+        # normal progress reporting, which is correct and not what this pins.)
+        def record_reclaim(*a, **kw):
+            calls.append("reclaim")
+            return reclaim(*a, **kw)
+
+        def record_help(*a, **kw):
+            calls.append("help")
+            result = help_other_branch(*a, **kw)
+            w._stop_requested = True   # one pass through the wait loop is enough
+            return result
+
+        w._claim_bundle = record_claim
+        w.queue.reclaim_stale_claims = record_reclaim
+        w._help_other_branch = record_help
+
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with w._entered(context):
+            with mock.patch.object(w.queue, "create_branch",
+                                   side_effect=create_then_occupy):
+                w.cooperative_solve(BRANCH[:3], owner["budget"] - 1)
+
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        # The dependency is occupied, so the sole-worker claim is refused —
+        # and a free branch exists, so help finds it on the first call and the
+        # loop stops there, never reaching the write-heavy fallback.
+        self.assertEqual(calls[:2], ["sole_worker_refused", "help"])
+        self.assertNotIn("reclaim", calls)
+
     def test_occupied_dependency_loses_to_a_free_branch(self):
         """A worker blocked on a dependency another worker holds must take free
         work rather than seat itself second.  The hard cap alone would permit
