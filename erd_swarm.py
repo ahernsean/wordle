@@ -240,6 +240,11 @@ logger = logging.getLogger('wordle')
 # the stack grows without bound under sustained blocking (issue #214).  The
 # cap only stops new recursion — it never cancels or abandons the subtree a
 # worker is already inside.
+MAX_WORKERS_PER_BRANCH = 2   # workers sharing a branch race a stale best_erd
+                             # ceiling and explore subtrees a sequential search
+                             # prunes; past the second the marginal worker costs
+                             # more than it returns.  A second worker joins only
+                             # when it has no unoccupied branch to take instead.
 MAX_HELP_RECURSION_DEPTH = 4
 
 # _promote_source_work sentinel: a pending branch was promoted (or found
@@ -1171,12 +1176,12 @@ class _BranchWorker:
         to choose among branches; this is what makes the cap hold when several
         workers pick the same branch before any of them has claimed it.
 
-        Only the paths that CHOOSE a branch pass a cap.  A worker solving a
-        branch it depends on (cooperative_solve, solve_branch_focused) is not
-        choosing and cannot be refused: it has no other work that would unblock
-        it, so capping there trades concentration for a stall.  A freshly
-        promoted branch needs no cap either — promotion is atomic, so nobody
-        else is on it yet.
+        Every path that claims work on an EXISTING branch passes the cap,
+        selection and dependency waits alike: a worker refused entry to a
+        branch it depends on falls into the same wait it already takes when
+        every candidate is claimed, and the branch it is waiting on is being
+        worked either way.  A freshly promoted branch is the exception and
+        needs no cap — promotion is atomic, so nobody else is on it yet.
 
         Every claim path (top-level loop, helping, deep solving, focused)
         funnels through here, so this is where a quiescing supervisor's pause
@@ -1942,9 +1947,11 @@ class _BranchWorker:
         # travels into the claim transaction, which is what decides it when
         # two workers reach the same branch together.
         paired = [b for b in branches
-                  if occupancy.get(bytes(b['branch_key']), 0) == 1]
+                  if occupancy.get(bytes(b['branch_key']), 0)
+                  == MAX_WORKERS_PER_BRANCH - 1]
         for branch, max_other_workers in ([(b, 0) for b in unoccupied]
-                                          + [(b, 1) for b in paired]):
+                                          + [(b, MAX_WORKERS_PER_BRANCH - 1)
+                                             for b in paired]):
             branch = dict(branch)
             other_key = bytes(branch['branch_key'])
             n_candidates = branch['n_candidates']
@@ -2185,7 +2192,8 @@ class _BranchWorker:
                     break                       # finalized as a loss + deleted
                 claim = self._claim_bundle(
                     branch_key, self.n_candidates, words,
-                    expected_source_work_id=self._work_context.source_work_id)
+                    expected_source_work_id=self._work_context.source_work_id,
+                    max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
                 if claim is not None:
                     bundle_id, indices, forced = claim
                     if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
@@ -2198,12 +2206,16 @@ class _BranchWorker:
                         self._await_rival_finalize(branch_key, words, n_words,
                                                    self.n_candidates)
                 else:  # pragma: no cover
-                    # Every candidate is claimed but coverage isn't complete: some
-                    # are held by other workers.  Heartbeat first (so THIS worker,
-                    # which still holds its own parent claim up the stack, isn't
-                    # itself presumed dead while it waits), then free any claim whose
-                    # holder has died so we can re-claim it rather than wait forever
-                    # — there may be no supervisor in the standalone solve path.
+                    # No bundle for this worker: either every candidate is
+                    # claimed, or the branch is already at MAX_WORKERS_PER_BRANCH
+                    # and this worker would be the one too many.  Both are
+                    # waits, not failures — the branch is being worked and this
+                    # worker's dependency will be satisfied by whoever holds it.
+                    # Heartbeat first (so THIS worker, which still holds its own
+                    # parent claim up the stack, isn't itself presumed dead while
+                    # it waits), then free any claim whose holder has died so we
+                    # can re-claim it rather than wait forever — there may be no
+                    # supervisor in the standalone solve path.
                     self._cur_candidate = None  # coordinating, no candidate in flight
                     self._heartbeat(branch_key, n_words, None, None,
                                     None, None, force=True)
@@ -2223,24 +2235,25 @@ class _BranchWorker:
                              occupancy=None, max_other_workers=0):
         """Claim a candidate bundle from an open branch, if one is available.
 
-        occupancy maps branch_key to the count of live workers other than
-        this one (worker_counts_by_branch).  A branch carrying more than
-        max_other_workers of them is passed over: workers sharing a branch
-        evaluate candidates against a stale best_erd ceiling and explore
-        subtrees a sequential search prunes, which costs more than the
-        parallelism returns at production candidate counts.  The default of 0
-        admits only branches nobody is working.  Passing occupancy=None
+        occupancy maps branch_key to the count of workers other than this one
+        holding unfinished claims (claim_holders_by_branch).  A branch
+        carrying more than max_other_workers of them is passed over: workers
+        sharing a branch evaluate candidates against a stale best_erd ceiling
+        and explore subtrees a sequential search prunes, which costs more than
+        the parallelism returns at production candidate counts.  The default
+        of 0 admits only branches nobody is working.  Passing occupancy=None
         disables the filter for callers that have already applied it.
 
-        This filter chooses BETWEEN branches, from heartbeats, which lag: a
-        worker writes one only once it is evaluating.  max_other_workers
-        travels into the claim transaction, which counts live claims instead
-        and so holds the cap when several workers reach the same branch
-        before any of them has claimed it.
+        This filter chooses BETWEEN branches; max_other_workers travels into
+        the claim transaction, which re-counts the same way for the one branch
+        it is claiming and so holds the cap when several workers reach a
+        branch together.
 
-        Both signals key on liveness, never on branch status: a branch whose
-        worker died becomes claimable again, which is how a partly-solved
-        branch resumes.
+        Occupancy is never read from branch status, and never from
+        heartbeats.  A branch whose worker moved on has no unfinished claims
+        and is immediately claimable again, which is how a partly-solved
+        branch resumes; a crashed worker's claims are freed by the queue's
+        own reclaim paths.
 
         The finalize sweep runs for every branch regardless of occupancy, so
         passing a branch over for claiming never leaves it unfinalized.
@@ -2269,8 +2282,8 @@ class _BranchWorker:
         return None
 
     def _branch_occupancy(self):
-        """Live workers per branch, excluding this one, for work selection."""
-        return self.queue.worker_counts_by_branch(exclude_worker_id=self.name)
+        """Workers other than this one holding unfinished claims, per branch."""
+        return self.queue.claim_holders_by_branch(exclude_worker_id=self.name)
 
     def claim_one(self):
         """Return (context, branch, bundle_id, indices, forced) for the next
@@ -2463,13 +2476,13 @@ class _BranchWorker:
                    else SCHEDULING_ROLE_FALLBACK)
             paired = self._claim_active_branch(
                 self.queue.branches_in_progress(source_work['source_work_id']),
-                source_work['source_work_id'], role,
-                occupancy=occupancy, max_other_workers=1)
+                source_work['source_work_id'], role, occupancy=occupancy,
+                max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
             if paired is not None:
                 return paired
         return self._claim_active_branch(
-            self.queue.direct_branches_in_progress(),
-            occupancy=occupancy, max_other_workers=1)
+            self.queue.direct_branches_in_progress(), occupancy=occupancy,
+            max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
 
     # -- main loop ----------------------------------------------------------
 
@@ -2540,7 +2553,8 @@ class _BranchWorker:
                 break
             claim = self._claim_bundle(
                 branch_key, n_candidates, words,
-                expected_source_work_id=self._work_context.source_work_id)
+                expected_source_work_id=self._work_context.source_work_id,
+                max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
             if claim is None:
                 # Every candidate is claimed.  If coverage is complete, finalize
                 # and stop.  Otherwise some claims are held by siblings — there is

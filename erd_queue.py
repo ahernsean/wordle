@@ -3729,54 +3729,52 @@ class ERDQueue:
         return n_branches_resumed, freed
 
     def worker_counts_by_branch(
-        self, timeout_seconds: int = WORKER_LIVENESS_SECONDS,
-        exclude_worker_id: str = None,
+        self, timeout_seconds: int = WORKER_LIVENESS_SECONDS
     ) -> dict:
-        """{branch_key bytes: number of recent workers on it}.
-
-        exclude_worker_id drops one worker from the counts.  A worker choosing
-        its next branch passes its own id: its heartbeat still names the branch
-        it is leaving, which would otherwise read as that branch being occupied
-        by someone else.  A branch every counted worker has left is absent from
-        the result rather than present with a count of zero.
-        """
+        """{branch_key bytes: number of recent workers on it} for status."""
         cutoff = int(time.time()) - timeout_seconds
         rows = self._conn.execute("""
             SELECT b.branch_key AS k, COUNT(*) AS c
             FROM worker_heartbeat h
             JOIN branches b ON b.branch_id = h.current_branch_id
             WHERE h.current_branch_id IS NOT NULL AND h.updated_at > ?
-              AND (? IS NULL OR h.worker_id != ?)
             GROUP BY h.current_branch_id
-        """, (cutoff, exclude_worker_id, exclude_worker_id)).fetchall()
+        """, (cutoff,)).fetchall()
+        return {bytes(r["k"]): r["c"] for r in rows}
+
+    def claim_holders_by_branch(self, exclude_worker_id=None) -> dict:
+        """{branch_key bytes: workers other than exclude_worker_id holding
+        unfinished claims on it}, for work selection.
+
+        Branch occupancy.  An unfinished claim IS a worker on the branch: the
+        row is written by the same transaction that hands out the bundle, so a
+        branch shows as taken the instant it is taken, and the worker's own
+        rows are excluded so it never reads itself as a rival.
+
+        Occupancy needs no liveness test of its own.  A crashed worker's
+        done = 0 rows are freed by reclaim_stale_claims, reclaim_claims_of_
+        worker on a supervised respawn, and recover_active_branches at
+        restart — so a branch nobody is working drains to zero holders and
+        becomes claimable again through the existing path.  A branch with no
+        unfinished claims is absent from the result rather than present with a
+        count of zero.
+        """
+        rows = self._conn.execute("""
+            SELECT branch.branch_key AS k,
+                   COUNT(DISTINCT claim.claimed_by) AS c
+            FROM candidate_claims AS claim
+            JOIN branches AS branch ON branch.branch_id = claim.branch_id
+            WHERE claim.done = 0 AND claim.claimed_by IS NOT ?
+            GROUP BY claim.branch_id
+        """, (exclude_worker_id,)).fetchall()
         return {bytes(r["k"]): r["c"] for r in rows}
 
     def _other_claim_holders(self, branch_id, worker_id):
-        """Workers other than worker_id holding unfinished claims on a branch.
-
-        Occupancy for work selection.  A claim row is written in the same
-        transaction that hands out the work, so this is current the instant a
-        worker takes a bundle — unlike a heartbeat, which a worker writes only
-        after it is already evaluating and which therefore reads as "branch
-        free" during the window every worker would pile in.
-
-        Workers whose heartbeat has aged out do not count: their claims are
-        freed at restart, and until then a crashed worker must not reserve a
-        branch nobody can enter.  A worker with no heartbeat row at all has
-        just started and does count.
-        """
+        """claim_holders_by_branch for one branch, inside a claim transaction."""
         return self._conn.execute("""
-            SELECT COUNT(*) FROM (
-                SELECT DISTINCT claim.claimed_by
-                FROM candidate_claims AS claim
-                LEFT JOIN worker_heartbeat AS beat
-                       ON beat.worker_id = claim.claimed_by
-                WHERE claim.branch_id = ? AND claim.done = 0
-                  AND claim.claimed_by IS NOT ?
-                  AND (beat.worker_id IS NULL OR beat.updated_at > ?)
-            )
-        """, (branch_id, worker_id,
-              int(time.time()) - WORKER_LIVENESS_SECONDS)).fetchone()[0]
+            SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims
+            WHERE branch_id = ? AND done = 0 AND claimed_by IS NOT ?
+        """, (branch_id, worker_id)).fetchone()[0]
 
     def _branch_worker_count(self, branch_id, worker_id, now):
         """Count live workers assigned to a branch, including the recorder."""

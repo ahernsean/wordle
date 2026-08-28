@@ -3875,14 +3875,14 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         sc.close()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestOneWorkerPerBranch(unittest.TestCase):
     """Work selection takes one worker to a branch: an unoccupied branch is
     always preferred, a branch with one worker is joined only as a last
-    resort, and a branch nobody is on any longer is claimable again."""
+    resort, and a branch nobody holds a claim on is claimable again.
+
+    Occupancy throughout is unfinished candidate claims, which is what the
+    scheduler reads.  Heartbeats are reporting state and decide nothing here.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -3914,7 +3914,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
 
     def _queue_source(self, words_per_branch, source_word="crane", priority=0):
         """Queue one opener's branches as a single request, so every branch
-        shares the source work the way a real opener's response groups do."""
+        shares the source work the way an opener's response groups do."""
         keys = [ScoreCache.encode_subset(w) for w in words_per_branch]
         self.queue.add_pending_many([
             (key, len(words), priority, source_word, 0)
@@ -3938,10 +3938,18 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         return bytes(claimed["branch_key"]), claimed["source_work_id"]
 
     def _occupy(self, branch_key, worker_id):
-        """Put a live worker on a branch through the heartbeat path selection
-        reads, which is where occupancy actually lives."""
-        self.queue.heartbeat(worker_id, 4242, branch_key, len(BRANCH),
-                             int(time.time()), 0)
+        """Put a worker on a branch the way production does: an unfinished
+        candidate claim, written by the same transaction that hands out the
+        bundle.  That row IS the occupancy the scheduler reads."""
+        w = self._worker(worker_id, small_count=1, count_cap=1)
+        owner = self.queue.owner_row_for_branch(branch_key)
+        claim = w._claim_bundle(
+            branch_key, owner["n_candidates"], decode_subset(branch_key),
+            expected_source_work_id=owner["source_work_id"],
+            expected_source_priority=owner["owner_priority"])
+        self.assertIsNotNone(claim, "fixture worker took no claim to hold")
+        _bundle_id, indices, _forced = claim
+        return w, list(indices)
 
     def _claimed_key(self, work):
         self.assertIsNotNone(work)
@@ -3953,53 +3961,115 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         self._queue_source([BRANCH, BRANCH[:3]])
         busy_key, _ = self._promote()
         free_key, _ = self._promote()
-        self._occupy(busy_key, "worker-9")
+        self._occupy(busy_key, 9)
 
         self.assertEqual(self._claimed_key(self._worker().claim_one()),
                          free_key)
 
-    def test_own_stale_heartbeat_does_not_make_a_branch_look_occupied(self):
-        """A worker's heartbeat still names the branch it is leaving.  Counting
-        it would let a worker lock itself out of its own branch."""
-        # Two free branches, the worker's own sorting first (more answer
-        # words at equal priority).  Counting its own heartbeat would push it
-        # off its branch onto the other one instead of leaving it in place.
+    def test_selection_skips_an_occupied_branch_without_attempting_a_claim(self):
+        """The two occupancy checks divide differently than they look.
+
+        The claim transaction is what ENFORCES the cap — disable this filter
+        and an occupied branch is still refused, just one write transaction
+        later.  What the filter buys is that cost: a worker choosing among
+        branches does not open a BEGIN IMMEDIATE against each occupied one
+        before finding free work.  So the thing to assert is the attempt, not
+        the outcome.
+        """
+        self._queue_source([BRANCH, BRANCH[:3]])
+        busy_key, _ = self._promote()
+        free_key, _ = self._promote()
+        self._occupy(busy_key, 9)
+        w = self._worker()
+        attempted = []
+        claim_bundle = w._claim_bundle
+
+        def spy(branch_key, *args, **kwargs):
+            attempted.append(bytes(branch_key))
+            return claim_bundle(branch_key, *args, **kwargs)
+
+        w._claim_bundle = spy
+
+        self.assertEqual(self._claimed_key(w.claim_one()), free_key)
+        self.assertNotIn(busy_key, attempted)
+        self.assertIn(free_key, attempted)
+
+    def test_a_workers_own_claims_do_not_make_a_branch_look_occupied(self):
+        """A worker part-way through a branch must keep claiming from it.
+        Counting its own unfinished claims would push it off its own branch."""
+        # Two free branches, the worker's own sorting first (more answer words
+        # at equal priority), so a wrong answer is visible as a move.
         self._queue_source([BRANCH, BRANCH[:3]])
         own_key, _ = self._promote()
         other_key, _ = self._promote()
         self.assertNotEqual(own_key, other_key)
-        w = self._worker()
-        self._occupy(own_key, w.name)
+        w, _ = self._occupy(own_key, 0)
 
         self.assertEqual(self._claimed_key(w.claim_one()), own_key)
 
-    def test_branch_left_by_a_dead_worker_is_claimable_again(self):
-        """The filter keys on the liveness window, not on ever-having-been
-        claimed: a branch whose worker died must resume, not starve.  A filter
-        that blocks concurrent occupancy and resumption alike passes every
-        other test here while starving the swarm."""
+    def test_branch_is_claimable_again_once_its_claims_are_released(self):
+        """Occupancy is held by unfinished claims, not by a branch having ever
+        been claimed.  A worker that finished its bundle and moved on leaves
+        the branch immediately claimable — this is how a partly-solved branch
+        resumes, and a filter that blocked it would starve the swarm while
+        passing every other test here."""
         self._queue_source([BRANCH])
         only_key, _ = self._promote()
-        # Two dead workers, so a filter that ignores the liveness window sees
-        # an occupancy of 2 and refuses even the last-resort pairing.  With
-        # one, pairing would rescue the claim and the test would pass whether
-        # or not the window is honoured.
-        for dead in ("worker-8", "worker-9"):
-            self._occupy(only_key, dead)
-        self.queue._conn.execute(
-            "UPDATE worker_heartbeat SET updated_at = ?",
-            (int(time.time()) - erd_queue.WORKER_LIVENESS_SECONDS - 60,))
-        self.queue._conn.commit()
+        holder, _ = self._occupy(only_key, 8)
+        self._occupy(only_key, 9)
+        # Two holders: at the cap, so nothing else may enter.
+        self.assertIsNone(self._worker(3).claim_one())
 
-        self.assertEqual(self._claimed_key(self._worker().claim_one()),
+        self.queue.reclaim_claims_of_worker(holder.name)
+
+        self.assertEqual(self._claimed_key(self._worker(3).claim_one()),
                          only_key)
+
+    def test_finished_claims_do_not_reserve_a_branch(self):
+        """Only UNFINISHED claims are occupancy.  Counting completed ones
+        would make every branch anyone ever worked look permanently taken."""
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        _holder, indices = self._occupy(only_key, 8)
+        self.assertEqual(self.queue.claim_holders_by_branch()[only_key], 1)
+
+        for idx in indices:
+            self.queue.complete_candidate(only_key, idx)
+
+        self.assertNotIn(only_key, self.queue.claim_holders_by_branch())
+
+    def test_reclaiming_a_crashed_workers_claims_frees_its_branch(self):
+        """Occupancy carries no liveness test of its own — it does not need
+        one.  A crashed worker's unfinished claims are freed by the queue's
+        existing reclaim paths, and the branch's occupancy falls with them.
+
+        This pins the dependency rather than new code: if reclaim stopped
+        freeing claims, branches held by dead workers would never reopen.
+        """
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        self._occupy(only_key, 8)
+        self._occupy(only_key, 9)
+        self.assertEqual(self.queue.claim_holders_by_branch()[only_key], 2)
+
+        # Claims taken an hour ago by workers that have not heartbeat since:
+        # reclaim_stale_claims holds a floor on claim age, so a claim made in
+        # this same second is deliberately not yet eligible.
+        self.queue._conn.execute(
+            "UPDATE candidate_claims SET claimed_at = ? WHERE done = 0",
+            (int(time.time()) - 3600,))
+        self.queue._conn.commit()
+        freed = self.queue.reclaim_stale_claims(heartbeat_timeout_seconds=60)
+
+        self.assertGreater(freed, 0)
+        self.assertNotIn(only_key, self.queue.claim_holders_by_branch())
 
     # -- last-resort pairing ---------------------------------------------
 
     def test_second_worker_joins_when_no_branch_is_free(self):
         self._queue_source([BRANCH])
         only_key, _ = self._promote()
-        self._occupy(only_key, "worker-9")
+        self._occupy(only_key, 9)
 
         self.assertEqual(self._claimed_key(self._worker().claim_one()),
                          only_key)
@@ -4007,22 +4077,39 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     def test_third_worker_never_joins(self):
         self._queue_source([BRANCH])
         only_key, _ = self._promote()
-        self._occupy(only_key, "worker-8")
-        self._occupy(only_key, "worker-9")
+        self._occupy(only_key, 8)
+        self._occupy(only_key, 9)
 
-        self.assertIsNone(self._worker().claim_one())
+        self.assertIsNone(self._worker(3).claim_one())
 
     def test_pairing_loses_to_a_promotable_pending_branch(self):
         """A second worker on a branch is worth a fraction of the same worker
         on a branch of its own, so every other path is tried first."""
         keys = self._queue_source([BRANCH, BRANCH[:3]])
         busy_key, _ = self._promote()
-        self._occupy(busy_key, "worker-9")
+        self._occupy(busy_key, 9)
 
         claimed = self._claimed_key(self._worker().claim_one())
 
         self.assertNotEqual(claimed, busy_key)
         self.assertIn(claimed, keys)
+
+    def test_cap_holds_when_two_workers_select_the_same_branch_together(self):
+        """Selection filters on occupancy read before the claim, so two
+        workers can both see the same branch as free.  The claim transaction
+        re-counts and only one of them gets in."""
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        self._occupy(only_key, 8)
+        third = self._worker(9, small_count=1, count_cap=1)
+        owner = self.queue.owner_row_for_branch(only_key)
+        # A stale reading: the branch looked free when this worker chose it.
+        stale_occupancy = {}
+
+        self.assertIsNone(third._claim_active_branch(
+            self.queue.branches_in_progress(owner["source_work_id"]),
+            owner["source_work_id"], SCHEDULING_ROLE_PREFERRED,
+            occupancy=stale_occupancy, max_other_workers=0))
 
     # -- widening and preemption -----------------------------------------
 
@@ -4031,7 +4118,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         branch of it that is running."""
         self._queue_source([BRANCH, BRANCH[:3]])
         busy_key, source_work_id = self._promote()
-        self._occupy(busy_key, "worker-9")
+        self._occupy(busy_key, 9)
 
         work = self._worker().claim_one()
 
@@ -4105,11 +4192,11 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         # one another worker holds, and one still pending.  The occupied
         # branch must not count as covering the source — if it does, the
         # promote loop is skipped and the worker joins it instead of opening
-        # the pending one, which is the whole failure being fixed.
+        # the pending one, which is the failure being fixed.
         self._queue_source([BRANCH, BRANCH[:3], BRANCH[:4]])
         own_key, source_work_id = self._promote()
         busy_key, _ = self._promote()
-        self._occupy(busy_key, "worker-9")
+        self._occupy(busy_key, 9)
         self.assertEqual(
             len(self.queue.branches_in_progress(source_work_id)), 2)
 
@@ -4120,52 +4207,6 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         self.assertEqual(len(open_after), 3)
         self.assertEqual({b["source_work_id"] for b in open_after},
                          {source_work_id})
-
-    # -- the cap holds without heartbeats --------------------------------
-
-    def _hold_a_claim(self, worker_id, branch_key, max_other_workers=1):
-        """Take a bundle and keep it, the way a worker mid-evaluation does:
-        live done=0 claims, no heartbeat written yet."""
-        w = self._worker(worker_id, small_count=1, count_cap=1)
-        owner = self.queue.owner_row_for_branch(branch_key)
-        claim = w._claim_bundle(
-            branch_key, owner["n_candidates"], decode_subset(branch_key),
-            expected_source_work_id=owner["source_work_id"],
-            expected_source_priority=owner["owner_priority"],
-            max_other_workers=max_other_workers)
-        self.assertIsNotNone(claim)
-        return w
-
-    def test_cap_holds_against_workers_that_have_not_heartbeat_yet(self):
-        """A worker writes its heartbeat only once it is already evaluating,
-        so at startup every worker reads the branch as free.  The claim
-        transaction is what decides occupancy: it counts live claims, which
-        it is itself about to create."""
-        self._queue_source([BRANCH])
-        only_key, _ = self._promote()
-        self._hold_a_claim(1, only_key)
-        self._hold_a_claim(2, only_key)
-        self.assertEqual(
-            self.queue._conn.execute(
-                "SELECT COUNT(*) FROM worker_heartbeat").fetchone()[0], 0)
-
-        self.assertIsNone(self._worker(3).claim_one())
-
-    def test_claims_of_a_dead_worker_do_not_reserve_a_branch(self):
-        """A crashed worker's claims survive until restart.  Counting them as
-        occupancy would leave a branch nobody may enter."""
-        self._queue_source([BRANCH])
-        only_key, _ = self._promote()
-        self._hold_a_claim(1, only_key)
-        self._hold_a_claim(2, only_key)
-        for dead in ("worker-1", "worker-2"):
-            self._occupy(only_key, dead)
-        self.queue._conn.execute(
-            "UPDATE worker_heartbeat SET updated_at = ?",
-            (int(time.time()) - erd_queue.WORKER_LIVENESS_SECONDS - 60,))
-        self.queue._conn.commit()
-
-        self.assertIsNotNone(self._worker(3).claim_one())
 
     # -- branches with no source ownership --------------------------------
 
@@ -4180,8 +4221,8 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     def test_unowned_branch_is_claimed_when_no_source_can_supply_work(self):
         self._queue_source([BRANCH])
         owned_key, _ = self._promote()
-        self._occupy(owned_key, "worker-8")
-        self._occupy(owned_key, "worker-9")
+        self._occupy(owned_key, 8)
+        self._occupy(owned_key, 9)
         direct_key = self._direct_branch(BRANCH[:3])
         w = self._worker()
         # A worker that has already seen source work does not re-check the
@@ -4192,7 +4233,11 @@ class TestOneWorkerPerBranch(unittest.TestCase):
 
     def test_unowned_branch_can_be_paired_as_a_last_resort(self):
         direct_key = self._direct_branch(BRANCH)
-        self._occupy(direct_key, "worker-9")
+        self._occupy(direct_key, 9)
 
         self.assertEqual(self._claimed_key(self._worker().claim_one()),
                          direct_key)
+
+
+if __name__ == "__main__":
+    unittest.main()
