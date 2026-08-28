@@ -1855,6 +1855,15 @@ class ViewParserTest(unittest.TestCase):
                 self.assertEqual(args.report_kind, report_kind)
                 self.assertEqual(args.worker, worker_id)
 
+    def test_accuracy_offset_is_forwarded_to_the_report_request(self):
+        with (
+            patch("sys.argv", ["erd_search.py", "view", "--accuracy",
+                              "--limit", "5", "--accuracy-offset", "10"]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        self.assertEqual(run_view.call_args.args[0].accuracy_offset, 10)
+
     def test_incompatible_report_options_and_invalid_branch_filters_are_rejected(self):
         invalid_arguments = [
             ["erd_search.py", "view", "--cache", "--tree"],
