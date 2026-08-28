@@ -3040,7 +3040,7 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
 def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> dict:
     """Collect the candidate-work calibration corpus without changing it."""
     generated_at = int(time.time())
-    data = {"epoch": request.epoch, "row_count": 0,
+    data = {"epoch": request.epoch, "requested_sample_size": 0,
             "erd_pruned_row_count": 0, "non_erd_pruned_row_count": 0,
             "no_prediction_row_count": 0, "sampled_row_count": 0,
             "population_row_count": None,

@@ -1911,11 +1911,13 @@ def _render_accuracy_sections(report, width):
         _fit(f"Candidate-level accuracy  epoch={data.get('epoch')}", width),
         _fit(f"  population "
              f"{('not counted' if data.get('population_row_count') is None else format(data['population_row_count'], ','))}; "
-             f"random sample {data.get('row_count', 0):,}; ERD-pruned "
+             f"random sample {data.get('sampled_row_count', 0):,}/"
+             f"{data.get('requested_sample_size', 0):,} requested; ERD-pruned "
              f"{data.get('erd_pruned_row_count', 0):,}; non-ERD-pruned "
              f"{data.get('non_erd_pruned_row_count', 0):,}", width),
         _fit(f"  no prediction {data.get('no_prediction_row_count', 0):,}; "
-             f"calibration sample {data.get('sampled_row_count', 0):,}", width),
+             f"non-pruned calibration rows {calibration.get('row_count', 0):,}",
+             width),
         _fit("  actual/predicted ratio " + " ".join(
             f"{name}={value:.2f}" for name, value in ratio.items()
             if value is not None), width),
