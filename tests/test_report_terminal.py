@@ -740,6 +740,26 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("sample-size=50000", output)
         self.assertIn("truncated=true", output)
 
+    def test_accuracy_render_distinguishes_requested_and_achieved_samples(self):
+        report = overview_report()
+        report.update({"report_kind": "accuracy", "tree": False})
+        report["data"] = {
+            "epoch": 4, "population_row_count": None,
+            "requested_sample_size": 50_000, "sampled_row_count": 2,
+            "erd_pruned_row_count": 1, "non_erd_pruned_row_count": 1,
+            "no_prediction_row_count": 1,
+            "calibration": {"row_count": 1,
+                            "actual_predicted_ratio": {
+                                "p1": 0.1, "p10": 0.2, "p50": 1.0,
+                                "p90": 5.0, "p99": 10.0}},
+            "largest_under_predicted": [], "rows": [],
+        }
+        output = render_report(report, width=120)
+        self.assertIn("population not counted", output)
+        self.assertIn("random sample 2/50,000 requested", output)
+        self.assertIn("non-pruned calibration rows 1", output)
+        self.assertIn("p1=0.10", output)
+
 
 class CandidateSweepBarTest(unittest.TestCase):
     def test_block_heights_scale_with_cell_completion(self):

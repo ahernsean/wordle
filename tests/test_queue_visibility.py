@@ -82,7 +82,7 @@ class QueueVisibilityTests(unittest.TestCase):
             source_word="salet", candidate_word="trace", idx=9)
         report = self.q.report_candidate_accuracy(
             epoch=0, source_word="salet", limit=1)
-        self.assertEqual(report["row_count"], 3)
+        self.assertEqual(report["requested_sample_size"], 50_000)
         self.assertEqual(report["erd_pruned_row_count"], 1)
         self.assertEqual(report["non_erd_pruned_row_count"], 2)
         self.assertEqual(report["no_prediction_row_count"], 2)
@@ -112,7 +112,7 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(filtered["rows"][0]["candidate_word"], "crane")
         self.assertEqual(filtered["raw_row_offset"], 1)
         empty = self.q.report_candidate_accuracy(epoch=0, source_word="none")
-        self.assertEqual(empty["row_count"], 0)
+        self.assertEqual(empty["sampled_row_count"], 0)
         self.assertIsNone(
             empty["calibration"]["actual_predicted_ratio"]["p99"])
 
@@ -123,9 +123,10 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q._conn.execute(
             "UPDATE telemetry.candidate_accuracy SET recorded_at = 100")
         self.assertEqual(
-            self.q.report_candidate_accuracy(epoch=0, since=101)["row_count"], 0)
+            self.q.report_candidate_accuracy(
+                epoch=0, since=101)["sampled_row_count"], 0)
         report = self.q.report_candidate_accuracy(epoch=0, since=100)
-        self.assertEqual(report["row_count"], 1)
+        self.assertEqual(report["sampled_row_count"], 1)
         self.assertEqual(report["population_row_count"], 1)
 
     def test_candidate_republish_count_defaults_to_zero_and_reads_a_republish(self):

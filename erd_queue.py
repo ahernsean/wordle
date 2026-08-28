@@ -6127,11 +6127,12 @@ class ERDQueue:
     def _accuracy_percentiles(values):
         values = sorted(values)
         if not values:
-            return {"p50": None, "p90": None, "p99": None}
+            return {f"p{percentile}": None
+                    for percentile in (1, 10, 50, 90, 99)}
         return {
             f"p{percentile}": values[min(
                 len(values) - 1, int(percentile / 100 * len(values)))]
-            for percentile in (50, 90, 99)
+            for percentile in (1, 10, 50, 90, 99)
         }
 
     def report_candidate_accuracy(self, epoch=None, budget=None,
@@ -6143,7 +6144,10 @@ class ERDQueue:
 
         Candidate telemetry is one row per claim.  Sampling random ids across
         an epoch avoids both a full aggregate and treating a few recent minutes
-        from one opener as representative of a multi-day epoch.
+        from one opener as representative of a multi-day epoch.  The seed is
+        derived from the epoch and requested size, so a report is reproducible;
+        a different requested size is an independent sample.  Requested and
+        achieved counts make a selective-filter shortfall explicit.
         """
         epoch = self.epoch if epoch is None else epoch
         where, parameters = ["epoch = ?"], [epoch]
@@ -6171,7 +6175,8 @@ class ERDQueue:
         if minimum_id is not None:
             # Candidate-accuracy ids are append-only and dense.  Batched point
             # lookups keep the random sample bounded by the epoch/id index.
-            sample_ids = random.Random(epoch).sample(
+            random_generator = random.Random(f"{epoch}:{sample_size}")
+            sample_ids = random_generator.sample(
                 range(minimum_id, maximum_id + 1),
                 min(sample_size, maximum_id - minimum_id + 1))
             for start in range(0, len(sample_ids), 500):
@@ -6221,7 +6226,8 @@ class ERDQueue:
                 "SELECT COUNT(*) FROM telemetry.candidate_accuracy"
                 + sampling_condition, sampling_parameters).fetchone()[0]
         return {
-            "epoch": epoch, "row_count": len(sampled_rows),
+            "epoch": epoch,
+            "requested_sample_size": sample_size,
             "sampled_row_count": len(sampled_rows),
             "population_row_count": population_row_count,
             "erd_pruned_row_count": sum(
