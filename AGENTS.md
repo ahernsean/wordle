@@ -96,17 +96,28 @@ Work selection therefore takes an unoccupied branch first, promotes one of the
 current opener's pending branches next, and only pairs a second worker onto an
 occupied branch when nothing anywhere is free. Never a third.
 
-**Occupancy is decided in two places, and both are needed.** The heartbeat map
-(`worker_counts_by_branch`) chooses *between* branches, but heartbeats lag: a
-worker writes one only once it is already evaluating, so at startup every worker
-reads every branch as free. `claim_next_bundle` therefore re-checks inside its
-`BEGIN IMMEDIATE` transaction, counting distinct workers holding `done = 0`
-`candidate_claims` — rows that transaction is itself about to write. Selection
-filters; the transaction decides.
+**Occupancy is unfinished claims, never heartbeats.** A `done = 0`
+`candidate_claims` row *is* a worker on that branch: it is written by the same
+transaction that hands out the bundle, so a branch reads as taken the instant it
+is taken. Heartbeats are reporting state — they lag by design (a worker writes
+one only once it is already evaluating), so at startup every worker would read
+every branch as free. `worker_counts_by_branch` is for `status` and the reports;
+`claim_holders_by_branch` is for scheduling.
 
-Both signals key on the liveness window, never on branch status. A branch whose
-worker died must become claimable again — sequential hand-off over a branch's
-life is normal, and only *concurrent* occupancy is capped.
+**The cap is enforced in the claim transaction; the filter is an optimization.**
+`claim_next_bundle` re-counts holders inside its `BEGIN IMMEDIATE`, which is what
+makes the cap hold when several workers pick the same branch before any has
+claimed it. Filtering the candidate list first changes no outcome — it saves
+opening a write transaction against each occupied branch. Do not remove the
+transaction check on the grounds that selection already filtered.
+
+**Occupancy needs no liveness test of its own.** A crashed worker's `done = 0`
+rows are freed by `reclaim_stale_claims`, by `reclaim_claims_of_worker` on a
+supervised respawn, and by `recover_active_branches` at restart — so a branch
+nobody is working drains to zero holders through paths that already exist. A
+worker that simply finished its bundle leaves no unfinished claims at all, which
+is how a partly-solved branch resumes: sequential hand-off over a branch's life
+is normal, and only *concurrent* occupancy is capped.
 
 ### Completed work has two records, and they can disagree
 
