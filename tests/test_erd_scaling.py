@@ -710,6 +710,25 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             "regression, so the timed legs below prove nothing about it")
 
     def test_workers_scale_when_solving_dominates_coordination(self):
+        """Correctness-gating, ratio-informational: see issue #296.
+
+        The speedup ratio below is published and logged but no longer
+        asserted.  Across PR #295, on an unchanged, deterministic fixture
+        (tests/trap_workloads.py has no randomness), this single-sample
+        wall-clock measurement swung from 1.72x to as low as 0.40x and back to
+        1.69x purely from GitHub-hosted runner variance: 4 workers fill every
+        advertised vCPU, leaving nothing for the supervisor, SQLite, and
+        coverage instrumentation, on a runner with no CPU isolation. A noisy
+        gate here drove several speculative production changes chasing a
+        number that was never the regression it looked like — see #296 for
+        the redesign (repeated/interleaved legs, an isolated runner, a
+        confidence-based comparison, and telemetry that explains a red result
+        instead of just reporting one).
+
+        What still gates: both legs must fully drain, and every branch must
+        resolve to a correct result in both — a real correctness assertion,
+        unaffected by runner timing.
+        """
         n = min(4, os.cpu_count() or 1)
         if n < 2:
             self.skipTest("needs >=2 CPUs for a speedup measurement")
@@ -765,12 +784,10 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             self.assertEqual(unresolved, [],
                              f"{len(unresolved)} branches never resolved "
                              f"in the {tag} leg")
-        self.assertGreaterEqual(
-            speedup, min_speedup,
-            f"{n} workers achieved only {speedup:.2f}x over 1 worker "
-            f"({tN:.3f}s vs {t1:.3f}s); expected >= {min_speedup:.2f}x on a "
-            f"solve-dominated workload — coordination is eating the "
-            f"parallelism")
+        # Informational only — see the docstring and issue #296.  Do not add
+        # an assertion on `speedup` here without redesigning the measurement
+        # first; the single-sample wall-clock ratio is not currently a
+        # reliable release gate on GitHub-hosted runners.
 
 
 if __name__ == "__main__":
