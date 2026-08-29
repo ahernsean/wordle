@@ -247,15 +247,6 @@ MAX_WORKERS_PER_BRANCH = 2   # workers sharing a branch race a stale best_erd
                              # when it has no unoccupied branch to take instead.
 MAX_HELP_RECURSION_DEPTH = 4
 
-# A dependency wait re-checks for free/promotable work via _help_other_branch,
-# which is several read queries (source_work_candidates, one branches_in_
-# progress per source, branch occupancy) — cheap once, expensive at the poll
-# cadence of a tight wait loop with many simultaneously-waiting workers.
-# Throttled to the same cadence as heartbeats: frequent enough that a pair
-# dissolves for free work within a couple of seconds of it appearing (Codex
-# review, issue #293), far below the timescale a branch takes to solve.
-DEPENDENCY_HELP_RECHECK_SECONDS = HB_SECONDS
-
 # _promote_source_work sentinel: a pending branch was promoted (or found
 # already solved and marked done) but no bundle is claimable from it right
 # now — distinct from None, which means the source has no pending branch
@@ -623,7 +614,6 @@ class _BranchWorker:
         self.n_pruned = 0    # infeasible within budget (depth floor hit)
         self.n_useless = 0
         self._last_hb = 0.0
-        self._last_dependency_help_scan = 0.0
         self._last_checkpoint = time.time()
         self._checkpoint_interval = CHECKPOINT_SECONDS * random.uniform(
             1 - CHECKPOINT_JITTER, 1 + CHECKPOINT_JITTER)
@@ -2235,35 +2225,34 @@ class _BranchWorker:
                     time.sleep(0.05)
                 else:
                     # No bundle: every candidate is claimed, or another worker
-                    # holds the branch.  The sole-worker claim above fails on
-                    # every iteration a legitimate pair is simply progressing,
-                    # which makes this the COMMON case, not the rare one — so
-                    # the full free/promotable scan (several read queries) is
-                    # throttled to DEPENDENCY_HELP_RECHECK_SECONDS rather than
-                    # repeated on every poll: paying it every ~50ms across
-                    # every simultaneously-waiting worker in a deep-recursion
-                    # workload is coordination overhead in its own right, the
-                    # same shape of cost as the heartbeat/reclaim writes this
-                    # branch used to pay unconditionally (see the commit that
-                    # moved those to the empty-scan case below).
+                    # holds the branch.  Try free or promotable work first —
+                    # reads, and what gives free work priority over pairing on
+                    # every iteration as it should.  The sole-worker claim
+                    # above fails on every iteration a legitimate pair is
+                    # simply progressing, which makes this the COMMON case, not
+                    # the rare one, so heartbeat and stale-claim reclaim (both
+                    # writes) are reserved for the branch below that finds
+                    # nothing: paying them here on every iteration would add a
+                    # write transaction to a busy pair's steady state, and that
+                    # contends against the very lock every other worker's
+                    # writes need too.
                     self._cur_candidate = None  # coordinating, no candidate in flight
-                    now = time.time()
-                    if now - self._last_dependency_help_scan >= (
-                            DEPENDENCY_HELP_RECHECK_SECONDS):
-                        self._last_dependency_help_scan = now
-                        found_elsewhere = self._help_other_branch(branch_key)
-                    else:
-                        found_elsewhere = False
-                    if not found_elsewhere:
-                        # Recently scanned and found nothing (or too soon to
-                        # scan again): pair onto the dependency, the best move
-                        # available right now.  Heartbeat (so THIS worker,
-                        # which still holds its own parent claim up the stack,
-                        # isn't itself presumed dead while it waits) and free
-                        # any claim whose holder has died — there may be no
-                        # supervisor in the standalone solve path — only when
-                        # the pair claim itself is refused (branch already at
-                        # cap): the rare, genuinely-stuck case, not every poll.
+                    if not self._help_other_branch(branch_key):
+                        # A completed scan found nothing free or promotable
+                        # anywhere (the recursion cap is ruled out by the
+                        # branch above, so this really is an empty scan, not a
+                        # refusal to look).  Heartbeat (so THIS worker, which
+                        # still holds its own parent claim up the stack, isn't
+                        # itself presumed dead while it waits), then free any
+                        # claim whose holder has died so we can re-claim it
+                        # rather than wait forever — there may be no
+                        # supervisor in the standalone solve path — before
+                        # pairing onto the dependency, the best move left.
+                        # Retried from the top of this loop every time, so the
+                        # pair dissolves as soon as free work appears.
+                        self._heartbeat(branch_key, n_words, None, None,
+                                        None, None, force=True)
+                        self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                         paired = self._claim_bundle(
                             branch_key, self.n_candidates, words,
                             expected_source_work_id=(
@@ -2273,9 +2262,6 @@ class _BranchWorker:
                             self._evaluate_dependency_bundle(
                                 branch_key, words, n_words, paired, budget)
                         else:
-                            self._heartbeat(branch_key, n_words, None, None,
-                                            None, None, force=True)
-                            self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                             time.sleep(0.05)    # let claims land
 
             if self.cancel():  # pragma: no cover

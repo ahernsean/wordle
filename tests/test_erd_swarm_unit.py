@@ -4489,67 +4489,6 @@ class TestOneWorkerPerBranch(unittest.TestCase):
                          "paired onto a recursion-capped dependency while a "
                          "branch was free")
 
-    def test_dependency_help_scan_is_throttled_across_iterations(self):
-        """The free/promotable scan (source_work_candidates + a
-        branches_in_progress per source + branch_occupancy — several read
-        queries) must not repeat on every iteration of a tight wait loop:
-        that is coordination overhead in its own right, multiplied by every
-        simultaneously-waiting worker.  Within the throttle window, a second
-        refused sole-worker claim goes straight to the pair attempt."""
-        self._queue_source([BRANCH])
-        parent_key, _ = self._promote()
-        w = self._worker(small_count=1, count_cap=1)
-
-        create_branch = w.queue.create_branch
-        taken = []
-
-        def create_then_occupy(branch_key, *args, **kwargs):
-            result = create_branch(branch_key, *args, **kwargs)
-            if not taken:
-                taken.append(bytes(branch_key))
-                self._occupy(bytes(branch_key), 9)
-            return result
-
-        help_calls = []
-        help_other_branch = w._help_other_branch
-        claim_bundle = w._claim_bundle
-        sole_worker_refusals = []
-
-        def record_help(*a, **kw):
-            help_calls.append(1)
-            return help_other_branch(*a, **kw)
-
-        def record_claim(*a, **kw):
-            result = claim_bundle(*a, **kw)
-            if kw.get("max_other_workers") == 0 and result is None:
-                sole_worker_refusals.append(1)
-                if len(sole_worker_refusals) >= 2:
-                    # Two full iterations of the wait loop is enough to prove
-                    # the scan did not repeat; stop before a third.
-                    w._stop_requested = True
-            return result
-
-        w._help_other_branch = record_help
-        w._claim_bundle = record_claim
-        owner = self.queue.owner_row_for_branch(parent_key)
-        context = erd_swarm.WorkContext.from_branch_row(
-            dict(owner), SCHEDULING_ROLE_PREFERRED)
-        with w._entered(context):
-            with mock.patch.object(w.queue, "create_branch",
-                                   side_effect=create_then_occupy):
-                w.cooperative_solve(BRANCH[:3], owner["budget"] - 1)
-
-        self.assertEqual(len(taken), 1, "no child branch was created")
-        self.assertGreaterEqual(len(sole_worker_refusals), 2,
-                                "did not observe two wait-loop iterations")
-        self.assertEqual(len(help_calls), 1,
-                         "the free/promotable scan repeated within the "
-                         "throttle window instead of being reused")
-        # And the pair still forms on the throttled iteration, since nothing
-        # else is claimable — the throttle skips the SCAN, not the pairing.
-        self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]),
-                         MAX_WORKERS_PER_BRANCH)
-
     # -- branches with no source ownership --------------------------------
 
     def _direct_branch(self, words):
