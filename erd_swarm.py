@@ -2214,6 +2214,15 @@ class _BranchWorker:
                                                self.n_candidates):
                         self._await_rival_finalize(branch_key, words, n_words,
                                                    self.n_candidates)
+                elif self._help_recursion_depth >= MAX_HELP_RECURSION_DEPTH:
+                    # _help_other_branch would refuse to scan at all here (see
+                    # its own docstring): False from it below would mean
+                    # "didn't look", not "looked and found nothing", so it is
+                    # not license to pair.  Poll instead, exactly as
+                    # _help_other_branch's capped-depth contract already
+                    # promises its callers.
+                    self._cur_candidate = None
+                    time.sleep(0.05)
                 else:
                     # No bundle: every candidate is claimed, or another worker
                     # holds the branch.  Try free or promotable work first —
@@ -2229,15 +2238,18 @@ class _BranchWorker:
                     # writes need too.
                     self._cur_candidate = None  # coordinating, no candidate in flight
                     if not self._help_other_branch(branch_key):
-                        # Nothing free or promotable anywhere.  Heartbeat (so
-                        # THIS worker, which still holds its own parent claim
-                        # up the stack, isn't itself presumed dead while it
-                        # waits), then free any claim whose holder has died so
-                        # we can re-claim it rather than wait forever — there
-                        # may be no supervisor in the standalone solve path —
-                        # before pairing onto the dependency, the best move
-                        # left.  Retried from the top of this loop every time,
-                        # so the pair dissolves as soon as free work appears.
+                        # A completed scan found nothing free or promotable
+                        # anywhere (the recursion cap is ruled out by the
+                        # branch above, so this really is an empty scan, not a
+                        # refusal to look).  Heartbeat (so THIS worker, which
+                        # still holds its own parent claim up the stack, isn't
+                        # itself presumed dead while it waits), then free any
+                        # claim whose holder has died so we can re-claim it
+                        # rather than wait forever — there may be no
+                        # supervisor in the standalone solve path — before
+                        # pairing onto the dependency, the best move left.
+                        # Retried from the top of this loop every time, so the
+                        # pair dissolves as soon as free work appears.
                         self._heartbeat(branch_key, n_words, None, None,
                                         None, None, force=True)
                         self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)

@@ -4439,6 +4439,56 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         child_attempts = [a for a in attempts if a["branch_key"] == child_key]
         self.assertEqual(child_attempts[0]["max_other_workers"], 0)
 
+    def test_recursion_capped_help_does_not_authorize_pairing(self):
+        """_help_other_branch returns False for two different reasons: it
+        scanned everything and found nothing, or it refused to scan at all
+        because _help_recursion_depth is already at MAX_HELP_RECURSION_DEPTH
+        — its own docstring says the caller should poll at that depth, not
+        treat it as a completed empty scan.  Conflating the two lets a worker
+        pair onto an occupied dependency while a free branch sits untouched,
+        reached whenever the worker happens to already be deep in nested help
+        calls (issue #214's blocked-worker chains)."""
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+        w = self._worker(small_count=1, count_cap=1)
+        w._help_recursion_depth = erd_swarm.MAX_HELP_RECURSION_DEPTH
+
+        create_branch = w.queue.create_branch
+        taken = []
+
+        def create_then_occupy(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        claim_bundle = w._claim_bundle
+
+        def stop_after_one_wait_pass(*a, **kw):
+            result = claim_bundle(*a, **kw)
+            if kw.get("max_other_workers") == 0 and result is None:
+                # The sole-worker attempt was just refused: whatever this
+                # loop iteration decides next is the thing under test, so one
+                # more pass is enough.
+                w._stop_requested = True
+            return result
+
+        w._claim_bundle = stop_after_one_wait_pass
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with w._entered(context):
+            with mock.patch.object(w.queue, "create_branch",
+                                   side_effect=create_then_occupy):
+                w.cooperative_solve(BRANCH[:3], owner["budget"] - 1)
+
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]), 1,
+                         "paired onto a recursion-capped dependency while a "
+                         "branch was free")
+
     # -- branches with no source ownership --------------------------------
 
     def _direct_branch(self, words):
@@ -4472,3 +4522,54 @@ class TestOneWorkerPerBranch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+if __name__ == "__main__":
+    unittest.main()
+
+    def test_recursion_capped_help_does_not_authorize_pairing(self):
+        """_help_other_branch returns False for two different reasons: it
+        scanned everything and found nothing, or it refused to scan at all
+        because _help_recursion_depth is already at MAX_HELP_RECURSION_DEPTH
+        — its own docstring says the caller should poll at that depth, not
+        treat it as a completed empty scan.  Conflating the two lets a worker
+        pair onto an occupied dependency while a free branch sits untouched,
+        reached only when the worker happens to already be deep in nested
+        help calls (issue #214's blocked-worker chains)."""
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+        w = self._worker(small_count=1, count_cap=1)
+        w._help_recursion_depth = erd_swarm.MAX_HELP_RECURSION_DEPTH
+
+        create_branch = w.queue.create_branch
+        taken = []
+
+        def create_then_occupy(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with w._entered(context):
+            with mock.patch.object(w.queue, "create_branch",
+                                   side_effect=create_then_occupy):
+                w._stop_requested_after = 1  # see below
+                orig_claim_bundle = w._claim_bundle
+                calls = []
+                def stop_after_first_wait_iteration(*a, **kw):
+                    result = orig_claim_bundle(*a, **kw)
+                    calls.append((kw.get("max_other_workers"), result is not None))
+                    if len(calls) >= 3:
+                        w._stop_requested = True
+                    return result
+                w._claim_bundle = stop_after_first_wait_iteration
+                w.cooperative_solve(BRANCH[:3], owner["budget"] - 1)
+
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]), 1,
+                         "paired onto a recursion-capped dependency while a "
+                         "branch was free")
