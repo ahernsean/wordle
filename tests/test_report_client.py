@@ -30,13 +30,18 @@ FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
 # The client's DEFAULT_POLL; a re-render lands on every one of these.
 CLIENT_POLL_MILLIS = 2000
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
-REQUIRE_PLAYWRIGHT_BROWSER = os.environ.get("REQUIRE_PLAYWRIGHT_BROWSER") == "1"
-# The WebKit suite additionally needs a container runtime (podman/docker) and
-# a network pull of the Microsoft Playwright image, so unlike the Chromium
-# suite above it stays off by default even when playwright is installed.
-RUN_WEBKIT_CONTAINER_TESTS = os.environ.get("RUN_WEBKIT_CONTAINER_TESTS") == "1"
-REQUIRE_WEBKIT_CONTAINER_TESTS = (
-    os.environ.get("REQUIRE_WEBKIT_CONTAINER_TESTS") == "1"
+# Both browser suites run by default, and a browser that will not start is a
+# failure rather than a skip.  This client is used overwhelmingly from WebKit
+# (Safari and iOS Chrome), so a run that quietly covered only Chromium would
+# report green while leaving the primary engine untested.
+#
+# The opt-outs exist for an environment that genuinely cannot host a browser —
+# no playwright, or no container runtime for WebKit.  Setting one is a
+# deliberate statement that this run does not cover that engine.
+SKIP_BROWSER_TESTS = os.environ.get("SKIP_BROWSER_TESTS") == "1"
+SKIP_WEBKIT_CONTAINER_TESTS = (
+    SKIP_BROWSER_TESTS
+    or os.environ.get("SKIP_WEBKIT_CONTAINER_TESTS") == "1"
 )
 
 # Longer than the grid choreography, so a report applied before this has elapsed
@@ -196,16 +201,15 @@ def fixture_server():
         thread.join(timeout=2)
 
 
-@unittest.skipIf(
-    sync_playwright is None and not REQUIRE_PLAYWRIGHT_BROWSER,
-    "Playwright is not installed",
-)
+@unittest.skipIf(SKIP_BROWSER_TESTS, "SKIP_BROWSER_TESTS=1")
 class ReportClientBrowserTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if sync_playwright is None:
             raise RuntimeError(
-                "Playwright is required when REQUIRE_PLAYWRIGHT_BROWSER=1"
+                "playwright is not installed (it is in requirements-dev.txt); "
+                "install it, or set SKIP_BROWSER_TESTS=1 to run without any "
+                "browser coverage"
             )
         cls.server_context = fixture_server()
         cls.base_url = cls.server_context.__enter__()
@@ -215,9 +219,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         except Exception as error:
             cls.playwright.stop()
             cls.server_context.__exit__(None, None, None)
-            if REQUIRE_PLAYWRIGHT_BROWSER:
-                raise RuntimeError("Playwright Chromium failed to start") from error
-            raise unittest.SkipTest(f"Chromium is unavailable: {error}")
+            raise RuntimeError("Playwright Chromium failed to start") from error
 
     @classmethod
     def tearDownClass(cls):
@@ -4256,11 +4258,8 @@ class ReportClientBrowserTest(unittest.TestCase):
                     self.assertGreater(os.path.getsize(screenshot), 0)
 
 
-@unittest.skipUnless(
-    RUN_WEBKIT_CONTAINER_TESTS or REQUIRE_WEBKIT_CONTAINER_TESTS,
-    "Set RUN_WEBKIT_CONTAINER_TESTS=1 to exercise WebKit via a container "
-    "(podman or docker required)",
-)
+@unittest.skipIf(SKIP_WEBKIT_CONTAINER_TESTS,
+                 "SKIP_WEBKIT_CONTAINER_TESTS=1")
 class ReportClientWebKitBrowserTest(ReportClientBrowserTest):
     """The Chromium suite's test bodies, replayed against real WebKit.
 
@@ -4273,7 +4272,9 @@ class ReportClientWebKitBrowserTest(ReportClientBrowserTest):
     def setUpClass(cls):
         if sync_playwright is None:
             raise RuntimeError(
-                "Playwright is required when REQUIRE_WEBKIT_CONTAINER_TESTS=1"
+                "playwright is not installed (it is in requirements-dev.txt); "
+                "install it, or set SKIP_WEBKIT_CONTAINER_TESTS=1 to run "
+                "without WebKit coverage"
             )
         cls.server_context = fixture_server()
         cls.base_url = cls.server_context.__enter__()
@@ -4289,9 +4290,13 @@ class ReportClientWebKitBrowserTest(ReportClientBrowserTest):
                 cls.webkit_container.stop()
             cls.playwright.stop()
             cls.server_context.__exit__(None, None, None)
-            if REQUIRE_WEBKIT_CONTAINER_TESTS:
-                raise RuntimeError("WebKit container failed to start") from error
-            raise unittest.SkipTest(f"WebKit container is unavailable: {error}")
+            raise RuntimeError(
+                "WebKit container failed to start.  WebKit cannot run natively "
+                "here, so it needs podman or docker and the "
+                "mcr.microsoft.com/playwright image at the installed "
+                "playwright's version.  Set SKIP_WEBKIT_CONTAINER_TESTS=1 to "
+                "run without WebKit coverage."
+            ) from error
 
     @classmethod
     def tearDownClass(cls):

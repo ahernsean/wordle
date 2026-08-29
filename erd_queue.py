@@ -1508,6 +1508,16 @@ class ERDQueue:
             "CREATE INDEX IF NOT EXISTS idx_candidate_claims_bundle "
             "ON candidate_claims(branch_id, bundle_id)")
 
+        # Branch occupancy (_other_claim_holders) runs inside every claim
+        # transaction and asks only which workers hold UNFINISHED claims.  The
+        # primary key seeks by branch_id but then walks every claim row the
+        # branch has ever had — 3-4 ms on a branch with 8,475 of them, against
+        # a whole claim costing well under 1 ms.  Partial on done = 0 so the
+        # index holds only work in flight, a handful of rows per branch.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidate_claims_open_by_worker "
+            "ON candidate_claims(branch_id, claimed_by) WHERE done = 0")
+
         # candidate_claims.best_first_position: where the claimed candidate
         # sits in the branch's best-first order,
         # which candidate_holes inherits when the row is freed.  After the
@@ -2699,8 +2709,15 @@ class ERDQueue:
                           count_cap=DEFAULT_COUNT_CAP,
                           republish_limit=DEFAULT_REPUBLISH_LIMIT,
                           expected_source_work_id=None,
-                          expected_source_priority=None):
+                          expected_source_priority=None,
+                          max_other_workers=None):
         """Atomically complete one-level ERD prunes and claim survivors.
+
+        max_other_workers caps how many other workers may hold work on this
+        branch at once, enforced here rather than by the caller because only
+        this transaction can decide it: occupancy is counted from live claims,
+        which this call is about to create, so two workers that both saw an
+        empty branch cannot both pass.  None disables the cap.
 
         Runs the exact-elimination classification from
         adaptive_claim_packing.md §5 inside one BEGIN IMMEDIATE transaction:
@@ -2817,6 +2834,11 @@ class ERDQueue:
                     """, (branch_id, expected_source_work_id,
                           expected_source_priority)).fetchone() is not None
             if not owner_matches:
+                self._commit_claim_transaction(_txn_t0)
+                return None
+            if (max_other_workers is not None
+                    and self._other_claim_holders(branch_id, worker_id)
+                        > max_other_workers):
                 self._commit_claim_transaction(_txn_t0)
                 return None
             # The branch ceiling is a bound like any achieved best: candidates
@@ -3719,6 +3741,40 @@ class ERDQueue:
             GROUP BY h.current_branch_id
         """, (cutoff,)).fetchall()
         return {bytes(r["k"]): r["c"] for r in rows}
+
+    def claim_holders_by_branch(self, exclude_worker_id=None) -> dict:
+        """{branch_key bytes: workers other than exclude_worker_id holding
+        unfinished claims on it}, for work selection.
+
+        Branch occupancy.  An unfinished claim IS a worker on the branch: the
+        row is written by the same transaction that hands out the bundle, so a
+        branch shows as taken the instant it is taken, and the worker's own
+        rows are excluded so it never reads itself as a rival.
+
+        Occupancy needs no liveness test of its own.  A crashed worker's
+        done = 0 rows are freed by reclaim_stale_claims, reclaim_claims_of_
+        worker on a supervised respawn, and recover_active_branches at
+        restart — so a branch nobody is working drains to zero holders and
+        becomes claimable again through the existing path.  A branch with no
+        unfinished claims is absent from the result rather than present with a
+        count of zero.
+        """
+        rows = self._conn.execute("""
+            SELECT branch.branch_key AS k,
+                   COUNT(DISTINCT claim.claimed_by) AS c
+            FROM candidate_claims AS claim
+            JOIN branches AS branch ON branch.branch_id = claim.branch_id
+            WHERE claim.done = 0 AND claim.claimed_by IS NOT ?
+            GROUP BY claim.branch_id
+        """, (exclude_worker_id,)).fetchall()
+        return {bytes(r["k"]): r["c"] for r in rows}
+
+    def _other_claim_holders(self, branch_id, worker_id):
+        """claim_holders_by_branch for one branch, inside a claim transaction."""
+        return self._conn.execute("""
+            SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims
+            WHERE branch_id = ? AND done = 0 AND claimed_by IS NOT ?
+        """, (branch_id, worker_id)).fetchone()[0]
 
     def _branch_worker_count(self, branch_id, worker_id, now):
         """Count live workers assigned to a branch, including the recorder."""

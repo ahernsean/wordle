@@ -36,14 +36,20 @@ commands.
 spreads across every one of them.** When a worker blocks on a dependency,
 `_help_other_branch` prefers *starting an opener with no branch open yet* over
 *joining a branch of the opener it is already on*: its first loop skips any
-opener that already holds a joinable open branch and promotes a fresh one. The
-guard that would stop this is a strict `priority < fallback_priority`
+opener that already holds a **joinable** open branch and promotes a fresh one.
+The guard that would stop this is a strict `priority < fallback_priority`
 comparison, and ties are let through deliberately (issue #214 — a worker
 blocked on an opener's only branch must be able to widen that opener). So a
 flat batch of N openers becomes N simultaneously-active openers, one recruited
 per blocking event, each left with a single open branch and the rest of its
 response groups still pending. The signature in `view --queue` is many active
 openers each showing `open=1` with dozens pending behind them.
+
+Joinable means **open and unoccupied**. An opener whose open branches all have
+workers is not covered by the join loop, so it promotes another of its own
+pending branches instead of recruiting a fresh opener — the widening that keeps
+one opener's response groups moving rather than starting the next opener. See
+one worker per branch below.
 
 `queue add` therefore lays openers on a **descending priority ladder**,
 `--priority-step` apart (default 5), which breaks every tie so the guard fires
@@ -69,6 +75,49 @@ every unfinished request on each claim, and `_help_other_branch` additionally
 issues one query per request. Measured on rocky: 0.6 ms per claim at 64
 openers, 157 ms at 15,000. Invisible at today's batch sizes and fatal at the
 scale of a full sweep — see the open issue before queueing thousands.
+
+### One worker per branch
+
+**Two workers on one branch is a loss at production vocabulary, not a gain.**
+They evaluate candidates against a stale `best_erd` ceiling and explore subtrees
+a sequential best-first search prunes. Measured on a 296-word production branch
+at the full candidate list: six workers took 955.4s against 584.9s for one, on
+1.79x the nodes. Spreading the same six one-per-branch drained six real branches
+2.29x faster than ganging them.
+
+The effect is **regime-dependent, and candidate count is the lever** — room to
+run ahead of the ceiling. Below ~3,000 candidates concentration genuinely wins
+(1.82x at 230); above it, it loses (0.79x at 3,062). Production runs at 14,855,
+so a fixture built at test scale will show the opposite sign. That is why
+`TestSingleBranchDoesNotConcentrateWorkers` fixes `_BASE_CANDIDATES` above the
+crossover, and why it asserts structurally rather than on the clock.
+
+Work selection therefore takes an unoccupied branch first, promotes one of the
+current opener's pending branches next, and only pairs a second worker onto an
+occupied branch when nothing anywhere is free. Never a third.
+
+**Occupancy is unfinished claims, never heartbeats.** A `done = 0`
+`candidate_claims` row *is* a worker on that branch: it is written by the same
+transaction that hands out the bundle, so a branch reads as taken the instant it
+is taken. Heartbeats are reporting state — they lag by design (a worker writes
+one only once it is already evaluating), so at startup every worker would read
+every branch as free. `worker_counts_by_branch` is for `status` and the reports;
+`claim_holders_by_branch` is for scheduling.
+
+**The cap is enforced in the claim transaction; the filter is an optimization.**
+`claim_next_bundle` re-counts holders inside its `BEGIN IMMEDIATE`, which is what
+makes the cap hold when several workers pick the same branch before any has
+claimed it. Filtering the candidate list first changes no outcome — it saves
+opening a write transaction against each occupied branch. Do not remove the
+transaction check on the grounds that selection already filtered.
+
+**Occupancy needs no liveness test of its own.** A crashed worker's `done = 0`
+rows are freed by `reclaim_stale_claims`, by `reclaim_claims_of_worker` on a
+supervised respawn, and by `recover_active_branches` at restart — so a branch
+nobody is working drains to zero holders through paths that already exist. A
+worker that simply finished its bundle leaves no unfinished claims at all, which
+is how a partly-solved branch resumes: sequential hand-off over a branch's life
+is normal, and only *concurrent* occupancy is capped.
 
 ### Completed work has two records, and they can disagree
 
@@ -411,14 +460,15 @@ pip install -r requirements.txt       # runtime only (numpy)
   `PLAYWRIGHT_BROWSERS_PATH`. The browser tests launch the default bundled
   revision when present and otherwise fall back to that pre-installed build by
   path (`_launch_chromium`), so any installed playwright version works without
-  matching browser revisions. Without the package the browser tests skip; set
-  `REQUIRE_PLAYWRIGHT_BROWSER=1` to make them hard-fail instead of skipping.
+  matching browser revisions. A browser that will not start is a **failure**,
+  never a skip.
 
-  **On rocky, playwright is installed only under `python3.13`** (in
-  `~/.local/lib/python3.13/site-packages`). The default `python`/`python3` is
-  3.9, which has numpy but **not** playwright — run the suite under it and the
-  browser tests silently skip. Run with `python3.13` to actually exercise
-  `tests/test_report_client.py`.
+  **The suite refuses to run below Python 3.13.** `tests/__init__.py` raises on
+  import, because on rocky playwright is installed only under `python3.13` (in
+  `~/.local/lib/python3.13/site-packages`) while the default `python`/`python3`
+  is 3.9 — which has numpy but not playwright, so the browser suites would skip
+  themselves and a run that never touched the report client would still report
+  OK. Run everything with `python3.13`.
 
   **Codex sandbox note:** Codex's default command sandbox may deny the browser
   fixture server's bind to `127.0.0.1:0` with
@@ -430,11 +480,11 @@ pip install -r requirements.txt       # runtime only (numpy)
   policies.
 
 **Claude Code on the web** starts from a bare image with neither dependency
-installed. `.claude/hooks/session-start.sh` installs them into `python3.13`
-and sets `REQUIRE_PLAYWRIGHT_BROWSER=1`, so the browser tests fail loudly
-there rather than skipping. It no-ops on a local checkout
-(`CLAUDE_CODE_REMOTE`), which keeps whatever environment the developer set
-up.
+installed. `.claude/hooks/session-start.sh` installs them into `python3.13`.
+Browser tests need nothing set to run; the hook only sets
+`SKIP_WEBKIT_CONTAINER_TESTS=1`, and prints that it did, when the image carries
+neither podman nor docker. It no-ops on a local checkout (`CLAUDE_CODE_REMOTE`),
+which keeps whatever environment the developer set up.
 
 The hook runs asynchronously: the session starts immediately and the install
 lands a few seconds later, so a `ModuleNotFoundError` for numpy or playwright
@@ -457,12 +507,17 @@ or a clear, which keep the same container.
   same version, so the tag is derived from the installed version at run time,
   never pinned.
 
-  Off by default locally (it needs podman or docker, plus a network pull of
-  the container image) — set `RUN_WEBKIT_CONTAINER_TESTS=1` to opt in, or
-  `REQUIRE_WEBKIT_CONTAINER_TESTS=1` to hard-fail instead of skipping when the
-  container can't start (used by CI's `webkit` job). Rocky has `podman`, not
-  `docker`; `tests/webkit_container.py` tries `podman` first and falls back to
-  `docker`.
+  **WebKit runs by default, and a container that will not start fails the
+  suite.** This client is used overwhelmingly from WebKit — Safari and iOS
+  Chrome — so a green run that covered only Chromium would leave the primary
+  engine untested. Rocky has `podman` (not `docker`) and the image pulled;
+  `tests/webkit_container.py` tries `podman` first and falls back to `docker`.
+
+  `SKIP_WEBKIT_CONTAINER_TESTS=1` opts out for a machine with no container
+  runtime, and `SKIP_BROWSER_TESTS=1` opts out of both engines. Setting either
+  is a deliberate statement that the run does not cover that engine — reach for
+  them only when the environment genuinely cannot host the browser, never to
+  get a red suite green.
 
 ## Before committing and pushing
 
@@ -500,12 +555,22 @@ GitHub CI enforces total coverage of at least 98%; run its coverage gate
 locally when running the full suite:
 
 ```
-python3.13 -m coverage run -m unittest discover -s tests -t . -p 'test_*.py'
+rm -f .coverage; find . -maxdepth 1 -name '.coverage.*' -delete
+python3.13 -m coverage run --parallel-mode \
+    -m unittest discover -s tests -t . -p 'test_*.py'
+python3.13 -m coverage combine
 python3.13 -m coverage report --fail-under=98
 ```
 
-Use `python3.13`, not the default `python` (3.9): only 3.13 has playwright, so
-under 3.9 the browser contract tests skip rather than run.
+**`--parallel-mode` and `combine` are required, not optional.** Without them
+every process writes the single `.coverage` path, and the scaling tests fork
+workers that inherit the tracer and overwrite the parent's data when they exit.
+Last writer wins, so the total swings run to run — 98.0% and 93.9% from two
+identical runs, the whole difference being `erd_swarm.py`, the module those
+workers execute. CI already does this because it combines across its jobs; only
+the local single-file invocation was exposed. (Clear the data files with `find
+-delete`: under zsh a `.coverage.*` glob that matches nothing aborts the whole
+command, silently skipping the run chained after it.)
 
 Commits with failing tests must not be pushed.
 

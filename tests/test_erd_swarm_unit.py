@@ -26,7 +26,8 @@ from unittest import mock
 import erd_queue
 import erd_swarm
 from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
-                       PROMOTE_MIN_SIZE, decode_subset)
+                       PROMOTE_MIN_SIZE, MAX_WORKERS_PER_BRANCH,
+                       decode_subset)
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
 from erd_queue import guess_depth_from_spine, SCHEDULING_ROLE_PREFERRED
@@ -3875,5 +3876,700 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         sc.close()
 
 
+class TestOneWorkerPerBranch(unittest.TestCase):
+    """Work selection takes one worker to a branch: an unoccupied branch is
+    always preferred, a branch with one worker is joined only as a last
+    resort, and a branch nobody holds a claim on is claimable again.
+
+    Occupancy throughout is unfinished candidate claims, which is what the
+    scheduler reads.  Heartbeats are reporting state and decide nothing here.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+        ScoreCache(self.cache_path, BRANCH).close()
+        self.queue = erd_queue.ERDQueue(self.queue_path)
+        self.addCleanup(self.queue.close)
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def _worker(self, worker_id=0, **kwargs):
+        w = _BranchWorker(worker_id, self.cache_path, self.queue_path, None,
+                          **kwargs)
+        self.addCleanup(w.close)
+        return w
+
+    def _queue_source(self, words_per_branch, source_word="crane", priority=0):
+        """Queue one opener's branches as a single request, so every branch
+        shares the source work the way an opener's response groups do."""
+        keys = [ScoreCache.encode_subset(w) for w in words_per_branch]
+        self.queue.add_pending_many([
+            (key, len(words), priority, source_word, 0)
+            for key, words in zip(keys, words_per_branch)])
+        return keys
+
+    def _promote(self, source_word=None):
+        """Open the next pending branch of a source the way a worker does."""
+        source_work_id = None
+        if source_word is not None:
+            source_work_id = self.queue._conn.execute(
+                "SELECT source_work_id FROM source_work WHERE source_word = ?",
+                (source_word,)).fetchone()[0]
+        claimed = self.queue.claim_next("promoter", source_work_id)
+        self.queue.create_branch(
+            claimed["branch_key"], claimed["n_words"], len(CANDIDATES),
+            budget=ROOT_BUDGET, priority=claimed["priority"],
+            source_word=claimed["source_word"],
+            source_pattern=claimed["source_pattern"],
+            source_work_id=claimed["source_work_id"])
+        return bytes(claimed["branch_key"]), claimed["source_work_id"]
+
+    def _occupy(self, branch_key, worker_id):
+        """Put a worker on a branch the way production does: an unfinished
+        candidate claim, written by the same transaction that hands out the
+        bundle.  That row IS the occupancy the scheduler reads."""
+        w = self._worker(worker_id, small_count=1, count_cap=1)
+        owner = self.queue.owner_row_for_branch(branch_key)
+        claim = w._claim_bundle(
+            branch_key, owner["n_candidates"], decode_subset(branch_key),
+            expected_source_work_id=owner["source_work_id"],
+            expected_source_priority=owner["owner_priority"])
+        self.assertIsNotNone(claim, "fixture worker took no claim to hold")
+        _bundle_id, indices, _forced = claim
+        return w, list(indices)
+
+    def _drain_claims(self, branch_key, worker_id):
+        """Claim every remaining candidate of a branch, leaving it with no
+        bundle for anyone else — a branch that is occupied AND offers nothing
+        to fall back on."""
+        w = self._worker(worker_id, small_count=len(CANDIDATES),
+                         count_cap=len(CANDIDATES))
+        owner = self.queue.owner_row_for_branch(branch_key)
+        while w._claim_bundle(
+                branch_key, owner["n_candidates"], decode_subset(branch_key),
+                expected_source_work_id=owner["source_work_id"],
+                expected_source_priority=owner["owner_priority"]) is not None:
+            pass
+        return w
+
+    def _claimed_key(self, work):
+        self.assertIsNotNone(work)
+        return bytes(work[1]["branch_key"])
+
+    # -- occupancy -------------------------------------------------------
+
+    def test_free_branch_is_preferred_over_an_occupied_one(self):
+        self._queue_source([BRANCH, BRANCH[:3]])
+        busy_key, _ = self._promote()
+        free_key, _ = self._promote()
+        self._occupy(busy_key, 9)
+
+        self.assertEqual(self._claimed_key(self._worker().claim_one()),
+                         free_key)
+
+    def test_selection_skips_an_occupied_branch_without_attempting_a_claim(self):
+        """The two occupancy checks divide differently than they look.
+
+        The claim transaction is what ENFORCES the cap — disable this filter
+        and an occupied branch is still refused, just one write transaction
+        later.  What the filter buys is that cost: a worker choosing among
+        branches does not open a BEGIN IMMEDIATE against each occupied one
+        before finding free work.  So the thing to assert is the attempt, not
+        the outcome.
+        """
+        self._queue_source([BRANCH, BRANCH[:3]])
+        busy_key, _ = self._promote()
+        free_key, _ = self._promote()
+        self._occupy(busy_key, 9)
+        w = self._worker()
+        attempted = []
+        claim_bundle = w._claim_bundle
+
+        def spy(branch_key, *args, **kwargs):
+            attempted.append(bytes(branch_key))
+            return claim_bundle(branch_key, *args, **kwargs)
+
+        w._claim_bundle = spy
+
+        self.assertEqual(self._claimed_key(w.claim_one()), free_key)
+        self.assertNotIn(busy_key, attempted)
+        self.assertIn(free_key, attempted)
+
+    def test_a_workers_own_claims_do_not_make_a_branch_look_occupied(self):
+        """A worker part-way through a branch must keep claiming from it.
+        Counting its own unfinished claims would push it off its own branch."""
+        # Two free branches, the worker's own sorting first (more answer words
+        # at equal priority), so a wrong answer is visible as a move.
+        self._queue_source([BRANCH, BRANCH[:3]])
+        own_key, _ = self._promote()
+        other_key, _ = self._promote()
+        self.assertNotEqual(own_key, other_key)
+        w, _ = self._occupy(own_key, 0)
+
+        self.assertEqual(self._claimed_key(w.claim_one()), own_key)
+
+    def test_branch_is_claimable_again_once_its_claims_are_released(self):
+        """Occupancy is held by unfinished claims, not by a branch having ever
+        been claimed.  A worker that finished its bundle and moved on leaves
+        the branch immediately claimable — this is how a partly-solved branch
+        resumes, and a filter that blocked it would starve the swarm while
+        passing every other test here."""
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        holder, _ = self._occupy(only_key, 8)
+        self._occupy(only_key, 9)
+        # Two holders: at the cap, so nothing else may enter.
+        self.assertIsNone(self._worker(3).claim_one())
+
+        self.queue.reclaim_claims_of_worker(holder.name)
+
+        self.assertEqual(self._claimed_key(self._worker(3).claim_one()),
+                         only_key)
+
+    def test_finished_claims_do_not_reserve_a_branch(self):
+        """Only UNFINISHED claims are occupancy.  Counting completed ones
+        would make every branch anyone ever worked look permanently taken."""
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        _holder, indices = self._occupy(only_key, 8)
+        self.assertEqual(self.queue.claim_holders_by_branch()[only_key], 1)
+
+        for idx in indices:
+            self.queue.complete_candidate(only_key, idx)
+
+        self.assertNotIn(only_key, self.queue.claim_holders_by_branch())
+
+    def test_reclaiming_a_crashed_workers_claims_frees_its_branch(self):
+        """Occupancy carries no liveness test of its own — it does not need
+        one.  A crashed worker's unfinished claims are freed by the queue's
+        existing reclaim paths, and the branch's occupancy falls with them.
+
+        This pins the dependency rather than new code: if reclaim stopped
+        freeing claims, branches held by dead workers would never reopen.
+        """
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        self._occupy(only_key, 8)
+        self._occupy(only_key, 9)
+        self.assertEqual(self.queue.claim_holders_by_branch()[only_key], 2)
+
+        # Claims taken an hour ago by workers that have not heartbeat since:
+        # reclaim_stale_claims holds a floor on claim age, so a claim made in
+        # this same second is deliberately not yet eligible.
+        self.queue._conn.execute(
+            "UPDATE candidate_claims SET claimed_at = ? WHERE done = 0",
+            (int(time.time()) - 3600,))
+        self.queue._conn.commit()
+        freed = self.queue.reclaim_stale_claims(heartbeat_timeout_seconds=60)
+
+        self.assertGreater(freed, 0)
+        self.assertNotIn(only_key, self.queue.claim_holders_by_branch())
+
+    # -- last-resort pairing ---------------------------------------------
+
+    def test_second_worker_joins_when_no_branch_is_free(self):
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        self._occupy(only_key, 9)
+
+        self.assertEqual(self._claimed_key(self._worker().claim_one()),
+                         only_key)
+
+    def test_third_worker_never_joins(self):
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        self._occupy(only_key, 8)
+        self._occupy(only_key, 9)
+
+        self.assertIsNone(self._worker(3).claim_one())
+
+    def test_pairing_loses_to_a_promotable_pending_branch(self):
+        """A second worker on a branch is worth a fraction of the same worker
+        on a branch of its own, so every other path is tried first."""
+        keys = self._queue_source([BRANCH, BRANCH[:3]])
+        busy_key, _ = self._promote()
+        self._occupy(busy_key, 9)
+
+        claimed = self._claimed_key(self._worker().claim_one())
+
+        self.assertNotEqual(claimed, busy_key)
+        self.assertIn(claimed, keys)
+
+    def test_cap_holds_when_two_workers_select_the_same_branch_together(self):
+        """Selection filters on occupancy read before the claim, so two
+        workers can both see the same branch as free.  The claim transaction
+        re-counts and only one of them gets in."""
+        self._queue_source([BRANCH])
+        only_key, _ = self._promote()
+        self._occupy(only_key, 8)
+        third = self._worker(9, small_count=1, count_cap=1)
+        owner = self.queue.owner_row_for_branch(only_key)
+        # A stale reading: the branch looked free when this worker chose it.
+        stale_occupancy = {}
+
+        self.assertIsNone(third._claim_active_branch(
+            self.queue.branches_in_progress(owner["source_work_id"]),
+            owner["source_work_id"], SCHEDULING_ROLE_PREFERRED,
+            occupancy=stale_occupancy, max_other_workers=0))
+
+    # -- widening and preemption -----------------------------------------
+
+    def test_occupied_source_promotes_another_of_its_own_pending_branches(self):
+        """Widen the opener already in flight rather than stacking onto the
+        branch of it that is running."""
+        self._queue_source([BRANCH, BRANCH[:3]])
+        busy_key, source_work_id = self._promote()
+        self._occupy(busy_key, 9)
+
+        work = self._worker().claim_one()
+
+        self.assertNotEqual(self._claimed_key(work), busy_key)
+        self.assertEqual(work[1]["source_work_id"], source_work_id)
+
+    def test_worker_takes_a_higher_priority_source_at_the_next_claim(self):
+        """Preemption needs no cancellation: selection reruns at every claim
+        boundary and source_work_candidates() is ordered by requested
+        priority, so newly-queued higher-priority work wins the next claim."""
+        self._queue_source([BRANCH[:3]], source_word="slate", priority=10)
+        low_key, _ = self._promote()
+        w = self._worker()
+        self.assertEqual(self._claimed_key(w.claim_one()), low_key)
+
+        high_keys = self._queue_source([BRANCH[:4]], source_word="crane",
+                                       priority=500)
+
+        self.assertEqual(self._claimed_key(w.claim_one()), high_keys[0])
+
+    def test_branch_left_for_higher_priority_work_keeps_its_progress(self):
+        """A worker that moves to higher-priority work abandons nothing: the
+        branch stays open with its completed claims and its discovered
+        best_erd, so whoever resumes it continues rather than restarting."""
+        self._queue_source([BRANCH[:3]], source_word="slate", priority=10)
+        low_key, _ = self._promote()
+        # One candidate per bundle, so the move happens mid-branch.
+        w = self._worker(small_count=1, count_cap=1)
+        work = w.claim_one()
+        self.assertEqual(self._claimed_key(work), low_key)
+        with w._entered(erd_swarm.WorkContext.from_branch_row(
+                work[1], SCHEDULING_ROLE_PREFERRED)):
+            w.evaluate_bundle(low_key, decode_subset(low_key),
+                              work[1]["n_words"], work[2], work[3], work[4],
+                              budget=ROOT_BUDGET)
+        done_claims = self.queue.branch_done_candidates(low_key)
+        self.assertGreater(done_claims, 0)
+        before = self.queue.owner_row_for_branch(low_key)
+        self.assertIsNotNone(before["best_erd"])
+
+        high_keys = self._queue_source([BRANCH[:4]], source_word="crane",
+                                       priority=500)
+        self.assertEqual(self._claimed_key(w.claim_one()), high_keys[0])
+
+        after = self.queue.owner_row_for_branch(low_key)
+        self.assertEqual(after["status"], "open")
+        self.assertEqual(after["best_erd"], before["best_erd"])
+        self.assertEqual(self.queue.branch_done_candidates(low_key),
+                         done_claims)
+
+    def test_higher_priority_pending_only_source_still_starts(self):
+        """Issue #214: a source with no active branch must still be able to
+        start while other sources hold active ones."""
+        self._queue_source([BRANCH], source_word="slate", priority=10)
+        self._promote()
+        high_keys = self._queue_source([BRANCH[:4]], source_word="crane",
+                                       priority=500)
+
+        self.assertEqual(self._claimed_key(self._worker().claim_one()),
+                         high_keys[0])
+
+    # -- widening from a blocked worker ----------------------------------
+
+    def test_blocked_worker_widens_a_source_whose_branches_are_all_worked(self):
+        """_help_other_branch treats a source as covered only when it has an
+        unoccupied branch.  A source whose open branches all have workers
+        still needs its pending branches promoted to absorb another worker,
+        which is what leaves an opener running one response group at a time
+        with the rest waiting."""
+        # Three branches under one source: the one this worker is blocked on,
+        # one another worker holds, and one still pending.  The occupied
+        # branch must not count as covering the source — if it does, the
+        # promote loop is skipped and the worker joins it instead of opening
+        # the pending one, which is the failure being fixed.
+        self._queue_source([BRANCH, BRANCH[:3], BRANCH[:4]])
+        own_key, source_work_id = self._promote()
+        busy_key, _ = self._promote()
+        self._occupy(busy_key, 9)
+        self.assertEqual(
+            len(self.queue.branches_in_progress(source_work_id)), 2)
+
+        w = self._worker(small_count=1, count_cap=1)
+        self.assertTrue(w._help_other_branch(own_key))
+
+        open_after = self.queue.branches_in_progress(source_work_id)
+        self.assertEqual(len(open_after), 3)
+        self.assertEqual({b["source_work_id"] for b in open_after},
+                         {source_work_id})
+
+    def test_promoter_beaten_to_its_own_branch_does_not_join_it(self):
+        """create_branch commits before the promoter claims, so between the two
+        the branch is visible and unoccupied to every other worker.  Creating a
+        branch is therefore no exemption from the cap: by the time the promoter
+        claims, someone may already be on it, and claiming anyway would seat a
+        second worker on a branch while this one still had a free sibling to
+        open instead.
+
+        Deterministic rather than threaded: the interleaving is forced by
+        claiming from another worker inside create_branch, at exactly the point
+        the real race occurs.
+        """
+        keys = self._queue_source([BRANCH, BRANCH[:3]])
+        w = self._worker(small_count=1, count_cap=1)
+        create_branch = self.queue.create_branch
+        stolen = []
+
+        def create_then_let_a_rival_in(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not stolen:                     # only the first promotion
+                stolen.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        with mock.patch.object(w.queue, "create_branch",
+                               side_effect=create_then_let_a_rival_in):
+            work = w.claim_one()
+
+        self.assertEqual(len(stolen), 1)
+        holders = self.queue.claim_holders_by_branch()
+        self.assertEqual(holders.get(stolen[0]), 1,
+                         "promoter took a second seat on the branch it created")
+        for branch_key, count in holders.items():
+            self.assertLessEqual(count, 1, f"{branch_key!r} has {count} holders")
+        if work is not None:
+            claimed = self._claimed_key(work)
+            self.assertNotEqual(claimed, stolen[0])
+            self.assertIn(claimed, keys)
+
+    # -- dependency waits obey the same last-resort rule ------------------
+
+    def _wait_on_an_occupied_dependency(self, worker, parent_key, child_words):
+        """Drive cooperative_solve until its wait path decides, with the child
+        branch taken by another worker the instant it is created.
+
+        Shaped the way production reaches this loop: the worker is inside its
+        parent branch's context and asks the engine to solve a sub-branch, so
+        the child is created here rather than pre-built.  A rival claims it in
+        the window between create_branch committing and the solver's own claim
+        — the same window the promoter race lives in.
+
+        Returns the claim attempts made.  What is asserted is the decision
+        (which branch, at which cap, granted or not), not work completed:
+        stopping the worker cancels an in-flight evaluation, so a granted claim
+        can legitimately leave nothing done behind it.
+        """
+        attempts = []
+        claim_bundle = worker._claim_bundle
+        help_other_branch = worker._help_other_branch
+        create_branch = worker.queue.create_branch
+        taken = []
+
+        def create_then_let_a_rival_in(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        def record(branch_key, *args, **kwargs):
+            result = claim_bundle(branch_key, *args, **kwargs)
+            attempts.append({
+                "branch_key": bytes(branch_key),
+                "max_other_workers": kwargs.get("max_other_workers"),
+                "granted": result is not None,
+            })
+            if kwargs.get("max_other_workers") == MAX_WORKERS_PER_BRANCH - 1:
+                worker._stop_requested = True    # the pairing decision is made
+            return result
+
+        def help_then_stop_if_it_worked(*args, **kwargs):
+            did_work = help_other_branch(*args, **kwargs)
+            if did_work:
+                worker._stop_requested = True    # it chose other work
+            return did_work
+
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with worker._entered(context):
+            with mock.patch.object(worker.queue, "create_branch",
+                                   side_effect=create_then_let_a_rival_in):
+                worker._claim_bundle = record
+                worker._help_other_branch = help_then_stop_if_it_worked
+                # budget + guess_depth = GAME_GUESSES, so a child of this
+                # branch sits one below it.
+                worker.cooperative_solve(child_words, owner["budget"] - 1)
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        return attempts, taken[0]
+
+    def test_dependency_wait_tries_help_other_branch_before_any_write(self):
+        """The write-heavy liveness backstop (heartbeat force=True, then
+        reclaim_stale_claims) must stay on the RARE path: reached only when
+        _help_other_branch finds nothing, not on every iteration a legitimate
+        pair is simply progressing.  Getting this backwards converts a rare
+        write into a per-iteration one — exactly the regression this pins.
+        """
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+        w = self._worker(small_count=1, count_cap=1)
+
+        calls = []
+        reclaim = w.queue.reclaim_stale_claims
+        help_other_branch = w._help_other_branch
+        claim_bundle = w._claim_bundle
+        create_branch = w.queue.create_branch
+        taken = []
+
+        def create_then_occupy(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        def record_claim(*a, **kw):
+            attempt = claim_bundle(*a, **kw)
+            if kw.get("max_other_workers") == 0 and attempt is None:
+                calls.append("sole_worker_refused")
+            return attempt
+
+        # reclaim_stale_claims has no other legitimate caller anywhere in this
+        # trace, so it is the one unambiguous signal that the write-heavy
+        # fallback ran.  (Ordinary per-candidate heartbeats fire regardless —
+        # evaluating the bundle _help_other_branch finds calls them as part of
+        # normal progress reporting, which is correct and not what this pins.)
+        def record_reclaim(*a, **kw):
+            calls.append("reclaim")
+            return reclaim(*a, **kw)
+
+        def record_help(*a, **kw):
+            calls.append("help")
+            result = help_other_branch(*a, **kw)
+            w._stop_requested = True   # one pass through the wait loop is enough
+            return result
+
+        w._claim_bundle = record_claim
+        w.queue.reclaim_stale_claims = record_reclaim
+        w._help_other_branch = record_help
+
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with w._entered(context):
+            with mock.patch.object(w.queue, "create_branch",
+                                   side_effect=create_then_occupy):
+                w.cooperative_solve(BRANCH[:3], owner["budget"] - 1)
+
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        # The dependency is occupied, so the sole-worker claim is refused —
+        # and a free branch exists, so help finds it on the first call and the
+        # loop stops there, never reaching the write-heavy fallback.
+        self.assertEqual(calls[:2], ["sole_worker_refused", "help"])
+        self.assertNotIn("reclaim", calls)
+
+    def test_occupied_dependency_loses_to_a_free_branch(self):
+        """A worker blocked on a dependency another worker holds must take free
+        work rather than seat itself second.  The hard cap alone would permit
+        the pair; the last-resort rule is what forbids it while anything else
+        is claimable."""
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+
+        w = self._worker(small_count=1, count_cap=1)
+        attempts, child_key = self._wait_on_an_occupied_dependency(
+            w, parent_key, BRANCH[:3])
+
+        paired = [a for a in attempts
+                  if a["branch_key"] == child_key
+                  and a["max_other_workers"] == MAX_WORKERS_PER_BRANCH - 1]
+        self.assertEqual(paired, [],
+                         "asked to pair onto the dependency while a branch "
+                         "was free")
+        self.assertEqual(self.queue.claim_holders_by_branch().get(child_key), 1)
+        # The rival holds its claim unfinished throughout, so any completed
+        # candidate on the child could only be this worker's.
+        self.assertEqual(self.queue.branch_done_candidates(child_key), 0,
+                         "worked the occupied dependency anyway")
+        self.assertIsNotNone(self.queue.owner_row_for_branch(free_key))
+
+    def test_dependency_pair_forms_when_nothing_else_is_claimable(self):
+        """The rule is last resort, not never: with no other branch to take,
+        a second worker on the dependency beats idling."""
+        self._queue_source([BRANCH])
+        parent_key, _ = self._promote()
+        # Every candidate of the parent is claimed, so it offers no bundle to
+        # fall back on — occupying it alone would leave a pairing slot open and
+        # the worker would take that instead of ever reaching the child.
+        self._drain_claims(parent_key, 8)
+
+        w = self._worker(small_count=1, count_cap=1)
+        attempts, child_key = self._wait_on_an_occupied_dependency(
+            w, parent_key, BRANCH[:3])
+
+        granted_pair = [a for a in attempts
+                        if a["branch_key"] == child_key
+                        and a["max_other_workers"] == MAX_WORKERS_PER_BRANCH - 1
+                        and a["granted"]]
+        self.assertEqual(len(granted_pair), 1,
+                         "no free work anywhere, yet no pair formed")
+        # And it was tried as the sole worker first, never straight to a pair.
+        child_attempts = [a for a in attempts if a["branch_key"] == child_key]
+        self.assertEqual(child_attempts[0]["max_other_workers"], 0)
+
+    def test_recursion_capped_help_does_not_authorize_pairing(self):
+        """_help_other_branch returns False for two different reasons: it
+        scanned everything and found nothing, or it refused to scan at all
+        because _help_recursion_depth is already at MAX_HELP_RECURSION_DEPTH
+        — its own docstring says the caller should poll at that depth, not
+        treat it as a completed empty scan.  Conflating the two lets a worker
+        pair onto an occupied dependency while a free branch sits untouched,
+        reached whenever the worker happens to already be deep in nested help
+        calls (issue #214's blocked-worker chains)."""
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+        w = self._worker(small_count=1, count_cap=1)
+        w._help_recursion_depth = erd_swarm.MAX_HELP_RECURSION_DEPTH
+
+        create_branch = w.queue.create_branch
+        taken = []
+
+        def create_then_occupy(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        claim_bundle = w._claim_bundle
+
+        def stop_after_one_wait_pass(*a, **kw):
+            result = claim_bundle(*a, **kw)
+            if kw.get("max_other_workers") == 0 and result is None:
+                # The sole-worker attempt was just refused: whatever this
+                # loop iteration decides next is the thing under test, so one
+                # more pass is enough.
+                w._stop_requested = True
+            return result
+
+        w._claim_bundle = stop_after_one_wait_pass
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with w._entered(context):
+            with mock.patch.object(w.queue, "create_branch",
+                                   side_effect=create_then_occupy):
+                w.cooperative_solve(BRANCH[:3], owner["budget"] - 1)
+
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]), 1,
+                         "paired onto a recursion-capped dependency while a "
+                         "branch was free")
+
+    # -- branches with no source ownership --------------------------------
+
+    def _direct_branch(self, words):
+        """A branch with no source-work owner, as a queue upgraded while work
+        was in flight leaves behind."""
+        branch_key = ScoreCache.encode_subset(words)
+        self.queue.create_branch(branch_key, len(words), len(CANDIDATES),
+                                 budget=ROOT_BUDGET)
+        return branch_key
+
+    def test_unowned_branch_is_claimed_when_no_source_can_supply_work(self):
+        self._queue_source([BRANCH])
+        owned_key, _ = self._promote()
+        self._occupy(owned_key, 8)
+        self._occupy(owned_key, 9)
+        direct_key = self._direct_branch(BRANCH[:3])
+        w = self._worker()
+        # A worker that has already seen source work does not re-check the
+        # unowned branches until every source has been tried.
+        w._source_work_enabled = True
+
+        self.assertEqual(self._claimed_key(w.claim_one()), direct_key)
+
+    def test_unowned_branch_can_be_paired_as_a_last_resort(self):
+        direct_key = self._direct_branch(BRANCH)
+        self._occupy(direct_key, 9)
+
+        self.assertEqual(self._claimed_key(self._worker().claim_one()),
+                         direct_key)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+if __name__ == "__main__":
+    unittest.main()
+
+    def test_recursion_capped_help_does_not_authorize_pairing(self):
+        """_help_other_branch returns False for two different reasons: it
+        scanned everything and found nothing, or it refused to scan at all
+        because _help_recursion_depth is already at MAX_HELP_RECURSION_DEPTH
+        — its own docstring says the caller should poll at that depth, not
+        treat it as a completed empty scan.  Conflating the two lets a worker
+        pair onto an occupied dependency while a free branch sits untouched,
+        reached only when the worker happens to already be deep in nested
+        help calls (issue #214's blocked-worker chains)."""
+        self._queue_source([BRANCH, BRANCH[:4]])
+        parent_key, _ = self._promote()
+        free_key, _ = self._promote()
+        w = self._worker(small_count=1, count_cap=1)
+        w._help_recursion_depth = erd_swarm.MAX_HELP_RECURSION_DEPTH
+
+        create_branch = w.queue.create_branch
+        taken = []
+
+        def create_then_occupy(branch_key, *args, **kwargs):
+            result = create_branch(branch_key, *args, **kwargs)
+            if not taken:
+                taken.append(bytes(branch_key))
+                self._occupy(bytes(branch_key), 9)
+            return result
+
+        owner = self.queue.owner_row_for_branch(parent_key)
+        context = erd_swarm.WorkContext.from_branch_row(
+            dict(owner), SCHEDULING_ROLE_PREFERRED)
+        with w._entered(context):
+            with mock.patch.object(w.queue, "create_branch",
+                                   side_effect=create_then_occupy):
+                w._stop_requested_after = 1  # see below
+                orig_claim_bundle = w._claim_bundle
+                calls = []
+                def stop_after_first_wait_iteration(*a, **kw):
+                    result = orig_claim_bundle(*a, **kw)
+                    calls.append((kw.get("max_other_workers"), result is not None))
+                    if len(calls) >= 3:
+                        w._stop_requested = True
+                    return result
+                w._claim_bundle = stop_after_first_wait_iteration
+                w.cooperative_solve(BRANCH[:3], owner["budget"] - 1)
+
+        self.assertEqual(len(taken), 1, "no child branch was created")
+        self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]), 1,
+                         "paired onto a recursion-capped dependency while a "
+                         "branch was free")

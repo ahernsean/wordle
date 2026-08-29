@@ -240,6 +240,11 @@ logger = logging.getLogger('wordle')
 # the stack grows without bound under sustained blocking (issue #214).  The
 # cap only stops new recursion — it never cancels or abandons the subtree a
 # worker is already inside.
+MAX_WORKERS_PER_BRANCH = 2   # workers sharing a branch race a stale best_erd
+                             # ceiling and explore subtrees a sequential search
+                             # prunes; past the second the marginal worker costs
+                             # more than it returns.  A second worker joins only
+                             # when it has no unoccupied branch to take instead.
 MAX_HELP_RECURSION_DEPTH = 4
 
 # _promote_source_work sentinel: a pending branch was promoted (or found
@@ -1160,10 +1165,23 @@ class _BranchWorker:
 
     def _claim_bundle(self, branch_key, n_candidates, words,
                       expected_source_work_id=None,
-                      expected_source_priority=None):
+                      expected_source_priority=None,
+                      max_other_workers=None):
         """claim_next_bundle for `branch_key`, supplying this worker's
         (cached) packing stats.  Returns (bundle_id, indices, forced) or None
         — see ERDQueue.claim_next_bundle.
+
+        max_other_workers caps concurrent occupancy of the branch, checked
+        inside the claim transaction.  Selection filters on occupancy first,
+        to choose among branches; this is what makes the cap hold when several
+        workers pick the same branch before any of them has claimed it.
+
+        Every path that claims work passes a cap — selection, dependency waits
+        and promotion alike.  A worker refused entry to a branch it depends on
+        falls into the same wait it already takes when every candidate is
+        claimed, and the branch it is waiting on is being worked either way.
+        Promotion is not exempt: create_branch commits before the promoter
+        claims, so another worker can take the new branch in between.
 
         Every claim path (top-level loop, helping, deep solving, focused)
         funnels through here, so this is where a quiescing supervisor's pause
@@ -1180,7 +1198,8 @@ class _BranchWorker:
                 small_count=self.small_count, count_cap=self.count_cap,
                 republish_limit=self.republish_limit,
                 expected_source_work_id=expected_source_work_id,
-                expected_source_priority=expected_source_priority)
+                expected_source_priority=expected_source_priority,
+                max_other_workers=max_other_workers)
             if result is not CLAIM_RETRY:
                 return result
         return None
@@ -1833,6 +1852,12 @@ class _BranchWorker:
         done (a bundle evaluated, or a branch promoted/finalized without one
         being available yet), False if there was nothing to claim.
 
+        Work is taken one worker to a branch: an unoccupied branch first, and
+        a branch holding exactly one worker only when nothing is free.  A
+        source counts as covered by the join loop below only if it has an
+        unoccupied branch, so a source whose open branches are all worked
+        still promotes its pending ones and gains breadth.
+
         Without the promotion below, a source word with only pending
         branches can never start while any other source has active branches
         to help with, regardless of its requested priority: this method
@@ -1871,14 +1896,23 @@ class _BranchWorker:
         fallback_priority = self._work_context.source_priority
         if branches and branches[0]['owner_priority'] > fallback_priority:
             fallback_priority = branches[0]['owner_priority']
-        # Sources with a branch surviving the exclude-filter above are
-        # joinable by the loop below; excluding exclude_branch_key here (not
-        # just above) matters when a source's ONLY active branch is the one
-        # this call was invoked to wait out — the join loop cannot touch
+        occupancy = self._branch_occupancy()
+        unoccupied = [b for b in branches
+                      if occupancy.get(bytes(b['branch_key']), 0) == 0]
+        # Sources with an unoccupied branch surviving the exclude-filter above
+        # are joinable by the loop below; excluding exclude_branch_key here
+        # (not just above) matters when a source's ONLY active branch is the
+        # one this call was invoked to wait out — the join loop cannot touch
         # that branch, so re-querying branches_in_progress(source_work_id)
         # directly (unfiltered) would wrongly count it as "covered below"
         # and block the source from ever widening past that single branch.
-        joinable_source_ids = {b['source_work_id'] for b in branches}
+        #
+        # Occupied branches do not count as covering their source either: a
+        # source whose open branches all have workers still needs its pending
+        # branches promoted to absorb another worker, and treating it as
+        # covered is what leaves an opener running one branch at a time with
+        # dozens of response groups still waiting.
+        joinable_source_ids = {b['source_work_id'] for b in unoccupied}
 
         for source_work in source_rows:
             source_work_id = source_work['source_work_id']
@@ -1908,7 +1942,16 @@ class _BranchWorker:
             self._maybe_checkpoint()
             return True
 
-        for branch in branches:
+        # Unoccupied branches first; a branch with one worker on it is joined
+        # only when nothing is free, and never a third worker deep.  The cap
+        # travels into the claim transaction, which is what decides it when
+        # two workers reach the same branch together.
+        paired = [b for b in branches
+                  if occupancy.get(bytes(b['branch_key']), 0)
+                  == MAX_WORKERS_PER_BRANCH - 1]
+        for branch, max_other_workers in ([(b, 0) for b in unoccupied]
+                                          + [(b, MAX_WORKERS_PER_BRANCH - 1)
+                                             for b in paired]):
             branch = dict(branch)
             other_key = bytes(branch['branch_key'])
             n_candidates = branch['n_candidates']
@@ -1918,7 +1961,8 @@ class _BranchWorker:
             claim = self._claim_bundle(
                 other_key, n_candidates, words,
                 expected_source_work_id=source_work_id,
-                expected_source_priority=branch['owner_priority'])
+                expected_source_priority=branch['owner_priority'],
+                max_other_workers=max_other_workers)
             if claim is None:
                 continue
             bundle_id, indices, forced = claim
@@ -1942,6 +1986,15 @@ class _BranchWorker:
             self._maybe_checkpoint()
             return True
         return False
+
+    def _evaluate_dependency_bundle(self, branch_key, words, n_words, claim,
+                                    budget):
+        """Evaluate one claimed bundle of a branch this worker is waiting on."""
+        bundle_id, indices, forced = claim
+        if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
+                                indices, forced, budget=budget):
+            self.maybe_finalize(branch_key, words, self.n_candidates)
+        self._maybe_checkpoint()                # drain WAL during deep solving
 
     def _subbranch_solver(self, words, budget, ceiling=float('inf')):
         """Engine hook: decide whether to solve a sub-branch cooperatively.
@@ -2146,33 +2199,70 @@ class _BranchWorker:
                     if cut is not None:
                         return cut
                     break                       # finalized as a loss + deleted
+                # Sole worker only: a dependency someone else already holds is
+                # being worked, and this worker is worth far more opening a
+                # branch of its own than sitting second on this one.
                 claim = self._claim_bundle(
                     branch_key, self.n_candidates, words,
-                    expected_source_work_id=self._work_context.source_work_id)
+                    expected_source_work_id=self._work_context.source_work_id,
+                    max_other_workers=0)
                 if claim is not None:
-                    bundle_id, indices, forced = claim
-                    if self.evaluate_bundle(branch_key, words, n_words, bundle_id,
-                                            indices, forced, budget=budget):
-                        self.maybe_finalize(branch_key, words, self.n_candidates)
-                    self._maybe_checkpoint()    # drain WAL during deep solving
+                    self._evaluate_dependency_bundle(
+                        branch_key, words, n_words, claim, budget)
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
                     if not self.maybe_finalize(branch_key, words,
                                                self.n_candidates):
                         self._await_rival_finalize(branch_key, words, n_words,
                                                    self.n_candidates)
-                else:  # pragma: no cover
-                    # Every candidate is claimed but coverage isn't complete: some
-                    # are held by other workers.  Heartbeat first (so THIS worker,
-                    # which still holds its own parent claim up the stack, isn't
-                    # itself presumed dead while it waits), then free any claim whose
-                    # holder has died so we can re-claim it rather than wait forever
-                    # — there may be no supervisor in the standalone solve path.
+                elif self._help_recursion_depth >= MAX_HELP_RECURSION_DEPTH:
+                    # _help_other_branch would refuse to scan at all here (see
+                    # its own docstring): False from it below would mean
+                    # "didn't look", not "looked and found nothing", so it is
+                    # not license to pair.  Poll instead, exactly as
+                    # _help_other_branch's capped-depth contract already
+                    # promises its callers.
+                    self._cur_candidate = None
+                    time.sleep(0.05)
+                else:
+                    # No bundle: every candidate is claimed, or another worker
+                    # holds the branch.  Try free or promotable work first —
+                    # reads, and what gives free work priority over pairing on
+                    # every iteration as it should.  The sole-worker claim
+                    # above fails on every iteration a legitimate pair is
+                    # simply progressing, which makes this the COMMON case, not
+                    # the rare one, so heartbeat and stale-claim reclaim (both
+                    # writes) are reserved for the branch below that finds
+                    # nothing: paying them here on every iteration would add a
+                    # write transaction to a busy pair's steady state, and that
+                    # contends against the very lock every other worker's
+                    # writes need too.
                     self._cur_candidate = None  # coordinating, no candidate in flight
-                    self._heartbeat(branch_key, n_words, None, None,
-                                    None, None, force=True)
-                    self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                     if not self._help_other_branch(branch_key):
-                        time.sleep(0.05)        # nothing to claim anywhere; let claims land
+                        # A completed scan found nothing free or promotable
+                        # anywhere (the recursion cap is ruled out by the
+                        # branch above, so this really is an empty scan, not a
+                        # refusal to look).  Heartbeat (so THIS worker, which
+                        # still holds its own parent claim up the stack, isn't
+                        # itself presumed dead while it waits), then free any
+                        # claim whose holder has died so we can re-claim it
+                        # rather than wait forever — there may be no
+                        # supervisor in the standalone solve path — before
+                        # pairing onto the dependency, the best move left.
+                        # Retried from the top of this loop every time, so the
+                        # pair dissolves as soon as free work appears.
+                        self._heartbeat(branch_key, n_words, None, None,
+                                        None, None, force=True)
+                        self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
+                        paired = self._claim_bundle(
+                            branch_key, self.n_candidates, words,
+                            expected_source_work_id=(
+                                self._work_context.source_work_id),
+                            max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
+                        if paired is not None:
+                            self._evaluate_dependency_bundle(
+                                branch_key, words, n_words, paired, budget)
+                        else:
+                            time.sleep(0.05)    # let claims land
 
             if self.cancel():  # pragma: no cover
                 return CANCEL_RECVD
@@ -2182,27 +2272,59 @@ class _BranchWorker:
     # -- scheduling: claim one candidate from the best available branch ------
 
     def _claim_active_branch(self, branches, source_work_id=None,
-                             scheduling_role=SCHEDULING_ROLE_DIRECT):
-        """Claim a candidate bundle from an open branch, if one is available."""
+                             scheduling_role=SCHEDULING_ROLE_DIRECT,
+                             occupancy=None, max_other_workers=0):
+        """Claim a candidate bundle from an open branch, if one is available.
+
+        occupancy maps branch_key to the count of workers other than this one
+        holding unfinished claims (claim_holders_by_branch).  A branch
+        carrying more than max_other_workers of them is passed over: workers
+        sharing a branch evaluate candidates against a stale best_erd ceiling
+        and explore subtrees a sequential search prunes, which costs more than
+        the parallelism returns at production candidate counts.  The default
+        of 0 admits only branches nobody is working.  Passing occupancy=None
+        disables the filter for callers that have already applied it.
+
+        This filter chooses BETWEEN branches; max_other_workers travels into
+        the claim transaction, which re-counts the same way for the one branch
+        it is claiming and so holds the cap when several workers reach a
+        branch together.
+
+        Occupancy is never read from branch status, and never from
+        heartbeats.  A branch whose worker moved on has no unfinished claims
+        and is immediately claimable again, which is how a partly-solved
+        branch resumes; a crashed worker's claims are freed by the queue's
+        own reclaim paths.
+
+        The finalize sweep runs for every branch regardless of occupancy, so
+        passing a branch over for claiming never leaves it unfinalized.
+        """
         for active_branch in branches:
             branch = dict(active_branch)
             context = WorkContext.from_branch_row(branch, scheduling_role)
             branch_key = bytes(active_branch['branch_key'])
             words = decode_subset(branch_key)
-            claim = self._claim_bundle(
-                branch_key, active_branch['n_candidates'], words,
-                expected_source_work_id=source_work_id,
-                expected_source_priority=(
-                    active_branch['owner_priority']
-                    if source_work_id is not None else None))
-            if claim is not None:
-                bundle_id, indices, forced = claim
-                return context, branch, bundle_id, indices, forced
+            if (occupancy is None
+                    or occupancy.get(branch_key, 0) <= max_other_workers):
+                claim = self._claim_bundle(
+                    branch_key, active_branch['n_candidates'], words,
+                    expected_source_work_id=source_work_id,
+                    expected_source_priority=(
+                        active_branch['owner_priority']
+                        if source_work_id is not None else None),
+                    max_other_workers=max_other_workers)
+                if claim is not None:
+                    bundle_id, indices, forced = claim
+                    return context, branch, bundle_id, indices, forced
             if self.queue.branch_done_candidates(branch_key) >= active_branch['n_candidates']:
                 with self._entered(context):
                     self.maybe_finalize(
                         branch_key, words, active_branch['n_candidates'])
         return None
+
+    def _branch_occupancy(self):
+        """Workers other than this one holding unfinished claims, per branch."""
+        return self.queue.claim_holders_by_branch(exclude_worker_id=self.name)
 
     def claim_one(self):
         """Return (context, branch, bundle_id, indices, forced) for the next
@@ -2283,10 +2405,15 @@ class _BranchWorker:
             source_work_id=claimed['source_work_id'])
         self._source_work_enabled = True
         words = decode_subset(claimed['branch_key'])
+        # create_branch has already committed, so the branch has been visible
+        # and unoccupied to every other worker since then.  Creating it is no
+        # exemption from the cap: a worker that got there first holds it, and
+        # this one should open a sibling rather than take a second seat.
         claim = self._claim_bundle(
             claimed['branch_key'], self.n_candidates, words,
             expected_source_work_id=claimed['source_work_id'],
-            expected_source_priority=claimed['priority'])
+            expected_source_priority=claimed['priority'],
+            max_other_workers=0)
         branch = {
             'branch_key': claimed['branch_key'], 'n_words': n_words,
             'n_candidates': self.n_candidates,
@@ -2314,15 +2441,31 @@ class _BranchWorker:
         return context, branch, bundle_id, indices, forced
 
     def _claim_one_uninstrumented(self):
-        """claim_one's work selection.  See claim_one for the contract:
-        prefers JOINING an in-progress branch (to finish branches already
-        underway, concentrating workers) over PROMOTING a new one from the
-        queue.  Promotion claims a pending branch and registers it so others
-        can join.
+        """claim_one's work selection.  See claim_one for the contract: one
+        worker per branch.  Within a source it takes an unoccupied open branch
+        first and otherwise PROMOTES one of that source's pending branches,
+        widening the source it is already on before descending the priority
+        ladder to the next.  A branch held by another live worker is passed
+        over, so sources are exhausted by breadth rather than by piling onto
+        whichever branch is already underway.
+
+        Only when no source offers an unoccupied branch or a promotable
+        pending one does a worker pair up (_claim_paired_branch).  Because
+        this selection reruns at every claim boundary and reads occupancy
+        fresh each time, a pairing lasts only until an unoccupied branch
+        appears — including a sub-branch published by the shared branch
+        itself — at which point the second worker takes it.
+
+        Selection order also carries preemption: source_work_candidates() is
+        ordered requested_priority DESC, so a worker that descended to a
+        lower-priority source returns to a higher-priority one as soon as
+        that source has claimable work, without cancelling anything.  The
+        branch it leaves keeps its claims and best_erd and is resumable.
         """
+        occupancy = self._branch_occupancy()
         if not self._source_work_enabled:
             direct_work = self._claim_active_branch(
-                self.queue.direct_branches_in_progress())
+                self.queue.direct_branches_in_progress(), occupancy=occupancy)
             if direct_work is not None:
                 return direct_work
             self._source_work_enabled = self.queue.has_source_work()
@@ -2343,7 +2486,7 @@ class _BranchWorker:
                    else SCHEDULING_ROLE_FALLBACK)
             active_work = self._claim_active_branch(
                 self.queue.branches_in_progress(source_work_id), source_work_id,
-                role)
+                role, occupancy=occupancy)
             if active_work is not None:
                 return active_work
 
@@ -2353,7 +2496,39 @@ class _BranchWorker:
         # A queue upgraded while active work is present can carry branches
         # from before source lineage was recorded.  They remain claimable
         # until finalization; new work always follows source-first order.
-        return self._claim_active_branch(self.queue.direct_branches_in_progress())
+        direct_work = self._claim_active_branch(
+            self.queue.direct_branches_in_progress(), occupancy=occupancy)
+        if direct_work is not None:
+            return direct_work
+        return self._claim_paired_branch(source_work_rows, top_priority,
+                                         occupancy)
+
+    def _claim_paired_branch(self, source_work_rows, top_priority, occupancy):
+        """Join a branch already held by exactly one other worker, or None.
+
+        The last resort of work selection, reached only when no source offers
+        an unoccupied branch or a promotable pending one.  Six workers with
+        three branches left have three workers with nowhere to go; a second
+        worker on a branch returns about 0.16 of what it returns on a branch
+        of its own, which beats idling but loses to any unoccupied work, so
+        every other path is tried first.
+
+        The cap of one other worker is what keeps this safe: the second worker
+        on a branch is the only one whose marginal contribution is positive.
+        """
+        for source_work in source_work_rows:
+            role = (SCHEDULING_ROLE_PREFERRED
+                   if source_work['requested_priority'] == top_priority
+                   else SCHEDULING_ROLE_FALLBACK)
+            paired = self._claim_active_branch(
+                self.queue.branches_in_progress(source_work['source_work_id']),
+                source_work['source_work_id'], role, occupancy=occupancy,
+                max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
+            if paired is not None:
+                return paired
+        return self._claim_active_branch(
+            self.queue.direct_branches_in_progress(), occupancy=occupancy,
+            max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
 
     # -- main loop ----------------------------------------------------------
 
@@ -2424,7 +2599,8 @@ class _BranchWorker:
                 break
             claim = self._claim_bundle(
                 branch_key, n_candidates, words,
-                expected_source_work_id=self._work_context.source_work_id)
+                expected_source_work_id=self._work_context.source_work_id,
+                max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
             if claim is None:
                 # Every candidate is claimed.  If coverage is complete, finalize
                 # and stop.  Otherwise some claims are held by siblings — there is

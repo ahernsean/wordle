@@ -446,10 +446,19 @@ python3.13 erd_search.py queue add --word salet --pattern ..... \
 
 `queue add` is idempotent: already-queued branches are never duplicated, and
 priority is upgraded (never downgraded) if the new request is higher.  Setting
-a high priority on a large branch makes every idle worker in the running
-swarm converge on it: `claim_one` prefers joining any in-progress branch
-before promoting a new one, and both the pending and in-progress branch lists
-are ordered by priority — there is no separate "dedicated worker" mechanism.
+a high priority on an opener makes every idle worker in the running swarm
+converge on that opener, one worker to a branch: `claim_one` takes an
+unoccupied branch of the highest-priority source that has one, and otherwise
+promotes another of that source's pending branches, so the workers spread
+across the opener's response groups rather than stacking on one of them.  Both
+the pending and in-progress branch lists are ordered by priority — there is no
+separate "dedicated worker" mechanism.
+
+A worker joins a branch another worker already holds only when no unoccupied
+branch is available anywhere, and never as the third worker on one branch.
+Workers sharing a branch race against a stale `best_erd` ceiling and explore
+subtrees a sequential search prunes, so at the full candidate list six workers
+on one branch finish slower than one worker alone.
 
 ### The priority ladder
 
