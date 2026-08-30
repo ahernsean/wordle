@@ -912,6 +912,57 @@ class TestCooperativeSolveCachedPath(unittest.TestCase):
         q.close()
 
 
+class TestTransferredTaintFinalization(unittest.TestCase):
+    """A published branch's queue taint reaches its permanent cache row."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attribute, path in [("ANSWER_FILE", self.answer_file),
+                                ("WORDS_FILE", self.words_file)]:
+            patcher = mock.patch.object(erd_swarm, attribute, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        path = os.path.join(self._tmp.name, name)
+        with open(path, "w") as stream:
+            stream.write("\n".join(words) + "\n")
+        return path
+
+    def _finalize(self, *, transfer_taint):
+        worker = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        branch_words = BRANCH[:3]
+        branch_key = ScoreCache.encode_subset(branch_words)
+        try:
+            worker.queue.create_branch(
+                branch_key, len(branch_words), worker.n_candidates, budget=4)
+            if transfer_taint:
+                worker.queue.mark_branch_tainted(branch_key)
+            worker.queue.mark_claims_done(
+                branch_key, range(worker.n_candidates))
+            worker.queue.update_branch_best(
+                branch_key, "crane", 1.8, max_depth=2)
+            with mock.patch.object(erd_swarm, "cache_all_scores"):
+                self.assertTrue(worker.maybe_finalize(
+                    branch_key, branch_words, worker.n_candidates))
+            return worker.score_cache.read_with_depth(branch_key, ERD_ALL)
+        finally:
+            worker.close()
+
+    def test_transferred_taint_limits_cache_row_to_branch_budget(self):
+        self.assertEqual(self._finalize(transfer_taint=True),
+                         ("crane", 1.8, 2, 4))
+
+    def test_untainted_branch_keeps_unbounded_cache_reuse(self):
+        self.assertEqual(self._finalize(transfer_taint=False),
+                         ("crane", 1.8, 2, None))
+
+
 class TestSolveBranchFocusedPrecompletedCandidates(unittest.TestCase):
     """solve_branch_focused finalizes correctly when all candidates are already
     done by other workers: claim_next_bundle returns None,
@@ -2554,6 +2605,23 @@ class TestClaimBundleRetry(unittest.TestCase):
         self.assertEqual(w.queue.claim_next_bundle.call_count, 1)
 
 
+class TestInfeasibleCandidateCounters(unittest.TestCase):
+    def test_depth_infeasible_candidate_attributes_its_nodes(self):
+        worker = _bare_worker()
+
+        def evaluate(*_args, **_kwargs):
+            worker._nodes += 7
+            return (OVER_DEPTH_BUDGET, float('inf'), None, True)
+
+        with mock.patch.object(
+                erd_swarm, "evaluate_candidate", side_effect=evaluate):
+            self.assertTrue(worker.evaluate_claim(
+                b"branch", BRANCH, len(BRANCH), 0, budget=4))
+
+        worker.queue.add_nodes_spent.assert_called_once_with(
+            b"branch", 7, infeasible=True)
+
+
 class TestTwoLevelERDPruneBundles(unittest.TestCase):
     def _worker(self, bound_erd=3.1):
         worker = _bare_worker()
@@ -2801,6 +2869,23 @@ class TestMidLoopPublisher(unittest.TestCase):
             w.queue.mock_calls.index(taint_call),
             w.queue.mock_calls.index(done_call))
         self.assertEqual(result, (erd_swarm.SOLVED, 2.0, 2, True))
+
+    def test_check_preserves_cancel_status_after_transferring_taint(self):
+        pub, w = self._pub(predicted=10)
+        words = BRANCH[:6]
+        token = pub.enter(words, budget=3)
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=erd_swarm.CANCEL_RECVD)
+
+        result = pub.check(
+            token, CANDIDATES, 1, None, None, None, 3,
+            prefix_budget_tainted=True)
+
+        branch_key = ScoreCache.encode_subset(words)
+        w.queue.mark_branch_tainted.assert_called_once_with(branch_key)
+        w.queue.mark_claims_done.assert_called_once()
+        self.assertEqual(result, erd_swarm.CANCEL_RECVD)
 
     def test_record_inline_accumulates_buffer(self):
         import math
@@ -3607,14 +3692,6 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         log_kwargs = w.queue.add_branch_finalize_log.call_args.kwargs
         self.assertEqual(log_kwargs["outcome"], "exact")
         self.assertAlmostEqual(log_kwargs["ceiling"], 2.5)
-
-    def test_tainted_exact_caches_only_at_its_solve_budget(self):
-        key = ScoreCache.encode_subset(BRANCH)
-        w = self._worker(("crane", 1.8, 2, True, 4, None, False))
-        with mock.patch.object(erd_swarm, "cache_all_scores"):
-            w.maybe_finalize(key, BRANCH, len(CANDIDATES))
-        w.score_cache.write.assert_called_once_with(
-            key, ERD_ALL, "crane", 1.8, max_depth=2, solve_budget=4)
 
     def test_exact_direct_completion_is_snapshotted_before_branch_cleanup(self):
         key = ScoreCache.encode_subset(BRANCH)

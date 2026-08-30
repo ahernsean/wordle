@@ -525,7 +525,7 @@ class _MidLoopPublisher:
         result = self._worker.cooperative_solve(
             branch_words, budget,
             ceiling=best_erd if frame_ceilinged else float('inf'))
-        if result is not None and prefix_taint_transferred:
+        if isinstance(result, tuple) and prefix_taint_transferred:
             status, cost, max_remaining_depth, budget_tainted = result
             result = (status, cost, max_remaining_depth,
                       budget_tainted or prefix_taint_transferred)
@@ -1340,8 +1340,10 @@ class _BranchWorker:
                            idx, cand_elapsed, status, self._cand_max_depth)
 
         nodes_delta = self._nodes - nodes_before
-        if self._adaptive and nodes_delta > 0:
-            self.queue.add_nodes_spent(branch_key, nodes_delta)
+        if self._adaptive and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET):
+            self.queue.add_nodes_spent(
+                branch_key, nodes_delta,
+                infeasible=status == OVER_DEPTH_BUDGET)
 
         candidate_outcome = {
             SOLVED: 'exact',
@@ -1667,6 +1669,11 @@ class _BranchWorker:
          ceiling, cut_occurred) = meta
         branch_row = self.queue.get_branch(branch_key)
         nodes_spent = branch_row['nodes_spent'] if branch_row else 0
+        try:
+            infeasible_candidates = branch_row['infeasible_candidates']
+            infeasible_nodes = branch_row['infeasible_nodes']
+        except (KeyError, TypeError):
+            infeasible_candidates = infeasible_nodes = 0
         created_at = branch_row['created_at'] if branch_row else None
         finalized_at = branch_row['finalized_at'] if branch_row else None
         spine = branch_row['spine'] if branch_row else None
@@ -1784,6 +1791,8 @@ class _BranchWorker:
                     one_level_erd_pruned_candidates,
                 two_level_erd_pruned_candidates=
                     two_level_erd_pruned_candidates,
+                infeasible_candidates=infeasible_candidates,
+                infeasible_nodes=infeasible_nodes,
                 best_guess=best_guess, best_erd=best_erd,
                 cache_write_millis=cache_write_millis,
                 schedule_diagnostics=schedule_diagnostics,

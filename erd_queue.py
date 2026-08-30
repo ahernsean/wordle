@@ -351,6 +351,8 @@ CREATE TABLE IF NOT EXISTS active_branches (
     best_max_depth INTEGER,
     tainted        INTEGER NOT NULL DEFAULT 0,
     nodes_spent    INTEGER NOT NULL DEFAULT 0,
+    infeasible_candidates INTEGER NOT NULL DEFAULT 0,
+    infeasible_nodes INTEGER NOT NULL DEFAULT 0,
     -- the guesses played from the root to this branch, space-joined as
     -- "GUESS pattern" (e.g. "SALET -g-g- CRANE bb-y-").  guess_depth is the
     -- count of these guesses.  NULL = no spine recorded (a row predating spine
@@ -670,6 +672,8 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     created_at              INTEGER,
     finalized_at            INTEGER,
     nodes_spent             INTEGER,
+    infeasible_candidates   INTEGER,
+    infeasible_nodes        INTEGER,
     -- Candidates completed through worker evaluation; ERD prunes are counted
     -- separately by method.
     n_claims                INTEGER,
@@ -1084,6 +1088,10 @@ class ERDQueue:
             "bulk_done_bound": "REAL",
             "best_updated_at": "INTEGER",
         })
+        self._add_columns("branch_finalize_log", {
+            "infeasible_candidates": "INTEGER",
+            "infeasible_nodes": "INTEGER",
+        }, schema="telemetry")
         # An existing incumbent predates its bound timestamp.  Begin its ETA
         # sample now instead of using work measured against an unknown bound.
         self._conn.execute("""
@@ -1454,6 +1462,8 @@ class ERDQueue:
             """)
         self._add_columns("active_branches", {
             "requires_source_membership": "INTEGER NOT NULL DEFAULT 0",
+            "infeasible_candidates": "INTEGER NOT NULL DEFAULT 0",
+            "infeasible_nodes": "INTEGER NOT NULL DEFAULT 0",
         })
         # worker_heartbeat is transient liveness state (see its table comment): no
         # backfill for existing rows is needed, they are overwritten on the next
@@ -5736,14 +5746,20 @@ class ERDQueue:
             'candidate_claims/publisher-mark-done', written,
             written * _CLAIM_ROW_WAL_BYTES)
 
-    def add_nodes_spent(self, branch_key: bytes, delta: int):
-        """Increment nodes_spent on an active branch for cost-model sampling."""
-        if delta <= 0:
+    def add_nodes_spent(self, branch_key: bytes, delta: int, *,
+                        infeasible: bool = False):
+        """Add one candidate's nodes and any depth-infeasibility evidence."""
+        if delta <= 0 and not infeasible:
             return
+        delta = max(0, delta)
         branch_id = self._intern_branch(branch_key, create=True)
-        self._conn.execute(
-            "UPDATE active_branches SET nodes_spent = nodes_spent + ? "
-            "WHERE branch_id = ?", (delta, branch_id))
+        self._conn.execute("""
+            UPDATE active_branches
+            SET nodes_spent = nodes_spent + ?,
+                infeasible_candidates = infeasible_candidates + ?,
+                infeasible_nodes = infeasible_nodes + ?
+            WHERE branch_id = ?
+        """, (delta, int(infeasible), delta if infeasible else 0, branch_id))
         n = self._conn.execute("SELECT changes()").fetchone()[0]
         self._tally_wal_traffic(
             'active_branches/nodes-spent', n, n * _CLAIM_ROW_WAL_BYTES)
@@ -6060,6 +6076,8 @@ class ERDQueue:
                                 best_erd=None, cache_write_millis=None,
                                 one_level_erd_pruned_candidates=None,
                                 two_level_erd_pruned_candidates=None,
+                                infeasible_candidates=None,
+                                infeasible_nodes=None,
                                 schedule_diagnostics=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
@@ -6100,19 +6118,21 @@ class ERDQueue:
                  ceiling, outcome, bulk_done_candidates, best_guess, best_erd,
                  cache_write_millis, one_level_erd_pruned_candidates,
                  two_level_erd_pruned_candidates,
+                 infeasible_candidates, infeasible_nodes,
                  winner_best_first_position, winner_republish_count,
                  candidates_completed_before_winner,
                  max_best_first_position_before_winner,
                  republished_candidates, max_candidate_republish_count,
                  recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
               bulk_done_candidates, best_guess, best_erd, cache_write_millis,
               one_level_erd_pruned_candidates,
               two_level_erd_pruned_candidates,
+              infeasible_candidates, infeasible_nodes,
               schedule_diagnostics.get("winner_best_first_position"),
               schedule_diagnostics.get("winner_republish_count"),
               schedule_diagnostics.get("candidates_completed_before_winner"),
