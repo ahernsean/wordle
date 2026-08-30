@@ -2782,6 +2782,26 @@ class TestMidLoopPublisher(unittest.TestCase):
         for word in CANDIDATES[:2]:
             self.assertIn(w.all_words.index(word), marked_indices)
 
+    def test_check_transfers_prefix_budget_taint_before_done_marks(self):
+        pub, w = self._pub(predicted=10)
+        words = BRANCH[:6]
+        token = pub.enter(words, budget=3)
+        w._nodes = erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP + 1
+        w.cooperative_solve = mock.MagicMock(
+            return_value=(erd_swarm.SOLVED, 2.0, 2, False))
+
+        result = pub.check(
+            token, CANDIDATES, 1, None, None, None, 3,
+            prefix_budget_tainted=True)
+
+        branch_key = ScoreCache.encode_subset(words)
+        taint_call = mock.call.mark_branch_tainted(branch_key)
+        done_call = mock.call.mark_claims_done(branch_key, mock.ANY)
+        self.assertLess(
+            w.queue.mock_calls.index(taint_call),
+            w.queue.mock_calls.index(done_call))
+        self.assertEqual(result, (erd_swarm.SOLVED, 2.0, 2, True))
+
     def test_record_inline_accumulates_buffer(self):
         import math
         pub, w = self._pub(predicted=100)
@@ -3588,6 +3608,14 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         self.assertEqual(log_kwargs["outcome"], "exact")
         self.assertAlmostEqual(log_kwargs["ceiling"], 2.5)
 
+    def test_tainted_exact_caches_only_at_its_solve_budget(self):
+        key = ScoreCache.encode_subset(BRANCH)
+        w = self._worker(("crane", 1.8, 2, True, 4, None, False))
+        with mock.patch.object(erd_swarm, "cache_all_scores"):
+            w.maybe_finalize(key, BRANCH, len(CANDIDATES))
+        w.score_cache.write.assert_called_once_with(
+            key, ERD_ALL, "crane", 1.8, max_depth=2, solve_budget=4)
+
     def test_exact_direct_completion_is_snapshotted_before_branch_cleanup(self):
         key = ScoreCache.encode_subset(BRANCH)
         w = self._worker(("crane", 1.8, 2, False, 4, None, False))
@@ -3654,6 +3682,18 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         # The prefix was priced against the ceiling; in an exact branch those
         # price-outs do not hold, so the marks are skipped and redone there.
         w.queue.mark_claims_done.assert_not_called()
+
+    def test_skipped_prefix_marks_do_not_transfer_budget_taint(self):
+        pub, w, token = self._overrunning()
+        w.queue.has_pending_row.return_value = True
+
+        result = pub.check(
+            token, CANDIDATES, 1, None, 2.5, None, 5,
+            prefix_budget_tainted=True)
+
+        w.queue.mark_branch_tainted.assert_not_called()
+        w.queue.mark_claims_done.assert_not_called()
+        self.assertEqual(result, (SOLVED, 2.0, 3, False))
 
     def test_race_to_exact_branch_skips_prefix_marks(self):
         pub, w, token = self._overrunning()
