@@ -778,6 +778,25 @@ class ScoreCache:
             return None
         return (row["best_guess"], row["best_score"], row["updated_at"])
 
+    def repair_max_depth(self, branch_key, policy, max_depth):
+        """Correct one branch row's max_depth without disturbing its strategy.
+
+        max_depth is fully determined by best_guess and the max_depth of that
+        guess's response groups, so a row whose stored value disagrees with
+        that fold can be set to the folded value without re-searching: the
+        strategy is unchanged, only the worst-case line length it was
+        recorded with.  best_guess, best_score, solve_budget and updated_at
+        are left as they are — the row is not a new result.
+
+        Returns True when a row was updated.
+        """
+        cursor = self._conn.execute("""
+            UPDATE branch_best_by_policy SET max_depth = ?
+            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+        """, (max_depth, branch_key, policy, self.answer_list_id))
+        self._mem_cache.pop((branch_key, policy), None)
+        return cursor.rowcount > 0
+
     def delete(self, branch_key, policy):
         """Remove a cached branch result so it gets recomputed.
 

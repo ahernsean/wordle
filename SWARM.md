@@ -630,6 +630,39 @@ swarm was down.
 
 Cache coverage inspection uses `erd_search.py view --cache` with an optional semantic branch target.
 
+### Audit the max_depth column
+
+```bash
+python3.13 verify_branch_depths.py
+python3.13 verify_branch_depths.py --list 20
+python3.13 verify_branch_depths.py --repair
+```
+
+A branch row's `max_depth` is determined by its own `best_guess` and the
+`max_depth` of each response group that guess produces, so folding it back up
+turns any disagreement into a finding rather than an opinion.  It matters
+because `branch_best_by_policy` keys a branch without `solve_budget`: a
+branch's tainted and untainted values compete for one row, and an ancestor
+that folded the value the last write replaced is left describing a subtree the
+cache no longer holds.  Nothing records which value a parent folded, so those
+ancestors are reachable only by redoing the fold.
+
+Stored below the fold is the direction that matters — `_cache_reuse` gates an
+untainted entry on `max_depth <= budget`, so an understated depth hands out a
+strategy at a budget it cannot meet.  Stored above the fold only refuses reuse
+that was available.  The pass runs bottom-up, so a branch corrected in this run
+is what its parents are folded against; a fold that re-read stored children
+would agree with every parent that folded the same understated child, and its
+count is a floor rather than a measurement.
+
+`--repair` writes each folded depth back, and only that column: `best_guess` is
+the strategy the row already claims and the folded value is its true worst
+case.  A `best_score` that disagrees with its own fold is counted but never
+rewritten — a wrong ERD may mean `best_guess` is no longer the argmin, which
+only a re-search (`verify_erd_cache.py`) settles.  Stop the swarm before
+repairing; an audit-only run is safe while workers are active.  An audit-only
+run exits 1 when it finds a row stored below its fold.
+
 ### Export for the iPhone
 
 ```bash
