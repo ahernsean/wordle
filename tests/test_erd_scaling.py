@@ -491,10 +491,15 @@ class TestCooperativeDrainSmoke(unittest.TestCase):
         # branch with neither is a genuine gap the drain left behind. A loss is
         # a valid terminal result (a branch unsolvable within budget from this
         # test's deliberately small candidate set), not a missing entry.
+        #
+        # Read at the budget the branches were queued under: a solve whose
+        # floor fired records the optimum under that budget rather than the
+        # unrestricted one, and the two live in different tables.
         sc = ScoreCache(rN['cache'], self._pool)
-        unresolved = [bw for bw in self._branches
-                      if sc.read(encode_subset(bw), ERD_ALL) is None
-                      and sc.read_loss(encode_subset(bw), ERD_ALL) is None]
+        unresolved = [
+            bw for bw in self._branches
+            if sc.read_for_budget(encode_subset(bw), ERD_ALL, ROOT_BUDGET) is None
+            and sc.read_loss(encode_subset(bw), ERD_ALL) is None]
         sc.close()
         self.assertEqual(unresolved, [],
                          f"{len(unresolved)} branches unresolved "
@@ -778,7 +783,8 @@ class TestSolveDominatedStrongScaling(unittest.TestCase):
             sc = ScoreCache(r['cache'], self._pool, checkpoint_on_close=False)
             unresolved = [
                 bw for bw in self._branches
-                if sc.read(encode_subset(bw), ERD_ALL) is None
+                if sc.read_for_budget(encode_subset(bw), ERD_ALL,
+                                      self._BUDGET) is None
                 and sc.read_loss(encode_subset(bw), ERD_ALL) is None]
             sc.close()
             self.assertEqual(unresolved, [],

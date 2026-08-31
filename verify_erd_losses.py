@@ -147,7 +147,10 @@ def _verify_chunk(args):
             results.append(
                 ('CONFIRMED', n_words, loss_budget, '-', float('inf')))
         else:
-            entry = sc.read(branch_key, ERD_ALL)
+            # Read at the budget the loss was claimed for: a refuting solve
+            # whose floor fired records its result under that budget rather
+            # than as the unrestricted optimum.
+            entry = sc.read_for_budget(branch_key, ERD_ALL, loss_budget)
             new_guess = entry[0] if entry is not None else '?'
             results.append(
                 ('REFUTED', n_words, loss_budget, new_guess, cost))
