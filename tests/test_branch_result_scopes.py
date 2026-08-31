@@ -664,3 +664,135 @@ class ConcurrentWriteTest(_CacheTest):
                 score_cache._mem_cache.get((self.key, ERD_ALL, scope)),
                 f"scope {scope} still mirrored after delete")
         self.assertIsNone(score_cache.read_for_budget(self.key, ERD_ALL, 4))
+
+
+class ImportConflictTest(_CacheTest):
+    """A key collision between two caches is checked, not assumed.
+
+    Normally it is one fact reached twice.  When the costs disagree, one of
+    the caches is wrong and whichever the merge keeps displaces a result the
+    other's ancestors folded — the failure CacheWriteConflict refuses within a
+    file, applied across files.
+    """
+
+    def _attached(self, target_path, source_path):
+        conn = sqlite3.connect(target_path, isolation_level=None)
+        conn.execute(f"ATTACH DATABASE '{source_path}' AS src")
+        self.addCleanup(conn.close)
+        return conn
+
+    def _cache_with(self, name, guess, score, *, solve_budget=None,
+                    legacy_budget_in_canonical=False):
+        import_cache = __import__('import_cache')
+        path = os.path.join(self._dir, name)
+        score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        if legacy_budget_in_canonical:
+            score_cache._conn.execute(
+                f"INSERT OR REPLACE INTO {CANONICAL} "
+                "(branch_key, policy, answer_list_id, best_guess, best_score, "
+                " updated_at, max_depth, solve_budget) VALUES (?,?,?,?,?,7,3,?)",
+                (self.key, ERD_ALL, score_cache.answer_list_id, guess, score,
+                 solve_budget))
+        else:
+            score_cache.write(self.key, ERD_ALL, guess, score, max_depth=3,
+                              solve_budget=solve_budget)
+        score_cache.close()
+        del import_cache
+        return path
+
+    def _conflicts(self, target_path, source_path):
+        import import_cache
+        conn = self._attached(target_path, source_path)
+        src_tables = {row[0] for row in conn.execute(
+            "SELECT name FROM src.sqlite_master WHERE type='table'")}
+        return import_cache._conflicting_exact_results(conn, src_tables)
+
+    def test_disagreeing_unrestricted_results_are_reported_both_directions(self):
+        a = self._cache_with("a.sqlite3", "crane", 2.0)
+        b = self._cache_with("b.sqlite3", "slate", 2.5)
+        for target, source in ((a, b), (b, a)):
+            with self.subTest(direction=os.path.basename(target)):
+                conflicts = self._conflicts(target, source)
+                self.assertEqual(len(conflicts), 1, conflicts)
+                self.assertEqual(conflicts[0][0], 'unrestricted')
+
+    def test_disagreeing_budget_results_are_reported_both_directions(self):
+        a = self._cache_with("ba.sqlite3", "crane", 2.0, solve_budget=3)
+        b = self._cache_with("bb.sqlite3", "slate", 2.5, solve_budget=3)
+        for target, source in ((a, b), (b, a)):
+            with self.subTest(direction=os.path.basename(target)):
+                conflicts = self._conflicts(target, source)
+                self.assertEqual(len(conflicts), 1, conflicts)
+                self.assertEqual(conflicts[0][0], 'budget-specific')
+
+    def test_a_legacy_budget_row_is_compared_where_it_would_be_routed(self):
+        # It arrives in the source's canonical table but lands in the target's
+        # budget table, so that is where a disagreement has to be caught.
+        target = self._cache_with("lt.sqlite3", "crane", 2.0, solve_budget=3)
+        source = self._cache_with("ls.sqlite3", "slate", 2.5, solve_budget=3,
+                                  legacy_budget_in_canonical=True)
+        conflicts = self._conflicts(target, source)
+        self.assertEqual([c[0] for c in conflicts], ['budget-specific (routed)'])
+
+    def test_agreeing_results_are_not_conflicts(self):
+        # The same optimum reached twice, with different strategies and
+        # different worst cases, is one fact — not a disagreement.
+        a = self._cache_with("sa.sqlite3", "crane", 2.0)
+        b = self._cache_with("sb.sqlite3", "slate", 2.0)
+        self.assertEqual(self._conflicts(a, b), [])
+        self.assertEqual(self._conflicts(b, a), [])
+
+    def test_a_scope_only_one_cache_holds_is_not_a_conflict(self):
+        target = self._cache_with("oa.sqlite3", "crane", 2.0)
+        source = self._cache_with("ob.sqlite3", "slate", 2.5, solve_budget=3)
+        self.assertEqual(self._conflicts(target, source), [])
+
+    def test_the_report_names_both_sides(self):
+        import io
+        import import_cache
+        from contextlib import redirect_stderr
+        conflicts = [('unrestricted', 'abc123def456', ERD_ALL, None,
+                      ('crane', 2.0), ('slate', 2.5))]
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            import_cache._report_conflicts(conflicts)
+        report = stderr.getvalue()
+        self.assertIn('abc123def456', report)
+        self.assertIn('crane', report)
+        self.assertIn('slate', report)
+
+    def test_a_target_without_the_budget_table_is_skipped_not_an_error(self):
+        # An older target has no budget table to collide with; the comparison
+        # that would reach it is passed over rather than failing the import.
+        import import_cache
+        source = self._cache_with("nt_src.sqlite3", "slate", 2.5, solve_budget=3)
+        target = os.path.join(self._dir, "nt_target.sqlite3")
+        target_cache = ScoreCache(target, WORDS, checkpoint_on_close=False)
+        target_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
+        target_cache._conn.execute(f"DROP TABLE {BUDGETED}")
+        target_cache.close()
+
+        conn = self._attached(target, source)
+        src_tables = {row[0] for row in conn.execute(
+            "SELECT name FROM src.sqlite_master WHERE type='table'")}
+        self.assertEqual(
+            import_cache._conflicting_exact_results(conn, src_tables), [])
+
+    def test_the_conflict_report_is_bounded(self):
+        import import_cache
+        target_cache = self.cache("many_t.sqlite3")
+        source_cache = self.cache("many_s.sqlite3")
+        for index in range(4):
+            branch = ScoreCache.encode_subset(WORDS[:2] + [f"aaa{index}a"])
+            target_cache.write(branch, ERD_ALL, "crane", 2.0, max_depth=3)
+            source_cache.write(branch, ERD_ALL, "slate", 2.5, max_depth=3)
+        target_cache.close()
+        source_cache.close()
+
+        conn = self._attached(os.path.join(self._dir, "many_t.sqlite3"),
+                              os.path.join(self._dir, "many_s.sqlite3"))
+        src_tables = {row[0] for row in conn.execute(
+            "SELECT name FROM src.sqlite_master WHERE type='table'")}
+        conflicts = import_cache._conflicting_exact_results(
+            conn, src_tables, limit=2)
+        self.assertEqual(len(conflicts), 2)

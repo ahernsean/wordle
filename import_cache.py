@@ -38,6 +38,13 @@ they are routed into the budget table under their own budget and skipped by the
 canonical copy.  An older reader handed a newer export sees a table it does not
 know and ignores it, keeping the unrestricted rows it does understand.
 
+A key collision in either exact-result table is normally one fact reached
+twice, but that is checked rather than assumed: before any row moves, colliding
+rows whose costs disagree are reported and the merge refuses.  Two exact
+results for one scope cannot both be right, and keeping either displaces
+whichever the other cache's ancestors folded.  --dry-run reports them and
+continues.
+
 Run with --dry-run first to see how many rows would be added/upgraded.  Prefer
 to run while workers are stopped (or at least briefly paused) to avoid competing
 for the SQLite write lock, though the 30s timeout makes concurrent use safe.
@@ -51,7 +58,7 @@ import sqlite3
 import sys
 import time
 
-from cache_sqlite import ScoreCache
+from cache_sqlite import EXACT_SCORE_TOLERANCE, ScoreCache, branch_reference
 from wordle_engine import load_word_list
 
 from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CACHE_PATH, ensure_runtime_dir
@@ -214,6 +221,76 @@ def _route_legacy_budget_rows(conn) -> int:
     return conn.total_changes - before
 
 
+def _conflicting_exact_results(conn, src_tables, limit=20):
+    """Colliding exact results whose costs disagree, across both scopes.
+
+    A key collision between two caches is normally one fact reached twice, and
+    INSERT OR IGNORE is exact for that.  It is not safe to *assume*: two caches
+    can hold different costs for one branch at one scope, and whichever the
+    merge keeps displaces a result the other cache's ancestors folded — the
+    failure ScoreCache.write refuses within a file.  The same rule has to hold
+    across files, so a merge that would silently pick a side is refused
+    instead.
+
+    Returns up to `limit` (scope, reference, policy, budget, target, incoming)
+    rows.  A legacy source carries its budget-specific results in the canonical
+    table, so those are compared against the target's budget table, where the
+    routing would put them.
+    """
+    src_has_budget_column = 'solve_budget' in _all_cols_src(conn, CANONICAL_TABLE)
+    canonical_src_filter = ('s.solve_budget IS NULL' if src_has_budget_column
+                            else '1')
+    comparisons = [
+        ('unrestricted', CANONICAL_TABLE, CANONICAL_TABLE,
+         canonical_src_filter, ''),
+    ]
+    if src_has_budget_column:
+        # A pre-split source's budget rows are routed to the budget table, so
+        # that is where they can collide.
+        comparisons.append(
+            ('budget-specific (routed)', BUDGET_TABLE, CANONICAL_TABLE,
+             's.solve_budget IS NOT NULL', ' AND m.solve_budget = s.solve_budget'))
+    if BUDGET_TABLE in src_tables and _target_has_table(conn, BUDGET_TABLE):
+        comparisons.append(
+            ('budget-specific', BUDGET_TABLE, BUDGET_TABLE, '1',
+             ' AND m.solve_budget = s.solve_budget'))
+
+    conflicts = []
+    for scope, target_table, source_table, source_filter, budget_join in comparisons:
+        if not _target_has_table(conn, target_table):
+            continue
+        rows = conn.execute(f"""
+            SELECT s.branch_key, s.policy, s.solve_budget,
+                   m.best_guess, m.best_score, s.best_guess, s.best_score
+            FROM src.{source_table} s
+            JOIN main.{target_table} m
+              ON m.branch_key     = s.branch_key
+             AND m.policy         = s.policy
+             AND m.answer_list_id = s.answer_list_id{budget_join}
+            WHERE ({source_filter})
+              AND abs(m.best_score - s.best_score) > ?
+            LIMIT ?
+        """, (EXACT_SCORE_TOLERANCE, limit - len(conflicts))).fetchall()
+        for row in rows:
+            conflicts.append((scope, branch_reference(row[0]), row[1], row[2],
+                              (row[3], row[4]), (row[5], row[6])))
+        if len(conflicts) >= limit:
+            break
+    return conflicts
+
+
+def _report_conflicts(conflicts) -> None:
+    print(f'\n{len(conflicts):,} colliding exact result(s) disagree on cost:',
+          file=sys.stderr)
+    for scope, reference, policy, budget, target, incoming in conflicts:
+        print(f'  {reference} {scope} policy={policy} budget={budget}: '
+              f'target {target[0]}/{target[1]!r}, '
+              f'source {incoming[0]}/{incoming[1]!r}', file=sys.stderr)
+    print('Two exact results for one scope cannot both be right, and merging '
+          'either way displaces whichever the other cache\'s ancestors '
+          'folded.  Resolve the disagreement before importing.', file=sys.stderr)
+
+
 def _copy_table_with_progress(conn, table) -> int:
     """Copy src.table -> main.table in rowid-paged batches with live progress.
 
@@ -319,6 +396,17 @@ def main():  # pragma: no cover
 
         src_tables = {r[0] for r in conn.execute(
             "SELECT name FROM src.sqlite_master WHERE type='table'")}
+
+        # Before a single row moves: a disagreement means one of the two
+        # caches is wrong, and no merge direction is safe until that is
+        # settled.  A dry run reports and continues; a real merge refuses,
+        # leaving the target as it was rather than half-merged.
+        if CANONICAL_TABLE in src_tables:
+            conflicts = _conflicting_exact_results(conn, src_tables)
+            if conflicts:
+                _report_conflicts(conflicts)
+                if not args.dry_run:
+                    sys.exit(1)
 
         total_new = 0
         for table in TABLES:
