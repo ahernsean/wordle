@@ -98,7 +98,14 @@ class TestReclaimLiveness(_TmpDB, unittest.TestCase):
         self.assertEqual(self._n_claims(), 1)
 
 
-class TestMergeUntaintedWins(_TmpDB, unittest.TestCase):
+class TestMergeKeepsBothScopes(_TmpDB, unittest.TestCase):
+    """A merge no longer has to choose between a branch's two results.
+
+    They are keyed apart, so an incoming budget-specific result and a stored
+    unrestricted one both survive: there is nothing to prefer between two
+    different facts.
+    """
+
     def _make_cache(self, name, solve_budget):
         sc = ScoreCache(self.path(name), WORDS)
         key = ScoreCache.encode_subset(WORDS)
@@ -107,43 +114,57 @@ class TestMergeUntaintedWins(_TmpDB, unittest.TestCase):
         sc.close()
         return key
 
-    def _merge(self, target, source):
+    def _merge(self, target, source, table="branch_best_by_policy"):
         conn = sqlite3.connect(self.path(target), isolation_level=None)
         conn.execute(f"ATTACH DATABASE '{self.path(source)}' AS src")
-        cols = import_cache._all_cols(conn, "branch_best_by_policy")
+        cols = import_cache._all_cols(conn, table)
         col_list = ", ".join(cols)
-        insert_sql = import_cache._insert_sql("branch_best_by_policy", cols)
-        rows = conn.execute(
-            f"SELECT {col_list} FROM src.branch_best_by_policy").fetchall()
+        insert_sql = import_cache._insert_sql(table, cols)
+        rows = conn.execute(f"SELECT {col_list} FROM src.{table}").fetchall()
         conn.executemany(insert_sql, rows)
         conn.execute("DETACH DATABASE src")
         conn.close()
 
-    def _read_budget(self, name, key):
+    def _scopes(self, name, key):
+        """The solve_budget of every result stored for one branch."""
         sc = ScoreCache(self.path(name), WORDS, checkpoint_on_close=False)
-        row = sc.read_with_depth(key, ERD_ALL)
-        sc.close()
-        return row[3]  # solve_budget
+        try:
+            return sorted(
+                (row[0] for row in sc._conn.execute(
+                    "SELECT solve_budget FROM branch_best_by_policy "
+                    "WHERE branch_key = ? AND policy = ? AND answer_list_id = ? "
+                    "UNION ALL "
+                    "SELECT solve_budget FROM branch_best_by_policy_and_budget "
+                    "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
+                    (key, ERD_ALL, sc.answer_list_id,
+                     key, ERD_ALL, sc.answer_list_id))),
+                key=lambda budget: (budget is not None, budget))
+        finally:
+            sc.close()
 
-    def test_untainted_source_upgrades_tainted_target(self):
-        key = self._make_cache("target.sqlite3", solve_budget=5)   # tainted
-        self._make_cache("source.sqlite3", solve_budget=None)      # untainted
+    def test_a_budget_specific_source_leaves_the_unrestricted_target_alone(self):
+        key = self._make_cache("target.sqlite3", solve_budget=None)
+        self._make_cache("source.sqlite3", solve_budget=5)
         self._merge("target.sqlite3", "source.sqlite3")
-        self.assertIsNone(self._read_budget("target.sqlite3", key))  # upgraded
+        self._merge("target.sqlite3", "source.sqlite3",
+                    "branch_best_by_policy_and_budget")
+        self.assertEqual(self._scopes("target.sqlite3", key), [None, 5])
 
-    def test_tainted_source_does_not_downgrade_untainted_target(self):
-        key = self._make_cache("target.sqlite3", solve_budget=None)  # untainted
-        self._make_cache("source.sqlite3", solve_budget=5)           # tainted
+    def test_an_unrestricted_source_leaves_the_budget_specific_target_alone(self):
+        key = self._make_cache("target.sqlite3", solve_budget=5)
+        self._make_cache("source.sqlite3", solve_budget=None)
         self._merge("target.sqlite3", "source.sqlite3")
-        self.assertIsNone(self._read_budget("target.sqlite3", key))  # kept
+        self._merge("target.sqlite3", "source.sqlite3",
+                    "branch_best_by_policy_and_budget")
+        self.assertEqual(self._scopes("target.sqlite3", key), [None, 5])
 
 
 class TestBackfillGuard(_TmpDB, unittest.TestCase):
     """The backfill UPDATE must no-op on any row a worker already filled in."""
 
-    UPDATE = ("UPDATE branch_best_by_policy SET max_depth=?, solve_budget=NULL "
-              "WHERE branch_key=? AND policy=? AND answer_list_id=? "
-              "AND max_depth IS NULL")
+    UPDATE_TEMPLATE = ("UPDATE {table} SET max_depth=?, solve_budget=NULL "
+                       "WHERE branch_key=? AND policy=? AND answer_list_id=? "
+                       "AND max_depth IS NULL")
 
     def setUp(self):
         super().setUp()
@@ -152,26 +173,31 @@ class TestBackfillGuard(_TmpDB, unittest.TestCase):
         self.uid = self.sc.answer_list_id
         self.key = ScoreCache.encode_subset(WORDS)
 
-    def _db_row(self):
+    def _db_row(self, table="branch_best_by_policy"):
         # Read straight from the DB (not the in-memory mirror) so we observe
         # exactly what the UPDATE did.
         return self.sc._conn.execute(
-            "SELECT max_depth, solve_budget FROM branch_best_by_policy "
+            f"SELECT max_depth, solve_budget FROM {table} "
             "WHERE branch_key=? AND policy=? AND answer_list_id=?",
             (self.key, ERD_ALL, self.uid)).fetchone()
 
     def test_guard_skips_row_with_known_depth(self):
-        # A worker's fresh tainted entry (real max_depth, solve_budget=5).
+        # A worker's fresh budget-specific entry (real max_depth,
+        # solve_budget=5), which lives in the budget table.
+        table = "branch_best_by_policy_and_budget"
         self.sc.write(self.key, ERD_ALL, "crane", 1.5, max_depth=3, solve_budget=5)
-        self.sc._conn.execute(self.UPDATE, (9, self.key, ERD_ALL, self.uid))
-        md, sb = self._db_row()
+        self.sc._conn.execute(self.UPDATE_TEMPLATE.format(table=table),
+                              (9, self.key, ERD_ALL, self.uid))
+        md, sb = self._db_row(table)
         self.assertEqual(md, 3)      # max_depth unchanged
         self.assertEqual(sb, 5)      # solve_budget NOT clobbered to NULL
 
     def test_guard_fills_legacy_null_depth(self):
         self.sc.write(self.key, ERD_ALL, "crane", 1.5, max_depth=None,
                       solve_budget=None)
-        self.sc._conn.execute(self.UPDATE, (4, self.key, ERD_ALL, self.uid))
+        self.sc._conn.execute(
+            self.UPDATE_TEMPLATE.format(table="branch_best_by_policy"),
+            (4, self.key, ERD_ALL, self.uid))
         md, _sb = self._db_row()
         self.assertEqual(md, 4)      # backfilled
 

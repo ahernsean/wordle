@@ -110,7 +110,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
             sc.write(key, "full", "heart", 2.5)   # must not raise
         self.assertTrue(any("failed" in m for m in cm.output))
         # _mem_cache is still populated despite the failed disk write.
-        self.assertEqual(sc._mem_cache[(key, "full")], ("heart", 2.5, None, None))
+        self.assertEqual(sc._mem_cache[(key, "full", None)], ("heart", 2.5, None, None))
 
     def test_write_reraises_non_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
@@ -771,8 +771,11 @@ class TestOverErdLimitTaintJoin(unittest.TestCase):
         self.assertEqual(status, SOLVED)
         self.assertTrue(floor)
         key = ScoreCache.encode_subset(self.BRANCH)
-        best_guess, best_score, max_depth, solve_budget = sc.read_with_depth(
-            key, ERD_ANSWERS)
+        # The floor fired, so the result is the optimum under budget 5 rather
+        # than the unrestricted one, and lives in the budget table.
+        self.assertIsNone(sc.read_with_depth(key, ERD_ANSWERS))
+        best_guess, best_score, max_depth, solve_budget = sc.read_for_budget(
+            key, ERD_ANSWERS, 5)
         self.assertEqual(solve_budget, 5)
 
 

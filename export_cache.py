@@ -7,6 +7,7 @@ Usage
 
 Creates a trimmed export file with only the iPhone-useful tables:
 answer_list, response_decomposition, branch_best_by_policy,
+branch_best_by_policy_and_budget,
 candidate_scores, and candidate_erd_by_policy. A phone without a cached ERD
 result for its current position still needs candidate_scores' entropy/
 max-group-size numbers to rank candidates, and that need isn't limited to
@@ -42,8 +43,8 @@ DEFAULT_CACHE = DEFAULT_CACHE_PATH
 DEFAULT_EXPORT = 'wordle_erd_export.sqlite3'
 
 EXPORT_TABLES = ['answer_list', 'response_decomposition',
-                  'branch_best_by_policy', 'candidate_scores',
-                  'candidate_erd_by_policy']
+                  'branch_best_by_policy', 'branch_best_by_policy_and_budget',
+                  'candidate_scores', 'candidate_erd_by_policy']
 
 
 def cmd_export(args):

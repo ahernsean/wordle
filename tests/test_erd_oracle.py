@@ -267,7 +267,11 @@ class _CaseMixin:
                 policy=ERD_ALL, pattern_matrix=matrix, branch_floor_table=table)
             if cost is None:
                 return (None, None, None)
-            recorded = score_cache.read_with_depth(encode_subset(branch), ERD_ALL)
+            # A solve whose floor fired records its result under that budget
+            # rather than as the unrestricted optimum, so read it back the way
+            # a search at this budget would.
+            recorded = score_cache.read_for_budget(
+                encode_subset(branch), ERD_ALL, budget)
             guess = recorded[0] if recorded else None
             depth = recorded[2] if recorded else None
             return (cost, guess, depth)

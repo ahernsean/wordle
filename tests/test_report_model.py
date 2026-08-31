@@ -1538,6 +1538,9 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(cache.erd_report_summary(ERD_ALL, now - 1), {
             "exact_branch_count": 1,
             "recent_exact_branch_count": 1,
+            "budgeted_result_count": 0,
+            "budgeted_branch_count": 0,
+            "recent_budgeted_result_count": 0,
             "loss_branch_count": 1,
         })
         cache.close()

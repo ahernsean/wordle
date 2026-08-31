@@ -17,6 +17,66 @@ def branch_reference(branch_key: bytes) -> str:
     return hashlib.sha1(bytes(branch_key)).hexdigest()[:12]
 
 
+# Two searches reaching the same optimum sum the same terms in the same order,
+# so they agree exactly; the tolerance only absorbs a value that reached the
+# cache by some other route.
+EXACT_SCORE_TOLERANCE = 1e-9
+
+
+def exact_results_agree(stored_score, stored_max_depth,
+                        incoming_score, incoming_max_depth) -> bool:
+    """Whether two exact results for one scope are the same certificate.
+
+    Equal cost is not enough.  max_depth is ancestor-visible — a parent folds
+    a child's worst case into its own — so two equal-cost strategies with
+    different worst cases are different certificates, and a parent folded from
+    one does not describe a subtree the other supports.
+
+    import_cache expresses this same rule in SQL, over whole tables at once;
+    test_the_sql_equivalence_rule_matches_the_python_one keeps the two in step.
+    """
+    if abs(stored_score - incoming_score) > EXACT_SCORE_TOLERANCE:
+        return False
+    return stored_max_depth == incoming_max_depth
+
+
+def _branch_facts_by_key(rows):
+    """Group exact branch rows into (unrestricted_row, {solve_budget: row}).
+
+    Both branch tables carry the same columns, so one pass over their union
+    separates a branch's unrestricted result from its budget-specific ones
+    without the caller having to know which table a row came from.
+    """
+    facts = {}
+    for row in rows:
+        key = bytes(row["branch_key"])
+        canonical, by_budget = facts.get(key, (None, None))
+        if by_budget is None:
+            by_budget = {}
+        if row["solve_budget"] is None:
+            canonical = row
+        else:
+            by_budget[row["solve_budget"]] = row
+        facts[key] = (canonical, by_budget)
+    return facts
+
+
+class CacheWriteConflict(Exception):
+    """Two exact results disagree for one branch at one budget scope.
+
+    Within a scope the optimum is a single number, so a second exact write
+    naming a different one means the two searches cannot both be right.
+    Recording either would invalidate whichever ancestors folded the other,
+    which is the failure this schema exists to prevent — so the write is
+    refused instead.
+    """
+
+
+def answer_list_id(answer_words) -> str:
+    """Return the namespace key for one answer word list."""
+    return hashlib.sha256("\n".join(answer_words).encode()).hexdigest()
+
+
 class _LRUDict:
     """Fixed-capacity LRU cache backed by an OrderedDict.
 
@@ -53,6 +113,11 @@ class _LRUDict:
 
     def pop(self, key, *args):
         return self._data.pop(key, *args)
+
+    def pop_matching(self, predicate):
+        """Drop every entry whose key satisfies predicate."""
+        for key in [key for key in self._data if predicate(key)]:
+            del self._data[key]
 
     def __len__(self):
         return len(self._data)
@@ -117,21 +182,45 @@ class ScoreCache:
     """
 
     def __init__(self, db_path, answer_words, timeout=30.0,
-                 checkpoint_on_close=True, max_mem_entries=None):
+                 checkpoint_on_close=True, max_mem_entries=None,
+                 read_only=False):
         self.db_path = Path(db_path)
         self.answer_words = list(answer_words)
-        self.checkpoint_on_close = checkpoint_on_close
-        self._conn = sqlite3.connect(
-            self.db_path, timeout=timeout, isolation_level=None
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._ensure_schema()
-        self.answer_list_id = self._ensure_answer_list()
+        self.read_only = read_only
+        # A read-only cache never checkpoints: TRUNCATE is itself a write.
+        self.checkpoint_on_close = checkpoint_on_close and not read_only
+        if read_only:
+            # An inspection pass over a live cache must leave no trace, not
+            # even the schema migration and answer-list row an ordinary open
+            # writes.  SQLite enforces that for us: mode=ro rejects every
+            # write, so a caller that reaches for one gets an error instead of
+            # a silently swallowed no-op.  It also refuses to create the file,
+            # which is what keeps a mistyped path from reading as an empty
+            # database.
+            self._conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True,
+                timeout=timeout, isolation_level=None
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._present_pre_split_cache_by_scope()
+            self.answer_list_id = answer_list_id(self.answer_words)
+        else:
+            self._conn = sqlite3.connect(
+                self.db_path, timeout=timeout, isolation_level=None
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_schema()
+            self.answer_list_id = self._ensure_answer_list()
         self.read_hits = 0
         self.read_misses = 0
         self.write_count = 0
+        # Exact results re-derived and found already stored.
+        self.redundant_write_count = 0
+        # ...of which the stored worst case differed from the one just
+        # computed, so the caller adopted the stored certificate.
+        self.adopted_depth_count = 0
         # In-memory mirror of branch_best_by_policy rows seen this session.
         # Branch results are write-once/exact, so a hit here is as good as
         # a SQLite hit but ~1000x cheaper — recursive ERD search re-reads the
@@ -156,6 +245,59 @@ class ScoreCache:
                 # finalizing it; SQLite connections are thread-affine, so
                 # closing here is impossible.
                 pass
+
+    _BRANCH_RESULT_COLUMNS = (
+        'branch_key', 'branch_reference', 'policy', 'answer_list_id',
+        'solve_budget', 'best_guess', 'best_score', 'updated_at', 'max_depth')
+
+    def _present_pre_split_cache_by_scope(self):
+        """Show a pre-split cache through the split's own two tables.
+
+        A cache written before the split has no branch_best_by_policy_and_budget
+        — the migration that creates it runs in _ensure_schema, which a
+        read-only open deliberately skips.  Every reader spanning both scopes
+        would then fail on a database it is meant to inspect, and inspecting an
+        un-migrated cache is the whole point of opening one read-only.
+
+        Both tables are supplied as TEMP views over the legacy one, split on
+        solve_budget.  Supplying only the budget half would be worse than the
+        failure it replaces: the legacy canonical table holds both scopes, so
+        every reader would take a budget-specific result for the unrestricted
+        optimum and hand it out at any budget — the cross-scope reuse this
+        schema exists to stop.
+
+        Temp objects live outside the file, so this writes nothing, and SQLite
+        resolves an unqualified name against temp before main, so the readers
+        need no special case.  The view bodies name main. explicitly; unqualified
+        they would resolve to the temp views themselves.
+        """
+        if self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ('branch_best_by_policy_and_budget',)).fetchone():
+            return
+        legacy_columns = {row["name"] for row in
+                          self._conn.execute("PRAGMA table_info(branch_best_by_policy)")}
+        selection = self._legacy_select(legacy_columns)
+        if 'solve_budget' in legacy_columns:
+            unrestricted, budgeted = 'solve_budget IS NULL', 'solve_budget IS NOT NULL'
+        else:
+            # Older still: with no solve_budget column every row is an
+            # unrestricted result and there are no budget-specific ones.
+            unrestricted, budgeted = '1', '0'
+        for view, condition in (('branch_best_by_policy', unrestricted),
+                                ('branch_best_by_policy_and_budget', budgeted)):
+            self._conn.execute(f"""
+                CREATE TEMP VIEW {view} AS
+                SELECT {selection} FROM main.branch_best_by_policy
+                WHERE {condition}
+            """)
+
+    @classmethod
+    def _legacy_select(cls, legacy_columns):
+        """Select list giving a legacy table the post-split column shape."""
+        return ', '.join(
+            column if column in legacy_columns else f'NULL AS {column}'
+            for column in cls._BRANCH_RESULT_COLUMNS)
 
     def _is_migration_done(self, name):
         """Return True if migration `name` has been recorded as complete."""
@@ -234,6 +376,44 @@ class ScoreCache:
                 updated_at   INTEGER NOT NULL,
                 PRIMARY KEY (branch_key, policy, answer_list_id)
             )
+        """)
+        # A branch has two kinds of exact result, and they are different facts:
+        # the unrestricted optimum, and the optimum among strategies feasible
+        # at one remaining-depth budget.  Both can be right and differ.  They
+        # live in separate tables because one row cannot hold both: a shared
+        # key makes either write destroy the other, after ancestors may already
+        # have folded the value it displaced, and nothing records which one
+        # they folded.
+        #
+        # branch_best_by_policy holds only the unrestricted optima, so its
+        # solve_budget column is NULL on every row it now accepts.  The column
+        # stays because dropping it would rebuild a multi-GB table to no end,
+        # and legacy rows are read through it.
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS branch_best_by_policy_and_budget (
+                branch_key   BLOB NOT NULL,
+                branch_reference TEXT,
+                policy       TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL,
+                solve_budget INTEGER NOT NULL,
+                best_guess   TEXT NOT NULL,
+                best_score   REAL NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                max_depth    INTEGER,
+                PRIMARY KEY (branch_key, policy, answer_list_id, solve_budget)
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_branch_best_by_policy_and_budget
+            ON branch_best_by_policy_and_budget(answer_list_id, policy)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_branch_budget_updated
+            ON branch_best_by_policy_and_budget(answer_list_id, updated_at)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_branch_budget_reference
+            ON branch_best_by_policy_and_budget(branch_reference)
         """)
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_branch_best_by_policy
@@ -515,6 +695,26 @@ class ScoreCache:
                     f"ON {table_name}(branch_reference)"
                 )
             self._mark_migration_done('add_branch_references')
+        # Budget-specific results used to share the canonical table's key, so
+        # a branch's two facts overwrote one another.  Move them to the table
+        # that can hold both.  candidate_erd_by_policy goes with them: every
+        # row memoises a fold over branch rows under the old identity, and is
+        # trusted on a matching response-group count alone, so none of them can
+        # be relied on across the split.  Each is re-earned by one fold.
+        if not self._is_migration_done('split_budget_specific_branch_results'):  # pragma: migration
+            self._conn.execute("""
+                INSERT OR IGNORE INTO branch_best_by_policy_and_budget
+                    (branch_key, branch_reference, policy, answer_list_id,
+                     solve_budget, best_guess, best_score, updated_at, max_depth)
+                SELECT branch_key, branch_reference, policy, answer_list_id,
+                       solve_budget, best_guess, best_score, updated_at, max_depth
+                FROM branch_best_by_policy
+                WHERE solve_budget IS NOT NULL
+            """)
+            self._conn.execute(
+                "DELETE FROM branch_best_by_policy WHERE solve_budget IS NOT NULL")
+            self._conn.execute("DELETE FROM candidate_erd_by_policy")
+            self._mark_migration_done('split_budget_specific_branch_results')
 
     def _purge_legacy_rows(self, where, params, migration_name=None):
         """One-time cleanup of stale branch_best_by_policy rows.
@@ -540,15 +740,14 @@ class ScoreCache:
             self._mark_migration_done(migration_name)
 
     def _ensure_answer_list(self):
-        canonical = "\n".join(self.answer_words)
-        answer_list_id = hashlib.sha256(canonical.encode()).hexdigest()
+        list_id = answer_list_id(self.answer_words)
         now = int(time.time())
         self._conn.execute("""
             INSERT OR IGNORE INTO answer_list
                 (answer_list_id, answer_hash, answer_count, created_at)
             VALUES (?, ?, ?, ?)
-        """, (answer_list_id, answer_list_id, len(self.answer_words), now))
-        return answer_list_id
+        """, (list_id, list_id, len(self.answer_words), now))
+        return list_id
 
     def close(self):
         if self.checkpoint_on_close:
@@ -603,7 +802,7 @@ class ScoreCache:
         scoping, so the columns themselves can stay "best_guess"/"best_score"
         without re-litigating it.
         """
-        cached = self._mem_cache.get((branch_key, policy))
+        cached = self._mem_cache.get((branch_key, policy, None))
         if cached is not None:
             self.read_hits += 1
             return cached[:2]
@@ -615,32 +814,96 @@ class ScoreCache:
     def read_with_depth(self, branch_key, policy):
         """Like read(), but returns (best_guess, best_score, max_depth, solve_budget).
 
-        max_depth is the worst-case line length of best_guess's strategy (None
-        for legacy rows).  solve_budget is the reuse-range marker (see schema):
-        None = untainted, reusable at any budget >= max_depth; an int b =
-        tainted, reusable only at remaining budget == b.  A budget-aware caller
-        must apply that rule; a legacy row (max_depth None) is never reusable.
+        Answers for the branch's *unrestricted* result only — the optimum over
+        all strategies, reusable at any budget its own max_depth can meet.
+        solve_budget is therefore None on every row this returns except a
+        legacy one, and a legacy row (max_depth None) is never budget-reusable.
+        A search under a cap wants read_for_budget, which consults the
+        budget-specific results too.
         """
-        cached = self._mem_cache.get((branch_key, policy))
+        cached = self._mem_cache.get((branch_key, policy, None))
         if cached is not None:
             self.read_hits += 1
             return cached
         return self._read_full(branch_key, policy)
 
-    def _read_full(self, branch_key, policy):
-        row = self._conn.execute("""
-            SELECT best_guess, best_score, max_depth, solve_budget
-            FROM branch_best_by_policy
-            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
-        """, (branch_key, policy, self.answer_list_id)).fetchone()
+    def _read_stored_row(self, branch_key, policy, solve_budget):
+        """One scope's row straight from SQLite, with no session mirror.
+
+        The mirror can hold a value this connection read before another wrote,
+        so anything reconciling against what is *durably* stored — the write
+        path's conflict check — has to come here rather than through the
+        cached reads.
+        """
+        if solve_budget is None:
+            row = self._conn.execute("""
+                SELECT best_guess, best_score, max_depth, solve_budget
+                FROM branch_best_by_policy
+                WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+            """, (branch_key, policy, self.answer_list_id)).fetchone()
+        else:
+            row = self._conn.execute("""
+                SELECT best_guess, best_score, max_depth, solve_budget
+                FROM branch_best_by_policy_and_budget
+                WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+                  AND solve_budget = ?
+            """, (branch_key, policy, self.answer_list_id,
+                  solve_budget)).fetchone()
         if row is None:
+            return None
+        return (row["best_guess"], row["best_score"],
+                row["max_depth"], row["solve_budget"])
+
+    def _read_full(self, branch_key, policy):
+        result = self._read_stored_row(branch_key, policy, None)
+        if result is None:
             self.read_misses += 1
             return None
         self.read_hits += 1
-        result = (row["best_guess"], row["best_score"],
-                  row["max_depth"], row["solve_budget"])
-        self._mem_cache[(branch_key, policy)] = result
+        self._mem_cache[(branch_key, policy, None)] = result
         return result
+
+    def _read_full_at_budget(self, branch_key, policy, budget):
+        """The exact result stored for `branch_key` at remaining budget `budget`.
+
+        A budget-specific row is valid only at the budget it was solved under,
+        so it is looked up by that budget rather than filtered after the fact.
+        """
+        cached = self._mem_cache.get((branch_key, policy, budget))
+        if cached is not None:
+            self.read_hits += 1
+            return cached
+        result = self._read_stored_row(branch_key, policy, budget)
+        if result is None:
+            self.read_misses += 1
+            return None
+        self.read_hits += 1
+        self._mem_cache[(branch_key, policy, budget)] = result
+        return result
+
+    def read_for_budget(self, branch_key, policy, budget):
+        """The entry a search at `budget` should reuse, or None.
+
+        The unrestricted result wins whenever its strategy fits: it is
+        globally optimal, so it is also optimal within any budget its own
+        worst case can meet.  Only when it does not fit is the budget-specific
+        result consulted, and only the one solved at exactly this budget — a
+        row from another budget is optimal against a different set of feasible
+        strategies and is not an exact hit here.  An unlimited search
+        (budget None) reads the unrestricted table alone.
+
+        Returns the same (best_guess, best_score, max_depth, solve_budget)
+        tuple the plain reads return, so `wordle_engine._cache_reuse` remains
+        the one place the reuse rule is stated.
+        """
+        canonical = self.read_with_depth(branch_key, policy)
+        if budget is None:
+            return canonical
+        if canonical is not None:
+            max_remaining_depth = canonical[2]
+            if max_remaining_depth is not None and max_remaining_depth <= budget:
+                return canonical
+        return self._read_full_at_budget(branch_key, policy, budget)
 
     def reset_read_counters(self):
         self.read_hits = 0
@@ -651,8 +914,24 @@ class ScoreCache:
         """Store the word a policy's search judged best for a branch, its
         score, and (for depth-limited ERD) the worst-case line length of that
         strategy plus its reuse-range marker.  max_depth=None marks a
-        legacy/unbudgeted write; solve_budget None=untainted, int=tainted at
-        that budget (see read_with_depth / schema).
+        legacy/unbudgeted write.  solve_budget routes the result: None is the
+        unrestricted optimum and goes to branch_best_by_policy; an int is the
+        optimum under that cap and goes to branch_best_by_policy_and_budget.
+        The two are separate facts and neither displaces the other.
+
+        A result already stored for the same branch at the same scope is kept
+        rather than replaced, and **returned**: the caller must adopt it before
+        folding anything, because what a solver hands its parent has to be what
+        the cache durably holds.  Equal-cost strategies can differ in
+        max_depth, which is ancestor-visible, so a caller that kept its own
+        worst case would fold a parent the stored child does not support —
+        the inconsistent ancestry this schema exists to prevent, reached
+        without any overwrite.
+
+        Returns the durable (best_guess, best_score, max_depth, solve_budget).
+        A second result that disagrees on the *cost* cannot be reconciled by
+        adoption — both claim to be the optimum, so one of them is wrong — and
+        raises CacheWriteConflict.
 
         A transient 'disk I/O error' (e.g. iCloud File Provider Storage
         holding the cache file's lock during a sync pass — see checkpoint())
@@ -665,22 +944,68 @@ class ScoreCache:
         fails; the row is simply recomputed on a later run.
         """
         now = int(time.time())
+        entry = (best_guess, best_score, max_depth, solve_budget)
+        if solve_budget is None:
+            table = 'branch_best_by_policy'
+            conflict_target = 'branch_key, policy, answer_list_id'
+        else:
+            table = 'branch_best_by_policy_and_budget'
+            conflict_target = 'branch_key, policy, answer_list_id, solve_budget'
         try:
-            self._conn.execute("""
-                INSERT OR REPLACE INTO branch_best_by_policy
+            # Creating the row IS the check.  A read followed by an insert
+            # leaves a window two workers both pass through, and the second
+            # insert would then displace a result an ancestor may already have
+            # folded -- with neither writer noticing.  DO NOTHING makes the
+            # uniqueness constraint decide it: exactly one writer creates the
+            # row, and every other reconciles against what that one stored.
+            before = self._conn.total_changes
+            self._conn.execute(f"""
+                INSERT INTO {table}
                     (branch_key, branch_reference, policy, answer_list_id,
                      best_guess, best_score, updated_at, max_depth, solve_budget)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT({conflict_target}) DO NOTHING
             """, (branch_key, branch_reference(branch_key), policy, self.answer_list_id,
                   best_guess, best_score, now, max_depth, solve_budget))
-            self.write_count += 1
+            if self._conn.total_changes > before:
+                self.write_count += 1
+            else:
+                # Someone already holds this scope.  Read what they stored --
+                # from SQLite, not the mirror, which may predate their write.
+                stored = self._read_stored_row(branch_key, policy, solve_budget)
+                if stored is None:
+                    # Deleted between the insert and this read.  Nothing is
+                    # stored to reconcile against and nothing was written, so
+                    # do not mirror a value the cache does not hold; the
+                    # caller's own result is the only one in play.
+                    self._mem_cache.pop((branch_key, policy, solve_budget), None)
+                    return entry
+                if abs(stored[1] - best_score) > EXACT_SCORE_TOLERANCE:
+                    logger.error(
+                        "conflicting exact results for %s at policy=%s "
+                        "budget=%s: stored %s/%.6f, incoming %s/%.6f",
+                        branch_reference(branch_key), policy, solve_budget,
+                        stored[0], stored[1], best_guess, best_score)
+                    raise CacheWriteConflict(
+                        f"{branch_reference(branch_key)} at policy={policy} "
+                        f"budget={solve_budget}: stored {stored[1]!r}, "
+                        f"incoming {best_score!r}")
+                # The same optimum, reached again.  The stored row stands and
+                # the caller adopts it: an ancestor may already have folded its
+                # max_depth, and equal cost does not make two worst cases
+                # interchangeable.
+                self.redundant_write_count += 1
+                if stored[2] != max_depth:
+                    self.adopted_depth_count += 1
+                self._mem_cache[(branch_key, policy, solve_budget)] = stored
+                return stored
         except sqlite3.OperationalError as exc:
             if not _is_disk_io_error(exc):
                 raise
             logger.warning("write(%s, %s, %.3f) failed: %s",
                             policy, best_guess, best_score, exc)
-        self._mem_cache[(branch_key, policy)] = (
-            best_guess, best_score, max_depth, solve_budget)
+        self._mem_cache[(branch_key, policy, solve_budget)] = entry
+        return entry
 
     def read_loss(self, branch_key, policy, refresh=False):
         """Largest budget at which `branch_key` is proven a loss, or None.
@@ -756,9 +1081,13 @@ class ScoreCache:
             """SELECT branch_key FROM branch_best_by_policy
                WHERE branch_reference >= ? AND branch_reference < ?
                UNION
+               SELECT branch_key FROM branch_best_by_policy_and_budget
+               WHERE branch_reference >= ? AND branch_reference < ?
+               UNION
                SELECT branch_key FROM branch_loss_by_policy
                WHERE branch_reference >= ? AND branch_reference < ?""",
-            (digest_prefix, upper_bound, digest_prefix, upper_bound),
+            (digest_prefix, upper_bound, digest_prefix, upper_bound,
+             digest_prefix, upper_bound),
         ).fetchall()
         return [bytes(row["branch_key"]) for row in rows]
 
@@ -778,17 +1107,85 @@ class ScoreCache:
             return None
         return (row["best_guess"], row["best_score"], row["updated_at"])
 
+    def repair_max_depth(self, branch_key, policy, max_depth, solve_budget=None):
+        """Correct one branch row's max_depth without disturbing its strategy.
+
+        max_depth is fully determined by best_guess and the max_depth of that
+        guess's response groups, so a row whose stored value disagrees with
+        that fold can be set to the folded value without re-searching: the
+        strategy is unchanged, only the worst-case line length it was
+        recorded with.  best_guess, best_score and solve_budget are left as
+        they are.
+
+        updated_at moves to now, because the row did change: export_cache's
+        --since selects on it, so a repair that left the timestamp alone would
+        be dropped from every incremental export.  A full export does not
+        carry it either — import_cache keeps the target's row for a collision
+        that isn't tainted->untainted — so each cache is repaired on its own
+        machine rather than receiving another's repairs.
+
+        solve_budget names which of the branch's results to correct: None for
+        the unrestricted one, a budget for the result solved under that cap.
+
+        Returns True when a row was updated.
+        """
+        if solve_budget is None:
+            sql = """
+                UPDATE branch_best_by_policy SET max_depth = ?, updated_at = ?
+                WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+            """
+            params = (max_depth, int(time.time()), branch_key, policy,
+                      self.answer_list_id)
+        else:
+            sql = """
+                UPDATE branch_best_by_policy_and_budget
+                SET max_depth = ?, updated_at = ?
+                WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+                  AND solve_budget = ?
+            """
+            params = (max_depth, int(time.time()), branch_key, policy,
+                      self.answer_list_id, solve_budget)
+        cursor = self._conn.execute(sql, params)
+        self._mem_cache.pop((branch_key, policy, solve_budget), None)
+        return cursor.rowcount > 0
+
+    def delete_candidate_erds_for_policy(self, policy):
+        """Drop every folded candidate ERD for one policy, returning the count.
+
+        Each of those rows memoises a fold over branch_best_by_policy rows and
+        is trusted on a matching response-group count alone, so a change to any
+        branch row it folded leaves it stating a stale ERD and max_remaining_depth
+        that no read re-checks.  A repair pass changes branch rows without
+        changing any group count, and the memo is keyed by a hash of the
+        parent's word set, so there is no way to ask which folds touched a
+        given branch.  Dropping the policy's folds is therefore the narrowest
+        invalidation the schema supports; each is re-earned by one fold.
+        """
+        cursor = self._conn.execute("""
+            DELETE FROM candidate_erd_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+        """, (policy, self.answer_list_id))
+        return cursor.rowcount
+
     def delete(self, branch_key, policy):
-        """Remove a cached branch result so it gets recomputed.
+        """Remove every exact result for a branch so it gets recomputed.
 
         For invalidating an entry a spot-check has found to be inconsistent
-        with its own cached subtree.
+        with its own cached subtree.  Both scopes go: the branch is being
+        recomputed, not one of its results.
+
+        The session mirror is cleared by matching the branch rather than by
+        the scopes some prior query listed.  A budget-specific result written
+        between such a query and the delete is removed from SQLite by the
+        delete's own WHERE clause but would keep being served from memory.
         """
-        self._conn.execute("""
-            DELETE FROM branch_best_by_policy
-            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
-        """, (branch_key, policy, self.answer_list_id))
-        self._mem_cache.pop((branch_key, policy), None)
+        for table in ('branch_best_by_policy', 'branch_best_by_policy_and_budget'):
+            self._conn.execute(f"""
+                DELETE FROM {table}
+                WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+            """, (branch_key, policy, self.answer_list_id))
+        self._mem_cache.pop_matching(
+            lambda key: key[0] == branch_key and key[1] == policy)
 
     # ------------------------------------------------------------------
     # Response decomposition cache (guess -> per-answer pattern bytes)
@@ -1037,9 +1434,14 @@ class ScoreCache:
     def last_write_ts(self):
         """Return the unix timestamp of the most recent ERD write, or None."""
         row = self._conn.execute("""
-            SELECT MAX(updated_at) AS m
-            FROM branch_best_by_policy WHERE answer_list_id = ?
-        """, (self.answer_list_id,)).fetchone()
+            SELECT MAX(m) AS m FROM (
+                SELECT MAX(updated_at) AS m FROM branch_best_by_policy
+                WHERE answer_list_id = ?
+                UNION ALL
+                SELECT MAX(updated_at) AS m FROM branch_best_by_policy_and_budget
+                WHERE answer_list_id = ?
+            )
+        """, (self.answer_list_id, self.answer_list_id)).fetchone()
         return row["m"] if row else None
 
     def erd_report_summary(self, policy: str, recent_since: int) -> dict:
@@ -1051,6 +1453,16 @@ class ScoreCache:
             FROM branch_best_by_policy
             WHERE policy = ? AND answer_list_id = ?
         """, (recent_since, policy, self.answer_list_id)).fetchone()
+        # Counted separately, never unioned: a branch holding results at three
+        # budgets is one branch, and adding the rows up would report it as four.
+        budgeted = self._conn.execute("""
+            SELECT COUNT(*) AS budgeted_result_count,
+                   COUNT(DISTINCT branch_key) AS budgeted_branch_count,
+                   COUNT(CASE WHEN updated_at >= ? THEN 1 END)
+                       AS recent_budgeted_result_count
+            FROM branch_best_by_policy_and_budget
+            WHERE policy = ? AND answer_list_id = ?
+        """, (recent_since, policy, self.answer_list_id)).fetchone()
         loss = self._conn.execute("""
             SELECT COUNT(*) AS loss_branch_count
             FROM branch_loss_by_policy
@@ -1059,8 +1471,32 @@ class ScoreCache:
         return {
             "exact_branch_count": exact["exact_branch_count"],
             "recent_exact_branch_count": exact["recent_exact_branch_count"],
+            "budgeted_result_count": budgeted["budgeted_result_count"],
+            "budgeted_branch_count": budgeted["budgeted_branch_count"],
+            "recent_budgeted_result_count":
+                budgeted["recent_budgeted_result_count"],
             "loss_branch_count": loss["loss_branch_count"],
         }
+
+    @staticmethod
+    def _exact_row_for_budget(facts, budget):
+        """The row a search at `budget` would reuse, from one branch's facts.
+
+        Mirrors read_for_budget: the unrestricted result wins whenever its own
+        worst case fits, and only then does the budget-specific one apply.
+        `facts` is (unrestricted_row, {solve_budget: row}); either half may be
+        empty.
+        """
+        if facts is None:
+            return None
+        canonical, by_budget = facts
+        if budget is None:
+            return canonical
+        if canonical is not None:
+            max_remaining_depth = canonical["max_depth"]
+            if max_remaining_depth is not None and max_remaining_depth <= budget:
+                return canonical
+        return by_budget.get(budget)
 
     @staticmethod
     def _report_cache_state_from_rows(branch_key, exact_row, loss_row, budget):
@@ -1148,8 +1584,15 @@ class ScoreCache:
                        max_depth, solve_budget
                 FROM branch_best_by_policy
                 WHERE policy = ? AND answer_list_id = ?
+                  AND branch_key IN ({placeholders})
+                UNION ALL
+                SELECT branch_key, best_guess, best_score, updated_at,
+                       max_depth, solve_budget
+                FROM branch_best_by_policy_and_budget
+                WHERE policy = ? AND answer_list_id = ?
                   AND branch_key IN ({placeholders})""",
-            [policy, self.answer_list_id, *keys],
+            [policy, self.answer_list_id, *keys,
+             policy, self.answer_list_id, *keys],
         ).fetchall()
         loss_rows = self._conn.execute(
             f"""SELECT branch_key, loss_budget, updated_at
@@ -1158,11 +1601,12 @@ class ScoreCache:
                   AND branch_key IN ({placeholders})""",
             [policy, self.answer_list_id, *keys],
         ).fetchall()
-        exact_by_key = {bytes(row["branch_key"]): row for row in exact_rows}
+        exact_by_key = _branch_facts_by_key(exact_rows)
         loss_by_key = {bytes(row["branch_key"]): row for row in loss_rows}
         return {
             key: self._report_cache_state_from_rows(
-                key, exact_by_key.get(key), loss_by_key.get(key), budget
+                key, self._exact_row_for_budget(exact_by_key.get(key), budget),
+                loss_by_key.get(key), budget
             )
             for key in keys
         }
@@ -1176,16 +1620,18 @@ class ScoreCache:
         rows carry the same columns `_report_cache_state_from_rows` reads, so
         the caller reuses that reusability gate unchanged.
         """
-        exact_by_key = {
-            bytes(row["branch_key"]): row
-            for row in self._conn.execute(
-                """SELECT branch_key, best_guess, best_score, updated_at,
-                          max_depth, solve_budget
-                   FROM branch_best_by_policy
-                   WHERE policy = ? AND answer_list_id = ?""",
-                (policy, self.answer_list_id),
-            )
-        }
+        exact_by_key = _branch_facts_by_key(self._conn.execute(
+            """SELECT branch_key, best_guess, best_score, updated_at,
+                      max_depth, solve_budget
+               FROM branch_best_by_policy
+               WHERE policy = ? AND answer_list_id = ?
+               UNION ALL
+               SELECT branch_key, best_guess, best_score, updated_at,
+                      max_depth, solve_budget
+               FROM branch_best_by_policy_and_budget
+               WHERE policy = ? AND answer_list_id = ?""",
+            (policy, self.answer_list_id, policy, self.answer_list_id),
+        ))
         loss_by_key = {
             bytes(row["branch_key"]): row
             for row in self._conn.execute(
@@ -1211,7 +1657,8 @@ class ScoreCache:
         return {
             bytes(branch_key): self._report_cache_state_from_rows(
                 bytes(branch_key),
-                exact_by_key.get(bytes(branch_key)),
+                self._exact_row_for_budget(
+                    exact_by_key.get(bytes(branch_key)), budget),
                 loss_by_key.get(bytes(branch_key)),
                 budget,
             )
@@ -1225,9 +1672,15 @@ class ScoreCache:
                    max_depth, solve_budget
             FROM branch_best_by_policy
             WHERE policy = ? AND answer_list_id = ? AND updated_at >= ?
+            UNION ALL
+            SELECT branch_key, best_guess, best_score, updated_at,
+                   max_depth, solve_budget
+            FROM branch_best_by_policy_and_budget
+            WHERE policy = ? AND answer_list_id = ? AND updated_at >= ?
             ORDER BY updated_at DESC, branch_key
             LIMIT ?
-        """, (policy, self.answer_list_id, since, limit)).fetchall()
+        """, (policy, self.answer_list_id, since,
+              policy, self.answer_list_id, since, limit)).fetchall()
         return [
             {
                 "branch_key": bytes(row["branch_key"]),
@@ -1243,12 +1696,20 @@ class ScoreCache:
 
     def report_cache_distributions(self, policy) -> dict:
         """Return exact/loss counts grouped by their cache reuse axes."""
+        # Rows, not branches: a branch with results at three budgets
+        # contributes one unrestricted row and three budget-specific ones, and
+        # the by_solve_budget axis is what tells them apart.
         exact_rows = self._conn.execute("""
             SELECT max_depth, solve_budget, COUNT(*) AS branch_count
             FROM branch_best_by_policy
             WHERE policy = ? AND answer_list_id = ?
             GROUP BY max_depth, solve_budget
-        """, (policy, self.answer_list_id)).fetchall()
+            UNION ALL
+            SELECT max_depth, solve_budget, COUNT(*) AS branch_count
+            FROM branch_best_by_policy_and_budget
+            WHERE policy = ? AND answer_list_id = ?
+            GROUP BY max_depth, solve_budget
+        """, (policy, self.answer_list_id, policy, self.answer_list_id)).fetchall()
         loss_rows = self._conn.execute("""
             SELECT loss_budget, COUNT(*) AS branch_count
             FROM branch_loss_by_policy
@@ -1318,7 +1779,11 @@ class MemoryScoreCache:
     """
 
     def __init__(self):
-        # (scope, branch_key, policy) -> (best_guess, best_score, max_depth, solve_budget)
+        # (scope, branch_key, policy, solve_budget) ->
+        #     (best_guess, best_score, max_depth, solve_budget)
+        # solve_budget is part of the key for the same reason it is in SQLite:
+        # a branch's unrestricted optimum and its optimum under a cap are
+        # different facts, and one entry cannot hold both.
         self._data = {}
         # (scope, branch_key, policy) -> largest budget proven a loss
         self._losses = {}
@@ -1338,7 +1803,7 @@ class MemoryScoreCache:
         self._scope = fingerprint
 
     def read(self, branch_key, policy):
-        result = self._data.get((self._scope, branch_key, policy))
+        result = self._data.get((self._scope, branch_key, policy, None))
         if result is None:
             self.read_misses += 1
             return None
@@ -1346,7 +1811,23 @@ class MemoryScoreCache:
         return result[:2]
 
     def read_with_depth(self, branch_key, policy):
-        result = self._data.get((self._scope, branch_key, policy))
+        result = self._data.get((self._scope, branch_key, policy, None))
+        if result is None:
+            self.read_misses += 1
+            return None
+        self.read_hits += 1
+        return result
+
+    def read_for_budget(self, branch_key, policy, budget):
+        """The entry a search at `budget` should reuse — see ScoreCache."""
+        canonical = self.read_with_depth(branch_key, policy)
+        if budget is None:
+            return canonical
+        if canonical is not None:
+            max_remaining_depth = canonical[2]
+            if max_remaining_depth is not None and max_remaining_depth <= budget:
+                return canonical
+        result = self._data.get((self._scope, branch_key, policy, budget))
         if result is None:
             self.read_misses += 1
             return None
@@ -1359,9 +1840,26 @@ class MemoryScoreCache:
 
     def write(self, branch_key, policy, best_guess, best_score,
               max_depth=None, solve_budget=None):
-        self._data[(self._scope, branch_key, policy)] = (
-            best_guess, best_score, max_depth, solve_budget)
+        """Store an exact result, or adopt the one already held.
+
+        Same invariant as ScoreCache.write, for the same reason: max_depth is
+        ancestor-visible, so a result already stored for this scope stands and
+        is returned for the caller to adopt rather than being replaced.  A
+        disagreement on cost raises CacheWriteConflict.
+        """
+        key = (self._scope, branch_key, policy, solve_budget)
+        stored = self._data.get(key)
+        if stored is not None:
+            if abs(stored[1] - best_score) > EXACT_SCORE_TOLERANCE:
+                raise CacheWriteConflict(
+                    f"{branch_reference(branch_key)} at policy={policy} "
+                    f"budget={solve_budget}: stored {stored[1]!r}, "
+                    f"incoming {best_score!r}")
+            return stored
+        entry = (best_guess, best_score, max_depth, solve_budget)
+        self._data[key] = entry
         self.write_count += 1
+        return entry
 
     def read_loss(self, branch_key, policy, refresh=False):
         return self._losses.get((self._scope, branch_key, policy))

@@ -125,7 +125,10 @@ class TestSwarmVsDirectEngineOverhead(unittest.TestCase):
 
         score_cache = ScoreCache(cache_path, self._branch,
                                  checkpoint_on_close=False)
-        row = score_cache.read(self._branch_key, ERD_ALL)
+        # A solve whose floor fired records its result under the branch's
+        # budget rather than as the unrestricted optimum, so read it back the
+        # way a search at that budget would.
+        row = score_cache.read_for_budget(self._branch_key, ERD_ALL, self._BUDGET)
         score_cache.close()
         erd = row[1] if row is not None else None
 

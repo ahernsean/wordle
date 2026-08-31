@@ -1031,7 +1031,9 @@ class Solution:
                             best = s
                             best_guess = candidate
                     if lc and best_guess is not None and branch_key is not None:
-                        lc.write(branch_key, policy, best_guess, best)
+                        durable = lc.write(branch_key, policy, best_guess, best)
+                        if durable is not None:
+                            best_guess, best = durable[:2]
                         cache_all_scores(best_guess, branch_words, lc, branch_key,
                                          cache=cache)
 
@@ -1700,7 +1702,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     branch_key = ScoreCache.encode_subset(branch_words)
     if score_cache:
         reuse = _cache_reuse(
-            score_cache.read_with_depth(branch_key, policy), budget)
+            score_cache.read_for_budget(branch_key, policy, budget), budget)
         if reuse is not None:
             return (SOLVED, *reuse)   # cached values are exact optima
         # A loss proven within b guesses is a loss within any budget <= b.
@@ -1871,8 +1873,15 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         # optimum: finding a candidate below the ceiling means the ceiling only
         # pruned provably-worse candidates, so the value is universally valid.
         solve_budget = None if (budget is None or not node_floor) else budget
-        score_cache.write(branch_key, policy, best_guess, best_erd,
-                          max_depth=best_max_remaining_depth, solve_budget=solve_budget)
+        # Adopt whatever the cache durably holds for this scope.  Another
+        # solver may already own it with an equal-cost strategy of a different
+        # worst case, and returning our own max_depth would fold a parent the
+        # stored child does not support.
+        durable = score_cache.write(
+            branch_key, policy, best_guess, best_erd,
+            max_depth=best_max_remaining_depth, solve_budget=solve_budget)
+        if durable is not None:
+            best_guess, best_erd, best_max_remaining_depth = durable[:3]
         cache_all_scores(best_guess, branch_words, score_cache, branch_key, cache=cache)
 
     if mid_loop_publisher is not None and token is not None:
