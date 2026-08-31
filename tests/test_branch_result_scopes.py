@@ -10,7 +10,9 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 from cache_sqlite import CacheWriteConflict, ScoreCache
 from wordle_engine import ERD_ALL, _cache_reuse
@@ -518,3 +520,147 @@ class TransferTest(_CacheTest):
         finally:
             conn.execute("DETACH DATABASE src")
             conn.close()
+
+
+class ConcurrentWriteTest(_CacheTest):
+    """Two writers reaching one scope at once.
+
+    Creating the row is the check: a read followed by an insert leaves a
+    window both writers pass through, and the loser's insert would then
+    displace a result an ancestor may already have folded, with neither
+    noticing.  These drive that window directly.
+    """
+
+    SCOPES = [('unrestricted', None), ('budget-specific', 3)]
+
+    def test_a_stale_miss_cannot_displace_a_durable_result(self):
+        for label, scope in self.SCOPES:
+            with self.subTest(scope=label):
+                observer = self.cache(f'{label}-a.sqlite3')
+                writer = ScoreCache(observer.db_path, WORDS,
+                                    checkpoint_on_close=False)
+                self.addCleanup(writer.close)
+                # The observer looks first and sees nothing...
+                self.assertIsNone(
+                    observer.read_for_budget(self.key, ERD_ALL, scope))
+                # ...the writer stores a result...
+                writer.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3,
+                             solve_budget=scope)
+                # ...and the observer writes on the strength of its stale miss.
+                with self.assertLogs('wordle', level='ERROR') as logged:
+                    with self.assertRaises(CacheWriteConflict):
+                        observer.write(self.key, ERD_ALL, "slate", 2.5,
+                                       max_depth=3, solve_budget=scope)
+                self.assertIn('conflicting exact results',
+                              '\n'.join(logged.output))
+                self.assertEqual(
+                    writer.read_for_budget(self.key, ERD_ALL, scope),
+                    ("crane", 2.0, 3, scope))
+
+    def test_a_stale_miss_with_an_agreeing_value_keeps_the_incumbent(self):
+        # Equal cost, different worst case: the stored depth is the one an
+        # ancestor folded, so the loser must not replace it.
+        for label, scope in self.SCOPES:
+            with self.subTest(scope=label):
+                observer = self.cache(f'{label}-b.sqlite3')
+                writer = ScoreCache(observer.db_path, WORDS,
+                                    checkpoint_on_close=False)
+                self.addCleanup(writer.close)
+                self.assertIsNone(
+                    observer.read_for_budget(self.key, ERD_ALL, scope))
+                writer.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3,
+                             solve_budget=scope)
+
+                observer.write(self.key, ERD_ALL, "slate", 2.0, max_depth=4,
+                               solve_budget=scope)
+                self.assertEqual(observer.redundant_write_count, 1)
+                self.assertEqual(
+                    observer.read_for_budget(self.key, ERD_ALL, scope),
+                    ("crane", 2.0, 3, scope))
+
+    def _race(self, scope, scores):
+        """Two connections writing one scope, released together."""
+        path = os.path.join(self._dir, f'race-{scope}-{scores[1]}.sqlite3')
+        ScoreCache(path, WORDS, checkpoint_on_close=False).close()
+        barrier = threading.Barrier(len(scores))
+        outcomes = {}
+
+        def run(name, guess, score):
+            score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
+            try:
+                score_cache.read_for_budget(self.key, ERD_ALL, scope)
+                barrier.wait()
+                score_cache.write(self.key, ERD_ALL, guess, score,
+                                  max_depth=3, solve_budget=scope)
+                outcomes[name] = None
+            except CacheWriteConflict as conflict:
+                outcomes[name] = conflict
+            finally:
+                score_cache.close()
+
+        threads = [threading.Thread(target=run, args=(name, guess, score))
+                   for name, guess, score in scores]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        after = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        self.addCleanup(after.close)
+        table = CANONICAL if scope is None else BUDGETED
+        rows = after._conn.execute(
+            f"SELECT best_guess, best_score FROM {table}").fetchall()
+        return outcomes, [tuple(row) for row in rows]
+
+    def test_racing_writers_that_disagree_leave_one_result_and_one_conflict(self):
+        for label, scope in self.SCOPES:
+            with self.subTest(scope=label):
+                with self.assertLogs('wordle', level='ERROR'):
+                    outcomes, rows = self._race(
+                        scope, [("a", "crane", 2.0), ("b", "slate", 2.5)])
+                self.assertEqual(len(rows), 1)
+                raised = [name for name, outcome in outcomes.items()
+                          if outcome is not None]
+                self.assertEqual(len(raised), 1, outcomes)
+                # The survivor is whoever created the row, and the loser is
+                # the one that was told about it.
+                self.assertIn(rows[0], [("crane", 2.0), ("slate", 2.5)])
+
+    def test_racing_writers_that_agree_leave_one_result_and_no_conflict(self):
+        for label, scope in self.SCOPES:
+            with self.subTest(scope=label):
+                outcomes, rows = self._race(
+                    scope, [("a", "crane", 2.0), ("b", "crane", 2.0)])
+                self.assertEqual(rows, [("crane", 2.0)])
+                self.assertEqual([o for o in outcomes.values() if o], [])
+
+    def test_a_result_deleted_before_the_reconcile_is_not_resurrected(self):
+        score_cache = self.cache()
+        score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
+        with mock.patch.object(ScoreCache, '_read_stored_row',
+                               return_value=None):
+            score_cache.write(self.key, ERD_ALL, "slate", 2.5, max_depth=4)
+        # Nothing was written and nothing is mirrored, so the next read goes
+        # back to the database rather than serving a value it never stored.
+        self.assertIsNone(
+            score_cache._mem_cache.get((self.key, ERD_ALL, None)))
+        self.assertEqual(self.count(score_cache, CANONICAL), 1)
+
+    def test_delete_clears_every_mirrored_scope_for_the_branch(self):
+        # The mirror can hold a scope no query of the delete's own would list
+        # -- one written after such a query and removed by the delete's WHERE
+        # clause -- and serving that from memory outlives the row itself.
+        score_cache = self.cache()
+        score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=4)
+        score_cache.write(self.key, ERD_ALL, "slate", 2.5, max_depth=3,
+                          solve_budget=3)
+        self.assertIsNotNone(score_cache.read_with_depth(self.key, ERD_ALL))
+        self.assertIsNotNone(score_cache.read_for_budget(self.key, ERD_ALL, 3))
+        score_cache._mem_cache[(self.key, ERD_ALL, 4)] = ("trace", 2.2, 2, 4)
+
+        score_cache.delete(self.key, ERD_ALL)
+        for scope in (None, 3, 4):
+            self.assertIsNone(
+                score_cache._mem_cache.get((self.key, ERD_ALL, scope)),
+                f"scope {scope} still mirrored after delete")
+        self.assertIsNone(score_cache.read_for_budget(self.key, ERD_ALL, 4))

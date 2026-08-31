@@ -139,6 +139,15 @@ equal-cost strategies can differ in `max_depth`, and an ancestor folded the
 stored one.  A second result that disagrees on cost raises
 `CacheWriteConflict`.
 
+**Creating the row is the check.**  `write` inserts with `ON CONFLICT DO
+NOTHING` and reconciles only when the insert finds the scope taken; a read
+followed by an insert leaves a window two workers both pass through, and the
+loser's write would displace a result an ancestor had folded with neither
+noticing.  The reconciliation reads through `_read_stored_row`, never the
+session mirror, which can predate the other writer.  Anything else that
+invalidates a branch clears the mirror by matching the branch, not by the
+scopes some earlier query happened to list.
+
 Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
 report, or query that means branches must not union the two: a branch with
 results at three budgets is one branch.

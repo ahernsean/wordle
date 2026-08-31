@@ -97,6 +97,11 @@ class _LRUDict:
     def pop(self, key, *args):
         return self._data.pop(key, *args)
 
+    def pop_matching(self, predicate):
+        """Drop every entry whose key satisfies predicate."""
+        for key in [key for key in self._data if predicate(key)]:
+            del self._data[key]
+
     def __len__(self):
         return len(self._data)
 
@@ -748,18 +753,39 @@ class ScoreCache:
             return cached
         return self._read_full(branch_key, policy)
 
-    def _read_full(self, branch_key, policy):
-        row = self._conn.execute("""
-            SELECT best_guess, best_score, max_depth, solve_budget
-            FROM branch_best_by_policy
-            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
-        """, (branch_key, policy, self.answer_list_id)).fetchone()
+    def _read_stored_row(self, branch_key, policy, solve_budget):
+        """One scope's row straight from SQLite, with no session mirror.
+
+        The mirror can hold a value this connection read before another wrote,
+        so anything reconciling against what is *durably* stored — the write
+        path's conflict check — has to come here rather than through the
+        cached reads.
+        """
+        if solve_budget is None:
+            row = self._conn.execute("""
+                SELECT best_guess, best_score, max_depth, solve_budget
+                FROM branch_best_by_policy
+                WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+            """, (branch_key, policy, self.answer_list_id)).fetchone()
+        else:
+            row = self._conn.execute("""
+                SELECT best_guess, best_score, max_depth, solve_budget
+                FROM branch_best_by_policy_and_budget
+                WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
+                  AND solve_budget = ?
+            """, (branch_key, policy, self.answer_list_id,
+                  solve_budget)).fetchone()
         if row is None:
+            return None
+        return (row["best_guess"], row["best_score"],
+                row["max_depth"], row["solve_budget"])
+
+    def _read_full(self, branch_key, policy):
+        result = self._read_stored_row(branch_key, policy, None)
+        if result is None:
             self.read_misses += 1
             return None
         self.read_hits += 1
-        result = (row["best_guess"], row["best_score"],
-                  row["max_depth"], row["solve_budget"])
         self._mem_cache[(branch_key, policy, None)] = result
         return result
 
@@ -773,18 +799,11 @@ class ScoreCache:
         if cached is not None:
             self.read_hits += 1
             return cached
-        row = self._conn.execute("""
-            SELECT best_guess, best_score, max_depth, solve_budget
-            FROM branch_best_by_policy_and_budget
-            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
-              AND solve_budget = ?
-        """, (branch_key, policy, self.answer_list_id, budget)).fetchone()
-        if row is None:
+        result = self._read_stored_row(branch_key, policy, budget)
+        if result is None:
             self.read_misses += 1
             return None
         self.read_hits += 1
-        result = (row["best_guess"], row["best_score"],
-                  row["max_depth"], row["solve_budget"])
         self._mem_cache[(branch_key, policy, budget)] = result
         return result
 
@@ -846,16 +865,40 @@ class ScoreCache:
         """
         now = int(time.time())
         entry = (best_guess, best_score, max_depth, solve_budget)
-        table = ('branch_best_by_policy' if solve_budget is None
-                 else 'branch_best_by_policy_and_budget')
+        if solve_budget is None:
+            table = 'branch_best_by_policy'
+            conflict_target = 'branch_key, policy, answer_list_id'
+        else:
+            table = 'branch_best_by_policy_and_budget'
+            conflict_target = 'branch_key, policy, answer_list_id, solve_budget'
         try:
-            # The conflict check reads before it writes, and shares the
-            # disk-I/O handling below for the same reason the insert does.
-            stored = (self.read_with_depth(branch_key, policy)
-                      if solve_budget is None
-                      else self._read_full_at_budget(branch_key, policy,
-                                                     solve_budget))
-            if stored is not None:
+            # Creating the row IS the check.  A read followed by an insert
+            # leaves a window two workers both pass through, and the second
+            # insert would then displace a result an ancestor may already have
+            # folded -- with neither writer noticing.  DO NOTHING makes the
+            # uniqueness constraint decide it: exactly one writer creates the
+            # row, and every other reconciles against what that one stored.
+            before = self._conn.total_changes
+            self._conn.execute(f"""
+                INSERT INTO {table}
+                    (branch_key, branch_reference, policy, answer_list_id,
+                     best_guess, best_score, updated_at, max_depth, solve_budget)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT({conflict_target}) DO NOTHING
+            """, (branch_key, branch_reference(branch_key), policy, self.answer_list_id,
+                  best_guess, best_score, now, max_depth, solve_budget))
+            if self._conn.total_changes > before:
+                self.write_count += 1
+            else:
+                # Someone already holds this scope.  Read what they stored --
+                # from SQLite, not the mirror, which may predate their write.
+                stored = self._read_stored_row(branch_key, policy, solve_budget)
+                if stored is None:
+                    # Deleted between the insert and this read.  Nothing is
+                    # stored to reconcile against and nothing was written, so
+                    # do not mirror a value the cache does not hold.
+                    self._mem_cache.pop((branch_key, policy, solve_budget), None)
+                    return
                 if abs(stored[1] - best_score) > EXACT_SCORE_TOLERANCE:
                     logger.error(
                         "conflicting exact results for %s at policy=%s "
@@ -873,14 +916,6 @@ class ScoreCache:
                 self.redundant_write_count += 1
                 self._mem_cache[(branch_key, policy, solve_budget)] = stored
                 return
-            self._conn.execute(f"""
-                INSERT OR REPLACE INTO {table}
-                    (branch_key, branch_reference, policy, answer_list_id,
-                     best_guess, best_score, updated_at, max_depth, solve_budget)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (branch_key, branch_reference(branch_key), policy, self.answer_list_id,
-                  best_guess, best_score, now, max_depth, solve_budget))
-            self.write_count += 1
         except sqlite3.OperationalError as exc:
             if not _is_disk_io_error(exc):
                 raise
@@ -1049,22 +1084,24 @@ class ScoreCache:
         return cursor.rowcount
 
     def delete(self, branch_key, policy):
-        """Remove a cached branch result so it gets recomputed.
+        """Remove every exact result for a branch so it gets recomputed.
 
         For invalidating an entry a spot-check has found to be inconsistent
-        with its own cached subtree.
+        with its own cached subtree.  Both scopes go: the branch is being
+        recomputed, not one of its results.
+
+        The session mirror is cleared by matching the branch rather than by
+        the scopes some prior query listed.  A budget-specific result written
+        between such a query and the delete is removed from SQLite by the
+        delete's own WHERE clause but would keep being served from memory.
         """
-        budgets = [row["solve_budget"] for row in self._conn.execute("""
-            SELECT solve_budget FROM branch_best_by_policy_and_budget
-            WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
-        """, (branch_key, policy, self.answer_list_id))]
         for table in ('branch_best_by_policy', 'branch_best_by_policy_and_budget'):
             self._conn.execute(f"""
                 DELETE FROM {table}
                 WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
             """, (branch_key, policy, self.answer_list_id))
-        for scope in [None, *budgets]:
-            self._mem_cache.pop((branch_key, policy, scope), None)
+        self._mem_cache.pop_matching(
+            lambda key: key[0] == branch_key and key[1] == policy)
 
     # ------------------------------------------------------------------
     # Response decomposition cache (guess -> per-answer pattern bytes)

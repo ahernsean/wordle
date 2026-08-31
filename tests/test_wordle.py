@@ -727,7 +727,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
                 self._real = real
 
             def execute(self, sql, *a, **k):
-                if sql.lstrip().startswith("INSERT OR REPLACE INTO branch_best_by_policy"):
+                if sql.lstrip().startswith("INSERT INTO branch_best_by_policy"):
                     raise sqlite3.OperationalError("disk I/O error")
                 return self._real.execute(sql, *a, **k)
 
@@ -1645,7 +1645,7 @@ class TestMinExpectedGuesses(unittest.TestCase):
                     self._real = real
 
                 def execute(self, sql, *a, **k):
-                    if sql.lstrip().startswith("INSERT OR REPLACE INTO branch_best_by_policy"):
+                    if sql.lstrip().startswith("INSERT INTO branch_best_by_policy"):
                         raise sqlite3.OperationalError("disk I/O error")
                     return self._real.execute(sql, *a, **k)
 

@@ -650,6 +650,11 @@ against a different set of feasible strategies.  An unlimited search reads the
 unrestricted table alone.  `ScoreCache.read_for_budget` makes that selection;
 `wordle_engine._cache_reuse` remains the one place the rule is stated.
 
+Writes create the row with `ON CONFLICT DO NOTHING`, so the uniqueness
+constraint decides who owns a scope: exactly one worker creates it and every
+other reconciles against what that one stored.  A read followed by an insert
+would leave a window two workers both pass through.
+
 **A second exact result for a branch at a scope it already holds does not
 replace it.**  Two exact searches of one scope agree on the cost, and
 equal-cost strategies can still differ in `max_depth`, so overwriting would
