@@ -499,8 +499,24 @@ class TransferTest(_CacheTest):
         path = os.path.join(self._dir, "ancient.sqlite3")
         score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
         answer_list_id = score_cache.answer_list_id
+        # Rebuild the canonical table without solve_budget rather than
+        # dropping the column: ALTER TABLE ... DROP COLUMN needs SQLite 3.35,
+        # and rocky runs 3.34.
         score_cache._conn.execute(f"DROP TABLE {BUDGETED}")
-        score_cache._conn.execute(f"ALTER TABLE {CANONICAL} DROP COLUMN solve_budget")
+        score_cache._conn.execute(f"DROP TABLE {CANONICAL}")
+        score_cache._conn.execute(f"""
+            CREATE TABLE {CANONICAL} (
+                branch_key   BLOB NOT NULL,
+                branch_reference TEXT,
+                policy       TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL,
+                best_guess   TEXT NOT NULL,
+                best_score   REAL NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                max_depth    INTEGER,
+                PRIMARY KEY (branch_key, policy, answer_list_id)
+            )
+        """)
         score_cache._conn.execute(
             f"INSERT OR REPLACE INTO {CANONICAL} "
             "(branch_key, policy, answer_list_id, best_guess, best_score, "
@@ -919,6 +935,80 @@ class ImportConflictTest(_CacheTest):
         conflicts = import_cache._conflicting_exact_results(
             conn, src_tables, limit=2)
         self.assertEqual(len(conflicts), 2)
+
+
+class PreSplitReadOnlyTest(_CacheTest):
+    """Inspecting a cache written before the split, without migrating it.
+
+    The migration that creates the budget table runs in _ensure_schema, which
+    a read-only open deliberately skips — so every reader spanning both scopes
+    would fail on exactly the databases a read-only open exists to inspect.
+    """
+
+    def pre_split_cache(self, name="presplit.sqlite3"):
+        """A cache in the shape one written before the split has: no budget
+        table, and its budget-specific results inline with solve_budget set."""
+        path = os.path.join(self._dir, name)
+        score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        answer_list_id = score_cache.answer_list_id
+        score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
+        score_cache._conn.execute(
+            f"INSERT OR REPLACE INTO {CANONICAL} "
+            "(branch_key, policy, answer_list_id, best_guess, best_score, "
+            " updated_at, max_depth, solve_budget) VALUES (?,?,?,'slate',2.5,9,2,3)",
+            (ScoreCache.encode_subset(WORDS[:2]), ERD_ALL, answer_list_id))
+        score_cache._conn.execute(f"DROP TABLE {BUDGETED}")
+        score_cache._conn.execute(
+            "DELETE FROM schema_migrations "
+            "WHERE name = 'split_budget_specific_branch_results'")
+        score_cache.close()
+        return path
+
+    def test_a_read_only_open_can_read_a_cache_that_predates_the_split(self):
+        path = self.pre_split_cache()
+        score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False,
+                                 read_only=True)
+        self.addCleanup(score_cache.close)
+        self.assertEqual(score_cache.read_with_depth(self.key, ERD_ALL),
+                         ("crane", 2.0, 3, None))
+        # No budget table, so no budget-specific result is separately stored.
+        self.assertIsNone(
+            score_cache._read_full_at_budget(self.key, ERD_ALL, 3))
+        self.assertEqual(
+            score_cache.read_for_budget(self.key, ERD_ALL, 3)[0], "crane")
+
+    def test_the_reports_span_both_scopes_on_a_pre_split_cache(self):
+        path = self.pre_split_cache("presplit-reports.sqlite3")
+        score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False,
+                                 read_only=True)
+        self.addCleanup(score_cache.close)
+        summary = score_cache.erd_report_summary(ERD_ALL, 0)
+        self.assertEqual(summary["budgeted_result_count"], 0)
+        self.assertIsNotNone(score_cache.last_write_ts())
+        self.assertEqual(
+            score_cache.report_branch_state(self.key, ERD_ALL, budget=3)
+            ["best_guess"], "crane")
+        exact_by_key, _loss = score_cache.report_branch_row_maps(ERD_ALL)
+        self.assertIn(self.key, exact_by_key)
+
+    def test_the_audit_runs_over_a_pre_split_cache(self):
+        from verify_branch_depths import iter_rows
+        path = self.pre_split_cache("presplit-audit.sqlite3")
+        score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False,
+                                 read_only=True)
+        self.addCleanup(score_cache.close)
+        rows = list(iter_rows(score_cache, ERD_ALL))
+        # Both results are there; each still names the scope it belongs to,
+        # which is what the fold reads them at.
+        self.assertEqual(sorted(row["solve_budget"] or 0 for row in rows), [0, 3])
+
+    def test_supplying_the_table_writes_nothing_to_the_file(self):
+        path = self.pre_split_cache("presplit-untouched.sqlite3")
+        with open(path, 'rb') as handle:
+            before = handle.read()
+        ScoreCache(path, WORDS, checkpoint_on_close=False, read_only=True).close()
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), before)
 
 
 class EquivalenceRuleTest(unittest.TestCase):
