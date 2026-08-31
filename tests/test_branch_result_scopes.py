@@ -14,7 +14,8 @@ import threading
 import unittest
 from unittest import mock
 
-from cache_sqlite import CacheWriteConflict, ScoreCache
+from cache_sqlite import (CacheWriteConflict, ScoreCache,
+                          branch_reference, exact_results_agree)
 from wordle_engine import ERD_ALL, _cache_reuse
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
@@ -634,6 +635,86 @@ class ConcurrentWriteTest(_CacheTest):
                 self.assertEqual(rows, [("crane", 2.0)])
                 self.assertEqual([o for o in outcomes.values() if o], [])
 
+    def test_an_equal_cost_result_is_adopted_rather_than_kept_locally(self):
+        # The incumbent stands, and write hands it back: max_depth is
+        # ancestor-visible, so a solver that kept its own worst case would
+        # fold a parent the stored child does not support -- the same
+        # inconsistent ancestry, reached without any overwrite.
+        for label, scope in self.SCOPES:
+            with self.subTest(scope=label):
+                score_cache = self.cache(f'{label}-adopt.sqlite3')
+                score_cache.write(self.key, ERD_ALL, "crane", 2.0,
+                                  max_depth=3, solve_budget=scope)
+                durable = score_cache.write(self.key, ERD_ALL, "slate", 2.0,
+                                            max_depth=4, solve_budget=scope)
+                self.assertEqual(durable, ("crane", 2.0, 3, scope))
+                self.assertEqual(score_cache.adopted_depth_count, 1)
+                self.assertEqual(
+                    score_cache.read_for_budget(self.key, ERD_ALL, scope),
+                    ("crane", 2.0, 3, scope))
+
+    def test_creating_the_row_returns_what_was_stored(self):
+        score_cache = self.cache()
+        self.assertEqual(
+            score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3),
+            ("crane", 2.0, 3, None))
+        self.assertEqual(score_cache.adopted_depth_count, 0)
+
+    def test_the_memory_cache_holds_the_same_invariant(self):
+        from cache_sqlite import MemoryScoreCache
+        memory = MemoryScoreCache()
+        memory.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
+        self.assertEqual(
+            memory.write(self.key, ERD_ALL, "slate", 2.0, max_depth=4),
+            ("crane", 2.0, 3, None))
+        self.assertEqual(memory.read_with_depth(self.key, ERD_ALL),
+                         ("crane", 2.0, 3, None))
+        with self.assertRaises(CacheWriteConflict):
+            memory.write(self.key, ERD_ALL, "slate", 2.5, max_depth=3)
+
+    def _solve(self, answers, score_cache, budget=4):
+        from wordle_engine import ResponseCache, _solve_subset
+        return _solve_subset(answers, ResponseCache(answers), score_cache,
+                             budget, None, answers, ERD_ALL,
+                             None, None, None, None)
+
+    def test_a_solve_returns_the_depth_the_cache_holds(self):
+        # The engine must adopt before folding, so what _solve_subset hands
+        # its caller is what a parent reads back.  Driving that needs a
+        # competing incumbent the solve does not see until it writes -- the
+        # real interleaving, where another worker stored first.
+        from wordle_engine import SOLVED
+        answers = ["crane", "slate", "trace", "stale"]
+        branch_key = ScoreCache.encode_subset(answers)
+
+        reference = self.cache('adopt-ref.sqlite3')
+        status, cost, depth, _floor = self._solve(answers, reference)
+        self.assertEqual(status, SOLVED)
+
+        # Another worker got there first with an equal-cost strategy whose
+        # worst case is one guess deeper.
+        score_cache = self.cache('adopt-engine.sqlite3')
+        score_cache.write(branch_key, ERD_ALL, "trace", cost,
+                          max_depth=depth + 1, solve_budget=None)
+
+        real_read = ScoreCache.read_for_budget
+
+        def blind_to_this_branch(self, key, policy, budget):
+            if key == branch_key:
+                return None          # the stale miss this solve started from
+            return real_read(self, key, policy, budget)
+
+        with mock.patch.object(ScoreCache, 'read_for_budget',
+                               blind_to_this_branch):
+            _status, adopted_cost, adopted_depth, _f = self._solve(
+                answers, score_cache)
+
+        self.assertEqual(adopted_depth, depth + 1,
+                         "solve returned its own worst case, not the stored one")
+        self.assertEqual(adopted_cost, cost)
+        stored = score_cache._read_stored_row(branch_key, ERD_ALL, None)
+        self.assertEqual((adopted_cost, adopted_depth), (stored[1], stored[2]))
+
     def test_a_result_deleted_before_the_reconcile_is_not_resurrected(self):
         score_cache = self.cache()
         score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
@@ -682,7 +763,7 @@ class ImportConflictTest(_CacheTest):
         return conn
 
     def _cache_with(self, name, guess, score, *, solve_budget=None,
-                    legacy_budget_in_canonical=False):
+                    max_depth=3, legacy_budget_in_canonical=False):
         import_cache = __import__('import_cache')
         path = os.path.join(self._dir, name)
         score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
@@ -690,12 +771,12 @@ class ImportConflictTest(_CacheTest):
             score_cache._conn.execute(
                 f"INSERT OR REPLACE INTO {CANONICAL} "
                 "(branch_key, policy, answer_list_id, best_guess, best_score, "
-                " updated_at, max_depth, solve_budget) VALUES (?,?,?,?,?,7,3,?)",
+                " updated_at, max_depth, solve_budget) VALUES (?,?,?,?,?,7,?,?)",
                 (self.key, ERD_ALL, score_cache.answer_list_id, guess, score,
-                 solve_budget))
+                 max_depth, solve_budget))
         else:
-            score_cache.write(self.key, ERD_ALL, guess, score, max_depth=3,
-                              solve_budget=solve_budget)
+            score_cache.write(self.key, ERD_ALL, guess, score,
+                              max_depth=max_depth, solve_budget=solve_budget)
         score_cache.close()
         del import_cache
         return path
@@ -734,13 +815,50 @@ class ImportConflictTest(_CacheTest):
         conflicts = self._conflicts(target, source)
         self.assertEqual([c[0] for c in conflicts], ['budget-specific (routed)'])
 
-    def test_agreeing_results_are_not_conflicts(self):
-        # The same optimum reached twice, with different strategies and
-        # different worst cases, is one fact — not a disagreement.
+    def test_a_different_strategy_at_the_same_cost_and_depth_is_one_fact(self):
+        # Different guesses are harmless when both folded outputs agree: the
+        # cost and the worst case are what an ancestor folded.
         a = self._cache_with("sa.sqlite3", "crane", 2.0)
         b = self._cache_with("sb.sqlite3", "slate", 2.0)
         self.assertEqual(self._conflicts(a, b), [])
         self.assertEqual(self._conflicts(b, a), [])
+
+    def test_equal_cost_with_a_different_worst_case_is_a_conflict(self):
+        # max_depth is ancestor-visible, so equal cost does not make two
+        # certificates interchangeable: keeping the target's child while
+        # admitting source parents folded from the source's depth makes those
+        # parents inconsistent on arrival.
+        a = self._cache_with("da.sqlite3", "crane", 2.0, max_depth=3)
+        b = self._cache_with("db.sqlite3", "slate", 2.0, max_depth=4)
+        for target, source in ((a, b), (b, a)):
+            with self.subTest(direction=os.path.basename(target)):
+                conflicts = self._conflicts(target, source)
+                self.assertEqual(len(conflicts), 1, conflicts)
+                self.assertNotEqual(conflicts[0][4][2], conflicts[0][5][2])
+
+    def test_a_source_parent_is_not_admitted_above_a_retained_child(self):
+        # End to end: the source holds a child at depth 4 and a parent folded
+        # from it; the target holds the same child at depth 3.  INSERT OR
+        # IGNORE would keep the target's child and import the source's parent,
+        # leaving that parent describing a subtree the retained child does not
+        # support.  The merge has to refuse before any row moves.
+        child = ScoreCache.encode_subset(WORDS[:2])
+        parent = ScoreCache.encode_subset(WORDS[:3])
+
+        target_path = os.path.join(self._dir, "pt.sqlite3")
+        target = ScoreCache(target_path, WORDS, checkpoint_on_close=False)
+        target.write(child, ERD_ALL, "crane", 2.0, max_depth=3)
+        target.close()
+
+        source_path = os.path.join(self._dir, "ps.sqlite3")
+        source = ScoreCache(source_path, WORDS, checkpoint_on_close=False)
+        source.write(child, ERD_ALL, "slate", 2.0, max_depth=4)
+        source.write(parent, ERD_ALL, "trace", 2.5, max_depth=5)
+        source.close()
+
+        conflicts = self._conflicts(target_path, source_path)
+        self.assertEqual(len(conflicts), 1, conflicts)
+        self.assertEqual(conflicts[0][1], branch_reference(child))
 
     def test_a_scope_only_one_cache_holds_is_not_a_conflict(self):
         target = self._cache_with("oa.sqlite3", "crane", 2.0)
@@ -752,7 +870,7 @@ class ImportConflictTest(_CacheTest):
         import import_cache
         from contextlib import redirect_stderr
         conflicts = [('unrestricted', 'abc123def456', ERD_ALL, None,
-                      ('crane', 2.0), ('slate', 2.5))]
+                      ('crane', 2.0, 3), ('slate', 2.0, 4))]
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             import_cache._report_conflicts(conflicts)
@@ -760,6 +878,9 @@ class ImportConflictTest(_CacheTest):
         self.assertIn('abc123def456', report)
         self.assertIn('crane', report)
         self.assertIn('slate', report)
+        # The worst cases are what differ here, so the report has to show them.
+        self.assertIn('depth 3', report)
+        self.assertIn('depth 4', report)
 
     def test_a_target_without_the_budget_table_is_skipped_not_an_error(self):
         # An older target has no budget table to collide with; the comparison
@@ -796,3 +917,39 @@ class ImportConflictTest(_CacheTest):
         conflicts = import_cache._conflicting_exact_results(
             conn, src_tables, limit=2)
         self.assertEqual(len(conflicts), 2)
+
+
+class EquivalenceRuleTest(unittest.TestCase):
+    """The rule that decides sameness, in its two expressions."""
+
+    CASES = [
+        ((2.0, 3), (2.0, 3), True),
+        ((2.0, 3), (2.0, 4), False),
+        ((2.0, 3), (2.5, 3), False),
+        ((2.0, 3), (2.5, 4), False),
+        ((2.0, None), (2.0, None), True),
+        ((2.0, None), (2.0, 3), False),
+        ((2.0, 3), (2.0 + 1e-12, 3), True),
+    ]
+
+    def test_the_python_rule_is_cost_and_worst_case(self):
+        for (stored, incoming, agree) in self.CASES:
+            with self.subTest(stored=stored, incoming=incoming):
+                self.assertEqual(
+                    exact_results_agree(stored[0], stored[1],
+                                        incoming[0], incoming[1]),
+                    agree)
+
+    def test_the_sql_equivalence_rule_matches_the_python_one(self):
+        # import_cache compares whole tables in SQL; the two expressions of
+        # one rule have to answer alike or a merge and a write disagree.
+        import import_cache
+        conn = sqlite3.connect(':memory:')
+        self.addCleanup(conn.close)
+        for (stored, incoming, agree) in self.CASES:
+            with self.subTest(stored=stored, incoming=incoming):
+                flagged = conn.execute(
+                    "SELECT (abs(?1 - ?3) > ?5 OR ?2 IS NOT ?4)",
+                    (stored[0], stored[1], incoming[0], incoming[1],
+                     import_cache.EXACT_SCORE_TOLERANCE)).fetchone()[0]
+                self.assertEqual(not flagged, agree)

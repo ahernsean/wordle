@@ -134,10 +134,19 @@ apply.  `wordle_engine._cache_reuse` stays the single statement of the rule;
 `read_for_budget` only selects which result to put to it.  The memory mirror is
 keyed by scope for the same reason the tables are.
 
-**A second exact result at a scope already stored does not replace it** —
-equal-cost strategies can differ in `max_depth`, and an ancestor folded the
-stored one.  A second result that disagrees on cost raises
+**A second exact result at a scope already stored does not replace it** — it
+is returned, and the caller adopts it before folding anything.  `max_depth` is
+ancestor-visible, so a solver that kept its own worst case would hand its
+parent a value the stored child does not support: the same inconsistent
+ancestry, reached without an overwrite.  `_solve_subset` therefore takes
+`write`'s return value rather than its own locals.  A second result that
+disagrees on *cost* cannot be reconciled by adoption and raises
 `CacheWriteConflict`.
+
+**Sameness is `exact_results_agree`: equal cost AND equal `max_depth`.**
+`import_cache` states the same rule in SQL to compare whole tables; a merge
+cannot adopt, because the incoming ancestors are already folded, so it refuses
+instead.
 
 **Creating the row is the check.**  `write` inserts with `ON CONFLICT DO
 NOTHING` and reconciles only when the insert finds the scope taken; a read

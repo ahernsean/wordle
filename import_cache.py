@@ -58,7 +58,8 @@ import sqlite3
 import sys
 import time
 
-from cache_sqlite import EXACT_SCORE_TOLERANCE, ScoreCache, branch_reference
+from cache_sqlite import (EXACT_SCORE_TOLERANCE, ScoreCache,
+                          branch_reference, exact_results_agree)
 from wordle_engine import load_word_list
 
 from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CACHE_PATH, ensure_runtime_dir
@@ -226,11 +227,17 @@ def _conflicting_exact_results(conn, src_tables, limit=20):
 
     A key collision between two caches is normally one fact reached twice, and
     INSERT OR IGNORE is exact for that.  It is not safe to *assume*: two caches
-    can hold different costs for one branch at one scope, and whichever the
-    merge keeps displaces a result the other cache's ancestors folded — the
-    failure ScoreCache.write refuses within a file.  The same rule has to hold
-    across files, so a merge that would silently pick a side is refused
-    instead.
+    can hold different exact results for one branch at one scope, and whichever
+    the merge keeps displaces a result the other cache's ancestors folded.
+
+    Sameness is cache_sqlite.exact_results_agree — equal cost AND equal
+    max_depth, expressed here in SQL so whole tables compare at once.  Equal
+    cost alone is not enough: max_depth is ancestor-visible, so keeping the
+    target's child while admitting source-only parents folded from the source's
+    deeper worst case makes those imported parents inconsistent on arrival.
+    Within one file ScoreCache.write reconciles the same situation by handing
+    the incumbent back for the caller to adopt; a merge has no such option,
+    because the incoming ancestors are already computed and stored.
 
     Returns up to `limit` (scope, reference, policy, budget, target, incoming)
     rows.  A legacy source carries its budget-specific results in the canonical
@@ -261,34 +268,40 @@ def _conflicting_exact_results(conn, src_tables, limit=20):
             continue
         rows = conn.execute(f"""
             SELECT s.branch_key, s.policy, s.solve_budget,
-                   m.best_guess, m.best_score, s.best_guess, s.best_score
+                   m.best_guess, m.best_score, m.max_depth,
+                   s.best_guess, s.best_score, s.max_depth
             FROM src.{source_table} s
             JOIN main.{target_table} m
               ON m.branch_key     = s.branch_key
              AND m.policy         = s.policy
              AND m.answer_list_id = s.answer_list_id{budget_join}
             WHERE ({source_filter})
-              AND abs(m.best_score - s.best_score) > ?
+              AND (abs(m.best_score - s.best_score) > ?
+                   OR m.max_depth IS NOT s.max_depth)
             LIMIT ?
         """, (EXACT_SCORE_TOLERANCE, limit - len(conflicts))).fetchall()
         for row in rows:
             conflicts.append((scope, branch_reference(row[0]), row[1], row[2],
-                              (row[3], row[4]), (row[5], row[6])))
+                              (row[3], row[4], row[5]),
+                              (row[6], row[7], row[8])))
         if len(conflicts) >= limit:
             break
     return conflicts
 
 
 def _report_conflicts(conflicts) -> None:
-    print(f'\n{len(conflicts):,} colliding exact result(s) disagree on cost:',
-          file=sys.stderr)
+    print(f'\n{len(conflicts):,} colliding exact result(s) are not the same '
+          f'certificate:', file=sys.stderr)
     for scope, reference, policy, budget, target, incoming in conflicts:
         print(f'  {reference} {scope} policy={policy} budget={budget}: '
-              f'target {target[0]}/{target[1]!r}, '
-              f'source {incoming[0]}/{incoming[1]!r}', file=sys.stderr)
-    print('Two exact results for one scope cannot both be right, and merging '
-          'either way displaces whichever the other cache\'s ancestors '
-          'folded.  Resolve the disagreement before importing.', file=sys.stderr)
+              f'target {target[0]}/{target[1]!r}/depth {target[2]}, '
+              f'source {incoming[0]}/{incoming[1]!r}/depth {incoming[2]}',
+              file=sys.stderr)
+    print("Two exact results for one scope cannot both be right, and equal "
+          "cost with a different worst case is still two certificates: "
+          "whichever side the merge keeps, the other cache's ancestors folded "
+          "the one it dropped.  Resolve the disagreement before importing.",
+          file=sys.stderr)
 
 
 def _copy_table_with_progress(conn, table) -> int:

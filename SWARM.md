@@ -655,6 +655,10 @@ constraint decides who owns a scope: exactly one worker creates it and every
 other reconciles against what that one stored.  A read followed by an insert
 would leave a window two workers both pass through.
 
+Two results are the same certificate only when they agree on cost **and** on
+`max_depth`.  A parent folds a child's worst case into its own, so equal cost
+with a different worst case is two certificates, not one.
+
 **A second exact result for a branch at a scope it already holds does not
 replace it.**  Two exact searches of one scope agree on the cost, and
 equal-cost strategies can still differ in `max_depth`, so overwriting would
@@ -664,6 +668,12 @@ reconciled that way and raises `CacheWriteConflict` — the two searches cannot
 both be right, and recording either invalidates whichever ancestors folded the
 other.  Expect that never to fire; if it does, the log line names the branch,
 policy, budget and both values.
+
+An equal-cost result whose worst case differs is not an error: the stored
+certificate stands and `write` returns it for the caller to adopt, so what a
+solver hands its parent is always what the cache holds.  `import_cache` cannot
+adopt — a merge's incoming ancestors are already folded — so it refuses the
+merge instead and names both sides.
 
 Counts say which they mean.  `exact_branch_count` counts branches with an
 unrestricted result; `budgeted_result_count` counts budget-specific results and

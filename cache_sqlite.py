@@ -23,6 +23,23 @@ def branch_reference(branch_key: bytes) -> str:
 EXACT_SCORE_TOLERANCE = 1e-9
 
 
+def exact_results_agree(stored_score, stored_max_depth,
+                        incoming_score, incoming_max_depth) -> bool:
+    """Whether two exact results for one scope are the same certificate.
+
+    Equal cost is not enough.  max_depth is ancestor-visible — a parent folds
+    a child's worst case into its own — so two equal-cost strategies with
+    different worst cases are different certificates, and a parent folded from
+    one does not describe a subtree the other supports.
+
+    import_cache expresses this same rule in SQL, over whole tables at once;
+    test_the_sql_equivalence_rule_matches_the_python_one keeps the two in step.
+    """
+    if abs(stored_score - incoming_score) > EXACT_SCORE_TOLERANCE:
+        return False
+    return stored_max_depth == incoming_max_depth
+
+
 def _branch_facts_by_key(rows):
     """Group exact branch rows into (unrestricted_row, {solve_budget: row}).
 
@@ -198,8 +215,11 @@ class ScoreCache:
         self.read_hits = 0
         self.read_misses = 0
         self.write_count = 0
-        # Exact results re-derived and found to match what is already stored.
+        # Exact results re-derived and found already stored.
         self.redundant_write_count = 0
+        # ...of which the stored worst case differed from the one just
+        # computed, so the caller adopted the stored certificate.
+        self.adopted_depth_count = 0
         # In-memory mirror of branch_best_by_policy rows seen this session.
         # Branch results are write-once/exact, so a hit here is as good as
         # a SQLite hit but ~1000x cheaper — recursive ERD search re-reads the
@@ -846,12 +866,18 @@ class ScoreCache:
         The two are separate facts and neither displaces the other.
 
         A result already stored for the same branch at the same scope is kept
-        rather than replaced: two exact searches of one scope agree on the
-        cost, and equal-cost strategies can still differ in max_depth, so
-        overwriting would leave every ancestor that folded the stored depth
-        describing a subtree the cache no longer holds.  A second result that
-        disagrees on the cost cannot be reconciled that way and raises
-        CacheWriteConflict.
+        rather than replaced, and **returned**: the caller must adopt it before
+        folding anything, because what a solver hands its parent has to be what
+        the cache durably holds.  Equal-cost strategies can differ in
+        max_depth, which is ancestor-visible, so a caller that kept its own
+        worst case would fold a parent the stored child does not support —
+        the inconsistent ancestry this schema exists to prevent, reached
+        without any overwrite.
+
+        Returns the durable (best_guess, best_score, max_depth, solve_budget).
+        A second result that disagrees on the *cost* cannot be reconciled by
+        adoption — both claim to be the optimum, so one of them is wrong — and
+        raises CacheWriteConflict.
 
         A transient 'disk I/O error' (e.g. iCloud File Provider Storage
         holding the cache file's lock during a sync pass — see checkpoint())
@@ -896,9 +922,10 @@ class ScoreCache:
                 if stored is None:
                     # Deleted between the insert and this read.  Nothing is
                     # stored to reconcile against and nothing was written, so
-                    # do not mirror a value the cache does not hold.
+                    # do not mirror a value the cache does not hold; the
+                    # caller's own result is the only one in play.
                     self._mem_cache.pop((branch_key, policy, solve_budget), None)
-                    return
+                    return entry
                 if abs(stored[1] - best_score) > EXACT_SCORE_TOLERANCE:
                     logger.error(
                         "conflicting exact results for %s at policy=%s "
@@ -909,19 +936,22 @@ class ScoreCache:
                         f"{branch_reference(branch_key)} at policy={policy} "
                         f"budget={solve_budget}: stored {stored[1]!r}, "
                         f"incoming {best_score!r}")
-                # The same optimum, reached again.  Keep the stored row:
-                # equal-cost strategies can still differ in max_depth, and
-                # replacing one would leave every ancestor that folded the old
-                # depth describing a subtree the cache no longer holds.
+                # The same optimum, reached again.  The stored row stands and
+                # the caller adopts it: an ancestor may already have folded its
+                # max_depth, and equal cost does not make two worst cases
+                # interchangeable.
                 self.redundant_write_count += 1
+                if stored[2] != max_depth:
+                    self.adopted_depth_count += 1
                 self._mem_cache[(branch_key, policy, solve_budget)] = stored
-                return
+                return stored
         except sqlite3.OperationalError as exc:
             if not _is_disk_io_error(exc):
                 raise
             logger.warning("write(%s, %s, %.3f) failed: %s",
                             policy, best_guess, best_score, exc)
         self._mem_cache[(branch_key, policy, solve_budget)] = entry
+        return entry
 
     def read_loss(self, branch_key, policy, refresh=False):
         """Largest budget at which `branch_key` is proven a loss, or None.
@@ -1756,9 +1786,26 @@ class MemoryScoreCache:
 
     def write(self, branch_key, policy, best_guess, best_score,
               max_depth=None, solve_budget=None):
-        self._data[(self._scope, branch_key, policy, solve_budget)] = (
-            best_guess, best_score, max_depth, solve_budget)
+        """Store an exact result, or adopt the one already held.
+
+        Same invariant as ScoreCache.write, for the same reason: max_depth is
+        ancestor-visible, so a result already stored for this scope stands and
+        is returned for the caller to adopt rather than being replaced.  A
+        disagreement on cost raises CacheWriteConflict.
+        """
+        key = (self._scope, branch_key, policy, solve_budget)
+        stored = self._data.get(key)
+        if stored is not None:
+            if abs(stored[1] - best_score) > EXACT_SCORE_TOLERANCE:
+                raise CacheWriteConflict(
+                    f"{branch_reference(branch_key)} at policy={policy} "
+                    f"budget={solve_budget}: stored {stored[1]!r}, "
+                    f"incoming {best_score!r}")
+            return stored
+        entry = (best_guess, best_score, max_depth, solve_budget)
+        self._data[key] = entry
         self.write_count += 1
+        return entry
 
     def read_loss(self, branch_key, policy, refresh=False):
         return self._losses.get((self._scope, branch_key, policy))
