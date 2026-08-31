@@ -643,6 +643,31 @@ class TestEvaluateGuessBranches(unittest.TestCase):
         # progress_callback fires once per fully-evaluated top-level candidate.
         self.assertTrue(calls)
 
+    def test_solve_subset_passes_prefix_budget_taint_to_publisher(self):
+        remaining = ["crane", "slate"]
+
+        class Publisher:
+            def enter(self, branch_words, budget):
+                return object()
+
+            def check(self, token, candidate_list, last_index, best_guess,
+                      best_erd, best_max_remaining_depth, budget,
+                      prefix_budget_tainted=False):
+                self.prefix_budget_tainted = prefix_budget_tainted
+                return (SOLVED, 1.5, 2, prefix_budget_tainted)
+
+        publisher = Publisher()
+        with mock.patch.object(
+                wordle_engine, "evaluate_candidate",
+                return_value=(OVER_DEPTH_BUDGET, None, None, True)):
+            result = _solve_subset(
+                remaining, None, None, 2, None, remaining,
+                ERD_ANSWERS, None, None, None, None,
+                mid_loop_publisher=publisher)
+
+        self.assertTrue(publisher.prefix_budget_tainted)
+        self.assertEqual(result, (SOLVED, 1.5, 2, True))
+
 
 class TestVerifyERDCacheZeroGroup(unittest.TestCase):
     def setUp(self):

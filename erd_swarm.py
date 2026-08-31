@@ -338,7 +338,8 @@ class _MidLoopPublisher:
                 budget, True]
 
     def check(self, token, candidate_list, last_index,
-              best_guess, best_erd, best_max_remaining_depth, budget):
+              best_guess, best_erd, best_max_remaining_depth, budget,
+              prefix_budget_tainted=False):
         """Called every loop iteration (before status-continue checks).
 
         best_max_remaining_depth is the winning candidate's worst-case line
@@ -352,6 +353,11 @@ class _MidLoopPublisher:
         is the index just evaluated, so remaining_count is derived cheaply and
         the evaluated prefix is sliced only on the rare iteration the overrun
         actually fires (avoiding an O(n²) per-iteration copy).
+
+        prefix_budget_tainted means some evaluated prefix candidate depended on
+        this frame's depth cap.  The published branch inherits that taint only
+        when it inherits the prefix's done marks; a branch that re-evaluates the
+        prefix derives its own taint from those evaluations.
 
         Fires on either of two triggers:
         - node-proportionate: the frame has spent > OVERRUN_K * predicted nodes
@@ -498,11 +504,15 @@ class _MidLoopPublisher:
             sound_to_mark = row_ceiling is not None and erd_ge(best_erd, row_ceiling, n)
         else:
             sound_to_mark = True
+        prefix_taint_transferred = False
         if sound_to_mark:
             word_idx = self._worker._word_idx
             done_indices = [word_idx[w] for w in candidate_list[:last_index + 1]
                             if w in word_idx]
             if done_indices:
+                if prefix_budget_tainted:
+                    self._worker.queue.mark_branch_tainted(branch_key)
+                    prefix_taint_transferred = True
                 self._worker.queue.mark_claims_done(branch_key, done_indices)
 
         # Seed the cooperative branch's bound only when we have an achieved cost
@@ -515,6 +525,10 @@ class _MidLoopPublisher:
         result = self._worker.cooperative_solve(
             branch_words, budget,
             ceiling=best_erd if frame_ceilinged else float('inf'))
+        if isinstance(result, tuple) and prefix_taint_transferred:
+            status, cost, max_remaining_depth, budget_tainted = result
+            result = (status, cost, max_remaining_depth,
+                      budget_tainted or prefix_taint_transferred)
         if result is None:
             # cooperative_solve re-checked joinability and declined: a racing
             # writer changed the row between our read and its own.  The frame
@@ -1326,8 +1340,15 @@ class _BranchWorker:
                            idx, cand_elapsed, status, self._cand_max_depth)
 
         nodes_delta = self._nodes - nodes_before
-        if self._adaptive and nodes_delta > 0:
-            self.queue.add_nodes_spent(branch_key, nodes_delta)
+        if self._adaptive and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET):
+            # These counters cover candidates proven infeasible at this level,
+            # not candidates whose taint arrived from a deeper branch.  They
+            # are therefore a lower bound on local infeasibility.  Every such
+            # proof also carries budget_tainted, so infeasible_candidates > 0
+            # implies that the branch is marked tainted below.
+            self.queue.add_nodes_spent(
+                branch_key, nodes_delta,
+                infeasible=status == OVER_DEPTH_BUDGET)
 
         candidate_outcome = {
             SOLVED: 'exact',
@@ -1653,6 +1674,9 @@ class _BranchWorker:
          ceiling, cut_occurred) = meta
         branch_row = self.queue.get_branch(branch_key)
         nodes_spent = branch_row['nodes_spent'] if branch_row else 0
+        infeasible_candidates = (branch_row['infeasible_candidates']
+                                 if branch_row else 0)
+        infeasible_nodes = branch_row['infeasible_nodes'] if branch_row else 0
         created_at = branch_row['created_at'] if branch_row else None
         finalized_at = branch_row['finalized_at'] if branch_row else None
         spine = branch_row['spine'] if branch_row else None
@@ -1770,6 +1794,8 @@ class _BranchWorker:
                     one_level_erd_pruned_candidates,
                 two_level_erd_pruned_candidates=
                     two_level_erd_pruned_candidates,
+                infeasible_candidates=infeasible_candidates,
+                infeasible_nodes=infeasible_nodes,
                 best_guess=best_guess, best_erd=best_erd,
                 cache_write_millis=cache_write_millis,
                 schedule_diagnostics=schedule_diagnostics,

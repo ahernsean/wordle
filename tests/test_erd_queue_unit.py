@@ -1560,9 +1560,12 @@ class TestCostModel(_TmpQueue):
     def test_add_nodes_spent_accumulates(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
         self.q.add_nodes_spent(self.key, 100)
-        self.q.add_nodes_spent(self.key, 50)
+        self.q.add_nodes_spent(self.key, 50, infeasible=True)
+        self.q.add_nodes_spent(self.key, 0, infeasible=True)
         row = self.q.get_branch(self.key)
         self.assertEqual(row['nodes_spent'], 150)
+        self.assertEqual(row['infeasible_candidates'], 2)
+        self.assertEqual(row['infeasible_nodes'], 50)
 
     def test_add_claim_telemetry_inserts_row(self):
         self.q.add_claim_telemetry(
@@ -1814,15 +1817,19 @@ class TestCeilingTelemetry(_TmpQueue):
     def test_finalize_log_records_ceiling_and_outcome(self):
         self.q.add_branch_finalize_log(
             self.key, "SALET -g-g-", len(WORDS), 4, 100, 200, 5000, 3,
-            ceiling=2.5, outcome="cut", best_guess="crane", best_erd=1.75)
+            ceiling=2.5, outcome="cut", best_guess="crane", best_erd=1.75,
+            infeasible_candidates=2, infeasible_nodes=1_200)
         row = self.q._conn.execute(
-            "SELECT ceiling, outcome, best_guess, best_erd "
+            "SELECT ceiling, outcome, best_guess, best_erd, "
+            "infeasible_candidates, infeasible_nodes "
             "FROM telemetry.branch_finalize_log"
         ).fetchone()
         self.assertAlmostEqual(row["ceiling"], 2.5)
         self.assertEqual(row["outcome"], "cut")
         self.assertEqual(row["best_guess"], "crane")
         self.assertAlmostEqual(row["best_erd"], 1.75)
+        self.assertEqual(row["infeasible_candidates"], 2)
+        self.assertEqual(row["infeasible_nodes"], 1_200)
 
     def test_completed_source_timing_uses_the_spine_opener(self):
         old_branch_key = ScoreCache.encode_subset(["crane", "slate"])
